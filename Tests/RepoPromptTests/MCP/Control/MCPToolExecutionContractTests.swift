@@ -7,6 +7,7 @@ import XCTest
 final class MCPToolExecutionContractTests: XCTestCase {
     func testCentralTimeoutPolicyMatchesProductContract() {
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds, 30)
+        XCTAssertEqual(MCPTimeoutPolicy.fileActionTrashExecutionDeadlineSeconds, 60)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds, 5)
@@ -17,6 +18,26 @@ final class MCPToolExecutionContractTests: XCTestCase {
         XCTAssertEqual(MCPTimeoutPolicy.nextUserInstructionDefaultWaitSeconds, 600)
         XCTAssertEqual(MCPTimeoutPolicy.applyEditsApprovalTimeoutSeconds, 300)
         XCTAssertEqual(MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds, 600)
+    }
+
+    func testFileActionsDeleteUsesFinderTrashDeadline() {
+        guard case let .bounded(deadline, cancellationGrace, cleanupDisposition) = MCPToolExecutionContractCatalog.contract(
+            for: MCPWindowToolName.fileActions,
+            arguments: ["action": .string("  DeLeTe  ")]
+        ) else {
+            return XCTFail("Expected bounded Finder Trash contract")
+        }
+        XCTAssertEqual(deadline, MCPTimeoutPolicy.fileActionTrashExecutionDeadline)
+        XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+        XCTAssertEqual(cleanupDisposition, .detachAndSettle)
+
+        XCTAssertEqual(
+            MCPToolExecutionContractCatalog.contract(
+                for: MCPWindowToolName.fileActions,
+                arguments: ["action": .string("create")]
+            ),
+            MCPToolExecutionContractCatalog.contract(for: MCPWindowToolName.fileActions)
+        )
     }
 
     func testAdvertisedToolCatalogMatchesExecutionContractClassificationMatrix() {
@@ -63,6 +84,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
             ], caseLabel)
 
             let detachAndSettleToolNames: Set<String> = [
+                MCPWindowToolName.fileActions,
                 MCPWindowToolName.getCodeStructure,
                 MCPWindowToolName.readFile,
                 MCPWindowToolName.getFileTree

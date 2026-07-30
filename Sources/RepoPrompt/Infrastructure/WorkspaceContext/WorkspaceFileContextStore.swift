@@ -2798,6 +2798,7 @@ actor WorkspaceFileContextStore {
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
         private var codemapPathInvalidationStageHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
+        private var discardedCodemapPathFenceReleaseCounterForTesting = 0
     #endif
     private var codemapCleanupFlightsByRootID: [UUID: CodemapCleanupFlight] = [:]
     private var codemapPathInvalidationFlightsByRootEpoch: [
@@ -14063,6 +14064,14 @@ actor WorkspaceFileContextStore {
             }
         }
 
+        func discardedCodemapPathFenceReleaseCountForTesting() -> Int {
+            discardedCodemapPathFenceReleaseCounterForTesting
+        }
+
+        func pendingCodemapGraphIndexRescheduleCountForTesting() -> Int {
+            codemapGraphIndexBuildReschedulePendingRootEpochs.count
+        }
+
         func revokeReadyCodemapArtifactContributionForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) async -> Bool {
@@ -15644,8 +15653,9 @@ actor WorkspaceFileContextStore {
         return true
     }
 
-    private func removeCodemapPathFenceToken(id: UUID) {
-        codemapPathFenceTokensByID.removeValue(forKey: id)
+    @discardableResult
+    private func removeCodemapPathFenceToken(id: UUID) -> Bool {
+        codemapPathFenceTokensByID.removeValue(forKey: id) != nil
     }
 
     private func finishCodemapPathInvalidationWithoutAuthority(
@@ -15680,7 +15690,12 @@ actor WorkspaceFileContextStore {
         didCommitMutation: Bool = true
     ) {
         guard let token else { return }
-        removeCodemapPathFenceToken(id: token.id)
+        guard removeCodemapPathFenceToken(id: token.id) else {
+            #if DEBUG
+                discardedCodemapPathFenceReleaseCounterForTesting += 1
+            #endif
+            return
+        }
         // The fence itself advanced projection/path authority and cancelled old work. A failed
         // disk mutation still needs one restoration preload, while committed work needs the same
         // reschedule against the new public catalog.

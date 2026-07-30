@@ -56,6 +56,44 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         XCTAssertEqual(runningUpdate.processID, snapshotItem.processID)
     }
 
+    func testLateTerminalInteractionDoesNotReopenCompletedCanonicalCommand() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "command-item-1",
+                type: "commandExecution",
+                fields: [
+                    "status": .string("completed"),
+                    "processId": .string("cell:1"),
+                    "exitCode": .number(0),
+                    "aggregatedOutput": .string("done\n")
+                ]
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/commandExecution/terminalInteraction",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "itemId": .string("command-item-1"),
+                "processId": .string("cell:1"),
+                "stdin": .string("")
+            ]
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertEqual(events.count(where: {
+            if case .toolResult("bash", _, _, _, _) = $0 { return true }
+            return false
+        }), 1)
+        XCTAssertFalse(events.contains(where: {
+            if case .commandExecutionRunning = $0 { return true }
+            return false
+        }))
+    }
+
     func testLegacyAssistantCompleteWithoutPriorDeltaEmitsFullText() async {
         let controller = makeControllerWithThread(turnID: "turn-1")
 

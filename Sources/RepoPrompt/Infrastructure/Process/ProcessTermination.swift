@@ -566,10 +566,10 @@ enum ProcessTermination {
         }
     }
 
-    /// Cleans descendants after the direct child has already been reaped.
-    /// The API intentionally accepts no PID: signaling is process-group-only,
-    /// and no second waitpid or reused-PID fallback is possible.
-    static func terminateProcessGroupAfterRootReap(
+    /// Applies bounded TERM-to-KILL cleanup using process-group signaling only.
+    /// The API intentionally accepts no PID and never calls waitpid, so it is
+    /// safe both while another owner is reaping the direct child and after reap.
+    static func terminateProcessGroup(
         processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,
         sigkillGrace: TimeInterval? = nil,
@@ -608,6 +608,22 @@ enum ProcessTermination {
         if processGroupExists(processGroupID) {
             logger("Process group \(processGroupID) remained after bounded SIGKILL cleanup")
         }
+    }
+
+    /// Cleans descendants after the direct child has already been reaped.
+    /// Retained as the explicit call-site vocabulary for sole-reaper lifecycles.
+    static func terminateProcessGroupAfterRootReap(
+        processGroupID: pid_t?,
+        sigtermGrace: TimeInterval? = nil,
+        sigkillGrace: TimeInterval? = nil,
+        logger: (String) -> Void = { _ in }
+    ) async {
+        await terminateProcessGroup(
+            processGroupID: processGroupID,
+            sigtermGrace: sigtermGrace,
+            sigkillGrace: sigkillGrace,
+            logger: logger
+        )
     }
 
     /// Applies TERM-to-KILL policy to a child whose sole destructive reap is

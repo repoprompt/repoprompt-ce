@@ -35,6 +35,20 @@ struct FileSystemMutationDrainWaiter {
     let continuation: CheckedContinuation<Void, Never>
 }
 
+enum FileSystemMutationCompletion {
+    case success
+    case failure(any Error)
+
+    func get() throws {
+        switch self {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
+        }
+    }
+}
+
 final class FileSystemServiceFSEventCallbackContext {
     weak var service: FileSystemService?
 
@@ -176,6 +190,12 @@ actor FileSystemService {
         /// Test-only synchronous gate invoked on the blocking-I/O queue immediately before filesystem I/O.
         var mutationIOWillExecuteHandler: (@Sendable (FileSystemUncancellableMutation) -> Void)?
 
+        /// Test-only gate immediately before the request installs its mutation waiter.
+        var mutationWaiterWillRegisterHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+
+        /// Test-only replacement for UTF-8 materialization inside the detached create worker.
+        var createFileDataPreparationForTesting: (@Sendable (String) async throws -> Data)?
+
         /// Test-only replacement for the real Finder Trash operation.
         var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
 
@@ -191,9 +211,18 @@ actor FileSystemService {
 
     /// Request waiters are actor-owned and may be cancelled independently from detached filesystem I/O.
     var mutationWaiters: [UUID: FileSystemMutationWaiter] = [:]
-    /// In-flight records retain mutation and path authority until detached reconciliation completes.
+    /// In-flight records retain normalized path authority until the sole detached reconciler completes.
     var inFlightMutations: [UUID: FileSystemInFlightMutation] = [:]
     var mutationDrainWaiters: [UUID: FileSystemMutationDrainWaiter] = [:]
+    /// A detached mutation may reconcile before its request installs a waiter. Retain that
+    /// terminal result so the request consumes it instead of waiting forever.
+    var mutationCompletionMailbox: [UUID: FileSystemMutationCompletion] = [:]
+    /// Cancellation wins over a later uncancellable I/O completion, which must still reconcile
+    /// but must not leave an unconsumed mailbox entry.
+    var cancelledMutationWaiterIDs: Set<UUID> = []
+    /// Finder Trash can remove the source promptly but keep `trashItem` blocked for tens of
+    /// seconds. The first terminal observer owns reconciliation for each trash mutation.
+    var trashMutationsAwaitingReconciliation: Set<UUID> = []
     var deferredEditPublicationsByMutationID: [UUID: FileSystemDeferredEditPublication] = [:]
     #if DEBUG
         var completedMutationMonitorCountForTesting = 0
@@ -433,6 +462,18 @@ actor FileSystemService {
             mutationIOWillExecuteHandler = handler
         }
 
+        func setMutationWaiterWillRegisterHandlerForTesting(
+            _ handler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+        ) {
+            mutationWaiterWillRegisterHandler = handler
+        }
+
+        func setCreateFileDataPreparationForTesting(
+            _ preparation: (@Sendable (String) async throws -> Data)?
+        ) {
+            createFileDataPreparationForTesting = preparation
+        }
+
         func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
             moveItemToTrashIOForTesting = operation
         }
@@ -461,6 +502,10 @@ actor FileSystemService {
 
         func mutationMonitorCompletionCountForTesting() -> Int {
             completedMutationMonitorCountForTesting
+        }
+
+        func pendingMutationCompletionCountForTesting() -> Int {
+            mutationCompletionMailbox.count
         }
 
         func pendingDeferredEditPublicationCountForTesting() -> Int {
