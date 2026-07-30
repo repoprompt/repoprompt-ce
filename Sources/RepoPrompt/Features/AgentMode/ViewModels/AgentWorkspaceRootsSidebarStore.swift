@@ -145,7 +145,9 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         guard let snapshot else { return .pending }
         let state: State = if snapshot.isGenerationSuspended {
             .paused
-        } else if snapshot.unavailableReason == .workerRecoveryExhausted {
+        } else if snapshot.availability == .unavailable,
+                  snapshot.unavailableReason == .workerRecoveryExhausted
+        {
             .recoveryExhausted
         } else {
             switch snapshot.availability {

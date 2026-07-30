@@ -327,6 +327,15 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         let summary = AgentWorkspaceCodemapSummary.make([exhausted])
         XCTAssertEqual(summary.state, .recoveryExhausted)
         XCTAssertEqual(summary.detailText, "Indexing needs retry")
+
+        let revoked = AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .revoked,
+            coverage: coverage,
+            unavailableReason: .workerRecoveryExhausted
+        ))
+        XCTAssertEqual(revoked.state, .revoked)
+        XCTAssertFalse(revoked.canRetry)
     }
 
     func testCodemapStatusNotificationsCoalesceRootRowResnapshots() async {
