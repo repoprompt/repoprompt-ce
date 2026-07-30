@@ -95,6 +95,7 @@ import RepoPromptShared
                 "wall_clock_may_be_longer_during_elicitation": wallClockMayBeLongerDuringElicitation,
                 "custom_ui_waits_are_mcp_elicitation": customUIWaitsAreElicitation,
                 "bounded_execution_deadline_seconds": boundedExecutionDeadlineSeconds,
+                "file_action_trash_execution_deadline_seconds": fileActionTrashExecutionDeadlineSeconds,
                 "workspace_switch_execution_deadline_seconds": workspaceSwitchExecutionDeadlineSeconds,
                 "bounded_cleanup_grace_seconds": boundedCleanupGraceSeconds,
                 "preserved_long_synchronous_tools": preservedLongSynchronousToolNames,
