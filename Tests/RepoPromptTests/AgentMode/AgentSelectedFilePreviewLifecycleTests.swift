@@ -240,12 +240,14 @@ final class AgentSelectedFilePreviewLifecycleTests: XCTestCase {
 
     @MainActor
     private func waitForPreviewText(_ expected: String, in coordinator: AgentSelectedFilePreviewLoadCoordinator) async -> Bool {
-        for _ in 0 ..< 500 {
-            if coordinator.previewText == expected { return true }
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("preview text to equal \(expected)", timeout: 0.5) {
+                await MainActor.run { coordinator.previewText == expected }
+            }
+            return true
+        } catch {
+            return false
         }
-        return coordinator.previewText == expected
     }
 
     private func drainCancelledTask() async {
@@ -270,11 +272,12 @@ private actor PreviewLoadGate {
     }
 
     func waitUntilStarted() async -> Bool {
-        for _ in 0 ..< 500 {
-            if started { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("preview load to start", timeout: 0.5) { await self.started }
+            return true
+        } catch {
+            return false
         }
-        return started
     }
 
     func release(_ value: String?) {
@@ -283,11 +286,12 @@ private actor PreviewLoadGate {
     }
 
     func waitUntilCompleted() async -> Bool {
-        for _ in 0 ..< 500 {
-            if completed { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("preview load to complete", timeout: 0.5) { await self.completed }
+            return true
+        } catch {
+            return false
         }
-        return completed
     }
 }
 
@@ -304,11 +308,14 @@ private actor MultiPreviewLoadGate {
     }
 
     func waitUntilStarted(_ displayName: String) async -> Bool {
-        for _ in 0 ..< 500 {
-            if started.contains(displayName) { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("preview load for \(displayName) to start", timeout: 0.5) {
+                await self.started.contains(displayName)
+            }
+            return true
+        } catch {
+            return false
         }
-        return started.contains(displayName)
     }
 
     func release(_ displayName: String, value: String?) {
@@ -317,10 +324,13 @@ private actor MultiPreviewLoadGate {
     }
 
     func waitUntilCompleted(_ displayName: String) async -> Bool {
-        for _ in 0 ..< 500 {
-            if completed.contains(displayName) { return true }
-            try? await Task.sleep(nanoseconds: 1_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("preview load for \(displayName) to complete", timeout: 0.5) {
+                await self.completed.contains(displayName)
+            }
+            return true
+        } catch {
+            return false
         }
-        return completed.contains(displayName)
     }
 }

@@ -9,7 +9,6 @@ final class HistorySessionScannerTests: XCTestCase {
     private var workspacesRoot: URL!
     private var scanner: HistorySessionScanner!
     private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
 
     override func setUp() {
         super.setUp()

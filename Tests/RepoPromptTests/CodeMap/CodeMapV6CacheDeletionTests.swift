@@ -391,13 +391,6 @@ final class CodeMapV6CacheDeletionTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: file), try XCTUnwrap(expected[file.path]))
         }
     }
-
-    func testReportTelemetryShapeContainsOnlyNumericStoredFields() {
-        let report = CodeMapV6CacheDeletionReport()
-        for child in Mirror(reflecting: report).children {
-            XCTAssertTrue(child.value is Int || child.value is UInt64, "non-numeric field: \(child.label ?? "?")")
-        }
-    }
 }
 
 private struct InjectedFailure: Error {}

@@ -687,13 +687,9 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     }
 
     private func waitForWaiter(registration: AgentRunSessionStore.Registration) async throws {
-        for _ in 0 ..< 200 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            await Task.yield()
+        try await AsyncTestWait.waitUntil("Agent Run session waiter registration") {
+            await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1
         }
-        XCTFail("Timed out waiting for waiter")
     }
 
     private func makeViewModel() -> AgentModeViewModel {
@@ -755,7 +751,9 @@ private actor EpochBeginGate {
     }
 
     func waitUntilPaused() async {
-        if isPaused { return }
+        if isPaused {
+            return
+        }
         await withCheckedContinuation { continuation in
             pauseWaiters.append(continuation)
         }

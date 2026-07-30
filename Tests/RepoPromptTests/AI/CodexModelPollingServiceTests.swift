@@ -36,18 +36,14 @@ final class CodexModelPollingServiceTests: XCTestCase {
     }
 
     private func waitUntil(
-        timeout: Duration = .seconds(2),
+        timeout: TimeInterval = 2,
         condition: @escaping @Sendable () async -> Bool
     ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while await !condition() {
-            guard clock.now < deadline else {
-                XCTFail("Timed out waiting for condition")
-                return
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await AsyncTestWait.waitUntil(
+            "Codex model polling condition",
+            timeout: timeout,
+            condition: condition
+        )
     }
 }
 

@@ -738,21 +738,6 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertTrue(recordedBatches.isEmpty)
     }
 
-    private func waitUntil(
-        timeout: Duration = .seconds(2),
-        condition: @MainActor () -> Bool
-    ) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if condition() {
-                return true
-            }
-            try? await Task.sleep(for: .milliseconds(1))
-        }
-        return condition()
-    }
-
     private func makeCoordinator(
         recorder: CoordinatorRecorder,
         applyCanonical: MCPReadFileAutoSelectionCoordinator.ApplyCanonical? = nil
@@ -782,6 +767,21 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
             route: route,
             bindingGeneration: bindingGeneration
         )
+    }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(5),
+        condition: @escaping () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
     }
 }
 

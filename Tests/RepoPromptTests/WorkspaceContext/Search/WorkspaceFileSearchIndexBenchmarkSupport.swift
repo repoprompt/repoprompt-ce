@@ -913,21 +913,6 @@
                 return value
             }
 
-            private func distributionDictionary(_ distribution: WorkspaceBenchmarkDistribution) -> [String: Any] {
-                [
-                    "retainedSampleCount": distribution.rawValues.count,
-                    "rawValues": distribution.rawValues,
-                    "mean": distribution.mean,
-                    "median": distribution.median,
-                    "nearestRankP95": distribution.nearestRankP95,
-                    "sampleVariance": distribution.sampleVariance,
-                    "sampleStandardDeviation": distribution.sampleStandardDeviation,
-                    "coefficientOfVariation": distribution.coefficientOfVariation.map { $0 as Any } ?? NSNull(),
-                    "minimum": distribution.minimum,
-                    "maximum": distribution.maximum
-                ]
-            }
-
             private func validityIssueDictionary(_ issue: WorkspaceBenchmarkValidityIssue) -> [String: Any] {
                 ["code": issue.code, "detail": issue.detail]
             }
@@ -1341,10 +1326,6 @@
                     }
                 }
                 return lines
-            }
-
-            private func markdownEscaped(_ value: String) -> String {
-                value.replacingOccurrences(of: "|", with: "\\|")
             }
 
             private func coldStartRows(_ aggregate: WorkspaceFileSearchIndexBenchmarkAggregate) -> [String] {

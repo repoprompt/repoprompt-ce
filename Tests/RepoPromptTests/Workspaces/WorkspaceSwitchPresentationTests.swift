@@ -174,12 +174,14 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
         line: UInt = #line,
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            try await AsyncTestWait.waitUntil("workspace switch presentation condition", timeout: timeout) {
+                await MainActor.run { condition() }
+            }
+        } catch {
+            XCTFail("Timed out waiting for workspace switch presentation condition: \(error)", file: file, line: line)
+            throw error
         }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
     }
 }
 

@@ -199,30 +199,55 @@ final class GitProcessAdmissionControllerTests: XCTestCase {
         XCTAssertEqual(snapshot.activeLeaseCount, 0)
     }
 
-    func testBudgetsBoundGlobalAndPerRepositoryConcurrency() async {
+    func testBudgetsBoundGlobalAndPerRepositoryConcurrency() async throws {
         let controller = GitProcessAdmissionController(globalLimit: 2, perRepositoryLimit: 1)
         let probe = GitAdmissionProbe()
         let repositories = ["repo-a", "repo-a", "repo-b", "repo-c"]
 
-        await withTaskGroup(of: Void.self) { group in
-            for repository in repositories {
-                group.addTask {
-                    do {
-                        let lease = try await controller.acquire(repositoryKey: repository)
-                        await probe.enter(repository: repository)
-                        try? await Task.sleep(nanoseconds: 30_000_000)
-                        await probe.leave(repository: repository)
-                        await controller.release(lease)
-                    } catch {
-                        XCTFail("unexpected admission failure: \(error)")
-                    }
+        let runAdmission: (String) -> Task<Void, Never> = { repository in
+            Task {
+                do {
+                    let lease = try await controller.acquire(repositoryKey: repository)
+                    await probe.enterAndWait(repository: repository)
+                    await probe.leave(repository: repository)
+                    await controller.release(lease)
+                } catch {
+                    XCTFail("unexpected admission failure: \(error)")
                 }
             }
         }
 
-        let snapshot = await probe.snapshot()
-        XCTAssertLessThanOrEqual(snapshot.peakGlobal, 2)
-        XCTAssertLessThanOrEqual(snapshot.peakByRepository["repo-a"] ?? 0, 1)
+        let firstTask = runAdmission(repositories[0])
+        try await AsyncTestWait.waitUntil("repo-a Git permit to be active") {
+            await probe.snapshot().activeByRepository["repo-a"] == 1
+        }
+        let tasks = [firstTask] + repositories.dropFirst().map(runAdmission)
+
+        do {
+            try await AsyncTestWait.waitUntil("both global Git permits and repo-a to be active") {
+                let snapshot = await probe.snapshot()
+                return snapshot.activeGlobal == 2 && snapshot.activeByRepository["repo-a"] == 1
+            }
+        } catch {
+            await probe.releaseAll()
+            for task in tasks {
+                task.cancel()
+                await task.value
+            }
+            throw error
+        }
+
+        var snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.activeGlobal, 2)
+        XCTAssertEqual(snapshot.activeByRepository["repo-a"], 1)
+        await probe.releaseAll()
+        for task in tasks {
+            await task.value
+        }
+
+        snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.peakGlobal, 2)
+        XCTAssertEqual(snapshot.peakByRepository["repo-a"], 1)
         XCTAssertEqual(snapshot.completed, repositories.count)
     }
 
@@ -247,11 +272,10 @@ final class GitProcessAdmissionControllerTests: XCTestCase {
     private func waitUntil(
         _ predicate: @escaping () async -> Bool
     ) async throws {
-        for _ in 0 ..< 10000 {
-            if await predicate() { return }
-            await Task.yield()
-        }
-        XCTFail("Timed out waiting for Git admission state")
+        try await AsyncTestWait.waitUntil(
+            "Git process admission state",
+            condition: predicate
+        )
     }
 
     private func admissionTask(
@@ -351,8 +375,10 @@ private actor GitAdmissionProbe {
     private var peakGlobal = 0
     private var peakByRepository: [String: Int] = [:]
     private var completed = 0
+    private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-    func enter(repository: String) {
+    func enterAndWait(repository: String) async {
         activeGlobal += 1
         activeByRepository[repository, default: 0] += 1
         peakGlobal = max(peakGlobal, activeGlobal)
@@ -360,6 +386,10 @@ private actor GitAdmissionProbe {
             peakByRepository[repository] ?? 0,
             activeByRepository[repository] ?? 0
         )
+        if released {
+            return
+        }
+        await withCheckedContinuation { releaseWaiters.append($0) }
     }
 
     func leave(repository: String) {
@@ -368,7 +398,20 @@ private actor GitAdmissionProbe {
         completed += 1
     }
 
-    func snapshot() -> (peakGlobal: Int, peakByRepository: [String: Int], completed: Int) {
-        (peakGlobal, peakByRepository, completed)
+    func releaseAll() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func snapshot() -> (
+        activeGlobal: Int,
+        activeByRepository: [String: Int],
+        peakGlobal: Int,
+        peakByRepository: [String: Int],
+        completed: Int
+    ) {
+        (activeGlobal, activeByRepository, peakGlobal, peakByRepository, completed)
     }
 }

@@ -194,29 +194,35 @@ final class CLIProcessRunnerLifecycleTests: XCTestCase {
     }
 
     private static func waitForPIDFile(_ url: URL, timeout: TimeInterval = 3) async throws -> pid_t {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        var processID: pid_t?
+        try await AsyncTestWait.waitUntil("CLI process PID file", timeout: timeout) {
             if let text = try? String(contentsOf: url, encoding: .utf8),
                let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
             {
-                return value
+                processID = value
+                return true
             }
-            try? await Task.sleep(for: .milliseconds(20))
+            return false
         }
-        throw CLIProcessRunnerLifecycleTestError.pidFileTimedOut
+        guard let processID else { throw CLIProcessRunnerLifecycleTestError.pidFileTimedOut }
+        return processID
     }
 
     private static func waitUntilProcessGone(_ pid: pid_t, timeout: TimeInterval = 5) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if !processExists(pid) { return true }
-            try? await Task.sleep(for: .milliseconds(20))
+        do {
+            try await AsyncTestWait.waitUntil("CLI process \(pid) to exit", timeout: timeout) {
+                !processExists(pid)
+            }
+            return true
+        } catch {
+            return false
         }
-        return !processExists(pid)
     }
 
     private static func processExists(_ pid: pid_t) -> Bool {
-        if Darwin.kill(pid, 0) == 0 { return true }
+        if Darwin.kill(pid, 0) == 0 {
+            return true
+        }
         return errno == EPERM
     }
 
@@ -276,27 +282,30 @@ private actor ProcessLifecycleRecorder {
     }
 
     func waitForStart() async -> Bool {
-        for _ in 0 ..< 100 {
-            if startedPID != nil { return true }
-            try? await Task.sleep(for: .milliseconds(10))
+        do {
+            try await AsyncTestWait.waitUntil("process lifecycle start", timeout: 1) { await self.startedPID != nil }
+            return true
+        } catch {
+            return false
         }
-        return false
     }
 
     func waitForReadiness() async -> Bool {
-        for _ in 0 ..< 100 {
-            if readinessObserved { return true }
-            try? await Task.sleep(for: .milliseconds(10))
+        do {
+            try await AsyncTestWait.waitUntil("process lifecycle readiness", timeout: 1) { await self.readinessObserved }
+            return true
+        } catch {
+            return false
         }
-        return false
     }
 
     func waitForTermination() async -> Bool {
-        for _ in 0 ..< 300 {
-            if terminatedPID != nil { return true }
-            try? await Task.sleep(for: .milliseconds(10))
+        do {
+            try await AsyncTestWait.waitUntil("process lifecycle termination", timeout: 3) { await self.terminatedPID != nil }
+            return true
+        } catch {
+            return false
         }
-        return false
     }
 
     func snapshot() -> (startedPID: pid_t?, terminatedPID: pid_t?) {

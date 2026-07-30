@@ -97,6 +97,24 @@ class CIAppTestRunnerTests(unittest.TestCase):
             handle.write("\t".join(columns) + "\n")
             for row in rows:
                 values = {column: "" for column in columns}
+                values.update(
+                    {
+                        "method_id": f"root/{row['suite']}/{row['method']}",
+                        "target": "root",
+                        "file": "Tests/Fake.swift",
+                        "domain": "Root",
+                        "primary_contract_id": "contract",
+                        "validation_class": "unit",
+                        "layer": "root_swiftpm",
+                        "execution_tier": "fast",
+                        "scenario_count": "1",
+                        "observable_oracle": "oracle",
+                        "failure_risk": "low",
+                        "lifecycle_owner": "owner",
+                        "current_disposition": "retain",
+                        "preserved_scenario_delta": "0",
+                    }
+                )
                 values.update(row)
                 handle.write("\t".join(values[column] for column in columns) + "\n")
         return path
@@ -1378,59 +1396,6 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("did not match any built XCTest bundle", output.getvalue())
         run_all_suites.assert_not_called()
-
-    def write_ledger(self, directory: Path, rows: list[dict[str, str]]) -> Path:
-        header = [
-            "method_id",
-            "target",
-            "file",
-            "suite",
-            "method",
-            "domain",
-            "primary_contract_id",
-            "secondary_contract_tags",
-            "validation_class",
-            "layer",
-            "execution_tier",
-            "scenario_count",
-            "fixture_ids",
-            "observable_oracle",
-            "failure_risk",
-            "runtime_seconds",
-            "resource_cost_tags",
-            "shared_state_tags",
-            "lifecycle_owner",
-            "current_disposition",
-            "replacement_method_id",
-            "preserved_scenario_delta",
-            "notes",
-        ]
-        path = directory / "ledger.tsv"
-        lines = ["\t".join(header)]
-        for row in rows:
-            complete = {key: "" for key in header}
-            complete.update(
-                {
-                    "method_id": f"root/{row['suite']}/{row['method']}",
-                    "target": "root",
-                    "file": "Tests/Fake.swift",
-                    "domain": "Root",
-                    "primary_contract_id": "contract",
-                    "validation_class": "unit",
-                    "layer": "root_swiftpm",
-                    "execution_tier": "fast",
-                    "scenario_count": "1",
-                    "observable_oracle": "oracle",
-                    "failure_risk": "low",
-                    "lifecycle_owner": "owner",
-                    "current_disposition": "retain",
-                    "preserved_scenario_delta": "0",
-                }
-            )
-            complete.update(row)
-            lines.append("\t".join(complete[key] for key in header))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
 
     def test_plan_selected_suites_uses_runtime_balanced_shard_and_slow_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

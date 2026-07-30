@@ -403,12 +403,15 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         }
     }
 
-    private func waitUntil(_ condition: () async -> Bool) async -> Bool {
-        for _ in 0 ..< 200 {
-            if await condition() { return true }
-            try? await Task.sleep(for: .milliseconds(5))
+    private func waitUntil(_ condition: @escaping () async -> Bool) async -> Bool {
+        do {
+            try await AsyncTestWait.waitUntil("MCP tool admission condition", timeout: 1) {
+                await condition()
+            }
+            return true
+        } catch {
+            return false
         }
-        return false
     }
 }
 
