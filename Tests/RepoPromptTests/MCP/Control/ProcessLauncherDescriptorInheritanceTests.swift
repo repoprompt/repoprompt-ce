@@ -51,6 +51,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         var blockedMask = sigset_t()
         sigemptyset(&blockedMask)
         sigaddset(&blockedMask, SIGCHLD)
+        sigaddset(&blockedMask, SIGTERM)
         var previousMask = sigset_t()
         XCTAssertEqual(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask), 0)
         defer {
@@ -61,7 +62,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
             command: "/usr/bin/python3",
             arguments: [
                 "-c",
-                "import signal; blocked = signal.pthread_sigmask(signal.SIG_BLOCK, []); print('sigchld:' + ('blocked' if signal.SIGCHLD in blocked else 'unblocked'))"
+                "import signal; blocked = signal.pthread_sigmask(signal.SIG_BLOCK, []); print('sigchld:' + ('blocked' if signal.SIGCHLD in blocked else 'unblocked')); print('sigterm:' + ('blocked' if signal.SIGTERM in blocked else 'unblocked'))"
             ],
             environment: ProcessInfo.processInfo.environment,
             workingDirectory: nil
@@ -74,7 +75,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         let status = try Self.waitForExit(spawned.pid)
 
         XCTAssertEqual(status, 0)
-        XCTAssertEqual(stdout, "sigchld:unblocked\n")
+        XCTAssertEqual(stdout, "sigchld:unblocked\nsigterm:unblocked\n")
         XCTAssertEqual(stderr, "")
     }
 
