@@ -13,6 +13,60 @@ enum WorkspaceLookupRootScope: Hashable {
     )
 }
 
+enum WorkspaceLookupRootSelectorConflict: Error, Equatable {
+    case rootIDHasMultiplePaths
+    case rootIDHasMultipleRoles
+}
+
+struct WorkspaceValidatedLookupRootSelector: Equatable {
+    let canonicalRootPathsByID: [UUID: String]
+    let physicalRootPathsByID: [UUID: String]
+}
+
+enum WorkspaceLookupRootSelectorValidation: Equatable {
+    case valid(WorkspaceValidatedLookupRootSelector)
+    case conflict(WorkspaceLookupRootSelectorConflict)
+}
+
+enum WorkspaceLookupRootSelectorValidator {
+    static func validate(
+        canonicalRoots: Set<WorkspaceRootRef>,
+        physicalRoots: Set<WorkspaceRootRef>
+    ) -> WorkspaceLookupRootSelectorValidation {
+        switch normalizedPathsByID(canonicalRoots) {
+        case let .failure(conflict):
+            return .conflict(conflict)
+        case let .success(canonicalRootPathsByID):
+            switch normalizedPathsByID(physicalRoots) {
+            case let .failure(conflict):
+                return .conflict(conflict)
+            case let .success(physicalRootPathsByID):
+                guard Set(canonicalRootPathsByID.keys).isDisjoint(with: physicalRootPathsByID.keys) else {
+                    return .conflict(.rootIDHasMultipleRoles)
+                }
+                return .valid(WorkspaceValidatedLookupRootSelector(
+                    canonicalRootPathsByID: canonicalRootPathsByID,
+                    physicalRootPathsByID: physicalRootPathsByID
+                ))
+            }
+        }
+    }
+
+    private static func normalizedPathsByID(
+        _ roots: Set<WorkspaceRootRef>
+    ) -> Result<[UUID: String], WorkspaceLookupRootSelectorConflict> {
+        var pathsByID: [UUID: String] = [:]
+        for root in roots {
+            let path = root.standardizedFullPath
+            if let existingPath = pathsByID[root.id], existingPath != path {
+                return .failure(.rootIDHasMultiplePaths)
+            }
+            pathsByID[root.id] = path
+        }
+        return .success(pathsByID)
+    }
+}
+
 enum WorkspaceLookupRootScopeAvailability: Equatable {
     case available
     case sessionWorktreeUnavailable(missingPhysicalRootPaths: [String])
@@ -493,6 +547,13 @@ struct WorkspaceAppliedIndexRootSnapshot: Equatable {
     let generation: UInt64
     let files: [WorkspaceFileRecord]
     let folders: [WorkspaceFolderRecord]
+}
+
+struct WorkspaceAppliedIndexRecordLookup: Equatable {
+    let root: WorkspaceRootRecord
+    let generation: UInt64
+    let filesByID: [UUID: WorkspaceFileRecord]
+    let foldersByID: [UUID: WorkspaceFolderRecord]
 }
 
 struct WorkspaceSliceRebasePathState: Equatable {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 struct CodeMapArtifactStorePolicy: Equatable {
     static let `default` = CodeMapArtifactStorePolicy()

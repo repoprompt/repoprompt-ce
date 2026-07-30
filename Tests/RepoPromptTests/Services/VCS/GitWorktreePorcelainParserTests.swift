@@ -120,6 +120,106 @@ final class GitWorktreePorcelainParserTests: XCTestCase {
         }
     }
 
+    func testStandardizedPathAliasesCollapseOnlyForEquivalentRepositoryLayouts() throws {
+        let canonicalPath = "/tmp/repo"
+        let aliasPath = "/tmp/repo/linked/.."
+        let output = [
+            "worktree \(aliasPath)",
+            "HEAD 7777777777777777777777777777777777777777",
+            "branch refs/heads/main",
+            "",
+            "worktree \(canonicalPath)",
+            "HEAD 7777777777777777777777777777777777777777",
+            "branch refs/heads/main",
+            ""
+        ].joined(separator: "\0")
+        let records = try GitWorktreePorcelainParser.parse(output, format: .nulTerminated)
+        let commonDirectory = URL(fileURLWithPath: "/tmp/repo/.git")
+
+        func layout(
+            root: URL,
+            commonDirectory: URL,
+            marksDirectories: Bool = false
+        ) -> GitRepositoryLayout {
+            let markedRoot = URL(fileURLWithPath: root.path, isDirectory: marksDirectories)
+            let markedCommonDirectory = URL(
+                fileURLWithPath: commonDirectory.path,
+                isDirectory: marksDirectories
+            )
+            return GitRepositoryLayout(
+                workTreeRoot: markedRoot,
+                dotGitPath: markedRoot.appendingPathComponent(".git", isDirectory: marksDirectories),
+                gitDir: markedCommonDirectory.appendingPathComponent("worktrees/repo", isDirectory: marksDirectories),
+                commonDir: markedCommonDirectory,
+                isWorktree: true
+            )
+        }
+
+        let resolution = try GitService.collapseEquivalentWorktreeAliases(records) {
+            layout(root: $0, commonDirectory: commonDirectory)
+        }
+
+        XCTAssertEqual(resolution.records.count, 1)
+        XCTAssertEqual(resolution.collapsedAliasCount, 1)
+        XCTAssertEqual(resolution.records[0].record.path, canonicalPath)
+        XCTAssertEqual(resolution.records[0].pathURL.path, canonicalPath)
+        XCTAssertEqual(resolution.records[0].layout?.workTreeRoot.path, canonicalPath)
+
+        var directoryMarkerIndex = 0
+        let directoryMarkerResolution = try GitService.collapseEquivalentWorktreeAliases(records) { root in
+            defer { directoryMarkerIndex += 1 }
+            return layout(
+                root: root,
+                commonDirectory: commonDirectory,
+                marksDirectories: directoryMarkerIndex == 0
+            )
+        }
+        XCTAssertEqual(directoryMarkerResolution.records.count, 1)
+        XCTAssertEqual(directoryMarkerResolution.collapsedAliasCount, 1)
+        XCTAssertEqual(directoryMarkerResolution.records[0].layout?.workTreeRoot.hasDirectoryPath, true)
+
+        XCTAssertThrowsError(
+            try GitService.collapseEquivalentWorktreeAliases(records) { _ in nil }
+        ) { error in
+            XCTAssertEqual(error as? GitService.WorktreeAliasConflict, .repositoryLayout)
+        }
+
+        var partialLayoutIndex = 0
+        XCTAssertThrowsError(
+            try GitService.collapseEquivalentWorktreeAliases(records) { root in
+                defer { partialLayoutIndex += 1 }
+                return partialLayoutIndex == 0
+                    ? layout(root: root, commonDirectory: commonDirectory)
+                    : nil
+            }
+        ) { error in
+            XCTAssertEqual(error as? GitService.WorktreeAliasConflict, .repositoryLayout)
+        }
+
+        var layoutIndex = 0
+        XCTAssertThrowsError(
+            try GitService.collapseEquivalentWorktreeAliases(records) { root in
+                defer { layoutIndex += 1 }
+                let resolvedCommonDirectory = layoutIndex == 0
+                    ? commonDirectory
+                    : URL(fileURLWithPath: "/tmp/other-repo/.git")
+                return layout(root: root, commonDirectory: resolvedCommonDirectory)
+            }
+        ) { error in
+            XCTAssertEqual(error as? GitService.WorktreeAliasConflict, .repositoryLayout)
+        }
+
+        var conflictingRecords = records
+        conflictingRecords[1].branch = "topic"
+        XCTAssertThrowsError(
+            try GitService.collapseEquivalentWorktreeAliases(conflictingRecords) {
+                layout(root: $0, commonDirectory: commonDirectory)
+            }
+        ) { error in
+            XCTAssertEqual(error as? GitService.WorktreeAliasConflict, .recordMetadata)
+        }
+    }
+
     func testWorktreeListZFallsBackOnlyForUnsupportedCapabilityFailures() {
         XCTAssertTrue(GitService.shouldFallbackFromWorktreeListZError("error: unknown option `z'"))
         XCTAssertTrue(GitService.shouldFallbackFromWorktreeListZError("usage: git worktree list [<options>]"))
