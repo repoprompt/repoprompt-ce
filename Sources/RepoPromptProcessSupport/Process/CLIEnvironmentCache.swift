@@ -1,15 +1,15 @@
 import Darwin
 import Foundation
 
-actor CLIEnvironmentCache {
-    static let shared = CLIEnvironmentCache()
+package actor CLIEnvironmentCache {
+    package static let shared = CLIEnvironmentCache()
 
     private var cachedSnapshots: [ShellEnvironmentCaptureMode: CLIEnvironmentSnapshot] = [:]
     private var fallbackEnvironments: [ShellEnvironmentCaptureMode: [String: String]] = [:]
     private var loadTasks: [ShellEnvironmentCaptureMode: Task<CLIEnvironmentSnapshot, Never>] = [:]
     private var loadGenerations: [ShellEnvironmentCaptureMode: UInt64] = [:]
 
-    func invalidate() {
+    package func invalidate() {
         for mode in ShellEnvironmentCaptureMode.allCases {
             loadGenerations[mode, default: 0] &+= 1
             loadTasks[mode]?.cancel()
@@ -21,11 +21,11 @@ actor CLIEnvironmentCache {
         }
     }
 
-    func environment(enableLogging: Bool) async -> [String: String] {
+    package func environment(enableLogging: Bool) async -> [String: String] {
         await environmentSnapshot(enableLogging: enableLogging).environment
     }
 
-    func environmentSnapshot(
+    package func environmentSnapshot(
         enableLogging: Bool,
         forceRefresh: Bool = false,
         captureMode: ShellEnvironmentCaptureMode = .interactiveLoginShell
@@ -278,7 +278,9 @@ actor CLIEnvironmentCache {
         for candidate in fallbackPathCandidates {
             let expanded = expandTilde(candidate, home: home)
             guard !expanded.isEmpty else { continue }
-            if !FileManager.default.fileExists(atPath: expanded) { continue }
+            if !FileManager.default.fileExists(atPath: expanded) {
+                continue
+            }
             if !seen.contains(expanded) {
                 appendComponent(expanded)
                 appendedFallback = true
@@ -334,20 +336,19 @@ actor CLIEnvironmentCache {
     private static let fallbackPathCandidates: [String] = CLINativePathDefaults.loginShellFallbackCandidates
 
     #if DEBUG
-        @_spi(TestSupport)
-        public static func capturedEnvironment(enableLogging: Bool) async -> [String: String] {
+        package static func capturedEnvironment(enableLogging: Bool) async -> [String: String] {
             await shared.environment(enableLogging: enableLogging)
         }
 
-        static func test_snapshot(environment: [String: String], source: ShellEnvironmentSource) -> CLIEnvironmentSnapshot {
+        package static func test_snapshot(environment: [String: String], source: ShellEnvironmentSource) -> CLIEnvironmentSnapshot {
             CLIEnvironmentSnapshot(environment: environment, source: source)
         }
 
-        static func test_enrichedPath(existing: String?, home: String?) -> String {
+        package static func test_enrichedPath(existing: String?, home: String?) -> String {
             enrichedPath(existing: existing, home: home, enableLogging: false)
         }
 
-        static func test_pathLooksInsufficient(_ value: String?) -> Bool {
+        package static func test_pathLooksInsufficient(_ value: String?) -> Bool {
             pathLooksInsufficient(value)
         }
     #endif

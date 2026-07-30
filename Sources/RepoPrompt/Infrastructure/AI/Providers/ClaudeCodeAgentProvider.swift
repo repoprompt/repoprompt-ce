@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 struct HeadlessAgentContext {
     let runID: UUID
@@ -429,7 +430,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                             appendTail(&stdoutTail, chunk: chunk, limit: 128 * 1024)
                                             var sawStopThisChunk = false
                                             framer.feed(chunk) { lineData in
-                                                if sawStopThisChunk { return }
+                                                if sawStopThisChunk {
+                                                    return
+                                                }
                                                 guard !lineData.isEmpty else { return }
                                                 if Task.isCancelled {
                                                     return
@@ -443,7 +446,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                                         }
                                                         continuation.yield(mapped)
                                                         eventCount += 1
-                                                        if sawStopThisChunk { break }
+                                                        if sawStopThisChunk {
+                                                            break
+                                                        }
                                                     }
                                                 }
                                             }
@@ -694,7 +699,9 @@ private enum ClaudeEventParser {
         case let string as String:
             return string
         case let dict as [String: Any]:
-            if let text = dict["text"] as? String { return text }
+            if let text = dict["text"] as? String {
+                return text
+            }
             return nil
         case let array as [Any]:
             return array.compactMap { extractString($0) }.joined(separator: "")

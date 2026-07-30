@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptProcessSupport
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
@@ -2426,7 +2427,9 @@ final actor ClaudeNativeProcessSessionController {
                 "byteCount": data.count,
                 "text": text
             ]
-            if truncated { result["truncated"] = true }
+            if truncated {
+                result["truncated"] = true
+            }
             return result
         }
         return [

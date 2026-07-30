@@ -9,6 +9,7 @@ import Cocoa
 import Foundation
 import MachO
 import os.lock
+import RepoPromptProcessSupport
 
 /// This class handles application security by monitoring the environment
 /// for potential tampering or unauthorized access.

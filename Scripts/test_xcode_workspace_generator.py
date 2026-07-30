@@ -111,7 +111,8 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
-            {"RepoPromptApp", "RepoPromptCodeMapCore", "RepoPromptMCP", "RepoPromptShared"},
+            {"RepoPromptApp", "RepoPromptMCP", "RepoPromptProcessSupport", "RepoPromptShared"},
+            {"RepoPromptApp", "RepoPromptCodeMapCore", "RepoPromptMCP", "RepoPromptProcessSupport", "RepoPromptShared"},
         )
         self.assertNotIn("RepoPrompt", generator._by_name_dependencies(targets["RepoPromptTests"]))
 

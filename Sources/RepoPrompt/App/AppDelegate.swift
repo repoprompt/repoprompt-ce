@@ -1,6 +1,7 @@
 import Cocoa
 import Combine
 import Darwin
+import RepoPromptProcessSupport
 import Sparkle
 import SwiftUI
 

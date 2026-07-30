@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPromptApp
+import RepoPromptProcessSupport
 import XCTest
 
 final class CLIProcessRunnerLifecycleTests: XCTestCase {
@@ -209,14 +209,18 @@ final class CLIProcessRunnerLifecycleTests: XCTestCase {
     private static func waitUntilProcessGone(_ pid: pid_t, timeout: TimeInterval = 5) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if !processExists(pid) { return true }
+            if !processExists(pid) {
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return !processExists(pid)
     }
 
     private static func processExists(_ pid: pid_t) -> Bool {
-        if Darwin.kill(pid, 0) == 0 { return true }
+        if Darwin.kill(pid, 0) == 0 {
+            return true
+        }
         return errno == EPERM
     }
 
@@ -277,7 +281,9 @@ private actor ProcessLifecycleRecorder {
 
     func waitForStart() async -> Bool {
         for _ in 0 ..< 100 {
-            if startedPID != nil { return true }
+            if startedPID != nil {
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         return false
@@ -285,7 +291,9 @@ private actor ProcessLifecycleRecorder {
 
     func waitForReadiness() async -> Bool {
         for _ in 0 ..< 100 {
-            if readinessObserved { return true }
+            if readinessObserved {
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         return false
@@ -293,7 +301,9 @@ private actor ProcessLifecycleRecorder {
 
     func waitForTermination() async -> Bool {
         for _ in 0 ..< 300 {
-            if terminatedPID != nil { return true }
+            if terminatedPID != nil {
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         return false

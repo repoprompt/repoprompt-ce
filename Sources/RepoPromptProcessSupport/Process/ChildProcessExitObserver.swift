@@ -5,14 +5,14 @@ import Foundation
 /// One cancellation-independent owner for a direct child's destructive reap.
 /// Callers may wait repeatedly, but only the callback-based observation invokes
 /// `waitpid` through `ProcessTermination.observeChildStatus`.
-final class ChildProcessExitObserver: @unchecked Sendable {
-    typealias StatusObserver = @Sendable (
+package final class ChildProcessExitObserver: @unchecked Sendable {
+    package typealias StatusObserver = @Sendable (
         _ pid: pid_t,
         _ beforeReap: @escaping @Sendable () -> Void,
         _ completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
     ) -> Void
 
-    enum Outcome: Equatable {
+    package enum Outcome: Equatable {
         case exited(ProcessExitStatus)
         case failed(ProcessTerminationError)
     }
@@ -112,7 +112,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
     ///   reaper registry queue between signal-window closure and the destructive
     ///   reap; it must never block, or exit processing for every observed child
     ///   stalls behind it.
-    init(
+    package init(
         pid: pid_t,
         beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void = { _ in },
         afterClosingRootSignalingBeforeReap: @escaping @Sendable () -> Void = {},
@@ -137,7 +137,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         )
     }
 
-    func wait(timeout: TimeInterval? = nil) async -> Outcome? {
+    package func wait(timeout: TimeInterval? = nil) async -> Outcome? {
         await state.wait(timeout: timeout)
     }
 

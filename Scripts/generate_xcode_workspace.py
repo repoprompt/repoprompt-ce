@@ -155,15 +155,16 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
 
     expected_test_dependencies = {
         "RepoPromptApp",
-        "RepoPromptCodeMapCore",
         "RepoPromptMCP",
+        "RepoPromptProcessSupport",
+        "RepoPromptCodeMapCore",
         "RepoPromptShared",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
     if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
-            "RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, "
+            "RepoPromptProcessSupport, and RepoPromptShared"
         )
 
     unsafe_flags: list[list[str]] = []

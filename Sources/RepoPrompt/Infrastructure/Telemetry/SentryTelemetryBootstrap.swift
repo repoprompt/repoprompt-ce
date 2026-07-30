@@ -43,6 +43,7 @@ enum SentryTelemetryBootstrap {
                 options.add(inAppInclude: "RepoPrompt")
                 options.add(inAppInclude: "RepoPromptMCP")
                 options.add(inAppInclude: "RepoPromptShared")
+                options.add(inAppInclude: "RepoPromptProcessSupport")
                 options.sendDefaultPii = false
                 options.enableUncaughtNSExceptionReporting = true
                 options.enableAppHangTracking = appHangReportsEnabled

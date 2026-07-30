@@ -5,27 +5,27 @@ import Foundation
 /// This is intentionally narrower than a full process-environment builder: it is a
 /// first-class signal that later launch code can use to decide whether inherited
 /// environment variables are likely user-shell-rich or macOS app-launch-minimal.
-enum ProcessLaunchSource: Equatable {
+package enum ProcessLaunchSource: Equatable {
     case launchServices
     case xcode
     case terminalInherited
     case unknown
 }
 
-struct ProcessLaunchContext: Equatable {
-    static let launchSourceEnvironmentKey = "REPOPROMPT_LAUNCH_SOURCE"
-    static let launchServicesEnvironmentValue = "launchservices"
+package struct ProcessLaunchContext: Equatable {
+    package static let launchSourceEnvironmentKey = "REPOPROMPT_LAUNCH_SOURCE"
+    package static let launchServicesEnvironmentValue = "launchservices"
 
-    let source: ProcessLaunchSource
-    let inheritedEnvironmentPath: String?
-    let shell: String?
-    let home: String?
+    package let source: ProcessLaunchSource
+    package let inheritedEnvironmentPath: String?
+    package let shell: String?
+    package let home: String?
 
-    static var current: ProcessLaunchContext {
+    package static var current: ProcessLaunchContext {
         detect()
     }
 
-    static func detect(from environment: [String: String] = ProcessInfo.processInfo.environment) -> ProcessLaunchContext {
+    package static func detect(from environment: [String: String] = ProcessInfo.processInfo.environment) -> ProcessLaunchContext {
         let source: ProcessLaunchSource = if environment[launchSourceEnvironmentKey] == launchServicesEnvironmentValue {
             .launchServices
         } else if isXcodeOrTestEnvironment(environment) {
