@@ -123,11 +123,12 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
         let model = AIModel.codexCustom(name: "gpt-5.5-high").rawValue
 
         // User has the same model for Oracle and Chat with sync on.
-        store.setSyncChatModelWithOracle(true)
         store.setPlanningModelRaw(model, commit: true)
         store.setPreferredComposeModelRaw(model, commit: true)
+        store.setSyncChatModelWithOracle(true)
         XCTAssertEqual(store.planningModelRaw(), model)
         XCTAssertEqual(store.preferredComposeModelRaw(), model)
+        XCTAssertTrue(store.syncChatModelWithOracle())
 
         // Transient blank of the chat model (pickDiffCapableFallback's empty branch) routes
         // through here with honorSync=true while sync is on.
@@ -165,9 +166,10 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
         let model = AIModel.codexCustom(name: "gpt-5.5-high").rawValue
         let newModel = AIModel.codexCustom(name: "gpt-5.5-low").rawValue
 
-        store.setSyncChatModelWithOracle(true)
         store.setPlanningModelRaw(model, commit: true)
         store.setPreferredComposeModelRaw(model, commit: true)
+        store.setSyncChatModelWithOracle(true)
+        XCTAssertTrue(store.syncChatModelWithOracle())
 
         // A real (non-empty) chat model selection must still mirror into the Oracle when sync is on.
         store.setPreferredComposeModelRaw(newModel, commit: true, honorSync: true)

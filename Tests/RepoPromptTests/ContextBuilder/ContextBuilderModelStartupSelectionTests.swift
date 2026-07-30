@@ -8,7 +8,7 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         let fixture = try makeStoreFixture()
         fixture.store.setGlobalContextBuilderAgentSelection(
             agentRaw: AgentProviderKind.codexExec.rawValue,
-            modelRaw: AgentModel.gpt55CodexLow.rawValue,
+            modelRaw: AgentModel.gpt56SolLow.rawValue,
             markUserDefined: true
         )
 
@@ -26,7 +26,7 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         ))
 
         XCTAssertEqual(resolved.agent, .codexExec)
-        XCTAssertEqual(resolved.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertEqual(resolved.modelRaw, AgentModel.gpt56SolLow.rawValue)
     }
 
     func testUnavailablePersistedSelectionFallsBackToRecommendedAvailableProvider() throws {
@@ -42,7 +42,7 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         ))
 
         XCTAssertEqual(resolved.agent, .codexExec)
-        XCTAssertEqual(resolved.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertEqual(resolved.modelRaw, AgentModel.gpt56SolLow.rawValue)
     }
 
     func testUnconfiguredClaudeCodeCannotBecomeEffectiveStartupSelection() throws {

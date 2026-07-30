@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 struct WorkspaceCodemapLogicalPresentationPath: Hashable {
     let rootDisplayName: String

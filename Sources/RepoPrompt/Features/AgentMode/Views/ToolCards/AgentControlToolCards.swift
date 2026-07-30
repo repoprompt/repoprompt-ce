@@ -1,5 +1,34 @@
 import SwiftUI
 
+struct AgentReasoningEffortBadgePresentation: Equatable {
+    let rawValue: String
+    let displayLabel: String
+
+    init?(rawValue: String?) {
+        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawValue.isEmpty
+        else {
+            return nil
+        }
+        self.rawValue = rawValue
+        displayLabel = CodexReasoningEffort.parse(rawValue)?.displayName
+            ?? Self.readableFallbackLabel(from: rawValue)
+    }
+
+    private static func readableFallbackLabel(from rawValue: String) -> String {
+        let tokens = rawValue
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .split(separator: " ")
+            .map { token in
+                let value = String(token)
+                return value.isEmpty ? value : value.prefix(1).uppercased() + value.dropFirst().lowercased()
+            }
+        let label = tokens.joined(separator: " ")
+        return label.isEmpty ? rawValue : label
+    }
+}
+
 struct AgentRunCardPresentation: Equatable {
     let sessionID: UUID?
     let statusWord: String?
@@ -8,7 +37,7 @@ struct AgentRunCardPresentation: Equatable {
     let agentName: String?
     let model: String?
     let workflowLabel: String?
-    let reasoningEffort: String?
+    let reasoningBadge: AgentReasoningEffortBadgePresentation?
     let assistantText: String?
     let interactionKind: String?
     let interactionPrompt: String?
@@ -32,7 +61,8 @@ struct AgentRunCardPresentation: Equatable {
             ?? args?.workflowName?.nonEmpty
             ?? (resultObject["workflow_id"] as? String)?.nonEmpty
             ?? args?.workflowID?.nonEmpty
-        reasoningEffort = (agentObject?["reasoning_effort"] as? String)?.nonEmpty ?? args?.reasoningEffort?.nonEmpty
+        let rawReasoningEffort = (agentObject?["reasoning_effort"] as? String)?.nonEmpty ?? args?.reasoningEffort?.nonEmpty
+        reasoningBadge = AgentReasoningEffortBadgePresentation(rawValue: rawReasoningEffort)
         assistantText = (resultObject["assistant_text"] as? String)?.nonEmpty
         interactionKind = (interactionObject?["kind"] as? String)?.nonEmpty
         interactionPrompt = (interactionObject?["prompt"] as? String)?.nonEmpty
@@ -70,7 +100,7 @@ struct AgentRunCardPresentation: Equatable {
     }
 
     var subtitle: String? {
-        let parts = [statusLabel, interactionLabel, workflowLabel, sessionNameOrID, agentName, model, reasoningLabel]
+        let parts = [statusLabel, interactionLabel, workflowLabel, sessionNameOrID, agentName, model]
             .compactMap(\.self)
         if !parts.isEmpty {
             return parts.joined(separator: " • ")
@@ -99,10 +129,6 @@ struct AgentRunCardPresentation: Equatable {
     private var interactionLabel: String? {
         guard let interactionKind else { return nil }
         return AgentRunMCPSnapshot.Interaction.Kind(rawValue: interactionKind)?.displayLabel
-    }
-
-    private var reasoningLabel: String? {
-        reasoningEffort.map { "reasoning \($0)" }
     }
 
     private var deliveryExplanation: String? {
@@ -155,6 +181,44 @@ private extension String {
     }
 }
 
+private struct AgentReasoningEffortHeaderTrailingView: View {
+    let badge: AgentReasoningEffortBadgePresentation
+    let timestamp: Date?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            AgentReasoningEffortBadge(presentation: badge)
+            if let timestamp {
+                MessageTimestampText(date: timestamp)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
+        }
+        .fixedSize()
+    }
+}
+
+private struct AgentReasoningEffortBadge: View {
+    let presentation: AgentReasoningEffortBadgePresentation
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 8, weight: .semibold))
+            Text(presentation.displayLabel)
+                .font(.system(size: 10, weight: .medium))
+                .lineLimit(1)
+        }
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Reasoning effort \(presentation.displayLabel)")
+    }
+}
+
 struct AgentRunResultCard: View {
     let item: AgentChatItem
     @State private var isExpanded = false
@@ -204,6 +268,12 @@ struct AgentRunResultCard: View {
         return true
     }
 
+    private var headerTrailingView: AnyView? {
+        presentation?.reasoningBadge.map {
+            AnyView(AgentReasoningEffortHeaderTrailingView(badge: $0, timestamp: item.timestamp))
+        }
+    }
+
     var body: some View {
         ToolCardContainer(
             iconName: "play.circle",
@@ -213,6 +283,7 @@ struct AgentRunResultCard: View {
             subtitle: presentation?.subtitle,
             status: status,
             timestamp: item.timestamp,
+            headerTrailingView: headerTrailingView,
             isExpandable: hasExpandablePayload,
             isExpanded: $isExpanded
         ) {
@@ -312,6 +383,12 @@ struct AgentExploreResultCard: View {
         return true
     }
 
+    private var headerTrailingView: AnyView? {
+        presentation?.reasoningBadge.map {
+            AnyView(AgentReasoningEffortHeaderTrailingView(badge: $0, timestamp: item.timestamp))
+        }
+    }
+
     var body: some View {
         ToolCardContainer(
             iconName: "magnifyingglass.circle",
@@ -321,6 +398,7 @@ struct AgentExploreResultCard: View {
             subtitle: batchPresentation?.subtitle ?? presentation?.subtitle,
             status: status,
             timestamp: item.timestamp,
+            headerTrailingView: headerTrailingView,
             isExpandable: hasExpandablePayload,
             isExpanded: $isExpanded
         ) {

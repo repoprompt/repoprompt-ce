@@ -6,6 +6,62 @@ final class CodexCLIProvider: AIProvider {
         let emittedOutput: Bool
     }
 
+    private struct ReconciledTerminalTurn: Equatable {
+        let turnID: String
+        let status: CodexNativeSessionController.TurnStatus
+        let failure: CodexNativeSessionController.TurnFailure?
+    }
+
+    private actor TerminalReconciliationState {
+        private var lastEventAt: TimeInterval
+        private var eventGeneration: UInt64 = 0
+        private var terminalCandidateObserved = false
+        private var reconciledTerminal: ReconciledTerminalTurn?
+
+        init(startedAt: TimeInterval) {
+            lastEventAt = startedAt
+        }
+
+        func recordEvent(at timestamp: TimeInterval) {
+            lastEventAt = timestamp
+            eventGeneration &+= 1
+        }
+
+        func markTerminalCandidate() {
+            terminalCandidateObserved = true
+        }
+
+        func probeGeneration(
+            at timestamp: TimeInterval,
+            after inactivityInterval: TimeInterval
+        ) -> UInt64? {
+            guard terminalCandidateObserved,
+                  reconciledTerminal == nil,
+                  timestamp - lastEventAt >= inactivityInterval
+            else {
+                return nil
+            }
+            return eventGeneration
+        }
+
+        func claim(
+            _ terminal: ReconciledTerminalTurn,
+            ifEventGenerationIs expectedGeneration: UInt64
+        ) -> Bool {
+            guard reconciledTerminal == nil,
+                  eventGeneration == expectedGeneration
+            else {
+                return false
+            }
+            reconciledTerminal = terminal
+            return true
+        }
+
+        func terminal() -> ReconciledTerminalTurn? {
+            reconciledTerminal
+        }
+    }
+
     private actor TurnTimeoutState {
         private var didTimeout = false
 
@@ -27,6 +83,7 @@ final class CodexCLIProvider: AIProvider {
     private let enableDebugLogging: Bool
     private let defaultRequestTimeout: TimeInterval
     private let testRequestTimeout: TimeInterval
+    private let terminalSnapshotReconciliationInterval: TimeInterval
     private let maxRetries: Int
     private let appServerReadyHook: (() async throws -> Void)?
     private let sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)?
@@ -47,6 +104,7 @@ final class CodexCLIProvider: AIProvider {
         enableDebugLogging: Bool = false,
         defaultRequestTimeout: TimeInterval? = nil,
         testRequestTimeout: TimeInterval? = nil,
+        terminalSnapshotReconciliationInterval: TimeInterval = 5,
         maxRetries: Int? = nil,
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
@@ -57,6 +115,10 @@ final class CodexCLIProvider: AIProvider {
         self.enableDebugLogging = enableDebugLogging
         self.defaultRequestTimeout = defaultRequestTimeout ?? (45 * 60)
         self.testRequestTimeout = testRequestTimeout ?? 30
+        self.terminalSnapshotReconciliationInterval = max(
+            0.01,
+            terminalSnapshotReconciliationInterval
+        )
         self.maxRetries = maxRetries ?? 2
         self.appServerReadyHook = appServerReadyHook
         self.authRecovery = authRecovery
@@ -389,15 +451,18 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
-                _ = try await controller.startOrResume(
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
+                let sessionRef = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
-                _ = try await controller.startUserTurn(
+                let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
                     images: [],
                     model: selection.model,
@@ -406,10 +471,25 @@ final class CodexCLIProvider: AIProvider {
                 )
 
                 var sawCompletion = false
+                let reconciliationState = TerminalReconciliationState(
+                    startedAt: ProcessInfo.processInfo.systemUptime
+                )
+                let reconciliationMonitor = startTerminalSnapshotReconciliationMonitor(
+                    expectedTurnID: turnReceipt.provisionalSubmissionID,
+                    requestTimeout: requestTimeout,
+                    controller: controller,
+                    state: reconciliationState
+                )
+                defer {
+                    reconciliationMonitor.cancel()
+                }
                 eventLoop: for await event in controller.events {
                     if Task.isCancelled {
                         throw CancellationError()
                     }
+                    await reconciliationState.recordEvent(
+                        at: ProcessInfo.processInfo.systemUptime
+                    )
 
                     switch event {
                     case let .assistantDelta(delta):
@@ -424,6 +504,7 @@ final class CodexCLIProvider: AIProvider {
                         continuation.yield(AIStreamResult(type: "content", text: text))
 
                     case let .assistantCompleted(payload):
+                        await reconciliationState.markTerminalCandidate()
                         let existing = canonicalAssistantTextByScope[payload.scope] ?? ""
                         let existingUTF8 = existing.utf8
                         let completedUTF8 = payload.text.utf8
@@ -452,7 +533,7 @@ final class CodexCLIProvider: AIProvider {
                         switch status {
                         case .completed:
                             sawCompletion = true
-                            continuation.yield(Self.messageStopEvent())
+                            continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
                             break eventLoop
                         case .interrupted:
                             throw CancellationError()
@@ -510,6 +591,22 @@ final class CodexCLIProvider: AIProvider {
                     }
                 }
 
+                if !sawCompletion,
+                   let reconciledTerminal = await reconciliationState.terminal()
+                {
+                    switch reconciledTerminal.status {
+                    case .completed:
+                        sawCompletion = true
+                        continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
+                    case .interrupted:
+                        throw CancellationError()
+                    case .failed:
+                        throw AIProviderError.invalidResponse(
+                            detail: reconciledTerminal.failure?.message
+                                ?? "Codex's persisted turn completed with a failure after its terminal notification was missed."
+                        )
+                    }
+                }
                 if !sawCompletion {
                     if await didTimeout(monitor: timeoutMonitor) {
                         throw timeoutError(for: requestTimeout)
@@ -561,7 +658,10 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             let text = try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(appServerClient: appServerClient)
+                try await ensureAppServerReady(
+                    appServerClient: appServerClient,
+                    requestTimeout: requestTimeout
+                )
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -692,7 +792,10 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
-    private func ensureAppServerReady(appServerClient: CodexAppServerClient?) async throws {
+    private func ensureAppServerReady(
+        appServerClient: CodexAppServerClient?,
+        requestTimeout: TimeInterval
+    ) async throws {
         if let appServerReadyHook {
             try await appServerReadyHook()
             return
@@ -708,6 +811,7 @@ final class CodexCLIProvider: AIProvider {
                 )
             )
         }
+        await appServerClient.updateDefaultRequestTimeout(requestTimeout)
         try await appServerClient.startIfNeeded()
     }
 
@@ -729,6 +833,61 @@ final class CodexCLIProvider: AIProvider {
             await controller.shutdown()
         }
         return TurnTimeoutMonitor(state: state, task: task)
+    }
+
+    private func startTerminalSnapshotReconciliationMonitor(
+        expectedTurnID: String,
+        requestTimeout: TimeInterval,
+        controller: CodexSessionControlling,
+        state: TerminalReconciliationState
+    ) -> Task<Void, Never> {
+        let interval = terminalSnapshotReconciliationInterval
+        let snapshotTimeout = min(5, max(0.1, requestTimeout))
+        return Task {
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(interval))
+                    try Task.checkCancellation()
+                    guard let eventGeneration = await state.probeGeneration(
+                        at: ProcessInfo.processInfo.systemUptime,
+                        after: interval
+                    ) else {
+                        continue
+                    }
+                    let snapshot = try await controller.readThreadSnapshot(
+                        includeTurns: true,
+                        timeout: snapshotTimeout
+                    )
+                    try Task.checkCancellation()
+                    guard snapshot.latestTerminalTurnID == expectedTurnID,
+                          snapshot.activeTurnIDs.isEmpty,
+                          let status = snapshot.latestTurnStatus
+                    else {
+                        continue
+                    }
+                    let runtimeIsTerminal = snapshot.runtimeStatus == .idle
+                        || (snapshot.runtimeStatus == .systemError && status == .failed)
+                    guard runtimeIsTerminal else { continue }
+                    let terminal = ReconciledTerminalTurn(
+                        turnID: expectedTurnID,
+                        status: status,
+                        failure: snapshot.latestTurnFailure
+                    )
+                    guard await state.claim(
+                        terminal,
+                        ifEventGenerationIs: eventGeneration
+                    ) else {
+                        continue
+                    }
+                    await controller.shutdown()
+                    return
+                } catch is CancellationError {
+                    return
+                } catch {
+                    continue
+                }
+            }
+        }
     }
 
     private func didTimeout(monitor: TurnTimeoutMonitor?) async -> Bool {
@@ -753,12 +912,10 @@ final class CodexCLIProvider: AIProvider {
             preconditionFailure("CodexCLIProvider requires an app-server client when no custom session controller factory is provided.")
         }
 
+        let interactiveConfigOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
         let options = CodexNativeSessionController.Options(
             requestTimeout: requestTimeout,
-            configOverridesProvider: { [weak self] in
-                guard let self else { return [:] }
-                return interactiveConfigOverrides(excludeServers: excludeServers)
-            },
+            configOverridesProvider: { interactiveConfigOverrides },
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
@@ -773,7 +930,7 @@ final class CodexCLIProvider: AIProvider {
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: workingDirectory,
+            workspacePaths: .uniform(workingDirectory),
             options: options,
             // The transport is owned by the outer request lifecycle, not by the
             // single-turn controller.
@@ -817,8 +974,6 @@ final class CodexCLIProvider: AIProvider {
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: false,
-            viewImageToolEnabled: false,
-            includeApplyPatchTool: false,
             multiAgentEnabled: false
         )
     }
@@ -834,8 +989,6 @@ final class CodexCLIProvider: AIProvider {
         for (key, value) in mcpOverrides {
             overrides[key] = value
         }
-        overrides["approval_policy"] = CodexAgentToolPreferences.ApprovalPolicy.never.appServerConfigOverrideValue
-        overrides["sandbox_mode"] = CodexAgentToolPreferences.SandboxMode.readOnly.appServerConfigOverrideValue
         return overrides
     }
 
@@ -943,18 +1096,8 @@ final class CodexCLIProvider: AIProvider {
         if isTimeoutDetail(detail) {
             return timeoutError(for: timeoutValue)
         }
-        if lower.contains("command not found")
-            || lower.contains("no such file")
-            || lower.contains("spawnfailed(errno: 2)")
-            || lower.contains("errno: 2")
-        {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not installed or not in PATH. Install it and run `codex login`.")
-        }
-        if lower.contains("permission denied") || lower.contains("spawnfailed(errno: 13)") || lower.contains("errno: 13") {
-            return AIProviderError.invalidConfiguration(detail: "Permission denied. Ensure the 'codex' executable is accessible.")
-        }
         if lower.contains("unauthorized") || lower.contains("not authenticated") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI is not authenticated. Run `codex login` in your terminal.")
+            return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
         if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI rate limited. Please wait a moment and try again.")
@@ -999,6 +1142,8 @@ final class CodexCLIProvider: AIProvider {
                 return message
             case .processNotRunning:
                 return "Codex app-server process is not running."
+            case .processExited:
+                return clientError.localizedDescription
             case .invalidResponse:
                 return "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
@@ -1012,14 +1157,24 @@ final class CodexCLIProvider: AIProvider {
         return String(describing: error)
     }
 
-    private static func messageStopEvent() -> AIStreamResult {
-        AIStreamResult(
+    private static func messageStopEvent(
+        sessionRef: CodexNativeSessionController.SessionRef? = nil
+    ) -> AIStreamResult {
+        let cleanupHandle = sessionRef.map {
+            ProviderConversationCleanupHandle(
+                provider: String(describing: AIProviderType.codex),
+                conversationID: $0.conversationID,
+                rolloutPath: $0.rolloutPath
+            )
+        }
+        return AIStreamResult(
             type: "message_stop",
             text: nil,
             reasoning: nil,
             promptTokens: nil,
             completionTokens: nil,
-            cost: nil
+            cost: nil,
+            cleanupHandle: cleanupHandle
         )
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodeMapCore
 
 enum CodeMapArtifactBuildPriority: Equatable {
     case demand
@@ -215,7 +216,7 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         maximumTotalWaiterCount: Int = 512,
         maximumWaitersPerFlight: Int = 64,
         maximumQueuedBuildCount: Int = 128,
-        maximumConcurrentBuildCount: Int = 1,
+        maximumConcurrentBuildCount: Int = FileSystemService.codeMapArtifactBuildBulkPermitLimit,
         maximumLocatorIdentitiesPerFlight: Int = 16,
         maximumRetainedInputByteCount: Int = 128 * 1024 * 1024,
         maximumPendingHookEventCount: Int = 256,
@@ -350,10 +351,18 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
                 let buildStart = clock.nowNanoseconds()
                 let permitWait = Self.duration(from: permitStart, to: buildStart)
                 try Task.checkCancellation()
+                let performanceOptions = CodeMapPerfRuntime.makeGeneratorOptions()
+                let performanceCollector = CodeMapPerfRuntime.makeGeneratorStats()
                 let outcome = try CodeMapSyntaxArtifactBuilder.build(
-                    source: input.source,
-                    language: input.language
+                    source: input.source.coreSnapshot,
+                    language: input.language,
+                    performanceOptions: performanceOptions,
+                    performanceCollector: performanceCollector
                 )
+                if let performanceCollector {
+                    CodeMapPerfRuntime.sharedPipelineStats?.mergeSyntaxCodeMapStats(performanceCollector)
+                    CodeMapPerfRuntime.sharedPipelineStats?.mergeGeneratorStats(performanceCollector)
+                }
                 let buildEnd = clock.nowNanoseconds()
                 try Task.checkCancellation()
                 return CodeMapArtifactBuilderExecution(

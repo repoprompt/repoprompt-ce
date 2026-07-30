@@ -318,6 +318,10 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         await transport.ingressSnapshot()
     }
 
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        await transport.responseDeliverySnapshot()
+    }
+
     func waitUntilResponseDeliveryDrained() async -> Bool {
         await transport.waitUntilResponseDeliveryDrained()
     }
@@ -366,6 +370,48 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         } catch {
             // Non-fatal - just log and continue
             bootstrapLog.debug("Failed to send progress notification: \(error)")
+        }
+    }
+
+    /// Sends standards-compliant request progress when the MCP caller supplied
+    /// `_meta.progressToken` on the original `tools/call` request.
+    func sendMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async {
+        // Preserve the protocol's compatibility entry while bounded request
+        // progress uses the result-bearing delivery method below.
+        _ = await deliverMCPProgress(token: token, progress: progress, message: message)
+    }
+
+    func deliverMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async -> MCPProgressDeliveryResult {
+        guard !isClosing else { return .connectionTerminal }
+        // A pre-handshake call is unavailable, not proof that the transport closed.
+        guard handshakeComplete else { return .failed }
+
+        let notification = ProgressNotification.message(
+            .init(
+                progressToken: token,
+                progress: progress,
+                message: message
+            )
+        )
+
+        do {
+            try await server.notify(notification)
+            return .delivered
+        } catch {
+            // Progress is advisory. A failed notification must not fail or cancel
+            // the underlying tool execution. Tell the request worker when the
+            // transport is terminal so it can discard its one pending update.
+            bootstrapLog.debug("Failed to send standard MCP progress notification: \(error)")
+            let ingress = await transport.ingressSnapshot()
+            return isClosing || ingress.isTerminal ? .connectionTerminal : .failed
         }
     }
 }

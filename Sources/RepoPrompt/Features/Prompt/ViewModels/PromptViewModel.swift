@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptCodeMapCore
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
@@ -344,6 +345,10 @@ class PromptViewModel: ObservableObject {
         )
     }
 
+    func mcpOracleIsProviderConfigured(for model: AIModel) -> Bool {
+        isProviderConfigured(for: model)
+    }
+
     nonisolated static func mcpOraclePlanningModelErrorMessage(
         for resolution: MCPOraclePlanningModelResolution,
         availabilityGuidance: ((AIModel) -> String)? = nil
@@ -370,36 +375,44 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    private func setPreferredModelRaw(_ rawValue: String, markDirty: Bool, reason: String? = nil) {
+    private func setPreferredModelRaw(_ rawValue: String, markDirty: Bool, reason _: String? = nil) {
         sessionPreferredModelOverrideRaw = nil
-        let shouldSync = settingsManager.syncChatModelWithOracle()
+        var profile = currentAgentModelsProfile()
+        let shouldSync = profile.syncChatModelWithOracle
         if _preferredModel != rawValue {
             _preferredModel = rawValue
         }
+        profile.preferredComposeModelRaw = rawValue
         // Mirror the store-level Oracle guard in memory too: a blank/whitespace chat model
         // (pickDiffCapableFallback's empty branch) must not blank the in-memory Oracle, or the
         // Oracle dropdown briefly shows empty until the next settings sync re-reads it.
-        if shouldSync, !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           _planningModel != rawValue
-        {
-            _planningModel = rawValue
+        if shouldSync, !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            profile.planningModelRaw = rawValue
+            if _planningModel != rawValue {
+                _planningModel = rawValue
+            }
         }
-        settingsManager.setPreferredComposeModelRaw(rawValue, commit: true, reason: reason, honorSync: shouldSync)
+        persistCurrentAgentModelsProfile(profile)
         if markDirty {
             isDirty = true
         }
     }
 
-    private func setPlanningModelRaw(_ rawValue: String, markDirty: Bool, reason: String? = nil) {
-        let shouldSync = settingsManager.syncChatModelWithOracle()
+    private func setPlanningModelRaw(_ rawValue: String, markDirty: Bool, reason _: String? = nil) {
+        var profile = currentAgentModelsProfile()
+        let shouldSync = profile.syncChatModelWithOracle
         if _planningModel != rawValue {
             _planningModel = rawValue
         }
-        if shouldSync, _preferredModel != rawValue {
-            sessionPreferredModelOverrideRaw = nil
-            _preferredModel = rawValue
+        profile.planningModelRaw = rawValue
+        if shouldSync {
+            profile.preferredComposeModelRaw = rawValue
+            if _preferredModel != rawValue {
+                sessionPreferredModelOverrideRaw = nil
+                _preferredModel = rawValue
+            }
         }
-        settingsManager.setPlanningModelRaw(rawValue, commit: true, reason: reason, honorSync: shouldSync)
+        persistCurrentAgentModelsProfile(profile)
         if markDirty {
             isDirty = true
         }
@@ -412,7 +425,7 @@ class PromptViewModel: ObservableObject {
 
     @Published private(set) var availableAgentKinds: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
 
-    /// Preferred context-builder agent (global, persisted via GlobalSettingsStore)
+    /// Preferred context-builder agent from the effective Agent Models profile.
     @Published var contextBuilderAgent: AgentProviderKind = .claudeCode {
         didSet {
             guard oldValue != contextBuilderAgent else { return }
@@ -420,11 +433,7 @@ class PromptViewModel: ObservableObject {
             if !isContextBuilderModelRawValidForAgent(contextBuilderAgentModelRaw, agent: contextBuilderAgent) {
                 contextBuilderAgentModelRaw = defaultModelRaw(for: contextBuilderAgent)
             }
-            settingsManager.setGlobalContextBuilderAgentSelection(
-                agentRaw: contextBuilderAgent.rawValue,
-                modelRaw: contextBuilderAgentModelRaw,
-                markUserDefined: true
-            )
+            persistContextBuilderSelectionToEffectiveProfile()
             postRecommendationsShouldRefresh(reason: "contextBuilderAgentChanged")
         }
     }
@@ -444,11 +453,7 @@ class PromptViewModel: ObservableObject {
                 contextBuilderAgentModelRaw = defaultModelRaw(for: contextBuilderAgent)
                 return
             }
-            settingsManager.setGlobalContextBuilderAgentSelection(
-                agentRaw: contextBuilderAgent.rawValue,
-                modelRaw: effectiveRaw,
-                markUserDefined: true
-            )
+            persistContextBuilderSelectionToEffectiveProfile(modelRaw: effectiveRaw)
             postRecommendationsShouldRefresh(reason: "contextBuilderAgentModelChanged")
         }
     }
@@ -489,10 +494,12 @@ class PromptViewModel: ObservableObject {
         else {
             return nil
         }
-        let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
+        let profile = currentAgentModelsProfile()
+        let agentRaw = profile.contextBuilderAgentRaw
+        let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
         return AutoRecommendationEngine.resolveContextBuilderSelection(
-            persistedAgentRaw: persisted.agentRaw,
-            persistedModelRaw: persisted.modelRaw,
+            persistedAgentRaw: agentRaw,
+            persistedModelRaw: modelRaw,
             availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
             enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
@@ -520,21 +527,22 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    /// Force-commit context builder settings to the global store so other components (like recommendation engine) see them.
+    /// Persist the visible Context Builder selection to the active Agent Models profile even
+    /// when the user re-selects the same runtime fallback and observers do not fire.
     func commitContextBuilderSettings() {
-        settingsManager.setGlobalContextBuilderAgentSelection(
-            agentRaw: contextBuilderAgent.rawValue,
-            modelRaw: contextBuilderAgentModelRaw,
-            markUserDefined: true
-        )
+        persistContextBuilderSelectionToEffectiveProfile()
         postRecommendationsShouldRefresh(reason: "contextBuilderSettingsCommitted")
     }
 
     private func postRecommendationsShouldRefresh(reason: String) {
+        var userInfo: [String: Any] = ["reason": reason]
+        if case let .workspace(workspaceID) = currentAgentModelsEditingScope {
+            userInfo["workspaceID"] = workspaceID
+        }
         NotificationCenter.default.post(
             name: .recommendationsShouldRefresh,
             object: nil,
-            userInfo: ["reason": reason]
+            userInfo: userInfo
         )
     }
 
@@ -649,6 +657,45 @@ class PromptViewModel: ObservableObject {
     /// Workspace ID accessor
     var currentWorkspaceID: UUID? {
         fileManager.currentWorkspaceID
+    }
+
+    private var currentAgentModelsEditingScope: AgentModelsEditingScope {
+        guard let workspaceID = currentWorkspaceID,
+              settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        else {
+            return .global
+        }
+        return .workspace(workspaceID)
+    }
+
+    private func currentAgentModelsProfile() -> AgentModelsSettingsProfile {
+        settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+    }
+
+    private func persistCurrentAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
+    ) {
+        switch currentAgentModelsEditingScope {
+        case .global:
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
+        case let .workspace(workspaceID):
+            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+        }
+    }
+
+    private func persistContextBuilderSelectionToEffectiveProfile(modelRaw: String? = nil) {
+        var profile = currentAgentModelsProfile()
+        let rawModel = modelRaw ?? contextBuilderAgentModelRaw
+        profile.contextBuilderAgentRaw = contextBuilderAgent.rawValue
+        profile = profile.replacingContextBuilderModel(rawModel, for: contextBuilderAgent.rawValue)
+        persistCurrentAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .userInitiated
+        )
     }
 
     private var isSyncingSettings = false
@@ -806,14 +853,15 @@ class PromptViewModel: ObservableObject {
     // MARK: - Auto-Switch to Manual Mode Wrapper Methods
 
     private func syncModelSelectionFromSettingsManager() {
+        let profile = currentAgentModelsProfile()
         _planningModel = Self.modelRawAfterSettingsSync(
             currentRaw: _planningModel,
-            persistedRaw: settingsManager.planningModelRaw()
+            persistedRaw: profile.planningModelRaw
         )
         if sessionPreferredModelOverrideRaw == nil {
             _preferredModel = Self.modelRawAfterSettingsSync(
                 currentRaw: _preferredModel,
-                persistedRaw: settingsManager.preferredComposeModelRaw()
+                persistedRaw: profile.preferredComposeModelRaw
             )
         }
     }
@@ -823,8 +871,28 @@ class PromptViewModel: ObservableObject {
         return persistedRaw
     }
 
+    private func syncAgentModelsSettingsFromSettingsManager() {
+        refreshAvailableAgentKinds()
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            if Self.debugLoggingEnabled {
+                print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)")
+            }
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+            if Self.debugLoggingEnabled {
+                print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)")
+            }
+        }
+        syncModelSelectionFromSettingsManager()
+    }
+
     func syncSettingsFromSettingsManager() {
-        guard let workspaceID = currentWorkspaceID else { return }
+        guard let workspaceID = currentWorkspaceID else {
+            isSyncingSettings = true
+            syncAgentModelsSettingsFromSettingsManager()
+            isSyncingSettings = false
+            return
+        }
 
         let copySettings = settingsManager.copySettings(for: workspaceID)
         let chatSettings = settingsManager.chatSettings(for: workspaceID)
@@ -882,17 +950,8 @@ class PromptViewModel: ObservableObject {
         }
         _contextBuilderModel = chatSettings.contextBuilderModelRaw ?? ""
 
-        // Sync Context Builder agent/model from global Context Builder settings (single source of truth)
-        refreshAvailableAgentKinds()
-        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
-            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
-            contextBuilderAgent = normalizedContextBuilder.agent
-            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
-            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
-        }
-
-        // Sync model selection from the global settings store (may have been set by recommendation engine).
-        syncModelSelectionFromSettingsManager()
+        // Sync model and Context Builder selection from the effective Agent Models profile.
+        syncAgentModelsSettingsFromSettingsManager()
 
         isSyncingSettings = false
 
@@ -2234,6 +2293,26 @@ class PromptViewModel: ObservableObject {
                 syncSettingsFromSettingsManager()
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.handleAgentModelsSettingsDidChange(notification)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleAgentModelsSettingsDidChange(_ notification: Notification) {
+        let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+        if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+           workspaceID != currentWorkspaceID
+        {
+            return
+        }
+        isSyncingSettings = true
+        syncAgentModelsSettingsFromSettingsManager()
+        isSyncingSettings = false
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
@@ -2725,8 +2804,14 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func closeComposeTab(_ id: UUID) async {
-        await closeComposeTabs(withIDs: [id])
+    func closeComposeTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        await closeComposeTabs(
+            withIDs: [id],
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @MainActor
@@ -2765,7 +2850,8 @@ class PromptViewModel: ObservableObject {
         preferredActiveID: UUID? = nil,
         reason: ComposeTabRemovalReason = .close,
         expandCascade: Bool = true,
-        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        isMutationOwnerCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard !ids.isEmpty else { return }
         guard
@@ -2782,6 +2868,16 @@ class PromptViewModel: ObservableObject {
                 return false
             }
             return isMutationContextCurrent?() ?? true
+        }
+
+        func mutationOwnerIsCurrent() -> Bool {
+            guard manager.activeWorkspace?.id == workspace.id,
+                  manager.workspaces.indices.contains(index),
+                  manager.workspaces[index].id == workspace.id
+            else {
+                return false
+            }
+            return isMutationOwnerCurrent?() ?? true
         }
 
         guard mutationContextIsCurrent() else { return }
@@ -2814,12 +2910,14 @@ class PromptViewModel: ObservableObject {
             return adjacentTabID(afterClosing: previousActiveID, tabs: tabsBeforeClose, closingIDs: tabsBeingClosed)
         }()
 
-        // Notify listeners BEFORE mutation so they can cancel running tasks
+        // Notify listeners BEFORE mutation so they can cancel running tasks.
+        // The caller's target context may be invalidated by this intentional cleanup,
+        // so post-notify checks use the stable mutation owner instead.
         guard mutationContextIsCurrent() else { return }
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
-        guard mutationContextIsCurrent() else { return }
+        guard mutationOwnerIsCurrent() else { return }
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
-        guard mutationContextIsCurrent() else { return }
+        guard mutationOwnerIsCurrent() else { return }
         #if DEBUG
             for tabID in tabsBeingClosed {
                 AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
@@ -3053,11 +3151,15 @@ class PromptViewModel: ObservableObject {
     @Published private(set) var currentStashedTabs: [StashedTab] = []
 
     @MainActor
-    func stashTab(_ id: UUID) async {
+    func stashTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
+            isMutationContextCurrent?() ?? true
         else { return }
 
         // Don't allow stashing if it's the last tab
@@ -3068,7 +3170,11 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        await closeComposeTabs(withIDs: [id], reason: .stash)
+        await closeComposeTabs(
+            withIDs: [id],
+            reason: .stash,
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @discardableResult
@@ -3167,6 +3273,10 @@ class PromptViewModel: ObservableObject {
             reason: .stash,
             expandCascade: false,
             isMutationContextCurrent: {
+                isArchiveContextCurrent()
+                    && manager.activeWorkspace?.id == expectedWorkspaceID
+            },
+            isMutationOwnerCurrent: {
                 isArchiveContextCurrent()
                     && manager.activeWorkspace?.id == expectedWorkspaceID
             }

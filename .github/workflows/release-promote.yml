@@ -161,6 +161,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Prepare Sentry promotion token file
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SENTRY_AUTH_TOKEN" ]] || { echo "Missing protected SENTRY_AUTH_TOKEN" >&2; exit 1; }
+          umask 077
+          SENTRY_TOKEN_FILE="$RUNNER_TEMP/repoprompt-sentry-promotion-token"
+          printf '%s' "$SENTRY_AUTH_TOKEN" > "$SENTRY_TOKEN_FILE"
+          chmod 600 "$SENTRY_TOKEN_FILE"
+          echo "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE=$SENTRY_TOKEN_FILE" >> "$GITHUB_ENV"
+
       - name: Verify, mirror, and promote reviewed assets
         env:
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
@@ -172,4 +184,11 @@ jobs:
           REVIEWED_CHECKSUMS_SHA256: ${{ inputs.reviewed_checksums_sha256 }}
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+          REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production
         run: ./trusted-control-plane/Scripts/promote_release.sh promote
+
+      - name: Remove Sentry promotion token file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/repoprompt-sentry-promotion-token"

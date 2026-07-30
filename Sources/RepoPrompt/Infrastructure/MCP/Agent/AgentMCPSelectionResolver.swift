@@ -5,13 +5,13 @@ import MCP
 // Related:
 // - AgentModelSelectionID.swift (compound ID format)
 // - AgentModelCatalog.swift (discovery/validation/task label recommendations)
-// - MCPAgentRoleDefaultsService.swift (global role-default overrides)
+// - MCPAgentRoleDefaultsService.swift (scoped role-default overrides)
 // - AgentRunMCPToolService.swift / AgentManageMCPToolService.swift (consumers)
 
 /// Resolves `model_id` into agent + model for session configuration.
 ///
 /// Accepts two forms:
-/// 1. **Task label**: `explore`, `engineer`, `pair`, `design` — auto-picks the global effective role default
+/// 1. **Task label**: `explore`, `engineer`, `pair`, `design` — auto-picks the effective role default
 /// 2. **Compound ID**: `claudeCode:sonnet`, `codexExec:gpt-5.4-high` — explicit selection
 enum AgentMCPSelectionResolver {
     typealias RoleSelectionProvider = @MainActor (
@@ -29,9 +29,9 @@ enum AgentMCPSelectionResolver {
 
     /// Resolves a `model_id` string into agent + model components.
     ///
-    /// - If `modelID` is nil/empty and `defaultTaskLabel` is provided, resolves that role's global effective default.
+    /// - If `modelID` is nil/empty and `defaultTaskLabel` is provided, resolves that role's effective default.
     /// - If `modelID` is nil/empty and no default is provided, returns nils (use agent defaults).
-    /// - Task labels (`explore`, `engineer`, `pair`, `design`) resolve through global effective role defaults.
+    /// - Task labels (`explore`, `engineer`, `pair`, `design`) resolve through effective role defaults.
     /// - Compound IDs are validated against the catalog and are never rewritten by role defaults.
     ///
     /// - Throws: `MCPError.invalidParams` for unrecognized or invalid IDs.
@@ -40,13 +40,14 @@ enum AgentMCPSelectionResolver {
         modelID: String?,
         defaultTaskLabel: AgentModelCatalog.TaskLabelKind? = nil,
         availability: AgentModelCatalog.AvailabilityContext = .current,
+        workspaceID: UUID? = nil,
         roleSelectionProvider: RoleSelectionProvider? = nil
     ) throws -> ResolvedSelection {
         let trimmed = modelID?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty else {
             // No explicit model_id — use default global role if provided
             if let defaultKind = defaultTaskLabel,
-               let resolved = resolveRoleSelection(defaultKind, availability: availability, roleSelectionProvider: roleSelectionProvider)
+               let resolved = resolveRoleSelection(defaultKind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider)
             {
                 return ResolvedSelection(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw, taskLabelKind: defaultKind)
             }
@@ -57,7 +58,7 @@ enum AgentMCPSelectionResolver {
         if !trimmed.contains(":") {
             let lowered = trimmed.lowercased()
             if let entry = AgentModelCatalog.taskLabels.first(where: { $0.label == lowered }) {
-                guard let resolved = resolveRoleSelection(entry.kind, availability: availability, roleSelectionProvider: roleSelectionProvider) else {
+                guard let resolved = resolveRoleSelection(entry.kind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider) else {
                     throw MCPError.invalidParams("No available agent/model for task label '\(trimmed)'.")
                 }
                 return ResolvedSelection(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw, taskLabelKind: entry.kind)
@@ -103,12 +104,13 @@ enum AgentMCPSelectionResolver {
     private static func resolveRoleSelection(
         _ role: AgentModelCatalog.TaskLabelKind,
         availability: AgentModelCatalog.AvailabilityContext,
+        workspaceID: UUID?,
         roleSelectionProvider: RoleSelectionProvider?
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let provided = roleSelectionProvider?(role, availability) {
             return provided
         }
-        if let effective = MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability) {
+        if let effective = MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID) {
             return effective
         }
         return AgentModelCatalog.resolveTaskLabelKind(role, availability: availability)
