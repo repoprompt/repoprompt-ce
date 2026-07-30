@@ -455,6 +455,8 @@ allowed_tracked_docs=(
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
   "docs/testing.md"
+  "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
+  "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
   "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
