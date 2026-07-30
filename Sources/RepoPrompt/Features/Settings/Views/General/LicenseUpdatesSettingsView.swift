@@ -2,14 +2,13 @@ import SwiftUI
 
 struct LicenseUpdatesSettingsView: View {
     @ObservedObject var windowState: WindowState
-    private var sparkleManager: SparkleUpdaterManager {
-        SparkleUpdaterManager.shared
-    }
+    @ObservedObject private var sparkleManager: SparkleUpdaterManager
 
     var closeAction: (() -> Void)?
 
     init(windowState: WindowState, closeAction: (() -> Void)? = nil) {
         self.windowState = windowState
+        _sparkleManager = ObservedObject(wrappedValue: SparkleUpdaterManager.shared)
         self.closeAction = closeAction
     }
 
@@ -25,12 +24,8 @@ struct LicenseUpdatesSettingsView: View {
                             Image(systemName: sparkleManager.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle.fill")
                                 .foregroundColor(sparkleManager.updateAvailable ? .blue : .green)
 
-                            Text(
-                                sparkleManager.updateAvailable ?
-                                    "Version \(sparkleManager.updateVersion ?? "Unknown") is available" :
-                                    "You have the latest version"
-                            )
-                            .foregroundColor(sparkleManager.updateAvailable ? .blue : .secondary)
+                            Text(sparkleManager.availableUpdate?.availabilityStatus ?? "You have the latest version")
+                                .foregroundColor(sparkleManager.updateAvailable ? .blue : .secondary)
 
                             Spacer()
 
@@ -41,8 +36,8 @@ struct LicenseUpdatesSettingsView: View {
                             .buttonStyle(.bordered)
                         }
 
-                        if sparkleManager.updateAvailable {
-                            Button("Install Update") {
+                        if let availableUpdate = sparkleManager.availableUpdate {
+                            Button(availableUpdate.installButtonTitle) {
                                 sparkleManager.installUpdate()
                             }
                             .buttonStyle(.borderedProminent)

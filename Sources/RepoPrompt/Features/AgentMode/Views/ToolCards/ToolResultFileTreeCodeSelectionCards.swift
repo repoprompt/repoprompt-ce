@@ -200,11 +200,13 @@ struct CodeStructureResultCard: View {
         if let stored = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON) {
             return stored.detailText
         }
-        guard let paths = dto?.issues.compactMap(\.path), !paths.isEmpty else { return nil }
-        let visible = paths.prefix(2).map { shortenPath($0) }
-        var parts = visible
-        if paths.count > visible.count {
-            parts.append("(+\(paths.count - visible.count) more)")
+        guard let dto else { return nil }
+        let messages = (dto.issues + dto.roots.flatMap(\.issues)).map(\.message)
+        guard !messages.isEmpty else { return nil }
+        let visible = messages.prefix(2)
+        var parts = Array(visible)
+        if messages.count > visible.count {
+            parts.append("(+\(messages.count - visible.count) more)")
         }
         return parts.joined(separator: " • ")
     }
@@ -214,13 +216,16 @@ struct CodeStructureResultCard: View {
             return stored.subtitle ?? ""
         }
         if let dto {
-            return "\(dto.summary.returnedFiles) files • \(dto.status)"
+            return "\(dto.summary.nodes) nodes • \(dto.roots.count) roots • \(dto.status.rawValue)"
         }
-        if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) {
-            if args.scope == "selected" { return "selected" }
-            if let count = args.paths?.count, count > 0 {
-                return "\(count) path\(count == 1 ? "" : "s")"
-            }
+        if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON),
+           let count = args.paths?.count,
+           count > 0
+        {
+            return "\(count) path\(count == 1 ? "" : "s")"
+        }
+        if ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) != nil {
+            return "selection"
         }
         return ""
     }
@@ -232,10 +237,9 @@ struct CodeStructureResultCard: View {
         }
         if let dto {
             return switch dto.status {
-            case "ready": .success
-            case "partial", "pending", "budget": .warning
-            case "unavailable", "stale": .failure
-            default: .neutral
+            case .ok: .success
+            case .partial, .pending: .warning
+            case .unavailable: .failure
             }
         }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)

@@ -122,6 +122,21 @@ struct AttributedTextKitView: NSViewRepresentable {
             undoMgr
         }
 
+        func performExternalReplacement(
+            in textView: NSTextView,
+            mutation: () -> Void
+        ) {
+            TextViewUndoSafeReplacement.perform(
+                in: textView,
+                undoManager: undoMgr,
+                mutation: mutation
+            )
+        }
+
+        func clearUndoHistory() {
+            undoMgr.removeAllActions()
+        }
+
         /// Called by MentionCoordinator via closure
         func commit(_ suggestion: MentionSuggestion) {
             guard isActive else { return }
@@ -397,10 +412,12 @@ struct AttributedTextKitView: NSViewRepresentable {
 
                 // NEW: guard delegate echo while we apply programmatic updates
                 (textView as? MentionTextView)?.resetTransientEditingState()
-                context.coordinator.isApplyingExternalWrite = true
-                textView.string = text
-                context.coordinator.internalText = text
-                context.coordinator.isApplyingExternalWrite = false
+                context.coordinator.performExternalReplacement(in: textView) {
+                    context.coordinator.isApplyingExternalWrite = true
+                    textView.string = text
+                    context.coordinator.internalText = text
+                    context.coordinator.isApplyingExternalWrite = false
+                }
 
                 textView.setSelectedRange(previousSelection.clamped(to: textView.currentStringLength()))
 
@@ -446,6 +463,7 @@ struct AttributedTextKitView: NSViewRepresentable {
         coordinator.pendingLayoutTask?.cancel()
         coordinator.pendingLayoutTask = nil
 
+        coordinator.clearUndoHistory()
         coordinator.mentionTV = nil
         coordinator.mentionCoord = nil
         coordinator.isActive = false

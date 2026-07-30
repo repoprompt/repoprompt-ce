@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class PromptContextAccountingServiceTests: XCTestCase {

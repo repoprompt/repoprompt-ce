@@ -79,10 +79,10 @@ final class AutoRecommendationEngine {
     /// Recommendation satisfaction compares against the targeted profile rather than
     /// raw global settings. Mute/completion state remains workspace-local via `workspaceID`.
     func computeRecommendations(
-        for workspaceID: UUID,
-        scope: AgentModelsEditingScope = .global,
+        for identity: AgentModelsOperationIdentity,
         enabledProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> RecommendationSet {
+        let scope = identity.scope
         let actualStatus = computeProviderStatus()
         let status = actualStatus.filtered(to: enabledProviders)
         let profile = profile(for: scope)
@@ -169,7 +169,7 @@ final class AutoRecommendationEngine {
                 kind: .claudeCode,
                 displayName: "Claude Code",
                 modelString: AIModel.claudeCodeOpus.rawValue, // Opus for chat
-                description: "Claude Opus 4.6 – great for editing and context management",
+                description: "\(BestPracticeProfiles.claudeCodeOpusRecommendationLabel) – great for editing and context management",
                 tradeoffs: [
                     "• Excellent at file editing and code modifications",
                     "• Superior context window management",
@@ -519,11 +519,10 @@ final class AutoRecommendationEngine {
     /// Apply MCP agent defaults by clearing overrides in the targeted Agent Models scope.
     func applyMCPAgentDefaultsRecommendation(
         _: MCPAgentDefaultsRecommendation,
-        workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global
+        identity: AgentModelsOperationIdentity
     ) {
         updateProfile(
-            scope: scope,
+            scope: identity.scope,
             contextBuilderWriteIntent: .preserveExistingOwnership
         ) { profile in
             profile.mcpAgentRoleOverrides = nil
@@ -621,13 +620,12 @@ final class AutoRecommendationEngine {
     func applyChatModelRecommendation(
         _ rec: ChatModelRecommendation,
         backend: ChatBackendKind,
-        workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global
+        identity: AgentModelsOperationIdentity
     ) {
         guard let trimmedModel = recommendedChatModelRaw(rec, backend: backend) else { return }
 
         updateProfile(
-            scope: scope,
+            scope: identity.scope,
             contextBuilderWriteIntent: .preserveExistingOwnership
         ) { profile in
             profile.planningModelRaw = trimmedModel
@@ -638,14 +636,13 @@ final class AutoRecommendationEngine {
     /// Apply context builder recommendation in the target Agent Models profile.
     func applyContextBuilderRecommendation(
         _ rec: ContextBuilderRecommendation,
-        workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global,
+        identity: AgentModelsOperationIdentity,
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .userInitiated
     ) {
         let resolvedModelRaw = recommendedContextBuilderModelRaw(rec)
 
         updateProfile(
-            scope: scope,
+            scope: identity.scope,
             contextBuilderWriteIntent: contextBuilderWriteIntent
         ) { profile in
             profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
@@ -657,31 +654,34 @@ final class AutoRecommendationEngine {
     ///
     /// Composes `applyChatModelRecommendation` + `applyContextBuilderRecommendation`
     /// + `applyMCPAgentDefaultsRecommendation` (and optionally `applyMCPPresetExposure`),
-    /// then posts `.recommendationsDidApply` so listeners refresh. Intended for the
+    /// then posts `.recommendationsDidApply` for each unique affected scope so listeners refresh. Intended for the
     /// "Apply Recommended Setup" button on the Agent Models settings page; callers
     /// that want row-level control should keep using the individual apply methods.
     ///
     /// SEARCH-HELPER: Agent Models, Apply Recommended Setup, bulk apply
     func applyModelRecommendations(
         _ rec: RecommendationSet,
-        workspaceID: UUID,
-        scope: AgentModelsEditingScope = .global,
+        identity: AgentModelsOperationIdentity,
         includePresetExposure: Bool = false
     ) {
         if let chat = rec.chatModel {
-            applyChatModelRecommendation(chat, backend: chat.defaultBackend, workspaceID: workspaceID, scope: scope)
+            applyChatModelRecommendation(chat, backend: chat.defaultBackend, identity: identity)
         }
         if let cb = rec.contextBuilder {
-            applyContextBuilderRecommendation(cb, workspaceID: workspaceID, scope: scope)
+            applyContextBuilderRecommendation(cb, identity: identity)
         }
         if let agentDefaults = rec.mcpAgentDefaults {
-            applyMCPAgentDefaultsRecommendation(agentDefaults, workspaceID: workspaceID, scope: scope)
+            applyMCPAgentDefaultsRecommendation(agentDefaults, identity: identity)
         }
         if includePresetExposure, let presetExposure = rec.mcpPresetExposure {
             applyMCPPresetExposure(presetExposure)
         }
 
-        postRecommendationsDidApply(workspaceID: workspaceID, scope: scope)
+        RecommendationApplyNotification.post(
+            sourceWorkspaceID: identity.sourceWorkspaceID,
+            agentModelsScope: rec.hasAgentModelsRecommendations ? identity.scope : nil,
+            includesPresetExposure: includePresetExposure && rec.mcpPresetExposure != nil
+        )
     }
 
     /// Apply MCP preset exposure recommendation.
@@ -730,23 +730,6 @@ final class AutoRecommendationEngine {
         }
     }
 
-    private func postRecommendationsDidApply(workspaceID: UUID, scope: AgentModelsEditingScope) {
-        var userInfo: [String: Any] = [
-            AgentModelsSettingsNotification.scopeKey: scope.notificationScopeRaw
-        ]
-        if let targetWorkspaceID = scope.workspaceID {
-            userInfo["workspaceID"] = targetWorkspaceID
-        }
-        // Keep the initiating workspace available for diagnostics without using
-        // it as a refresh filter for global recommendation writes.
-        userInfo["sourceWorkspaceID"] = workspaceID
-        NotificationCenter.default.post(
-            name: .recommendationsDidApply,
-            object: nil,
-            userInfo: userInfo
-        )
-    }
-
     // MARK: - Auto-Apply for New Workspaces
 
     /// Auto-applies recommended defaults when global settings are not yet configured.
@@ -761,7 +744,8 @@ final class AutoRecommendationEngine {
         }
 
         // Compute recommendations
-        let recs = computeRecommendations(for: workspaceID)
+        let identity = AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global)
+        let recs = computeRecommendations(for: identity)
         var didApply = false
 
         // Apply Context Builder recommendation if global not already configured
@@ -770,8 +754,7 @@ final class AutoRecommendationEngine {
         {
             applyContextBuilderRecommendation(
                 cbRec,
-                workspaceID: workspaceID,
-                scope: .global,
+                identity: identity,
                 contextBuilderWriteIntent: .automaticSeed
             )
             didApply = true
@@ -891,7 +874,9 @@ final class AutoRecommendationEngine {
         let current = currentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let recommended = recommendedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !current.isEmpty, !recommended.isEmpty else { return false }
-        if current.caseInsensitiveCompare(recommended) == .orderedSame { return true }
+        if current.caseInsensitiveCompare(recommended) == .orderedSame {
+            return true
+        }
         guard let currentCodex = codexChatModelIdentity(for: current),
               let recommendedCodex = codexChatModelIdentity(for: recommended),
               currentCodex.baseModel == recommendedCodex.baseModel
@@ -983,21 +968,5 @@ final class AutoRecommendationEngine {
         // If recommendation is to just enable temp disable (shouldTemporarilyDisablePresets = true),
         // presets toggle is already on, just check if temp disable is on
         return temporarilyDisabled
-    }
-}
-
-private extension AgentModelsEditingScope {
-    var workspaceID: UUID? {
-        if case let .workspace(workspaceID) = self { return workspaceID }
-        return nil
-    }
-
-    var notificationScopeRaw: String {
-        switch self {
-        case .global:
-            AgentModelsSettingsNotification.Scope.global.rawValue
-        case .workspace:
-            AgentModelsSettingsNotification.Scope.workspace.rawValue
-        }
     }
 }

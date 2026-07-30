@@ -222,20 +222,29 @@ final class MCPServerViewModel: ObservableObject {
     struct CodeStructureRequest: Equatable {
         let direction: WorkspaceCodemapStructureTraversalDirection?
         let maximumDepth: Int
-        let maximumFiles: Int
-        let maximumEdges: Int
-        let maximumCodemapTokens: Int
+        let includesSignatures: Bool
+        let size: WorkspaceCodemapGraphOutputSize
+        let budget: WorkspaceCodemapGraphQueryBudget
+
+        init(
+            direction: WorkspaceCodemapStructureTraversalDirection?,
+            maximumDepth: Int,
+            includesSignatures: Bool,
+            size: WorkspaceCodemapGraphOutputSize,
+            budget: WorkspaceCodemapGraphQueryBudget
+        ) {
+            self.direction = direction
+            self.maximumDepth = maximumDepth
+            self.includesSignatures = includesSignatures
+            self.size = size
+            self.budget = budget
+        }
     }
 
     private static let maximumCodeStructureSeedCount = 8192
-    private static let maximumCodeStructurePathInputCount = 256
 
-    static func codeStructureSeedLimit(for request: CodeStructureRequest) -> Int {
-        min(
-            maximumCodeStructureSeedCount,
-            maximumCodeStructurePathInputCount,
-            max(1, request.maximumFiles)
-        )
+    static func codeStructureSeedLimit(for _: CodeStructureRequest) -> Int {
+        maximumCodeStructureSeedCount
     }
 
     #if DEBUG
@@ -423,6 +432,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceLookupContext?,
             ToolResultDTOs.SelectionReply
         ) -> Void)?
+        private var beforeAgentRunWaiterWakeForTesting: (@MainActor @Sendable (UUID, UUID) async -> Void)?
 
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
@@ -436,6 +446,12 @@ final class MCPServerViewModel: ObservableObject {
             _ override: AgentExternalMCPRunStarter.DispatchInstruction?
         ) {
             agentRunDispatchOverrideForTesting = override
+        }
+
+        func setBeforeAgentRunWaiterWakeForTesting(
+            _ hook: (@MainActor @Sendable (UUID, UUID) async -> Void)?
+        ) {
+            beforeAgentRunWaiterWakeForTesting = hook
         }
 
         func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
@@ -582,9 +598,6 @@ final class MCPServerViewModel: ObservableObject {
             resolveSpawnParentSessionIDFromSourceTabID: { sourceTabID, targetWindow in
                 targetWindow.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
             },
-            bindCurrentRequestToTab: { [self] tabID, metadata in
-                try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
-            },
             withHeartbeat: { [self] connectionID, tool, stage, message, operation in
                 try await withHeartbeat(
                     connectionID: connectionID,
@@ -600,12 +613,11 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
-                try await AgentExternalMCPRunStarter.start(
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                     target: target,
                     message: message,
                     metadata: metadata,
-                    bindCurrentRequestToTab: bindCurrentRequestToTab,
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
                     modelRaw: modelRaw,
@@ -841,9 +853,6 @@ final class MCPServerViewModel: ObservableObject {
             resolveSpawnParentSessionID: { [self] metadata, targetWindow in
                 await resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
             },
-            bindCurrentRequestToTab: { [self] tabID, metadata in
-                try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
-            },
             withHeartbeat: { [self] connectionID, tool, stage, message, operation in
                 try await withHeartbeat(
                     connectionID: connectionID,
@@ -859,12 +868,14 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
-                try await AgentExternalMCPRunStarter.start(
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+                try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
                     target: target,
                     message: message,
                     metadata: metadata,
-                    bindCurrentRequestToTab: bindCurrentRequestToTab,
+                    bindCurrentRequestToTab: { tabID, requestMetadata in
+                        try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata)
+                    },
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
                     modelRaw: modelRaw,
@@ -1113,8 +1124,8 @@ final class MCPServerViewModel: ObservableObject {
                 connectionID: connectionID
             )
             return MCPWindowToolDependencies.ContextBuilderTabResolution(
-                tabID: resolution.tabID,
-                workspaceID: resolution.workspaceID,
+                identity: resolution.identity,
+                nestedTabContext: resolution.nestedTabContext,
                 agentModeSessionID: resolution.agentModeSessionID,
                 agentModeRunID: resolution.agentModeRunID,
                 bindCaller: resolution.bindCaller,
@@ -1141,6 +1152,12 @@ final class MCPServerViewModel: ObservableObject {
                 display: display,
                 codeMapUsageOverride: codeMapUsageOverride,
                 lookupContextOverride: lookupContextOverride,
+                // Context Builder owns the selection authority before rendering: a completed run has
+                // already validated the exact committed snapshot revision, while a cancelled or failed
+                // pre-commit run deliberately reports its immutable captured initial snapshot as
+                // informational context. Joining later filesystem ingress cannot improve either
+                // snapshot's authority. Codemap/token freshness remains explicit in the reply metadata.
+                ingressPolicy: .alreadyAwaited,
                 reviewGitContextOverride: reviewGitContextOverride
             )
             #if DEBUG
@@ -1180,13 +1197,13 @@ final class MCPServerViewModel: ObservableObject {
                 _ = authorization
             #endif
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
                     return try await override(
                         contextBuilderVM,
-                        tabID,
+                        identity,
                         agentModeSessionID,
                         agentModeRunID,
                         mode,
@@ -1201,7 +1218,7 @@ final class MCPServerViewModel: ObservableObject {
                 }
             #endif
             return try await contextBuilderVM.runMCPPlanOrQuestion(
-                for: tabID,
+                for: identity,
                 oracleViewModel: oracleVM,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
@@ -1320,6 +1337,12 @@ final class MCPServerViewModel: ObservableObject {
         resolveFileToolLookupContext: { [weak self] metadata in
             guard let self else { return .visibleWorkspace }
             return await resolveFileToolLookupContext(from: metadata)
+        },
+        resolveMutationFileToolContext: { [weak self] metadata, toolName in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
+            }
+            return try await resolveMutationFileToolContext(from: metadata, toolName: toolName)
         },
         stabilizedVirtualSelection: { [weak self] context in
             guard let self else { return context.selection }
@@ -1454,16 +1477,17 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return "Window deallocated while resolving selection inputs." }
             return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
         },
-        performFileAction: { [weak self] action, path, content, newPath, ifExists in
+        performFileAction: { [weak self] action, path, content, newPath, ifExists, operationID in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
-            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
+            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists, operationID: operationID)
         },
-        buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, lookupContext in
+        buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, requestedPaths, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
             return try await buildCodeStructureDTO(
                 fromRecords: files,
                 request: request,
                 includePathNotFoundIssue: includePathNotFoundIssue,
+                requestedPaths: requestedPaths,
                 lookupContext: lookupContext
             )
         },
@@ -2091,7 +2115,11 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    private func beginAgentRunWaitScope(metadata: RequestMetadata, sessionIDs: Set<UUID>, timeoutSeconds: TimeInterval?) async -> UUID? {
+    private func beginAgentRunWaitScope(
+        metadata: RequestMetadata,
+        sessionIDs: Set<UUID>,
+        timeoutSeconds: TimeInterval?
+    ) async -> AgentRunWaitScopeRegistration? {
         guard !sessionIDs.isEmpty else { return nil }
         purgeStaleAgentRunWaitScopes(source: "begin")
         let resolvedContext = try? resolveTabContextSnapshot(
@@ -2117,7 +2145,7 @@ final class MCPServerViewModel: ObservableObject {
             childAgentRunWaitCountsByParentRunID[parentRunID, default: [:]][sessionID, default: 0] += 1
         }
         steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds.map { String($0) } ?? "none") childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
-        return token
+        return AgentRunWaitScopeRegistration(token: token, parentRunID: parentRunID)
     }
 
     @MainActor
@@ -2175,6 +2203,8 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
+        steeringMessage: String? = nil,
+        steeringOriginRunID: () -> UUID? = { nil },
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async {
         let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
@@ -2188,10 +2218,18 @@ final class MCPServerViewModel: ObservableObject {
                 steeringDebugLog("[AgentRunSteeringWake] parent wake skipped missing child snapshot source=\(source) parentRunID=\(runID) childSessionID=\(sessionID)")
                 continue
             }
+            #if DEBUG
+                if let beforeAgentRunWaiterWakeForTesting {
+                    await beforeAgentRunWaiterWakeForTesting(runID, sessionID)
+                }
+            #endif
+            let validatedSteeringOriginRunID = steeringOriginRunID()
             await AgentRunSessionStore.wakeCurrentWaiters(
                 publication.snapshot,
                 cursor: publication.cursor,
-                reason: .steeringRequested
+                reason: .steeringRequested,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: validatedSteeringOriginRunID
             )
         }
         await Task.yield()
@@ -2202,7 +2240,9 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAndDrainAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
+        steeringMessage: String? = nil,
         timeoutSeconds: TimeInterval,
+        steeringOriginRunID: () -> UUID? = { nil },
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async -> Bool {
         guard hasActiveChildAgentRunWaits(runID: runID) else {
@@ -2215,6 +2255,8 @@ final class MCPServerViewModel: ObservableObject {
             await wakeAgentRunWaitersOwnedByActiveRun(
                 runID: runID,
                 source: source,
+                steeringMessage: steeringMessage,
+                steeringOriginRunID: steeringOriginRunID,
                 publicationForSessionID: publicationForSessionID
             )
 
@@ -2340,7 +2382,7 @@ final class MCPServerViewModel: ObservableObject {
             metadata: RequestMetadata,
             sessionIDs: Set<UUID>,
             timeoutSeconds: TimeInterval?
-        ) async -> UUID? {
+        ) async -> AgentRunWaitScopeRegistration? {
             await beginAgentRunWaitScope(
                 metadata: metadata,
                 sessionIDs: sessionIDs,
@@ -3444,8 +3486,8 @@ final class MCPServerViewModel: ObservableObject {
         targetWindow: WindowState,
         connectionID: UUID?
     ) async throws -> (
-        tabID: UUID,
-        workspaceID: UUID?,
+        identity: WorkspaceSelectionIdentity,
+        nestedTabContext: TabContextSnapshot,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         bindCaller: Bool,
@@ -3523,10 +3565,34 @@ final class MCPServerViewModel: ObservableObject {
                 workspaceContext = nil
             }
 
-            let lookupContext: WorkspaceLookupContext = if let workspaceContext {
-                workspaceContext.lookupContext
+            let lookupContext: WorkspaceLookupContext
+            if let workspaceContext {
+                lookupContext = workspaceContext.lookupContext
+            } else if let workspaceID = context.workspaceID,
+                      workspaceID != targetWindow.workspaceManager.activeWorkspaceID
+            {
+                guard let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID }) else {
+                    throw MCPError.invalidParams("The inactive Context Builder workspace is no longer available.")
+                }
+                let canonicalPaths = Set(workspace.repoPaths.map(StandardizedPath.absolute))
+                let loadedPaths = await Set(
+                    targetWindow.promptManager.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+                        .map(\.standardizedFullPath)
+                )
+                guard !canonicalPaths.isEmpty, canonicalPaths.isSubset(of: loadedPaths) else {
+                    throw MCPError.invalidParams(
+                        "The resolved Context Builder workspace projection is unavailable. Reload the target workspace before retrying."
+                    )
+                }
+                lookupContext = WorkspaceLookupContext(
+                    rootScope: .sessionBoundWorkspace(
+                        canonicalRootPaths: canonicalPaths,
+                        physicalRootPaths: []
+                    ),
+                    bindingProjection: nil
+                )
             } else {
-                try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
                     tabID: context.tabID,
                     workspaceID: context.workspaceID
                 )
@@ -3544,9 +3610,14 @@ final class MCPServerViewModel: ObservableObject {
             }
             let agentModeSessionID = purpose == .agentModeRun ? context.activeAgentSessionID : nil
             let agentModeRunID = purpose == .agentModeRun ? context.runID : nil
+            guard let workspaceID = context.workspaceID else {
+                throw MCPError.invalidParams("context_builder resolved a tab without workspace authority.")
+            }
+            var nestedTabContext = context
+            nestedTabContext.frozenLookupContext = lookupContext
             return (
-                context.tabID,
-                context.workspaceID,
+                WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID),
+                nestedTabContext,
                 agentModeSessionID,
                 agentModeRunID,
                 shouldBindCaller,
@@ -3573,9 +3644,26 @@ final class MCPServerViewModel: ObservableObject {
             tabID: createdTab.id,
             base: "HEAD"
         )
+        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace is available for a fresh Context Builder tab.")
+        }
+        var nestedTabContext = TabContextSnapshot(
+            tabID: createdTab.id,
+            windowID: targetWindow.windowID,
+            workspaceID: activeWorkspace.id,
+            promptText: createdTab.promptText,
+            selection: createdTab.selection,
+            selectedMetaPromptIDs: createdTab.selectedMetaPromptIDs,
+            selectedContextBuilderPromptIDs: createdTab.contextBuilder.selectedContextBuilderPromptIDs,
+            tabName: createdTab.name,
+            runID: nil,
+            activeAgentSessionID: createdTab.activeAgentSessionID,
+            explicitlyBound: true
+        )
+        nestedTabContext.frozenLookupContext = .visibleWorkspace
         return (
-            createdTab.id,
-            targetWindow.workspaceManager.activeWorkspace?.id,
+            WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: createdTab.id),
+            nestedTabContext,
             nil,
             nil,
             true,
@@ -3597,7 +3685,7 @@ final class MCPServerViewModel: ObservableObject {
         guard let connectionID else {
             return try await operation()
         }
-        let shouldSendProgress = await ServerNetworkManager.shared.supportsControlNotifications(connectionID: connectionID)
+        let shouldSendProgress = await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
         guard shouldSendProgress else {
             return try await operation()
         }
@@ -4996,6 +5084,7 @@ final class MCPServerViewModel: ObservableObject {
         fromRecords files: [WorkspaceFileRecord],
         request: CodeStructureRequest,
         includePathNotFoundIssue: Bool,
+        requestedPaths: [String] = [],
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
         try Task.checkCancellation()
@@ -5009,7 +5098,7 @@ final class MCPServerViewModel: ObservableObject {
             return Self.codeStructureUnavailableReply(
                 issue: .init(
                     code: "codemaps_disabled",
-                    phase: "seed_demand",
+                    phase: "graph_snapshot",
                     path: nil,
                     retryable: false,
                     retryAfterMilliseconds: nil,
@@ -5017,7 +5106,7 @@ final class MCPServerViewModel: ObservableObject {
                     limit: nil,
                     message: "Codemap generation is disabled."
                 ),
-                requestedSeeds: files.count,
+                size: request.size,
                 worktreeScope: worktreeScope
             )
         }
@@ -5038,7 +5127,7 @@ final class MCPServerViewModel: ObservableObject {
                     limit: nil,
                     message: "The session-bound worktree root is unavailable."
                 ),
-                requestedSeeds: files.count,
+                size: request.size,
                 worktreeScope: worktreeScope
             )
         }
@@ -5051,185 +5140,465 @@ final class MCPServerViewModel: ObservableObject {
                 uniqueFilesByStandardizedFullPath[file.standardizedFullPath] = file
             }
         }
-        let seedLimit = Self.codeStructureSeedLimit(for: request)
-        guard uniqueFilesByStandardizedFullPath.count <= seedLimit else {
-            return Self.codeStructureSeedBudgetReply(
-                attempted: min(uniqueFilesByStandardizedFullPath.count, seedLimit + 1),
-                limit: seedLimit,
-                worktreeScope: worktreeScope
-            )
-        }
         if uniqueFilesByStandardizedFullPath.isEmpty, includePathNotFoundIssue {
             return Self.codeStructureUnavailableReply(
                 issue: .init(
                     code: "path_not_found",
                     phase: "seed_resolution",
-                    path: nil,
+                    path: requestedPaths.first,
                     retryable: false,
                     retryAfterMilliseconds: nil,
                     attempted: nil,
                     limit: nil,
                     message: "No requested path resolved to a file."
                 ),
-                requestedSeeds: files.count,
+                size: request.size,
                 worktreeScope: worktreeScope
             )
         }
 
         let logicalRootNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        let orderedFilePaths = uniqueFilesByStandardizedFullPath.values.map { file in
-            #if DEBUG
-                codeStructureLogicalPathComputationsForTesting += 1
-            #endif
-            return (
-                file: file,
-                logicalPath: Self.logicalCodeStructurePath(
-                    for: file,
-                    roots: roots,
-                    lookupContext: lookupContext,
-                    logicalRootDisplayNamesByRootID: logicalRootNames
-                )
+        let orderedFiles = uniqueFilesByStandardizedFullPath.values.sorted { lhs, rhs in
+            let left = Self.logicalCodeStructurePath(
+                for: lhs,
+                roots: roots,
+                lookupContext: lookupContext,
+                logicalRootDisplayNamesByRootID: logicalRootNames
             )
-        }.sorted { lhs, rhs in
-            if lhs.logicalPath != rhs.logicalPath {
-                return lhs.logicalPath.utf8.lexicographicallyPrecedes(rhs.logicalPath.utf8)
-            }
-            return lhs.file.id.uuidString < rhs.file.id.uuidString
+            let right = Self.logicalCodeStructurePath(
+                for: rhs,
+                roots: roots,
+                lookupContext: lookupContext,
+                logicalRootDisplayNamesByRootID: logicalRootNames
+            )
+            if left != right { return left.utf8.lexicographicallyPrecedes(right.utf8) }
+            return lhs.id.uuidString < rhs.id.uuidString
         }
-        let orderedFiles = orderedFilePaths.map(\.file)
 
-        let policy = WorkspaceCodemapPresentationRequestPolicy(
-            maximumReadinessRounds: 4096,
-            initialBackoffMilliseconds: 25,
-            maximumBackoffMilliseconds: 250,
-            maximumTotalWait: .milliseconds(workspaceCodemapProductionDemandWaitMilliseconds),
-            maximumStructureSeedCountPerRoot: Self.maximumCodeStructureSeedCount,
-            maximumCandidateDemandCount: seedLimit
-        )
-        #if DEBUG
-            codeStructureCoordinatorInvocationsForTesting += 1
-        #endif
-        let presentation = try await WorkspaceCodemapPresentationCoordinator(
-            store: store,
-            policy: policy
-        ).structurePresentation(
+        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphSnapshot)
+        let aggregate = try await store.queryCodemapStructureGraphs(
             seedFileIDs: orderedFiles.map(\.id),
             direction: request.direction,
-            traversalLimits: WorkspaceCodemapStructureTraversalLimits(
-                maximumDepth: request.maximumDepth,
-                maximumNodeCount: request.maximumFiles,
-                maximumEdgeCount: request.maximumEdges,
-                maximumByteCount: 8 * 1024 * 1024
-            ),
-            outputLimits: WorkspaceCodemapStructureOutputLimits(
-                maximumFileCount: request.maximumFiles,
-                maximumCodemapTokenCount: request.maximumCodemapTokens
-            ),
+            maximumDepth: request.maximumDepth,
+            budget: request.budget,
             rootScope: lookupContext.rootScope,
             logicalRootDisplayNamesByRootID: logicalRootNames
         )
         try Task.checkCancellation()
-
-        var logicalPathsByFileID = Dictionary(uniqueKeysWithValues: orderedFilePaths.map {
-            ($0.file.id, $0.logicalPath)
-        })
-        for entry in presentation.entries {
-            logicalPathsByFileID[entry.entry.fileID] = entry.entry.logicalPath.displayPath
+        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
+        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphRevalidation)
+        let initialRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
+        let renderableFileIDs = aggregate.roots.flatMap { root -> [UUID] in
+            if case .invalid? = initialRevalidation[root.rootEpoch] { return [] }
+            return root.nodes.map(\.fileID)
         }
+
+        let presentation: WorkspaceCodemapOperationPresentation?
+        if request.includesSignatures, !renderableFileIDs.isEmpty {
+            #if DEBUG
+                codeStructureCoordinatorInvocationsForTesting += 1
+            #endif
+            presentation = try await WorkspaceCodemapPresentationCoordinator(
+                store: store,
+                policy: WorkspaceCodemapPresentationRequestPolicy(
+                    maximumReadinessRounds: 4096,
+                    initialBackoffMilliseconds: 25,
+                    maximumBackoffMilliseconds: 250,
+                    maximumTotalWait: .milliseconds(workspaceCodemapProductionDemandWaitMilliseconds),
+                    maximumCandidateDemandCount: request.budget.maximumNodeCount
+                ),
+                structurePhaseDidChange: { phase in
+                    await MCPToolExecutionHandlerPhaseContext.report(phase.mcpToolExecutionHandlerPhase)
+                }
+            ).structureSignaturePresentation(
+                fileIDs: renderableFileIDs,
+                rootScope: lookupContext.rootScope,
+                logicalRootDisplayNamesByRootID: logicalRootNames
+            )
+        } else {
+            presentation = nil
+        }
+        try Task.checkCancellation()
+
+        let finalRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
+        var revalidation = initialRevalidation
+        for (rootEpoch, result) in finalRevalidation {
+            if case .invalid? = revalidation[rootEpoch] { continue }
+            revalidation[rootEpoch] = result
+        }
+        try Task.checkCancellation()
+        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureAssembly)
         return Self.codeStructureReplyDTO(
+            aggregate: aggregate,
             presentation: presentation,
-            logicalPathsByFileID: logicalPathsByFileID,
+            revalidation: revalidation,
+            includesSignatures: request.includesSignatures,
+            budget: request.budget,
+            size: request.size,
             worktreeScope: worktreeScope
         )
     }
 
     static func codeStructureReplyDTO(
-        presentation: WorkspaceCodemapStructurePresentation,
-        logicalPathsByFileID: [UUID: String],
+        aggregate: WorkspaceCodemapStructureAggregateResult,
+        presentation: WorkspaceCodemapOperationPresentation?,
+        revalidation: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult],
+        includesSignatures: Bool,
+        budget: WorkspaceCodemapGraphQueryBudget,
+        size: WorkspaceCodemapGraphOutputSize,
         worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
     ) -> ToolResultDTOs.CodeStructureReplyDTO {
-        let outcome: WorkspaceCodemapStructureOutcome = switch presentation.outcome {
-        case .partial, .pending: .timeout
-        default: presentation.outcome
+        typealias DTO = ToolResultDTOs.CodeStructureReplyDTO
+        let orderedRoots = aggregate.roots.sorted(by: {
+            if $0.rootDisplayName != $1.rootDisplayName {
+                return $0.rootDisplayName.utf8.lexicographicallyPrecedes($1.rootDisplayName.utf8)
+            }
+            return $0.rootEpoch.rootID.uuidString < $1.rootEpoch.rootID.uuidString
+        })
+        let pathByFileID = Dictionary(uniqueKeysWithValues: orderedRoots.flatMap { root in
+            root.nodes.map { ($0.fileID, $0.path) }
+        })
+        var globalIssues = aggregate.issues.map(codeStructureIssueDTO)
+        let signatureIssueCoverage: CodeStructureSignatureIssueCoverage
+        if let presentation {
+            globalIssues.append(contentsOf: presentation.issues.map {
+                codeStructureSignatureIssueDTO($0, pathByFileID: pathByFileID)
+            })
+            signatureIssueCoverage = codeStructureSignatureIssueCoverage(presentation.issues)
+        } else {
+            signatureIssueCoverage = CodeStructureSignatureIssueCoverage()
         }
-        var issueDTOs = presentation.issues.prefix(256).map {
-            codeStructureIssueDTO($0, logicalPathsByFileID: logicalPathsByFileID)
-        }
-        if outcome == .busy, !issueDTOs.contains(where: { $0.code == "codemap_busy" }) {
-            issueDTOs.append(.init(
-                code: "codemap_busy", phase: "projection", path: nil,
-                retryable: true, retryAfterMilliseconds: 100,
-                attempted: nil, limit: nil,
-                message: "Codemap readiness is temporarily busy."
-            ))
-        }
-        if outcome == .timeout, !issueDTOs.contains(where: { $0.code == "readiness_timeout" }) {
-            issueDTOs.append(.init(
-                code: "readiness_timeout", phase: "readiness", path: nil,
-                retryable: true, retryAfterMilliseconds: 100,
-                attempted: workspaceCodemapProductionDemandWaitMilliseconds,
-                limit: workspaceCodemapProductionDemandWaitMilliseconds,
-                message: "Exact codemap readiness was not reached before the request deadline."
-            ))
-        }
-        issueDTOs = issueDTOs.map(codeStructureIssueWithNormalizedRetry)
 
-        let publishesFiles = outcome == .ready || outcome == .budget
-        let filesDTO = (publishesFiles ? presentation.entries : []).map { rendered in
-            ToolResultDTOs.CodeStructureReplyDTO.FileDTO(
-                path: rendered.entry.logicalPath.displayPath,
-                role: rendered.isSeed ? "seed" : "related",
-                depth: rendered.depth,
-                reachedBy: rendered.reachedBy.map(Self.codeStructureDirectionName).sorted(),
-                content: rendered.entry.text,
-                tokens: rendered.entry.tokenCount
-            )
+        var renderedFiles: [DTO.FileDTO] = []
+        var renderedFileIDs = Set<UUID>()
+        var sizeOmittedFileIDs = Set<UUID>()
+        var renderedTokenCount = 0
+        let separatorTokens = TokenCalculationService.estimateTokens(for: "\n\n")
+        var signatureBudgetReached = false
+        if includesSignatures, let presentation {
+            let orderedSignatureNodes: [WorkspaceCodemapStructureNodeResult] = orderedRoots.flatMap { root -> [WorkspaceCodemapStructureNodeResult] in
+                if case .invalid? = revalidation[root.rootEpoch] { return [] }
+                return root.nodes
+            }.sorted { lhs, rhs in
+                if lhs.isSeed != rhs.isSeed { return lhs.isSeed }
+                if lhs.depth != rhs.depth { return lhs.depth < rhs.depth }
+                if lhs.path != rhs.path { return lhs.path.utf8.lexicographicallyPrecedes(rhs.path.utf8) }
+                return lhs.fileID.uuidString < rhs.fileID.uuidString
+            }
+            for node in orderedSignatureNodes {
+                guard let rendered = presentation.renderedEntriesByFileID[node.fileID] else { continue }
+                let separator = renderedFiles.isEmpty ? 0 : separatorTokens
+                let attempted = renderedTokenCount + separator + rendered.tokenCount
+                guard attempted <= budget.renderTokenCount else {
+                    signatureBudgetReached = true
+                    sizeOmittedFileIDs.insert(node.fileID)
+                    continue
+                }
+                renderedTokenCount = attempted
+                renderedFileIDs.insert(node.fileID)
+                renderedFiles.append(DTO.FileDTO(
+                    path: node.path,
+                    role: node.isSeed ? "seed" : "related",
+                    depth: node.depth,
+                    reachedBy: node.reachedBy.map(codeStructureDirectionName).sorted(),
+                    content: rendered.text,
+                    tokens: rendered.tokenCount
+                ))
+            }
         }
-        let returnedSeeds = filesDTO.lazy.count(where: { $0.role == "seed" })
-        let returnedRelated = filesDTO.count - returnedSeeds
-        let retryableIssues = issueDTOs.filter(\.retryable)
-        let retry = retryableIssues.isEmpty ? nil : ToolResultDTOs.CodeStructureReplyDTO.RetryDTO(
-            retryable: true,
-            retryAfterMilliseconds: retryableIssues.compactMap(\.retryAfterMilliseconds).max() ?? 100
-        )
-        return ToolResultDTOs.CodeStructureReplyDTO(
-            status: outcome.rawValue,
-            files: filesDTO,
-            summary: .init(
-                requestedSeeds: presentation.requestedSeedCount,
-                resolvedSeeds: presentation.resolvedSeedCount,
-                returnedSeeds: returnedSeeds,
-                returnedRelated: returnedRelated,
-                returnedFiles: filesDTO.count,
-                codemapContentTokens: publishesFiles ? presentation.codemapTokenCount : 0,
-                examinedEdges: publishesFiles ? presentation.examinedEdgeCount : 0
+        if signatureBudgetReached {
+            globalIssues.append(DTO.IssueDTO(
+                code: "signature_size_limit",
+                phase: "render",
+                path: nil,
+                retryable: false,
+                retryAfterMilliseconds: nil,
+                attempted: nil,
+                limit: nil,
+                message: "Some signatures were omitted to fit the requested output size."
+            ))
+        }
+
+        var rootDTOs: [DTO.RootDTO] = []
+        for root in orderedRoots {
+            let graphRevalidation = revalidation[root.rootEpoch]
+            let graphInvalid = if case .invalid? = graphRevalidation { true } else { false }
+            let revalidationUpdatesPending: Bool = if case let .valid(updatesPending)? = graphRevalidation {
+                updatesPending
+            } else {
+                false
+            }
+            let coverage = root.coverage
+            var rootIssues = root.issues.map { issue in
+                let mapped = codeStructureIssueDTO(issue)
+                guard issue.code == "seed_not_indexed", coverage?.isComplete != true else { return mapped }
+                return DTO.IssueDTO(
+                    code: mapped.code,
+                    phase: mapped.phase,
+                    path: mapped.path,
+                    retryable: true,
+                    retryAfterMilliseconds: 100,
+                    attempted: mapped.attempted,
+                    limit: mapped.limit,
+                    message: mapped.message
+                )
+            }
+            if case let .invalid(code, message)? = graphRevalidation {
+                rootIssues.append(DTO.IssueDTO(
+                    code: code,
+                    phase: "graph_revalidation",
+                    path: nil,
+                    retryable: false,
+                    retryAfterMilliseconds: nil,
+                    attempted: nil,
+                    limit: nil,
+                    message: message
+                ))
+            }
+            let signatureIssueCoversRoot = signatureIssueCoverage.coversAll ||
+                signatureIssueCoverage.rootEpochs.contains(root.rootEpoch)
+            let missingSignature = includesSignatures && !graphInvalid && !signatureIssueCoversRoot && root.nodes.contains {
+                !renderedFileIDs.contains($0.fileID) &&
+                    !sizeOmittedFileIDs.contains($0.fileID) &&
+                    !signatureIssueCoverage.fileIDs.contains($0.fileID)
+            }
+            if missingSignature {
+                rootIssues.append(DTO.IssueDTO(
+                    code: "signature_unavailable",
+                    phase: "render",
+                    path: nil,
+                    retryable: false,
+                    retryAfterMilliseconds: nil,
+                    attempted: nil,
+                    limit: nil,
+                    message: "One or more signatures could not be rendered; graph data remains usable."
+                ))
+            }
+            let status: DTO.Status = if graphInvalid {
+                .unavailable
+            } else if root.status != .ok || revalidationUpdatesPending || missingSignature {
+                root.hasUsefulData ? .partial : codeStructureStatusDTO(root.status)
+            } else {
+                .ok
+            }
+            rootDTOs.append(DTO.RootDTO(
+                root: root.rootDisplayName,
+                status: status,
+                index: DTO.IndexDTO(
+                    state: coverage?.isComplete == true ? .complete : .indexing,
+                    indexed: coverage?.classifiedCount ?? 0,
+                    total: coverage?.supportedCount ?? 0
+                ),
+                updatesPending: (root.updatesPending || revalidationUpdatesPending) ? true : nil,
+                seeds: root.seeds.map {
+                    DTO.SeedDTO(path: $0.path, state: codeStructureSeedStateDTO($0.state))
+                },
+                nodes: graphInvalid ? [] : root.nodes.map {
+                    DTO.NodeDTO(
+                        path: $0.path,
+                        depth: $0.depth,
+                        seed: $0.isSeed ? true : nil,
+                        reachedBy: $0.reachedBy.map(codeStructureDirectionName).sorted()
+                    )
+                },
+                edges: graphInvalid ? [] : root.edges.map {
+                    DTO.EdgeDTO(
+                        from: $0.fromPath,
+                        to: $0.toPath,
+                        symbols: $0.symbols,
+                        ambiguous: $0.ambiguous ? true : nil
+                    )
+                },
+                unresolved: graphInvalid ? [] : root.unresolved.map {
+                    DTO.UnresolvedDTO(
+                        from: $0.fromPath,
+                        name: $0.name,
+                        reason: codeStructureUnresolvedReasonDTO($0.reason)
+                    )
+                },
+                truncated: graphInvalid ? nil : root.truncation.map {
+                    DTO.TruncatedDTO(reason: "size", droppedNodes: $0.droppedNodeCount)
+                },
+                issues: rootIssues
+            ))
+        }
+
+        let usableNodeCount = rootDTOs.reduce(0) { $0 + $1.nodes.count }
+        let usableEdgeCount = rootDTOs.reduce(0) { $0 + $1.edges.count }
+        let allIssues = globalIssues + rootDTOs.flatMap(\.issues)
+        let hasUsefulData = usableNodeCount > 0 || usableEdgeCount > 0
+        let status: DTO.Status = if hasUsefulData {
+            globalIssues.isEmpty && rootDTOs.allSatisfy { $0.status == .ok } ? .ok : .partial
+        } else if rootDTOs.contains(where: { $0.status == .pending }) {
+            .pending
+        } else {
+            .unavailable
+        }
+        let retryableIssues = allIssues.filter(\.retryable)
+        return DTO(
+            status: status,
+            size: size,
+            roots: rootDTOs,
+            files: renderedFiles,
+            summary: DTO.SummaryDTO(
+                seeds: rootDTOs.reduce(0) { $0 + $1.seeds.count },
+                nodes: usableNodeCount,
+                edges: usableEdgeCount,
+                files: renderedFiles.count,
+                tokens: renderedTokenCount
             ),
-            issues: issueDTOs,
-            retry: retry,
+            issues: globalIssues,
+            retry: retryableIssues.isEmpty ? nil : DTO.RetryDTO(
+                retryable: true,
+                retryAfterMilliseconds: retryableIssues.compactMap(\.retryAfterMilliseconds).max() ?? 100
+            ),
             worktreeScope: worktreeScope
         )
     }
 
-    private static func codeStructureIssueWithNormalizedRetry(
-        _ issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO
+    private static func codeStructureUnavailableReply(
+        issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO,
+        size: WorkspaceCodemapGraphOutputSize,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
+    ) -> ToolResultDTOs.CodeStructureReplyDTO {
+        ToolResultDTOs.CodeStructureReplyDTO(
+            status: .unavailable,
+            size: size,
+            roots: [],
+            files: [],
+            summary: .init(seeds: 0, nodes: 0, edges: 0, files: 0, tokens: 0),
+            issues: [issue],
+            retry: issue.retryable
+                ? .init(retryable: true, retryAfterMilliseconds: issue.retryAfterMilliseconds ?? 100)
+                : nil,
+            worktreeScope: worktreeScope
+        )
+    }
+
+    private static func codeStructureIssueDTO(
+        _ issue: WorkspaceCodemapStructureIssueRecord
     ) -> ToolResultDTOs.CodeStructureReplyDTO.IssueDTO {
-        let retryAfterMilliseconds = issue.retryable
-            ? normalizedCodeStructureRetryDelay(issue.retryAfterMilliseconds)
-            : nil
+        let isSizeIssue = ["graph_size_limit", "signature_size_limit"].contains(issue.code)
         return .init(
             code: issue.code,
             phase: issue.phase,
             path: issue.path,
             retryable: issue.retryable,
-            retryAfterMilliseconds: retryAfterMilliseconds,
-            attempted: issue.attempted,
-            limit: issue.limit,
+            retryAfterMilliseconds: issue.retryAfterMilliseconds,
+            attempted: isSizeIssue ? nil : issue.attempted,
+            limit: isSizeIssue ? nil : issue.limit,
             message: issue.message
         )
     }
 
-    private static func normalizedCodeStructureRetryDelay(_ milliseconds: Int?) -> Int {
-        min(1000, max(25, milliseconds ?? 100))
+    private struct CodeStructureSignatureIssueCoverage {
+        var fileIDs = Set<UUID>()
+        var rootEpochs = Set<WorkspaceCodemapRootEpoch>()
+        var coversAll = false
+    }
+
+    private static func codeStructureSignatureIssueCoverage(
+        _ issues: [WorkspaceCodemapOperationIssue]
+    ) -> CodeStructureSignatureIssueCoverage {
+        var coverage = CodeStructureSignatureIssueCoverage()
+        for issue in issues {
+            switch issue {
+            case .coordinationUnavailable, .cancelled, .automatic:
+                coverage.coversAll = true
+            case let .candidate(candidate):
+                switch candidate {
+                case let .fileNotCataloged(fileID),
+                     let .fileOutsideRootScope(fileID),
+                     let .logicalPathUnavailable(fileID):
+                    coverage.fileIDs.insert(fileID)
+                case let .incompleteRootSet(missingFileIDs):
+                    coverage.fileIDs.formUnion(missingFileIDs)
+                }
+            case let .pending(fileID, _), let .unavailable(fileID, _):
+                coverage.fileIDs.insert(fileID)
+            case let .freezeUnavailable(rootEpoch, _), let .renderUnavailable(rootEpoch, _):
+                coverage.rootEpochs.insert(rootEpoch)
+            case let .publicationStale(reason):
+                switch reason {
+                case .rootScope, .automatic:
+                    coverage.coversAll = true
+                case let .rootEpoch(rootEpoch), let .bundle(rootEpoch, _):
+                    coverage.rootEpochs.insert(rootEpoch)
+                case let .catalog(fileID):
+                    coverage.fileIDs.insert(fileID)
+                case let .demand(ticket):
+                    coverage.fileIDs.insert(ticket.fileID)
+                }
+            }
+        }
+        return coverage
+    }
+
+    private static func codeStructureSignatureIssueDTO(
+        _ issue: WorkspaceCodemapOperationIssue,
+        pathByFileID: [UUID: String]
+    ) -> ToolResultDTOs.CodeStructureReplyDTO.IssueDTO {
+        typealias DTO = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO
+        switch issue {
+        case .coordinationUnavailable:
+            return DTO(code: "signature_unavailable", phase: "render_demand", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "Signature coordination is temporarily unavailable.")
+        case .cancelled:
+            return DTO(code: "signature_unavailable", phase: "render_demand", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "Signature rendering was cancelled.")
+        case let .candidate(candidate):
+            let fileID: UUID? = switch candidate {
+            case let .fileNotCataloged(fileID), let .fileOutsideRootScope(fileID), let .logicalPathUnavailable(fileID): fileID
+            case .incompleteRootSet: nil
+            }
+            return DTO(code: "signature_unavailable", phase: "render_demand", path: fileID.flatMap { pathByFileID[$0] }, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "A current signature candidate is unavailable.")
+        case let .pending(fileID, _):
+            return DTO(code: "signature_pending", phase: "render_demand", path: pathByFileID[fileID], retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "Signature generation is still pending.")
+        case let .unavailable(fileID, reason):
+            let retryable = switch reason {
+            case .busy, .gitTransient, .staleCurrentness: true
+            default: false
+            }
+            return DTO(code: "signature_unavailable", phase: "render_demand", path: pathByFileID[fileID], retryable: retryable, retryAfterMilliseconds: retryable ? 100 : nil, attempted: nil, limit: nil, message: "A signature artifact is unavailable; graph data remains usable.")
+        case .automatic:
+            return DTO(code: "signature_unavailable", phase: "render_demand", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Signature selection is unavailable.")
+        case .freezeUnavailable:
+            return DTO(code: "signature_freeze_failed", phase: "freeze", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Signatures could not be frozen; graph data remains usable.")
+        case .renderUnavailable:
+            return DTO(code: "signature_render_failed", phase: "render", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Signatures could not be rendered; graph data remains usable.")
+        case .publicationStale:
+            return DTO(code: "signature_publication_stale", phase: "render", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "Signature rendering became stale; graph data remains usable.")
+        }
+    }
+
+    private static func codeStructureStatusDTO(
+        _ status: WorkspaceCodemapStructureStatus
+    ) -> ToolResultDTOs.CodeStructureReplyDTO.Status {
+        switch status {
+        case .ok: .ok
+        case .partial: .partial
+        case .pending: .pending
+        case .unavailable: .unavailable
+        }
+    }
+
+    private static func codeStructureSeedStateDTO(
+        _ state: WorkspaceCodemapStructureSeedState
+    ) -> ToolResultDTOs.CodeStructureReplyDTO.SeedState {
+        switch state {
+        case .covered: .covered
+        case .pending: .pending
+        case .notIndexed: .notIndexed
+        case .excluded: .excluded
+        }
+    }
+
+    private static func codeStructureUnresolvedReasonDTO(
+        _ reason: WorkspaceCodemapGraphUnresolvedReason
+    ) -> ToolResultDTOs.CodeStructureReplyDTO.UnresolvedReason {
+        switch reason {
+        case .notIndexedYet: .notIndexedYet
+        case .missing: .missing
+        case .tooCommon: .tooCommon
+        }
     }
 
     private static func logicalCodeStructurePath(
@@ -5250,321 +5619,8 @@ final class MCPServerViewModel: ObservableObject {
         _ direction: WorkspaceCodemapStructureTraversalReachDirection
     ) -> String {
         switch direction {
-        case .referencedDefinitions: "referenced_definitions"
-        case .referrers: "referrers"
-        }
-    }
-
-    private static func codeStructureSeedBudgetReply(
-        attempted: Int,
-        limit: Int,
-        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
-    ) -> ToolResultDTOs.CodeStructureReplyDTO {
-        ToolResultDTOs.CodeStructureReplyDTO(
-            status: "budget",
-            files: [],
-            summary: .init(
-                requestedSeeds: attempted,
-                resolvedSeeds: 0,
-                returnedSeeds: 0,
-                returnedRelated: 0,
-                returnedFiles: 0,
-                codemapContentTokens: 0,
-                examinedEdges: 0
-            ),
-            issues: [
-                .init(
-                    code: "hard_budget_exceeded",
-                    phase: "seed_demand",
-                    path: nil,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: attempted,
-                    limit: limit,
-                    message: "The expanded seed set exceeds the effective request limit."
-                )
-            ],
-            retry: nil,
-            worktreeScope: worktreeScope
-        )
-    }
-
-    private static func codeStructureUnavailableReply(
-        issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO,
-        requestedSeeds: Int,
-        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
-    ) -> ToolResultDTOs.CodeStructureReplyDTO {
-        let issue = codeStructureIssueWithNormalizedRetry(issue)
-        return ToolResultDTOs.CodeStructureReplyDTO(
-            status: "unavailable",
-            files: [],
-            summary: .init(
-                requestedSeeds: requestedSeeds,
-                resolvedSeeds: 0,
-                returnedSeeds: 0,
-                returnedRelated: 0,
-                returnedFiles: 0,
-                codemapContentTokens: 0,
-                examinedEdges: 0
-            ),
-            issues: [issue],
-            retry: issue.retryable
-                ? .init(
-                    retryable: true,
-                    retryAfterMilliseconds: issue.retryAfterMilliseconds
-                )
-                : nil,
-            worktreeScope: worktreeScope
-        )
-    }
-
-    private static func codeStructureIssueDTO(
-        _ issue: WorkspaceCodemapStructureIssue,
-        logicalPathsByFileID: [UUID: String]
-    ) -> ToolResultDTOs.CodeStructureReplyDTO.IssueDTO {
-        typealias DTO = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO
-        switch issue {
-        case let .candidate(candidate):
-            switch candidate {
-            case let .fileNotCataloged(fileID):
-                return DTO(
-                    code: "path_not_found", phase: "seed_resolution",
-                    path: logicalPathsByFileID[fileID], retryable: false,
-                    retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                    message: "The file is no longer cataloged."
-                )
-            case let .fileOutsideRootScope(fileID):
-                return DTO(
-                    code: "outside_root_scope", phase: "seed_resolution",
-                    path: logicalPathsByFileID[fileID], retryable: false,
-                    retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                    message: "The file is outside the captured root scope."
-                )
-            case let .logicalPathUnavailable(fileID):
-                return DTO(
-                    code: "path_not_found", phase: "seed_resolution",
-                    path: logicalPathsByFileID[fileID], retryable: false,
-                    retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                    message: "A logical display path is unavailable."
-                )
-            case let .incompleteRootSet(missingFileIDs):
-                return DTO(
-                    code: "candidate_overflow", phase: "seed_resolution",
-                    path: nil, retryable: false, retryAfterMilliseconds: nil,
-                    attempted: missingFileIDs.count, limit: nil,
-                    message: "The requested root set is incomplete."
-                )
-            }
-        case let .artifactPending(fileID, _):
-            return DTO(
-                code: "artifact_pending", phase: "seed_demand",
-                path: logicalPathsByFileID[fileID], retryable: true,
-                retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                message: "Codemap generation is still pending."
-            )
-        case let .artifactUnavailable(fileID, reason):
-            let path = logicalPathsByFileID[fileID]
-            switch reason {
-            case .unsupportedFileType:
-                return DTO(
-                    code: "unsupported_file", phase: "seed_demand", path: path,
-                    retryable: false, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "The file type does not support codemaps."
-                )
-            case .rootNotLoaded, .gitTerminal:
-                return DTO(
-                    code: "git_root_unavailable", phase: "seed_demand", path: path,
-                    retryable: false, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "The Git root is unavailable for codemap generation."
-                )
-            case let .busy(retryAfterMilliseconds):
-                return DTO(
-                    code: "artifact_pending", phase: "seed_demand", path: path,
-                    retryable: true,
-                    retryAfterMilliseconds: retryAfterMilliseconds,
-                    attempted: nil, limit: nil,
-                    message: "Codemap generation is temporarily unavailable."
-                )
-            case .gitTransient:
-                return DTO(
-                    code: "artifact_pending", phase: "seed_demand", path: path,
-                    retryable: true, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "Codemap generation is temporarily unavailable."
-                )
-            case .staleCurrentness:
-                return DTO(
-                    code: "publication_stale", phase: "publication", path: path,
-                    retryable: true, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "The codemap demand became stale."
-                )
-            case .fileNotCataloged:
-                return DTO(
-                    code: "path_not_found", phase: "seed_demand", path: path,
-                    retryable: false, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "The file is no longer cataloged."
-                )
-            case .demandUnavailable, .rejected, .routeConflict, .registrationFailed,
-                 .runtimeFailure, .cancelled:
-                return DTO(
-                    code: "artifact_unavailable", phase: "seed_demand", path: path,
-                    retryable: false, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "A codemap artifact is unavailable."
-                )
-            }
-        case let .traversalPartial(reason):
-            switch reason {
-            case .definitionUniverseIncomplete:
-                return DTO(
-                    code: "definition_universe_incomplete", phase: "graph", path: nil,
-                    retryable: false, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "Cold relationship discovery is incomplete."
-                )
-            case .referenceFailuresPresent:
-                return DTO(
-                    code: "unresolved_reference", phase: "graph", path: nil,
-                    retryable: false, retryAfterMilliseconds: nil,
-                    attempted: nil, limit: nil,
-                    message: "One or more resident references could not be resolved."
-                )
-            }
-        case let .traversalPending(reason):
-            let code = switch reason {
-            case .graphRebuilding: "graph_rebuilding"
-            case .graphBusy: "graph_rebuilding"
-            }
-            return DTO(
-                code: code, phase: "graph", path: nil, retryable: true,
-                retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                message: "The root-local codemap graph is rebuilding."
-            )
-        case let .traversalUnavailable(reason):
-            let code = switch reason {
-            case .graphNotBuilt: "graph_not_built"
-            case .definitionUniverse: "definition_universe_incomplete"
-            case .emptySeeds, .foreignRootEpoch, .duplicateSeedConflict,
-                 .seedNotReady, .invalidGraphResult, .runtime: "artifact_unavailable"
-            }
-            return DTO(
-                code: code, phase: "graph", path: nil, retryable: false,
-                retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                message: "Root-local relationship traversal is unavailable."
-            )
-        case .traversalStale:
-            return DTO(
-                code: "publication_stale", phase: "publication", path: nil,
-                retryable: true, retryAfterMilliseconds: nil,
-                attempted: nil, limit: nil,
-                message: "Relationship traversal became stale."
-            )
-        case let .traversalBudget(reason):
-            let values: (String, Int?, Int?) = switch reason {
-            case let .nodeLimit(attempted, limit): ("result_limit", attempted, limit)
-            case let .edgeLimit(attempted, limit): ("edge_limit", attempted, limit)
-            case let .byteLimit(attempted, limit): ("hard_budget_exceeded", attempted, limit)
-            case let .rootLimit(attempted, limit): ("hard_budget_exceeded", attempted, limit)
-            case .accountingOverflow, .runtime: ("hard_budget_exceeded", nil, nil)
-            }
-            return DTO(
-                code: values.0, phase: "graph", path: nil, retryable: false,
-                retryAfterMilliseconds: nil, attempted: values.1, limit: values.2,
-                message: "A traversal budget was reached."
-            )
-        case let .busy(retryAfterMilliseconds):
-            return DTO(
-                code: "codemap_busy", phase: "projection", path: nil,
-                retryable: true,
-                retryAfterMilliseconds: normalizedCodeStructureRetryDelay(retryAfterMilliseconds),
-                attempted: nil, limit: nil,
-                message: "Codemap readiness is temporarily busy."
-            )
-        case let .readinessTimeout(elapsedMilliseconds, limitMilliseconds, retryAfterMilliseconds):
-            return DTO(
-                code: "readiness_timeout", phase: "readiness", path: nil,
-                retryable: true,
-                retryAfterMilliseconds: normalizedCodeStructureRetryDelay(retryAfterMilliseconds),
-                attempted: elapsedMilliseconds,
-                limit: limitMilliseconds,
-                message: "Exact codemap readiness was not reached before the request deadline."
-            )
-        case let .projectionUnavailable(reason, retryAfterMilliseconds):
-            let message = switch reason {
-            case .rootNotRegistered:
-                "The codemap projection root is no longer registered."
-            case .capabilityUnavailable:
-                "Codemap projection is unavailable for this root."
-            case .generationMismatch:
-                "The codemap projection generation changed before admission."
-            case .projectionBudget:
-                "Codemap projection exceeded a resource budget."
-            }
-            return DTO(
-                code: "projection_unavailable", phase: "projection", path: nil,
-                retryable: retryAfterMilliseconds != nil,
-                retryAfterMilliseconds: retryAfterMilliseconds,
-                attempted: nil, limit: nil,
-                message: message
-            )
-        case let .projectionBudget(budget):
-            return DTO(
-                code: "projection_budget", phase: "projection", path: nil,
-                retryable: false, retryAfterMilliseconds: nil,
-                attempted: Int(clamping: budget.attempted),
-                limit: Int(clamping: budget.limit),
-                message: "Codemap projection exceeded a resource budget."
-            )
-        case let .freezeUnavailable(_, reason):
-            let isBudget = switch reason {
-            case .entryLimitExceeded, .retainedBundleLimitExceeded: true
-            default: false
-            }
-            return DTO(
-                code: isBudget ? "hard_budget_exceeded" : "artifact_unavailable",
-                phase: "presentation", path: nil, retryable: !isBudget,
-                retryAfterMilliseconds: nil, attempted: nil, limit: nil,
-                message: "Codemap presentation could not be frozen."
-            )
-        case .renderUnavailable:
-            return DTO(
-                code: "artifact_unavailable", phase: "presentation", path: nil,
-                retryable: false, retryAfterMilliseconds: nil,
-                attempted: nil, limit: nil,
-                message: "Codemap presentation could not be rendered."
-            )
-        case let .fileLimit(attempted, limit):
-            return DTO(
-                code: "result_limit", phase: "output", path: nil,
-                retryable: false, retryAfterMilliseconds: nil,
-                attempted: attempted, limit: limit,
-                message: "The file result limit was reached."
-            )
-        case let .seedDemandLimit(attempted, limit):
-            return DTO(
-                code: "hard_budget_exceeded", phase: "seed_demand", path: nil,
-                retryable: false, retryAfterMilliseconds: nil,
-                attempted: attempted, limit: limit,
-                message: "The resolved seed set exceeds the artifact-demand limit."
-            )
-        case let .tokenLimit(path, attempted, limit):
-            return DTO(
-                code: "token_limit", phase: "output", path: path,
-                retryable: false, retryAfterMilliseconds: nil,
-                attempted: attempted, limit: limit,
-                message: "The codemap content token limit was reached."
-            )
-        case .publicationStale:
-            return DTO(
-                code: "publication_stale", phase: "publication", path: nil,
-                retryable: true, retryAfterMilliseconds: nil,
-                attempted: nil, limit: nil,
-                message: "The operation changed before publication."
-            )
+        case .referencedDefinitions: "uses"
+        case .referrers: "used_by"
         }
     }
 
@@ -5808,20 +5864,26 @@ final class MCPServerViewModel: ObservableObject {
         path: String,
         content: String? = nil,
         newPath: String? = nil,
-        ifExists: String? = nil
-    ) async throws -> String? {
+        ifExists: String? = nil,
+        operationID: String
+    ) async throws -> MCPFileActionMutationAcknowledgement {
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks)
         // Enforce workspace presence in multi-window mode
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
         try Task.checkCancellation()
         let metadata = await captureRequestMetadata()
-        var resolvedContext = try resolveTabContextSnapshot(
+        var (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(
             from: metadata,
-            toolName: MCPWindowToolName.fileActions,
-            policy: .allowLegacyImplicitRouting
+            toolName: MCPWindowToolName.fileActions
         )
-        let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if !resolvedContext.usesActiveTabCompatibility,
+           let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
+               for: resolvedContext.snapshot
+           )
+        {
+            throw failure
+        }
         if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
             for: lookupContext,
             store: promptVM.workspaceFileContextStore
@@ -5836,15 +5898,15 @@ final class MCPServerViewModel: ObservableObject {
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: effectivePath,
-            fallbackScope: lookupContext.rootScope
-        )
-        if let effectiveNewPath {
-            _ = await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectiveNewPath,
-                fallbackScope: lookupContext.rootScope
+        do {
+            let mutationPaths = [effectivePath] + (effectiveNewPath.map { [$0] } ?? [])
+            _ = try await store.awaitAppliedIngressForExplicitRequests(
+                userPaths: mutationPaths,
+                fallbackScope: lookupContext.rootScope,
+                timeout: MCPTimeoutPolicy.mutationPreflightFreshnessWaitTimeout
             )
+        } catch is WorkspaceAppliedIngressWaitError {
+            throw MCPMutationRetryableFailure.workspaceFreshnessUnavailable()
         }
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility, transition: .completed)
         try Task.checkCancellation()
@@ -5882,7 +5944,6 @@ final class MCPServerViewModel: ObservableObject {
             default:
                 throw MCPError.invalidParams("invalid action: \(action). Must be 'create', 'delete', or 'move'")
             }
-            try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
         } catch is CancellationError {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsMutationIO, transition: .completed)
@@ -5900,56 +5961,62 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("File action '\(action)' failed: \(error.localizedDescription)")
         }
 
-        // Ensure resulting synthetic publications are canonical before returning.
-        try Task.checkCancellation()
+        // The filesystem mutation is durable. From this point cancellation must not be
+        // misreported as a safe-to-retry pre-mutation failure.
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: effectivePath,
-            fallbackScope: lookupContext.rootScope
-        )
-        if let effectiveNewPath {
-            _ = await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectiveNewPath,
-                fallbackScope: lookupContext.rootScope
+        // Workspace-backed mutations publish their catalog delta before returning.
+        // Re-entering the store here to await watcher ingress is both redundant and
+        // unsafe for request settlement: a concurrent Context Builder rebuild can hold
+        // the store actor after the durable mutation and strand this acknowledgement.
+        // External watcher reconciliation remains asynchronous by design.
+        let freshness = "fresh"
+        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
+        var acknowledgementWarnings: [String] = []
+        if Task.isCancelled {
+            acknowledgementWarnings.append(
+                "Reply delivery was cancelled after the durable mutation. Inspect the filesystem and use operation ID \(operationID) only to correlate this result; do not blindly replay."
             )
         }
-        await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
-        try Task.checkCancellation()
         if action.lowercased() == "create", !resolvedContext.usesActiveTabCompatibility {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
+            let baseSelection = resolvedContext.snapshot.selection
             let addResult = await addStoredSelectionPaths(
-                existing: resolvedContext.snapshot.selection,
+                existing: baseSelection,
                 paths: [effectivePath],
                 rawPaths: [path],
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            try Task.checkCancellation()
-            guard addResult.selection != resolvedContext.snapshot.selection else {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                return nil
-            }
-            resolvedContext.snapshot.selection = addResult.selection
-            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
-            try Task.checkCancellation()
-            do {
-                _ = try MCPSelectionToolProvider.requireCanonicalSelection(
-                    verification,
-                    requested: addResult.selection,
-                    tabID: resolvedContext.snapshot.tabID,
-                    operation: "file_actions create selection update",
-                    recovery: "Retry manage_selection for the same context_id."
-                )
-            } catch is CancellationError {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                throw CancellationError()
-            } catch {
-                await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
-                return "The file was created, but its selection was not confirmed. \(error)"
+            let requestedSelection = addResult.selection
+            if requestedSelection != baseSelection {
+                resolvedContext.snapshot.selection = requestedSelection
+                let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+                do {
+                    _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                        verification,
+                        requested: requestedSelection,
+                        tabID: resolvedContext.snapshot.tabID,
+                        operation: "file_actions create selection update",
+                        recovery: "Retry manage_selection for the same context_id."
+                    )
+                } catch is CancellationError {
+                    acknowledgementWarnings.append(
+                        "The created path selection update was cancelled and was not confirmed."
+                    )
+                } catch {
+                    acknowledgementWarnings.append(
+                        "The file was created, but its selection was not confirmed. \(error)"
+                    )
+                }
             }
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
-        return nil
+        return MCPFileActionMutationAcknowledgement(
+            warning: acknowledgementWarnings.isEmpty ? nil : acknowledgementWarnings.joined(separator: " "),
+            operationID: operationID,
+            mutationState: "applied",
+            freshness: freshness
+        )
     }
 
     /// Creates a **new** file, with optional overwrite behavior.
@@ -6483,5 +6550,20 @@ final class MCPServerViewModel: ObservableObject {
             slices: sliceSnapshot,
             autoEnabled: selection.codemapAutoEnabled
         )
+    }
+}
+
+private extension WorkspaceCodemapStructureExecutionPhase {
+    var mcpToolExecutionHandlerPhase: MCPToolExecutionHandlerPhase {
+        switch self {
+        case .seedResolution: .getCodeStructureSeedResolution
+        case .graphSnapshot: .getCodeStructureGraphSnapshot
+        case .graphTraversal: .getCodeStructureGraphTraversal
+        case .graphRevalidation: .getCodeStructureGraphRevalidation
+        case .renderDemand: .getCodeStructureRenderDemand
+        case .freeze: .getCodeStructureFreeze
+        case .render: .getCodeStructureRender
+        case .assembly: .getCodeStructureAssembly
+        }
     }
 }

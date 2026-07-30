@@ -7,6 +7,7 @@ enum AgentSessionDataError: Error {
     case decodingFailed(Error)
     case loadFailed(Error)
     case saveFailed(Error)
+    case sessionDeleted(UUID)
     case noActiveWorkspace
 }
 
@@ -36,6 +37,11 @@ private actor AgentSessionDiskWriter {
     }
 
     private var pendingByURL: [URL: PendingWrite] = [:]
+    private var idleWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
+
+    #if DEBUG
+        private var beforeWriteHook: (@Sendable (URL) async -> Void)?
+    #endif
 
     func enqueueAndWait(data: Data, url: URL) async throws {
         try await withCheckedThrowingContinuation { continuation in
@@ -55,6 +61,19 @@ private actor AgentSessionDiskWriter {
         }
     }
 
+    func waitUntilIdle(for url: URL) async {
+        guard pendingByURL[url] != nil else { return }
+        await withCheckedContinuation { continuation in
+            idleWaitersByURL[url, default: []].append(continuation)
+        }
+    }
+
+    #if DEBUG
+        func test_setBeforeWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
+            beforeWriteHook = hook
+        }
+    #endif
+
     private func drainWrites(for url: URL) async {
         var lastError: Error?
         while true {
@@ -70,10 +89,20 @@ private actor AgentSessionDiskWriter {
                         waiter.resume(returning: ())
                     }
                 }
+                let idleWaiters = idleWaitersByURL.removeValue(forKey: url) ?? []
+                for waiter in idleWaiters {
+                    waiter.resume()
+                }
                 return
             }
             pending.pendingData = nil
             pendingByURL[url] = pending
+
+            #if DEBUG
+                if let beforeWriteHook {
+                    await beforeWriteHook(url)
+                }
+            #endif
 
             let writeResult: Result<Void, Error> = await Task.detached(priority: .utility) {
                 do {
@@ -112,6 +141,10 @@ actor AgentSessionDataService {
     }
 
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
+    private var deletedSessionFileURLs: Set<URL> = []
+    #if DEBUG
+        private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
+    #endif
     private var metadataIndexReconciliationTasksByFolder: [URL: MetadataIndexReconciliationTaskState] = [:]
     private var metadataIndexReconciledThisProcess: Set<URL> = []
 
@@ -148,6 +181,7 @@ actor AgentSessionDataService {
         let agentReasoningEffort: String?
         let lastRunState: String?
         let providerSessionID: String?
+        let providerCleanupHandle: ProviderConversationCleanupHandle?
         let autoEditEnabled: Bool
         let codexConversationID: String?
         let codexRolloutPath: String?
@@ -932,7 +966,10 @@ actor AgentSessionDataService {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
 
         let filename = "AgentSession-\(session.id.uuidString).json"
-        let fileURL = agentSessionsFolder.appendingPathComponent(filename)
+        let fileURL = agentSessionsFolder.appendingPathComponent(filename).standardizedFileURL
+        guard !deletedSessionFileURLs.contains(fileURL) else {
+            throw AgentSessionDataError.sessionDeleted(session.id)
+        }
 
         let sessionToSave = sessionPreparedForStorage(
             session,
@@ -944,7 +981,9 @@ actor AgentSessionDataService {
         let freshEncoder = JSONEncoder()
         let data = try freshEncoder.encode(sessionToSave)
         try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: agentSessionsFolder)
         await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
+        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: agentSessionsFolder)
         return fileURL
     }
 
@@ -1075,6 +1114,7 @@ actor AgentSessionDataService {
                 agentReasoningEffort: header.agentReasoningEffort,
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,
+                providerCleanupHandle: header.providerCleanupHandle,
                 autoEditEnabled: header.autoEditEnabled,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
@@ -1295,12 +1335,11 @@ actor AgentSessionDataService {
 
     /// Delete a particular agent session file.
     func deleteAgentSessionFile(_ fileURL: URL) async throws {
+        let fileURL = fileURL.standardizedFileURL
         let folder = fileURL.deletingLastPathComponent()
         let filename = fileURL.lastPathComponent
         let parsedID = agentSessionID(fromFilename: filename)
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            try FileManager.default.removeItem(at: fileURL)
-        }
+        try await deleteSessionFileDurably(fileURL)
         await removeMetadataRecords(
             matching: { record in
                 record.filename == filename || parsedID.map { record.id == $0 } == true
@@ -1313,11 +1352,9 @@ actor AgentSessionDataService {
     func deleteAgentSession(id: UUID, for workspace: WorkspaceModel) async throws {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let filename = agentSessionFilename(for: id)
-        let fileURL = agentSessionsFolder.appendingPathComponent(filename)
+        let fileURL = agentSessionsFolder.appendingPathComponent(filename).standardizedFileURL
 
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            try FileManager.default.removeItem(at: fileURL)
-        }
+        try await deleteSessionFileDurably(fileURL)
         await removeMetadataRecords(matching: { $0.id == id || $0.filename == filename }, folder: agentSessionsFolder)
     }
 
@@ -1344,12 +1381,57 @@ actor AgentSessionDataService {
         }
 
         for fileURL in candidateFilesByPath.values {
-            try? FileManager.default.removeItem(at: fileURL)
+            try? await deleteSessionFileDurably(fileURL.standardizedFileURL)
         }
         await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
     }
 
+    private func deleteSessionFileDurably(_ fileURL: URL) async throws {
+        deletedSessionFileURLs.insert(fileURL)
+        #if DEBUG
+            let tombstoneWaiters = deletionTombstoneWaitersByURL.removeValue(forKey: fileURL) ?? []
+            for waiter in tombstoneWaiters {
+                waiter.resume()
+            }
+        #endif
+        await diskWriter.waitUntilIdle(for: fileURL)
+        do {
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+        } catch {
+            deletedSessionFileURLs.remove(fileURL)
+            throw error
+        }
+    }
+
+    private func discardSaveIfSessionWasDeleted(
+        _ sessionID: UUID,
+        fileURL: URL,
+        folder: URL
+    ) async throws {
+        guard deletedSessionFileURLs.contains(fileURL) else { return }
+        try? FileManager.default.removeItem(at: fileURL)
+        await removeMetadataRecords(
+            matching: { $0.id == sessionID || $0.filename == fileURL.lastPathComponent },
+            folder: folder
+        )
+        throw AgentSessionDataError.sessionDeleted(sessionID)
+    }
+
     #if DEBUG
+        func test_setBeforeSessionWriteHook(_ hook: (@Sendable (URL) async -> Void)?) async {
+            await diskWriter.test_setBeforeWriteHook(hook)
+        }
+
+        func test_waitUntilDeletionTombstone(for fileURL: URL) async {
+            let fileURL = fileURL.standardizedFileURL
+            guard !deletedSessionFileURLs.contains(fileURL) else { return }
+            await withCheckedContinuation { continuation in
+                deletionTombstoneWaitersByURL[fileURL, default: []].append(continuation)
+            }
+        }
+
         func test_clearMetadataIndexCache(forAgentSessionsFolder folder: URL) {
             let key = canonicalMetadataFolderKey(folder)
             metadataIndexCacheByFolder.removeValue(forKey: key)

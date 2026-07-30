@@ -1,0 +1,774 @@
+{
+  "schema_version": 1,
+  "milestone": "M0",
+  "recorded_at": "2026-07-26",
+  "scope": {
+    "production_runtime_target_allowed": false,
+    "production_domain_run_launch_token_allowed": false,
+    "later_milestone_implementation_allowed": false
+  },
+  "catalog": {
+    "global_tools": ["app_settings", "bind_context", "manage_workspaces"],
+    "window_tools": ["manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+    "normalized_schema_golden": "Tests/RepoPromptTests/MCP/ToolCatalogSnapshotTests.swift",
+    "actions": {
+      "app_settings": ["list", "get", "set", "options"],
+      "bind_context": ["list", "status", "bind"],
+      "manage_workspaces": ["list", "switch", "create", "hide", "unhide", "delete", "add_folder", "remove_folder", "list_tabs", "select_tab", "create_tab", "close_tab"],
+      "manage_selection": ["get", "add", "remove", "set", "clear", "preview", "promote", "demote"],
+      "file_actions": ["create", "delete", "move"],
+      "workspace_context": ["snapshot", "export", "list_presets", "select_preset"],
+      "prompt": ["get", "set", "append", "clear", "export", "list_presets", "select_preset"],
+      "apply_edits": ["rewrite", "single_replace", "multiple_edits"],
+      "oracle_utils": ["models", "sessions"],
+      "git": ["status", "diff", "log", "show", "blame"],
+      "manage_worktree": ["list", "show", "create", "bind", "select", "unbind", "preview", "apply", "status", "continue", "abort"],
+      "agent_explore": ["start", "poll", "wait", "cancel"],
+      "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
+      "agent_manage": ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"],
+      "history": ["list_sessions", "search", "time", "get_session"]
+    },
+    "canonical_discriminated_action_count": 86,
+    "actionless_tool_count": 12,
+    "actionless_tools": {
+      "get_code_structure": {
+        "required_properties": []
+      },
+      "get_file_tree": {
+        "required_properties": []
+      },
+      "read_file": {
+        "required_properties": ["path"]
+      },
+      "file_search": {
+        "required_properties": ["pattern"]
+      },
+      "ask_oracle": {
+        "required_properties": ["message"]
+      },
+      "oracle_send": {
+        "required_properties": ["message"]
+      },
+      "oracle_chat_log": {
+        "required_properties": []
+      },
+      "context_builder": {
+        "required_properties": []
+      },
+      "ask_user": {
+        "required_properties": ["questions"]
+      },
+      "share_thoughts": {
+        "required_properties": ["thoughts"]
+      },
+      "set_status": {
+        "required_properties": []
+      },
+      "wait_for_next_user_instruction": {
+        "required_properties": []
+      }
+    },
+    "action_execution_evidence": {
+      "status": "explicitly_unmeasured_in_m0",
+      "scope": "per-action success/error result and exact JSON-RPC envelope",
+      "reason": "M0 freezes schema/action/default/error contracts from executable catalog and implementation sources; it does not claim each action was invoked.",
+      "wire_envelope_claim": false
+    },
+    "missing_discriminator_contracts": [
+      {
+        "tool": "app_settings",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/AppSettingsMCPService.swift",
+          "marker": "app_settings requires op='list', 'get', 'set', or 'options'.",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "bind_context",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowRoutingService.swift",
+          "marker": "bind_context requires op='list', 'status', or 'bind'.",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "manage_workspaces",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowRoutingService.swift",
+          "marker": "Missing or invalid 'action' parameter",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "manage_selection",
+        "behavior": "defaults_to_action",
+        "default_action": "get",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPSelectionToolProvider.swift",
+          "marker": "args[\"op\"]?.stringValue ?? \"get\""
+        }
+      },
+      {
+        "tool": "file_actions",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift",
+          "marker": "throw MCPError.invalidParams(\"missing required fields\")",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "workspace_context",
+        "behavior": "defaults_to_action",
+        "default_action": "snapshot",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
+          "marker": "args[\"op\"]?.stringValue ?? \"snapshot\""
+        }
+      },
+      {
+        "tool": "prompt",
+        "behavior": "defaults_to_action",
+        "default_action": "get",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
+          "marker": "args[\"op\"]?.stringValue ?? \"get\""
+        }
+      },
+      {
+        "tool": "apply_edits",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "ApplyEditsError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/ApplyEdits/ApplyEditsRequestBuilder.swift",
+          "marker": "Provide exactly one of: `rewrite`, `replace`, or `edits`.",
+          "type_marker": "ApplyEditsError.invalidParams"
+        }
+      },
+      {
+        "tool": "oracle_utils",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPOracleToolService.swift",
+          "marker": "oracle_utils requires an 'op' parameter.",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "git",
+        "behavior": "defaults_to_action",
+        "default_action": "status",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift",
+          "marker": "?? \"status\""
+        }
+      },
+      {
+        "tool": "manage_worktree",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWorktreeToolProvider.swift",
+          "marker": "op is required. Valid ops:",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "agent_explore",
+        "behavior": "source_declares_typed_invalid_params",
+        "error_type": "MCPError.invalidParams",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
+          "marker": "agent_explore op is required.",
+          "type_marker": "MCPError.invalidParams"
+        }
+      },
+      {
+        "tool": "agent_run",
+        "behavior": "defaults_to_action",
+        "default_action": "wait",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift",
+          "marker": "?? \"wait\""
+        }
+      },
+      {
+        "tool": "agent_manage",
+        "behavior": "defaults_to_action",
+        "default_action": "list_sessions",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift",
+          "marker": "?? \"list_sessions\""
+        }
+      },
+      {
+        "tool": "history",
+        "behavior": "source_declares_typed_error_reply",
+        "error_type": "HistoryToolReply.error(HistoryErrorReply)",
+        "source_evidence": {
+          "path": "Sources/RepoPrompt/Features/AgentMode/History/HistoryMCPToolService.swift",
+          "marker": "Missing or empty required parameter 'op'",
+          "type_marker": ".error(HistoryErrorReply("
+        }
+      }
+    ]
+  },
+  "policy": {
+    "admission": {
+      "exclusive": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "workspace_context", "prompt", "apply_edits", "manage_worktree"],
+      "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+      "small_read": ["get_code_structure", "get_file_tree", "read_file", "oracle_chat_log"],
+      "git_read": ["git"],
+      "file_search": ["file_search"]
+    },
+    "execution": {
+      "long_synchronous": ["oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log", "context_builder", "file_search"],
+      "lifecycle_managed": ["agent_explore", "agent_run"],
+      "interactive": ["apply_edits", "ask_user", "wait_for_next_user_instruction"],
+      "workspace_lifecycle": ["bind_context", "manage_workspaces", "git", "manage_worktree"],
+      "bounded": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "workspace_context", "prompt", "agent_manage", "share_thoughts", "set_status", "history"]
+    },
+    "advertisement_profiles": {
+      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "routing_advanced", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
+      "discover_granted_capabilities": ["user_interaction"],
+      "agent_mode_restricted_capabilities": ["routing_advanced", "conversation_helper", "conversation_send"],
+      "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_claude_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_codex_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_open_code_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_cursor_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"]
+    },
+    "tool_capabilities": {
+      "app_settings": ["app_settings"],
+      "bind_context": ["routing_advanced"],
+      "manage_workspaces": ["routing_advanced"],
+      "manage_selection": ["context_mutate"],
+      "file_actions": ["file_management"],
+      "get_code_structure": ["structural_explore"],
+      "get_file_tree": ["structural_explore"],
+      "read_file": [],
+      "file_search": [],
+      "workspace_context": ["context_render"],
+      "prompt": ["context_mutate"],
+      "apply_edits": ["file_content_edit"],
+      "oracle_utils": ["conversation_helper"],
+      "ask_oracle": ["agent_conversation_send"],
+      "oracle_send": ["conversation_send"],
+      "oracle_chat_log": ["conversation_log"],
+      "git": ["git_read"],
+      "manage_worktree": ["worktree_manage"],
+      "context_builder": ["discovery"],
+      "ask_user": ["user_interaction"],
+      "agent_explore": ["agent_explore_control"],
+      "agent_run": ["agent_external_control"],
+      "agent_manage": ["agent_external_control"],
+      "share_thoughts": ["agent_reasoning_control"],
+      "set_status": ["agent_session_control"],
+      "wait_for_next_user_instruction": ["agent_reasoning_control"],
+      "history": []
+    },
+    "resolved_tool_policy_projection_classification": "production_policy_projection_not_runtime_registry_evidence",
+    "resolved_tool_policy_projection": {
+      "direct": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "oracle_send", "git", "manage_worktree", "context_builder", "agent_run", "agent_manage", "history"],
+      "discovery": ["manage_selection", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "git", "ask_user", "history"],
+      "agent_mode_generic_explore": ["app_settings", "get_code_structure", "get_file_tree", "read_file", "file_search", "git", "ask_user", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+      "agent_mode_generic_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+      "agent_mode_generic_engineer_orchestrator": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+      "agent_mode_claude_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+      "agent_mode_codex_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+      "agent_mode_open_code_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+      "agent_mode_cursor_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
+    }
+  },
+  "dependencies": {
+    "owner": "MCPWindowToolDependencies",
+    "stored_dependency_count": 84,
+    "stored_dependencies": ["executeOracleUtils", "executeAskOracle", "executeOracleSend", "executeOracleChatLog", "executeAgentExplore", "executeAgentRun", "executeAgentManage", "requireTargetWindow", "requireCurrentTabContext", "requireAgentModeConnection", "resolveAgentModeTabID", "resolveContextBuilderTab", "bindTabForConnection", "buildTabSelectionReply", "sendStageProgress", "makeOracleExportDestination", "resolveDefaultOracleExportPath", "writeGeneratedOracleExportFile", "beforeContextBuilderFinalReviewAuthorization", "didFinalizeContextBuilderReview", "runMCPPlanOrQuestion", "windowID", "promptVM", "workspaceManager", "selectionCoordinator", "applyEditsApprovalStore", "captureRequestMetadata", "resolveImplicitContextBuilderGitTarget", "validateContextBuilderGitArtifactSelection", "resolveTabContextSnapshot", "updateCurrentTabContext", "selectedRecordsForCurrentTabContext", "physicalSelectionForCurrentTabContext", "resolveSelectedFilesForCodeStructure", "boundTabID", "mapFileManagerErrorToMCP", "ensureGitDataRootLoaded", "logDebug", "commitPrimaryGitDiffArtifactsToCurrentTab", "replaceAdvertisedGitArtifactsForCurrentTab", "invalidateAdvertisedGitArtifactsForCurrentTab", "workspaceSearch", "parseManageSelectionInputs", "resolveFileToolLookupContext", "resolveMutationFileToolContext", "stabilizedVirtualSelection", "freezePromptGitReviewContext", "buildCurrentSelectionReply", "buildSelectionPreviewReply", "buildSelectionMutationReply", "buildManageSelectionSetSelection", "resolveManageSelectionArtifactInputs", "validateManageSelectionArtifactFence", "mutatePreResolvedFullFilePaths", "commitManageSelectionArtifactMutation", "addStoredSelectionPaths", "removeStoredSelectionPaths", "promoteStoredSelectionPaths", "demoteStoredSelectionPaths", "computeSelectionSlicesVirtual", "persistResolvedTabContextSnapshot", "makeSelectionHintError", "performFileAction", "buildCodeStructureDTO", "resolveFilesForCodeStructure", "buildStoreBackedFileTreeResult", "readSelectedAuthorizedGitArtifact", "readFile", "enqueueReadFileAutoSelection", "drainReadFileAutoSelection", "enqueueFileSearchAutoSelection", "workspaceContextMessage", "parseCopyPresetSelector", "resolveCopyPreset", "buildTabWorkspaceContext", "selectedFilesWithStats", "selectionCollectionsForCurrentTabContext", "buildCopyPresetContextDTO", "buildCopyPresetsListDTO", "copyPresetDescriptorDTO", "buildExportSelectedFileInfos", "buildTabClipboardContent", "writePromptExportFile", "latestTokenBreakdown"]
+  },
+  "approval": {
+    "workspace_operations": ["create_workspace", "delete_workspace", "add_folder", "remove_folder"],
+    "terminal_results": ["approved", "denied", "timeout"],
+    "cancellation_result": "denied",
+    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay"
+  },
+  "main_actor": {
+    "mcp_local_declaration_count": 42,
+    "mcp_local_declaration_sites": [
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
+        "kind": "struct",
+        "symbol": "AgentExploreMCPToolService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExternalMCPRunStarter.swift",
+        "kind": "enum",
+        "symbol": "AgentExternalMCPRunStarter"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentMCPStartWorktreeCoordinator.swift",
+        "kind": "struct",
+        "symbol": "AgentMCPStartWorktreeCoordinator"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift",
+        "kind": "struct",
+        "symbol": "AgentManageMCPToolService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift",
+        "kind": "struct",
+        "symbol": "AgentRunMCPToolService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/MCPAgentRoleDefaultsService.swift",
+        "kind": "class",
+        "symbol": "AgentModelsProfileRoleDefaultsStore"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/MCPAgentRoleDefaultsService.swift",
+        "kind": "enum",
+        "symbol": "MCPAgentRoleDefaultsService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/MCPAgentRoleDefaultsService.swift",
+        "kind": "protocol",
+        "symbol": "MCPAgentRoleDefaultsStoring"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPExternalEventsMonitor.swift",
+        "kind": "class",
+        "symbol": "MCPExternalEventsMonitor"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPOracleToolService.swift",
+        "kind": "struct",
+        "symbol": "MCPOracleToolService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/Policies/MCPGitArtifactAdvertisementRegistry.swift",
+        "kind": "class",
+        "symbol": "MCPGitArtifactAdvertisementRegistry"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift",
+        "kind": "enum",
+        "symbol": "ServiceRegistry"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ToolAvailabilityStore.swift",
+        "kind": "class",
+        "symbol": "ToolAvailabilityStore"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift",
+        "kind": "class",
+        "symbol": "MCPReadFileAutoSelectionCoordinator"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+SelectionCore.swift",
+        "kind": "protocol",
+        "symbol": "SelectionSource"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+SelectionCore.swift",
+        "kind": "struct",
+        "symbol": "StoredSelectionSource"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift",
+        "kind": "class",
+        "symbol": "ContextBuilderTeardownPublicationCoordinator"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift",
+        "kind": "struct",
+        "symbol": "PendingRunScopedContextStore"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift",
+        "kind": "class",
+        "symbol": "MCPServerViewModel"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift",
+        "kind": "struct",
+        "symbol": "ActiveToolExecution"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift",
+        "kind": "struct",
+        "symbol": "AgentRunWaitScope"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowRoutingService.swift",
+        "kind": "class",
+        "symbol": "WindowRoutingService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentControlToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPAgentControlToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentSessionControlToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPAgentSessionControlToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPApplyEditsToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPApplyEditsToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAskUserToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPAskUserToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPContextBuilderToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPContextBuilderToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPFileToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolAdmissionController.swift",
+        "kind": "class",
+        "symbol": "MCPGitToolAdmissionController"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPGitRequestContext"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPGitToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPHistoryToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPHistoryToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPManageSelectionArtifactResolver.swift",
+        "kind": "struct",
+        "symbol": "MCPManageSelectionArtifactResolver"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPOracleToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPOracleToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPPromptContextToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPSelectionToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPSelectionToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
+        "kind": "class",
+        "symbol": "MCPWindowToolCatalogService"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
+        "kind": "protocol",
+        "symbol": "MCPWindowToolProviding"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolRuntime.swift",
+        "kind": "class",
+        "symbol": "MCPWindowToolRuntime"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWorktreeToolProvider+Merge.swift",
+        "kind": "extension",
+        "symbol": "MCPWorktreeToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWorktreeToolProvider.swift",
+        "kind": "class",
+        "symbol": "MCPWorktreeToolProvider"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WorkspaceApproval/WorkspaceApprovalManager.swift",
+        "kind": "class",
+        "symbol": "WorkspaceApprovalManager"
+      }
+    ],
+    "external_collaborators": [
+      {
+        "path": "Sources/RepoPrompt/App/WindowState.swift",
+        "symbol": "WindowState"
+      },
+      {
+        "path": "Sources/RepoPrompt/App/WindowStateManager.swift",
+        "symbol": "WindowStatesManager"
+      },
+      {
+        "path": "Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift",
+        "symbol": "WorkspaceManagerViewModel"
+      },
+      {
+        "path": "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift",
+        "symbol": "PromptViewModel"
+      },
+      {
+        "path": "Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift",
+        "symbol": "ContextBuilderAgentViewModel"
+      },
+      {
+        "path": "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsManager.swift",
+        "symbol": "GlobalSettingsStore"
+      },
+      {
+        "path": "Sources/RepoPrompt/Features/Settings/Models/WindowSettingsManager.swift",
+        "symbol": "WindowSettingsManager"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionCoordinator.swift",
+        "symbol": "WorkspaceSelectionCoordinator"
+      }
+    ],
+    "non_main_actors": ["MCPBootstrapLease", "MCPReplayState", "BootstrapSocketMCPTransport"],
+    "request_hops": ["main_actor_scheduled", "main_actor_entered", "main_actor_exited"],
+    "existing_test": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+    "per_tool_source_guarded_hops": {
+      "app_settings": ["GlobalSettingsStore"],
+      "bind_context": ["WindowRoutingService"],
+      "manage_workspaces": ["WindowRoutingService"],
+      "manage_selection": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPSelectionToolProvider"],
+      "file_actions": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
+      "get_code_structure": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
+      "get_file_tree": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
+      "read_file": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
+      "file_search": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
+      "workspace_context": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPPromptContextToolProvider"],
+      "prompt": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPPromptContextToolProvider"],
+      "apply_edits": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPApplyEditsToolProvider"],
+      "oracle_utils": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
+      "ask_oracle": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
+      "oracle_send": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
+      "oracle_chat_log": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
+      "git": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPGitToolProvider"],
+      "manage_worktree": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPWorktreeToolProvider"],
+      "context_builder": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPContextBuilderToolProvider"],
+      "ask_user": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAskUserToolProvider"],
+      "agent_explore": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
+      "agent_run": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
+      "agent_manage": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
+      "share_thoughts": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
+      "set_status": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
+      "wait_for_next_user_instruction": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
+      "history": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPHistoryToolProvider"]
+    },
+    "reviewed_delegated_hops": {
+      "evidence_status": "reviewed_non_executable_inventory",
+      "tools": {
+        "oracle_utils": ["MCPOracleToolService"],
+        "ask_oracle": ["MCPOracleToolService"],
+        "oracle_send": ["MCPOracleToolService"],
+        "oracle_chat_log": ["MCPOracleToolService"],
+        "context_builder": ["ContextBuilderAgentViewModel"],
+        "agent_explore": ["AgentExploreMCPToolService"],
+        "agent_run": ["AgentRunMCPToolService", "AgentExternalMCPRunStarter", "AgentMCPStartWorktreeCoordinator"],
+        "agent_manage": ["AgentManageMCPToolService"]
+      }
+    }
+  },
+  "sdk_stdio": {
+    "package": "https://github.com/repoprompt/swift-sdk.git",
+    "revision": "85dec2fc7a27252bc33dc7728be6af6b3bd398c0",
+    "source_evidence": {
+      "transport": "Sources/MCP/Base/Transports/StdioTransport.swift",
+      "server": "Sources/MCP/Server/Server.swift",
+      "assessment_kind": "pinned_dependency_source_inspection"
+    },
+    "observed_terminal_assessment": {
+      "clean_eof": "message stream finishes normally",
+      "read_failure": "logged then message stream finishes normally",
+      "incomplete_frame_eof": "pending bytes are discarded and message stream finishes normally",
+      "host_visible_error": "none; all three collapse to connectionClosed",
+      "decision": "Keep the pin. M6B must use a bounded RepoPromptMCP-owned stdio transport adapter rather than claim terminal parity from the SDK transport."
+    },
+    "elicitation": {
+      "method": "elicitation/create",
+      "actions": ["accept", "decline", "cancel"],
+      "classification": "SDK-supported and client-negotiated; never assumed"
+    },
+    "fallback_evidence": ["RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished", "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive"]
+  },
+  "credential_gate": {
+    "packaged_cli_path": "RepoPrompt.app/Contents/MacOS/repoprompt-mcp",
+    "signing_observation": "Scripts/package_app.sh signs the CLI before signing the outer app bundle.",
+    "reason": "The preserved record says authorization-UI behavior was not probed and startup_scan_approved is false.",
+    "prohibited_claim": "Direct packaged-child Keychain access works.",
+    "prescribed_fallback": "Parent-owned secure storage and a minimum-scope in-memory credential handoff; debug alternate-in-memory storage remains nonpersistent.",
+    "secure_account_catalog_count": 23,
+    "observation_status": "not_observed_approval_required",
+    "record_classification": "unresolved_procedure_record_not_empirical_evidence",
+    "prescribed_measurement_milestone": "before_M5_credential_transport"
+  },
+  "persistence": {
+    "stores": [
+      {
+        "owner": "GlobalSettingsStore",
+        "backing": "file",
+        "path": "~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json",
+        "classification": "durable_authority"
+      },
+      {
+        "owner": "WindowSettingsManager",
+        "backing": "memory",
+        "classification": "window_overlay_explicit_commit_or_opt_in_auto_persist"
+      },
+      {
+        "owner": "WorkspaceManagerViewModel",
+        "backing": "workspace_documents",
+        "classification": "durable_workspace_authority"
+      },
+      {
+        "owner": "WorkspaceApprovalManager",
+        "backing": "UserDefaults",
+        "classification": "runtime_policy_migration_candidate"
+      },
+      {
+        "owner": "ApplyEditsApprovalStore",
+        "backing": "UserDefaults",
+        "classification": "runtime_policy_migration_candidate"
+      },
+      {
+        "owner": "ToolAvailabilityStore",
+        "backing": "UserDefaults",
+        "classification": "catalog_policy_migration_candidate"
+      },
+      {
+        "owner": "ServerController",
+        "backing": "UserDefaults",
+        "classification": "host_admission_policy_migration_candidate"
+      },
+      {
+        "owner": "SecureStorage",
+        "backing": "Keychain_or_debug_memory",
+        "classification": "parent_owned_secret_authority"
+      }
+    ],
+    "save_source_classification": {
+      "automatic_poll": ["pollTimer", "pollAndSaveState", "pollAndSaveStateAsync"],
+      "lifecycle": ["workspaceSwitchSaveState", "mcpTabContextEndOfRun"],
+      "debounced_automatic": ["workspaceFilesDebouncedSelectionSave"],
+      "explicit_save_api": ["saveWorkspaceAsync"],
+      "mutation_write_through": ["createWorkspace", "renameWorkspace", "setWorkspaceHidden", "setWorkspaceHiddenFromSnapshot", "rootReorder", "rootRemove", "rootAdd", "applyPreset", "createPreset", "createPresetWithPaths", "saveCurrentPreset", "savePresetShortcut", "deletePreset", "renamePreset", "reorderPresets", "updatePromptText", "updateSelectedMetaPromptIDs", "clearActiveAgentSessionIDReferences", "duplicateCleanupPreSwitch", "duplicateCleanupCanonicalMerge", "createDefaultWorkspace", "normalizationWriteback", "refreshWorkspace"],
+      "legacy_unattributed": ["directUnknown"],
+      "debug_only": ["debugWorkspaceSelectionFixtureApply"]
+    },
+    "working_journal_migration_rows": [
+      {
+        "state": "workspace_identity_and_roots",
+        "current_authority": "workspace_document",
+        "dirty_revision_required": true,
+        "saved_revision_required": true,
+        "migration_milestone": "M2"
+      },
+      {
+        "state": "tab_context_selection_prompt",
+        "current_authority": "workspace_document_plus_window_overlay",
+        "dirty_revision_required": true,
+        "saved_revision_required": true,
+        "migration_milestone": "M2"
+      },
+      {
+        "state": "connection_binding",
+        "current_authority": "in_memory_connection_state",
+        "dirty_revision_required": false,
+        "saved_revision_required": false,
+        "migration_milestone": "M2"
+      },
+      {
+        "state": "approval_and_tool_policy",
+        "current_authority": "UserDefaults",
+        "dirty_revision_required": true,
+        "saved_revision_required": true,
+        "migration_milestone": "M4"
+      },
+      {
+        "state": "secure_credentials",
+        "current_authority": "parent_secure_storage",
+        "dirty_revision_required": false,
+        "saved_revision_required": false,
+        "migration_milestone": "never_to_child_disk"
+      }
+    ]
+  },
+  "child_launch": {
+    "current_lease_fields": ["runID", "gateID", "windowID", "tabID", "clientName", "restrictedTools", "additionalTools", "oneShot", "reason", "ttl", "purpose", "taskLabelKind", "allowsAgentExternalControlTools", "requiresExpectedAgentPID"],
+    "private_endpoint_contract": {
+      "transport": "unix_domain_socket",
+      "directory_mode": "0700",
+      "socket_mode": "0600",
+      "addressing": "per_runtime_random_non_well_known_path",
+      "ownership_fence": ["runtime_id", "generation", "owner_pid"],
+      "descriptor_inheritance": "prohibited",
+      "child_environment_key": "REPOPROMPT_MCP_PRIVATE_ENDPOINT",
+      "transmission_boundary": "host_created_launch_scoped_child_environment",
+      "lifetime": "one_child_launch_through_terminal_settlement",
+      "admission": "single_use_expected_child_or_descendant",
+      "cleanup": "identity_fenced_idempotent_settlement",
+      "failure_behavior": "fail_closed_and_revoke_endpoint_and_token"
+    },
+    "domain_run_launch_token_contract": {
+      "status": "frozen_contract_only_not_implemented",
+      "child_material": ["opaque_random_capability"],
+      "host_record_bindings": ["token_id", "secret_digest", "runtime_id", "runtime_generation", "run_id", "expected_child_pid_or_descendant", "workspace_context_identity", "client_principal", "provider", "run_purpose", "restricted_tools", "additional_tools", "issued_at", "expires_at", "nonce"],
+      "rules": ["single_use", "short_lived", "memory_only", "never_logged", "never_persisted", "bound_to_private_endpoint_generation", "revoked_on_terminal_cleanup"],
+      "policy_selection_authority": "host_only",
+      "child_environment_key": "REPOPROMPT_MCP_LAUNCH_TOKEN"
+    },
+    "launch_carriers": [
+      {
+        "family": "Codex",
+        "carrier": "process_environment_or_managed_MCP_config"
+      },
+      {
+        "family": "Claude",
+        "carrier": "process_environment_and_--mcp-config"
+      },
+      {
+        "family": "OpenCode",
+        "carrier": "ACP_process_environment_or_OPENCODE_CONFIG_CONTENT"
+      },
+      {
+        "family": "Cursor",
+        "carrier": "ACP_process_environment_and_session_mcpServers"
+      }
+    ]
+  },
+  "performance_baseline": {
+    "artifact": "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json",
+    "required_stages": ["queue", "main_actor", "execution", "persistence", "response"],
+    "live_sample_status": "not_observed_task_prohibited",
+    "required_before": "M2_no_regression_decisions"
+  },
+  "milestone_result": {
+    "status": "contract_freeze_complete_with_carried_forward_evidence_gates",
+    "carried_forward_gates": ["packaged_cli_credential_access_before_M5", "live_editflowperf_latency_before_M2_no_regression_decisions"]
+  }
+}

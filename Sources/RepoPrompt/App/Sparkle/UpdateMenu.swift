@@ -18,8 +18,8 @@ struct UpdateMenu: Commands {
     var body: some Commands {
         CommandGroup(after: .appInfo) {
             // If an update is already known, offer a one-click "Install Update…"
-            if sparkleManager.updateAvailable {
-                Button("Install Update \(sparkleManager.updateVersion ?? "")…") {
+            if let availableUpdate = sparkleManager.availableUpdate {
+                Button(availableUpdate.menuInstallTitle) {
                     sparkleManager.installUpdate() // always installs the latest
                 }
                 .keyboardShortcut("u", modifiers: [.command, .option])

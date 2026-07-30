@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptCodeMapCore
 
 struct CodeMapArtifactContainerPolicy: Equatable {
     static let `default` = CodeMapArtifactContainerPolicy()

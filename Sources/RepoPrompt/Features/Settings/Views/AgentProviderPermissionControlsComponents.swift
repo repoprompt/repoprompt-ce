@@ -241,7 +241,7 @@ struct CodexProviderToolsRuntimeSection: View {
                         )
                     }
                 } else {
-                    Text("No MCP servers found in ~/.codex/config.toml.")
+                    Text("No MCP servers found in RepoPrompt's isolated Codex config.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }

@@ -220,9 +220,14 @@ actor ContentReadAsyncLimiter {
         self.retryAfterMilliseconds = retryAfterMilliseconds
         self.agePromotionNanoseconds = agePromotionNanoseconds
         self.maxConsecutiveInteractiveGrants = maxConsecutiveInteractiveGrants
-        backgroundPermitLimit = capacity > 1 ? capacity - 1 : 1
+        backgroundPermitLimit = Self.bulkPermitLimit(forCapacity: capacity)
         self.nowUptimeNanoseconds = nowUptimeNanoseconds
         availablePermits = capacity
+    }
+
+    static func bulkPermitLimit(forCapacity capacity: Int) -> Int {
+        precondition(capacity > 0)
+        return capacity > 1 ? capacity - 1 : 1
     }
 
     func beginForegroundActivity(
@@ -771,6 +776,12 @@ extension FileSystemService {
         capacity: contentReadWorkerLimit,
         maxQueuedWaiterCount: 512
     )
+
+    /// Maximum CodeMap bulk permits when no foreground activity is registered.
+    /// Foreground activity temporarily suppresses all CodeMap permit grants.
+    nonisolated static var codeMapArtifactBuildBulkPermitLimit: Int {
+        ContentReadAsyncLimiter.bulkPermitLimit(forCapacity: contentReadWorkerLimit)
+    }
 
     nonisolated static func withContentReadForegroundActivity<T>(
         kind: ContentReadForegroundActivityKind,

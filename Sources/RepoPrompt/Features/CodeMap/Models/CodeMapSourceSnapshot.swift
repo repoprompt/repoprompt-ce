@@ -1,44 +1,6 @@
 import CryptoKit
 import Foundation
-
-enum CodeMapSourceDecoderPolicy: String, Codable, Hashable {
-    case workspaceAutomaticV1
-    #if DEBUG
-        case testOnlyMismatch
-    #endif
-}
-
-struct CodeMapRawSourceDigest: Hashable, Codable {
-    private static let requiredByteCount = 32
-
-    let bytes: Data
-
-    init(bytes: Data) {
-        precondition(bytes.count == Self.requiredByteCount, "A raw source digest must contain exactly 32 SHA-256 bytes.")
-        self.bytes = bytes
-    }
-
-    var lowercaseHex: String {
-        bytes.map { String(format: "%02x", $0) }.joined()
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        let decodedBytes = try container.decode(Data.self)
-        guard decodedBytes.count == Self.requiredByteCount else {
-            throw DecodingError.dataCorruptedError(
-                in: container,
-                debugDescription: "A raw source digest must contain exactly 32 SHA-256 bytes."
-            )
-        }
-        bytes = decodedBytes
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(bytes)
-    }
-}
+import RepoPromptCodeMapCore
 
 struct CodeMapSourceValidationToken: Hashable {
     let fingerprint: FileContentFingerprint
@@ -47,20 +9,6 @@ struct CodeMapSourceValidationToken: Hashable {
 enum CodeMapSourceProvenance: Hashable {
     case validatedWorktree(CodeMapSourceValidationToken)
     case cleanGitBlob(repositoryNamespace: GitBlobRepositoryNamespace, blobOID: GitBlobOID)
-}
-
-struct CodeMapDecodedSource: Equatable {
-    let text: String
-    let detectedEncodingRawValue: UInt
-}
-
-enum CodeMapSourceDecodeFailure: String, Codable, Equatable {
-    case undecodable
-}
-
-enum CodeMapSourceDecodeResult: Equatable {
-    case decoded(CodeMapDecodedSource)
-    case failed(CodeMapSourceDecodeFailure)
 }
 
 struct CodeMapSourceSnapshot {
@@ -74,6 +22,15 @@ struct CodeMapSourceSnapshot {
     var validatedWorktreeToken: CodeMapSourceValidationToken? {
         guard case let .validatedWorktree(token) = provenance else { return nil }
         return token
+    }
+
+    var coreSnapshot: CodeMapCoreSourceSnapshot {
+        CodeMapCoreSourceSnapshot(
+            rawByteCount: rawByteCount,
+            rawSHA256: rawSHA256,
+            decoderPolicy: decoderPolicy,
+            decodeResult: decodeResult
+        )
     }
 
     init(
