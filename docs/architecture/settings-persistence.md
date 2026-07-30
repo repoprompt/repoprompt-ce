@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-07-12. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-07-26. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -83,9 +83,11 @@ that rollback compatibility guarantee.
 `currentSchemaVersion` increases.
 
 Classic/internal RepoPrompt wrote unlineaged v3/v4 `globalSettings.json` files before CE
-introduced `schemaLineage`. An unlineaged version above the frozen ceiling is therefore
-foreign forever, even after CE reaches v3/v4 numerically. This prevents old live/dev files
-from being silently adopted and overwritten by a newer CE build.
+introduced `schemaLineage`. CE therefore skipped numeric schema v3 rather than claiming a
+version that existing classic/internal installs had already written without lineage. An
+unlineaged version above the frozen ceiling is foreign forever, even after CE reaches v3/v4
+numerically. This prevents old live/dev files from being silently adopted and overwritten by
+a newer CE build.
 
 The guardrail tests are:
 
@@ -106,6 +108,15 @@ the preserved file until the user chooses an action:
   unknown fields only in the backup.
 - **Save failure**: offer retry before reset.
 
+Telemetry enablement has a `UserDefaults` mirror so startup can make a safe decision before
+the canonical JSON document is available. A successful settings load synchronizes that
+mirror from JSON. When a same-lineage future or incompatible/foreign schema blocks the
+load, an existing mirror is preserved; if no mirror exists, telemetry defaults off. Other
+load failures, including corrupt input, force the mirror off. Missing settings remove a
+stale mirror so the build default applies, and successful user-initiated recovery
+resynchronizes the mirror from the replacement current-schema document. None of these
+mirror decisions bypass the blocked file's byte-preservation and save latch.
+
 Every save re-checks the on-disk header before writing. This matters because CE dev builds
 can share the live app support folder; a future/foreign file may appear after launch.
 
@@ -113,6 +124,49 @@ Blocked-persistence warnings may be dismissed in workspace windows for the curre
 session. The store owns dismissal across workspace windows and clears it when the reason
 changes or persistence unblocks. It is never stored in `UserDefaults`. The Settings
 window always shows the active warning and recovery controls.
+
+## Agent Mode Handoff instructions
+
+The reusable titlebar Handoff default is one optional app-wide scalar:
+
+```text
+scalarPreferences.agentMode.agentSessionHandoffInstructions
+```
+
+This setting is global across workspaces. It does not use the Agent Models
+workspace-profile system, which is feature-specific rather than a generic
+layered-settings authority. Workspace-scoped Handoff instructions require a
+separate persistence and migration design.
+
+The field is a JSON string when present. An absent or decoded `null` field resolves to
+exactly `""` through `GlobalSettingsStore.agentSessionHandoffInstructions()` without
+materializing the field or rewriting the file. The typed setter preserves text verbatim:
+leading and trailing whitespace, blank lines, and whitespace-only values are significant.
+Setting exactly `""` removes the optional field (`nil`); clearing an already absent field
+is an accepted no-op that does not publish or save.
+
+Supported UI and store writes accept at most 20,000 Swift `Character`s, counted with
+`String.count`. Exactly 20,000 is valid. The setter rejects 20,001 or more without changing
+memory or disk and never trims or truncates. An oversized value from externally authored
+JSON remains loaded so Settings can show the full invalid draft for correction or clearing;
+it does not make the document corrupt or authorize a compatibility fallback that silently
+omits configured instructions.
+
+This scalar belongs to the existing baseline scalar container, requires no schema-version
+bump or migration, and leaves baseline-only documents stamped v2. Compatible import retains
+a type-compatible string. False-v4 normalization changes only the raw root `schemaVersion`,
+so the raw Handoff field and its exact value survive unchanged. Setting or clearing this
+field uses the sibling-preserving Agent Mode scalar update path.
+
+The setting is intentionally local to the Agent Mode settings UI and titlebar Handoff flow.
+It has no `app_settings` descriptor, catalog key, getter, setter, candidate schema, or MCP
+tool property. Do not expose `agent_mode.handoff_instructions` (or an equivalent key)
+without a separate public-surface design and migration decision.
+
+If global-settings persistence is blocked, an accepted Save or Clear remains active in
+memory for the current launch and the Handoff card surfaces a noninteractive warning. The
+existing global-settings warning and recovery controls remain the only recovery authority;
+the card does not roll back the accepted value or create a second recovery path.
 
 ## Agent Models profiles
 
@@ -219,3 +273,4 @@ Those keys write the global backing fields. Workspace-specific Agent Models over
 - Do not resurrect the old Context Builder drift resolver. Agent Models and runtime code should use the effective Agent Models profile, not compare against legacy `ChatGlobalSettings.contextBuilder*` fields.
 - Do not add a second global Agent Models blob unless there is a separate migration plan; the global profile intentionally maps to existing fields.
 - Existing workspaces default to `Use global settings`. Workspace overrides are opt-in and materialized from the current global profile.
+- Orphaned workspace-keyed settings are intentionally retained. Pruning remains deferred until authoritative workspace IDs can drive one atomic sweep across every workspace-keyed settings map.

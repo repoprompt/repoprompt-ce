@@ -279,12 +279,14 @@ final class DurableArtifactCrashAndCatalogTests: XCTestCase {
                 records: ["b"],
                 retryBusy: true
             )
-            guard case let .published(initial) = try store.compareAndSwapCatalog(
-                family: DurableArtifactTestSupport.family,
-                expectedRevision: nil,
-                target: old,
-                admittedByteUpperBound: 4096
-            ) else { return XCTFail("Expected initial catalog") }
+            guard case let .published(initial) = try DurableArtifactTestSupport.catalogCASWithBusyRetry({
+                try store.compareAndSwapCatalog(
+                    family: DurableArtifactTestSupport.family,
+                    expectedRevision: nil,
+                    target: old,
+                    admittedByteUpperBound: 4096
+                )
+            }) else { return XCTFail("Expected initial catalog") }
 
             let child = try DurableArtifactSubprocess.spawn(
                 testCase: Self.self,

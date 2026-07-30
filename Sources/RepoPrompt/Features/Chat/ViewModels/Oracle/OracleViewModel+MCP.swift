@@ -1,6 +1,18 @@
 import Foundation
 import MCP // <- required for `Value`
 
+private actor OracleProviderCleanupHandleBox {
+    private var handle: ProviderConversationCleanupHandle?
+
+    func update(_ handle: ProviderConversationCleanupHandle) {
+        self.handle = handle
+    }
+
+    func current() -> ProviderConversationCleanupHandle? {
+        handle
+    }
+}
+
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
 extension OracleViewModel {
@@ -1634,6 +1646,15 @@ extension OracleViewModel {
 
         // 4) Stream via AIQueriesService WITHOUT touching OracleViewModel.messages
         let (streamID, stream) = try await aiQueriesService.sendPrompt(aiMessage, model: model)
+        let cleanupHandleBox = OracleProviderCleanupHandleBox()
+        var didScheduleProviderCleanup = false
+        defer {
+            if !didScheduleProviderCleanup {
+                Task {
+                    await self.cleanupOracleProviderConversation(cleanupHandleBox.current(), model: model)
+                }
+            }
+        }
 
         // Register this headless stream by tab ID so Discover can cancel it.
         headlessStreamsByTabID[tabID] = streamID
@@ -1646,8 +1667,8 @@ extension OracleViewModel {
         // (One Task.sleep for entire stream, not per-chunk - avoids CPU churn)
         let timeout: Duration = .seconds(4 * 60 * 60)
 
-        let (finalText, finalReasoning, finalTokenInfo) = try await withThrowingTaskGroup(
-            of: (String, String, ChatTokenInfo).self
+        let (finalText, _, finalTokenInfo, providerCleanupHandle) = try await withThrowingTaskGroup(
+            of: (String, String, ChatTokenInfo, ProviderConversationCleanupHandle?).self
         ) { group in
             // Timeout task - throws after 4 hours
             group.addTask {
@@ -1656,10 +1677,11 @@ extension OracleViewModel {
             }
 
             // Streaming task - accumulates locally, returns result
-            group.addTask { [stream, onProgress] in
+            group.addTask { [stream, onProgress, cleanupHandleBox] in
                 var accText = ""
                 var accReasoning = ""
                 var tokens = ChatTokenInfo()
+                var cleanupHandle: ProviderConversationCleanupHandle?
                 var iterator = stream.makeAsyncIterator()
 
                 while let chunk = try await iterator.next() {
@@ -1674,6 +1696,10 @@ extension OracleViewModel {
                     {
                         tokens = chunk.tokens
                     }
+                    if let handle = chunk.cleanupHandle {
+                        cleanupHandle = handle
+                        await cleanupHandleBox.update(handle)
+                    }
                     // Only hop to MainActor for progress callback
                     if let onProgress {
                         let text = accText
@@ -1681,7 +1707,7 @@ extension OracleViewModel {
                         await MainActor.run { onProgress(text, reasoning) }
                     }
                 }
-                return (accText, accReasoning, tokens)
+                return (accText, accReasoning, tokens, cleanupHandle)
             }
 
             // Wait for stream to complete or timeout to fire
@@ -1709,6 +1735,9 @@ extension OracleViewModel {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID
         )
+
+        didScheduleProviderCleanup = true
+        Task { await cleanupOracleProviderConversation(providerCleanupHandle, model: model) }
 
         // 6) Return ChatSendReply
         return ChatSendReply(

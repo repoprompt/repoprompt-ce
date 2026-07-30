@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 enum WarmManifestCandidateState: CaseIterable {
@@ -294,7 +295,9 @@ class CodemapBindingEngineTestCase: XCTestCase {
         runtime: CodeMapArtifactRuntime,
         policy: WorkspaceCodemapBindingEnginePolicy = .default,
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
+        manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .init { _ in },
         overlay: WorkspaceCodemapLiveOverlay? = nil,
+        selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
         initialQueueOrdinal: UInt64 = 1,
         initialAdmissionOrdinal: UInt64 = 1,
         initialCounterValue: UInt64 = 0,
@@ -373,8 +376,10 @@ class CodemapBindingEngineTestCase: XCTestCase {
             sourceReader: sourceReaderOverride ?? reader,
             catalogClient: catalog,
             overlay: overlay ?? WorkspaceCodemapLiveOverlay(),
+            selectionGraphFactory: selectionGraphFactory,
             policy: policy,
             hooks: hooks,
+            manifestWriterRetryWaiter: manifestWriterRetryWaiter,
             initialQueueOrdinal: initialQueueOrdinal,
             initialAdmissionOrdinal: initialAdmissionOrdinal,
             initialCounterValue: initialCounterValue,
@@ -626,7 +631,9 @@ final class EngineFileIDs: @unchecked Sendable {
     func id(for path: String) -> UUID {
         lock.lock()
         defer { lock.unlock() }
-        if let value = values[path] { return value }
+        if let value = values[path] {
+            return value
+        }
         let value = UUID()
         values[path] = value
         return value
@@ -691,6 +698,59 @@ final class EngineManifestFaultOnce: @unchecked Sendable {
             guard point == .afterTemporaryWrite, !failed else { return .proceed }
             failed = true
             triggerCount += 1
+            return .simulateProcessTermination
+        }
+    }
+}
+
+final class EngineManifestFaultOnPublication: @unchecked Sendable {
+    private let lock = NSLock()
+    private let target: Int
+    private var publicationCount = 0
+    private var didFail = false
+
+    init(_ target: Int) {
+        precondition(target > 0)
+        self.target = target
+    }
+
+    var triggeredCount: Int {
+        lock.withLock { didFail ? 1 : 0 }
+    }
+
+    var observedPublicationCount: Int {
+        lock.withLock { publicationCount }
+    }
+
+    func action(_ point: CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction {
+        lock.withLock {
+            guard point == .afterTemporaryWrite else { return .proceed }
+            publicationCount += 1
+            guard publicationCount == target, !didFail else { return .proceed }
+            didFail = true
+            return .simulateProcessTermination
+        }
+    }
+}
+
+final class EngineManifestFaultOnPublications: @unchecked Sendable {
+    private let lock = NSLock()
+    private let targets: Set<Int>
+    private var publicationCount = 0
+
+    init(_ targets: [Int]) {
+        self.targets = Set(targets)
+    }
+
+    var triggeredCount: Int {
+        lock.withLock { publicationCount }
+    }
+
+    func action(_ point: CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction {
+        lock.withLock {
+            guard point == .afterTemporaryWrite else { return .proceed }
+            publicationCount += 1
+            guard targets.contains(publicationCount) else { return .proceed }
             return .simulateProcessTermination
         }
     }
@@ -882,10 +942,16 @@ actor EngineMultiEntryGate {
             )
         } catch {
             // Timeout sibling can win the task group even after the condition is met.
-            if state.count >= expectedCount { return true }
+            if state.count >= expectedCount {
+                return true
+            }
             XCTFail(error.localizedDescription)
             return false
         }
+    }
+
+    func releaseOne() {
+        state.releaseOne()
     }
 
     func releaseAll() {
@@ -941,7 +1007,9 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
     }
 
     func waitUntilEntered(_ expectedCount: Int, timeout: TimeInterval) async throws -> Bool {
-        if count >= expectedCount { return true }
+        if count >= expectedCount {
+            return true
+        }
         let waiterID = UUID()
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -963,10 +1031,20 @@ private final class EngineMultiEntryGateState: @unchecked Sendable {
                 _ = try await group.next()
             }
         } catch {
-            if count >= expectedCount { return true }
+            if count >= expectedCount {
+                return true
+            }
             throw error
         }
         return count >= expectedCount
+    }
+
+    func releaseOne() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            guard let id = continuations.keys.first else { return nil }
+            return continuations.removeValue(forKey: id)
+        }
+        continuation?.resume()
     }
 
     func releaseAll() {
@@ -1062,7 +1140,9 @@ actor EngineFirstResolutionGate {
                 timeout: CodemapBindingEngineTestCase.timeInterval(timeout)
             )
         } catch {
-            if state.firstResolutionEntered { return true }
+            if state.firstResolutionEntered {
+                return true
+            }
             XCTFail(error.localizedDescription)
             return false
         }
@@ -1134,7 +1214,9 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
     }
 
     func waitUntilFirstResolution(timeout: TimeInterval) async throws -> Bool {
-        if firstResolutionEntered { return true }
+        if firstResolutionEntered {
+            return true
+        }
         let waiterID = UUID()
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -1156,7 +1238,9 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
                 _ = try await group.next()
             }
         } catch {
-            if firstResolutionEntered { return true }
+            if firstResolutionEntered {
+                return true
+            }
             throw error
         }
         return firstResolutionEntered
@@ -1291,127 +1375,20 @@ final class EngineHookEvents: @unchecked Sendable {
         }
         return true
     }
-}
 
-actor EngineProjectionRecorder {
-    private(set) var snapshots: [WorkspaceCodemapProjectionSnapshot] = []
-    private var progress = WorkspaceCodemapProjectionProgress.notStarted
-
-    func publish(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot
-    ) -> WorkspaceCodemapProjectionSnapshotDisposition {
-        snapshots.append(snapshot)
-        switch snapshot {
-        case let .segment(segment):
-            progress = segment.progress
-        case let .seal(proof):
-            if case let .success(completed) = progress.advancing(
-                to: .complete,
-                by: .zero,
-                catalogCompletion: proof.catalogCompletion
-            ) {
-                progress = completed
-            }
-        }
-        return .accepted(progress)
-    }
-}
-
-actor EngineProjectionGenerationRacePublisher {
-    private let gate: EngineAsyncGate
-    private let recorder: EngineProjectionRecorder
-    private var rejectedFirstSnapshot = false
-    private(set) var snapshots: [WorkspaceCodemapProjectionSnapshot] = []
-
-    init(gate: EngineAsyncGate, recorder: EngineProjectionRecorder) {
-        self.gate = gate
-        self.recorder = recorder
-    }
-
-    func publish(
-        _ snapshot: WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
-        snapshots.append(snapshot)
-        if !rejectedFirstSnapshot {
-            rejectedFirstSnapshot = true
-            await gate.enterAndWait()
-            return .stale
-        }
-        return await recorder.publish(snapshot)
-    }
-}
-
-final class EngineProjectionCatalogStub: @unchecked Sendable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let entries: [WorkspaceCodemapProjectionCatalogCandidate]
-    let recorder: EngineProjectionRecorder
-    let pageGate: EngineAsyncGate?
-    let publishProjectionOverride: (@Sendable (
-        WorkspaceCodemapProjectionSnapshot
-    ) async -> WorkspaceCodemapProjectionSnapshotDisposition)?
-
-    init(
+    func wait(
+        kind: WorkspaceCodemapBindingEngineHookKind,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        entries: [WorkspaceCodemapProjectionCatalogCandidate],
-        recorder: EngineProjectionRecorder,
-        pageGate: EngineAsyncGate? = nil,
-        publishProjectionOverride: (@Sendable (
-            WorkspaceCodemapProjectionSnapshot
-        ) async -> WorkspaceCodemapProjectionSnapshotDisposition)? = nil
-    ) {
-        self.rootEpoch = rootEpoch
-        self.entries = entries.sorted { lhs, rhs in
-            if lhs.identity.standardizedRelativePath != rhs.identity.standardizedRelativePath {
-                return lhs.identity.standardizedRelativePath.utf8.lexicographicallyPrecedes(
-                    rhs.identity.standardizedRelativePath.utf8
-                )
-            }
-            return lhs.identity.fileID.uuidString.utf8.lexicographicallyPrecedes(
-                rhs.identity.fileID.uuidString.utf8
-            )
+        minimumCount: Int,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while events.count(where: { $0.kind == kind && $0.rootEpoch == rootEpoch }) < minimumCount {
+            guard condition.wait(until: deadline) else { return false }
         }
-        self.recorder = recorder
-        self.pageGate = pageGate
-        self.publishProjectionOverride = publishProjectionOverride
-    }
-
-    var client: WorkspaceCodemapBindingCatalogClient {
-        WorkspaceCodemapBindingCatalogClient {
-            _, _ in nil
-        } readProjectionCatalogPage: { [self] request in
-            if let pageGate { await pageGate.enterAndWait() }
-            guard request.rootEpoch == rootEpoch, request.cursor == nil else { return .stale }
-            let token = projectionToken
-            switch WorkspaceCodemapProjectionCatalogPage.validated(
-                request: request,
-                token: token,
-                entries: entries,
-                nextCursor: nil,
-                isEnd: true,
-                supportedCandidateCountThroughPage: UInt64(entries.count)
-            ) {
-            case let .success(page): return .page(page)
-            case .failure: return .unavailable(.catalogUnavailable)
-            }
-        } revalidateProjectionCatalogToken: { [self] epoch, token in
-            epoch == rootEpoch && token == projectionToken ? .current : .stale
-        } publishProjection: { [recorder, publishProjectionOverride] snapshot in
-            if let publishProjectionOverride {
-                return await publishProjectionOverride(snapshot)
-            }
-            return await recorder.publish(snapshot)
-        }
-    }
-
-    private var projectionToken: WorkspaceCodemapProjectionCatalogToken {
-        WorkspaceCodemapProjectionCatalogToken(
-            rootEpoch: rootEpoch,
-            topologyGeneration: 1,
-            appliedIndexGeneration: 1,
-            catalogGeneration: 1,
-            ingressGeneration: 1,
-            projectionInvalidationGeneration: 1
-        )
+        return true
     }
 }
 

@@ -648,6 +648,16 @@ import XCTest
                         probeCodeStructure: false
                     )
 
+                    let progressRecorder = ContextBuilderReviewProgressRecorder()
+                    fixture.contextA.window.mcpServer.installStageProgressSinkForTesting {
+                        _, tool, stage, message in
+                        guard tool == MCPWindowToolName.contextBuilder else { return }
+                        await progressRecorder.record(stage: stage, message: message)
+                    }
+                    defer {
+                        fixture.contextA.window.mcpServer.installStageProgressSinkForTesting(nil)
+                    }
+
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
                         _, _, routedSessionID, routedRunID, mode, _, selection, lookupContext, _, finalReviewAuthorization, _, _ in
                         XCTAssertEqual(routedSessionID, sessionID)
@@ -690,6 +700,42 @@ import XCTest
                     )
                     let text = try toolResultText(response)
                     XCTAssertTrue(text.contains("generated deferred review"), text)
+
+                    let progress = await progressRecorder.snapshot()
+                    let runFinalizationCompleted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.runFinalization.displayName) completed"
+                        )
+                    })
+                    let selectionRenderingStarted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.selectionReplyRendering.displayName) started"
+                        )
+                    })
+                    let selectionRenderingCompleted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.selectionReplyRendering.displayName) completed"
+                        )
+                    })
+                    let reviewAuthorizationStarted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.reviewSelectionAuthorization.displayName) started"
+                        )
+                    })
+                    let reviewAuthorizationCompleted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.reviewSelectionAuthorization.displayName) completed"
+                        )
+                    })
+                    let generationStarted = try XCTUnwrap(progress.firstIndex {
+                        $0.stage == "generating" && $0.message == "Generating review..."
+                    })
+                    XCTAssertLessThan(runFinalizationCompleted, selectionRenderingStarted)
+                    XCTAssertLessThan(selectionRenderingStarted, selectionRenderingCompleted)
+                    XCTAssertLessThan(selectionRenderingCompleted, reviewAuthorizationStarted)
+                    XCTAssertLessThan(reviewAuthorizationStarted, reviewAuthorizationCompleted)
+                    XCTAssertLessThan(reviewAuthorizationCompleted, generationStarted)
+
                     XCTAssertEqual(state.providerCreationCount, 1)
                     XCTAssertEqual(state.followUps.count, 1)
                     XCTAssertEqual(
@@ -2743,6 +2789,23 @@ import XCTest
                 selection: selection,
                 lookupContext: lookupContext
             ))
+        }
+    }
+
+    private actor ContextBuilderReviewProgressRecorder {
+        struct Entry {
+            let stage: String
+            let message: String
+        }
+
+        private var entries: [Entry] = []
+
+        func record(stage: String, message: String) {
+            entries.append(Entry(stage: stage, message: message))
+        }
+
+        func snapshot() -> [Entry] {
+            entries
         }
     }
 

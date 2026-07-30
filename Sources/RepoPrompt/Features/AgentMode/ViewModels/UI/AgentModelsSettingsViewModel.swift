@@ -42,8 +42,13 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         didSet {
             guard !isReloadingScopedState, oldValue != syncChatWithOracle else { return }
             updateSelectedProfile(reason: "agent_models.sync_toggle") { profile in
-                profile.syncChatModelWithOracle = syncChatWithOracle
-                if syncChatWithOracle, profile.preferredComposeModelRaw != profile.planningModelRaw {
+                let planningModelRaw = profile.planningModelRaw?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let canEnableSync = planningModelRaw?.isEmpty == false
+                profile.syncChatModelWithOracle = syncChatWithOracle && canEnableSync
+                if profile.syncChatModelWithOracle,
+                   profile.preferredComposeModelRaw != profile.planningModelRaw
+                {
                     profile.preferredComposeModelRaw = profile.planningModelRaw
                 }
             }
@@ -127,12 +132,16 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var editingScope: AgentModelsEditingScope {
-        guard let workspaceID, inheritanceMode == .useWorkspaceOverrides else { return .global }
-        return .workspace(workspaceID)
+        AgentModelsEditingScope.resolve(
+            workspaceID: workspaceID,
+            inheritanceMode: inheritanceMode
+        )
     }
 
     var isEditingWorkspaceSettings: Bool {
-        if case .workspace = editingScope { return true }
+        if case .workspace = editingScope {
+            return true
+        }
         return false
     }
 
@@ -240,7 +249,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var roleDefaultsHasOverrides: Bool {
-        roleDefaultsResolutions.contains(where: \.hasStoredOverride)
+        MCPAgentRoleDefaultsService.hasStoredOverrides(
+            settingsStore: AgentModelsProfileRoleDefaultsStore(
+                overrides: profileSnapshot.mcpAgentRoleOverrides
+            )
+        )
     }
 
     var hasUnsatisfiedRecommendations: Bool {
@@ -316,7 +329,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func setOracleModel(raw: String) {
         updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
             profile.planningModelRaw = raw
-            if profile.syncChatModelWithOracle {
+            guard profile.syncChatModelWithOracle else { return }
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                profile.syncChatModelWithOracle = false
+            } else {
                 profile.preferredComposeModelRaw = raw
             }
         }
@@ -325,9 +341,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func setBuiltinChatModel(raw: String) {
         updateSelectedProfile(reason: "agent_models.builtin_chat_model") { profile in
             profile.preferredComposeModelRaw = raw
-            if profile.syncChatModelWithOracle,
-               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            {
+            guard profile.syncChatModelWithOracle else { return }
+            if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                profile.syncChatModelWithOracle = false
+            } else {
                 profile.planningModelRaw = raw
             }
         }
@@ -640,18 +657,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     private func postRecommendationsDidApply(reason: String) {
-        var userInfo: [String: Any] = [
-            "reason": reason,
-            AgentModelsSettingsNotification.scopeKey: isEditingWorkspaceSettings
-                ? AgentModelsSettingsNotification.Scope.workspace.rawValue
-                : AgentModelsSettingsNotification.Scope.global.rawValue
-        ]
-        if case let .workspace(workspaceID) = editingScope {
-            userInfo["workspaceID"] = workspaceID
-        }
-        if let workspaceID {
-            userInfo["sourceWorkspaceID"] = workspaceID
-        }
+        var userInfo = AgentModelsSettingsNotification.userInfo(
+            scope: editingScope,
+            sourceWorkspaceID: workspaceID
+        )
+        userInfo["reason"] = reason
         notificationCenter.post(
             name: .recommendationsDidApply,
             object: nil,

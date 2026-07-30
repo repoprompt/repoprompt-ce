@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -41,6 +42,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
 
     func testMenuItemsCaptureImmutableRepresentedTarget() throws {
         let target = AgentChatOptionsMenuTarget(
+            windowID: 7,
             workspaceID: UUID(),
             tabID: UUID(),
             agentSessionID: UUID(),
@@ -54,19 +56,40 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                 togglePin: { invocations.append(("pin", $0)) },
                 rename: { invocations.append(("rename", $0)) },
                 stash: { invocations.append(("stash", $0)) },
+                copyHandoffPrompt: { invocations.append(("copy", $0)) },
                 delete: { invocations.append(("delete", $0)) }
             )
         )
 
         XCTAssertEqual(menu.items.map(\.title), [
-            "Unpin Chat",
-            "Rename Chat…",
-            "Stash Chat",
+            "Unpin",
+            "Rename",
+            "Stash",
+            "Handoff",
             "",
-            "Delete Chat…"
+            "Delete"
         ])
 
-        for index in [0, 1, 2, 4] {
+        let unpinnedMenu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false),
+            actions: AgentChatOptionsMenuActions(
+                togglePin: { _ in },
+                rename: { _ in },
+                stash: { _ in },
+                copyHandoffPrompt: { _ in },
+                delete: { _ in }
+            )
+        )
+        XCTAssertEqual(unpinnedMenu.items.map(\.title), [
+            "Pin",
+            "Rename",
+            "Stash",
+            "Handoff",
+            "",
+            "Delete"
+        ])
+
+        for index in [0, 1, 2, 3, 5] {
             let item = menu.items[index]
             XCTAssertTrue(item.target === item)
             XCTAssertTrue(try NSApplication.shared.sendAction(
@@ -76,14 +99,151 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             ))
         }
 
-        XCTAssertEqual(invocations.map(\.0), ["pin", "rename", "stash", "delete"])
-        XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 4))
+        XCTAssertEqual(invocations.map(\.0), ["pin", "rename", "stash", "copy", "delete"])
+        XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 5))
+    }
+
+    func testHandoffPromptRendersExactBuildAwareMCPAndCLIRouting() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+        let bindRequest = try WindowRoutingService.parseBindContextRequest([
+            "op": .string("bind"),
+            "window_id": .int(target.windowID),
+            "context_id": .string(target.tabID.uuidString)
+        ])
+        XCTAssertEqual(bindRequest.op, .bind)
+        XCTAssertEqual(bindRequest.windowID, target.windowID)
+        XCTAssertEqual(bindRequest.contextID, target.tabID)
+        XCTAssertEqual(bindRequest.matchKind, .contextID)
+
+        let expectedDebug = """
+        Use RepoPrompt CE to continue this exact Agent Mode session.
+
+        Window ID: 7
+        Workspace ID: 11111111-1111-1111-1111-111111111111
+        Context ID (compose tab): 22222222-2222-2222-2222-222222222222
+        Agent session ID: 33333333-3333-3333-3333-333333333333
+
+        MCP:
+        1. Call `bind_context` with `{"op":"bind","window_id":7,"context_id":"22222222-2222-2222-2222-222222222222"}`.
+        2. Call `agent_manage` with `{"op":"extract_handoff","session_id":"33333333-3333-3333-3333-333333333333"}`.
+        3. Consume the returned `<forked_session>` XML before continuing.
+
+        CLI equivalent (`rpce-cli-debug`):
+        `rpce-cli-debug -w 7 --context-id 22222222-2222-2222-2222-222222222222 -c agent_manage -j '{"op":"extract_handoff","session_id":"33333333-3333-3333-3333-333333333333"}'`
+        """
+        let expectedRelease = """
+        Use RepoPrompt CE to continue this exact Agent Mode session.
+
+        Window ID: 7
+        Workspace ID: 11111111-1111-1111-1111-111111111111
+        Context ID (compose tab): 22222222-2222-2222-2222-222222222222
+        Agent session ID: 33333333-3333-3333-3333-333333333333
+
+        MCP:
+        1. Call `bind_context` with `{"op":"bind","window_id":7,"context_id":"22222222-2222-2222-2222-222222222222"}`.
+        2. Call `agent_manage` with `{"op":"extract_handoff","session_id":"33333333-3333-3333-3333-333333333333"}`.
+        3. Consume the returned `<forked_session>` XML before continuing.
+
+        CLI equivalent (`rpce-cli`):
+        `rpce-cli -w 7 --context-id 22222222-2222-2222-2222-222222222222 -c agent_manage -j '{"op":"extract_handoff","session_id":"33333333-3333-3333-3333-333333333333"}'`
+        """
+
+        XCTAssertEqual(
+            AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli-debug"),
+            expectedDebug
+        )
+        XCTAssertEqual(
+            AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli"),
+            expectedRelease
+        )
+    }
+
+    func testHandoffPromptExplicitEmptyMatchesLegacyPromptByteForByte() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+
+        for cliCommandName in ["rpce-cli-debug", "rpce-cli"] {
+            XCTAssertEqual(
+                AgentSessionHandoffPrompt.render(target: target, cliCommandName: cliCommandName, instructions: ""),
+                AgentSessionHandoffPrompt.render(target: target, cliCommandName: cliCommandName)
+            )
+        }
+    }
+
+    func testHandoffPromptAppendsInstructionsVerbatim() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+        let instructions = "  Lead with this\n\nKeep the blank line\t"
+        let legacyPrompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli-debug")
+
+        XCTAssertEqual(
+            AgentSessionHandoffPrompt.render(
+                target: target,
+                cliCommandName: "rpce-cli-debug",
+                instructions: instructions
+            ),
+            legacyPrompt + "\n\nAdditional instructions:\n" + instructions
+        )
+    }
+
+    func testHandoffPromptTreatsWhitespaceOnlyInstructionsAsNonEmpty() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Captured"
+        )
+        let instructions = " \n\t"
+        let legacyPrompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli")
+
+        XCTAssertEqual(
+            AgentSessionHandoffPrompt.render(
+                target: target,
+                cliCommandName: "rpce-cli",
+                instructions: instructions
+            ),
+            legacyPrompt + "\n\nAdditional instructions:\n" + instructions
+        )
+    }
+
+    func testHandoffInstructionsPolicyAcceptsTwentyThousandAndRejectsTwentyThousandOne() {
+        let maximum = AgentSessionHandoffInstructionsPolicy.maximumCharacterCount
+        let composedGrapheme = "👨‍👩‍👧‍👦"
+
+        XCTAssertEqual(AgentSessionHandoffInstructionsPolicy.characterCount(of: composedGrapheme), 1)
+        XCTAssertEqual(AgentSessionHandoffInstructionsPolicy.validation(of: ""), .valid(count: 0))
+        XCTAssertEqual(
+            AgentSessionHandoffInstructionsPolicy.validation(of: String(repeating: "a", count: maximum)),
+            .valid(count: maximum)
+        )
+        XCTAssertEqual(
+            AgentSessionHandoffInstructionsPolicy.validation(of: String(repeating: "a", count: maximum + 1)),
+            .tooLong(count: maximum + 1, maximum: maximum)
+        )
     }
 
     func testSnapshotAndTargetValidationFailClosedAcrossLifecycleChanges() async throws {
         try await withFixture { fixture in
             let snapshot = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot())
             let target = snapshot.target
+            XCTAssertEqual(target.windowID, fixture.window.windowID)
             XCTAssertEqual(target.workspaceID, fixture.workspaceID)
             XCTAssertEqual(target.tabID, fixture.tabAID)
             XCTAssertEqual(target.agentSessionID, fixture.sessionAID)
@@ -92,6 +252,16 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
 
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(
                 AgentChatOptionsMenuTarget(
+                    windowID: target.windowID + 1,
+                    workspaceID: target.workspaceID,
+                    tabID: target.tabID,
+                    agentSessionID: target.agentSessionID,
+                    tabName: target.tabName
+                )
+            ))
+            XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(
+                AgentChatOptionsMenuTarget(
+                    windowID: target.windowID,
                     workspaceID: UUID(),
                     tabID: target.tabID,
                     agentSessionID: target.agentSessionID,
@@ -100,6 +270,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             ))
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(
                 AgentChatOptionsMenuTarget(
+                    windowID: target.windowID,
                     workspaceID: target.workspaceID,
                     tabID: UUID(),
                     agentSessionID: target.agentSessionID,
@@ -108,6 +279,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             ))
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(
                 AgentChatOptionsMenuTarget(
+                    windowID: target.windowID,
                     workspaceID: target.workspaceID,
                     tabID: target.tabID,
                     agentSessionID: UUID(),
@@ -139,6 +311,94 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             fixture.window.agentChatTitleClusterMenuActions().togglePin(target)
             XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, true)
             XCTAssertEqual(fixture.tab(fixture.tabBID)?.isPinned, false)
+        }
+    }
+
+    func testQuickHandoffUsesCurrentStoredDefault() async throws {
+        try await withFixture { fixture in
+            let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            var storedDefault = "Earlier default"
+            var providerReadCount = 0
+            var clipboard = "sentinel"
+            var writeCount = 0
+            let actions = fixture.window.agentChatTitleClusterMenuActions(
+                handoffInstructionsProvider: {
+                    providerReadCount += 1
+                    return storedDefault
+                },
+                copyToClipboard: { value in
+                    clipboard = value
+                    writeCount += 1
+                }
+            )
+
+            storedDefault = "Current default"
+            actions.copyHandoffPrompt(target)
+
+            XCTAssertEqual(providerReadCount, 1)
+            XCTAssertEqual(writeCount, 1)
+            XCTAssertEqual(
+                clipboard,
+                AgentSessionHandoffPrompt.render(
+                    target: target,
+                    cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName,
+                    instructions: "Current default"
+                )
+            )
+        }
+    }
+
+    func testQuickHandoffRejectsStaleTargetWithoutClipboardWrite() async throws {
+        try await withFixture { fixture in
+            let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            var providerReadCount = 0
+            var clipboard = "sentinel"
+            var writeCount = 0
+            let actions = fixture.window.agentChatTitleClusterMenuActions(
+                handoffInstructionsProvider: {
+                    providerReadCount += 1
+                    return "Saved default"
+                },
+                copyToClipboard: { value in
+                    clipboard = value
+                    writeCount += 1
+                }
+            )
+
+            fixture.window.promptManager.renameComposeTab(target.tabID, to: "Stale")
+            XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+            actions.copyHandoffPrompt(target)
+
+            XCTAssertEqual(providerReadCount, 0)
+            XCTAssertEqual(writeCount, 0)
+            XCTAssertEqual(clipboard, "sentinel")
+        }
+    }
+
+    func testQuickHandoffReportsOversizedStoredInstructionsWithoutCopying() async throws {
+        try await withFixture { fixture in
+            let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+            let maximum = AgentSessionHandoffInstructionsPolicy.maximumCharacterCount
+            let oversized = String(repeating: "a", count: maximum + 1)
+            var feedback: [(count: Int, maximum: Int)] = []
+            var clipboard = "sentinel"
+            var writeCount = 0
+            let actions = fixture.window.agentChatTitleClusterMenuActions(
+                handoffInstructionsProvider: { oversized },
+                handoffOversizedFeedback: { feedback.append((count: $0, maximum: $1)) },
+                copyToClipboard: { value in
+                    clipboard = value
+                    writeCount += 1
+                }
+            )
+
+            actions.copyHandoffPrompt(target)
+
+            XCTAssertEqual(feedback.count, 1)
+            XCTAssertEqual(feedback.first?.count, maximum + 1)
+            XCTAssertEqual(feedback.first?.maximum, maximum)
+            XCTAssertEqual(writeCount, 0)
+            XCTAssertEqual(clipboard, "sentinel")
         }
     }
 
