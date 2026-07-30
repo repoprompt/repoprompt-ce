@@ -2,8 +2,17 @@ import Foundation
 import MCP
 import RepoPromptShared
 
+enum MCPToolExecutionCleanupDisposition: String, Equatable {
+    case forceDisconnect = "force_disconnect"
+    case detachAndSettle = "detach_and_settle"
+}
+
 enum MCPToolExecutionContract: Equatable {
-    case bounded(deadline: Duration, cancellationGrace: Duration)
+    case bounded(
+        deadline: Duration,
+        cancellationGrace: Duration,
+        cleanupDisposition: MCPToolExecutionCleanupDisposition
+    )
     case longSynchronousCancellable
     case lifecycleManagedCancellable
     case interactiveCancellable
@@ -25,13 +34,18 @@ enum MCPToolExecutionContract: Equatable {
     }
 
     var deadline: Duration? {
-        guard case let .bounded(deadline, _) = self else { return nil }
+        guard case let .bounded(deadline, _, _) = self else { return nil }
         return deadline
     }
 
     var cancellationGrace: Duration? {
-        guard case let .bounded(_, cancellationGrace) = self else { return nil }
+        guard case let .bounded(_, cancellationGrace, _) = self else { return nil }
         return cancellationGrace
+    }
+
+    var cleanupDisposition: MCPToolExecutionCleanupDisposition? {
+        guard case let .bounded(_, _, cleanupDisposition) = self else { return nil }
+        return cleanupDisposition
     }
 
     enum Kind: String {
@@ -45,12 +59,15 @@ enum MCPToolExecutionContract: Equatable {
 
 enum MCPToolExecutionDispatchError: Error, Equatable {
     case missingContract(toolName: String)
+    case structureSettlementBusy(windowID: Int, reason: MCPCodeStructureSettlementRegistry.BusyReason)
+    case structureSettlementWindowUnresolved
 }
 
 enum MCPToolExecutionContractCatalog {
     private static let workspaceSwitchContract = MCPToolExecutionContract.bounded(
         deadline: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline,
-        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+        cleanupDisposition: .forceDisconnect
     )
 
     static let orderedAdvertisedToolNames = MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames
@@ -58,9 +75,22 @@ enum MCPToolExecutionContractCatalog {
     static let contracts: [String: MCPToolExecutionContract] = {
         let bounded = MCPToolExecutionContract.bounded(
             deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
-            cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+            cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+            cleanupDisposition: .forceDisconnect
         )
         var result = Dictionary(uniqueKeysWithValues: orderedAdvertisedToolNames.map { ($0, bounded) })
+        for toolName in [
+            MCPWindowToolName.fileActions,
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.readFile,
+            MCPWindowToolName.getFileTree
+        ] {
+            result[toolName] = .bounded(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle
+            )
+        }
 
         for toolName in [
             MCPWindowToolName.oracleUtils,
@@ -109,6 +139,17 @@ enum MCPToolExecutionContractCatalog {
         arguments: [String: Value]
     ) -> MCPToolExecutionContract? {
         guard let baseContract = contract(for: toolName) else { return nil }
+        if toolName == MCPWindowToolName.fileActions,
+           arguments["action"]?.stringValue?
+           .trimmingCharacters(in: .whitespacesAndNewlines)
+           .lowercased() == "delete"
+        {
+            return .bounded(
+                deadline: MCPTimeoutPolicy.fileActionTrashExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle
+            )
+        }
         guard toolName == MCPGlobalToolName.manageWorkspaces else { return baseContract }
         guard let rawAction = arguments["action"]?.stringValue else {
             return baseContract

@@ -147,6 +147,7 @@ class ContentViewModel: ObservableObject {
         guard onboardingViewModel == nil else { return }
         let engine = AutoRecommendationEngine(
             settingsStore: GlobalSettingsStore.shared,
+            profileSettingsManager: GlobalSettingsStore.shared,
             apiSettingsViewModel: apiSettingsViewModel
         )
         onboardingViewModel = AgentOnboardingWizardViewModel(

@@ -857,6 +857,27 @@ final class GitWorktreeInitializationAPITests: XCTestCase {
                 expected
             )
         }
+        let launcherCases: [(ProcessLauncherError, Int32)] = [
+            (.pipeCreationFailed(label: "stdout", errno: EMFILE), EMFILE),
+            (
+                .descriptorConfigurationFailed(
+                    label: "stderr",
+                    fd: 9,
+                    underlying: .getDescriptorFlagsFailed(fd: 9, errno: EBADF)
+                ),
+                EBADF
+            ),
+            (.spawnFileActionsFailed(operation: "init", errno: ENOMEM), ENOMEM),
+            (.changeDirectoryFailed(path: "/private/missing", errno: ENOENT), ENOENT),
+            (.spawnAttributesFailed(operation: "setflags", errno: EINVAL), EINVAL),
+            (.spawnFailed(errno: ENOEXEC), ENOEXEC)
+        ]
+        for (launcherError, expectedCode) in launcherCases {
+            XCTAssertEqual(
+                GitService.targetEvidenceCollectionError(launcherError) as? GitTargetEvidenceCollectionError,
+                .processLaunch(domain: NSPOSIXErrorDomain, code: Int(expectedCode))
+            )
+        }
         let launch = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOEXEC))
         XCTAssertEqual(
             GitService.targetEvidenceCollectionError(launch) as? GitTargetEvidenceCollectionError,

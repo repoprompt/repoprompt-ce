@@ -13,6 +13,15 @@ enum MCPToolExecutionHandlerPhase: String, Equatable {
     case fileActionsPostMutationCatalog = "file_actions.post_mutation_catalog"
     case fileActionsPostMutationSelection = "file_actions.post_mutation_selection"
     case fileActionsReplyConstruction = "file_actions.reply_construction"
+    // Graph-first get_code_structure execution stages.
+    case getCodeStructureSeedResolution = "get_code_structure.seed_resolution"
+    case getCodeStructureGraphSnapshot = "get_code_structure.graph_snapshot"
+    case getCodeStructureGraphTraversal = "get_code_structure.graph_traversal"
+    case getCodeStructureGraphRevalidation = "get_code_structure.graph_revalidation"
+    case getCodeStructureRenderDemand = "get_code_structure.render_demand"
+    case getCodeStructureFreeze = "get_code_structure.freeze"
+    case getCodeStructureRender = "get_code_structure.render"
+    case getCodeStructureAssembly = "get_code_structure.assembly"
 }
 
 enum MCPToolExecutionHandlerPhaseTransition: String, Equatable {
@@ -89,7 +98,20 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
         case cancellationRequested = "execution_cancellation_requested"
         case settledDuringGrace = "execution_settled_during_grace"
         case cleanupGraceExpired = "execution_cleanup_grace_expired"
+        case detachedForSettlement = "execution_detached_for_settlement"
+        case detachedSettled = "execution_detached_settled"
         case connectionForceDisconnectRequested = "connection_force_disconnect_requested"
+
+        var isAlwaysEmitted: Bool {
+            switch self {
+            case .deadlineExpired, .cancellationRequested, .settledDuringGrace,
+                 .cleanupGraceExpired, .detachedForSettlement, .detachedSettled,
+                 .connectionForceDisconnectRequested:
+                true
+            case .contractSelected, .started, .handlerCompleted:
+                false
+            }
+        }
     }
 
     let toolName: String
@@ -99,23 +121,20 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     let contractKind: MCPToolExecutionContract.Kind
     let executionDeadlineSeconds: Double?
     let cleanupGraceSeconds: Double?
+    let cleanupDisposition: MCPToolExecutionCleanupDisposition?
     let phase: Phase
     let elapsedMilliseconds: Double
     let cancellationRequested: Bool?
     let cancellationOutcome: String?
+    let cancellationOrigin: MCPToolExecutionCancellationOrigin?
+    let settlement: String?
     let graceOutcome: String?
     let escalationReason: String?
     let handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?
     let handlerPhaseAgeMilliseconds: Double?
 
     var isAlwaysEmitted: Bool {
-        switch phase {
-        case .deadlineExpired, .cancellationRequested, .settledDuringGrace,
-             .cleanupGraceExpired, .connectionForceDisconnectRequested:
-            true
-        case .contractSelected, .started, .handlerCompleted:
-            false
-        }
+        phase.isAlwaysEmitted
     }
 
     var description: String {
@@ -130,8 +149,11 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
         if let runID { fields.append("run_id=\(runID.uuidString)") }
         if let executionDeadlineSeconds { fields.append("deadline_s=\(executionDeadlineSeconds)") }
         if let cleanupGraceSeconds { fields.append("grace_s=\(cleanupGraceSeconds)") }
+        if let cleanupDisposition { fields.append("cleanup_disposition=\(cleanupDisposition.rawValue)") }
         if let cancellationRequested { fields.append("cancellation_requested=\(cancellationRequested)") }
         if let cancellationOutcome { fields.append("cancellation_outcome=\(cancellationOutcome)") }
+        if let cancellationOrigin { fields.append("cancellation_origin=\(cancellationOrigin.rawValue)") }
+        if let settlement { fields.append("settlement=\(settlement)") }
         if let graceOutcome { fields.append("grace_outcome=\(graceOutcome)") }
         if let escalationReason { fields.append("escalation_reason=\(escalationReason)") }
         if let handlerPhase {
@@ -164,6 +186,9 @@ enum MCPToolExecutionTracer {
     }
 
     static func emit(_ event: MCPToolExecutionTraceEvent) {
+        // Release-safe concurrency evidence ingestion (counts and bounded latency
+        // aggregates only; see MCPToolConcurrencyEvidenceRecorder).
+        MCPToolConcurrencyEvidenceRecorder.shared.recordExecutionTraceEvent(event)
         let sink: (@Sendable (MCPToolExecutionTraceEvent) -> Void)?
         state.lock.lock()
         sink = state.testSink

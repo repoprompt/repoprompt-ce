@@ -58,11 +58,29 @@ struct AgentModelsPopoverView: View {
 
     private var roleResolutions: [MCPAgentRoleDefaultsService.RoleDefaultResolution] {
         _ = roleDefaultsRevision
-        return MCPAgentRoleDefaultsService.resolutions(availability: availability)
+        return MCPAgentRoleDefaultsService.resolutions(availability: availability, workspaceID: promptViewModel.currentWorkspaceID)
     }
 
     private var hasRoleOverrides: Bool {
-        roleResolutions.contains(where: \.hasCustomOverride)
+        _ = roleDefaultsRevision
+        return MCPAgentRoleDefaultsService.hasStoredOverrides(
+            workspaceID: promptViewModel.currentWorkspaceID
+        )
+    }
+
+    private var currentOperationIdentity: AgentModelsOperationIdentity? {
+        guard let workspaceID = promptViewModel.currentWorkspaceID else { return nil }
+        let inheritanceMode = GlobalSettingsStore.shared
+            .workspaceAgentModelsSettings(for: workspaceID)
+            .inheritanceMode
+        return AgentModelsOperationIdentity(
+            sourceWorkspaceID: workspaceID,
+            inheritanceMode: inheritanceMode
+        )
+    }
+
+    private var editingScope: AgentModelsEditingScope {
+        currentOperationIdentity?.scope ?? .global
     }
 
     private var hasConnectedCLIProvider: Bool {
@@ -112,6 +130,20 @@ struct AgentModelsPopoverView: View {
                 .publisher(for: .recommendationsDidApply)
                 .receive(on: RunLoop.main)
         ) { _ in
+            roleDefaultsRevision &+= 1
+        }
+        .onReceive(
+            NotificationCenter.default
+                .publisher(for: .agentModelsSettingsDidChange)
+                .receive(on: RunLoop.main)
+        ) { notification in
+            let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+            let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+            if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+               workspaceID != promptViewModel.currentWorkspaceID
+            {
+                return
+            }
             roleDefaultsRevision &+= 1
         }
     }
@@ -217,11 +249,17 @@ struct AgentModelsPopoverView: View {
                 selectedAgent: promptViewModel.contextBuilderAgent,
                 selectedModelRaw: promptViewModel.contextBuilderAgentModelRaw
             ) { selectedAgent, selectedOption in
+                let identity = currentOperationIdentity
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
                 promptViewModel.commitContextBuilderSettings()
                 DispatchQueue.main.async {
-                    NotificationCenter.default.post(name: .recommendationsDidApply, object: nil)
+                    guard let identity else { return }
+                    RecommendationApplyNotification.post(
+                        sourceWorkspaceID: identity.sourceWorkspaceID,
+                        agentModelsScope: identity.scope,
+                        includesPresetExposure: false
+                    )
                 }
             }
         }
@@ -244,7 +282,9 @@ struct AgentModelsPopoverView: View {
                 Spacer()
                 if hasRoleOverrides {
                     Button("Reset") {
-                        MCPAgentRoleDefaultsService.clearAllOverrides()
+                        MCPAgentRoleDefaultsService.clearAllOverrides(
+                            scope: editingScope
+                        )
                         bumpRoleDefaults()
                     }
                     .buttonStyle(.plain)
@@ -291,56 +331,93 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultRow(
         _ resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: iconForRole(resolution.role))
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                .foregroundColor(colorForRole(resolution.role))
-                .frame(width: fontPreset.scaledClamped(14, max: 20))
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Image(systemName: iconForRole(resolution.role))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                    .foregroundColor(colorForRole(resolution.role))
+                    .frame(width: fontPreset.scaledClamped(14, max: 20))
 
-            Text(resolution.roleLabel)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                .frame(width: roleLabelWidth, alignment: .leading)
+                Text(resolution.roleLabel)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    .frame(width: roleLabelWidth, alignment: .leading)
 
-            Spacer(minLength: 4)
+                Spacer(minLength: 4)
 
-            StableMenuButton(
-                items: { roleDefaultMenuItems(for: resolution) },
-                triggerStyle: .plain
-            ) {
-                HStack(spacing: 4) {
-                    Image(systemName: resolution.effective.agent.iconName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                    // No `.fixedSize()` on the row — long model display names
-                    // truncate instead of overflowing the 340pt popover.
-                    AgentModelSelectionSummaryLabel(
-                        agentKind: resolution.effective.agent,
-                        rawModel: resolution.effective.modelRaw,
-                        title: resolution.effectiveDisplayName,
-                        iconFont: fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold)
+                StableMenuButton(
+                    items: { roleDefaultMenuItems(for: resolution) },
+                    triggerStyle: .plain
+                ) {
+                    HStack(spacing: 4) {
+                        Image(systemName: resolution.effective.agent.iconName)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                        // No `.fixedSize()` on the row — long model display names
+                        // truncate instead of overflowing the 340pt popover.
+                        AgentModelSelectionSummaryLabel(
+                            agentKind: resolution.effective.agent,
+                            rawModel: resolution.effective.modelRaw,
+                            title: resolution.effectiveDisplayName,
+                            iconFont: fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold)
+                        )
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, fontPreset.scaledClamped(6, max: 9))
+                    .padding(.vertical, fontPreset.scaledClamped(3, max: 5))
+                    .background(
+                        RoundedRectangle(cornerRadius: fontPreset.scaledClamped(4, max: 6))
+                            .fill(Color.secondary.opacity(0.1))
                     )
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
-                        .foregroundColor(.secondary)
                 }
-                .foregroundColor(.secondary)
-                .padding(.horizontal, fontPreset.scaledClamped(6, max: 9))
-                .padding(.vertical, fontPreset.scaledClamped(3, max: 5))
-                .background(
-                    RoundedRectangle(cornerRadius: fontPreset.scaledClamped(4, max: 6))
-                        .fill(Color.secondary.opacity(0.1))
-                )
+                .layoutPriority(1)
             }
-            .layoutPriority(1)
+
+            roleDefaultPinState(for: resolution)
         }
+    }
+
+    @ViewBuilder
+    private func roleDefaultPinState(
+        for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
+    ) -> some View {
+        let pinState = resolution.pinState
+        if let message = pinState.message,
+           let actionTitle = pinState.actionTitle
+        {
+            HStack(spacing: 6) {
+                Text(message)
+                    .foregroundColor(pinState.usesWarningStyle ? .orange : .secondary)
+                clearRoleDefaultButton(for: resolution.role, title: actionTitle)
+            }
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 9))
+            .padding(.leading, fontPreset.scaledClamped(22, max: 30))
+        }
+    }
+
+    private func clearRoleDefaultButton(
+        for role: AgentModelCatalog.TaskLabelKind,
+        title: String
+    ) -> some View {
+        Button(title) {
+            MCPAgentRoleDefaultsService.clearOverride(
+                for: role,
+                scope: editingScope
+            )
+            bumpRoleDefaults()
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(.accentColor)
     }
 
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+        var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
@@ -356,20 +433,39 @@ struct AgentModelsPopoverView: View {
                 )
                 _ = MCPAgentRoleDefaultsService.setSelection(
                     selection,
-                    for: resolution.role
+                    for: resolution.role,
+                    availability: availability,
+                    scope: editingScope
                 )
                 bumpRoleDefaults()
             }
         }
+        if resolution.hasStoredOverride {
+            items.insert(.separator, at: 0)
+            items.insert(StableMenuItem.action("Use Recommended", imageSystemName: "arrow.counterclockwise") {
+                MCPAgentRoleDefaultsService.clearOverride(
+                    for: resolution.role,
+                    scope: editingScope
+                )
+                bumpRoleDefaults()
+            }, at: 0)
+        }
+        return items
     }
 
     private func bumpRoleDefaults() {
         roleDefaultsRevision &+= 1
         DispatchQueue.main.async {
+            var userInfo: [String: Any] = ["reason": "agentRoleDefaultsChanged"]
+            if let workspaceID = promptViewModel.currentWorkspaceID,
+               GlobalSettingsStore.shared.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+            {
+                userInfo["workspaceID"] = workspaceID
+            }
             NotificationCenter.default.post(
                 name: .recommendationsShouldRefresh,
                 object: nil,
-                userInfo: ["reason": "agentRoleDefaultsChanged", "scope": "global"]
+                userInfo: userInfo
             )
         }
     }

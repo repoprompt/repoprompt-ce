@@ -973,7 +973,7 @@ enum AgentModelCatalog {
         }
     }
 
-    private static let claudeMenuEffortOrder: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .max, .xhigh]
+    private static let claudeMenuEffortOrder: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .xhigh, .max]
 
     private static func supportedClaudeEfforts(forBaseModelRaw baseModelRaw: String, agentKind: AgentProviderKind?) -> [ClaudeCodeEffortLevel] {
         claudeMenuEffortOrder.filter {

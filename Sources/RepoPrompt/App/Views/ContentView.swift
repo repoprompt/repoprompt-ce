@@ -50,6 +50,7 @@ struct ContentView: View {
             if recommendationWizardViewModel == nil {
                 let engine = AutoRecommendationEngine(
                     settingsStore: GlobalSettingsStore.shared,
+                    profileSettingsManager: GlobalSettingsStore.shared,
                     apiSettingsViewModel: viewModel.apiSettingsViewModel
                 )
                 recommendationWizardViewModel = RecommendationWizardViewModel(
