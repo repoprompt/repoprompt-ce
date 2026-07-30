@@ -10,6 +10,45 @@ struct AppcastCheckRequestIdentity: Equatable {
     }
 }
 
+struct SparkleUserInitiatedObserverState: Equatable {
+    struct Request: Equatable {
+        let id: UUID
+        let channel: UpdateChannel
+    }
+
+    enum UncorrelatedNoUpdateDisposition: Equatable {
+        case preserveNoticeAndRequest
+    }
+
+    private(set) var activeRequest: Request?
+
+    mutating func begin(channel: UpdateChannel, requestID: UUID = UUID()) -> Request {
+        let request = Request(id: requestID, channel: channel)
+        activeRequest = request
+        return request
+    }
+
+    @discardableResult
+    mutating func finish(request: Request) -> Bool {
+        guard activeRequest == request else { return false }
+        activeRequest = nil
+        return true
+    }
+
+    mutating func cancel() {
+        activeRequest = nil
+    }
+
+    func receiveUncorrelatedNoUpdate() -> UncorrelatedNoUpdateDisposition {
+        .preserveNoticeAndRequest
+    }
+
+    func requestToSettle(afterPositiveResultFor channel: UpdateChannel) -> Request? {
+        guard let activeRequest, activeRequest.channel == channel else { return nil }
+        return activeRequest
+    }
+}
+
 /// Immutable identity and presentation for a detected app update.
 ///
 /// The channel is captured when the update is detected so a live notice never
@@ -18,96 +57,139 @@ struct AvailableUpdateNotice: Equatable {
     let channel: UpdateChannel
     let version: String
     let buildNumber: String?
+    let shortCommitSHA: String?
     let date: Date?
     let releaseNotes: String?
 
     var versionLabel: String {
-        let version = normalizedVersion
-        guard !version.isEmpty else { return "Update" }
-        return "v\(version)"
-    }
-
-    var channelVersionLabel: String {
-        switch channel {
-        case .stable: versionLabel
-        case .tip: "Tip build \(versionLabel)"
-        }
+        let trimmedVersion = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedVersion.isEmpty else { return "Unknown" }
+        return trimmedVersion.lowercased().hasPrefix("v") ? trimmedVersion : "v\(trimmedVersion)"
     }
 
     var detailedVersionLabel: String {
-        guard channel == .tip, let buildNumber = normalizedBuildNumber else {
-            return channelVersionLabel
+        switch channel {
+        case .stable:
+            var components = ["Version \(versionLabel)"]
+            if let normalizedBuildNumber {
+                components.append("Build \(normalizedBuildNumber)")
+            }
+            return components.joined(separator: " · ")
+        case .tip:
+            var components = [normalizedBuildNumber.map { "Tip build \($0)" } ?? "Tip update"]
+            components.append("Version \(versionLabel)")
+            if let normalizedShortCommitSHA {
+                components.append("Commit \(normalizedShortCommitSHA)")
+            }
+            return components.joined(separator: " · ")
         }
-        return "\(channelVersionLabel) (\(buildNumber))"
     }
 
     var toolbarLabel: String {
         switch channel {
-        case .stable: "Update \(versionLabel)"
-        case .tip: channelVersionLabel
+        case .stable:
+            "Update \(versionLabel)"
+        case .tip:
+            normalizedBuildNumber.map { "Tip build \($0)" } ?? "Tip \(versionLabel)"
         }
     }
 
     var availabilityStatus: String {
-        switch channel {
-        case .stable:
-            let version = normalizedVersion
-            return "Version \(version.isEmpty ? "Unknown" : version) is available"
-        case .tip:
-            return "\(detailedVersionLabel) is available"
-        }
+        "\(detailedVersionLabel) is available"
     }
 
     var availableTooltip: String {
-        switch channel {
-        case .stable: "Update available: \(versionLabel) — click for release notes"
-        case .tip: "\(detailedVersionLabel) is available — click for release notes"
-        }
+        let action = hasUpdateDetails ? "click for update details" : "click to install"
+        return "\(detailedVersionLabel) is available — \(action)"
     }
 
     var notReadyTooltip: String {
-        switch channel {
-        case .stable: "Update available: \(versionLabel), but Sparkle is not ready to check for updates yet"
-        case .tip: "\(detailedVersionLabel) is available, but Sparkle is not ready to check for updates yet"
-        }
+        "\(detailedVersionLabel) is available, but Sparkle is not ready to check for updates yet"
     }
 
     var accessibilityLabel: String {
-        switch channel {
-        case .stable: "Update available, version \(versionLabel)"
-        case .tip: "\(detailedVersionLabel) update available"
+        "\(detailedVersionLabel) update available"
+    }
+
+    var accessibilityHint: String {
+        if hasUpdateDetails {
+            return "Opens Sparkle's update details and install dialog."
         }
+        return "Opens Sparkle's update and install dialog."
     }
 
     var menuInstallTitle: String {
         switch channel {
         case .stable:
-            let version = normalizedVersion
-            return "Install Update \(version)…"
+            guard let normalizedBuildNumber else { return "Install Update \(versionLabel)…" }
+            return "Install Update \(versionLabel) (build \(normalizedBuildNumber))…"
         case .tip:
-            return "Install \(channelVersionLabel)…"
+            var context = [versionLabel]
+            if let normalizedShortCommitSHA {
+                context.append("commit \(normalizedShortCommitSHA)")
+            }
+            let tipBuild = normalizedBuildNumber.map { "Tip Build \($0)" } ?? "Tip Update"
+            return "Install \(tipBuild) (\(context.joined(separator: ", ")))…"
         }
     }
 
     var installButtonTitle: String {
         switch channel {
-        case .stable: "Install Update"
-        case .tip: "Install Tip Build"
+        case .stable:
+            "Install Update"
+        case .tip:
+            normalizedBuildNumber.map { "Install Tip Build \($0)" } ?? "Install Tip Update"
         }
     }
 
-    private var normalizedVersion: String {
-        var version = version.trimmingCharacters(in: .whitespacesAndNewlines)
-        if version.lowercased().hasPrefix("v") {
-            version.removeFirst()
-        }
-        return version
+    static func marketingVersion(fromTipTitle title: String?) -> String? {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              title.lowercased().hasPrefix("tip build "),
+              let versionSeparator = title.range(of: " · v", options: .caseInsensitive),
+              let commitSeparator = title.range(
+                  of: " · commit ",
+                  options: .caseInsensitive,
+                  range: versionSeparator.upperBound ..< title.endIndex
+              )
+        else { return nil }
+
+        let candidate = title[versionSeparator.upperBound ..< commitSeparator.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-"))
+        guard !candidate.isEmpty,
+              candidate.unicodeScalars.allSatisfy({ allowedCharacters.contains($0) })
+        else { return nil }
+        return candidate
+    }
+
+    static func shortCommitSHA(fromTipTitle title: String?) -> String? {
+        guard let title,
+              let separator = title.range(of: " · commit ", options: .caseInsensitive)
+        else { return nil }
+
+        let candidate = title[separator.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (7 ... 40).contains(candidate.count),
+              candidate.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdefABCDEF").contains($0) })
+        else { return nil }
+        return candidate
     }
 
     private var normalizedBuildNumber: String? {
         guard let buildNumber = buildNumber?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !buildNumber.isEmpty
-        else { return nil }
+              !buildNumber.isEmpty else { return nil }
         return buildNumber
+    }
+
+    private var normalizedShortCommitSHA: String? {
+        guard let shortCommitSHA = shortCommitSHA?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !shortCommitSHA.isEmpty else { return nil }
+        return shortCommitSHA
+    }
+
+    private var hasUpdateDetails: Bool {
+        guard let releaseNotes = releaseNotes?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !releaseNotes.isEmpty
     }
 }

@@ -132,6 +132,20 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
                 modelRaw: AgentModel.claudeOpus.rawValue
             ).rawValue
         ])
+        let unavailableResolution = try XCTUnwrap(
+            MCPAgentRoleDefaultsService.effectiveSelection(
+                for: .explore,
+                availability: actualAvailability,
+                settingsStore: store
+            )
+        )
+        XCTAssertEqual(unavailableResolution.pinState, .unavailable)
+        XCTAssertEqual(
+            unavailableResolution.pinState.message,
+            "Saved pin unavailable; using recommended default."
+        )
+        XCTAssertEqual(unavailableResolution.pinState.actionTitle, "Clear Pin")
+
         // This selection equals the fallback recommendation for `.explore` under this availability.
         let selection = AgentModelCatalog.NormalizedAgentSelection(
             agent: .codexExec,
@@ -167,6 +181,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         XCTAssertTrue(resolution.hasStoredOverride)
         XCTAssertFalse(resolution.hasCustomOverride)
         XCTAssertFalse(resolution.overrideUnavailable)
+        XCTAssertEqual(resolution.pinState, .pinnedToRecommended)
         XCTAssertEqual(resolution.effective, selection)
     }
 
@@ -200,6 +215,15 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         ))
         XCTAssertTrue(pinnedResolution.hasStoredOverride)
         XCTAssertTrue(pinnedResolution.hasCustomOverride)
+        XCTAssertEqual(
+            pinnedResolution.pinState,
+            .custom(recommendedDisplayName: pinnedResolution.recommendedDisplayName)
+        )
+        XCTAssertEqual(
+            pinnedResolution.pinState.message,
+            "Recommended: \(pinnedResolution.recommendedDisplayName)"
+        )
+        XCTAssertEqual(pinnedResolution.pinState.actionTitle, "Apply")
 
         MCPAgentRoleDefaultsService.clearOverride(for: .engineer, scope: .global, settingsStore: store)
         XCTAssertNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
@@ -210,6 +234,104 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         ))
         XCTAssertFalse(clearedResolution.hasStoredOverride)
         XCTAssertFalse(clearedResolution.hasCustomOverride)
+        XCTAssertEqual(clearedResolution.pinState, .none)
+        XCTAssertEqual(clearedResolution.effective, clearedResolution.recommended)
+    }
+
+    func testCanonicalPinPresentationExposesStoredRecommendedPinAndRawReset() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            zaiConfigured: false,
+            kimiConfigured: false,
+            customClaudeCompatibleConfigured: false
+        )
+        let storedRecommended = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt56SolLow.rawValue
+        ).rawValue
+        let overrides = [AgentModelCatalog.TaskLabelKind.explore.rawValue: storedRecommended]
+        let store = RoleDefaultsStoreStub(overrides: overrides)
+
+        let resolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .explore,
+            availability: availability,
+            settingsStore: store
+        ))
+
+        XCTAssertTrue(
+            MCPAgentRoleDefaultsService.hasStoredOverrides(settingsStore: store)
+        )
+        XCTAssertEqual(resolution.pinState, .pinnedToRecommended)
+        XCTAssertEqual(resolution.pinState.message, "Pinned to recommended")
+        XCTAssertEqual(resolution.pinState.actionTitle, "Clear Pin")
+
+        MCPAgentRoleDefaultsService.clearOverride(for: .explore, scope: .global, settingsStore: store)
+
+        let cleared = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .explore,
+            availability: availability,
+            settingsStore: store
+        ))
+        XCTAssertNil(store.overrides)
+        XCTAssertFalse(cleared.hasStoredOverride)
+        XCTAssertEqual(cleared.pinState, .none)
+        XCTAssertEqual(cleared.effective, cleared.recommended)
+    }
+
+    func testStoredOverridePredicateDoesNotDependOnResolvedRows() {
+        let unavailableOverrides = [
+            AgentModelCatalog.TaskLabelKind.explore.rawValue: AgentModelSelectionID(
+                agentRaw: AgentProviderKind.claudeCode.rawValue,
+                modelRaw: AgentModel.claudeOpus.rawValue
+            ).rawValue
+        ]
+        let store = RoleDefaultsStoreStub(overrides: unavailableOverrides)
+
+        XCTAssertTrue(
+            MCPAgentRoleDefaultsService.resolutions(
+                availability: .none,
+                recommendedAvailability: .none,
+                settingsStore: store
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            MCPAgentRoleDefaultsService.hasStoredOverrides(settingsStore: store)
+        )
+
+        MCPAgentRoleDefaultsService.clearAllOverrides(scope: .global, settingsStore: store)
+        XCTAssertNil(store.overrides)
+        XCTAssertFalse(
+            MCPAgentRoleDefaultsService.hasStoredOverrides(settingsStore: store)
+        )
+    }
+
+    func testWorkspaceClearUsesSameScopeAsWorkspaceResolution() {
+        let workspaceID = UUID()
+        let globalPin = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt55CodexHigh.rawValue
+        ).rawValue
+        let workspacePin = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt55CodexMedium.rawValue
+        ).rawValue
+        let roleKey = AgentModelCatalog.TaskLabelKind.explore.rawValue
+        let store = RoleDefaultsStoreStub(
+            overrides: [roleKey: globalPin],
+            workspaceOverrides: [workspaceID: [roleKey: workspacePin]]
+        )
+
+        MCPAgentRoleDefaultsService.clearOverride(
+            for: .explore,
+            scope: .workspace(workspaceID),
+            settingsStore: store
+        )
+
+        XCTAssertEqual(store.overrides?[roleKey], globalPin)
+        XCTAssertNil(store.workspaceOverrides[workspaceID]?[roleKey])
     }
 
     func testExplicitWorkspaceResetDoesNotMutateGlobalAndStaleNonCodexPinDoesNotExecute() throws {

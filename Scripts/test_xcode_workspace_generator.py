@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 
@@ -110,7 +111,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
-            {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"},
+            {"RepoPromptApp", "RepoPromptCodeMapCore", "RepoPromptMCP", "RepoPromptShared"},
         )
         self.assertNotIn("RepoPrompt", generator._by_name_dependencies(targets["RepoPromptTests"]))
 
@@ -177,6 +178,39 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
     def test_mcp_scheme_points_at_debug_executable(self) -> None:
         path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.MCP_SCHEME}.xcscheme"
         self.assertIn(".build/debug/repoprompt-mcp", self.outputs[path].decode())
+
+    def test_xcodebuild_list_uses_expected_command(self) -> None:
+        payload = {
+            "workspace": {
+                "schemes": [
+                    generator.APP_SCHEME,
+                    generator.MCP_SCHEME,
+                    generator.TEST_SCHEME,
+                    "RepoPrompt",
+                ],
+            },
+        }
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with patch.object(generator.subprocess, "run", return_value=completed) as run:
+            generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "xcodebuild",
+                "-list",
+                "-json",
+                "-workspace",
+                "/tmp/generated-xcode/RepoPromptCE.xcworkspace",
+            ],
+        )
+        self.assertNotIn("env", run.call_args.kwargs)
 
     def test_check_detects_corruption(self) -> None:
         temporary, destination = self.generate_in_temporary_directory()
@@ -280,28 +314,38 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
 
         bad_resources = deepcopy(self.manifest)
         for target in bad_resources["targets"]:
-            if target["name"] == "RepoPromptTests":
+            if target["name"] == "RepoPromptCodeMapCoreTests":
                 target["resources"] = []
-        with self.assertRaisesRegex(generator.GeneratorError, "CodeMap/Fixtures"):
+        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptCodeMapCoreTests"):
             generator.validate_manifest(bad_resources, generator.REPO_ROOT)
 
-        moved_resources = deepcopy(self.manifest)
-        for target in moved_resources["targets"]:
-            if target["name"] == "RepoPromptTests":
-                target["resources"] = []
+        moved_resources = deepcopy(bad_resources)
         moved_resources["targets"].append({
             "name": "RepoPromptWorkspaceTests",
             "type": "test",
             "resources": [
-                {"path": "CodeMap/Fixtures", "rule": {"copy": {}}},
-                {"path": "CodeMap/Goldens", "rule": {"copy": {}}},
+                {"path": "Fixtures", "rule": {"copy": {}}},
+                {"path": "Goldens", "rule": {"copy": {}}},
             ],
         })
-        generator.validate_manifest(moved_resources, generator.REPO_ROOT)
+        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptCodeMapCoreTests"):
+            generator.validate_manifest(moved_resources, generator.REPO_ROOT)
 
-        extra_resources = deepcopy(moved_resources)
+        duplicate_resources = deepcopy(self.manifest)
+        duplicate_resources["targets"].append({
+            "name": "RepoPromptWorkspaceTests",
+            "type": "test",
+            "resources": [
+                {"path": "Fixtures", "rule": {"copy": {}}},
+                {"path": "Goldens", "rule": {"copy": {}}},
+            ],
+        })
+        with self.assertRaisesRegex(generator.GeneratorError, "sole SwiftPM test target"):
+            generator.validate_manifest(duplicate_resources, generator.REPO_ROOT)
+
+        extra_resources = deepcopy(self.manifest)
         for target in extra_resources["targets"]:
-            if target["name"] == "RepoPromptWorkspaceTests":
+            if target["name"] == "RepoPromptCodeMapCoreTests":
                 target["resources"].append({"path": "Extra/Fixtures", "rule": {"copy": {}}})
         generator.validate_manifest(extra_resources, generator.REPO_ROOT)
 

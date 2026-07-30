@@ -488,8 +488,10 @@ struct AttributedTextView: NSViewRepresentable {
                     wasFirstResponder: wasFirstResponder
                 )
             textView.textStorage?.setAttributedString(attributedString)
-            textView.setSelectedRange(previousSelection)
-            textView.clampSelectionToCurrentString(scrollToVisible: shouldScrollSelectionToVisible)
+            textView.restoreSelectionCandidate(
+                previousSelection,
+                scrollToVisible: shouldScrollSelectionToVisible
+            )
             // Bump content version so the next sizeThatFits performs a real measurement.
             textView.incrementContentVersion()
             textView.needsDisplay = true

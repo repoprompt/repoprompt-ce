@@ -13,6 +13,7 @@ enum MCPToolWorkCountDiagnostics {
         let outputBytes: Int
         let parseMicroseconds: Int
         let commands: [String]
+        let inlinePathspecCounts: [Int]
         let outcome: String
     }
 
@@ -40,6 +41,7 @@ enum MCPToolWorkCountDiagnostics {
             private var outputBytes = 0
             private var parseMicroseconds = 0
             private var commands: [String] = []
+            private var inlinePathspecCounts: [Int] = []
 
             init(operation: String, requestIdentity: MCPRequestTimelineIdentity?) {
                 self.operation = operation
@@ -71,6 +73,10 @@ enum MCPToolWorkCountDiagnostics {
                 }
                 if commands.count < 128 {
                     commands.append(arguments.prefix(4).joined(separator: " "))
+                    let pathspecCount = arguments.firstIndex(of: "--").map {
+                        arguments.count - $0 - 1
+                    } ?? 0
+                    inlinePathspecCounts.append(pathspecCount)
                 }
                 lock.unlock()
             }
@@ -95,6 +101,7 @@ enum MCPToolWorkCountDiagnostics {
                     outputBytes: outputBytes,
                     parseMicroseconds: parseMicroseconds,
                     commands: commands,
+                    inlinePathspecCounts: inlinePathspecCounts,
                     outcome: outcome
                 )
             }

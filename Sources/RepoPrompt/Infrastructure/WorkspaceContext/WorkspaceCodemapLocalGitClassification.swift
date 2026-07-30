@@ -6,6 +6,12 @@ enum WorkspaceCodemapLocalGitClassification: Equatable {
     case requiresGitPreflight
 }
 
+enum WorkspaceCodemapNonGitFilesystemProofValidation: Equatable {
+    case current
+    case requiresLocalReclassification
+    case requiresGitPreflight
+}
+
 struct WorkspaceCodemapNonGitFilesystemProof: Equatable {
     struct FileIdentity: Equatable {
         let device: UInt64
@@ -43,12 +49,16 @@ struct WorkspaceCodemapNonGitFilesystemProof: Equatable {
 
 struct WorkspaceCodemapLocalGitClassificationProbe {
     let resolve: @Sendable (URL) async -> WorkspaceCodemapLocalGitClassification
-    let validate: @Sendable (WorkspaceCodemapNonGitFilesystemProof) -> Bool
+    let validate: @Sendable (
+        WorkspaceCodemapNonGitFilesystemProof
+    ) -> WorkspaceCodemapNonGitFilesystemProofValidation
 
     init(
         _ resolve: @escaping @Sendable (URL) async -> WorkspaceCodemapLocalGitClassification,
-        validate: @escaping @Sendable (WorkspaceCodemapNonGitFilesystemProof) -> Bool = {
-            WorkspaceCodemapLocalGitClassificationProbe.proofIsCurrent($0)
+        validate: @escaping @Sendable (
+            WorkspaceCodemapNonGitFilesystemProof
+        ) -> WorkspaceCodemapNonGitFilesystemProofValidation = {
+            WorkspaceCodemapLocalGitClassificationProbe.validateProof($0)
         }
     ) {
         self.resolve = resolve
@@ -66,9 +76,62 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
         return .definitelyNonGit(proof)
     }
 
-    private static func proofIsCurrent(_ proof: WorkspaceCodemapNonGitFilesystemProof) -> Bool {
+    private static func validateProof(
+        _ proof: WorkspaceCodemapNonGitFilesystemProof
+    ) -> WorkspaceCodemapNonGitFilesystemProofValidation {
         let rootURL = URL(fileURLWithPath: proof.requestedRootPath, isDirectory: true)
-        return makeProof(rootURL) == proof
+        guard let currentProof = makeProof(rootURL) else {
+            return .requiresGitPreflight
+        }
+        if currentProof == proof {
+            return .current
+        }
+        return proofHasSameTopology(proof, currentProof)
+            ? .requiresLocalReclassification
+            : .requiresGitPreflight
+    }
+
+    private static func proofHasSameTopology(
+        _ previous: WorkspaceCodemapNonGitFilesystemProof,
+        _ current: WorkspaceCodemapNonGitFilesystemProof
+    ) -> Bool {
+        guard previous.requestedRootPath == current.requestedRootPath,
+              previous.resolvedRootPath == current.resolvedRootPath,
+              previous.lexicalPathWitnesses.count == current.lexicalPathWitnesses.count,
+              previous.ancestorWitnesses.count == current.ancestorWitnesses.count
+        else { return false }
+
+        let lexicalTopologyMatches = zip(
+            previous.lexicalPathWitnesses,
+            current.lexicalPathWitnesses
+        ).allSatisfy { previousWitness, currentWitness in
+            previousWitness.path == currentWitness.path &&
+                identitiesHaveSameTopology(previousWitness.identity, currentWitness.identity)
+        }
+        guard lexicalTopologyMatches else { return false }
+
+        return zip(previous.ancestorWitnesses, current.ancestorWitnesses).allSatisfy {
+            previousWitness, currentWitness in
+            previousWitness.path == currentWitness.path &&
+                identitiesHaveSameTopology(
+                    previousWitness.directoryIdentity,
+                    currentWitness.directoryIdentity
+                ) &&
+                previousWitness.dotGit == currentWitness.dotGit &&
+                previousWitness.head == currentWitness.head &&
+                previousWitness.objects == currentWitness.objects &&
+                previousWitness.refs == currentWitness.refs
+        }
+    }
+
+    private static func identitiesHaveSameTopology(
+        _ previous: WorkspaceCodemapNonGitFilesystemProof.FileIdentity,
+        _ current: WorkspaceCodemapNonGitFilesystemProof.FileIdentity
+    ) -> Bool {
+        previous.device == current.device &&
+            previous.inode == current.inode &&
+            previous.mode == current.mode &&
+            previous.symlinkTarget == current.symlinkTarget
     }
 
     private static func makeProof(_ rootURL: URL) -> WorkspaceCodemapNonGitFilesystemProof? {

@@ -21,6 +21,8 @@ token_file="${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}"
 if [[ -n "$token_file" ]]; then
     [[ -f "$token_file" ]] || fail "Sentry auth token file does not exist: $token_file"
     SENTRY_AUTH_TOKEN="$(tr -d '\r\n' < "$token_file")"
+    [[ -n "${SENTRY_AUTH_TOKEN//[[:space:]]/}" ]] ||
+        fail "Explicit Sentry auth token file contains no token."
 fi
 
 if [[ -z "${SENTRY_AUTH_TOKEN:-}" ]]; then

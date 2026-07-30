@@ -96,6 +96,488 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertEqual(results.first?.records.map(\.name), ["First", "Second"])
     }
 
+    func testScanWorkspaces_coldFifteenThousandDirectoryShapeStopsAtWorkspaceBudget() async throws {
+        let directories = (0 ..< 15000).map { index in
+            workspacesRoot.appendingPathComponent("Workspace-Cold-\(index)", isDirectory: true)
+        }
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 128,
+                maxIndexDecodes: 128,
+                maxIndexBytes: 1024 * 1024,
+                maxElapsed: .seconds(20)
+            ),
+            workspaceDirectoryProvider: { _ in directories }
+        )
+
+        let inventory = try await scanner.scanWorkspaces(matching: nil)
+
+        let inspected = await scanner.workspaceInspectionCountForTesting
+        XCTAssertEqual(inspected, 128)
+        XCTAssertEqual(inventory.diagnostics.map(\.kind), [.workspaceCount])
+        XCTAssertEqual(inventory.diagnostics.first?.consumed, 128)
+        XCTAssertEqual(inventory.diagnostics.first?.retryable, true)
+    }
+
+    func testLocateSession_findsTargetAtOrdinal14999WithoutBroadWorkspaceCap() async throws {
+        let sessionID = UUID()
+        let target = try createWorkspaceDir(name: "Target", uuid: UUID())
+        try writeSessionFile(
+            AgentSession(id: sessionID, name: "Direct Target", transcript: .empty, itemCount: 0),
+            in: target
+        )
+        let directories = (0 ..< 14999).map { index in
+            workspacesRoot.appendingPathComponent("Workspace-Synthetic-\(index)", isDirectory: true)
+        } + [target]
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            workspaceDirectoryProvider: { _ in directories }
+        )
+
+        let lookup = try await scanner.locateSession(
+            sessionID: sessionID,
+            requestBudget: .standalone(maxElapsed: .seconds(20))
+        )
+
+        XCTAssertTrue(lookup.isComplete)
+        XCTAssertEqual(lookup.location?.workspaceDir, target)
+        XCTAssertTrue(lookup.diagnostics.isEmpty)
+        let statCount = await scanner.directSessionFileStatCountForTesting
+        XCTAssertEqual(statCount, 15000)
+    }
+
+    func testScanWorkspaces_exactUUIDZeroFallsBackToCanonicalWorkspaceIdentity() async throws {
+        let targetID = UUID()
+        try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: true)
+        let legacyDir = workspacesRoot.appendingPathComponent("Legacy-Storage", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+        try writeWorkspaceJSON(in: legacyDir, name: "Canonical Target", id: targetID)
+        try createAgentSessionsIndex(in: legacyDir, records: [makeMinimalRecord(name: "Target")])
+
+        let inventory = try await scanner.scanWorkspaces(matching: targetID.uuidString)
+
+        XCTAssertFalse(inventory.isTruncated)
+        XCTAssertEqual(inventory.workspaces.map(\.workspaceID), [targetID])
+        XCTAssertEqual(inventory.workspaces.flatMap(\.records).map(\.name), ["Target"])
+    }
+
+    func testScanWorkspaces_oversizedIndexReturnsTypedNonRetryablePartial() async throws {
+        let wsDir = try createWorkspaceDir(name: "Oversized", uuid: UUID())
+        let agentSessions = wsDir.appendingPathComponent("AgentSessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: agentSessions, withIntermediateDirectories: true)
+        try Data(repeating: 0x78, count: 128).write(
+            to: agentSessions.appendingPathComponent("AgentSessionIndex.json")
+        )
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 10,
+                maxIndexBytes: 1024,
+                maxIndexFileBytes: 64
+            )
+        )
+
+        let inventory = try await scanner.scanWorkspaces(matching: nil)
+
+        XCTAssertEqual(inventory.diagnostics.map(\.kind), [.indexFileBytes])
+        XCTAssertEqual(inventory.diagnostics.first?.retryable, false)
+        XCTAssertEqual(inventory.diagnostics.first?.consumed, 128)
+        XCTAssertTrue(inventory.isTruncated)
+
+        let cached = try await scanner.scanWorkspaces(matching: nil)
+        XCTAssertEqual(cached.diagnostics, inventory.diagnostics)
+        let inspected = await scanner.workspaceInspectionCountForTesting
+        XCTAssertEqual(inspected, 1, "Completed discovery with a persistent per-file failure should be TTL-cached")
+    }
+
+    func testScanWorkspaces_oversizedIndexDoesNotHideLaterValidWorkspace() async throws {
+        let oversized = try createWorkspaceDir(name: "Oversized", uuid: UUID())
+        let oversizedSessions = oversized.appendingPathComponent("AgentSessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: oversizedSessions, withIntermediateDirectories: true)
+        try Data(repeating: 0x78, count: 4096).write(
+            to: oversizedSessions.appendingPathComponent("AgentSessionIndex.json")
+        )
+        let valid = try createWorkspaceDir(name: "Valid", uuid: UUID())
+        try createAgentSessionsIndex(in: valid, records: [makeMinimalRecord(name: "Survives")])
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 10,
+                maxIndexBytes: 1024 * 1024,
+                maxIndexFileBytes: 2048
+            ),
+            workspaceDirectoryProvider: { _ in [oversized, valid] }
+        )
+
+        let inventory = try await scanner.scanWorkspaces(matching: nil)
+
+        XCTAssertEqual(inventory.diagnostics.map(\.kind), [.indexFileBytes])
+        XCTAssertEqual(inventory.workspaces.flatMap(\.records).map(\.name), ["Survives"])
+        XCTAssertEqual(inventory.workspaces.first?.indexReadFailed, true)
+    }
+
+    func testScanWorkspaces_nonDirectoryEntriesDoNotConsumeWorkspaceBudget() async throws {
+        try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: true)
+        let files = try (0 ..< 4).map { index -> URL in
+            let file = workspacesRoot.appendingPathComponent("not-a-workspace-\(index)")
+            try Data("file".utf8).write(to: file)
+            return file
+        }
+        let valid = try createWorkspaceDir(name: "Valid", uuid: UUID())
+        try createAgentSessionsIndex(in: valid, records: [makeMinimalRecord(name: "Visible")])
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 1,
+                maxIndexDecodes: 1,
+                maxIndexBytes: 1024 * 1024
+            ),
+            workspaceDirectoryProvider: { _ in files + [valid] }
+        )
+
+        let inventory = try await scanner.scanWorkspaces(matching: nil)
+
+        XCTAssertFalse(inventory.isTruncated)
+        XCTAssertEqual(inventory.workspaces.flatMap(\.records).map(\.name), ["Visible"])
+        let inspected = await scanner.workspaceInspectionCountForTesting
+        XCTAssertEqual(inspected, 1)
+    }
+
+    func testScanWorkspaces_oversizedWorkspaceJSONFallsBackWithTypedDiagnostic() async throws {
+        let workspaceID = UUID()
+        let workspace = try createWorkspaceDir(name: "Fallback", uuid: workspaceID)
+        try Data(repeating: 0x78, count: 128).write(to: workspace.appendingPathComponent("workspace.json"))
+        try createAgentSessionsIndex(in: workspace, records: [makeMinimalRecord()])
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 10,
+                maxIndexBytes: 1024 * 1024,
+                maxWorkspaceMetadataFileBytes: 64
+            )
+        )
+
+        let inventory = try await scanner.scanWorkspaces(matching: nil)
+
+        XCTAssertEqual(inventory.workspaces.first?.workspaceName, "Fallback")
+        XCTAssertEqual(inventory.workspaces.first?.workspaceID, workspaceID)
+        XCTAssertEqual(inventory.diagnostics.map(\.kind), [.workspaceMetadataFileBytes])
+        XCTAssertFalse(inventory.isTruncated, "Directory-identity fallback does not hide records")
+
+        let cached = try await scanner.scanWorkspaces(matching: nil)
+        XCTAssertEqual(cached.diagnostics, inventory.diagnostics)
+        let inspected = await scanner.workspaceInspectionCountForTesting
+        XCTAssertEqual(inspected, 1, "Warning-only metadata fallback should retain warm inventory caching")
+    }
+
+    func testLoadSession_oversizedTranscriptFailsBeforeDecode() async throws {
+        let wsDir = try createWorkspaceDir(name: "Oversized", uuid: UUID())
+        let sessionID = UUID()
+        try writeSessionFile(
+            AgentSession(
+                id: sessionID,
+                name: String(repeating: "oversized", count: 64),
+                transcript: .empty,
+                itemCount: 0
+            ),
+            in: wsDir
+        )
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 10,
+                maxIndexBytes: 1024,
+                maxTranscriptFileBytes: 64
+            )
+        )
+
+        do {
+            _ = try await scanner.loadSessionForHistory(
+                sessionID: sessionID,
+                workspaceDir: wsDir,
+                requestBudget: .standalone(maxTranscriptFileBytes: 64)
+            )
+            XCTFail("Expected transcript byte budget failure")
+        } catch let error as HistorySessionScannerError {
+            XCTAssertEqual(error.scanDiagnostic?.kind, .transcriptFileBytes)
+            XCTAssertEqual(error.scanDiagnostic?.retryable, false)
+        }
+        let decodeCount = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 0)
+    }
+
+    func testLoadSession_insufficientProportionalDecodeTimeFailsBeforeDecode() async throws {
+        let workspace = try createWorkspaceDir(name: "Decode", uuid: UUID())
+        let sessionID = UUID()
+        try writeSessionFile(
+            AgentSession(id: sessionID, name: "Decode", transcript: .empty, itemCount: 0),
+            in: workspace
+        )
+        let clock = ContinuousClock()
+        let start = clock.now
+        let now = HistoryScannerNowProvider(instants: [start, start, start + .seconds(19) + .milliseconds(975)])
+        let budget = HistoryRequestBudget(
+            startedAt: start,
+            deadline: start + .seconds(20),
+            maxTurns: 100,
+            yieldEveryTurns: 1,
+            maxIndexBytes: 1024,
+            maxIndexFileBytes: 1024,
+            maxTranscriptBytes: 1024 * 1024,
+            maxTranscriptFileBytes: 1024 * 1024,
+            nowProvider: { now.next() }
+        )
+
+        do {
+            _ = try await scanner.loadSessionForHistory(
+                sessionID: sessionID,
+                workspaceDir: workspace,
+                requestBudget: budget
+            )
+            XCTFail("Expected proportional decode-time guard")
+        } catch let error as HistorySessionScannerError {
+            XCTAssertEqual(error.scanDiagnostic?.kind, .elapsedTime)
+            XCTAssertEqual(error.scanDiagnostic?.phase, "transcript_decode")
+        }
+        let decodeCount = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 0)
+    }
+
+    func testTranscriptCache_usesDeterministicByteBoundedLRUEviction() async throws {
+        let wsDir = try createWorkspaceDir(name: "Cache", uuid: UUID())
+        let firstID = UUID()
+        let secondID = UUID()
+        try writeSessionFile(
+            AgentSession(id: firstID, name: "First", transcript: .empty, itemCount: 0),
+            in: wsDir
+        )
+        try writeSessionFile(
+            AgentSession(id: secondID, name: "Second", transcript: .empty, itemCount: 0),
+            in: wsDir
+        )
+        let sessionsDir = wsDir.appendingPathComponent("AgentSessions", isDirectory: true)
+        let firstSize = try FileManager.default.attributesOfItem(
+            atPath: sessionsDir.appendingPathComponent("AgentSession-\(firstID.uuidString).json").path
+        )[.size] as? NSNumber
+        let secondSize = try FileManager.default.attributesOfItem(
+            atPath: sessionsDir.appendingPathComponent("AgentSession-\(secondID.uuidString).json").path
+        )[.size] as? NSNumber
+        let cacheLimit = max(firstSize?.int64Value ?? 1, secondSize?.int64Value ?? 1)
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 10,
+                maxIndexBytes: 1024,
+                maxTranscriptCacheBytes: cacheLimit
+            )
+        )
+
+        _ = try await scanner.loadTranscriptForSearch(sessionID: firstID, workspaceDir: wsDir)
+        _ = try await scanner.loadTranscriptForSearch(sessionID: secondID, workspaceDir: wsDir)
+        _ = try await scanner.loadTranscriptForSearch(sessionID: firstID, workspaceDir: wsDir)
+
+        let decodeCount = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 3, "The oldest byte-budget entry must be evicted deterministically")
+    }
+
+    func testScanWorkspaces_warmInventoryCacheAvoidsRepeatedIndexDecode() async throws {
+        let wsDir = try createWorkspaceDir(name: "Warm", uuid: UUID())
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord()])
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            scanCacheTTL: 3600,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 1,
+                maxIndexBytes: 1024 * 1024,
+                maxElapsed: .seconds(20)
+            )
+        )
+
+        let first = try await scanner.scanWorkspaces(matching: nil)
+        let second = try await scanner.scanWorkspaces(matching: nil)
+
+        XCTAssertFalse(first.isTruncated)
+        XCTAssertEqual(second.workspaces, first.workspaces)
+        let decodeCount = await scanner.indexDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 1)
+    }
+
+    func testScanWorkspaces_midScanCancellationPropagates() async throws {
+        let directories = (0 ..< 15000).map { index in
+            workspacesRoot.appendingPathComponent("Workspace-Cancel-\(index)", isDirectory: true)
+        }
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 20000,
+                maxIndexDecodes: 20000,
+                maxIndexBytes: 1024 * 1024,
+                maxElapsed: .seconds(20)
+            ),
+            workspaceDirectoryProvider: { _ in directories }
+        )
+
+        let task = Task { try await scanner.scanWorkspaces(matching: nil) }
+        for _ in 0 ..< 10000 {
+            if await scanner.workspaceInspectionCountForTesting >= 32 { break }
+            await Task.yield()
+        }
+        let inspectedBeforeCancellation = await scanner.workspaceInspectionCountForTesting
+        XCTAssertGreaterThanOrEqual(inspectedBeforeCancellation, 32)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation to propagate")
+        } catch is CancellationError {
+            // Expected: the directory loop observes cancellation at a cooperative checkpoint.
+        }
+    }
+
+    func testScanWorkspaces_indexBudgetIsTypedRetryableAndPartialScanIsNotTTLCached() async throws {
+        let ws1 = try createWorkspaceDir(name: "A", uuid: UUID())
+        let ws2 = try createWorkspaceDir(name: "B", uuid: UUID())
+        try createAgentSessionsIndex(in: ws1, records: [makeMinimalRecord(name: "A")])
+        try createAgentSessionsIndex(in: ws2, records: [makeMinimalRecord(name: "B")])
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            scanCacheTTL: 3600,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 1,
+                maxIndexBytes: 1024 * 1024,
+                maxElapsed: .seconds(20)
+            )
+        )
+
+        let partial = try await scanner.scanWorkspaces(matching: nil)
+        XCTAssertEqual(partial.diagnostics.map(\.kind), [.indexCount])
+        XCTAssertEqual(partial.diagnostics.first?.retryable, true)
+        let decodeCount = await scanner.indexDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 1)
+
+        // The first index is now signature-cached, so a retry can decode the remaining
+        // index within the same per-call budget. A truncated inventory must not poison TTL.
+        let retry = try await scanner.scanWorkspaces(matching: nil)
+        XCTAssertFalse(retry.isTruncated)
+        XCTAssertEqual(retry.workspaces.flatMap(\.records).count, 2)
+        let decodeCountAfterRetry = await scanner.indexDecodeCountForTesting
+        XCTAssertEqual(decodeCountAfterRetry, 2)
+    }
+
+    func testScanWorkspaces_exactWorkspaceUUIDPreNarrowsColdIndexWork() async throws {
+        let targetID = UUID()
+        let target = try createWorkspaceDir(name: "Target", uuid: targetID)
+        let other = try createWorkspaceDir(name: "Other", uuid: UUID())
+        try createAgentSessionsIndex(in: target, records: [makeMinimalRecord(name: "Target")])
+        try createAgentSessionsIndex(in: other, records: [makeMinimalRecord(name: "Other")])
+
+        let inventory = try await scanner.scanWorkspaces(matching: targetID.uuidString)
+
+        XCTAssertEqual(inventory.workspaces.map(\.workspaceID), [targetID])
+        let decodeCount = await scanner.indexDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 1)
+    }
+
+    func testIndexScanCache_repeatedExactScopesStayEntryAndByteBounded() async throws {
+        let workspaceIDs = [UUID(), UUID(), UUID()]
+        for (index, id) in workspaceIDs.enumerated() {
+            let workspace = try createWorkspaceDir(name: "Exact\(index)", uuid: id)
+            try createAgentSessionsIndex(in: workspace, records: [makeMinimalRecord(name: "S\(index)")])
+        }
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            scanCacheTTL: 0,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 10,
+                maxIndexDecodes: 10,
+                maxIndexBytes: 1024 * 1024,
+                maxIndexCacheEntries: 2,
+                maxIndexCacheBytes: 1024 * 1024
+            )
+        )
+
+        for id in workspaceIDs {
+            _ = try await scanner.scanWorkspaces(matching: id.uuidString)
+        }
+        let entryCount = await scanner.indexScanCacheEntryCountForTesting
+        let cacheBytes = await scanner.indexScanCacheBytesForTesting
+        XCTAssertEqual(entryCount, 2)
+        XCTAssertLessThanOrEqual(cacheBytes, 1024 * 1024)
+
+        _ = try await scanner.scanWorkspaces(matching: workspaceIDs[0].uuidString)
+        let decodeCount = await scanner.indexDecodeCountForTesting
+        XCTAssertEqual(decodeCount, 4, "The deterministic LRU must evict the oldest exact scope")
+    }
+
+    func testIndexScanCache_repeatedPartialScansStayBounded() async throws {
+        var workspaces: [URL] = []
+        for index in 0 ..< 3 {
+            let workspace = try createWorkspaceDir(name: "Partial\(index)", uuid: UUID())
+            try createAgentSessionsIndex(in: workspace, records: [makeMinimalRecord(name: "S\(index)")])
+            workspaces.append(workspace)
+        }
+        let rotations = HistoryRotatingWorkspaceProvider(values: workspaces.map { first in
+            [first] + workspaces.filter { $0 != first }
+        })
+        scanner = HistorySessionScanner(
+            applicationSupportRoot: tempDir,
+            scanCacheTTL: 3600,
+            inventoryBudget: HistoryInventoryBudget(
+                maxWorkspaces: 1,
+                maxIndexDecodes: 1,
+                maxIndexBytes: 1024 * 1024,
+                maxIndexCacheEntries: 2,
+                maxIndexCacheBytes: 1024 * 1024
+            ),
+            workspaceDirectoryProvider: { _ in rotations.next() }
+        )
+
+        for _ in 0 ..< 3 {
+            let partial = try await scanner.scanWorkspaces(matching: nil)
+            XCTAssertEqual(partial.diagnostics.last?.kind, .workspaceCount)
+        }
+
+        let entryCount = await scanner.indexScanCacheEntryCountForTesting
+        let cacheBytes = await scanner.indexScanCacheBytesForTesting
+        XCTAssertEqual(entryCount, 2)
+        XCTAssertLessThanOrEqual(cacheBytes, 1024 * 1024)
+    }
+
+    func testInventoryScanGate_cancelledWaitersLeaveNoTombstonesAndReleaseFIFO() async throws {
+        let gate = HistoryInventoryScanGate()
+        let holder = try await gate.acquire()
+        let waiters = (0 ..< 100).map { _ in
+            Task {
+                let lease = try await gate.acquire()
+                await gate.release(lease)
+            }
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        waiters.forEach { $0.cancel() }
+        await gate.release(holder)
+        for waiter in waiters {
+            do {
+                try await waiter.value
+            } catch is CancellationError {
+                // Expected for queued waiters.
+            }
+        }
+
+        let snapshot = await gate.snapshotForTesting()
+        XCTAssertFalse(snapshot.hasHolder)
+        XCTAssertEqual(snapshot.waiterCount, 0)
+    }
+
     func testScanAllWorkspaces_workspaceWithoutAgentSessionsDir() async throws {
         _ = try createWorkspaceDir(name: "EmptyProject", uuid: UUID())
         // No AgentSessions directory created
@@ -730,5 +1212,41 @@ final class HistorySessionScannerTests: XCTestCase {
             keyPaths: keyPaths,
             coveredTurnDurationSeconds: activeDurationSeconds
         )
+    }
+}
+
+private final class HistoryScannerNowProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private let instants: [ContinuousClock.Instant]
+    private var index = 0
+
+    init(instants: [ContinuousClock.Instant]) {
+        precondition(!instants.isEmpty)
+        self.instants = instants
+    }
+
+    func next() -> ContinuousClock.Instant {
+        lock.withLock {
+            defer { index += 1 }
+            return instants[min(index, instants.count - 1)]
+        }
+    }
+}
+
+private final class HistoryRotatingWorkspaceProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private let values: [[URL]]
+    private var index = 0
+
+    init(values: [[URL]]) {
+        precondition(!values.isEmpty)
+        self.values = values
+    }
+
+    func next() -> [URL] {
+        lock.withLock {
+            defer { index += 1 }
+            return values[min(index, values.count - 1)]
+        }
     }
 }

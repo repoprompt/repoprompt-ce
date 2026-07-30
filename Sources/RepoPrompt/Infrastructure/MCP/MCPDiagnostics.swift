@@ -39,22 +39,35 @@ struct MCPFirstTerminalRecordClaim: Equatable {
     }
 }
 
+struct MCPTerminalToolExecutionContext: Equatable {
+    let toolName: String
+    let invocationID: UUID
+    let elapsedMilliseconds: Double
+    let handlerPhase: String?
+    let handlerPhaseAgeMilliseconds: Double?
+    let executionDeadlineMilliseconds: Double?
+    let cleanupGraceMilliseconds: Double?
+}
+
 struct MCPConnectionCloseContext: Equatable {
     let reason: String
     let initiator: MCPTerminalInitiator
     let errno: Int32?
     let errorDescription: String?
+    let toolExecution: MCPTerminalToolExecutionContext?
 
     init(
         reason: String,
         initiator: MCPTerminalInitiator,
         errno: Int32? = nil,
-        errorDescription: String? = nil
+        errorDescription: String? = nil,
+        toolExecution: MCPTerminalToolExecutionContext? = nil
     ) {
         self.reason = reason
         self.initiator = initiator
         self.errno = errno
         self.errorDescription = errorDescription
+        self.toolExecution = toolExecution
     }
 
     init(transport snapshot: MCPTransportCloseSnapshot) {

@@ -19,19 +19,20 @@ enum ClaudeCodeAIModelCatalog {
     }
 
     private static let pickerEffortOrder: [ClaudeCodeEffortLevel] = [
-        .low, .medium, .high, .max, .xhigh
+        .low, .medium, .high, .xhigh, .max
     ]
 
     private static let modelDefinitions: [ModelDefinition] = [
-        ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
-        ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
-        ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
-        ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
-        ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
+        ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-5", displayName: "Opus 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-5-20251101", displayName: "Opus 4.5", supportedEfforts: []),
         ModelDefinition(runtimeModelRaw: "sonnet[1m]", displayName: "Sonnet Latest (1M)", supportedEfforts: [.low, .medium, .high]),
         ModelDefinition(runtimeModelRaw: "sonnet", displayName: "Sonnet Latest", supportedEfforts: [.low, .medium, .high]),
-        ModelDefinition(runtimeModelRaw: "claude-sonnet-5", displayName: "Sonnet 5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
+        ModelDefinition(runtimeModelRaw: "claude-sonnet-5", displayName: "Sonnet 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-4-6", displayName: "Sonnet 4.6", supportedEfforts: [.low, .medium, .high]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-4-5-20250929", displayName: "Sonnet 4.5", supportedEfforts: []),
         ModelDefinition(runtimeModelRaw: "haiku", displayName: "Haiku Latest", supportedEfforts: []),

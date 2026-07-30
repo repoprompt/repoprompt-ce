@@ -4,6 +4,8 @@ import Foundation
 /// Retained ownership of one well-known UNIX-domain socket pathname.
 /// The same-directory lock descriptor remains held for the listener lifetime.
 final class BootstrapSocketOwnership: @unchecked Sendable {
+    static let boundIdentityRecordPrefix = "repoprompt-ce-socket-identity-v1"
+
     struct FileIdentity: Equatable {
         let device: dev_t
         let inode: ino_t
@@ -40,6 +42,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         case socketProbeFailed(path: String, errno: Int32)
         case staleRemovalFailed(path: String, errno: Int32)
         case boundIdentityMissing(path: String)
+        case boundIdentityRecordWriteFailed(path: String, errno: Int32)
 
         var errorDescription: String? {
             switch self {
@@ -61,6 +64,8 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
                 "Could not remove the confirmed stale socket at \(path) (errno \(code))"
             case let .boundIdentityMissing(path):
                 "Bound socket identity is unavailable at \(path)"
+            case let .boundIdentityRecordWriteFailed(path, code):
+                "Could not persist bound socket identity at \(path) (errno \(code))"
             }
         }
     }
@@ -159,6 +164,34 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         stateLock.lock()
         boundIdentity = identity
         stateLock.unlock()
+        try persistBoundIdentityRecord(identity)
+    }
+
+    private func persistBoundIdentityRecord(_ identity: FileIdentity) throws {
+        let record = "\(Self.boundIdentityRecordPrefix) \(identity.device) \(identity.inode)\n"
+        let bytes = Array(record.utf8)
+        guard ftruncate(lockFD, 0) == 0 else {
+            throw OwnershipError.boundIdentityRecordWriteFailed(path: lockURL.path, errno: errno)
+        }
+
+        var offset = 0
+        while offset < bytes.count {
+            let written = bytes.withUnsafeBytes { buffer -> Int in
+                guard let baseAddress = buffer.baseAddress else { return 0 }
+                return pwrite(lockFD, baseAddress.advanced(by: offset), bytes.count - offset, off_t(offset))
+            }
+            if written < 0 {
+                if errno == EINTR { continue }
+                throw OwnershipError.boundIdentityRecordWriteFailed(path: lockURL.path, errno: errno)
+            }
+            guard written > 0 else {
+                throw OwnershipError.boundIdentityRecordWriteFailed(path: lockURL.path, errno: EIO)
+            }
+            offset += written
+        }
+        guard fsync(lockFD) == 0 else {
+            throw OwnershipError.boundIdentityRecordWriteFailed(path: lockURL.path, errno: errno)
+        }
     }
 
     func pathStatus() -> PathStatus {

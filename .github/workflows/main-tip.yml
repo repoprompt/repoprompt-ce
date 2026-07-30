@@ -46,6 +46,7 @@ jobs:
         env:
           REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -147,6 +148,8 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+          # Link Sentry and preserve dSYMs without exposing DSN or auth in this stage.
+          REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/main_tip_release.sh stage
 
       - name: Upload staged tip source
@@ -244,6 +247,25 @@ jobs:
           echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
           echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
 
+      - name: Install Sentry CLI for Tip symbol upload
+        run: |
+          set -euo pipefail
+          if ! command -v sentry-cli >/dev/null 2>&1; then
+            brew install getsentry/tools/sentry-cli
+          fi
+
+      - name: Prepare Tip Sentry auth token file
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ -n "${SENTRY_AUTH_TOKEN:-}" ]] || { echo "SENTRY_AUTH_TOKEN is not configured" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/repoprompt-tip-secrets"
+          SENTRY_TOKEN_FILE="$RUNNER_TEMP/repoprompt-tip-secrets/sentry-auth-token"
+          printf '%s' "$SENTRY_AUTH_TOKEN" > "$SENTRY_TOKEN_FILE"
+          chmod 600 "$SENTRY_TOKEN_FILE"
+
       - name: Sign and notarize staged tip
         env:
           TIP_COMMIT: ${{ needs.setup.outputs.commit }}
@@ -256,6 +278,11 @@ jobs:
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
+          REPOPROMPT_ENABLE_SENTRY: "1"
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+          REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}

@@ -871,6 +871,13 @@ class OracleViewModel: ObservableObject {
         (pinnedSessionRefCounts[sessionID] ?? 0) > 0
     }
 
+    #if DEBUG
+        @MainActor
+        func isSessionPinnedForTesting(_ sessionID: UUID) -> Bool {
+            isSessionPinned(sessionID)
+        }
+    #endif
+
     nonisolated static func shouldUseLivePromptStateForAutosave(
         sessionID: UUID,
         currentSessionID: UUID?,
@@ -2884,6 +2891,7 @@ class OracleViewModel: ObservableObject {
         }
 
         Task {
+            var providerCleanupHandle: ProviderConversationCleanupHandle?
             do {
                 let shouldContinueStreaming: () async -> Bool = {
                     await MainActor.run {
@@ -2967,6 +2975,9 @@ class OracleViewModel: ObservableObject {
                     let reasoningDelta = output.reasoning
                     let tokenInfo = output.tokens
                     let isStreamFinalized = output.isFinal
+                    if let cleanupHandle = output.cleanupHandle {
+                        providerCleanupHandle = cleanupHandle
+                    }
 
                     partialBuffer += delta
                     reasoningBuffer += reasoningDelta ?? ""
@@ -3026,6 +3037,7 @@ class OracleViewModel: ObservableObject {
 
                         Task {
                             await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer)
+                            await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                         }
                     }
                 }
@@ -3034,7 +3046,10 @@ class OracleViewModel: ObservableObject {
                     await MainActor.run {
                         self.cancelStreamInactivityWatchdog(for: aiResponseId)
                     }
-                    Task { await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer) }
+                    Task {
+                        await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer)
+                        await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
+                    }
                 }
             } catch {
                 #if DEBUG
@@ -3045,9 +3060,21 @@ class OracleViewModel: ObservableObject {
                 }
                 Task {
                     await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID)
+                    await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                 }
             }
         }
+    }
+
+    func cleanupOracleProviderConversation(
+        _ handle: ProviderConversationCleanupHandle?,
+        model: AIModel
+    ) async {
+        guard let handle else { return }
+        let outcome = await aiQueriesService.cleanupProviderConversation(handle: handle, model: model, action: .delete)
+        #if DEBUG
+            print("[OracleViewModel] provider conversation cleanup action=delete provider=\(handle.provider) status=\(outcome.status) message=\(outcome.message ?? "")")
+        #endif
     }
 
     // MARK: - Finalise an AI response

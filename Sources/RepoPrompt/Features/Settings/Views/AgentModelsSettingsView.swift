@@ -586,40 +586,15 @@ struct AgentModelsSettingsView: View {
                 .fixedSize()
             }
 
-            if resolution.overrideUnavailable {
+            let pinState = resolution.pinState
+            if let message = pinState.message,
+               let actionTitle = pinState.actionTitle
+            {
                 HStack(spacing: 6) {
-                    Text("Saved override unavailable; using recommended default.")
+                    Text(message)
                         .font(.caption2)
-                        .foregroundColor(.orange)
-                    if resolution.hasStoredOverride {
-                        Button("Clear Pin") {
-                            viewModel.applyRoleDefault(resolution)
-                        }
-                        .font(.caption2)
-                        .buttonStyle(.plain)
-                        .foregroundColor(.accentColor)
-                    }
-                }
-                .padding(.leading, 30)
-            } else if resolution.hasCustomOverride {
-                HStack(spacing: 6) {
-                    Text("Recommended: \(resolution.recommendedDisplayName)")
-                        .font(.caption2)
-                        .foregroundColor(.orange)
-                    Button("Apply") {
-                        viewModel.applyRoleDefault(resolution)
-                    }
-                    .font(.caption2)
-                    .buttonStyle(.plain)
-                    .foregroundColor(.accentColor)
-                }
-                .padding(.leading, 30)
-            } else if resolution.hasStoredOverride {
-                HStack(spacing: 6) {
-                    Text("Pinned to recommended")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                    Button("Clear Pin") {
+                        .foregroundColor(pinState.usesWarningStyle ? .orange : .secondary)
+                    Button(actionTitle) {
                         viewModel.applyRoleDefault(resolution)
                     }
                     .font(.caption2)
@@ -697,7 +672,7 @@ struct AgentModelsSettingsView: View {
     /// no longer requires a click to uncover.
     ///
     /// SEARCH-HELPER: Agent Models related settings, Oracle Model Presets link,
-    /// Benchmark Model link, related-settings footer
+    /// related-settings footer
     private var relatedSettingsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Related Settings")
@@ -709,12 +684,6 @@ struct AgentModelsSettingsView: View {
                 title: "Oracle Model Presets",
                 detail: "Named Oracle model choices exposed to MCP clients.",
                 tab: .modelPresets
-            )
-            linkRow(
-                icon: "gauge",
-                title: "Benchmark Model",
-                detail: "Head-to-head model benchmarks.",
-                tab: .benchmark
             )
         }
         .padding(.top, 8)

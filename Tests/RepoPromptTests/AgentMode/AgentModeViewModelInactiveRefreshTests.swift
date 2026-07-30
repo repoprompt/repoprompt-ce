@@ -1013,6 +1013,122 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(rows.map(\.depth), [0, 1, 2])
     }
 
+    func testNestedSidebarThreadsDefaultCollapseAndPreserveSearchActiveAndExpandAll() async throws {
+        let viewModel = makeViewModel()
+        let rootTabID = UUID()
+        let childTabID = UUID()
+        let grandchildTabID = UUID()
+        let rootSessionID = UUID()
+        let childSessionID = UUID()
+        let grandchildSessionID = UUID()
+        let tabs = [
+            ComposeTabState(id: rootTabID, name: "Root", activeAgentSessionID: rootSessionID),
+            ComposeTabState(id: childTabID, name: "Child", activeAgentSessionID: childSessionID),
+            ComposeTabState(id: grandchildTabID, name: "Grandchild", activeAgentSessionID: grandchildSessionID)
+        ]
+        let entries = [
+            makeIndexEntry(id: rootSessionID, tabID: rootTabID),
+            makeIndexEntry(id: childSessionID, tabID: childTabID, parentSessionID: rootSessionID),
+            makeIndexEntry(id: grandchildSessionID, tabID: grandchildTabID, parentSessionID: childSessionID)
+        ]
+        let gate = SidebarIndexStreamGate()
+        let harness = SidebarIndexStreamHarness(plans: [
+            .init(batches: [makeBatch(entries)], gate: gate)
+        ])
+        installSidebarIndexHarness(harness, on: viewModel)
+        let workspace = makeWorkspace(name: "Nested sidebar", tabs: tabs, activeTabID: rootTabID)
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
+        await harness.waitForRequestCount(1)
+        await gate.release()
+        await viewModel.test_waitForSessionListCacheRefresh()
+        try await waitUntil {
+            Set(viewModel.test_ownerValidatedSessionIndex.keys) == [rootSessionID, childSessionID, grandchildSessionID]
+        }
+
+        let rootKey = AgentSidebarThreadKey.session(rootSessionID)
+        let childKey = AgentSidebarThreadKey.session(childSessionID)
+        XCTAssertEqual(
+            Set(viewModel.collapsibleSidebarThreadKeys(
+                for: tabs,
+                currentTabID: rootTabID,
+                searchText: ""
+            )),
+            [rootKey, childKey]
+        )
+
+        let defaultCollapsedKeys = viewModel.defaultCollapsedSidebarThreadKeys(
+            for: tabs,
+            searchText: ""
+        )
+        XCTAssertEqual(defaultCollapsedKeys, [childKey])
+        XCTAssertTrue(viewModel.defaultCollapsedSidebarThreadKeys(for: tabs, searchText: "Grandchild").isEmpty)
+
+        let revisionBeforeRender = viewModel.ui.sessionSidebar.snapshot.revision
+        let rowsBeforeLifecycleSeed = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(rowsBeforeLifecycleSeed.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionBeforeRender)
+
+        viewModel.seedDefaultCollapsedSidebarThreads(defaultCollapsedKeys)
+        let revisionAfterLifecycleSeed = viewModel.ui.sessionSidebar.snapshot.revision
+        let initialRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(initialRows.map(\.tabID), [rootTabID, childTabID])
+        XCTAssertEqual(initialRows.map(\.isThreadCollapsed), [false, true])
+        XCTAssertEqual(initialRows.map(\.hiddenThreadDescendantCount), [0, 1])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [childKey])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionAfterLifecycleSeed)
+
+        let activeGrandchildRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: grandchildTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(activeGrandchildRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(activeGrandchildRows.map(\.isThreadCollapsed), [false, false, false])
+
+        let effectiveChildRow = try XCTUnwrap(activeGrandchildRows.first { $0.tabID == childTabID })
+        viewModel.requestSidebarThreadDisclosureToggle(for: effectiveChildRow)
+        let rowsAfterSwitchingAway = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(rowsAfterSwitchingAway.map(\.tabID), [rootTabID, childTabID])
+        XCTAssertEqual(rowsAfterSwitchingAway.last?.isThreadCollapsed, true)
+
+        let searchRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: "Grandchild"
+        )
+        XCTAssertEqual(searchRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(searchRows.map(\.isThreadCollapsed), [false, false, false])
+
+        viewModel.expandAllSidebarThreads(for: tabs, currentTabID: rootTabID)
+        XCTAssertTrue(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys.isEmpty)
+        XCTAssertEqual(
+            viewModel.ui.sessionSidebar.snapshot.defaultCollapsedThreadKeysHandled,
+            [rootKey, childKey]
+        )
+        let expandedRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(expandedRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+
+        viewModel.collapseAllSidebarThreads(for: tabs, currentTabID: rootTabID)
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [rootKey, childKey])
+    }
+
     func testConflictingBindingStartsSuccessorRefresh() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()

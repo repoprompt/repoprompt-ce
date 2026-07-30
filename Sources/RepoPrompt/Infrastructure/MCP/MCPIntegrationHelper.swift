@@ -582,12 +582,12 @@ enum MCPIntegrationHelper {
         CodexIntegrationConfiguration.mcpServerNames()
     }
 
-    /// Installs the RepoPrompt MCP server into Codex CLI (`~/.codex/config.toml`).
+    /// Installs the RepoPrompt MCP server into RepoPrompt's isolated Codex config.
     ///
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installInCodex() -> (success: Bool, wasAlreadyPresent: Bool) {
+    static func installInCodex() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         let result = CodexIntegrationConfiguration.installPersistentMCPConfig()
         if result.success {
             // Also install Codex slash commands for MCP tool usage.
@@ -601,7 +601,7 @@ enum MCPIntegrationHelper {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureCodexServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
+    static func ensureCodexServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         CodexIntegrationConfiguration.ensureServerForDiscovery()
     }
 
@@ -953,8 +953,7 @@ enum MCPIntegrationHelper {
 
     /// Returns the URL for the Codex prompts directory.
     private static func codexPromptsDirectoryURL() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex", isDirectory: true)
+        CodexIntegrationConfiguration.configDirectoryURL()
             .appendingPathComponent("prompts", isDirectory: true)
     }
 
@@ -1132,7 +1131,7 @@ enum MCPIntegrationHelper {
             do {
                 try fm.createDirectory(at: promptsDir, withIntermediateDirectories: true, attributes: nil)
             } catch {
-                print("MCPIntegrationHelper – Failed to create ~/.codex/prompts directory: \(error)")
+                print("MCPIntegrationHelper – Failed to create RepoPrompt-owned Codex prompts directory: \(error)")
                 return 0
             }
         }

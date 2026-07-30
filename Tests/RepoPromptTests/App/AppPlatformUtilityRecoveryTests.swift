@@ -106,7 +106,7 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
                     <enclosure url="https://example.com/RepoPrompt-2.1.9.zip" />
                 </item>
                 <item>
-                    <title>Version 2.1.20</title>
+                    <title>Tip build 320 · v2.1.20 · commit abc1234def56</title>
                     <sparkle:shortVersionString>2.1.20</sparkle:shortVersionString>
                     <sparkle:version>320</sparkle:version>
                     <pubDate>Tue, 21 Apr 2026 12:28:34 +0000</pubDate>
@@ -122,6 +122,9 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
 
         XCTAssertEqual(version.version, "2.1.20")
         XCTAssertEqual(version.buildNumber, "320")
+        XCTAssertEqual(version.title, "Tip build 320 · v2.1.20 · commit abc1234def56")
+        XCTAssertEqual(AvailableUpdateNotice.marketingVersion(fromTipTitle: version.title), "2.1.20")
+        XCTAssertEqual(AvailableUpdateNotice.shortCommitSHA(fromTipTitle: version.title), "abc1234def56")
         XCTAssertEqual(version.releaseNotesURL, "https://example.com/release-notes.html")
         XCTAssertEqual(version.downloadURL, "https://example.com/RepoPrompt-2.1.20.zip")
         XCTAssertEqual(version.minimumSystemVersion, "14.0")
@@ -181,40 +184,162 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
             channel: .tip,
             version: "1.0.28",
             buildNumber: "29.8.52",
+            shortCommitSHA: "abc1234def56",
             date: nil,
-            releaseNotes: nil
+            releaseNotes: "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/tag/tip-abc1234def56"
         )
 
-        XCTAssertEqual(notice.toolbarLabel, "Tip build v1.0.28")
-        XCTAssertEqual(notice.availabilityStatus, "Tip build v1.0.28 (29.8.52) is available")
-        XCTAssertEqual(notice.menuInstallTitle, "Install Tip build v1.0.28…")
-        XCTAssertEqual(notice.installButtonTitle, "Install Tip Build")
-        XCTAssertEqual(notice.accessibilityLabel, "Tip build v1.0.28 (29.8.52) update available")
+        XCTAssertEqual(notice.toolbarLabel, "Tip build 29.8.52")
+        XCTAssertEqual(notice.availabilityStatus, "Tip build 29.8.52 · Version v1.0.28 · Commit abc1234def56 is available")
+        XCTAssertEqual(notice.menuInstallTitle, "Install Tip Build 29.8.52 (v1.0.28, commit abc1234def56)…")
+        XCTAssertEqual(notice.installButtonTitle, "Install Tip Build 29.8.52")
+        XCTAssertEqual(notice.accessibilityLabel, "Tip build 29.8.52 · Version v1.0.28 · Commit abc1234def56 update available")
+        XCTAssertEqual(notice.availableTooltip, "Tip build 29.8.52 · Version v1.0.28 · Commit abc1234def56 is available — click for update details")
+        XCTAssertEqual(notice.accessibilityHint, "Opens Sparkle's update details and install dialog.")
         XCTAssertEqual(notice.channel, .tip)
     }
 
-    func testStableUpdateNoticePreservesExistingStableCopy() {
+    func testStableUpdateNoticeUsesStableCopyWithoutTipLabel() {
         let notice = AvailableUpdateNotice(
             channel: .stable,
             version: "v1.0.29",
             buildNumber: "30",
+            shortCommitSHA: nil,
             date: nil,
             releaseNotes: nil
         )
 
         XCTAssertEqual(notice.toolbarLabel, "Update v1.0.29")
-        XCTAssertEqual(notice.availabilityStatus, "Version 1.0.29 is available")
-        XCTAssertEqual(notice.menuInstallTitle, "Install Update 1.0.29…")
+        XCTAssertEqual(notice.availabilityStatus, "Version v1.0.29 · Build 30 is available")
+        XCTAssertEqual(notice.menuInstallTitle, "Install Update v1.0.29 (build 30)…")
         XCTAssertEqual(notice.installButtonTitle, "Install Update")
+        XCTAssertEqual(notice.availableTooltip, "Version v1.0.29 · Build 30 is available — click to install")
+        XCTAssertEqual(notice.accessibilityHint, "Opens Sparkle's update and install dialog.")
+        XCTAssertFalse(notice.availableTooltip.localizedCaseInsensitiveContains("release notes"))
         XCTAssertFalse(notice.availabilityStatus.contains("Tip"))
     }
 
+    func testUncorrelatedSparkleNoUpdatePreservesNewerRequestAndNoticeDisposition() throws {
+        var observerState = SparkleUserInitiatedObserverState()
+        let olderRequestID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
+        let newerRequestID = try XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222"))
+
+        let olderRequest = observerState.begin(channel: .tip, requestID: olderRequestID)
+        XCTAssertTrue(observerState.finish(request: olderRequest))
+        let newerRequest = observerState.begin(channel: .tip, requestID: newerRequestID)
+
+        let disposition = observerState.receiveUncorrelatedNoUpdate()
+
+        XCTAssertEqual(disposition, .preserveNoticeAndRequest)
+        XCTAssertEqual(observerState.activeRequest, newerRequest)
+        XCTAssertFalse(observerState.finish(request: olderRequest))
+        XCTAssertEqual(observerState.activeRequest, newerRequest)
+    }
+
+    func testSparklePositiveResultTargetsOnlyMatchingActiveRequestForSettlement() throws {
+        var observerState = SparkleUserInitiatedObserverState()
+        let requestID = try XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333"))
+
+        XCTAssertNil(observerState.requestToSettle(afterPositiveResultFor: .tip))
+        let tipRequest = observerState.begin(channel: .tip, requestID: requestID)
+        XCTAssertEqual(observerState.requestToSettle(afterPositiveResultFor: .tip), tipRequest)
+        XCTAssertNil(observerState.requestToSettle(afterPositiveResultFor: .stable))
+        XCTAssertEqual(observerState.activeRequest, tipRequest)
+    }
+
+    func testSparklePositiveResultsCannotDowngradeKnownBuilds() {
+        XCTAssertTrue(SparkleUpdaterManager.sparkleResultIsNotOlderThanKnownUpdate(
+            candidateBuildNumber: "29.8.52",
+            knownBuildNumber: nil
+        ))
+        XCTAssertTrue(SparkleUpdaterManager.sparkleResultIsNotOlderThanKnownUpdate(
+            candidateBuildNumber: "29.8.52",
+            knownBuildNumber: "29.8.52"
+        ))
+        XCTAssertTrue(SparkleUpdaterManager.sparkleResultIsNotOlderThanKnownUpdate(
+            candidateBuildNumber: "29.8.53",
+            knownBuildNumber: "29.8.52"
+        ))
+        XCTAssertFalse(SparkleUpdaterManager.sparkleResultIsNotOlderThanKnownUpdate(
+            candidateBuildNumber: "29.8.51",
+            knownBuildNumber: "29.8.52"
+        ))
+        XCTAssertFalse(SparkleUpdaterManager.sparkleResultIsNotOlderThanKnownUpdate(
+            candidateBuildNumber: "not-a-build",
+            knownBuildNumber: "29.8.52"
+        ))
+    }
+
     func testSparkleDisplayVersionNormalizationRemovesTipDecoration() {
+        let enrichedTipTitle = "Tip build 29.8.52 · v1.0.28 · commit abc1234def56"
+
         XCTAssertEqual(
-            SparkleUpdaterManager.sanitizeVersionString("  Tip build v1.0.28  "),
+            AvailableUpdateNotice.marketingVersion(fromTipTitle: enrichedTipTitle),
             "1.0.28"
         )
-        XCTAssertEqual(SparkleUpdaterManager.sanitizeVersionString("v1.0.29"), "1.0.29")
+        XCTAssertNil(AvailableUpdateNotice.marketingVersion(fromTipTitle: "Tip build v1.0.27"))
+        XCTAssertEqual(
+            SparkleUpdaterManager.presentationVersion(
+                channel: .tip,
+                displayVersion: "1.0.28",
+                title: enrichedTipTitle
+            ),
+            "1.0.28"
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.presentationVersion(
+                channel: .tip,
+                displayVersion: "Tip build v1.0.27",
+                title: "Tip build v1.0.27"
+            ),
+            "1.0.27"
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.presentationVersion(
+                channel: .stable,
+                displayVersion: "v1.0.29",
+                title: enrichedTipTitle
+            ),
+            "1.0.29"
+        )
+
+        let tipIdentities = SparkleVersionDisplay.formattedIdentities(
+            availableDisplayVersion: "1.1.0",
+            availableBuildNumber: "31.11.89",
+            availableTitle: "Tip build 31.11.89 · v1.1.0 · commit abc1234def56",
+            installedDisplayVersion: "1.1.0",
+            installedBuildNumber: "31.10.88"
+        )
+        XCTAssertEqual(tipIdentities.available, "v1.1.0 (31.11.89)")
+        XCTAssertEqual(tipIdentities.installed, "1.1.0 (31.10.88)")
+
+        var installedDisplayVersion: NSString = "1.1.0"
+        let availableDisplayVersion = SparkleVersionDisplay.apply(
+            tipIdentities,
+            toInstalledDisplayVersion: &installedDisplayVersion
+        )
+        XCTAssertEqual(availableDisplayVersion, "v1.1.0 (31.11.89)")
+        XCTAssertEqual(installedDisplayVersion, "1.1.0 (31.10.88)")
+
+        let stableIdentities = SparkleVersionDisplay.formattedIdentities(
+            availableDisplayVersion: "1.2.0",
+            availableBuildNumber: "32",
+            availableTitle: "Version 1.2.0",
+            installedDisplayVersion: "1.1.0",
+            installedBuildNumber: "31"
+        )
+        XCTAssertEqual(stableIdentities.available, "v1.2.0 (32)")
+        XCTAssertEqual(stableIdentities.installed, "1.1.0 (31)")
+
+        let legacyTipIdentities = SparkleVersionDisplay.formattedIdentities(
+            availableDisplayVersion: "Tip build v1.0.27",
+            availableBuildNumber: "29.8.51",
+            availableTitle: "Tip build v1.0.27",
+            installedDisplayVersion: "v1.0.26",
+            installedBuildNumber: "29.8.50"
+        )
+        XCTAssertEqual(legacyTipIdentities.available, "v1.0.27 (29.8.51)")
+        XCTAssertEqual(legacyTipIdentities.installed, "1.0.26 (29.8.50)")
     }
 
     func testAppcastRequestIdentityRejectsDelayedAndOverlappingResults() throws {

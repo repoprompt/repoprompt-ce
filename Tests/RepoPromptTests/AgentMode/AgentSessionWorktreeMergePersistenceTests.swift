@@ -21,7 +21,7 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         XCTAssertTrue(decoded.worktreeMergeOperations.isEmpty)
     }
 
-    func testAgentSessionRoundTripsActiveWorktreeMergeOperationsAsVersionSix() throws {
+    func testAgentSessionRoundTripsActiveWorktreeMergeOperationsAsCurrentVersion() throws {
         let operation = makeOperation(status: .awaitingCommit, conflictFiles: [])
         let session = try AgentSession(
             id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000202")),
@@ -38,7 +38,7 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 6)
+        XCTAssertEqual(decoded.serializationVersion, 7)
         XCTAssertEqual(decoded.worktreeMergeOperations, [operation])
         XCTAssertEqual(decoded.worktreeMergeOperations.activeWorktreeMergeSummaries, try [XCTUnwrap(operation.activeSummary)])
     }

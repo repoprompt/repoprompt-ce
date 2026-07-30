@@ -162,8 +162,15 @@ struct RecommendationWizardPopoverView: View {
                 .font(.title2)
                 .foregroundColor(.accentColor)
 
-            Text(title)
-                .font(.headline)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                if let scopeLabel = viewModel.agentModelsScopeLabel {
+                    Text(scopeLabel)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
 
             Spacer()
 
@@ -218,6 +225,11 @@ struct RecommendationWizardPopoverView: View {
                     Text(viewModel.progressText)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                    if step != .presets, let scopeLabel = viewModel.agentModelsScopeLabel {
+                        Text(scopeLabel)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
 
@@ -288,19 +300,31 @@ struct RecommendationWizardPopoverView: View {
     // MARK: - Footer
 
     private var wizardFooter: some View {
-        HStack {
-            // Back button
-            if viewModel.canGoBack {
-                Button("Back") {
-                    viewModel.previousStep()
+        VStack(alignment: .trailing, spacing: 6) {
+            if !viewModel.applyActionScopeLabels.isEmpty {
+                VStack(alignment: .trailing, spacing: 2) {
+                    ForEach(viewModel.applyActionScopeLabels, id: \.self) { label in
+                        Text(label)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
-                .buttonStyle(.plain)
             }
 
-            Spacer()
+            HStack {
+                // Back button
+                if viewModel.canGoBack {
+                    Button("Back") {
+                        viewModel.previousStep()
+                    }
+                    .buttonStyle(.plain)
+                }
 
-            // Action buttons based on current step
-            footerActions
+                Spacer()
+
+                // Action buttons based on current step
+                footerActions
+            }
         }
         .padding(.top, 8)
     }
@@ -315,6 +339,7 @@ struct RecommendationWizardPopoverView: View {
                     // Don't dismiss - applyAllRecommendations navigates to Summary
                 }
                 .buttonStyle(.plain)
+                .disabled(!viewModel.canApplyRecommendations)
 
                 Button("Start Wizard") {
                     viewModel.nextStep()
@@ -346,6 +371,7 @@ struct RecommendationWizardPopoverView: View {
                 viewModel.applyCurrentStep()
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!viewModel.canApplyRecommendations)
 
         case .mcpAgentDefaults:
             if let rec = viewModel.recommendations.mcpAgentDefaults, !rec.alreadySatisfied {
@@ -363,6 +389,7 @@ struct RecommendationWizardPopoverView: View {
                     viewModel.applyCurrentStep()
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canApplyRecommendations)
             } else {
                 Button("Configure…") {
                     viewModel.openAgentModeSettings()

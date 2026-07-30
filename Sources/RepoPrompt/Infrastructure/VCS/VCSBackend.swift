@@ -114,12 +114,14 @@ public protocol VCSBackend: Sendable {
     ///   - compare: The compare specification.
     ///   - includeUntrackedWhenApplicable: Whether to include untracked files.
     ///   - detectRenames: Whether to detect renames.
+    ///   - paths: Optional repository-relative paths used to scope changed-file discovery.
     ///   - repoURL: The repository root URL.
     /// - Returns: Array of changed files with stats.
     func getChangedFilesStats(
         compare: GitDiffCompareSpec,
         includeUntrackedWhenApplicable: Bool,
         detectRenames: Bool,
+        paths: [String]?,
         at repoURL: URL
     ) async throws -> [VCSUncommittedFile]
 
@@ -211,6 +213,22 @@ public protocol VCSBackend: Sendable {
 // MARK: - Default Implementations
 
 public extension VCSBackend {
+    /// Compatibility overload for whole-repository changed-file discovery.
+    func getChangedFilesStats(
+        compare: GitDiffCompareSpec,
+        includeUntrackedWhenApplicable: Bool,
+        detectRenames: Bool,
+        at repoURL: URL
+    ) async throws -> [VCSUncommittedFile] {
+        try await getChangedFilesStats(
+            compare: compare,
+            includeUntrackedWhenApplicable: includeUntrackedWhenApplicable,
+            detectRenames: detectRenames,
+            paths: nil,
+            at: repoURL
+        )
+    }
+
     /// Default implementation checks if findRepoRoot returns non-nil.
     func isRepository(at url: URL) async -> Bool {
         do {

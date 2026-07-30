@@ -77,7 +77,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 10)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -218,7 +218,21 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(lanes, [])
         self.assertEqual(cwd, repo_root)
 
-    def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
+    def test_codex_schema_check_delegates_bounded_gate_without_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            argv, lanes, cwd, _env, timeout = registry.prepare(
+                {"operation": "codex-schema-check", "args": {}}
+            )
+
+        self.assertEqual(Path(argv[0]).name, Path(sys.executable).name)
+        self.assertEqual(Path(argv[1]).name, "check_codex_app_server_schema.py")
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, repo_root)
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
+
+    def test_release_artifact_delegates_release_script_with_release_lanes_and_extended_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
@@ -232,7 +246,30 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(Path(argv[0]).name, "release.sh")
         self.assertEqual(argv[1], "artifact")
         self.assertEqual(lanes, ["build", "debugArtifact", "release"])
-        self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
+        self.assertEqual(timeout, conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS)
+
+    def test_release_artifact_timeout_is_distinct_from_other_release_packaging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            _argv, _lanes, _cwd, _env, artifact_timeout = registry.prepare(
+                {"operation": "release", "args": {"subcommand": "artifact"}}
+            )
+            normal_release_requests = {
+                "package release": {"operation": "package", "args": {"config": "release"}},
+                "release package": {"operation": "release", "args": {"subcommand": "package"}},
+                "release local-install": {"operation": "release", "args": {"subcommand": "local-install"}},
+            }
+            normal_timeouts = {
+                label: registry.prepare(request)[4]
+                for label, request in normal_release_requests.items()
+            }
+
+        self.assertEqual(conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS, 4 * 60 * 60)
+        self.assertEqual(artifact_timeout, conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS)
+        self.assertEqual(conductor.RELEASE_TIMEOUT_SECONDS, 2 * 60 * 60)
+        for label, timeout in normal_timeouts.items():
+            with self.subTest(operation=label):
+                self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
 
     def test_packaged_smoke_uses_only_live_app_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1707,6 +1744,62 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 }
             )
 
+    def test_codex_packaging_environment_survives_client_snapshot_and_build_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REPOPROMPT_CODEX_ARCH": "all",
+                    "REPOPROMPT_CODEX_CACHE_ROOT": "/tmp/repoprompt-codex-cache",
+                    "REPOPROMPT_UNRELATED_BUILD_SETTING": "discard-me",
+                },
+                clear=False,
+            ):
+                snapshot = conductor.OperationRegistry.client_env_snapshot()
+
+            self.assertEqual(snapshot["REPOPROMPT_CODEX_ARCH"], "all")
+            self.assertEqual(
+                snapshot["REPOPROMPT_CODEX_CACHE_ROOT"],
+                "/tmp/repoprompt-codex-cache",
+            )
+            self.assertNotIn("REPOPROMPT_UNRELATED_BUILD_SETTING", snapshot)
+
+            _argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "build",
+                    "args": {},
+                    "env": snapshot,
+                }
+            )
+
+        self.assertEqual(env["REPOPROMPT_CODEX_ARCH"], "all")
+        self.assertEqual(
+            env["REPOPROMPT_CODEX_CACHE_ROOT"],
+            "/tmp/repoprompt-codex-cache",
+        )
+        self.assertNotIn("REPOPROMPT_UNRELATED_BUILD_SETTING", env)
+
+    def test_codex_packaging_environment_reaches_release_package_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            argv, lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "release",
+                    "args": {"subcommand": "package"},
+                    "env": {
+                        "REPOPROMPT_CODEX_ARCH": "all",
+                        "REPOPROMPT_CODEX_CACHE_ROOT": "/tmp/release-codex-cache",
+                    },
+                }
+            )
+
+        self.assertEqual(Path(argv[0]).name, "package_app.sh")
+        self.assertEqual(argv[1], "release")
+        self.assertEqual(lanes, ["build", "debugArtifact", "release"])
+        self.assertEqual(env["REPOPROMPT_CODEX_ARCH"], "all")
+        self.assertEqual(env["REPOPROMPT_CODEX_CACHE_ROOT"], "/tmp/release-codex-cache")
+
     def test_test_gate_environment_survives_client_snapshot_and_job_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
@@ -1716,6 +1809,14 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     "RPCE_ENABLE_BENCHMARK_TESTS": "1",
                     "RPCE_RUN_CODEMAP_E2E": "1",
                     "RPCE_RUN_SCALE_TESTS": "1",
+                    "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK": "1",
+                    "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE": "1",
+                    "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE": "compare",
+                    "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH": "/tmp/typescript-reference.json",
+                    "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH": "/tmp/tsx-reference.json",
+                    "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES": "type.class",
+                    "RP_SWIFT_CODEMAP_REFERENCE_MODE": "compare",
+                    "RP_SWIFT_CODEMAP_REFERENCE_PATH": "/tmp/reference.json",
                     "RPCE_UNRELATED_TEST_GATE": "1",
                 },
                 clear=False,
@@ -1725,6 +1826,14 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             self.assertEqual(snapshot["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
             self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
             self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
+            self.assertEqual(snapshot["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+            self.assertEqual(snapshot["RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"], "1")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"], "compare")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"], "/tmp/typescript-reference.json")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"], "/tmp/tsx-reference.json")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
             self.assertNotIn("RPCE_UNRELATED_TEST_GATE", snapshot)
 
             _argv, _lanes, _cwd, env, _timeout = registry.prepare(
@@ -1738,6 +1847,14 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(env["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
         self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
         self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertEqual(env["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+        self.assertEqual(env["RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"], "1")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"], "compare")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"], "/tmp/typescript-reference.json")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"], "/tmp/tsx-reference.json")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
         self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
 
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:

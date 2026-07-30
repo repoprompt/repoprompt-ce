@@ -131,6 +131,13 @@ final class ClaudeAgentModeCoordinator {
             return false
         }
         session.providerSessionID = candidate
+        session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+            provider: session.selectedAgent.rawValue,
+            explicit: nil,
+            providerSessionID: candidate,
+            codexConversationID: session.codexConversationID,
+            codexRolloutPath: session.codexRolloutPath
+        )
         guard scheduleSave else { return true }
         session.isDirty = true
         viewModel?.scheduleSave(for: session.tabID)
@@ -420,6 +427,7 @@ final class ClaudeAgentModeCoordinator {
             // session when switching to CC Moonshot/CC Zai/CC Custom can keep the
             // old process/session alive and bypass the compatible backend env.
             session.providerSessionID = nil
+            session.providerCleanupHandle = nil
             session.isDirty = true
             viewModel?.scheduleSave(for: session.tabID)
         }
@@ -627,6 +635,7 @@ final class ClaudeAgentModeCoordinator {
             await stopToolTracking(detached, for: session)
             session.runID = nil
             session.providerSessionID = nil
+            session.providerCleanupHandle = nil
             session.isDirty = true
             viewModel?.scheduleSave(for: session.tabID)
 
@@ -1046,6 +1055,7 @@ final class ClaudeAgentModeCoordinator {
         let detached = prepareClaudeCancelSync(session)
         invalidatePendingClaudeResumeTransfer(for: session)
         session.providerSessionID = nil
+        session.providerCleanupHandle = nil
         return detached
     }
 

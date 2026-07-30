@@ -269,12 +269,12 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
             guard case let .hit(hit) = result else {
                 return XCTFail("Independent owners must share the published artifact.")
             }
-            XCTAssertEqual(hit.source, .projectionCAS)
+            XCTAssertEqual(hit.source, .graphIndexCAS)
         }
         let accountingAfterWarmLookups = await fixture.engine.accounting()
         XCTAssertEqual(
-            accountingAfterWarmLookups.counters.publishedArtifactProjectionCASHits,
-            accountingBeforeWarmLookups.counters.publishedArtifactProjectionCASHits + 2
+            accountingAfterWarmLookups.counters.publishedArtifactGraphIndexCASHits,
+            accountingBeforeWarmLookups.counters.publishedArtifactGraphIndexCASHits + 2
         )
         XCTAssertEqual(
             accountingAfterWarmLookups.counters.publishedArtifactLocatorCASHits,
@@ -316,13 +316,13 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let accountingBeforeInvalidation = await fixture.engine.accounting()
         XCTAssertEqual(accountingBeforeInvalidation.counters.classifications, 1)
         XCTAssertGreaterThanOrEqual(
-            accountingBeforeInvalidation.counters.publishedArtifactProjectionCASHits,
+            accountingBeforeInvalidation.counters.publishedArtifactGraphIndexCASHits,
             3
         )
         XCTAssertEqual(accountingBeforeInvalidation.counters.publishedArtifactLocatorCASHits, 0)
         XCTAssertGreaterThanOrEqual(hookEvents.count(kind: .publishedArtifactLookupHit), 3)
         XCTAssertTrue(hookEvents.values(kind: .publishedArtifactLookupHit).allSatisfy {
-            $0.publishedArtifactLookupSource == .projectionCAS
+            $0.publishedArtifactLookupSource == .graphIndexCAS
         })
 
         gatePostLookupCurrentnessValidation.set(true)
@@ -354,13 +354,13 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         XCTAssertEqual(
             hookEvents.values(kind: .publishedArtifactPostLookupCurrentnessRejection).first?
                 .publishedArtifactLookupSource,
-            .projectionCAS
+            .graphIndexCAS
         )
         gatePostLookupCurrentnessValidation.set(false)
         guard case let .miss(reason) = await fixture.engine.lookupPublishedArtifact(lookupRequest(UUID())) else {
             return XCTFail("A changed path identity must invalidate its published projection.")
         }
-        XCTAssertEqual(reason, .projectionMissing)
+        XCTAssertEqual(reason, .graphIndexMissing)
         XCTAssertEqual(
             hookEvents.values(kind: .invalidation).last?.invalidationReason,
             .modified
@@ -368,7 +368,7 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         XCTAssertEqual(
             hookEvents.values(kind: .publishedArtifactLookupMiss).last?
                 .publishedArtifactLookupMissReason,
-            .projectionMissing
+            .graphIndexMissing
         )
     }
 

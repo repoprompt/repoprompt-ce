@@ -286,7 +286,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
             return XCTFail("Expected durable queue acknowledgement for MCP fallback, got \(terminalState)")
         }
         let disposition = await wait.value
-        assertAcceptedDispatchReleasedWaiter(disposition, sessionID: sessionID)
+        assertAcceptedDispatchReleasedWaiter(
+            disposition,
+            sessionID: sessionID,
+            expectedSteeringMessage: "start after idle"
+        )
     }
 
     func testNoActiveFallbackRetriesTransientSnapshotFailure() async throws {
@@ -841,6 +845,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             fallbackContext: context
         )
         XCTAssertEqual(session.codexFallbackQueue.count, 1)
+        session.deferredActiveAgentRunTimerRollback = .init(
+            originalStartedAt: Date(timeIntervalSinceNow: -60)
+        )
 
         viewModel.clearChat(tabID: session.tabID)
 
@@ -852,6 +859,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
         XCTAssertNil(session.codexFallbackDispatchInFlight)
         XCTAssertTrue(session.items.isEmpty)
+        XCTAssertNil(session.deferredActiveAgentRunTimerRollback)
         XCTAssertNil(viewModel.draftRestorationEvent)
     }
 
@@ -869,6 +877,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
@@ -914,6 +925,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback.mcp")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
@@ -941,7 +955,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: "/tmp/workspace",
+            workspacePaths: .uniform("/tmp/workspace"),
             requestExecutor: { method, params, timeout in
                 try recorder.handle(method: method, params: params, timeout: timeout)
             }
@@ -989,12 +1003,16 @@ final class CodexFallbackFIFOTests: XCTestCase {
     private func assertAcceptedDispatchReleasedWaiter(
         _ disposition: AgentRunSessionStore.WaitDisposition,
         sessionID: UUID,
+        expectedSteeringMessage: String,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         switch disposition {
-        case let .noteworthySnapshot(snapshot, .steeringRequested),
-             let .snapshotReady(snapshot):
+        case let .noteworthySnapshot(wake):
+            XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+            XCTAssertEqual(wake.steeringMessage, expectedSteeringMessage, file: file, line: line)
+        case let .snapshotReady(snapshot):
             XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
         default:
             XCTFail("Expected accepted dispatch to release waiter, got \(disposition)", file: file, line: line)
@@ -1007,10 +1025,10 @@ final class CodexFallbackFIFOTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        if case let .noteworthySnapshot(snapshot, reason) = disposition,
-           reason == .steeringRequested
+        if case let .noteworthySnapshot(wake) = disposition,
+           wake.reason == .steeringRequested
         {
-            XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
             XCTFail("Codex fallback must not release waiters as steeringRequested before durable queue ack", file: file, line: line)
         }
     }
@@ -1021,11 +1039,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        guard case let .noteworthySnapshot(snapshot, reason) = disposition else {
+        guard case let .noteworthySnapshot(wake) = disposition else {
             return XCTFail("Expected steering wake, got \(disposition)", file: file, line: line)
         }
-        XCTAssertEqual(reason, .steeringRequested, file: file, line: line)
-        XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
+        XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+        XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
     }
 
     private func waitUntil(

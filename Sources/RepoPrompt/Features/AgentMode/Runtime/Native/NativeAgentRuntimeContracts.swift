@@ -47,12 +47,19 @@ protocol NativeAgentRuntimeControlling: Actor {
     /// Sends a reasoned interrupt request to the provider runtime.
     /// - Parameter reason: "interrupt" for steering (graceful), "cancel" for forceful stop.
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
 
     #if DEBUG
         func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot?
     #endif
+}
+
+extension NativeAgentRuntimeControlling {
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+        .unsupported(message: "Native runtime has no local API for \(action.rawValue) cleanup of conversations.")
+    }
 }
 
 // MARK: - Current Claude-compatible native runtime aliases

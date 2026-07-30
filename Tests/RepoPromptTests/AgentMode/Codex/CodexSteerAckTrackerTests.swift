@@ -206,7 +206,11 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         let delivery = try await dispatch.value
         XCTAssertEqual(delivery, .dispatchedCodexTurn)
         let disposition = await wait.value
-        assertAcceptedDispatchReleasedWaiter(disposition, sessionID: sessionID)
+        assertAcceptedDispatchReleasedWaiter(
+            disposition,
+            sessionID: sessionID,
+            expectedSteeringMessage: "ack before wake"
+        )
     }
 
     func testAcceptedCodexAckAfterRunReplacementDoesNotWakeReplacementWaiters() async throws {
@@ -446,12 +450,16 @@ final class CodexSteerAckTrackerTests: XCTestCase {
     private func assertAcceptedDispatchReleasedWaiter(
         _ disposition: AgentRunSessionStore.WaitDisposition,
         sessionID: UUID,
+        expectedSteeringMessage: String,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         switch disposition {
-        case let .noteworthySnapshot(snapshot, .steeringRequested),
-             let .snapshotReady(snapshot):
+        case let .noteworthySnapshot(wake):
+            XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+            XCTAssertEqual(wake.steeringMessage, expectedSteeringMessage, file: file, line: line)
+        case let .snapshotReady(snapshot):
             XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
         default:
             XCTFail("Expected accepted dispatch to release waiter, got \(disposition)", file: file, line: line)
@@ -464,10 +472,10 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        if case let .noteworthySnapshot(snapshot, reason) = disposition,
-           reason == .steeringRequested
+        if case let .noteworthySnapshot(wake) = disposition,
+           wake.reason == .steeringRequested
         {
-            XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
             XCTFail("Failed Codex steer must not release waiters as steeringRequested", file: file, line: line)
         }
     }
@@ -478,11 +486,11 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        guard case let .noteworthySnapshot(snapshot, reason) = disposition else {
+        guard case let .noteworthySnapshot(wake) = disposition else {
             return XCTFail("Expected steering wake, got \(disposition)", file: file, line: line)
         }
-        XCTAssertEqual(reason, .steeringRequested, file: file, line: line)
-        XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
+        XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+        XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
     }
 
     private func waitUntil(

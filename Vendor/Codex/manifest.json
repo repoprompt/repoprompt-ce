@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 2,
+  "version": "0.145.0",
+  "tag": "rust-v0.145.0",
+  "releaseURL": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
+  "checksums": {
+    "asset": "codex-package_SHA256SUMS",
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package_SHA256SUMS",
+    "sha256": "2692d126c2fc9bfe35041f28c771c4296dda43704fad6b4a1c8752987aaee806"
+  },
+  "packages": {
+    "aarch64-apple-darwin": {
+      "archive": "codex-package-aarch64-apple-darwin.tar.gz",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package-aarch64-apple-darwin.tar.gz",
+      "sha256": "ece937169d4c9e910d60826a6ea4ae7848a16c089403d122e70e7da4ac41ba34",
+      "architecture": "arm64",
+      "tree": [
+        {
+          "path": "bin",
+          "kind": "directory"
+        },
+        {
+          "path": "bin/codex",
+          "kind": "file",
+          "sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+          "executable": true,
+          "normalizedSha256": "9d5063b15eef5355edebd2bcb85f782cfcb4d0730dc876305dffb2877016b64a"
+        },
+        {
+          "path": "bin/codex-code-mode-host",
+          "kind": "file",
+          "sha256": "c75e27ea296ede4025959e4f66772c283261f28d95b1f27be4d8ef07aabe9bce",
+          "executable": true,
+          "normalizedSha256": "dcab13acb27395da4debde1996ab2e2fda238444d61ab513c6985b783bbbff71"
+        },
+        {
+          "path": "codex-package.json",
+          "kind": "file",
+          "sha256": "547b024068df54e735ba27886edb2f2e403e656f100d9e5c8d300cc36d236108",
+          "executable": false
+        },
+        {
+          "path": "codex-path",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-path/rg",
+          "kind": "file",
+          "sha256": "a326a1fb48074202e9ad41e4cd1e389eeea372c8c6f7d7e80da81176d5d9430e",
+          "executable": true,
+          "normalizedSha256": "0bb5ee787d769df26f96e176b74139c3da0c4fb0ded311e96c5970a9ce7b0330"
+        },
+        {
+          "path": "codex-resources",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-resources/zsh",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-resources/zsh/bin",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-resources/zsh/bin/zsh",
+          "kind": "file",
+          "sha256": "b69893d9da08786211bac0862212e26a8a31af24eb77da21692671c58d388b8d",
+          "executable": true,
+          "normalizedSha256": "5cc9238f3e211be71cd25cde1bbe4319849951d4b1fdf942d925091388bd95fd"
+        }
+      ]
+    },
+    "x86_64-apple-darwin": {
+      "archive": "codex-package-x86_64-apple-darwin.tar.gz",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package-x86_64-apple-darwin.tar.gz",
+      "sha256": "9d402c9ca814655fddc07b548d7086491c0afcebe1f746cdeba1045fd6f62646",
+      "architecture": "x86_64",
+      "tree": [
+        {
+          "path": "bin",
+          "kind": "directory"
+        },
+        {
+          "path": "bin/codex",
+          "kind": "file",
+          "sha256": "6db9193ce2c9a8cef2b5482612cde24202a4329dfc34f4687a036d5d7da619af",
+          "executable": true,
+          "normalizedSha256": "3fe2099550d6d2d3e3d652798f17ae40802f7fabf7dbef29316b6d07328859fd"
+        },
+        {
+          "path": "bin/codex-code-mode-host",
+          "kind": "file",
+          "sha256": "d80a29354a989060c974c4f5280815df07d602e4c1ae38106b9a97f58c63eb83",
+          "executable": true,
+          "normalizedSha256": "0598a563e61b8df1e6492af0befb7971bbe47f6b945f39cf124ba46fba46273c"
+        },
+        {
+          "path": "codex-package.json",
+          "kind": "file",
+          "sha256": "c8072bf3f7352998626ba7384023be130c691167e258d4e97a6848c1f2b4ae2b",
+          "executable": false
+        },
+        {
+          "path": "codex-path",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-path/rg",
+          "kind": "file",
+          "sha256": "0c9a0066db0d26b640777db88045b0ccdd58509a746700e43e1c4ff8707a5ed0",
+          "executable": true,
+          "normalizedSha256": "817d5e12aaa1d12716865d4fa2d7fb5847000d722a9c601e6ea0bd7ea9003c1a"
+        },
+        {
+          "path": "codex-resources",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-resources/zsh",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-resources/zsh/bin",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-resources/zsh/bin/zsh",
+          "kind": "file",
+          "sha256": "901782b34a9742b9962199332934ac77229073760bf837bc86b156ce4b86b9fa",
+          "executable": true,
+          "normalizedSha256": "901782b34a9742b9962199332934ac77229073760bf837bc86b156ce4b86b9fa"
+        }
+      ]
+    }
+  },
+  "requiredLayout": [
+    "codex-package.json",
+    "bin/codex",
+    "bin/codex-code-mode-host",
+    "codex-resources",
+    "codex-path"
+  ],
+  "machOFiles": [
+    "bin/codex",
+    "bin/codex-code-mode-host",
+    "codex-path/rg",
+    "codex-resources/zsh/bin/zsh"
+  ],
+  "releaseSigningEntitlements": {
+    "bin/codex": {
+      "com.apple.security.cs.allow-jit": true,
+      "com.apple.security.cs.allow-unsigned-executable-memory": true
+    },
+    "bin/codex-code-mode-host": {
+      "com.apple.security.cs.allow-jit": true,
+      "com.apple.security.cs.allow-unsigned-executable-memory": true
+    },
+    "codex-path/rg": {},
+    "codex-resources/zsh/bin/zsh": {}
+  },
+  "signedExecutables": [
+    {
+      "path": "bin/codex",
+      "identifier": "codex",
+      "teamIdentifier": "2DC432GLL2",
+      "authority": "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
+      "requiresHardenedRuntime": true,
+      "requiresTimestamp": true,
+      "entitlements": {
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true
+      }
+    },
+    {
+      "path": "bin/codex-code-mode-host",
+      "identifier": "codex-code-mode-host",
+      "teamIdentifier": "2DC432GLL2",
+      "authority": "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
+      "requiresHardenedRuntime": true,
+      "requiresTimestamp": true,
+      "entitlements": {
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true
+      }
+    }
+  ]
+}

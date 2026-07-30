@@ -189,7 +189,13 @@ extension AgentModeViewModel {
     }
 
     func expandAllSidebarThreads(for tabs: [ComposeTabState], currentTabID: UUID?) {
-        ui.sessionSidebar.clearCollapsedThreads()
+        let keys = collapsibleSidebarThreadKeys(
+            for: tabs,
+            currentTabID: currentTabID,
+            searchText: "",
+            diagnosticSource: "collapseAllButton.applyExpand"
+        )
+        ui.sessionSidebar.expandAllSidebarThreads(eligibleKeys: keys)
     }
 
     func isSidebarThreadCollapsed(_ key: AgentSidebarThreadKey) -> Bool {
@@ -202,6 +208,11 @@ extension AgentModeViewModel {
 
     func toggleSidebarThreadCollapse(_ key: AgentSidebarThreadKey) {
         ui.sessionSidebar.toggleThreadCollapse(key)
+    }
+
+    func requestSidebarThreadDisclosureToggle(for row: SidebarSession) {
+        guard row.hasThreadChildren, let key = row.threadKey else { return }
+        ui.sessionSidebar.setThreadCollapsed(!row.isThreadCollapsed, for: key)
     }
 
     // MARK: - Sidebar run-state attention
