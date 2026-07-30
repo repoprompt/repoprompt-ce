@@ -47,6 +47,38 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertEqual(stderr, "stderr:ok\n")
     }
 
+    func testSpawnedChildDoesNotInheritBlockedSIGCHLDMask() throws {
+        var blockedMask = sigset_t()
+        sigemptyset(&blockedMask)
+        sigaddset(&blockedMask, SIGCHLD)
+        sigaddset(&blockedMask, SIGTERM)
+        var previousMask = sigset_t()
+        XCTAssertEqual(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask), 0)
+        defer {
+            _ = pthread_sigmask(SIG_SETMASK, &previousMask, nil)
+        }
+
+        let spawned = try ProcessLauncher.spawn(
+            command: "/usr/bin/python3",
+            arguments: [
+                "-c",
+                "import signal; blocked = signal.pthread_sigmask(signal.SIG_BLOCK, []); print('sigchld:' + ('blocked' if signal.SIGCHLD in blocked else 'unblocked')); print('sigterm:' + ('blocked' if signal.SIGTERM in blocked else 'unblocked'))"
+            ],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        defer { Self.cleanup(spawned) }
+        spawned.stdin?.closeFile()
+
+        let stdout = String(decoding: spawned.stdout.readDataToEndOfFile(), as: UTF8.self)
+        let stderr = String(decoding: spawned.stderr.readDataToEndOfFile(), as: UTF8.self)
+        let status = try Self.waitForExit(spawned.pid)
+
+        XCTAssertEqual(status, 0)
+        XCTAssertEqual(stdout, "sigchld:unblocked\nsigterm:unblocked\n")
+        XCTAssertEqual(stderr, "")
+    }
+
     func testDarwinSpawnDefaultClosesUnrelatedSentinelFDWhileStdioStillWorks() throws {
         var sentinelPipe = [Int32](repeating: -1, count: 2)
         XCTAssertEqual(Darwin.pipe(&sentinelPipe), 0)

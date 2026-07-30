@@ -97,6 +97,8 @@ struct HistoryListSessionsReply: Codable, Equatable {
     let truncated: Bool
     let sessionsScanned: Int
     let scanTruncated: Bool
+    let scanDiagnostics: [HistoryScanDiagnostic]?
+    let totalsAreLowerBounds: Bool?
     let skippedWorkspaces: [String]?
     let sessions: [SessionDTO]
 
@@ -105,6 +107,8 @@ struct HistoryListSessionsReply: Codable, Equatable {
         case truncated
         case sessionsScanned = "sessions_scanned"
         case scanTruncated = "scan_truncated"
+        case scanDiagnostics = "scan_diagnostics"
+        case totalsAreLowerBounds = "totals_are_lower_bounds"
         case skippedWorkspaces = "skipped_workspaces"
         case sessions
     }
@@ -166,6 +170,8 @@ struct HistorySearchReply: Codable, Equatable {
     /// match `limit`). Surface so callers know the scan — not just the results — was
     /// bounded.
     let scanTruncated: Bool
+    let scanDiagnostics: [HistoryScanDiagnostic]?
+    let totalsAreLowerBounds: Bool?
     let sessionsScanned: Int
     let skippedWorkspaces: [String]?
     let results: [MatchDTO]
@@ -174,6 +180,8 @@ struct HistorySearchReply: Codable, Equatable {
         case totalMatches = "total_matches"
         case truncated
         case scanTruncated = "scan_truncated"
+        case scanDiagnostics = "scan_diagnostics"
+        case totalsAreLowerBounds = "totals_are_lower_bounds"
         case sessionsScanned = "sessions_scanned"
         case skippedWorkspaces = "skipped_workspaces"
         case results
@@ -236,6 +244,8 @@ struct HistoryTimeReply: Codable, Equatable {
     let truncated: Bool
     let sessionsScanned: Int
     let scanTruncated: Bool
+    let scanDiagnostics: [HistoryScanDiagnostic]?
+    let totalsAreLowerBounds: Bool?
     let skippedWorkspaces: [String]?
     let groups: [GroupDTO]
 
@@ -245,6 +255,8 @@ struct HistoryTimeReply: Codable, Equatable {
         case truncated
         case sessionsScanned = "sessions_scanned"
         case scanTruncated = "scan_truncated"
+        case scanDiagnostics = "scan_diagnostics"
+        case totalsAreLowerBounds = "totals_are_lower_bounds"
         case skippedWorkspaces = "skipped_workspaces"
         case groups
     }
@@ -312,6 +324,8 @@ struct HistoryGetSessionReply: Codable, Equatable {
     let returnedTurnStart: Int
     let returnedTurnEnd: Int
     let truncated: Bool
+    let scanTruncated: Bool?
+    let scanDiagnostics: [HistoryScanDiagnostic]?
     let turns: [TurnDTO]
 
     private enum CodingKeys: String, CodingKey {
@@ -322,6 +336,8 @@ struct HistoryGetSessionReply: Codable, Equatable {
         case returnedTurnStart = "returned_turn_start"
         case returnedTurnEnd = "returned_turn_end"
         case truncated
+        case scanTruncated = "scan_truncated"
+        case scanDiagnostics = "scan_diagnostics"
         case turns
     }
 }
@@ -330,4 +346,30 @@ struct HistoryGetSessionReply: Codable, Equatable {
 
 struct HistoryErrorReply: Codable, Equatable {
     let error: String
+    let retryable: Bool?
+    let scanTruncated: Bool?
+    let scanDiagnostics: [HistoryScanDiagnostic]?
+    let suggestion: String?
+
+    init(
+        error: String,
+        retryable: Bool? = nil,
+        scanTruncated: Bool? = nil,
+        scanDiagnostics: [HistoryScanDiagnostic]? = nil,
+        suggestion: String? = nil
+    ) {
+        self.error = error
+        self.retryable = retryable
+        self.scanTruncated = scanTruncated
+        self.scanDiagnostics = scanDiagnostics
+        self.suggestion = suggestion
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error
+        case retryable
+        case scanTruncated = "scan_truncated"
+        case scanDiagnostics = "scan_diagnostics"
+        case suggestion
+    }
 }

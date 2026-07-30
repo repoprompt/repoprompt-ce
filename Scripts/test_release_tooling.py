@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -199,6 +200,70 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertNotIn("SUEnableInstallerLauncherService", info_plist)
         self.assertIn("trap 'finish $?' EXIT", package_script)
         self.assertIn('local status="$1" now total', package_script)
+
+    def test_staged_signing_resigns_every_codex_mach_o_before_mcp_and_outer_app(self) -> None:
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
+        self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
+        self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
+        self.assertEqual(source.count("list-bundle-signing-plan --arch all"), 1)
+        self.assertNotIn("list-bundle-mach-o-paths", source)
+        self.assertEqual(source.count('--signed-team-identifier "$SIGNING_TEAM_ID"'), 1)
+        self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+        self.assertIn('CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"', source)
+        self.assertIn('plutil -lint "$CODEX_V8_ENTITLEMENTS"', source)
+        for line in source.splitlines():
+            if 'sign_path "$CODEX_BUNDLE' in line:
+                self.assertNotIn("--preserve-metadata", line)
+
+        sparkle_sign = source.index('sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"')
+        enumerate_codex = source.index("list-bundle-signing-plan --arch all")
+        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"')
+        codex_sign_unprofiled = source.index('sign_path "$CODEX_BUNDLE/$relative_path"\n', codex_sign + 1)
+        mcp_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"')
+        app_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"')
+        outer_sign = source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
+        self.assertLess(sparkle_sign, enumerate_codex)
+        self.assertLess(enumerate_codex, codex_sign)
+        self.assertLess(codex_sign, codex_sign_unprofiled)
+        self.assertLess(codex_sign_unprofiled, mcp_sign)
+        self.assertLess(mcp_sign, app_sign)
+        self.assertLess(app_sign, outer_sign)
+        self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+    def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
+        v8_profile = {
+            "com.apple.security.cs.allow-jit": True,
+            "com.apple.security.cs.allow-unsigned-executable-memory": True,
+        }
+        plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "CodexV8JIT.entitlements").read_bytes())
+        self.assertEqual(plist, v8_profile)
+
+        manifest = json.loads(
+            (SCRIPT_DIR.parent / "Vendor" / "Codex" / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(
+            manifest["releaseSigningEntitlements"],
+            {
+                "bin/codex": v8_profile,
+                "bin/codex-code-mode-host": v8_profile,
+                "codex-path/rg": {},
+                "codex-resources/zsh/bin/zsh": {},
+            },
+        )
+        for policy in manifest["signedExecutables"]:
+            self.assertEqual(policy["entitlements"], v8_profile, policy["path"])
+
+        for release_script_name in (
+            "release.sh",
+            "main_tip_release.sh",
+            "promote_release.sh",
+            "publish_public_update_test.sh",
+        ):
+            release_source = (SCRIPT_DIR / release_script_name).read_text(encoding="utf-8")
+            self.assertIn("--signed-team-identifier", release_source, release_script_name)
 
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -1010,9 +1075,11 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('APP_PID=$!', source)
         self.assertIn('launched-process.json', source)
         self.assertIn('verify_packaged_mcp_socket_owner.py', source)
+        self.assertIn('"$SOCKET_OWNER_HELPER" selftest', source)
         self.assertIn('preflight "$MCP_SOCKET_DIR"', source)
         self.assertIn('find-owner "$MCP_SOCKET_DIR" "$APP_PID" "$APP_EXECUTABLE"', source)
         self.assertIn('verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE"', source)
+        self.assertLess(source.index('"$SOCKET_OWNER_HELPER" selftest'), source.index('preflight "$MCP_SOCKET_DIR"'))
         self.assertLess(source.index('preflight "$MCP_SOCKET_DIR"'), source.index('APP_PID=$!'))
         roundtrip_loop = source.split('while (( $(date +%s) <= deadline )); do', 1)[1]
         self.assertLess(
@@ -1025,27 +1092,36 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertNotIn("pkill", source)
         self.assertNotIn("open -n", source)
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_rejects_live_preflight_and_accepts_exact_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         socket_directory = temp_dir / "repoprompt-ce-mcp"
         socket_directory.mkdir(mode=0o700)
         socket_path = socket_directory / "repoprompt-ce-7.sock"
-        listener = self.start_unix_listener(socket_path)
+        listener, accepted_connections = self.start_unix_listener(socket_path)
         expected_executable = self.socket_owner_process_path(listener.pid)
+        wrong_pid = os.getpid()
+        wrong_executable = self.socket_owner_process_path(wrong_pid)
 
+        selftest = self.run_socket_owner_helper("selftest")
         preflight = self.run_socket_owner_helper("preflight", socket_directory)
         found = self.run_socket_owner_helper("find-owner", socket_directory, listener.pid, expected_executable)
         verified = self.run_socket_owner_helper("verify-owner", socket_path, listener.pid, expected_executable)
+        wrong_owner = self.run_socket_owner_helper("verify-owner", socket_path, wrong_pid, wrong_executable)
 
+        self.assertEqual(selftest.returncode, 0, selftest.stderr)
         self.assertNotEqual(preflight.returncode, 0)
         self.assertIn("pre-existing live release socket", preflight.stderr)
         self.assertEqual(found.returncode, 0, found.stderr)
         self.assertEqual(Path(found.stdout.strip()), socket_path)
         self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertNotEqual(wrong_owner.returncode, 0)
+        self.assertIn(str(listener.pid), wrong_owner.stderr)
+        self.assertIn(f"not exclusively launched pid {wrong_pid}", wrong_owner.stderr)
+        self.assertFalse(accepted_connections.exists(), "ownership inspection must not connect to the release socket")
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_allows_stale_and_rejects_wrong_or_replaced_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -1059,18 +1135,54 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertEqual(accepted_stale.returncode, 0, accepted_stale.stderr)
 
         socket_path.unlink()
-        first = self.start_unix_listener(socket_path)
+        first, first_accepted_connections = self.start_unix_listener(socket_path)
         first_executable = self.socket_owner_process_path(first.pid)
+
         socket_path.unlink()
-        second = self.start_unix_listener(socket_path)
+        stale_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale_replacement.bind(os.fspath(socket_path))
+        stale_replacement.close()
+        replaced_by_stale = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        self.assertNotEqual(replaced_by_stale.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_stale.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "stale-replacement inspection must not connect")
+
+        socket_path.unlink()
+        bound_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_replacement.bind(os.fspath(socket_path))
+        try:
+            replaced_by_bound = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        finally:
+            bound_replacement.close()
+        self.assertNotEqual(replaced_by_bound.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_bound.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "bound-replacement inspection must not connect")
+
+        socket_path.unlink()
+        second, second_accepted_connections = self.start_unix_listener(
+            socket_path,
+            claim_ownership_lock=False,
+        )
         second_executable = self.socket_owner_process_path(second.pid)
 
         replaced = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
-        current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        ambiguous_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
 
         self.assertNotEqual(replaced.returncode, 0)
-        self.assertIn(f"belongs to pid {second.pid}", replaced.stderr)
-        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertIn("not exclusively launched pid", replaced.stderr)
+        self.assertIn(str(first.pid), replaced.stderr)
+        self.assertIn(str(second.pid), replaced.stderr)
+        self.assertNotEqual(ambiguous_current.returncode, 0)
+        self.assertIn("not exclusively launched pid", ambiguous_current.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "replaced-owner inspection must not connect")
+        self.assertFalse(second_accepted_connections.exists(), "current-owner inspection must not connect")
+
+        first.terminate()
+        first.wait(timeout=5)
+        unlocked_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        self.assertNotEqual(unlocked_current.returncode, 0)
+        self.assertIn("ownership lock is not held", unlocked_current.stderr)
+        self.assertFalse(second_accepted_connections.exists(), "unlocked-owner verification must not connect")
 
         socket_path.unlink()
         socket_path.write_text("not a socket\n", encoding="utf-8")
@@ -1203,6 +1315,307 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('rm -f "$CERTIFICATE_PATH"', final_cleanup)
         self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"', final_cleanup)
 
+    def test_official_release_stage_and_publish_require_sentry_linking(self) -> None:
+        env = os.environ.copy()
+        env["REPOPROMPT_ENABLE_SENTRY"] = "0"
+        for mode, phase in (("stage-publish", "staging"), ("publish-staged", "publishing")):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [str(SCRIPT_DIR / "release.sh"), mode],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"Official release {phase} requires REPOPROMPT_ENABLE_SENTRY=1",
+                    result.stderr,
+                )
+
+    def test_shared_release_sentry_symbol_policy_requires_copies_and_uploads(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        policy = SCRIPT_DIR / "release_sentry_symbols.sh"
+        uploader = SCRIPT_DIR / "upload_sentry_debug_symbols.sh"
+        symbols = temp_dir / "symbols"
+        dwarf = symbols / "RepoPrompt.dSYM" / "Contents" / "Resources" / "DWARF" / "RepoPrompt"
+        dwarf.parent.mkdir(parents=True)
+        dwarf.write_text("fixture-debug-symbols", encoding="utf-8")
+        helper_dwarf = symbols / "repoprompt-mcp.dSYM" / "Contents" / "Resources" / "DWARF" / "repoprompt-mcp"
+        helper_dwarf.parent.mkdir(parents=True)
+        helper_dwarf.write_text("fixture-helper-debug-symbols", encoding="utf-8")
+        staged_symbols = temp_dir / "stage" / ".build" / "sentry-symbols" / "release"
+        token = "shared-policy-secret-output-marker"
+        token_file = temp_dir / "sentry-token"
+        token_file.write_text(token, encoding="utf-8")
+        token_file.chmod(0o600)
+        argv_capture = temp_dir / "sentry-argv.txt"
+        token_capture = temp_dir / "sentry-token-capture.txt"
+        fake_cli = temp_dir / "sentry-cli"
+        fake_cli.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$@" > "$ARGV_CAPTURE"
+printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
+""",
+            encoding="utf-8",
+        )
+        fake_cli.chmod(0o755)
+
+        env = os.environ.copy()
+        env.pop("SENTRY_AUTH_TOKEN", None)
+        env.update(
+            {
+                "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                "REPOPROMPT_ENABLE_SENTRY": "1",
+                "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE": str(token_file),
+                "REPOPROMPT_SENTRY_ORG": "fixture-org",
+                "REPOPROMPT_SENTRY_PROJECT": "fixture-project",
+                "ARGV_CAPTURE": str(argv_capture),
+                "TOKEN_CAPTURE": str(token_capture),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; stage_release_sentry_symbols "$2" "$3" "$5" "$6" "$7" "$8"; '
+                'upload_release_sentry_symbols "$2" "$4" "$5" "$6" "$7" "$8"',
+                "release-sentry-symbol-policy-test",
+                str(policy),
+                str(symbols),
+                str(staged_symbols),
+                str(uploader),
+                "RepoPrompt.dSYM",
+                "RepoPrompt",
+                "repoprompt-mcp.dSYM",
+                "repoprompt-mcp",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (staged_symbols / "RepoPrompt.dSYM" / "Contents" / "Resources" / "DWARF" / "RepoPrompt").read_text(
+                encoding="utf-8"
+            ),
+            "fixture-debug-symbols",
+        )
+        self.assertEqual(
+            (
+                staged_symbols
+                / "repoprompt-mcp.dSYM"
+                / "Contents"
+                / "Resources"
+                / "DWARF"
+                / "repoprompt-mcp"
+            ).read_text(encoding="utf-8"),
+            "fixture-helper-debug-symbols",
+        )
+        self.assertEqual(token_capture.read_text(encoding="utf-8"), token)
+        self.assertEqual(
+            argv_capture.read_text(encoding="utf-8").splitlines(),
+            [
+                "debug-files",
+                "upload",
+                "--org",
+                "fixture-org",
+                "--project",
+                "fixture-project",
+                str(symbols),
+            ],
+        )
+        self.assertNotIn(token, result.stdout + result.stderr)
+
+        app_bundle = temp_dir / "RepoPrompt.app"
+        app_macos = app_bundle / "Contents" / "MacOS"
+        app_macos.mkdir(parents=True)
+        (app_macos / "RepoPrompt").write_text("fixture-app-executable", encoding="utf-8")
+        (app_macos / "repoprompt-mcp").write_text("fixture-helper-executable", encoding="utf-8")
+        fake_dwarfdump = temp_dir / "dwarfdump"
+        fake_dwarfdump.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "--uuid" ]]
+path="$2"
+[[ -s "$path" ]] || exit 9
+if [[ "${UUID_MODE:-match}" == "malformed" ]]; then
+    printf 'unexpected uuid output\\n'
+    exit 0
+fi
+if [[ "$path" == *repoprompt-mcp* ]]; then
+    first_uuid="33333333-3333-3333-3333-333333333333"
+    second_uuid="44444444-4444-4444-4444-444444444444"
+    if [[ "${UUID_MODE:-match}" == "mismatch" && "$path" == *.dSYM/* ]]; then
+        first_uuid="55555555-5555-5555-5555-555555555555"
+    fi
+else
+    first_uuid="11111111-1111-1111-1111-111111111111"
+    second_uuid="22222222-2222-2222-2222-222222222222"
+fi
+printf 'UUID: %s (arm64) %s\\n' "$first_uuid" "$path"
+printf 'UUID: %s (x86_64) %s\\n' "$second_uuid" "$path"
+""",
+            encoding="utf-8",
+        )
+        fake_dwarfdump.chmod(0o755)
+        uuid_env = env | {"REPOPROMPT_DWARFDUMP_BIN": str(fake_dwarfdump)}
+        uuid_command = (
+            'source "$1"; verify_release_sentry_symbol_uuids_before_signing '
+            '"$2" "$3" "$4" "$5" "$6" "$7"'
+        )
+        uuid_args = [
+            "bash",
+            "-c",
+            uuid_command,
+            "release-sentry-symbol-uuid-test",
+            str(policy),
+            str(symbols),
+            str(app_bundle),
+            "RepoPrompt.dSYM",
+            "RepoPrompt",
+            "repoprompt-mcp.dSYM",
+            "repoprompt-mcp",
+        ]
+
+        uuid_result = subprocess.run(uuid_args, env=uuid_env, text=True, capture_output=True)
+        self.assertEqual(uuid_result.returncode, 0, uuid_result.stderr)
+        self.assertNotIn(token, uuid_result.stdout + uuid_result.stderr)
+
+        empty_symbols = temp_dir / "empty-symbols"
+        shutil.copytree(symbols, empty_symbols)
+        (
+            empty_symbols
+            / "repoprompt-mcp.dSYM"
+            / "Contents"
+            / "Resources"
+            / "DWARF"
+            / "repoprompt-mcp"
+        ).write_bytes(b"")
+        empty_args = list(uuid_args)
+        empty_args[5] = str(empty_symbols)
+        empty_result = subprocess.run(empty_args, env=uuid_env, text=True, capture_output=True)
+        self.assertNotEqual(empty_result.returncode, 0)
+        self.assertIn("Unable to read Mach-O UUIDs", empty_result.stderr)
+        self.assertNotIn(token, empty_result.stdout + empty_result.stderr)
+
+        mismatch_result = subprocess.run(
+            uuid_args,
+            env=uuid_env | {"UUID_MODE": "mismatch"},
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(mismatch_result.returncode, 0)
+        self.assertIn("UUIDs do not match staged executable", mismatch_result.stderr)
+        self.assertNotIn(token, mismatch_result.stdout + mismatch_result.stderr)
+
+        malformed_result = subprocess.run(
+            uuid_args,
+            env=uuid_env | {"UUID_MODE": "malformed"},
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(malformed_result.returncode, 0)
+        self.assertIn("Malformed Mach-O UUID output", malformed_result.stderr)
+        self.assertNotIn(token, malformed_result.stdout + malformed_result.stderr)
+
+        nested_symlink = symbols / "RepoPrompt.dSYM" / "Contents" / "linked-debug-file"
+        nested_symlink.symlink_to(dwarf)
+        symlink_result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; require_release_sentry_symbols_when_enabled "$2" "$3" "$4" "$5" "$6"',
+                "release-sentry-symbol-policy-symlink-test",
+                str(policy),
+                str(symbols),
+                "RepoPrompt.dSYM",
+                "RepoPrompt",
+                "repoprompt-mcp.dSYM",
+                "repoprompt-mcp",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(symlink_result.returncode, 0)
+        self.assertIn("must not contain symlinks", symlink_result.stderr)
+        self.assertNotIn(token, symlink_result.stdout + symlink_result.stderr)
+        nested_symlink.unlink()
+
+        missing = temp_dir / "missing-symbols"
+        missing_result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; require_release_sentry_symbols_when_enabled "$2" "$3" "$4" "$5" "$6"',
+                "release-sentry-symbol-policy-missing-test",
+                str(policy),
+                str(missing),
+                "RepoPrompt.dSYM",
+                "RepoPrompt",
+                "repoprompt-mcp.dSYM",
+                "repoprompt-mcp",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(missing_result.returncode, 0)
+        self.assertIn("did not produce a real debug-symbol directory", missing_result.stderr)
+        self.assertNotIn(token, missing_result.stdout + missing_result.stderr)
+
+        partial_symbols = temp_dir / "partial-symbols"
+        (partial_symbols / "RepoPrompt.dSYM").mkdir(parents=True)
+        partial_result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; require_release_sentry_symbols_when_enabled "$2" "$3" "$4" "$5" "$6"',
+                "release-sentry-symbol-policy-partial-test",
+                str(policy),
+                str(partial_symbols),
+                "RepoPrompt.dSYM",
+                "RepoPrompt",
+                "repoprompt-mcp.dSYM",
+                "repoprompt-mcp",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(partial_result.returncode, 0)
+        self.assertIn("missing required dSYM payload", partial_result.stderr)
+        self.assertNotIn(token, partial_result.stdout + partial_result.stderr)
+
+        disabled_destination = temp_dir / "disabled-stage"
+        disabled_env = env | {"REPOPROMPT_ENABLE_SENTRY": "0"}
+        disabled_result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; stage_release_sentry_symbols "$2" "$3" "$5" "$6" "$7" "$8"; '
+                'upload_release_sentry_symbols "$2" "$4" "$5" "$6" "$7" "$8"',
+                "release-sentry-symbol-policy-disabled-test",
+                str(policy),
+                str(missing),
+                str(disabled_destination),
+                str(temp_dir / "missing-uploader"),
+                "RepoPrompt.dSYM",
+                "RepoPrompt",
+                "repoprompt-mcp.dSYM",
+                "repoprompt-mcp",
+            ],
+            env=disabled_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(disabled_result.returncode, 0, disabled_result.stderr)
+        self.assertFalse(disabled_destination.exists())
+        self.assertNotIn(token, disabled_result.stdout + disabled_result.stderr)
+
     def test_sentry_symbol_upload_helper_uses_token_file_without_logging_secret(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -1265,45 +1678,140 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertNotIn(token, "\n".join(argv))
         self.assertEqual(token_capture.read_text(encoding="utf-8"), token)
 
+        empty_token_file = temp_dir / "empty-sentry-token"
+        empty_token_file.write_text(" \t\r\n", encoding="utf-8")
+        argv_capture.unlink()
+        token_capture.unlink()
+        for token_file_variable in (
+            "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
+            "SENTRY_AUTH_TOKEN_FILE",
+        ):
+            with self.subTest(token_file_variable=token_file_variable):
+                explicit_empty_env = env.copy()
+                explicit_empty_env.pop("REPOPROMPT_SENTRY_AUTH_TOKEN_FILE", None)
+                explicit_empty_env.pop("SENTRY_AUTH_TOKEN_FILE", None)
+                explicit_empty_env[token_file_variable] = str(empty_token_file)
+                empty_result = subprocess.run(
+                    [str(SCRIPT_DIR / "upload_sentry_debug_symbols.sh"), str(symbols)],
+                    env=explicit_empty_env,
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertNotEqual(empty_result.returncode, 0)
+                self.assertEqual(empty_result.stdout, "")
+                self.assertEqual(
+                    empty_result.stderr,
+                    "ERROR: Explicit Sentry auth token file contains no token.\n",
+                )
+                self.assertFalse(argv_capture.exists())
+                self.assertFalse(token_capture.exists())
+
     def run_sentry_prepare_fixture(
         self,
         lookup_mode: str,
         attempts: int = 1,
-    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
-        call_log = temp_dir / "sentry-calls.log"
-        release_state = temp_dir / "release-created"
-        fake_cli = temp_dir / "sentry-cli"
-        fake_cli.write_text(
-            """#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "$SENTRY_CALL_LOG"
-if [[ "$*" == *"releases info"* ]]; then
-    case "$SENTRY_LOOKUP_MODE" in
-        not-found-once)
-            if [[ -f "$SENTRY_RELEASE_STATE" ]]; then
-                exit 0
-            fi
-            printf 'error: release not found (404)\n' >&2
-            exit 1
-            ;;
-        denied)
-            printf 'error: authentication failed\n' >&2
-            exit 2
-            ;;
-        existing)
-            exit 0
-            ;;
-    esac
-fi
-if [[ "$*" == *"releases new"* ]]; then
-    : > "$SENTRY_RELEASE_STATE"
-fi
+        call_log = temp_dir / "sentry-api-calls.jsonl"
+        release_state = temp_dir / "sentry-release.json"
+        api_tmp = temp_dir / "api-tmp"
+        api_tmp.mkdir()
+        fake_curl = temp_dir / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+args = sys.argv[1:]
+
+def option(name):
+    return args[args.index(name) + 1]
+
+config = Path(option("--config"))
+if stat.S_IMODE(config.stat().st_mode) != 0o600:
+    raise SystemExit(90)
+if config.read_text(encoding="utf-8") != 'header = "Authorization: Bearer fixture-token"\\n':
+    raise SystemExit(91)
+token_file = Path(os.environ["REPOPROMPT_SENTRY_AUTH_TOKEN_FILE"])
+if stat.S_IMODE(token_file.stat().st_mode) != 0o600:
+    raise SystemExit(92)
+if token_file.read_text(encoding="utf-8") != "fixture-token":
+    raise SystemExit(93)
+if "SENTRY_AUTH_TOKEN" in os.environ:
+    raise SystemExit(94)
+
+scenario = os.environ["SENTRY_LOOKUP_MODE"]
+if scenario == "transport":
+    raise SystemExit(7)
+
+method = option("--request")
+output = Path(option("--output"))
+url = args[-1]
+body = None
+if "--data-binary" in args:
+    body_arg = option("--data-binary")
+    if not body_arg.startswith("@"):
+        raise SystemExit(95)
+    body = json.loads(Path(body_arg[1:]).read_text(encoding="utf-8"))
+
+with Path(os.environ["SENTRY_CALL_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"method": method, "url": url, "body": body}) + "\\n")
+
+state_path = Path(os.environ["SENTRY_RELEASE_STATE"])
+parsed = urlparse(url)
+is_preflight = parsed.query != ""
+is_collection = parsed.path.endswith("/releases/")
+version = unquote(parsed.path.rstrip("/").split("/")[-1])
+
+def release_payload():
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return {
+        "version": state["version"],
+        "projects": [{"slug": "fixture-project"}],
+        "dateReleased": state.get("dateReleased"),
+    }
+
+if is_preflight:
+    if scenario == "unauthorized":
+        status, response = 401, {"detail": "SECRET_BODY_MARKER"}
+    elif scenario == "denied":
+        status, response = 403, {"detail": "SECRET_BODY_MARKER"}
+    elif scenario == "malformed":
+        status, response = 200, {}
+    else:
+        status, response = 200, []
+elif method == "GET" and not is_collection:
+    if state_path.exists():
+        status, response = 200, release_payload()
+    else:
+        status, response = 404, {"detail": "SECRET_BODY_MARKER"}
+elif method == "POST" and is_collection:
+    state_path.write_text(
+        json.dumps({"version": body["version"], "dateReleased": None}),
+        encoding="utf-8",
+    )
+    status, response = 201, release_payload()
+elif method == "PUT" and not is_collection and state_path.exists():
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if "dateReleased" in body:
+        state["dateReleased"] = body["dateReleased"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    status, response = 200, release_payload()
+else:
+    status, response = 500, {"detail": "unexpected fixture request", "version": version}
+
+output.write_text(json.dumps(response), encoding="utf-8")
+sys.stdout.write(str(status))
 """,
             encoding="utf-8",
         )
-        fake_cli.chmod(0o755)
+        fake_curl.chmod(0o755)
         env = os.environ.copy()
         env.update(
             {
@@ -1312,11 +1820,13 @@ fi
                 "SENTRY_AUTH_TOKEN": "fixture-token",
                 "REPOPROMPT_SENTRY_ORG": "fixture-org",
                 "REPOPROMPT_SENTRY_PROJECT": "fixture-project",
+                "REPOPROMPT_SENTRY_API_BASE_URL": "https://sentry.example/api/0",
                 "SOURCE_GITHUB_REPOSITORY": "fixture/repository",
                 "RELEASE_COMMIT": "0123456789abcdef",
                 "SENTRY_LOOKUP_MODE": lookup_mode,
                 "SENTRY_CALL_LOG": str(call_log),
                 "SENTRY_RELEASE_STATE": str(release_state),
+                "FIXTURE_TMP_DIR": str(api_tmp),
                 "ATTEMPTS": str(attempts),
             }
         )
@@ -1324,7 +1834,10 @@ fi
             [
                 "bash",
                 "-c",
-                'source "$1"; for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done',
+                'source "$1"; TMP_DIR="$FIXTURE_TMP_DIR"; '
+                "preflight_sentry_release_access; "
+                "for ((attempt = 0; attempt < ATTEMPTS; attempt++)); do prepare_sentry_release; done; "
+                "finalize_sentry_release; finalize_sentry_release",
                 "sentry-release-test",
                 str(SCRIPT_DIR / "release.sh"),
             ],
@@ -1332,45 +1845,75 @@ fi
             text=True,
             capture_output=True,
         )
-        calls = call_log.read_text(encoding="utf-8").splitlines() if call_log.exists() else []
+        calls = (
+            [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+            if call_log.exists()
+            else []
+        )
         return result, calls
 
     def test_sentry_release_prepare_creates_only_for_not_found_and_is_retry_safe(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("not-found-once", attempts=2)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum("releases info" in call for call in calls), 2)
-        self.assertEqual(sum("releases new" in call for call in calls), 1)
-        self.assertEqual(sum("releases set-commits" in call for call in calls), 2)
-        self.assertTrue(
-            any(
-                "--org fixture-org releases new --project fixture-project "
-                "com.pvncher.repoprompt.ce@" in call
-                for call in calls
-            )
+        collection_posts = [call for call in calls if call["method"] == "POST"]
+        refs_updates = [
+            call
+            for call in calls
+            if call["method"] == "PUT" and "refs" in (call["body"] or {})
+        ]
+        finalizations = [
+            call
+            for call in calls
+            if call["method"] == "PUT" and "dateReleased" in (call["body"] or {})
+        ]
+        self.assertEqual(len(collection_posts), 1)
+        self.assertEqual(len(refs_updates), 2)
+        self.assertEqual(len(finalizations), 1)
+        self.assertEqual(
+            collection_posts[0]["body"]["refs"],
+            [{"repository": "fixture/repository", "commit": "0123456789abcdef"}],
         )
-        self.assertTrue(
-            all(
-                "--commit fixture/repository@0123456789abcdef" in call
-                for call in calls
-                if "releases set-commits" in call
-            )
-        )
+        self.assertTrue(all("%40" in call["url"] and "%2B" in call["url"] for call in refs_updates))
+        self.assertIn("already finalized", result.stdout)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr + json.dumps(calls))
+        self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
 
     def test_sentry_release_prepare_does_not_create_after_lookup_failure(self) -> None:
         result, calls = self.run_sentry_prepare_fixture("denied")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(sum("releases info" in call for call in calls), 1)
-        self.assertFalse(any("releases new" in call for call in calls))
-        self.assertFalse(any("releases set-commits" in call for call in calls))
-        self.assertIn("refusing to create it", result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["method"], "GET")
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("org:ci access", result.stderr)
         self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+
+    def test_sentry_release_preflight_distinguishes_invalid_token_without_mutation(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("unauthorized")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("HTTP 401", result.stderr)
+        self.assertIn("SENTRY_AUTH_TOKEN is current", result.stderr)
+        self.assertNotIn("fixture-token", result.stdout + result.stderr)
+        self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+
+    def test_sentry_release_preflight_rejects_malformed_json_before_mutation(self) -> None:
+        result, calls = self.run_sentry_prepare_fixture("malformed")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(call["method"] in {"POST", "PUT"} for call in calls))
+        self.assertIn("malformed JSON during access preflight", result.stderr)
 
     def test_sentry_symbol_flow_is_explicit_secret_safe_and_release_only_by_default(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        symbol_policy = (SCRIPT_DIR / "release_sentry_symbols.sh").read_text(encoding="utf-8")
         promote_script = (SCRIPT_DIR / "promote_release.sh").read_text(encoding="utf-8")
         release_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         promote_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release-promote.yml").read_text(encoding="utf-8")
@@ -1386,21 +1929,36 @@ fi
         self.assertIn("SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)", universal_builder)
 
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"', release_script)
+        self.assertIn('source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"', release_script)
+        self.assertIn("Official release staging requires REPOPROMPT_ENABLE_SENTRY=1", release_script)
+        self.assertIn("Official release publishing requires REPOPROMPT_ENABLE_SENTRY=1", release_script)
         self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"', release_script)
-        self.assertIn('ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"', release_script)
+        self.assertIn("stage_release_sentry_symbols", release_script)
+        self.assertIn("upload_release_sentry_symbols", release_script)
         self.assertIn('upload_required_sentry_symbols', release_script)
+        self.assertIn("require_release_sentry_symbols_when_enabled()", symbol_policy)
+        self.assertIn("stage_release_sentry_symbols()", symbol_policy)
+        self.assertIn("verify_release_sentry_symbol_uuids_before_signing()", symbol_policy)
+        self.assertIn("REPOPROMPT_DWARFDUMP_BIN", symbol_policy)
+        self.assertIn("upload_release_sentry_symbols()", symbol_policy)
+        self.assertNotIn("SENTRY_AUTH_TOKEN", symbol_policy)
         self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
         self.assertIn('require_sentry_publish_configuration() {', release_script)
         self.assertIn('require_command sentry-cli', release_script)
+        self.assertIn('preflight_sentry_release_access', release_script)
         self.assertIn('prepare_sentry_release', release_script)
-        self.assertIn('releases new', release_script)
-        self.assertIn('releases set-commits', release_script)
-        self.assertIn('--commit "$source_repository@$RELEASE_COMMIT"', release_script)
+        self.assertIn('sentry_api_request POST', release_script)
+        self.assertIn('sentry_api_request PUT', release_script)
+        self.assertIn("'{refs: [{repository: $repository, commit: $commit}]}'", release_script)
         self.assertIn('finalize_sentry_release', release_script)
-        self.assertIn('releases finalize "$SENTRY_RELEASE_NAME"', release_script)
+        self.assertIn("'{dateReleased: $date_released}'", release_script)
+        self.assertNotIn('sentry-cli --org', release_script)
         self.assertNotIn('record_sentry_production_deploy', release_script)
         self.assertNotIn('releases deploys "$SENTRY_RELEASE_NAME" new', release_script)
-        self.assertIn('SENTRY_AUTH_TOKEN="$(tr -d', release_script)
+        self.assertIn('token="$(tr -d', release_script)
+        self.assertIn('REPOPROMPT_SENTRY_AUTH_TOKEN_FILE="$normalized_token_file"', release_script)
+        self.assertIn('unset SENTRY_AUTH_TOKEN', release_script)
 
         self.assertIn('preflight_sentry_deploy_access', promote_script)
         self.assertIn('record_verified_sentry_deploy_if_needed', promote_script)
@@ -1411,6 +1969,18 @@ fi
         self.assertNotIn("--retry", sentry_request)
 
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}\n\ncase", 1)[0]
+        self.assertLess(
+            publish_staged.index("preflight_sentry_release_access"),
+            publish_staged.index("sign_staged_release.sh"),
+        )
+        self.assertLess(
+            publish_staged.index("validate_staged_release.sh"),
+            publish_staged.index("verify_release_sentry_symbol_uuids_before_signing"),
+        )
+        self.assertLess(
+            publish_staged.index("verify_release_sentry_symbol_uuids_before_signing"),
+            publish_staged.index("sign_staged_release.sh"),
+        )
         self.assertLess(publish_staged.index("prepare_sentry_release"), publish_staged.index("upload_required_sentry_symbols"))
         self.assertLess(publish_staged.index("upload_required_sentry_symbols"), publish_staged.index("gh release view"))
         self.assertLess(publish_staged.index("gh release view"), publish_staged.index("gh release create"))
@@ -1501,6 +2071,44 @@ fi
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: staged release payload matches approved source", result.stdout)
+
+    def test_public_app_validation_uses_approved_manifest_from_extracted_stage_layout(self) -> None:
+        for script_name in ("release.sh", "main_tip_release.sh"):
+            with self.subTest(script=script_name):
+                approved, staged, scripts = self.make_staged_release_fixture()
+                self.assertFalse((staged / "Vendor").exists())
+
+                result, capture = self.run_public_app_validation(
+                    approved,
+                    staged,
+                    scripts,
+                    script_name,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(calls), 1)
+                self.assertIn(str(approved / "Vendor" / "Codex" / "manifest.json"), calls[0])
+                self.assertNotIn(str(staged / "Vendor"), calls[0])
+
+    def test_staged_release_validator_rejects_missing_approved_codex_manifest(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        (approved / "Vendor" / "Codex" / "manifest.json").unlink()
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing approved Codex manifest", result.stderr)
+
+    def test_staged_release_validator_rejects_missing_embedded_codex_package_target(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        bundle = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+        shutil.rmtree(bundle / "x86_64-apple-darwin")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing embedded Codex package targets", result.stderr)
 
     def test_staged_release_validator_rejects_keyboard_shortcuts_app_root_bundle(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
@@ -1649,7 +2257,10 @@ fi
         )[0]
         self.assertNotIn("updaterController.startUpdater()", manager_init)
         self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
-        self.assertIn("guard updaterStarted, sparkleConfigurationValid else { return false }", sparkle_manager)
+        self.assertIn(
+            "guard updaterStarted, sparkleConfigurationValid, userInitiatedObserverState.activeRequest == nil else {",
+            sparkle_manager,
+        )
 
     def test_ci_secret_scan_covers_introduced_commit_range_and_checked_out_tree(self) -> None:
         workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -1658,12 +2269,194 @@ fi
         self.assertIn('gitleaks git --redact --log-opts="$range" .', workflow)
         self.assertIn("gitleaks dir --redact .", workflow)
 
+    def _make_format_tools_test_environment(
+        self,
+        system_swiftformat_version: str,
+    ) -> tuple[Path, dict[str, str], Path]:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        tools = root / "tools"
+        tools.mkdir()
+        managed = root / "managed"
+        temp = root / "tmp"
+        temp.mkdir()
+        mismatched_invocations = root / "mismatched-swiftformat-invocations"
+
+        fake_swiftformat = tools / "swiftformat"
+        fake_swiftformat.write_text(
+            f"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+if sys.argv[1:] == ["--version"]:
+    print({system_swiftformat_version!r})
+    raise SystemExit(0)
+
+Path({str(mismatched_invocations)!r}).write_text(" ".join(sys.argv[1:]), encoding="utf-8")
+raise SystemExit(99)
+""",
+            encoding="utf-8",
+        )
+        fake_swiftformat.chmod(0o755)
+
+        fake_swiftlint = tools / "swiftlint"
+        fake_swiftlint.write_text(
+            "#!/bin/sh\nif [ \"$1\" = version ] || [ \"$1\" = --version ]; then echo 0.65.0; fi\nexit 0\n",
+            encoding="utf-8",
+        )
+        fake_swiftlint.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{tools}:/usr/bin:/bin",
+                "REPOPROMPT_FORMAT_TOOLS_DIR": str(managed),
+                "TMPDIR": str(temp),
+            }
+        )
+        return root, env, mismatched_invocations
+
+    def _install_fake_swiftformat_download_tools(
+        self,
+        root: Path,
+        archive: Path,
+        checksum: str,
+    ) -> None:
+        tools = root / "tools"
+        fake_curl = tools / "curl"
+        fake_curl.write_text(
+            """#!/usr/bin/env python3
+import os
+import shutil
+import sys
+
+args = sys.argv[1:]
+output = args[args.index("--output") + 1]
+shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
+""",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+
+        fake_shasum = tools / "shasum"
+        fake_shasum.write_text(
+            f"#!/bin/sh\nprintf '%s  %s\\n' {checksum!r} \"$3\"\n",
+            encoding="utf-8",
+        )
+        fake_shasum.chmod(0o755)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+
+    def test_format_tool_resolver_accepts_only_authoritative_system_swiftformat(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+
+        exact_root, exact_env, _ = self._make_format_tools_test_environment("0.61.1")
+        exact = subprocess.run(
+            [str(installer), "resolve-swiftformat"],
+            env=exact_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertEqual(Path(exact.stdout.strip()), exact_root / "tools" / "swiftformat")
+
+        _, mismatch_env, mismatch_invocations = self._make_format_tools_test_environment("0.62.1")
+        mismatch = subprocess.run(
+            [str(installer), "resolve-swiftformat"],
+            env=mismatch_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("incompatible (0.62.1", mismatch.stderr)
+        self.assertIn("SwiftFormat 0.61.1 is required", mismatch.stderr)
+        self.assertFalse(mismatch_invocations.exists())
+
+    def test_format_tool_install_verifies_and_resolves_managed_swiftformat(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        root, env, mismatched_invocations = self._make_format_tools_test_environment("0.62.1")
+        archive = root / "fixtures" / "swiftformat.zip"
+        managed_swiftformat = root / "managed" / "swiftformat" / "0.61.1" / "swiftformat"
+        pinned_checksum = "b990400779aceb7d7020796eb9ba814d4480543f671d38fc0ff48cb72f04c584"
+
+        archive.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(
+                "swiftformat",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 0.61.1; exit 0; fi\nexit 0\n",
+            )
+        self._install_fake_swiftformat_download_tools(root, archive, pinned_checksum)
+        env["FAKE_SWIFTFORMAT_ARCHIVE"] = str(archive)
+
+        installed = subprocess.run(
+            [str(installer), "install"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertIn(f"Installed SwiftFormat 0.61.1 at {managed_swiftformat}", installed.stdout)
+        self.assertTrue(os.access(managed_swiftformat, os.X_OK))
+        self.assertFalse(mismatched_invocations.exists())
+
+        resolved = subprocess.run(
+            [str(installer), "resolve-swiftformat"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(Path(resolved.stdout.strip()), managed_swiftformat)
+
+    def test_format_tool_install_rejects_bad_swiftformat_checksum(self) -> None:
+        installer = SCRIPT_DIR / "install_format_tools.sh"
+        root, env, mismatched_invocations = self._make_format_tools_test_environment("0.62.1")
+        archive = root / "fixtures" / "swiftformat.zip"
+        managed_swiftformat = root / "managed" / "swiftformat" / "0.61.1" / "swiftformat"
+
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"not-the-official-swiftformat-archive")
+        self._install_fake_swiftformat_download_tools(root, archive, "0" * 64)
+        env["FAKE_SWIFTFORMAT_ARCHIVE"] = str(archive)
+
+        result = subprocess.run(
+            [str(installer), "install"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SwiftFormat archive checksum mismatch", result.stderr)
+        self.assertFalse(managed_swiftformat.exists())
+        self.assertFalse(mismatched_invocations.exists())
+
+    def test_swift_style_never_formats_with_mismatched_path_swiftformat(self) -> None:
+        style_script = SCRIPT_DIR / "swift_style.sh"
+        _, env, mismatched_invocations = self._make_format_tools_test_environment("0.62.1")
+
+        result = subprocess.run(
+            [str(style_script), "format-check"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SwiftFormat 0.61.1 is required", result.stderr)
+        self.assertIn("make install-format-tools", result.stderr)
+        self.assertFalse(mismatched_invocations.exists())
+
     def test_swift_style_lint_uses_config_discovery_without_script_input_overhead(self) -> None:
         root = SCRIPT_DIR.parent
         style_script = (SCRIPT_DIR / "swift_style.sh").read_text(encoding="utf-8")
         swiftlint_config = (root / ".swiftlint.yml").read_text(encoding="utf-8")
         lint_body = style_script.split("run_swiftlint(){", 1)[1].split("\n}", 1)[0]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        style_job = workflow.split("\n  style:", 1)[1].split("\n  build-and-test:", 1)[0]
 
+        installer_step = "./Scripts/install_format_tools.sh install"
+        lint_step = "run: make lint"
+        self.assertIn(installer_step, style_job)
+        self.assertIn(lint_step, style_job)
+        self.assertLess(style_job.index(installer_step), style_job.index(lint_step))
         self.assertIn('local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)', lint_body)
         self.assertNotIn("SCRIPT_INPUT_FILE", lint_body)
         self.assertNotIn("--use-script-input-files", lint_body)
@@ -1709,6 +2502,10 @@ fi
 
         self.assertLess(
             publish_staged.index('"$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"'),
+            publish_staged.index("verify_release_sentry_symbol_uuids_before_signing"),
+        )
+        self.assertLess(
+            publish_staged.index("verify_release_sentry_symbol_uuids_before_signing"),
             publish_staged.index('"$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"'),
         )
         self.assertLess(
@@ -1747,6 +2544,58 @@ fi
         self.assertNotIn("release-draft-creation", tip_workflow)
         self.assertNotIn("PUBLIC_UPDATE_REPOSITORY_TOKEN", tip_workflow)
 
+        stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        sign_job = tip_workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
+        sign_step = sign_job.split("      - name: Sign and notarize staged tip", 1)[1].split(
+            "      - name: Remove ephemeral keychain", 1
+        )[0]
+        cleanup_step = sign_job.split("      - name: Remove ephemeral keychain", 1)[1].split(
+            "      - name: Upload signed tip assets", 1
+        )[0]
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', stage_job)
+        for protected_name in (
+            "SENTRY_DSN",
+            "SENTRY_AUTH_TOKEN",
+            "REPOPROMPT_SENTRY_ORG",
+            "REPOPROMPT_SENTRY_PROJECT",
+            "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
+        ):
+            self.assertNotIn(protected_name, stage_job)
+        self.assertIn("Install Sentry CLI for Tip symbol upload", sign_job)
+        self.assertIn("Prepare Tip Sentry auth token file", sign_job)
+        self.assertIn("chmod 600", sign_job)
+        self.assertIn('mkdir -p "$RUNNER_TEMP/repoprompt-tip-secrets"', sign_job)
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', sign_step)
+        self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", sign_step)
+        self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", sign_step)
+        self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", sign_step)
+        self.assertIn("REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token", sign_step)
+        self.assertNotIn("SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}", sign_step)
+        self.assertIn("if: always()", cleanup_step)
+        self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-tip-secrets"', cleanup_step)
+        self.assertEqual(tip_workflow.count("SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}"), 1)
+        self.assertEqual(tip_workflow.count("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}"), 1)
+        self.assertEqual(tip_workflow.count("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}"), 1)
+        self.assertEqual(tip_workflow.count("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}"), 1)
+        self.assertEqual(
+            tip_workflow.count(
+                "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token"
+            ),
+            1,
+        )
+        self.assertLess(
+            sign_job.index("Install Sentry CLI for Tip symbol upload"),
+            sign_job.index("Sign and notarize staged tip"),
+        )
+        self.assertLess(
+            sign_job.index("Prepare Tip Sentry auth token file"),
+            sign_job.index("Sign and notarize staged tip"),
+        )
+        self.assertLess(
+            sign_job.index("Sign and notarize staged tip"),
+            sign_job.index("Upload signed tip assets for smoke and publish"),
+        )
+
         self.assertIn('TIP_BUILD_NUMBER="$BUILD_NUMBER.$((TIP_BUILD_SEQUENCE / 100)).$((TIP_BUILD_SEQUENCE % 100))"', tip_script)
         self.assertLess(
             tip_script.index('if [[ -z "${TIP_BUILD_NUMBER:-}" ]]'),
@@ -1762,8 +2611,29 @@ fi
         self.assertEqual(tip_script.count('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"'), 3)
         self.assertNotIn('BUILD_NUMBER="$TIP_BUILD_NUMBER"', tip_script)
         self.assertIn("stage|sign|publish-tip", tip_script)
+        self.assertIn('source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"', tip_script)
+        self.assertIn("stage_release_sentry_symbols", tip_script)
+        self.assertIn("require_tip_sentry_configuration", tip_script)
+        self.assertIn("require_release_sentry_symbols_when_enabled", tip_script)
+        self.assertIn("upload_release_sentry_symbols", tip_script)
+        self.assertIn("final Tip artifact manifest must record telemetry_enabled=true", tip_script)
+        stage_tip = tip_script.split("stage_tip() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", stage_tip)
+        self.assertNotIn("SENTRY_DSN", stage_tip)
+        self.assertNotIn("SENTRY_AUTH_TOKEN", stage_tip)
 
         sign_tip = tip_script.split("sign_tip() {", 1)[1].split("\n}", 1)[0]
+        require_sentry = sign_tip.index("require_tip_sentry_configuration")
+        verify_symbols = sign_tip.index("verify_release_sentry_symbol_uuids_before_signing")
+        sign_staged = sign_tip.index('"$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"')
+        assert_telemetry = sign_tip.index("assert_tip_manifest_telemetry_enabled")
+        upload_symbols = sign_tip.index("upload_release_sentry_symbols")
+        create_distribution = sign_tip.index('local distribution_dir="$TMP_DIR/distribution"')
+        self.assertLess(require_sentry, verify_symbols)
+        self.assertLess(verify_symbols, sign_staged)
+        self.assertLess(sign_staged, assert_telemetry)
+        self.assertLess(assert_telemetry, upload_symbols)
+        self.assertLess(upload_symbols, create_distribution)
         generate_appcast = sign_tip.index('"$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast"')
         validate_appcast = sign_tip.index("validate_generated_tip_appcast")
         write_checksums = sign_tip.index('shasum -a 256', validate_appcast)
@@ -1786,14 +2656,18 @@ fi
             package_script,
         )
 
-    def test_main_tip_setup_uses_anonymous_release_lookup_helper(self) -> None:
+    def test_main_tip_setup_uses_read_only_github_token_for_release_lookup_helper(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
         setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  stage:", 1)[0]
+        after_setup = tip_workflow.split("\n  stage:", 1)[1]
         before_publish, publish_job = tip_workflow.split("\n  publish:", 1)
 
         self.assertIn("permissions:\n  contents: read", tip_workflow)
         self.assertIn("./Scripts/lookup_public_tip_release.sh", setup_job)
-        self.assertNotIn("GITHUB_TOKEN", setup_job)
+        self.assertIn("TIP_GH_TOKEN: ${{ github.token }}", setup_job)
+        self.assertEqual(tip_workflow.count("${{ github.token }}"), 1)
+        self.assertNotIn("${{ github.token }}", after_setup)
+        self.assertNotIn("environment: tip-release", setup_job)
         self.assertNotIn("Authorization:", setup_job)
         self.assertNotIn("api.github.com", setup_job)
         self.assertNotIn("TIP_UPDATE_REPOSITORY_TOKEN", before_publish)
@@ -1821,7 +2695,12 @@ def option(name):
     return args[args.index(name) + 1]
 
 request_headers = [args[index + 1] for index, value in enumerate(args) if value == "--header"]
-if any(header.lower().startswith("authorization:") for header in request_headers):
+authorization_headers = [header for header in request_headers if header.lower().startswith("authorization:")]
+expected_tip_gh_token = os.environ.get("FAKE_EXPECTED_TIP_GH_TOKEN", "")
+if expected_tip_gh_token:
+    if authorization_headers != [f"Authorization: Bearer {expected_tip_gh_token}"]:
+        raise SystemExit(90)
+elif authorization_headers:
     raise SystemExit(90)
 if any(option_name in args for option_name in ("--user", "--netrc", "--netrc-file", "-u")):
     raise SystemExit(91)
@@ -1906,23 +2785,33 @@ sys.stdout.write(str(status))
         fake_sleep.chmod(0o755)
 
         scenarios = (
-            ("found", 0, "found", 1, "found"),
-            ("absent", 0, "not-found", 1, "not-found"),
-            ("rate-403-primary", 1, "", 3, "rate-limited"),
-            ("rate-403-secondary", 1, "", 3, "rate-limited"),
-            ("rate-429", 1, "", 3, "rate-limited"),
-            ("server", 1, "", 3, "server-failure"),
-            ("transport", 1, "", 3, "transport-failure"),
-            ("unexpected-403", 1, "", 1, "unexpected-failure"),
-            ("redirect-final-unexpected-403", 1, "", 1, "unexpected-failure"),
-            ("malformed", 1, "", 1, "malformed"),
-            ("malformed-flags", 1, "", 1, "malformed"),
+            ("found-anonymous", "found", "", 0, "found", 1, "found"),
+            ("found-authenticated", "found", "fixture-tip-token", 0, "found", 1, "found"),
+            ("absent", "absent", "", 0, "not-found", 1, "not-found"),
+            ("rate-403-primary", "rate-403-primary", "", 1, "", 3, "rate-limited"),
+            ("rate-403-secondary", "rate-403-secondary", "", 1, "", 3, "rate-limited"),
+            ("rate-429", "rate-429", "", 1, "", 3, "rate-limited"),
+            ("server", "server", "", 1, "", 3, "server-failure"),
+            ("transport", "transport", "", 1, "", 3, "transport-failure"),
+            ("unexpected-403", "unexpected-403", "", 1, "", 1, "unexpected-failure"),
+            (
+                "redirect-final-unexpected-403",
+                "redirect-final-unexpected-403",
+                "",
+                1,
+                "",
+                1,
+                "unexpected-failure",
+            ),
+            ("malformed", "malformed", "", 1, "", 1, "malformed"),
+            ("malformed-flags", "malformed-flags", "", 1, "", 1, "malformed"),
         )
         helper = SCRIPT_DIR / "lookup_public_tip_release.sh"
-        for scenario, returncode, stdout, attempt_count, classification in scenarios:
-            with self.subTest(scenario=scenario):
+        for case_name, scenario, tip_gh_token, returncode, stdout, attempt_count, classification in scenarios:
+            with self.subTest(case=case_name):
                 calls.unlink(missing_ok=True)
                 env = os.environ.copy()
+                env.pop("TIP_GH_TOKEN", None)
                 env.update(
                     {
                         "PATH": f"{tools}:{env['PATH']}",
@@ -1930,8 +2819,11 @@ sys.stdout.write(str(status))
                         "FAKE_CURL_CALLS": str(calls),
                         "FAKE_GITHUB_SCENARIO": scenario,
                         "FAKE_ARCHIVE_BASENAME": archive_basename,
+                        "FAKE_EXPECTED_TIP_GH_TOKEN": tip_gh_token,
                     }
                 )
+                if tip_gh_token:
+                    env["TIP_GH_TOKEN"] = tip_gh_token
                 result = subprocess.run(
                     [str(helper), "example/public-tip", "tip-fixture", archive_basename],
                     env=env,
@@ -1944,6 +2836,8 @@ sys.stdout.write(str(status))
                 self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), attempt_count)
                 self.assertIn(f"classification={classification}", result.stderr)
                 self.assertNotIn("SECRET_BODY_MARKER", result.stdout + result.stderr)
+                if tip_gh_token:
+                    self.assertNotIn(tip_gh_token, result.stdout + result.stderr)
                 if scenario == "redirect-final-unexpected-403":
                     self.assertNotIn("classification=rate-limited", result.stderr)
                     self.assertIn(
@@ -1987,15 +2881,28 @@ sys.stdout.write(str(status))
             ]
         ).stdout.strip()
 
-        def write_appcast(enclosure_signature: str) -> None:
+        expected_title = "Tip build 1.2.3 · v9.8.7 · commit 0123456789ab"
+        def write_appcast(
+            enclosure_signature: str,
+            *,
+            marketing_version: str = "9.8.7",
+            title: str = expected_title,
+            release_notes_link: str | None = None,
+        ) -> None:
+            release_notes_xml = (
+                f"      <sparkle:releaseNotesLink>{release_notes_link}</sparkle:releaseNotesLink>\n"
+                if release_notes_link is not None
+                else ""
+            )
             appcast.write_text(
                 f"""<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
     <item>
+      <title>{title}</title>
       <sparkle:version>1.2.3</sparkle:version>
-      <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
-      <enclosure url="https://example.invalid/tip/{archive.name}"
+      <sparkle:shortVersionString>{marketing_version}</sparkle:shortVersionString>
+{release_notes_xml}      <enclosure url="https://example.invalid/tip/{archive.name}"
                  length="{archive.stat().st_size}"
                  sparkle:edSignature="{enclosure_signature}" />
     </item>
@@ -2010,7 +2917,8 @@ sys.stdout.write(str(status))
             {
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
                 "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
-                "TIP_COMMIT": "0" * 40,
+                "TIP_COMMIT": "0123456789abcdef" * 2 + "01234567",
+                "TIP_SHORT_SHA": "0123456789ab",
                 "TIP_BUILD_NUMBER": "1.2.3",
                 "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
                 "SPARKLE_PRIVATE_KEY": private_key,
@@ -2039,10 +2947,94 @@ validate_generated_tip_appcast""",
         accepted = subprocess.run(command, env=env, text=True, capture_output=True)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
+        duplicate_version_tree = ET.parse(appcast)
+        duplicate_version_item = duplicate_version_tree.getroot().find("./channel/item")
+        self.assertIsNotNone(duplicate_version_item)
+        assert duplicate_version_item is not None
+        ET.SubElement(
+            duplicate_version_item,
+            "{http://www.andymatuschak.org/xml-namespaces/sparkle}version",
+        ).text = "999"
+        duplicate_version_tree.write(appcast, encoding="utf-8", xml_declaration=True)
+        rejected_duplicate_version = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_duplicate_version.returncode, 0)
+        self.assertIn(
+            "tip appcast item must contain exactly one sparkle:version",
+            rejected_duplicate_version.stderr,
+        )
+
+        write_appcast(signature, marketing_version="9.8.8")
+        wrong_marketing = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_marketing.returncode, 0)
+        self.assertIn(
+            "Tip appcast marketing version mismatch: expected 9.8.7, got 9.8.8",
+            wrong_marketing.stderr,
+        )
+
+        write_appcast(signature, title="Wrong tip title")
+        wrong_title = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_title.returncode, 0)
+        self.assertIn("Tip appcast presentation title mismatch: Wrong tip title", wrong_title.stderr)
+
+        write_appcast(signature, release_notes_link="https://example.invalid/tip/details")
+        embedded_release_page = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(embedded_release_page.returncode, 0)
+        self.assertIn(
+            "tip appcast item must not contain sparkle:releaseNotesLink",
+            embedded_release_page.stderr,
+        )
+
         write_appcast("")
-        rejected = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected.stderr)
+        rejected_signature = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_signature.returncode, 0)
+        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected_signature.stderr)
+
+    def test_tip_appcast_label_changes_display_metadata_without_changing_comparison_version(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        appcast = temp_dir / "appcast.xml"
+        appcast.write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel><item><title>Version 9.8.7</title>
+    <sparkle:version>29.8.52</sparkle:version>
+    <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+    <sparkle:releaseNotesLink>https://github.com/example/release</sparkle:releaseNotesLink>
+    <description>Embedded release content</description>
+  </item></channel>
+</rss>
+""",
+            encoding="utf-8",
+        )
+        command = [
+            "bash",
+            "-c",
+            """source "$1"
+APPCAST="$2"
+MARKETING_VERSION="9.8.7"
+TIP_BUILD_NUMBER="29.8.52"
+TIP_SHORT_SHA="abc1234def56"
+label_generated_tip_appcast""",
+            "tip-appcast-label",
+            str(SCRIPT_DIR / "main_tip_release.sh"),
+            str(appcast),
+        ]
+
+        labeled = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(labeled.returncode, 0, labeled.stderr)
+        item = ET.parse(appcast).getroot().find("./channel/item")
+        self.assertIsNotNone(item)
+        assert item is not None
+        sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+        self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
+        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "9.8.7")
+        self.assertNotEqual(
+            item.findtext(f"{{{sparkle}}}shortVersionString"),
+            item.findtext(f"{{{sparkle}}}version"),
+        )
+        self.assertEqual(item.findtext("title"), "Tip build 29.8.52 · v9.8.7 · commit abc1234def56")
+        self.assertIsNone(item.find(f"{{{sparkle}}}releaseNotesLink"))
+        self.assertIsNone(item.find("description"))
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
@@ -2194,10 +3186,12 @@ validate_generated_tip_appcast""",
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("does not verify", rejected.stderr)
 
-    def test_github_tokens_are_scrubbed_before_swiftpm_commands(self) -> None:
+    def test_secret_free_swiftpm_commands_scrub_tokens(self) -> None:
         helper = SCRIPT_DIR / "run_without_github_tokens.sh"
         result = subprocess.run(
             [
+                str(helper),
+                # Re-enter the wrapper to verify nesting remains harmless.
                 str(helper),
                 "bash",
                 "-c",
@@ -2215,8 +3209,33 @@ validate_generated_tip_appcast""",
 
         self.assertEqual(result.returncode, 0, result.stderr)
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
-        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
+        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
+        release_workflow = (workflows_dir / "release.yml").read_text(encoding="utf-8")
+        tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
+
+        release_stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
+        tip_stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        release_stage_function = release_script.split("stage_publish_release() {", 1)[1].split("\n}", 1)[0]
+        tip_stage_function = tip_script.split("stage_tip() {", 1)[1].split("\n}", 1)[0]
+        release_resolver = release_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
+        tip_resolver = tip_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn("run: ./trusted-control-plane/Scripts/release.sh stage-publish", release_stage_job)
+        self.assertIn("run: ./trusted-control-plane/Scripts/main_tip_release.sh stage", tip_stage_job)
+        self.assertIn("resolve_without_lockfile_drift", release_stage_function)
+        self.assertIn("resolve_without_lockfile_drift", tip_stage_function)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_resolver)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', tip_resolver)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY', release_stage_function)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY', tip_stage_function)
+        self.assertIn(
+            'REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS="$RUN_WITHOUT_GITHUB_TOKENS"',
+            package_script,
+        )
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift build', universal_builder)
         self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 4)
         self.assertIn(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',
@@ -2548,25 +3567,48 @@ fi
         (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         return app
 
-    def start_unix_listener(self, socket_path: Path) -> subprocess.Popen[str]:
+    def start_unix_listener(
+        self,
+        socket_path: Path,
+        *,
+        claim_ownership_lock: bool = True,
+    ) -> tuple[subprocess.Popen[str], Path]:
         ready = socket_path.with_suffix(".ready")
+        accepted_connections = socket_path.with_name(f"{socket_path.name}.{time.monotonic_ns()}.accepted")
         ready.unlink(missing_ok=True)
+        accepted_connections.unlink(missing_ok=True)
         process = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
-                "import socket, sys\n"
+                "import fcntl, os, socket, sys\n"
+                "lock_descriptor = None\n"
+                "if sys.argv[4] == '1':\n"
+                "    lock_descriptor = os.open(sys.argv[1] + '.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)\n"
+                "    os.fchmod(lock_descriptor, 0o600)\n"
+                "    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
                 "listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
                 "listener.bind(sys.argv[1])\n"
+                "if lock_descriptor is not None:\n"
+                "    metadata = os.lstat(sys.argv[1])\n"
+                "    record = f'repoprompt-ce-socket-identity-v1 {metadata.st_dev} {metadata.st_ino}\\n'.encode()\n"
+                "    os.ftruncate(lock_descriptor, 0)\n"
+                "    assert os.write(lock_descriptor, record) == len(record)\n"
+                "    os.fsync(lock_descriptor)\n"
                 "listener.listen(8)\n"
                 "open(sys.argv[2], 'w', encoding='utf-8').close()\n"
                 "while True:\n"
                 "    client, _ = listener.accept()\n"
+                "    with open(sys.argv[3], 'a', encoding='utf-8') as accepted:\n"
+                "        accepted.write('accepted\\n')\n"
+                "        accepted.flush()\n"
                 "    with client:\n"
                 "        while client.recv(4096):\n"
                 "            pass\n",
                 os.fspath(socket_path),
                 os.fspath(ready),
+                os.fspath(accepted_connections),
+                "1" if claim_ownership_lock else "0",
             ],
             text=True,
             stdout=subprocess.DEVNULL,
@@ -2591,7 +3633,7 @@ fi
                 self.fail(f"UNIX listener exited early: {process.stderr.read() if process.stderr else ''}")
             time.sleep(0.02)
         self.assertTrue(ready.exists(), "UNIX listener did not become ready")
-        return process
+        return process, accepted_connections
 
     def socket_owner_process_path(self, pid: int) -> Path:
         result = self.run_socket_owner_helper("process-path", pid)
@@ -2695,12 +3737,15 @@ extension Data {
         app = staged / ".build" / "release" / "RepoPrompt.app"
         for directory in (
             approved / "AppBundle",
+            approved / "Vendor" / "Codex",
             approved / "ThirdPartyLicenses" / "fixture",
             staged / "ThirdPartyLicenses" / "fixture",
             app / "Contents" / "Frameworks" / "Sparkle.framework",
             app / "Contents" / "MacOS",
             app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "aarch64-apple-darwin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin",
             scripts,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -2712,9 +3757,17 @@ extension Data {
             "validate_packaged_legal.sh",
             "validate_required_swiftpm_resource_bundles.sh",
             "validate_staged_release.sh",
+            "release_sentry_symbols.sh",
+            "release.sh",
+            "main_tip_release.sh",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
+        (scripts / "codex_runtime_artifact.py").write_text(
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nexpected_bundle = Path(os.environ[\"FAKE_CODEX_BUNDLE\"])\nexpected = [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n    str(expected_bundle),\n]\nif sys.argv[1:] != expected:\n    print(f\"ERROR: unexpected Codex verifier arguments: {sys.argv[1:]!r}\", file=sys.stderr)\n    raise SystemExit(64)\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not expected_bundle.is_dir() or {path.name for path in expected_bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {expected_bundle}\", file=sys.stderr)\n    raise SystemExit(66)\ncapture = os.environ.get(\"FAKE_CODEX_CAPTURE\")\nif capture:\n    with Path(capture).open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
+            encoding="utf-8",
+        )
+        (approved / "Vendor" / "Codex" / "manifest.json").write_text("{}\n", encoding="utf-8")
         metadata = """\
 APP_NAME=RepoPrompt
 DISPLAY_NAME="RepoPrompt CE"
@@ -2816,7 +3869,22 @@ esac
         (resources / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
 
     @staticmethod
-    def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:
+    def codex_fixture_environment(approved: Path, staged: Path) -> dict[str, str]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        return {
+            "FAKE_CODEX_MANIFEST": str(approved / "Vendor" / "Codex" / "manifest.json"),
+            "FAKE_CODEX_BUNDLE": str(
+                app / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+            ),
+        }
+
+    @classmethod
+    def run_staged_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
             {
@@ -2825,6 +3893,7 @@ esac
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
                 "LIPO": str(scripts / "fake-lipo"),
                 "CODESIGN": str(scripts / "fake-codesign"),
+                **cls.codex_fixture_environment(approved, staged),
             }
         )
         return subprocess.run(
@@ -2833,6 +3902,48 @@ esac
             text=True,
             capture_output=True,
         )
+
+    @classmethod
+    def run_public_app_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+        script_name: str,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        artifact_manifest = staged / ".build" / "release" / "RepoPrompt-artifact-manifest.json"
+        capture = staged.parent / f"{script_name}-codex-calls.txt"
+        env = os.environ.copy()
+        env.update(
+            {
+                "RELEASE_COMMIT": "fixture-release-commit",
+                "REPOPROMPT_APPROVED_SOURCE_ROOT": str(approved),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
+                "TIP_COMMIT": "fixture-release-commit",
+                "TIP_BUILD_NUMBER": "1.1",
+                "LIPO": str(scripts / "fake-lipo"),
+                "CODESIGN": str(scripts / "fake-codesign"),
+                "FAKE_CODEX_CAPTURE": str(capture),
+                **cls.codex_fixture_environment(approved, staged),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; TMP_DIR="$(mktemp -d)"; validate_public_app "$2" "$3" "Extracted stage fixture"',
+                "bash",
+                str(scripts / script_name),
+                str(app),
+                str(artifact_manifest),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        return result, capture
 
     def make_git_remote(self) -> tuple[Path, Path]:
         parent = Path(tempfile.mkdtemp())

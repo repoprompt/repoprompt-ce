@@ -6,9 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$SCRIPT_DIR}"
 TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
+APPROVED_SOURCE_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
+CODEX_MANIFEST="$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
+source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"
 load_release_metadata "$ROOT_DIR"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -37,6 +40,7 @@ DMG="$DIST_DIR/$ARCHIVE_BASENAME.dmg"
 APPCAST="$DIST_DIR/appcast.xml"
 CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
@@ -73,8 +77,18 @@ validate_public_app() {
     local app_bundle="$1"
     local manifest="$2"
     local label="$3"
+    local signed_team_identifier="${4:-}"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$app_bundle" "$label MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$app_bundle" "arm64,x86_64" "$label architectures"
+    local codex_verification_args=(
+        --manifest "$CODEX_MANIFEST" verify-bundle
+        --arch all
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex"
+    )
+    if [[ -n "$signed_team_identifier" ]]; then
+        codex_verification_args+=(--signed-team-identifier "$signed_team_identifier")
+    fi
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" "${codex_verification_args[@]}"
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$manifest" \
@@ -85,13 +99,14 @@ validate_distribution_zip() {
     local archive="$1"
     local manifest="$2"
     local label="$3"
+    local signed_team_identifier="${4:-}"
     local extract_dir="$TMP_DIR/${label//[^A-Za-z0-9]/-}-extract"
     rm -rf "$extract_dir"
     mkdir -p "$extract_dir"
     ditto -x -k "$archive" "$extract_dir"
     local extracted_app="$extract_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
     [[ -d "$extracted_app" ]] || fail "$label ZIP must contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
-    validate_public_app "$extracted_app" "$manifest" "$label extracted app"
+    validate_public_app "$extracted_app" "$manifest" "$label extracted app" "$signed_team_identifier"
 }
 
 resolve_without_lockfile_drift() {
@@ -118,6 +133,31 @@ write_tip_metadata() {
 JSON
 }
 
+require_tip_sentry_configuration() {
+    release_sentry_linking_enabled ||
+        fail "Official Tip signing requires REPOPROMPT_ENABLE_SENTRY=1"
+    require_env SENTRY_DSN
+    require_env REPOPROMPT_SENTRY_AUTH_TOKEN_FILE
+    require_file "$REPOPROMPT_SENTRY_AUTH_TOKEN_FILE"
+    [[ -s "$REPOPROMPT_SENTRY_AUTH_TOKEN_FILE" ]] || fail "Tip Sentry auth token file must not be empty"
+    require_env REPOPROMPT_SENTRY_ORG
+    require_env REPOPROMPT_SENTRY_PROJECT
+    require_command sentry-cli
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"
+}
+
+assert_tip_manifest_telemetry_enabled() {
+    python3 - "$FINAL_ARTIFACT_MANIFEST" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if manifest.get("bundle", {}).get("telemetry_enabled") is not True:
+    raise SystemExit("ERROR: final Tip artifact manifest must record telemetry_enabled=true")
+PYTHON
+}
+
 stage_tip() {
     require_command ditto
     require_command git
@@ -132,17 +172,31 @@ stage_tip() {
         REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
         MARKETING_VERSION="$MARKETING_VERSION" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
     "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight
     validate_packaged_legal "$APP_BUNDLE"
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Tip staging"
+    REPOPROMPT_ENABLE_SENTRY=1 require_release_sentry_symbols_when_enabled \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
 
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/tip-stage"
     mkdir -p "$stage_root/.build/release"
     ditto "$APP_BUNDLE" "$stage_root/.build/release/$APP_NAME.app"
     cp "$BUILD_ARTIFACT_MANIFEST" "$stage_root/.build/release/$APP_NAME-artifact-manifest.json"
+    REPOPROMPT_ENABLE_SENTRY=1 stage_release_sentry_symbols \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$stage_root/.build/sentry-symbols/release" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     write_tip_version_env "$stage_root/version.env"
     cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
@@ -166,6 +220,48 @@ derive_sparkle_public_key() {
     xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/derive_sparkle_public_key.swift" "$1"
 }
 
+label_generated_tip_appcast() {
+    python3 - "$APPCAST" "$MARKETING_VERSION" "$TIP_BUILD_NUMBER" "$TIP_SHORT_SHA" <<'PYTHON'
+import sys
+import xml.etree.ElementTree as ET
+
+sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+ET.register_namespace("sparkle", sparkle)
+tree = ET.parse(sys.argv[1])
+root = tree.getroot()
+items = root.findall("./channel/item")
+if len(items) != 1:
+    raise SystemExit(f"tip appcast must contain exactly one item, got {len(items)}")
+
+item = items[0]
+marketing_version, build_number, short_sha = sys.argv[2:]
+
+def singleton_or_create(element_name, qualified_name):
+    elements = item.findall(qualified_name)
+    if len(elements) > 1:
+        raise SystemExit(
+            f"tip appcast item must contain at most one {element_name}, got {len(elements)}"
+        )
+    return elements[0] if elements else ET.SubElement(item, qualified_name)
+
+title = singleton_or_create("title", "title")
+title.text = f"Tip build {build_number} · v{marketing_version} · commit {short_sha}"
+short_version = singleton_or_create(
+    "sparkle:shortVersionString", f"{{{sparkle}}}shortVersionString"
+)
+short_version.text = marketing_version
+# Sparkle embeds releaseNotesLink targets inside its stock update window.
+# Tip releases intentionally keep that dialog compact instead of loading a full
+# GitHub release page as web content.
+for release_notes_link in item.findall(f"{{{sparkle}}}releaseNotesLink"):
+    item.remove(release_notes_link)
+for description in item.findall("description"):
+    item.remove(description)
+
+tree.write(sys.argv[1], encoding="utf-8", xml_declaration=True)
+PYTHON
+}
+
 validate_generated_tip_appcast() {
     local appcast_values="$TMP_DIR/tip-appcast-values.tsv"
     python3 - "$APPCAST" > "$appcast_values" <<'PYTHON'
@@ -182,18 +278,43 @@ if len(enclosures) != 1:
     raise SystemExit(f"tip appcast item must contain exactly one enclosure, got {len(enclosures)}")
 item = items[0]
 enclosure = enclosures[0]
+titles = item.findall("title")
+versions = item.findall(f"{{{sparkle}}}version")
+short_versions = item.findall(f"{{{sparkle}}}shortVersionString")
+release_notes_links = item.findall(f"{{{sparkle}}}releaseNotesLink")
+descriptions = item.findall("description")
+if len(titles) != 1:
+    raise SystemExit(f"tip appcast item must contain exactly one title, got {len(titles)}")
+if len(versions) != 1:
+    raise SystemExit(
+        f"tip appcast item must contain exactly one sparkle:version, got {len(versions)}"
+    )
+if len(short_versions) != 1:
+    raise SystemExit(
+        "tip appcast item must contain exactly one "
+        f"sparkle:shortVersionString, got {len(short_versions)}"
+    )
+if release_notes_links:
+    raise SystemExit(
+        "tip appcast item must not contain sparkle:releaseNotesLink"
+    )
+if descriptions:
+    raise SystemExit("tip appcast item must not contain description")
 values = [
     enclosure.attrib.get("url", ""),
     enclosure.attrib.get(f"{{{sparkle}}}edSignature", ""),
     enclosure.attrib.get("length", ""),
-    item.findtext(f"{{{sparkle}}}version", default=""),
-    item.findtext(f"{{{sparkle}}}shortVersionString", default=""),
+    versions[0].text or "",
+    short_versions[0].text or "",
+    titles[0].text or "",
 ]
-print("\x1f".join(values))
+print("\x1f".join([str(len(values)), *values]))
 PYTHON
 
-    local enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing
-    IFS=$'\x1f' read -r enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing < "$appcast_values"
+    local appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title
+    IFS=$'\x1f' read -r appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title < "$appcast_values"
+    [[ "$appcast_field_count" == "6" ]] ||
+        fail "Tip appcast metadata field count mismatch: expected 6, got $appcast_field_count"
     [[ "$enclosure_url" == "$TIP_DOWNLOAD_URL_PREFIX$(basename "$UPDATE_ZIP")" ]] ||
         fail "Tip appcast enclosure URL mismatch: $enclosure_url"
     [[ -n "$enclosure_signature" ]] || fail "Tip appcast enclosure is missing an EdDSA signature"
@@ -203,6 +324,8 @@ PYTHON
         fail "Tip appcast build mismatch: expected $TIP_BUILD_NUMBER, got $appcast_build"
     [[ "$appcast_marketing" == "$MARKETING_VERSION" ]] ||
         fail "Tip appcast marketing version mismatch: expected $MARKETING_VERSION, got $appcast_marketing"
+    [[ "$appcast_title" == "Tip build $TIP_BUILD_NUMBER · v$MARKETING_VERSION · commit $TIP_SHORT_SHA" ]] ||
+        fail "Tip appcast presentation title mismatch: $appcast_title"
 
     local private_key_file="$TMP_DIR/tip-sparkle-private-key"
     local public_key_file="$TMP_DIR/tip-sparkle-public-key"
@@ -244,11 +367,19 @@ sign_tip() {
     require_env NOTARYTOOL_ISSUER_ID
     require_env RELEASE_COMMIT
     require_env REPOPROMPT_APPROVED_SOURCE_ROOT
+    require_tip_sentry_configuration
     [[ "$RELEASE_COMMIT" == "$TIP_COMMIT" ]] || fail "RELEASE_COMMIT must match TIP_COMMIT"
     [[ -d "$APP_BUNDLE" ]] || fail "Missing staged tip app bundle: $APP_BUNDLE"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
+    verify_release_sentry_symbol_uuids_before_signing \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$APP_BUNDLE" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
@@ -263,14 +394,22 @@ sign_tip() {
         --app "$APP_BUNDLE" \
         --output "$FINAL_ARTIFACT_MANIFEST" \
         --expected-architectures "arm64,x86_64"
+    assert_tip_manifest_telemetry_enabled
     write_tip_metadata
-    validate_public_app "$APP_BUNDLE" "$FINAL_ARTIFACT_MANIFEST" "Final tip Developer ID app"
+    validate_public_app "$APP_BUNDLE" "$FINAL_ARTIFACT_MANIFEST" "Final tip Developer ID app" "$SIGNING_TEAM_ID"
+    upload_release_sentry_symbols \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
 
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"
     ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
     ditto -c -k --norsrc --keepParent "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
-    validate_distribution_zip "$UPDATE_ZIP" "$FINAL_ARTIFACT_MANIFEST" "Final tip distribution"
+    validate_distribution_zip "$UPDATE_ZIP" "$FINAL_ARTIFACT_MANIFEST" "Final tip distribution" "$SIGNING_TEAM_ID"
     hdiutil create -volname "$DISPLAY_NAME Tip" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
     submit_notarization "$DMG"
     xcrun stapler staple "$DMG"
@@ -285,6 +424,7 @@ sign_tip() {
             --download-url-prefix "$TIP_DOWNLOAD_URL_PREFIX" \
             -o "$APPCAST" \
             "$appcast_dir"
+    label_generated_tip_appcast
     validate_generated_tip_appcast
     (cd "$DIST_DIR" && shasum -a 256 \
         "$(basename "$UPDATE_ZIP")" \

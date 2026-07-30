@@ -788,10 +788,18 @@ final class ACPIntegratedAgentModeRunner {
            providerSessionID != invalidated
         {
             session.providerSessionID = nil
+            session.providerCleanupHandle = nil
             changed = true
         }
         if session.providerSessionID != providerSessionID {
             session.providerSessionID = providerSessionID
+            session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+                provider: session.selectedAgent.rawValue,
+                explicit: nil,
+                providerSessionID: providerSessionID,
+                codexConversationID: session.codexConversationID,
+                codexRolloutPath: session.codexRolloutPath
+            )
             changed = true
         }
         guard changed else { return }

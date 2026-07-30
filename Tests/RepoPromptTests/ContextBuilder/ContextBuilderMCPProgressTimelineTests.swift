@@ -3,6 +3,41 @@ import Foundation
 import XCTest
 
 final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
+    func testPhaseCatalogCoversExpectedDiscoveryAndGenerationSequence() {
+        XCTAssertEqual(ContextBuilderMCPProgressPhase.allCases, [
+            .providerProcessStarting,
+            .waitingForChildConnection,
+            .childConnectionObserved,
+            .waitingForRouting,
+            .routingConfirmed,
+            .waitingForProviderStreamEvent,
+            .providerStreamActive,
+            .routingTimeoutBeforeConnection,
+            .routingTimeoutAfterConnection,
+            .readFileAutoSelectionFinish,
+            .tabContextCommit,
+            .statePersistence,
+            .childConnectionTermination,
+            .childConnectionTerminationJoin,
+            .runFinalization,
+            .selectionReplyRendering,
+            .reviewSelectionAuthorization,
+            .modelResolution,
+            .payloadPackaging,
+            .sessionCreationAndPersist,
+            .messageSend,
+            .activeQueryAcquisition,
+            .streaming,
+            .messageFinalization
+        ])
+        XCTAssertEqual(
+            ContextBuilderMCPProgressPhase.allCases.map(\.stage),
+            Array(repeating: "discovering", count: 15)
+                + ["processing"]
+                + Array(repeating: "generating", count: 8)
+        )
+    }
+
     func testTimelineEmitsTimedTransitionsAndUsesCurrentSubphaseForHeartbeat() async {
         let clock = ContextBuilderProgressTestClock()
         let recorder = ContextBuilderProgressEventRecorder()
@@ -11,30 +46,42 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             sink: { event in await recorder.record(event) }
         )
 
-        await timeline.transition(to: .modelResolution)
+        await timeline.transition(to: .selectionReplyRendering)
         clock.advance(by: 1.25)
 
-        let heartbeat = await timeline.heartbeat(
-            fallbackStage: "generating",
-            fallbackMessage: "Still generating plan..."
+        let renderingHeartbeat = await timeline.heartbeat(
+            fallbackStage: "processing",
+            fallbackMessage: "Still rendering selection..."
         )
-        XCTAssertEqual(heartbeat.stage, "generating")
-        XCTAssertTrue(heartbeat.message.contains("follow-up model resolution"), heartbeat.message)
-        XCTAssertTrue(heartbeat.message.contains("phase 1.250s"), heartbeat.message)
+        XCTAssertEqual(renderingHeartbeat.stage, "processing")
+        XCTAssertTrue(
+            renderingHeartbeat.message.contains("selection reply rendering"),
+            renderingHeartbeat.message
+        )
+        XCTAssertTrue(renderingHeartbeat.message.contains("phase 1.250s"), renderingHeartbeat.message)
 
-        await timeline.transition(to: .payloadPackaging)
+        await timeline.transition(to: .reviewSelectionAuthorization)
         clock.advance(by: 0.5)
+        let authorizationHeartbeat = await timeline.heartbeat(
+            fallbackStage: "generating",
+            fallbackMessage: "Still authorizing review..."
+        )
+        XCTAssertEqual(authorizationHeartbeat.stage, "generating")
+        XCTAssertTrue(
+            authorizationHeartbeat.message.contains("review selection authorization"),
+            authorizationHeartbeat.message
+        )
         await timeline.finishCurrentPhase()
 
         let events = await recorder.snapshot()
         XCTAssertEqual(events.map(\.kind), [.started, .completed, .started, .completed])
         XCTAssertEqual(events.map(\.phase), [
-            .modelResolution,
-            .modelResolution,
-            .payloadPackaging,
-            .payloadPackaging
+            .selectionReplyRendering,
+            .selectionReplyRendering,
+            .reviewSelectionAuthorization,
+            .reviewSelectionAuthorization
         ])
-        XCTAssertEqual(events.map(\.stage), ["generating", "generating", "generating", "generating"])
+        XCTAssertEqual(events.map(\.stage), ["processing", "processing", "generating", "generating"])
         XCTAssertEqual(events[1].phaseElapsed, 1.25, accuracy: 0.000_1)
         XCTAssertEqual(events[3].phaseElapsed, 0.5, accuracy: 0.000_1)
         XCTAssertTrue(events[1].message.contains("completed in 1.250s"), events[1].message)
@@ -218,6 +265,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             defer { viewModel.installRunTestHooks(nil) }
 
             let recorder = ContextBuilderProgressPhaseRecorder()
+            let sessionRetentionRecorder = ContextBuilderSessionRetentionRecorder()
             let reply = try await viewModel.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: composition.oracleViewModel,
@@ -229,6 +277,21 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 reviewGitContext: .automaticOnly(),
                 progressReporter: { phase in
                     await recorder.record(phase)
+                },
+                activityReporter: { phase, _ in
+                    guard phase == .streaming || phase == .messageFinalization else { return }
+                    let isPinned: Bool? = await MainActor.run {
+                        guard let session = composition.oracleViewModel.sessions.first(where: {
+                            $0.agentModeSessionID == agentModeSessionID &&
+                                $0.agentModeRunID == agentModeRunID
+                        }) else {
+                            return nil
+                        }
+                        return composition.oracleViewModel.isSessionPinnedForTesting(session.id)
+                    }
+                    if let isPinned {
+                        await sessionRetentionRecorder.record(isPinned)
+                    }
                 }
             )
 
@@ -239,6 +302,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             )
             XCTAssertEqual(createdSession.agentModeSessionID, agentModeSessionID)
             XCTAssertEqual(createdSession.agentModeRunID, agentModeRunID)
+            let retentionObservations = await sessionRetentionRecorder.snapshot()
+            XCTAssertFalse(retentionObservations.isEmpty)
+            XCTAssertTrue(retentionObservations.allSatisfy(\.self))
+            XCTAssertFalse(composition.oracleViewModel.isSessionPinnedForTesting(reply.chatId))
             let phases = await recorder.snapshot()
             XCTAssertEqual(phases, [
                 .modelResolution,
@@ -255,9 +322,11 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
     }
 
     @MainActor
-    func testContextBuilderToolProviderReportsDiscoveryAndGenerationStageEnvelope() async throws {
+    func testContextBuilderToolProviderReportsPhasesAndSkipsSelectionIngressBarrier() async throws {
         #if DEBUG
-            let provider = ContextBuilderImmediateCompletionProvider()
+            let provider = ContextBuilderImmediateCompletionProvider(
+                emitRepoPromptToolCall: true
+            )
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState { _, _, _ in provider }
@@ -282,6 +351,11 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 reason: "ContextBuilderMCPProgressTimelineTests.providerPath"
             )
 
+            let fileContextStore = window.workspaceFileContextStore
+            let loadedRoots = await fileContextStore.roots()
+            let rootRecord = try XCTUnwrap(
+                loadedRoots.first { $0.standardizedFullPath == root.standardizedFileURL.path }
+            )
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
                 apiSettingsViewModel: window.apiSettingsViewModel,
@@ -302,6 +376,15 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             }
             defer { window.mcpServer.installStageProgressSinkForTesting(nil) }
 
+            let selectionReplyRecorder = ContextBuilderSelectionReplyRecorder()
+            window.mcpServer.setContextBuilderSelectionReplyObserverForTesting {
+                selection, _, reply in
+                selectionReplyRecorder.record(selection: selection, reply: reply)
+            }
+            defer { window.mcpServer.setContextBuilderSelectionReplyObserverForTesting(nil) }
+
+            let commitGate = ContextBuilderRunGate()
+            let barrierFlushRecorder = ContextBuilderIngressBarrierFlushRecorder()
             let followUpRecorder = ContextBuilderFollowUpInvocationRecorder()
             window.contextBuilderAgentViewModel.installRunTestHooks(
                 ContextBuilderAgentViewModel.RunTestHooks(
@@ -323,6 +406,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                             response: "deterministic provider follow-up",
                             errors: nil
                         )
+                    },
+                    afterCommittedTabSnapshotCaptured: { runID, _ in
+                        await commitGate.arriveAndWait(runID: runID)
                     }
                 )
             )
@@ -332,11 +418,42 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let contextBuilder = try XCTUnwrap(
                 tools.first { $0.name == MCPWindowToolName.contextBuilder }
             )
-            _ = try await contextBuilder([
-                "instructions": .string("Inspect the test workspace."),
-                "response_type": .string("plan"),
-                "context_id": .string(tabID.uuidString)
-            ])
+            let resultTask = Task { @MainActor in
+                try await contextBuilder([
+                    "instructions": .string("Inspect the test workspace."),
+                    "response_type": .string("plan"),
+                    "context_id": .string(tabID.uuidString)
+                ])
+            }
+            _ = await commitGate.waitUntilArrived()
+            await fileContextStore.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootRecord.id)
+            await fileContextStore.setScopedIngressBarrierWillFlushHandler { rootID in
+                await barrierFlushRecorder.record(rootID: rootID)
+            }
+            await commitGate.release()
+            _ = try await resultTask.value
+
+            let contextBuilderBarrierStats =
+                await fileContextStore.scopedIngressBarrierStatsForTesting(rootID: rootRecord.id)
+            XCTAssertEqual(contextBuilderBarrierStats.totalWorkCount, 0)
+            let contextBuilderFlushCount = await barrierFlushRecorder.count(for: rootRecord.id)
+            XCTAssertEqual(contextBuilderFlushCount, 0)
+            let selectionReplyCaptures = selectionReplyRecorder.snapshot()
+            XCTAssertEqual(selectionReplyCaptures.count, 1)
+            XCTAssertEqual(selectionReplyCaptures.first?.selection, StoredSelection())
+
+            await fileContextStore.setScopedIngressBarrierWillFlushHandler(nil)
+            await fileContextStore.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootRecord.id)
+            _ = await window.mcpServer.buildTabSelectionReply(
+                from: StoredSelection(),
+                includeBlocks: false,
+                display: .relative,
+                lookupContextOverride: .visibleWorkspace,
+                ingressPolicy: .awaitPending
+            )
+            let controlBarrierStats =
+                await fileContextStore.scopedIngressBarrierStatsForTesting(rootID: rootRecord.id)
+            XCTAssertGreaterThan(controlBarrierStats.totalWorkCount, 0)
 
             let recordedInvocation = await followUpRecorder.snapshot()
             let invocation = try XCTUnwrap(recordedInvocation)
@@ -347,7 +464,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let stages = await stageRecorder.snapshot()
             let envelopeStages = stages
                 .map(\.stage)
-                .filter { ["discovering", "discovered", "generating", "complete"].contains($0) }
+                .filter {
+                    ["discovering", "discovered", "processing", "generating", "complete"].contains($0)
+                }
                 .reduce(into: [String]()) { collapsed, stage in
                     if collapsed.last != stage {
                         collapsed.append(stage)
@@ -356,9 +475,67 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             XCTAssertEqual(envelopeStages, [
                 "discovering",
                 "discovered",
+                "processing",
                 "generating",
                 "complete"
             ])
+            let startupMessages = stages
+                .filter { $0.stage == "discovering" }
+                .map(\.message)
+            let requiredStartupMarkers = [
+                ContextBuilderMCPProgressPhase.providerProcessStarting.displayName,
+                ContextBuilderMCPProgressPhase.routingConfirmed.displayName,
+                ContextBuilderMCPProgressPhase.waitingForProviderStreamEvent.displayName,
+                ContextBuilderMCPProgressPhase.providerStreamActive.displayName
+            ]
+            let startupIndexes = try requiredStartupMarkers.map { marker in
+                try XCTUnwrap(
+                    startupMessages.firstIndex { $0.contains("\(marker) started") },
+                    "Missing production-lineage startup phase: \(marker)"
+                )
+            }
+            XCTAssertEqual(startupIndexes, startupIndexes.sorted())
+
+            let routingConfirmedIndex = startupIndexes[1]
+            for optionalRoutingMarker in [
+                ContextBuilderMCPProgressPhase.waitingForChildConnection.displayName,
+                ContextBuilderMCPProgressPhase.childConnectionObserved.displayName,
+                ContextBuilderMCPProgressPhase.waitingForRouting.displayName
+            ] {
+                if let index = startupMessages.firstIndex(where: {
+                    $0.contains("\(optionalRoutingMarker) started")
+                }) {
+                    XCTAssertLessThan(index, routingConfirmedIndex)
+                }
+            }
+            XCTAssertTrue(startupMessages.contains {
+                $0.contains("First discovery provider event received: tool_call")
+            })
+            XCTAssertTrue(startupMessages.contains {
+                $0.contains("First nested RepoPrompt MCP tool request observed: file_search")
+            })
+
+            let runFinalizationCompleted = try XCTUnwrap(stages.firstIndex {
+                $0.message.contains(
+                    "\(ContextBuilderMCPProgressPhase.runFinalization.displayName) completed"
+                )
+            })
+            let selectionRenderingStarted = try XCTUnwrap(stages.firstIndex {
+                $0.message.contains(
+                    "\(ContextBuilderMCPProgressPhase.selectionReplyRendering.displayName) started"
+                )
+            })
+            let selectionRenderingCompleted = try XCTUnwrap(stages.firstIndex {
+                $0.message.contains(
+                    "\(ContextBuilderMCPProgressPhase.selectionReplyRendering.displayName) completed"
+                )
+            })
+            let generationStarted = try XCTUnwrap(stages.firstIndex {
+                $0.stage == "generating" && $0.message == "Generating plan..."
+            })
+            XCTAssertLessThan(runFinalizationCompleted, selectionRenderingStarted)
+            XCTAssertLessThan(selectionRenderingStarted, selectionRenderingCompleted)
+            XCTAssertLessThan(selectionRenderingCompleted, generationStarted)
         #else
             throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
         #endif
@@ -512,6 +689,273 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             XCTAssertEqual(committed.snapshot.tab.id, tabID)
             XCTAssertEqual(committed.snapshot.tab.promptText, "Discovery complete")
             XCTAssertTrue(committed.snapshot.usedAgentOutputAsPrompt)
+        #else
+            throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testPostCommitMCPCancellationReturnsCommittedPromptAndSelection() async throws {
+        #if DEBUG
+            let provider = ContextBuilderImmediateCompletionProvider()
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState { _, _, _ in provider }
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await window.workspaceManager.awaitInitialized()
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ContextBuilderPostCommitCancellationTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let selectedFile = root.appendingPathComponent("committed.swift")
+            try "struct CommittedSelection {}\n".write(to: selectedFile, atomically: true, encoding: .utf8)
+
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Context Builder post-commit cancellation test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderMCPProgressTimelineTests.postCommitCancellation"
+            )
+
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let identity = WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: tabID)
+            var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+            initialTab.promptText = "Initial prompt"
+            initialTab.selection = StoredSelection()
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(
+                initialTab,
+                inWorkspaceID: activeWorkspace.id
+            ))
+            window.workspaceManager.beginApplyingTabContext(forTabID: tabID)
+            defer { window.workspaceManager.endApplyingTabContext(forTabID: tabID) }
+
+            let committedPrompt = "Committed prompt"
+            let committedSelection = StoredSelection(selectedPaths: [selectedFile.path])
+            let commitGate = ContextBuilderRunGate()
+            let storedOnlyUpdateRecorder = ContextBuilderStoredOnlyUpdateRecorder()
+            let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
+            let followUpRecorder = ContextBuilderFollowUpInvocationRecorder()
+            window.contextBuilderAgentViewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: { [weak window] result, _ in
+                        guard result.type == "content", let window else { return }
+                        let updateSucceeded = await MainActor.run {
+                            guard var tab = window.workspaceManager.composeTab(for: identity) else {
+                                return false
+                            }
+                            tab.promptText = committedPrompt
+                            tab.selection = committedSelection
+                            return window.workspaceManager.updateComposeTabStoredOnly(
+                                tab,
+                                inWorkspaceID: identity.workspaceID
+                            )
+                        }
+                        await storedOnlyUpdateRecorder.record(updateSucceeded)
+                    },
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    allowSyntheticRoutingWithoutFinalContext: true,
+                    runMCPFollowUp: { mode, prompt, selection in
+                        await followUpRecorder.record(mode: mode, prompt: prompt, selection: selection)
+                        let chatID = UUID()
+                        return ChatSendReply(
+                            chatId: chatID,
+                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                            mode: mode.mcpModeName,
+                            response: "must not be generated",
+                            errors: nil
+                        )
+                    },
+                    committedTabSnapshotCaptured: { runID, snapshot in
+                        committedSnapshotRecorder.record(runID: runID, snapshot: snapshot)
+                    },
+                    afterCommittedTabSnapshotCaptured: { runID, _ in
+                        await commitGate.arriveAndWait(runID: runID)
+                    }
+                )
+            )
+            defer { window.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+
+            let tools = await window.mcpServer.windowMCPTools
+            let contextBuilder = try XCTUnwrap(
+                tools.first { $0.name == MCPWindowToolName.contextBuilder }
+            )
+            let resultTask = Task { @MainActor in
+                try await contextBuilder([
+                    "instructions": .string("Inspect the committed selection."),
+                    "response_type": .string("plan"),
+                    "context_id": .string(tabID.uuidString)
+                ])
+            }
+
+            let runID = await commitGate.waitUntilArrived()
+            await window.contextBuilderAgentViewModel.cancelMCPContextBuilderRun(runID: runID)
+            XCTAssertTrue(window.contextBuilderAgentViewModel.sessions[tabID]?.isCancelling == true)
+            await commitGate.release()
+
+            let result = try await resultTask.value
+            guard case let .object(resultObject) = result else {
+                return XCTFail("Expected Context Builder object result")
+            }
+            XCTAssertEqual(resultObject["status"]?.stringValue, "cancelled")
+            XCTAssertEqual(resultObject["prompt"]?.stringValue, committedPrompt)
+            XCTAssertEqual(resultObject["file_count"], .int(1))
+            XCTAssertTrue(
+                resultObject["selection"]?.stringValue?.contains(selectedFile.lastPathComponent) == true
+            )
+            XCTAssertNil(resultObject["plan"])
+            let followUpInvocation = await followUpRecorder.snapshot()
+            XCTAssertNil(followUpInvocation)
+
+            let storedOnlyUpdateResults = await storedOnlyUpdateRecorder.snapshot()
+            XCTAssertEqual(storedOnlyUpdateResults, [true])
+            let storedTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+            XCTAssertEqual(storedTab.promptText, committedPrompt)
+            XCTAssertEqual(storedTab.selection, committedSelection)
+            let captures = committedSnapshotRecorder.snapshotAll()
+            XCTAssertEqual(captures.count, 1)
+            XCTAssertEqual(captures.first?.runID, runID)
+            XCTAssertEqual(captures.first?.snapshot.tab.promptText, committedPrompt)
+            XCTAssertEqual(captures.first?.snapshot.tab.selection, committedSelection)
+            XCTAssertEqual(window.contextBuilderAgentViewModel.sessions[tabID]?.agentRunState, .cancelled)
+        #else
+            throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testPreCommitMCPCancellationRendersInitialSnapshotWithoutIngressBarrier() async throws {
+        #if DEBUG
+            let provider = ContextBuilderImmediateCancellationProvider()
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState { _, _, _ in provider }
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await window.workspaceManager.awaitInitialized()
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ContextBuilderPreCommitCancellationTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let selectedFile = root.appendingPathComponent("initial.swift")
+            try "struct InitialSelection {}\n".write(
+                to: selectedFile,
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Context Builder pre-commit cancellation test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderMCPProgressTimelineTests.preCommitCancellation"
+            )
+
+            let fileContextStore = window.workspaceFileContextStore
+            let loadedRoots = await fileContextStore.roots()
+            let rootRecord = try XCTUnwrap(
+                loadedRoots.first { $0.standardizedFullPath == root.standardizedFileURL.path }
+            )
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let identity = WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: tabID)
+            let initialSelection = StoredSelection(selectedPaths: [selectedFile.path])
+            var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+            initialTab.promptText = "Immutable initial prompt"
+            initialTab.selection = initialSelection
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(
+                initialTab,
+                inWorkspaceID: activeWorkspace.id
+            ))
+            _ = await window.selectionCoordinator.persistSelection(
+                initialSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: true
+            )
+            window.promptManager.promptText = initialTab.promptText
+
+            let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
+            let selectionReplyRecorder = ContextBuilderSelectionReplyRecorder()
+            let barrierFlushRecorder = ContextBuilderIngressBarrierFlushRecorder()
+            window.mcpServer.setContextBuilderSelectionReplyObserverForTesting {
+                selection, _, reply in
+                selectionReplyRecorder.record(selection: selection, reply: reply)
+            }
+            defer { window.mcpServer.setContextBuilderSelectionReplyObserverForTesting(nil) }
+            window.contextBuilderAgentViewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    allowSyntheticRoutingWithoutFinalContext: true,
+                    committedTabSnapshotCaptured: { runID, snapshot in
+                        committedSnapshotRecorder.record(runID: runID, snapshot: snapshot)
+                    }
+                )
+            )
+            defer { window.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+
+            let tools = await window.mcpServer.windowMCPTools
+            let contextBuilder = try XCTUnwrap(
+                tools.first { $0.name == MCPWindowToolName.contextBuilder }
+            )
+            await fileContextStore.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootRecord.id)
+            await fileContextStore.setScopedIngressBarrierWillFlushHandler { rootID in
+                await barrierFlushRecorder.record(rootID: rootID)
+            }
+            let result = try await contextBuilder([
+                "instructions": .string("Inspect the initial selection."),
+                "response_type": .string("plan"),
+                "context_id": .string(tabID.uuidString)
+            ])
+            await fileContextStore.setScopedIngressBarrierWillFlushHandler(nil)
+            guard case let .object(resultObject) = result else {
+                return XCTFail("Expected Context Builder object result")
+            }
+            XCTAssertEqual(resultObject["status"]?.stringValue, "cancelled")
+            XCTAssertEqual(resultObject["prompt"]?.stringValue, initialTab.promptText)
+            XCTAssertEqual(resultObject["file_count"], .int(1))
+            XCTAssertTrue(
+                resultObject["selection"]?.stringValue?.contains(selectedFile.lastPathComponent) == true
+            )
+            XCTAssertNil(resultObject["plan"])
+            XCTAssertTrue(committedSnapshotRecorder.snapshotAll().isEmpty)
+
+            let captures = selectionReplyRecorder.snapshot()
+            XCTAssertEqual(captures.count, 1)
+            XCTAssertEqual(captures.first?.selection, initialSelection)
+            let barrierStats =
+                await fileContextStore.scopedIngressBarrierStatsForTesting(rootID: rootRecord.id)
+            XCTAssertEqual(barrierStats.totalWorkCount, 0)
+            let barrierFlushCount = await barrierFlushRecorder.count(for: rootRecord.id)
+            XCTAssertEqual(barrierFlushCount, 0)
         #else
             throw XCTSkip("Provider-path Context Builder injection is DEBUG-only.")
         #endif
@@ -905,9 +1349,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
 
 private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProvider {
     private let discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder?
+    private let emitRepoPromptToolCall: Bool
 
-    init(discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder? = nil) {
+    init(
+        discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder? = nil,
+        emitRepoPromptToolCall: Bool = false
+    ) {
         self.discoveryInputRecorder = discoveryInputRecorder
+        self.emitRepoPromptToolCall = emitRepoPromptToolCall
     }
 
     func streamAgentMessage(
@@ -916,16 +1365,75 @@ private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProv
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         await discoveryInputRecorder?.record(message.userMessage)
         let stream = AsyncThrowingStream<AIStreamResult, Error> { continuation in
+            if emitRepoPromptToolCall {
+                continuation.yield(AIStreamResult(
+                    type: "tool_call",
+                    text: nil,
+                    toolName: "mcp__RepoPromptCE__file_search"
+                ))
+            }
             continuation.yield(AIStreamResult(type: "content", text: "Discovery complete"))
             continuation.finish()
         }
         if let runID {
+            await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
             await MCPRoutingWaiter.notifyRouted(runID: runID)
         }
         return stream
     }
 
     func dispose() async {}
+}
+
+private final class ContextBuilderImmediateCancellationProvider: HeadlessAgentProvider {
+    func streamAgentMessage(
+        _ message: AgentMessage,
+        runID: UUID?
+    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        let stream = AsyncThrowingStream<AIStreamResult, Error> { continuation in
+            continuation.finish(throwing: CancellationError())
+        }
+        if let runID {
+            await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+        }
+        return stream
+    }
+
+    func dispose() async {}
+}
+
+private actor ContextBuilderRunGate {
+    private var arrivedRunID: UUID?
+    private var arrivalWaiters: [CheckedContinuation<UUID, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+
+    func arriveAndWait(runID: UUID) async {
+        arrivedRunID = runID
+        let waiters = arrivalWaiters
+        arrivalWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: runID) }
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilArrived() async -> UUID {
+        if let arrivedRunID { return arrivedRunID }
+        return await withCheckedContinuation { continuation in
+            arrivalWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        guard !isReleased else { return }
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }
 
 private actor ContextBuilderDiscoveryInputRecorder {
@@ -974,6 +1482,60 @@ private actor ContextBuilderFollowUpInvocationRecorder {
         invocation
     }
 }
+
+private final class ContextBuilderSelectionReplyRecorder: @unchecked Sendable {
+    struct Capture {
+        let selection: StoredSelection
+        let reply: ToolResultDTOs.SelectionReply
+    }
+
+    private let lock = NSLock()
+    private var captures: [Capture] = []
+
+    func record(selection: StoredSelection, reply: ToolResultDTOs.SelectionReply) {
+        lock.lock()
+        captures.append(Capture(selection: selection, reply: reply))
+        lock.unlock()
+    }
+
+    func snapshot() -> [Capture] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captures
+    }
+}
+
+private actor ContextBuilderIngressBarrierFlushRecorder {
+    private var countsByRootID: [UUID: Int] = [:]
+
+    func record(rootID: UUID) {
+        countsByRootID[rootID, default: 0] += 1
+    }
+
+    func count(for rootID: UUID) -> Int {
+        countsByRootID[rootID, default: 0]
+    }
+}
+
+private actor ContextBuilderStoredOnlyUpdateRecorder {
+    private var results: [Bool] = []
+
+    func record(_ result: Bool) {
+        results.append(result)
+    }
+
+    func snapshot() -> [Bool] {
+        results
+    }
+}
+
+#if DEBUG
+    private extension WorkspaceFileContextStore.ScopedIngressBarrierStats {
+        var totalWorkCount: Int {
+            launchCount + joinCount + successorCount + coalescedSuccessorCount + noopCount
+        }
+    }
+#endif
 
 private final class ContextBuilderCommittedSnapshotRecorder: @unchecked Sendable {
     private let lock = NSLock()
@@ -1134,15 +1696,9 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
     }
 
     func waitUntilSleeping(timeout: TimeInterval = TestFenceDefaults.enterWait) async throws -> TimeInterval {
-        if let seconds = peekSleepingSeconds {
-            return seconds
-        }
-        if isCancelled {
-            throw CancellationError()
-        }
-        if let terminal = terminalError {
-            throw terminal
-        }
+        if let seconds = peekSleepingSeconds { return seconds }
+        if isCancelled { throw CancellationError() }
+        if let terminal = terminalError { throw terminal }
 
         let timeoutError = AsyncTestConditionTimeout(
             description: "context builder soft-bound sleep gate",
@@ -1176,9 +1732,7 @@ private final class ContextBuilderSoftBoundSleepGate: @unchecked Sendable {
     }
 
     func waitUntilCancelled(timeout: TimeInterval = TestFenceDefaults.enterWait) async throws {
-        if isCancelled {
-            return
-        }
+        if isCancelled { return }
         try await AsyncTestWait.waitUntil(
             "context builder soft-bound cancellation",
             timeout: timeout
@@ -1274,5 +1828,17 @@ private actor ContextBuilderProgressPhaseRecorder {
 
     func snapshot() -> [ContextBuilderMCPProgressPhase] {
         phases
+    }
+}
+
+private actor ContextBuilderSessionRetentionRecorder {
+    private var observations: [Bool] = []
+
+    func record(_ isPinned: Bool) {
+        observations.append(isPinned)
+    }
+
+    func snapshot() -> [Bool] {
+        observations
     }
 }

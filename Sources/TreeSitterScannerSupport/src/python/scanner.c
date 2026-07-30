@@ -85,7 +85,7 @@ static inline void set_end_character(Delimiter *delimiter, int32_t character) {
 typedef struct {
     Array(uint16_t) indents;
     Array(Delimiter) delimiters;
-    bool inside_f_string;
+    bool inside_interpolated_string;
 } Scanner;
 
 static inline void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
@@ -177,7 +177,7 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
                                 lexer->mark_end(lexer);
                                 array_pop(&scanner->delimiters);
                                 lexer->result_symbol = STRING_END;
-                                scanner->inside_f_string = false;
+                                scanner->inside_interpolated_string = false;
                             }
                             return true;
                         }
@@ -195,7 +195,7 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
                     advance(lexer);
                     array_pop(&scanner->delimiters);
                     lexer->result_symbol = STRING_END;
-                    scanner->inside_f_string = false;
+                    scanner->inside_interpolated_string = false;
                 }
                 lexer->mark_end(lexer);
                 return true;
@@ -280,7 +280,7 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
             if ((valid_symbols[DEDENT] ||
                  (!valid_symbols[NEWLINE] && !(valid_symbols[STRING_START] && next_tok_is_string_start) &&
                   !within_brackets)) &&
-                indent_length < current_indent_length && !scanner->inside_f_string &&
+                indent_length < current_indent_length && !scanner->inside_interpolated_string &&
 
                 // Wait to create a dedent token until we've consumed any
                 // comments
@@ -303,7 +303,8 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
 
         bool has_flags = false;
         while (lexer->lookahead) {
-            if (lexer->lookahead == 'f' || lexer->lookahead == 'F') {
+            if (lexer->lookahead == 'f' || lexer->lookahead == 'F' || lexer->lookahead == 't' ||
+                lexer->lookahead == 'T') {
                 set_format(&delimiter);
             } else if (lexer->lookahead == 'r' || lexer->lookahead == 'R') {
                 set_raw(&delimiter);
@@ -349,7 +350,7 @@ bool tree_sitter_python_external_scanner_scan(void *payload, TSLexer *lexer, con
         if (end_character(&delimiter)) {
             array_push(&scanner->delimiters, delimiter);
             lexer->result_symbol = STRING_START;
-            scanner->inside_f_string = is_format(&delimiter);
+            scanner->inside_interpolated_string = is_format(&delimiter);
             return true;
         }
         if (has_flags) {
@@ -365,7 +366,7 @@ unsigned tree_sitter_python_external_scanner_serialize(void *payload, char *buff
 
     size_t size = 0;
 
-    buffer[size++] = (char)scanner->inside_f_string;
+    buffer[size++] = (char)scanner->inside_interpolated_string;
 
     size_t delimiter_count = scanner->delimiters.size;
     if (delimiter_count > UINT8_MAX) {
@@ -398,7 +399,7 @@ void tree_sitter_python_external_scanner_deserialize(void *payload, const char *
     if (length > 0) {
         size_t size = 0;
 
-        scanner->inside_f_string = (bool)buffer[size++];
+        scanner->inside_interpolated_string = (bool)buffer[size++];
 
         size_t delimiter_count = (uint8_t)buffer[size++];
         if (delimiter_count > 0) {

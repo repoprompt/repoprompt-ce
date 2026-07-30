@@ -681,7 +681,7 @@ struct MCPServerPopoverContent: View {
                             if result.success {
                                 showMCPFeedback(result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
                             } else {
-                                showMCPFeedback("Codex config failed", isError: true)
+                                showMCPFeedback(result.errorMessage ?? "Codex config failed", isError: true)
                             }
                         }
                         Button("OpenCode") {
@@ -863,7 +863,7 @@ struct MCPServerPopoverContent: View {
                     }
 
                     Section {
-                        Text("Codex CLI (~/.codex/prompts)")
+                        Text("RepoPrompt Codex (isolated prompts)")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

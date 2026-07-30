@@ -13,7 +13,11 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             XCTAssertTrue(harness.server.hasActiveChildAgentRunWaits(runID: harness.parentRunID))
             XCTAssertEqual(harness.activeScopeCount(), 1)
 
-            let drained = await harness.drain(source: "test-real-wait-scope-drain")
+            let steeringMessage = "real drain accepted steering"
+            let drained = await harness.drain(
+                source: "test-real-wait-scope-drain",
+                steeringMessage: steeringMessage
+            )
             XCTAssertTrue(drained)
 
             let interruptedValue = try await firstWait.value
@@ -22,6 +26,14 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
                 interruptedObject["wait"]?.objectValue?["result"]?.stringValue,
                 "interrupted_by_steering"
             )
+            XCTAssertNil(
+                interruptedObject["wait"]?.objectValue?["steering_message"]
+            )
+            let formatted = try Self.onlyText(ToolOutputFormatter.formatAgentRun(
+                args: ["op": .string("wait")],
+                value: interruptedValue
+            ))
+            XCTAssertEqual(formatted.components(separatedBy: steeringMessage).count - 1, 0)
             XCTAssertEqual(
                 interruptedObject["_meta"]?.objectValue?["wake_reason"]?.stringValue,
                 AgentRunSessionStore.WakeReason.steeringRequested.rawValue
@@ -54,12 +66,176 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             try await harness.publishTerminal()
             let terminalValue = try await secondWait.value
             XCTAssertEqual(terminalValue.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+            XCTAssertNil(terminalValue.objectValue?["wait"]?.objectValue?["steering_message"])
             XCTAssertFalse(harness.server.hasActiveChildAgentRunWaits(runID: harness.parentRunID))
             XCTAssertEqual(harness.activeScopeCount(), 0)
             let allCompletions = await harness.completionRecorder.completions()
             XCTAssertEqual(allCompletions.count, 2)
             XCTAssertEqual(allCompletions.last?.reason, .snapshotReady)
         }
+    }
+
+    func testStaleManualSubmitPreservesWaitSteeringMessageAfterWakeSuspension() async throws {
+        try await AgentRunWaitDrainTestHarness.withHarness { harness in
+            let steeringMarker = "<<stale-manual-steering-origin>>"
+            let waitTask = harness.startWait()
+            try await harness.waitUntilBlocked()
+
+            let barrier = AgentRunWaiterWakeBarrier()
+            harness.server.setBeforeAgentRunWaiterWakeForTesting { targetRunID, _ in
+                guard targetRunID == harness.parentRunID else { return }
+                await barrier.suspend()
+            }
+            defer {
+                harness.server.setBeforeAgentRunWaiterWakeForTesting(nil)
+                Task { await barrier.release() }
+            }
+
+            let session = await harness.viewModel.ensureSessionReady(tabID: UUID())
+            session.selectedAgent = .openCode
+            session.runID = harness.parentRunID
+            session.runState = .running
+            _ = session.beginRunAttempt(source: "test.staleManualWake")
+
+            let submission = harness.viewModel.submitUserTurn(
+                text: steeringMarker,
+                tabID: session.tabID
+            )
+            guard case .submitted = submission else {
+                return XCTFail("Expected the manual steering turn to be submitted")
+            }
+
+            await barrier.waitUntilSuspended()
+            Self.rotateRunIdentity(session, source: "test.staleManualWake.rotate")
+            await barrier.release()
+
+            let value = try await waitTask.value
+            try Self.assertExactSteeringMessage(
+                steeringMarker,
+                in: value,
+                message: "A stale manual origin must fail open after the wake suspension"
+            )
+        }
+    }
+
+    func testStaleClaudeDispatchPreservesWaitSteeringMessageAfterWakeSuspension() async throws {
+        try await assertStaleProviderDispatchPreservesWaitSteeringMessage(
+            delivery: .queuedClaudeInterrupt,
+            selectedAgent: .claudeCode,
+            steeringMarker: "<<stale-claude-steering-origin>>"
+        )
+    }
+
+    func testStaleACPDispatchPreservesWaitSteeringMessageAfterWakeSuspension() async throws {
+        try await assertStaleProviderDispatchPreservesWaitSteeringMessage(
+            delivery: .queuedACPInterrupt,
+            selectedAgent: .openCode,
+            steeringMarker: "<<stale-acp-steering-origin>>"
+        )
+    }
+
+    private func assertStaleProviderDispatchPreservesWaitSteeringMessage(
+        delivery: AgentModeViewModel.MCPInstructionDispatch,
+        selectedAgent: AgentProviderKind,
+        steeringMarker: String
+    ) async throws {
+        try await AgentRunWaitDrainTestHarness.withHarness { harness in
+            let waitTask = harness.startWait()
+            try await harness.waitUntilBlocked()
+
+            let sessionID = UUID()
+            let session = await harness.viewModel.ensureSessionReady(tabID: UUID())
+            session.selectedAgent = selectedAgent
+            session.runID = harness.parentRunID
+            session.runState = .running
+            _ = session.beginRunAttempt(source: "test.staleProviderWake")
+            _ = harness.viewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session
+            )
+            try await harness.viewModel.mcpActivateControlContext(
+                forTabID: session.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: nil,
+                startPending: true
+            )
+            await harness.viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            let registration = try XCTUnwrap(session.mcpControlContext?.registration)
+
+            let barrier = AgentRunWaiterWakeBarrier()
+            harness.server.setBeforeAgentRunWaiterWakeForTesting { targetRunID, _ in
+                guard targetRunID == harness.parentRunID else { return }
+                await barrier.suspend()
+            }
+            harness.trackAdditionalRegistration(registration)
+            defer {
+                harness.server.setBeforeAgentRunWaiterWakeForTesting(nil)
+                Task { await barrier.release() }
+            }
+
+            let wakeTask = Task { @MainActor in
+                await harness.viewModel.test_wakeMCPWaitersForActiveDispatch(
+                    delivery: delivery,
+                    session: session,
+                    sessionID: sessionID,
+                    steeringMessage: steeringMarker
+                )
+            }
+
+            await barrier.waitUntilSuspended()
+            Self.rotateRunIdentity(session, source: "test.staleProviderWake.rotate")
+            await barrier.release()
+
+            let didWakeCurrentSession = await wakeTask.value
+            XCTAssertFalse(
+                didWakeCurrentSession,
+                "The stale dispatch must not claim the successor as its current controlled session"
+            )
+            let value = try await waitTask.value
+            try Self.assertExactSteeringMessage(
+                steeringMarker,
+                in: value,
+                message: "A stale provider origin must fail open after the wake suspension"
+            )
+        }
+    }
+
+    private static func rotateRunIdentity(
+        _ session: AgentModeViewModel.TabSession,
+        source: String
+    ) {
+        if let ownership = session.activeRunOwnership {
+            session.endRunAttempt(ifCurrent: ownership, source: source)
+        }
+        session.runID = UUID()
+        _ = session.beginRunAttempt(source: source)
+        session.runState = .running
+    }
+
+    private static func assertExactSteeringMessage(
+        _ steeringMessage: String,
+        in value: Value,
+        message: String
+    ) throws {
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(
+            object["wait"]?.objectValue?["result"]?.stringValue,
+            "interrupted_by_steering"
+        )
+        XCTAssertEqual(
+            object["wait"]?.objectValue?["steering_message"]?.stringValue,
+            steeringMessage,
+            message
+        )
+    }
+
+    private static func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
+        let first = try XCTUnwrap(blocks.first)
+        guard case let .text(text, _, _) = first else {
+            XCTFail("Expected text content")
+            return ""
+        }
+        return text
     }
 }
 
@@ -75,32 +251,45 @@ final class AgentRunWaitDrainTestHarness {
 
     let window: WindowState
     let server: MCPServerViewModel
+    let viewModel: AgentModeViewModel
     let parentRunID: UUID
     let connectionID: UUID
+    let externalSupervisorRunID: UUID
+    let externalConnectionID: UUID
     let fixture: Fixture
     let completionRecorder: AgentRunWaitDrainCompletionRecorder
 
     private let service: AgentRunMCPToolService
+    private let externalService: AgentRunMCPToolService
     private let liveSnapshots: AgentRunWaitDrainLiveSnapshots
     private var waitTasks: [Task<Value, Error>] = []
+    private var additionalRegistrations: [AgentRunSessionStore.Registration] = []
     private var didCleanup = false
 
     private init(
         window: WindowState,
+        viewModel: AgentModeViewModel,
         parentRunID: UUID,
         connectionID: UUID,
+        externalSupervisorRunID: UUID,
+        externalConnectionID: UUID,
         fixture: Fixture,
         completionRecorder: AgentRunWaitDrainCompletionRecorder,
         service: AgentRunMCPToolService,
+        externalService: AgentRunMCPToolService,
         liveSnapshots: AgentRunWaitDrainLiveSnapshots
     ) {
         self.window = window
         server = window.mcpServer
+        self.viewModel = viewModel
         self.parentRunID = parentRunID
         self.connectionID = connectionID
+        self.externalSupervisorRunID = externalSupervisorRunID
+        self.externalConnectionID = externalConnectionID
         self.fixture = fixture
         self.completionRecorder = completionRecorder
         self.service = service
+        self.externalService = externalService
         self.liveSnapshots = liveSnapshots
     }
 
@@ -122,9 +311,14 @@ final class AgentRunWaitDrainTestHarness {
     static func make(parentRunID: UUID = UUID()) async throws -> AgentRunWaitDrainTestHarness {
         let window = makeWindow()
         let connectionID = UUID()
+        let externalSupervisorRunID = UUID()
+        let externalConnectionID = UUID()
         let liveSnapshots = AgentRunWaitDrainLiveSnapshots()
         let completionRecorder = AgentRunWaitDrainCompletionRecorder()
-        let childViewModel = makeChildViewModel(windowID: window.windowID)
+        let childViewModel = makeChildViewModel(
+            windowID: window.windowID,
+            mcpServer: window.mcpServer
+        )
         let fixture: Fixture
         do {
             fixture = try await installRunningSession(
@@ -145,54 +339,90 @@ final class AgentRunWaitDrainTestHarness {
             WindowStatesManager.shared.unregisterWindowState(window)
             throw AgentRunWaitDrainHarnessError.failedToRegisterRunMapping
         }
+        guard window.mcpServer.registerRunIDMapping(
+            connectionID: externalConnectionID,
+            runID: externalSupervisorRunID,
+            windowID: window.windowID
+        ) else {
+            window.mcpServer.cleanupRunIDMapping(runID: parentRunID, connectionID: connectionID)
+            await AgentRunSessionStore.cleanup(registration: fixture.registration)
+            WindowStatesManager.shared.unregisterWindowState(window)
+            throw AgentRunWaitDrainHarnessError.failedToRegisterRunMapping
+        }
 
-        var service = AgentRunMCPToolService(
-            toolName: MCPWindowToolName.agentRun,
-            captureRequestMetadata: {
-                MCPServerViewModel.RequestMetadata(
-                    connectionID: connectionID,
-                    clientName: "agent-run-wait-drain-tests",
-                    windowID: window.windowID
-                )
-            },
-            requireTargetWindow: { window },
-            resolveRequestedTabID: { _ in nil },
-            resolveSpawnParentSourceTabID: { _ in nil },
-            resolveSpawnParentSessionID: { _, _ in nil },
-            bindCurrentRequestToTab: { _, _ in },
-            withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
-                throw MCPError.internalError("startRun should not be used by wait-drain tests")
-            }
-        )
-        service.beginAgentRunWait = { metadata, sessionIDs, timeoutSeconds in
-            await window.mcpServer.test_beginAgentRunWaitScope(
-                metadata: metadata,
-                sessionIDs: sessionIDs,
-                timeoutSeconds: timeoutSeconds
+        func makeWaitService(connectionID: UUID, clientName: String) -> AgentRunMCPToolService {
+            var service = AgentRunMCPToolService(
+                toolName: MCPWindowToolName.agentRun,
+                captureRequestMetadata: {
+                    MCPServerViewModel.RequestMetadata(
+                        connectionID: connectionID,
+                        clientName: clientName,
+                        windowID: window.windowID
+                    )
+                },
+                requireTargetWindow: { window },
+                resolveRequestedTabID: { _ in nil },
+                resolveSpawnParentSourceTabID: { _ in nil },
+                resolveSpawnParentSessionID: { _, _ in nil },
+                withHeartbeat: { _, _, _, _, operation in try await operation() },
+                startRun: { _, _, _, _, _, _, _, _, _, _, _ in
+                    throw MCPError.internalError("startRun should not be used by wait-drain tests")
+                }
             )
+            service.beginAgentRunWait = { metadata, sessionIDs, timeoutSeconds in
+                await window.mcpServer.test_beginAgentRunWaitScope(
+                    metadata: metadata,
+                    sessionIDs: sessionIDs,
+                    timeoutSeconds: timeoutSeconds
+                )
+            }
+            service.endAgentRunWait = { token, completion in
+                await window.mcpServer.test_endAgentRunWaitScope(token, completion: completion)
+                await completionRecorder.record(completion)
+            }
+            service.currentSnapshotProvider = { sessionID, _ in
+                await liveSnapshots.snapshot(for: sessionID)
+            }
+            service.testAgentModeViewModel = childViewModel
+            return service
         }
-        service.endAgentRunWait = { token, completion in
-            await window.mcpServer.test_endAgentRunWaitScope(token, completion: completion)
-            await completionRecorder.record(completion)
-        }
-        service.currentSnapshotProvider = { sessionID, _ in
-            await liveSnapshots.snapshot(for: sessionID)
-        }
-        service.testAgentModeViewModel = childViewModel
+
+        let service = makeWaitService(
+            connectionID: connectionID,
+            clientName: "agent-run-wait-drain-tests"
+        )
+        let externalService = makeWaitService(
+            connectionID: externalConnectionID,
+            clientName: "agent-run-wait-drain-external-supervisor-tests"
+        )
 
         return AgentRunWaitDrainTestHarness(
             window: window,
+            viewModel: childViewModel,
             parentRunID: parentRunID,
             connectionID: connectionID,
+            externalSupervisorRunID: externalSupervisorRunID,
+            externalConnectionID: externalConnectionID,
             fixture: fixture,
             completionRecorder: completionRecorder,
             service: service,
+            externalService: externalService,
             liveSnapshots: liveSnapshots
         )
     }
 
     func startWait(timeoutSeconds: TimeInterval = 2) -> Task<Value, Error> {
+        startWait(using: service, timeoutSeconds: timeoutSeconds)
+    }
+
+    func startExternalWait(timeoutSeconds: TimeInterval = 2) -> Task<Value, Error> {
+        startWait(using: externalService, timeoutSeconds: timeoutSeconds)
+    }
+
+    private func startWait(
+        using service: AgentRunMCPToolService,
+        timeoutSeconds: TimeInterval
+    ) -> Task<Value, Error> {
         let task = Task { @MainActor [service, fixture] in
             try await service.execute(args: [
                 "op": .string("wait"),
@@ -221,19 +451,48 @@ final class AgentRunWaitDrainTestHarness {
         throw AgentRunWaitDrainHarnessError.timedOutWaitingForBlockedScope
     }
 
-    func drain(source: String) async -> Bool {
+    func waitUntilBothBlocked(timeout: TimeInterval = 2) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let waiterCount = await AgentRunSessionStore.shared.test_waiterCount(
+                registration: fixture.registration
+            )
+            if waiterCount == 2,
+               activeScopeCount() == 1,
+               externalActiveScopeCount() == 1,
+               server.hasActiveChildAgentRunWaits(runID: parentRunID),
+               server.hasActiveChildAgentRunWaits(runID: externalSupervisorRunID)
+            {
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        throw AgentRunWaitDrainHarnessError.timedOutWaitingForBlockedScope
+    }
+
+    func drain(source: String, steeringMessage: String? = nil) async -> Bool {
         await server.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
             runID: parentRunID,
             source: source,
-            timeoutSeconds: 1
+            steeringMessage: steeringMessage,
+            timeoutSeconds: 1,
+            steeringOriginRunID: { [parentRunID] in parentRunID }
         ) { [fixture] sessionID in
             guard sessionID == fixture.sessionID else { return nil }
             return (fixture.runningSnapshot, fixture.cursor)
         }
     }
 
+    func trackAdditionalRegistration(_ registration: AgentRunSessionStore.Registration) {
+        additionalRegistrations.append(registration)
+    }
+
     func activeScopeCount() -> Int {
         server.test_agentRunWaitScopeCount(parentRunID: parentRunID)
+    }
+
+    func externalActiveScopeCount() -> Int {
+        server.test_agentRunWaitScopeCount(parentRunID: externalSupervisorRunID)
     }
 
     func publishTerminal() async throws {
@@ -262,7 +521,15 @@ final class AgentRunWaitDrainTestHarness {
             _ = try? await task.value
         }
         server.cleanupRunIDMapping(runID: parentRunID, connectionID: connectionID)
+        server.cleanupRunIDMapping(
+            runID: externalSupervisorRunID,
+            connectionID: externalConnectionID
+        )
         await AgentRunSessionStore.cleanup(registration: fixture.registration)
+        for registration in additionalRegistrations {
+            await AgentRunSessionStore.cleanup(registration: registration)
+        }
+        additionalRegistrations.removeAll()
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
@@ -275,11 +542,15 @@ final class AgentRunWaitDrainTestHarness {
         return window
     }
 
-    private static func makeChildViewModel(windowID: Int) -> AgentModeViewModel {
+    private static func makeChildViewModel(
+        windowID: Int,
+        mcpServer: MCPServerViewModel
+    ) -> AgentModeViewModel {
         AgentModeViewModel(
             testWindowID: windowID,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
-            codexControllerFactory: { _, _, _, _, _, _ in AgentRunWaitDrainCodexController() }
+            codexControllerFactory: { _, _, _, _, _, _ in AgentRunWaitDrainCodexController() },
+            testMCPServer: mcpServer
         )
     }
 
@@ -353,6 +624,43 @@ final class AgentRunWaitDrainTestHarness {
             worktreeBindings: [],
             activeWorktreeMerges: []
         )
+    }
+}
+
+actor AgentRunWaiterWakeBarrier {
+    private var isSuspended = false
+    private var isReleased = false
+    private var suspensionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        guard !isReleased else { return }
+        isSuspended = true
+        let waiters = suspensionWaiters
+        suspensionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                releaseWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { continuation in
+            suspensionWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        guard !isReleased else { return }
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 

@@ -2,6 +2,7 @@
     import Darwin
     import Foundation
     @testable import RepoPromptApp
+    @testable import RepoPromptCodeMapCore
 
     enum WorkspaceCodeMapPhase3BenchmarkMetric: String, CaseIterable {
         case canonicalKeyPipelineConstruction

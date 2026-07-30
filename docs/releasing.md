@@ -21,6 +21,153 @@ RepoPrompt CE starts a new public release line at `1.0.0 (1)`. Its separate
 bundle identifier, Sparkle key pair, and appcast intentionally do not inherit
 the closed app's version history.
 
+## Bundled Codex artifact
+
+Debug and release packaging include the complete official OpenAI Codex 0.145.0
+standalone package. The authority is the repository-owned
+[`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
+official [`rust-v0.145.0` release](https://github.com/openai/codex/releases/tag/rust-v0.145.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package_SHA256SUMS),
+both macOS package assets, their complete extracted layouts, file hashes,
+architectures, and primary executable signing identities. The upstream release
+publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
+verification procedure, so acquisition requires both the fixed HTTPS release
+URLs and agreement between the official checksum file and the independently
+pinned repository manifest.
+
+Packaging is the only automatic acquisition boundary; the app never downloads
+Codex at runtime. To acquire or inspect the cache explicitly:
+
+```bash
+make codex-acquire                         # verifies both macOS packages
+make codex-acquire CODEX_ARCH=host         # current host only
+make codex-status                          # offline verification of both caches
+```
+
+The verified cache lives under `.build/codex-runtime/<manifest-version>/<target>/`
+by default and can be relocated with `REPOPROMPT_CODEX_CACHE_ROOT`. Ordinary
+host-native debug and non-public packaging defaults to the host target and embeds
+one package under that target name. Setting `REPOPROMPT_CODEX_ARCH=all` explicitly
+for one of those host-native lanes embeds both target packages. Universal
+release-candidate and public release lanes always select `all`, acquire and embed
+both official macOS packages, and reject an explicit single-target selection.
+
+Each intact thin package is copied to the stable target-specific layout
+`Contents/Resources/BundledRuntimes/Codex/<target>/`. Ordinary host-native output
+contains only its selected target directory, while explicit
+`REPOPROMPT_CODEX_ARCH=all` output and universal release-candidate/public artifacts
+contain both `aarch64-apple-darwin/` and `x86_64-apple-darwin/`. Runtime selection
+fails closed unless the package matching the running app architecture is present.
+Each target subtree preserves `codex-package.json`, `bin/codex`,
+`bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
+package resources; the binaries inside remain thin and must match the directory's
+target architecture. The two primary macOS executables are
+Developer ID signed by `OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened
+runtime and timestamps. RepoPrompt's signing scripts do **not** thin, mutate, or
+re-sign anything in this subtree. The outer app signature seals the resource
+tree, after which the artifact verifier rechecks every byte, architecture, and
+upstream signature. Privileged staged signing and post-notarization validation
+run the verifier implementation from trusted control-plane tooling while reading
+artifact identity from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`;
+the intentionally minimal staged payload does not carry a second manifest copy.
+This mixed-authority layout passes macOS strict deep code
+signature verification without changing the upstream binary hashes. Actual
+notarization remains enforced by the protected release workflow; if Apple ever
+rejects this policy, stop rather than silently re-signing the upstream payload.
+
+The bundled package is RepoPrompt's default Codex runtime authority; runtime
+selection never falls through to the user's shell `PATH`. Advanced users may set
+one explicit absolute external override with `REPOPROMPT_CODEX_EXECUTABLE`.
+RepoPrompt rejects overrides older than 0.145.0, matching the bundled runtime and
+the documented app-server contract floor. Bundled and external runtimes both use
+RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
+`~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
+`~/.codex` and official Codex App state untouched.
+
+Within that isolated `config.toml`, RepoPrompt owns the
+`[mcp_servers.RepoPromptCE]` launch/policy keys, the managed global tool-output
+limit, and exactly `[features.code_mode].enabled` plus
+`[features.code_mode].direct_only_tool_namespaces`. It preserves other TOML,
+applies repeated updates idempotently, and stops with an actionable conflict
+instead of guessing when the code-mode policy is ambiguous, uses dotted or inline
+definitions that would redefine the owned table/keys, or uses
+`non_prefixed_mcp_tool_names`.
+
+The standalone package also contains the upstream Zsh executable at
+`codex-resources/zsh/bin/zsh`. Its exact Zsh 5.9 licence is included as
+[`ThirdPartyLicenses/codex/ZSH-LICENCE`](../ThirdPartyLicenses/codex/ZSH-LICENCE)
+and is covered by the packaged legal inventory checksum contract.
+
+To diagnose acquisition independently of a build, run:
+
+```bash
+python3 Scripts/codex_runtime_artifact.py acquire --arch all
+python3 Scripts/codex_runtime_artifact.py verify \
+  --arch aarch64-apple-darwin \
+  --package .build/codex-runtime/0.145.0/aarch64-apple-darwin
+python3 Scripts/codex_runtime_artifact.py stage-bundle \
+  --arch all \
+  --cache-root .build/codex-runtime \
+  --bundle /tmp/RepoPrompt-Codex-bundle
+python3 Scripts/codex_runtime_artifact.py verify-bundle \
+  --arch all \
+  --bundle /tmp/RepoPrompt-Codex-bundle
+```
+
+Rotate the pin only by reviewing a new official release and its checksum asset,
+updating every archive and exact-tree hash in the manifest, capturing the new
+license/notice files, and rerunning the offline artifact tests plus a protected
+release candidate. Never derive a new pin from an unverified local installation.
+
+### Guarded Codex update candidates
+
+`Scripts/codex_update_candidate.py` prepares evidence for a possible rotation; it
+does not edit or replace `Vendor/Codex/manifest.json`. Select exactly one explicit
+stable version/tag, or opt in explicitly to GitHub's latest stable release:
+
+```bash
+make codex-update-candidate CODEX_CANDIDATE_VERSION=0.146.0
+make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.146.0
+make codex-update-candidate CODEX_CANDIDATE_LATEST=1
+```
+
+Official mode accepts no baseline or verification-tool override: it uses the
+repository manifest, `/usr/bin/lipo`, `/usr/bin/codesign`, and live official
+`openai/codex` metadata/assets. `--release-json`, `--asset-dir`, or any non-default
+baseline/tool requires `--fixture-mode`; that mode rejects `--latest-stable` and
+marks the report, manifest filename, metadata, marker file, and provenance as a
+**NON-PROMOTABLE TEST FIXTURE**. Fixture provenance records the baseline path and
+digest, explicit selection mode, input sources, and effective tools so fixture
+evidence cannot make an official-online claim.
+
+The tool rejects draft and prerelease releases, requires exactly one checksum
+asset and both exact macOS package assets, bounds downloads to the release-declared
+size, bounds archive members and total expansion, and verifies the archives
+against the upstream checksums. It then
+uses the same artifact verifier as packaging to reject extracted-layout, Mach-O
+inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
+The official output directory contains a proposed `candidate-manifest.json`,
+`candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
+checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
+0.145.0 pin remains authoritative
+until a maintainer reviews and deliberately applies a complete rotation change.
+
+The known-good rollback for the 0.145.0 rotation is verified Codex 0.144.6
+(`rust-v0.144.6`; arm64 archive SHA-256
+`bcbfa76650b6c581505aa5178c1e799d37ff12fc43a35ff16c90b97fa757e63f`, x86_64
+archive SHA-256 `daa3df37c8a041280f52a2198dbe7acbead64936b23f8b660edf9d886df5f9da`).
+After a reviewed rotation, roll back by reverting the complete rotation change and
+rebuilding from the restored manifest rather than mixing old and new authority files.
+
+The manual **Codex Runtime Update Candidate** workflow runs only from `main`, has
+`contents: read`, uploads those evidence files, and cannot commit, open a pull
+request, promote Tip, or publish a release. Local and workflow runs share the same
+repository-owned tool. A report is not approval: it leaves the external override
+floor as an explicit policy decision and requires schema-gate review (including
+`memory_mode`, MCP direct-only behavior, and `thread/start`/`thread/resume`),
+license/NOTICE review, focused validation, rollback confirmation, maintainer
+approval, and soak before any stable rotation.
+
 ## Release ownership
 
 Ordinary contributors prepare release candidates. They do not need Apple
@@ -95,8 +242,10 @@ before the repository reaches that limit.
 
 The workflow uses GitHub concurrency to allow one active and one pending run.
 New successful `main` runs replace an older pending run while an active signing
-or notarization run finishes. Before compiling, it checks for a complete release
-for the immutable `tip-<shortsha>` tag and skips an already-published commit.
+or notarization run finishes. Before compiling, it uses the workflow's read-only
+`github.token` to check for a complete release for the immutable `tip-<shortsha>`
+tag and skips an already-published commit. The protected update-repository token
+remains confined to the publishing job.
 
 Configure a protected GitHub Actions environment named `tip-release`. It can use
 the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
@@ -107,10 +256,16 @@ The publishing script fails closed if this variable points at the source repo or
 the stable update repo. Tip artifacts also include a small `*-metadata.json` asset
 recording the source commit, immutable tag, marketing version, and build number.
 
-Tip builds currently do not enable the Sentry-linked release build or upload
-dSYMs; that keeps the rolling lane focused on fast tester distribution without
-adding the release symbol-upload dependency. Stable releases remain the official
-Sentry-symbolicated lane.
+Tip builds use the same Sentry-linked binary and symbolication policy as stable
+releases. The secret-free stage enables Sentry linking and carries release dSYMs
+inside the staged archive without a DSN or auth token. Only the protected
+`tip-release` signing job receives `SENTRY_DSN`, `SENTRY_AUTH_TOKEN`, and the
+Sentry org/project variables: it injects the DSN through
+`sign_staged_release.sh`, uploads the staged dSYMs before signed assets leave
+the job, and requires the final artifact manifest to record
+`telemetry_enabled: true`. The workflow materializes Sentry auth in an
+owner-only temporary token file and removes it through the job's always-run
+cleanup step.
 
 ## Contributor release candidate
 
@@ -124,8 +279,11 @@ make dev-release-artifact
 The artifact is written under `dist/`. It exercises universal `arm64+x86_64`
 release-mode compilation in isolated SwiftPM directories, resource-equivalence
 checking, unsigned product merging, app bundling, legal-file packaging, and
-archive extraction validation. It is intentionally ad-hoc signed and is not
-suitable for distribution. The ZIP is accompanied by a deterministic external
+archive extraction validation. Coordinated `release artifact` jobs allow up to
+four hours for this dual-architecture path; `package release`, `release package`,
+and `release local-install` retain the normal two-hour release timeout. The
+artifact is intentionally ad-hoc signed and is not suitable for distribution.
+The ZIP is accompanied by a deterministic external
 `*-artifact-manifest.json` and `SHA256SUMS`; the manifest binds bundle versions,
 architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the
@@ -189,7 +347,10 @@ a local-only production app by double-clicking
 in Finder. The Finder launcher requires Python 3, confirms replacement of any
 existing installed app, runs the coordinated developer daemon, and keeps the
 terminal window open so certificate approval prompts and build results remain
-visible.
+visible. Local production packaging requires a full Xcode installation. The
+installer preserves an explicit compatible `DEVELOPER_DIR`; otherwise it uses
+the selected full Xcode or discovers a compatible Xcode app for that process
+without changing the system-wide `xcode-select` setting.
 
 The equivalent command-line path is:
 
@@ -287,15 +448,17 @@ Add these environment secrets:
 | `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
 | `TIP_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-tip-updates` with repository contents read/write permission. Do not reuse the stable update token. |
 | `SENTRY_DSN` | Sentry DSN injected into official signed builds for release routing. It is not a credential, but keep it in the protected release environment so unofficial artifacts do not route telemetry to the official project. |
-| `SENTRY_AUTH_TOKEN` | Sentry release token used for draft-time debug-symbol/release metadata and verified-promotion deploy recording. Provisioning it with `project:releases` only is a manual release gate; tooling does not inspect or change token scopes. |
+| `SENTRY_AUTH_TOKEN` | Sentry Organization Token used for draft-time debug-symbol/release metadata and verified-promotion deploy recording. Create it with the fixed `org:ci` scope; Organization Token scopes are immutable, and release tooling does not inspect or change them. |
 
-Add these non-secret release environment variables when Sentry symbol upload is enabled:
+Add these non-secret GitHub environment variables for Sentry symbol upload in
+both the `release` and `tip-release` environments. The workflows map them to
+the release scripts' `REPOPROMPT_SENTRY_*` names and explicitly set
+`REPOPROMPT_ENABLE_SENTRY=1` for official staging and signing.
 
 | Variable | Contents |
 | --- | --- |
-| `REPOPROMPT_ENABLE_SENTRY` | `1` for official telemetry-enabled release staging. |
-| `REPOPROMPT_SENTRY_ORG` | Sentry organization slug. |
-| `REPOPROMPT_SENTRY_PROJECT` | Sentry project slug. |
+| `SENTRY_ORG` | Sentry organization slug. |
+| `SENTRY_PROJECT` | Sentry project slug. |
 
 Official stable promotion intentionally requires `SENTRY_AUTH_TOKEN` and the Sentry org/project/environment configuration so it can record the verified production deploy only after public verification.
 
@@ -309,12 +472,17 @@ logged, or recorded in artifact manifests so only official signed artifacts rout
 telemetry to the official project. Manifests record only the non-secret
 `telemetry_enabled` boolean.
 
-When Sentry is enabled, release staging generates dSYMs under
-`.build/sentry-symbols/release` and carries them inside the staged release ZIP.
-`release.sh publish-staged` requires `SENTRY_AUTH_TOKEN` (or
+When Sentry is enabled, stable and Tip staging generate dSYMs under
+`.build/sentry-symbols/release` and carry them inside their staged release ZIPs.
+Both lanes use the shared deterministic symbol policy to require, copy, and
+upload those staged symbols with `upload_sentry_debug_symbols.sh`.
+`release.sh publish-staged` additionally requires `SENTRY_AUTH_TOKEN` (or
 `REPOPROMPT_SENTRY_AUTH_TOKEN_FILE`), `REPOPROMPT_SENTRY_ORG`, and
-`REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases, then uploads
-those debug symbols. After the GitHub draft exists, it finalizes the Sentry
+`REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases. Before code
+signing or notarization, it performs a read-only release API preflight. Release
+lookup, creation, commit association, and finalization use Sentry's release API,
+which accepts Organization Tokens with `org:ci`; only debug-symbol upload uses
+`sentry-cli`. After the GitHub draft exists, the script finalizes the Sentry
 release to mark its commit metadata and symbols ready. Finalization does not
 mean that the release is deployed to production.
 The upload helper runs:

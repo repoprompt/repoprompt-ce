@@ -80,7 +80,7 @@ struct CLIProvidersSettingsView: View {
     private var codexStatusText: String? {
         switch viewModel.codexConnectionPhase {
         case .resolvingExecutable:
-            "Looking for Codex CLI in your login-shell PATH…"
+            "Verifying the managed Codex runtime…"
         case .refreshingAuth:
             "Checking Codex authentication…"
         case .testingAppServer:
@@ -1598,7 +1598,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.red)
                             .fixedSize(horizontal: false, vertical: true)
                         if viewModel.isCodexExecutableUnavailable {
-                            Text("After installing Codex or fixing PATH, click Connect to check again.")
+                            Text("Reinstall RepoPrompt CE, or fix/remove REPOPROMPT_CODEX_EXECUTABLE, then click Connect to check again.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1609,7 +1609,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
-                        Text("Run `codex login` in your terminal, or use Login with ChatGPT.")
+                        Text(CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

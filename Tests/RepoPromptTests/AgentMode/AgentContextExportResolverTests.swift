@@ -2,7 +2,7 @@ import Foundation
 @testable import RepoPromptApp
 import XCTest
 
-final class AgentContextExportResolverTests: XCTestCase {
+final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
     func testDisplayFileCountUsesExplicitSelectionAndExcludesAutoCodemaps() {
         let selection = StoredSelection(
             selectedPaths: ["A.swift", "B.swift", "C.swift", "D.swift", "E.swift"],
@@ -302,7 +302,6 @@ final class AgentContextExportResolverTests: XCTestCase {
 
     func testBoundWorktreeAutoCodemapDoesNotUseMetadataOnlyFastPathWhenAutoCodemapEnabled() async throws {
         let fixture = try await makeBoundFixture()
-        _ = try await fixture.store.loadRoot(path: fixture.worktreeRoot.path)
         let source = makeSource(
             logicalRoot: fixture.logicalRoot,
             worktreeRoot: fixture.worktreeRoot,
@@ -316,6 +315,7 @@ final class AgentContextExportResolverTests: XCTestCase {
             codeMapUsage: .auto
         )
 
+        XCTAssertEqual(model.lookupContext.bindingProjection?.isFullyMaterialized, true)
         XCTAssertEqual(model.rows.first?.displayPath, "Sources/App.swift")
         XCTAssertTrue(model.rows.allSatisfy { $0.directContentPath == nil })
     }
@@ -492,7 +492,7 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(runtimeAccessCount.value, 0)
     }
 
-    func testRevokedCodemapLifetimeOmitsStaleTargetBeforeModelPublication() async throws {
+    func testRevokedCodemapLifetimeOmitsUnavailableTargetAndReportsLogicalMissingPath() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         defer { repositoryFixture.cleanup() }
         let logicalRoot = try repositoryFixture.makeRepository(
@@ -518,6 +518,15 @@ final class AgentContextExportResolverTests: XCTestCase {
         let physicalRootID = try XCTUnwrap(boundRoots.first {
             $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
         }?.id)
+        let targetLookup = await store.lookupPath(
+            worktreeRoot.appendingPathComponent("Sources/Target.swift").path,
+            rootScope: lookupContext.rootScope
+        )
+        let target = try XCTUnwrap(targetLookup?.file)
+        let ready = try await readyArtifactDemand(store: store, forFileID: target.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
         let revalidationCount = AgentExportLockedCounter()
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,
@@ -529,6 +538,7 @@ final class AgentContextExportResolverTests: XCTestCase {
                 revalidationCount.increment()
                 if revalidationCount.value == 1 {
                     await store.unloadRoot(id: physicalRootID)
+                    try? FileManager.default.removeItem(at: worktreeRoot)
                 }
             }
         )
@@ -541,12 +551,175 @@ final class AgentContextExportResolverTests: XCTestCase {
             presentationCoordinator: coordinator
         )
 
-        XCTAssertEqual(model.rows.map(\.kind), [.full])
+        XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertEqual(model.missingPaths, ["Sources/Target.swift"])
+        XCTAssertFalse(model.missingPaths.contains { $0.contains(worktreeRoot.path) })
         XCTAssertTrue(model.codemapPresentation.orderedEntries.isEmpty)
         guard case .unavailable = model.codemapCoverage else {
             return XCTFail("Revoked complete export must publish typed incomplete coverage")
         }
-        XCTAssertGreaterThanOrEqual(revalidationCount.value, 1)
+        XCTAssertEqual(revalidationCount.value, 1)
+    }
+
+    func testRevokedCodemapReloadFallsBackToFreshAuthoritativeFullContent() async throws {
+        let canonicalSentinel = "canonicalCodemapReloadSentinel"
+        let revokedSentinel = "revokedCodemapReloadSentinel"
+        let freshSentinel = "freshCodemapReloadSentinel"
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-reload-logical",
+            files: ["Sources/Target.swift": "struct \(canonicalSentinel) {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-reload-worktree",
+            files: ["Sources/Target.swift": "struct \(revokedSentinel) { func revoked() {} }\n"]
+        )
+        let targetURL = worktreeRoot.appendingPathComponent("Sources/Target.swift")
+        let store = try makeIsolatedCodemapStore(name: #function)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let source = makeSource(
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/Target.swift"], codemapAutoEnabled: false)
+        )
+        let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: store)
+        let boundRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        let physicalRoot = try XCTUnwrap(boundRoots.first {
+            $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
+        })
+        let targetLookup = await store.lookupPath(targetURL.path, rootScope: lookupContext.rootScope)
+        let target = try XCTUnwrap(targetLookup?.file)
+        let ready = try await readyArtifactDemand(store: store, forFileID: target.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+        let revalidationCount = AgentExportLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { _ in
+                revalidationCount.increment()
+                guard revalidationCount.value == 1 else { return }
+                await store.unloadRoot(id: physicalRoot.id)
+                try? FileManager.default.removeItem(at: worktreeRoot.appendingPathComponent(".git"))
+                try? "struct \(freshSentinel) { func current() {} }\n".write(
+                    to: targetURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .selected,
+            presentationCoordinator: coordinator
+        )
+
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertEqual(row.kind, .full)
+        XCTAssertNotEqual(row.rootID, physicalRoot.id)
+        guard case .unavailable = model.codemapCoverage else {
+            return XCTFail("Unavailable replacement codemap must retain typed unavailable coverage")
+        }
+        let preview = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: store,
+            purpose: .preview
+        )
+        XCTAssertTrue(preview?.contains(freshSentinel) == true, preview ?? "")
+        XCTAssertFalse(preview?.contains(revokedSentinel) == true, preview ?? "")
+        XCTAssertFalse(preview?.contains(canonicalSentinel) == true, preview ?? "")
+        XCTAssertFalse(row.displayPath.contains(worktreeRoot.path), row.displayPath)
+        XCTAssertEqual(revalidationCount.value, 1)
+    }
+
+    func testRevokedCodemapClipboardPublishesFreshBoundBytesOnly() async throws {
+        let canonicalSentinel = "canonicalClipboardRevocationSentinel"
+        let revokedSentinel = "revokedClipboardRevocationSentinel"
+        let freshSentinel = "freshClipboardRevocationSentinel"
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { repositoryFixture.cleanup() }
+        let logicalRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-clipboard-logical",
+            files: ["Sources/Target.swift": "struct \(canonicalSentinel) {}\n"]
+        )
+        let worktreeRoot = try repositoryFixture.makeRepository(
+            named: "agent-export-clipboard-worktree",
+            files: ["Sources/Target.swift": "struct \(revokedSentinel) { func revoked() {} }\n"]
+        )
+        let targetURL = worktreeRoot.appendingPathComponent("Sources/Target.swift")
+        let store = try makeIsolatedCodemapStore(name: #function)
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let source = makeSource(
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot,
+            selection: StoredSelection(selectedPaths: ["Sources/Target.swift"], codemapAutoEnabled: false)
+        )
+        let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: store)
+        let boundRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        let physicalRoot = try XCTUnwrap(boundRoots.first {
+            $0.standardizedFullPath == worktreeRoot.standardizedFileURL.path
+        })
+        let targetLookup = await store.lookupPath(targetURL.path, rootScope: lookupContext.rootScope)
+        let target = try XCTUnwrap(targetLookup?.file)
+        let ready = try await readyArtifactDemand(store: store, forFileID: target.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+        let revalidationCount = AgentExportLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { _ in
+                revalidationCount.increment()
+                guard revalidationCount.value == 1 else { return }
+                await store.unloadRoot(id: physicalRoot.id)
+                try? FileManager.default.removeItem(at: worktreeRoot.appendingPathComponent(".git"))
+                try? "struct \(freshSentinel) { func current() {} }\n".write(
+                    to: targetURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+        )
+
+        let clipboard = await AgentContextExportResolver.buildClipboardContent(
+            AgentContextClipboardRequest(
+                cfg: makeConfig(gitInclusion: .none, codeMapUsage: .selected),
+                source: source,
+                store: store,
+                lookupContext: lookupContext,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: true,
+                showCodeMapMarkers: true,
+                metaInstructions: [],
+                includeDatetimeInUserInstructions: false,
+                promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+                disabledPromptSections: [],
+                duplicateUserInstructionsAtTop: false,
+                reviewGitContext: .automaticOnly(),
+                completeGitDiffProvider: { "" }
+            ),
+            presentationCoordinator: coordinator
+        )
+
+        XCTAssertTrue(clipboard.contains(freshSentinel), clipboard)
+        XCTAssertFalse(clipboard.contains(revokedSentinel), clipboard)
+        XCTAssertFalse(clipboard.contains(canonicalSentinel), clipboard)
+        XCTAssertFalse(clipboard.contains(worktreeRoot.path), clipboard)
+        XCTAssertFalse(clipboard.contains(worktreeRoot.lastPathComponent), clipboard)
+        XCTAssertEqual(revalidationCount.value, 1)
     }
 
     func testBoundExportFailsClosedWhenPhysicalWorktreeCannotBeLoaded() async throws {
@@ -570,7 +743,10 @@ final class AgentContextExportResolverTests: XCTestCase {
             filePathDisplay: .relative,
             codeMapUsage: .none
         )
-        XCTAssertEqual(model.lookupContext.bindingProjection?.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
+        XCTAssertEqual(
+            model.lookupContext,
+            AgentWorkspaceLookupContextResolver.failClosedLookupContext
+        )
         XCTAssertTrue(model.rows.isEmpty)
         XCTAssertEqual(model.missingPaths, ["Sources/App.swift"])
         XCTAssertFalse(model.missingPaths.contains { $0.contains(unloadablePhysicalRoot.path) })
