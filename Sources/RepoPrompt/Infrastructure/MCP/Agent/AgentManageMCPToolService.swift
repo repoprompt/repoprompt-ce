@@ -1333,7 +1333,7 @@ struct AgentManageMCPToolService {
             }
             let parent = url.deletingLastPathComponent()
             try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-            let options: Data.WritingOptions = overwrite ? [.atomic] : [.atomic, .withoutOverwriting]
+            let options: Data.WritingOptions = overwrite ? [.atomic] : [.withoutOverwriting]
             do {
                 try data.write(to: url, options: options)
             } catch {
