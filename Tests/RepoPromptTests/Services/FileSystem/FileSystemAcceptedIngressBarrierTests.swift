@@ -13,6 +13,103 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testFSEventCallbackQueueIsSerialOffMainAndCanBeFenced() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemWatcherCallbackQueue")
+        let service = try await makeService(root: root)
+        let queue = service.fseventCallbackQueue
+        XCTAssertNotEqual(queue.label, DispatchQueue.main.label)
+
+        let callbackContext = FileSystemServiceFSEventCallbackContext(service: nil)
+        XCTAssertTrue(callbackContext.isActive)
+        callbackContext.deactivate()
+        XCTAssertFalse(callbackContext.isActive)
+
+        let expectation = expectation(description: "serial callback ordering")
+        let values = LockedValues()
+        for value in 0 ..< 4 {
+            queue.async {
+                values.append(value)
+                if value == 3 {
+                    expectation.fulfill()
+                }
+            }
+        }
+        await fulfillment(of: [expectation], timeout: 1)
+        XCTAssertEqual(values.snapshot(), [0, 1, 2, 3])
+    }
+
+    func testLargeFSEventCallbackIsBoundedWithRecoverySentinel() {
+        let count = 5000
+        let paths = (0 ..< count).map { "/root/file-\($0)" as NSString }
+        let flags = Array(repeating: createdFileFlags, count: count)
+        let ids = (1 ... FSEventStreamEventId(count)).map(\.self)
+        let payload = FileSystemService.buildOwnedFSEventPayloadFromCFArrayForTesting(
+            pathObjects: paths,
+            flags: flags,
+            ids: ids
+        )
+        XCTAssertEqual(payload?.entries.count, 4097)
+        XCTAssertTrue(payload?.isTruncated ?? false)
+        let mustScanSubdirectories = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+        XCTAssertNotEqual((payload?.entries.last?.flags ?? 0) & mustScanSubdirectories, 0)
+        XCTAssertEqual(payload?.entries.last?.id, FSEventStreamEventId(count))
+    }
+
+    func testLargeCallbackWithTrailingIgnoreFileDeletionRebuildsIgnoreRules() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "LargeCallbackIgnoreDeletion")
+        let gitignoreURL = root.appendingPathComponent(".gitignore")
+        let ignoredURL = root.appendingPathComponent("ignored.txt")
+        try "*.txt\n".write(to: gitignoreURL, atomically: true, encoding: .utf8)
+        try "ignored".write(to: ignoredURL, atomically: true, encoding: .utf8)
+
+        let service = try await makeService(root: root)
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+        defer { cancellable.cancel() }
+
+        // Delete the ignore control file on disk before the truncated callback arrives.
+        try FileManager.default.removeItem(at: gitignoreURL)
+
+        let count = 5000
+        let rootPath = root.path
+        var paths: [AnyObject] = (0 ..< count).map { index in
+            if index == count - 1 {
+                return (rootPath + "/.gitignore") as NSString
+            }
+            return (rootPath + "/filler-\(index)") as NSString
+        }
+        var flags = Array(repeating: createdFileFlags, count: count)
+        flags[count - 1] = removedFileFlags
+        let ids = (1 ... count).map { FSEventStreamEventId($0) }
+
+        let payload = try XCTUnwrap(FileSystemService.buildOwnedFSEventPayloadFromCFArrayForTesting(
+            pathObjects: paths,
+            flags: flags,
+            ids: ids
+        ))
+        XCTAssertEqual(payload.entries.count, 4097)
+        XCTAssertTrue(payload.isTruncated)
+
+        let events = payload.entries.map { entry in
+            (absolutePath: entry.path, flags: entry.flags, eventId: entry.id)
+        }
+        await service.acceptWatcherPayloadForTesting(events, isTruncated: payload.isTruncated)
+        _ = await service.flushPendingEventsNow()
+
+        let allDeltas = publications.snapshot().flatMap(\.deltas)
+        let addedPaths = allDeltas.compactMap { delta -> String? in
+            if case let .fileAdded(path) = delta {
+                return path
+            }
+            return nil
+        }
+        XCTAssertTrue(
+            addedPaths.contains("ignored.txt"),
+            "Truncated callback must rebuild ignore rules so the previously ignored file becomes visible"
+        )
+    }
+
     func testAcceptedBeforeAndAfterCaptureCutsPublishIndependentWatermarks() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressBarrier")
         let service = try await makeService(root: root)
@@ -107,6 +204,56 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let filter = await service.watcherEarlyFilterSnapshotForTesting()
         XCTAssertTrue(filter.isValid)
         XCTAssertEqual(filter.filteredEntryCount, 10)
+        let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+        XCTAssertEqual(diagnostics.callbackCount, 10)
+        XCTAssertEqual(diagnostics.sourceEntryCount, 10)
+        XCTAssertEqual(diagnostics.retainedEntryCount, 0)
+        XCTAssertEqual(diagnostics.earlyFilteredEntryCount, 10)
+        XCTAssertTrue(diagnostics.recoveryEpisodes.isEmpty)
+    }
+
+    func testIgnoredBuildBurstWithRecoverySignalProducesOneFullResync() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressIgnoredRecovery")
+        try ".build/\n".write(
+            to: root.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let service = try await makeService(
+            root: root,
+            maxPendingWatcherIngressEntries: 4
+        )
+        let publications = LockedPublications()
+        let publisher = await service.publisherForChanges()
+        let cancellable = publisher.sink { publications.append($0) }
+
+        var entries: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)] =
+            (1 ... 20).map { eventID in
+                (
+                    root.appendingPathComponent(".build/churn-\(eventID).o").path,
+                    createdFileFlags,
+                    FSEventStreamEventId(eventID)
+                )
+            }
+        entries.append((
+            "/",
+            FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                | FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped),
+            21
+        ))
+
+        let acceptedPayload = await service.acceptWatcherPayloadForTesting(entries, scheduleDrain: false)
+        let accepted = try XCTUnwrap(acceptedPayload)
+        _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: accepted)
+
+        let fullResyncs = publications.snapshot().filter(\.requiresFullResync)
+        XCTAssertEqual(fullResyncs.count, 1)
+        XCTAssertEqual(fullResyncs.first?.watcherAcceptedWatermark, accepted)
+        let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+        XCTAssertEqual(diagnostics.recoveryEpisodes.count, 1)
+        XCTAssertTrue(diagnostics.recoveryEpisodes[0].causes.contains(.kernelDropped))
+        XCTAssertTrue(diagnostics.recoveryEpisodes[0].completedFullResync)
+        cancellables.insert(cancellable)
     }
 
     func testMixedIgnoredAndVisibleEventsPreserveVisibleOrderingAndWatermarks() async throws {
@@ -175,6 +322,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let filter = await service.watcherEarlyFilterSnapshotForTesting()
         XCTAssertFalse(filter.isValid)
         XCTAssertEqual(filter.filteredEntryCount, 1)
+        let firstPayload = try XCTUnwrap(service.watcherIngressMailbox.takeNextAcceptedPayload())
+        XCTAssertTrue(firstPayload.ingressEvidence.triggers.contains(.ignoreControl))
+        XCTAssertTrue(firstPayload.ingressEvidence.recoveryCauses.isEmpty)
     }
 
     func testMailboxOverflowRootRescanPreservesHighestAcceptedWatermark() async throws {
@@ -203,8 +353,17 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let publication = try XCTUnwrap(publications.snapshot().last)
         XCTAssertEqual(publication.source, .overflowRootRescan)
         XCTAssertEqual(publication.watcherAcceptedWatermark, highest)
+        XCTAssertTrue(publication.requiresFullResync)
         let serviceState = await service.publicationStateForTesting()
         XCTAssertEqual(serviceState.lastPublishedWatcherAcceptedWatermark, highest)
+        let diagnostics = service.watcherRecoveryDiagnosticsSnapshotForTesting()
+        let episode = try XCTUnwrap(diagnostics.recoveryEpisodes.last)
+        XCTAssertTrue(episode.triggers.contains(.mailboxCapacity))
+        XCTAssertTrue(episode.causes.contains(.mailboxCapacity))
+        XCTAssertTrue(episode.triggeredRootRescan)
+        XCTAssertTrue(episode.triggeredFullResync)
+        XCTAssertTrue(episode.completedFullResync)
+        XCTAssertEqual(episode.acceptedHighWatermark, highest.rawValue)
         cancellables.insert(cancellable)
     }
 
@@ -352,7 +511,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
             while mailbox.takeNextAcceptedPayload() != nil {}
         }
         for _ in 0 ..< 100 {
-            if await drainCount.value() > 0 { break }
+            if await drainCount.value() > 0 {
+                break
+            }
             await Task.yield()
         }
         let resumedDrainCount = await drainCount.value()
@@ -601,6 +762,10 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile)
     }
 
+    private var removedFileFlags: FSEventStreamEventFlags {
+        FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemIsFile)
+    }
+
     private func callbackPayload(path: String, eventID: FSEventStreamEventId) -> FSEventCallbackPayload {
         FSEventCallbackPayload(entries: [
             FSEventCallbackEntry(path: path, flags: createdFileFlags, id: eventID)
@@ -691,5 +856,22 @@ private actor AsyncCounter {
 
     func value() -> Int {
         count
+    }
+}
+
+private final class LockedValues: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Int] = []
+
+    func append(_ value: Int) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }

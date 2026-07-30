@@ -32,6 +32,8 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         let acceptedHighWatermark: Watermark
         let contents: Contents
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+        let ingressEvidence: FileSystemWatcherIngressEvidence
+        let isTruncated: Bool
 
         var rawEntryCount: Int {
             switch contents {
@@ -139,7 +141,9 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
             lowestAcceptedWatermark: watermark,
             acceptedHighWatermark: watermark,
             contents: .entries(payload.entries),
-            lifecycleCorrelation: lifecycleCorrelation
+            lifecycleCorrelation: lifecycleCorrelation,
+            ingressEvidence: payload.ingressEvidence,
+            isTruncated: payload.isTruncated
         )
         appendOrCollapse(acceptedPayload)
         if let scheduleDrain {
@@ -201,14 +205,18 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         var acceptedHighWatermark = payload.acceptedHighWatermark
         var highestEventID: FSEventStreamEventId = 0
         var changedIgnoreAbsolutePaths = Set<String>()
+        var ingressEvidence = FileSystemWatcherIngressEvidence.empty
+        var isTruncated = false
         for queuedPayload in payloads {
             lowestAcceptedWatermark = min(lowestAcceptedWatermark, queuedPayload.lowestAcceptedWatermark)
             acceptedHighWatermark = max(acceptedHighWatermark, queuedPayload.acceptedHighWatermark)
+            ingressEvidence = ingressEvidence.merging(queuedPayload.ingressEvidence)
+            isTruncated = isTruncated || queuedPayload.isTruncated
             switch queuedPayload.contents {
             case let .entries(entries):
                 for entry in entries {
                     highestEventID = max(highestEventID, entry.id)
-                    if Self.isIgnoreControlPath(entry.path) {
+                    if FileSystemWatcherPathClassifier.isIgnoreControlPath(entry.path) {
                         changedIgnoreAbsolutePaths.insert(entry.path)
                     }
                 }
@@ -217,6 +225,10 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
                 changedIgnoreAbsolutePaths.formUnion(queuedIgnorePaths)
             }
         }
+        ingressEvidence = ingressEvidence.addingCapacityRecovery(
+            cause: .mailboxCapacity,
+            trigger: .mailboxCapacity
+        )
         queuedPayloads = [AcceptedPayload(
             lowestAcceptedWatermark: lowestAcceptedWatermark,
             acceptedHighWatermark: acceptedHighWatermark,
@@ -224,7 +236,9 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
                 highestEventID: highestEventID,
                 changedIgnoreAbsolutePaths: changedIgnoreAbsolutePaths
             ),
-            lifecycleCorrelation: payload.lifecycleCorrelation
+            lifecycleCorrelation: payload.lifecycleCorrelation,
+            ingressEvidence: ingressEvidence,
+            isTruncated: isTruncated
         )]
         queuedPayloadHead = 0
         queuedRawEntryCount = 1
@@ -271,10 +285,5 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         drainTask = nil
         scheduleDrainIfNeeded(scheduleDrain)
         lock.unlock()
-    }
-
-    private static func isIgnoreControlPath(_ path: String) -> Bool {
-        let filename = (path as NSString).lastPathComponent.lowercased()
-        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
     }
 }

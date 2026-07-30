@@ -12,6 +12,18 @@ struct FSEventCallbackEntry {
 
 struct FSEventCallbackPayload {
     let entries: [FSEventCallbackEntry]
+    let ingressEvidence: FileSystemWatcherIngressEvidence
+    let isTruncated: Bool
+
+    init(
+        entries: [FSEventCallbackEntry],
+        ingressEvidence: FileSystemWatcherIngressEvidence = .empty,
+        isTruncated: Bool = false
+    ) {
+        self.entries = entries
+        self.ingressEvidence = ingressEvidence
+        self.isTruncated = isTruncated
+    }
 
     var count: Int {
         entries.count
@@ -242,7 +254,8 @@ extension FileSystemService {
               pendingQuietFolderScanTargets.isEmpty,
               dirtyRecoveryScanTargets.isEmpty,
               recoveryScanFailureCountByFolder.isEmpty,
-              recoveryScanRetryTask == nil
+              recoveryScanRetryTask == nil,
+              recoveryEpisode == nil
         else {
             return false
         }
@@ -262,6 +275,7 @@ extension FileSystemService {
         throughAcceptedWatcherWatermark target: FileSystemWatcherIngressMailbox.Watermark
     ) async -> UInt64 {
         guard !Task.isCancelled else { return lastServicePublicationSequence }
+        let expectedIngressGeneration = watcherIngressGeneration
         #if DEBUG
             freshnessFlushCallCount += 1
         #endif
@@ -274,7 +288,9 @@ extension FileSystemService {
         #endif
 
         while lastPublishedWatcherAcceptedWatermark < target {
-            guard !Task.isCancelled else { return lastServicePublicationSequence }
+            guard !Task.isCancelled,
+                  expectedIngressGeneration == watcherIngressGeneration
+            else { return lastServicePublicationSequence }
             if let watcherBatchProcessingTask {
                 await watcherBatchProcessingTask.value
                 guard !Task.isCancelled else { return lastServicePublicationSequence }
@@ -291,6 +307,16 @@ extension FileSystemService {
                         await recoveryScanRetryTask.value
                         continue
                     }
+                    if recoveryIsQuiescent {
+                        let didReactivate = await waitForRecoveryReactivation(
+                            expectedIngressGeneration: expectedIngressGeneration
+                        )
+                        guard didReactivate else { return lastServicePublicationSequence }
+                        continue
+                    }
+                }
+                guard expectedIngressGeneration == watcherIngressGeneration else {
+                    return lastServicePublicationSequence
                 }
                 // A callback cut must remain representable even if accepted payloads
                 // were explicitly abandoned during watcher teardown or produced no deltas.
@@ -387,7 +413,7 @@ extension FileSystemService {
             throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
         }
 
-        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamSetDispatchQueue(stream, fseventCallbackQueue)
         #if DEBUG
             let didStart = watcherActivationFailurePointForTesting == .streamStart ? false : FSEventStreamStart(stream)
         #else
@@ -395,6 +421,7 @@ extension FileSystemService {
         #endif
         if !didStart {
             // Clean up to avoid leaks
+            deactivateFSEventCallbackContext()
             FSEventStreamInvalidate(stream)
             FSEventStreamRelease(stream)
             fseventStreamRef = nil
@@ -407,13 +434,13 @@ extension FileSystemService {
 
     func stopFSEventStream() {
         if let stream = fseventStreamRef {
-            nextFSEventStreamStartEventID = max(
-                nextFSEventStreamStartEventID,
-                FSEventStreamGetLatestEventId(stream)
-            )
             FSEventStreamStop(stream)
             FSEventStreamFlushSync(stream)
             FSEventStreamInvalidate(stream)
+            // Drain callbacks that were already submitted before releasing their
+            // unretained context pointer.
+            fseventCallbackQueue.sync {}
+            deactivateFSEventCallbackContext()
             FSEventStreamRelease(stream)
             fseventStreamRef = nil
 
@@ -425,6 +452,13 @@ extension FileSystemService {
         }
 
         resetWatcherIngressState()
+    }
+
+    private func deactivateFSEventCallbackContext() {
+        guard let ptr = fseventCallbackContextPointer else { return }
+        Unmanaged<FileSystemServiceFSEventCallbackContext>.fromOpaque(ptr)
+            .takeUnretainedValue()
+            .deactivate()
     }
 
     private func releaseFSEventCallbackContext() {
@@ -470,7 +504,8 @@ extension FileSystemService {
         eventIds: UnsafePointer<FSEventStreamEventId>
     ) -> FSEventCallbackPayload? {
         let cfArray = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
-        let safeCount = min(numEvents, CFArrayGetCount(cfArray))
+        let availableCount = min(numEvents, CFArrayGetCount(cfArray))
+        let safeCount = min(availableCount, maximumCallbackEntries)
         guard safeCount > 0 else { return nil }
 
         var entries: [FSEventCallbackEntry] = []
@@ -504,19 +539,31 @@ extension FileSystemService {
             )
         }
 
-        guard !entries.isEmpty else { return nil }
-        return FSEventCallbackPayload(entries: entries)
+        if entries.isEmpty, availableCount <= safeCount { return nil }
+        let isTruncated = availableCount > safeCount
+        if isTruncated {
+            // Do not synchronously walk an unbounded burst. The sentinel preserves the
+            // highest callback event ID and forces the existing whole-root recovery path.
+            entries.append(FSEventCallbackEntry(
+                path: "",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                    | FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped),
+                id: eventIds[availableCount - 1]
+            ))
+        }
+        return FSEventCallbackPayload(entries: entries, isTruncated: isTruncated)
     }
 
     /// The static callback that FSEvents uses to report changes. We hand off to Task to enter the actor context.
     static let fseventCallback: FSEventStreamCallback = {
         _, context, numEvents, eventPaths, eventFlags, eventIds in
+        let callbackStart = DispatchTime.now().uptimeNanoseconds
         // Context must be valid
         guard let context else { return }
         let callbackContext = Unmanaged<FileSystemServiceFSEventCallbackContext>
             .fromOpaque(context)
             .takeUnretainedValue()
-        guard let service = callbackContext.service else { return }
+        guard callbackContext.isActive, let service = callbackContext.service else { return }
 
         let count = Int(numEvents)
         guard count > 0 else { return }
@@ -551,18 +598,38 @@ extension FileSystemService {
             }
         #endif
 
+        var evidence = FileSystemWatcherIngressEvidence.callback(
+            sourcePayload: payload,
+            retainedEntryCount: payload.count,
+            earlyFilteredEntryCount: 0,
+            callbackDurationMicroseconds: 0
+        )
+        let analyzedPayload = FSEventCallbackPayload(
+            entries: payload.entries,
+            ingressEvidence: evidence,
+            isTruncated: payload.isTruncated
+        )
         // A wrapped journal can never be proven safe by path filtering. Preserve
         // the signal so strict seeded replay rejects it even when its path would
         // otherwise be ignored by the immutable early-filter snapshot.
-        let hasWrappedJournal = payload.entries.contains { entry in
-            (entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)) != 0
-        }
-        let filterResult = if hasWrappedJournal {
-            FileSystemWatcherEarlyFilter.Result(payload: payload, filteredEntryCount: 0)
+        let filterResult = if evidence.recoveryCauses.contains(.eventIDsWrapped) {
+            FileSystemWatcherEarlyFilter.Result(payload: analyzedPayload, filteredEntryCount: 0)
         } else {
-            service.watcherEarlyFilter.filter(payload)
+            service.watcherEarlyFilter.filter(analyzedPayload)
         }
-        guard let retainedPayload = filterResult.payload else { return }
+        let callbackDuration = (DispatchTime.now().uptimeNanoseconds - callbackStart) / 1000
+        evidence = evidence.finalizingCallback(
+            retainedEntryCount: filterResult.payload?.count ?? 0,
+            earlyFilteredEntryCount: filterResult.filteredEntryCount,
+            callbackDurationMicroseconds: callbackDuration
+        )
+        service.watcherRecoveryDiagnostics.recordCallback(evidence)
+        guard let filteredPayload = filterResult.payload else { return }
+        let retainedPayload = FSEventCallbackPayload(
+            entries: filteredPayload.entries,
+            ingressEvidence: evidence,
+            isTruncated: filteredPayload.isTruncated
+        )
 
         let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
         let acceptedWatermark = service.watcherIngressMailbox.accept(
@@ -611,10 +678,22 @@ extension FileSystemService {
             )
         )
 
+        // A truncated payload may have dropped ignore-control deletions in the
+        // discarded tail; conservatively rebuild all ignore rules before any later
+        // reconciliation or full resync.
+        if payload.isTruncated {
+            overflowChangedIgnoreDirs.insert("")
+        }
+
         switch payload.contents {
         case let .entries(entries):
-            enqueueFSEventEntries(entries, acceptedHighWatermark: payload.acceptedHighWatermark)
+            enqueueFSEventEntries(
+                entries,
+                acceptedHighWatermark: payload.acceptedHighWatermark,
+                ingressEvidence: payload.ingressEvidence
+            )
         case let .overflowRootRescan(highestEventID, changedIgnoreAbsolutePaths):
+            pendingWatcherIngressEvidence = pendingWatcherIngressEvidence.merging(payload.ingressEvidence)
             nextFSEventStreamStartEventID = max(nextFSEventStreamStartEventID, highestEventID)
             overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: changedIgnoreAbsolutePaths.map { ($0, 0, 0) }))
             collapsePendingEventsToRootRescan(
@@ -622,17 +701,22 @@ extension FileSystemService {
                 acceptedHighWatermark: payload.acceptedHighWatermark
             )
         }
+        if reactivateQuiescentRecoveryIfNeeded() {
+            pendingQuietFolderScanTargets.formUnion(dirtyRecoveryScanTargets)
+        }
         scheduleCoalescingIfNeeded()
     }
 
     func enqueueFSEventEntries(
         _ entries: [FSEventCallbackEntry],
-        acceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil
+        acceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil,
+        ingressEvidence: FileSystemWatcherIngressEvidence = .empty
     ) {
         guard !entries.isEmpty else { return }
         let payloadMaxEventID = entries.map(\.id).max() ?? 0
         nextFSEventStreamStartEventID = max(nextFSEventStreamStartEventID, payloadMaxEventID)
         if hasPendingOverflowRescan {
+            pendingWatcherIngressEvidence = pendingWatcherIngressEvidence.merging(ingressEvidence)
             overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: entries.map { ($0.path, $0.flags, $0.id) }))
             collapsePendingEventsToRootRescan(
                 upTo: max(pendingFSEvents.first?.id ?? 0, payloadMaxEventID),
@@ -643,6 +727,9 @@ extension FileSystemService {
 
         let projectedCount = pendingFSEvents.count + entries.count
         if projectedCount > Self.maxPendingRawEvents {
+            pendingWatcherIngressEvidence = pendingWatcherIngressEvidence
+                .merging(ingressEvidence)
+                .addingCapacityRecovery(cause: .serviceCapacity, trigger: .serviceCapacity)
             let bufferedMaxEventID = pendingFSEvents.map(\.id).max() ?? 0
             let maxEventID = max(bufferedMaxEventID, payloadMaxEventID)
             overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: pendingFSEvents))
@@ -659,13 +746,117 @@ extension FileSystemService {
 
         pendingFSEvents.reserveCapacity(projectedCount)
         pendingFSEvents.append(contentsOf: entries.map { ($0.path, $0.flags, $0.id) })
+        pendingWatcherIngressEvidence = pendingWatcherIngressEvidence.merging(ingressEvidence)
         if let acceptedHighWatermark {
             pendingWatcherAcceptedHighWatermark = max(pendingWatcherAcceptedHighWatermark ?? .zero, acceptedHighWatermark)
         }
     }
 
+    var recoveryRetryIsAuthorized: Bool {
+        !pendingQuietFolderScanTargets.intersection(dirtyRecoveryScanTargets).isEmpty
+    }
+
+    var recoveryIsQuiescent: Bool {
+        recoveryEpisode?.phase == .quiescent
+    }
+
+    func beginOrMergeRecoveryEpisode(evidence: FileSystemWatcherIngressEvidence) {
+        if recoveryEpisode == nil {
+            recoveryEpisode = FileSystemWatcherRecoveryEpisodeState(
+                evidence: evidence,
+                phase: .recovering,
+                failedFullResyncCount: 0
+            )
+        } else {
+            recoveryEpisode?.merge(evidence)
+        }
+    }
+
+    @discardableResult
+    func reactivateQuiescentRecoveryIfNeeded() -> Bool {
+        guard recoveryEpisode?.phase == .quiescent else { return false }
+        recoveryEpisode?.phase = .recovering
+        recoveryEpisode?.failedFullResyncCount = 0
+        recoveryScanFailureCountByFolder.removeAll(keepingCapacity: false)
+        let waiters = recoveryReactivationWaiters
+        recoveryReactivationWaiters.removeAll(keepingCapacity: false)
+        for continuation in waiters.values {
+            continuation.resume(returning: true)
+        }
+        return true
+    }
+
+    public func requestWatcherRecovery() {
+        guard reactivateQuiescentRecoveryIfNeeded() else { return }
+        pendingQuietFolderScanTargets.formUnion(dirtyRecoveryScanTargets)
+        _ = startProcessingPendingWatcherBatchIfNeeded()
+    }
+
+    func recordFullResyncFailure(
+        failedBatchHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
+    ) {
+        guard var episode = recoveryEpisode else { return }
+        episode.failedFullResyncCount += 1
+        if episode.failedFullResyncCount >= maxRecoveryFullResyncFailures {
+            let hasNewerAcceptedEvidence = if let failedBatchHighWatermark,
+                                              let pendingWatcherAcceptedHighWatermark
+            {
+                pendingWatcherAcceptedHighWatermark > failedBatchHighWatermark
+            } else {
+                pendingWatcherAcceptedHighWatermark != nil
+            }
+            if hasNewerAcceptedEvidence {
+                episode.phase = .recovering
+                episode.failedFullResyncCount = 0
+                pendingQuietFolderScanTargets.formUnion(dirtyRecoveryScanTargets)
+            } else {
+                episode.phase = .quiescent
+                recoveryScanRetryTask?.cancel()
+                recoveryScanRetryTask = nil
+            }
+        }
+        recoveryEpisode = episode
+    }
+
+    func clearRecoveryEpisode() {
+        recoveryEpisode = nil
+    }
+
+    func resumeRecoveryReactivationWaiters(returning value: Bool) {
+        let waiters = recoveryReactivationWaiters
+        recoveryReactivationWaiters.removeAll(keepingCapacity: false)
+        for continuation in waiters.values {
+            continuation.resume(returning: value)
+        }
+    }
+
+    func waitForRecoveryReactivation(expectedIngressGeneration: UInt64) async -> Bool {
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard expectedIngressGeneration == watcherIngressGeneration,
+                      recoveryIsQuiescent
+                else {
+                    continuation.resume(returning: expectedIngressGeneration == watcherIngressGeneration)
+                    return
+                }
+                recoveryReactivationWaiters[waiterID] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancelRecoveryReactivationWaiter(waiterID) }
+        }
+    }
+
+    func cancelRecoveryReactivationWaiter(_ waiterID: UUID) {
+        recoveryReactivationWaiters.removeValue(forKey: waiterID)?.resume(returning: false)
+    }
+
     func scheduleCoalescingIfNeeded() {
-        guard coalescingTask == nil, !pendingFSEvents.isEmpty else { return }
+        guard coalescingTask == nil,
+              !pendingFSEvents.isEmpty,
+              !recoveryIsQuiescent,
+              recoveryEpisode == nil || dirtyRecoveryScanTargets.isEmpty || recoveryRetryIsAuthorized
+        else { return }
         coalescingTask = Task { [weak self] in
             do {
                 guard let self else { return }
@@ -697,6 +888,13 @@ extension FileSystemService {
     @discardableResult
     func startProcessingPendingWatcherBatchIfNeeded() -> Bool {
         guard watcherBatchProcessingTask == nil else { return true }
+        guard !recoveryIsQuiescent else { return false }
+        if recoveryEpisode != nil,
+           !dirtyRecoveryScanTargets.isEmpty,
+           !recoveryRetryIsAuthorized
+        {
+            return false
+        }
         let canPublishParkedWatermark = pendingWatcherAcceptedHighWatermark != nil
             && dirtyRecoveryScanTargets.isEmpty
         guard !pendingFSEvents.isEmpty || !pendingQuietFolderScanTargets.isEmpty || canPublishParkedWatermark else {
@@ -731,7 +929,9 @@ extension FileSystemService {
         guard watcherBatchProcessingToken == token else { return }
         watcherBatchProcessingTask = nil
         watcherBatchProcessingToken = nil
-        if !pendingFSEvents.isEmpty {
+        if recoveryEpisode != nil, !dirtyRecoveryScanTargets.isEmpty {
+            scheduleDirtyRecoveryScanRetryIfNeeded()
+        } else if !pendingFSEvents.isEmpty {
             scheduleCoalescingIfNeeded()
         } else if !pendingQuietFolderScanTargets.isEmpty {
             _ = startProcessingPendingWatcherBatchIfNeeded()
@@ -741,7 +941,10 @@ extension FileSystemService {
     }
 
     func scheduleDirtyRecoveryScanRetryIfNeeded() {
-        guard recoveryScanRetryTask == nil, !dirtyRecoveryScanTargets.isEmpty else { return }
+        guard recoveryScanRetryTask == nil,
+              !dirtyRecoveryScanTargets.isEmpty,
+              !recoveryIsQuiescent
+        else { return }
         let highestAttempt = dirtyRecoveryScanTargets.compactMap { recoveryScanFailureCountByFolder[$0] }.max() ?? 1
         let exponent = min(max(0, highestAttempt - 1), 5)
         let multiplier = UInt64(1 << exponent)
@@ -806,11 +1009,13 @@ extension FileSystemService {
             events: pendingFSEvents,
             watcherAcceptedHighWatermark: pendingWatcherAcceptedHighWatermark,
             publicationSource: pendingWatcherPublicationSource,
-            watcherIngressGeneration: watcherIngressGeneration
+            watcherIngressGeneration: watcherIngressGeneration,
+            ingressEvidence: pendingWatcherIngressEvidence
         )
         pendingFSEvents.removeAll(keepingCapacity: false)
         pendingWatcherAcceptedHighWatermark = nil
         pendingWatcherPublicationSource = .watcher
+        pendingWatcherIngressEvidence = .empty
         hasPendingOverflowRescan = false
         return batch
     }
@@ -831,16 +1036,22 @@ extension FileSystemService {
         watcherIngressMailbox.stopAcceptingAndDiscardPending()
         watcherIngressGeneration &+= 1
         cancelScheduledCoalescingDelay()
-        watcherBatchProcessingTask?.cancel()
+        let cancelledBatchTask = watcherBatchProcessingTask
+        watcherBatchProcessingTask = nil
+        watcherBatchProcessingToken = nil
+        cancelledBatchTask?.cancel()
+        resumeRecoveryReactivationWaiters(returning: false)
         pendingFSEvents.removeAll(keepingCapacity: false)
         pendingWatcherAcceptedHighWatermark = nil
         pendingWatcherPublicationSource = .watcher
+        pendingWatcherIngressEvidence = .empty
         hasPendingOverflowRescan = false
         overflowChangedIgnoreDirs.removeAll(keepingCapacity: false)
         pendingScanTargets.removeAll(keepingCapacity: false)
         pendingQuietFolderScanTargets.removeAll(keepingCapacity: false)
         dirtyRecoveryScanTargets.removeAll(keepingCapacity: false)
         recoveryScanFailureCountByFolder.removeAll(keepingCapacity: false)
+        clearRecoveryEpisode()
         recoveryScanRetryTask?.cancel()
         recoveryScanRetryTask = nil
         lastScannedEventIdByFolder.removeAll(keepingCapacity: false)
@@ -901,10 +1112,11 @@ extension FileSystemService {
         let mustScanSubdirs: Bool // kFSEventStreamEventFlagMustScanSubDirs
         let userOrKernelDropped: Bool // events were dropped
         let rootChanged: Bool // mount/unmount or root moved
+        let eventIDsWrapped: Bool
 
         /// True if this event requires us to scan directories for correctness
         var requiresAggressiveScan: Bool {
-            mustScanSubdirs || userOrKernelDropped || rootChanged
+            mustScanSubdirs || userOrKernelDropped || rootChanged || eventIDsWrapped
         }
     }
 
@@ -935,7 +1147,8 @@ extension FileSystemService {
                 has(kFSEventStreamEventFlagItemChangeOwner),
             mustScanSubdirs: has(kFSEventStreamEventFlagMustScanSubDirs),
             userOrKernelDropped: has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped),
-            rootChanged: has(kFSEventStreamEventFlagRootChanged)
+            rootChanged: has(kFSEventStreamEventFlagRootChanged),
+            eventIDsWrapped: has(kFSEventStreamEventFlagEventIdsWrapped)
         )
     }
 
@@ -1015,6 +1228,20 @@ extension FileSystemService {
             return testMode ? [] : nil
         }
         let events = batch.events
+        let recoveryEventID = events.compactMap { _, flags, eventID -> FSEventStreamEventId? in
+            Self.parseEventFlags(flags, isDirFallback: false).requiresAggressiveScan ? eventID : nil
+        }.max()
+        if let recoveryEventID {
+            beginOrMergeRecoveryEpisode(evidence: .empty)
+            pendingScanTargets[""] = max(pendingScanTargets[""] ?? 0, recoveryEventID)
+        }
+        if recoveryEpisode != nil {
+            return await reconcileUncertainWatcherBatch(
+                batch,
+                recoveryEventID: recoveryEventID,
+                testMode: testMode
+            )
+        }
         guard !events.isEmpty || !pendingQuietFolderScanTargets.isEmpty else {
             if let watermark = batch.watcherAcceptedHighWatermark {
                 if dirtyRecoveryScanTargets.isEmpty {
@@ -1105,25 +1332,15 @@ extension FileSystemService {
             let parsed = Self.parseEventFlags(flags, isDirFallback: isDirFallback)
             let isDir = parsed.isDir
 
-            // Handle aggressive scan requirements (FSEvents overflow, dropped events, root changes)
-            // These are rare but critical - we must rescan to maintain correctness
-            if parsed.requiresAggressiveScan {
-                // Schedule root scan for comprehensive recovery
-                trackFolder("", eventId: eventId)
-                #if DEBUG
-                    if isTestMode, Self.enableDebugLogging {
-                        print("DEBUG: Aggressive scan required - mustScan=\(parsed.mustScanSubdirs), dropped=\(parsed.userOrKernelDropped), rootChanged=\(parsed.rootChanged)")
-                    }
-                #endif
-                continue
-            }
-
             // ---------- UPDATED FILTER LOGIC ---------------------------------------
             let isKnown = visitedPaths.contains(relPath)
             let shouldIgnore: Bool = if enableHierarchicalIgnores {
                 await isIgnoredHierarchical(relativePath: relPath, isDirectory: isDir)
             } else {
                 isIgnoredPrefixCheck(relativePath: relPath, isDirectory: isDir)
+            }
+            guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                return testMode ? [] : nil
             }
 
             #if DEBUG
@@ -1186,9 +1403,15 @@ extension FileSystemService {
                 if visitedPaths.contains(relPath) {
                     if isDir {
                         let mdate = await getItemModificationDateIfAvailable(atRelativePath: relPath)
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                         immediateModifications.append(.folderModified(relPath, mdate))
                     } else {
                         let mdate = try? await getFileModificationDate(atRelativePath: relPath)
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                         immediateModifications.append(.fileModified(relPath, mdate))
                     }
                     // If it's a tracked folder, also scan it for changes.
@@ -1258,10 +1481,16 @@ extension FileSystemService {
                         if isKnown {
                             if diskIsDir {
                                 let mdate = await getItemModificationDateIfAvailable(atRelativePath: relPath)
+                                guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                                    return testMode ? [] : nil
+                                }
                                 immediateModifications.append(.folderModified(relPath, mdate))
                                 trackFolder(relPath, eventId: eventId)
                             } else {
                                 let mdate = try? await getFileModificationDate(atRelativePath: relPath)
+                                guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                                    return testMode ? [] : nil
+                                }
                                 immediateModifications.append(.fileModified(relPath, mdate))
                             }
                         } else {
@@ -1304,6 +1533,9 @@ extension FileSystemService {
                     if stillExists {
                         // Treat as file modification (atomic save completed)
                         let mdate = try? await getFileModificationDate(atRelativePath: relPath)
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                         immediateModifications.append(.fileModified(relPath, mdate))
                         #if DEBUG
                             if isTestMode, Self.enableDebugLogging {
@@ -1357,6 +1589,9 @@ extension FileSystemService {
                         #endif
                         if !isDir {
                             let mdate = try? await getFileModificationDate(atRelativePath: relPath)
+                            guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                                return testMode ? [] : nil
+                            }
                             immediateModifications.append(.fileModified(relPath, mdate))
                         }
                         // Schedule parent scan to verify state
@@ -1458,7 +1693,11 @@ extension FileSystemService {
 
             if needsParentScan {
                 if enableHierarchicalIgnores {
-                    if await !isIgnoredHierarchicalDir(parent) {
+                    let parentIsIgnored = await isIgnoredHierarchicalDir(parent)
+                    guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                        return testMode ? [] : nil
+                    }
+                    if !parentIsIgnored {
                         trackFolder(parent, eventId: eventId)
                     }
                 } else if !isIgnoredPrefixCheck(relativePath: parent, isDirectory: true) {
@@ -1503,10 +1742,19 @@ extension FileSystemService {
                 if enableHierarchicalIgnores {
                     for folderRelPath in eligibleFolders {
                         _ = try await ensureRulesChain(for: folderRelPath)
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                     }
                 }
 
-                let scanResult = try await scanFoldersInParallel(eligibleFolders)
+                let scanResult = try await scanFoldersInParallel(
+                    eligibleFolders,
+                    expectedWatcherIngressGeneration: batch.watcherIngressGeneration
+                )
+                guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                    return testMode ? [] : nil
+                }
                 allDeltas.append(contentsOf: scanResult.deltas)
 
                 #if DEBUG
@@ -1533,6 +1781,9 @@ extension FileSystemService {
                     pendingQuietFolderScanTargets.formIntersection(Set(pendingScanTargets.keys))
                 }
             } catch {
+                guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                    return testMode ? [] : nil
+                }
                 print("Error during parallel folder scanning: \(error)")
                 if seedReplayRequiresFailClosedRecovery() {
                     failCurrentSeedReplayForRecovery()
@@ -1544,7 +1795,13 @@ extension FileSystemService {
                 var targetsRequiringFullResync = Set<String>()
                 for folderRelPath in eligibleFolders {
                     do {
-                        let deltas = try await scanOneLevelAndDiff(folderRelPath)
+                        let deltas = try await scanOneLevelAndDiff(
+                            folderRelPath,
+                            expectedWatcherIngressGeneration: batch.watcherIngressGeneration
+                        )
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                         allDeltas.append(contentsOf: deltas)
                         // Update tracking for successfully scanned folder
                         if let pendingId = pendingScanTargets[folderRelPath] {
@@ -1555,6 +1812,9 @@ extension FileSystemService {
                         // Record verification time for safety-net tracking
                         recordFolderVerified(folderRelPath)
                     } catch {
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                         print("Error scanning folder '\(folderRelPath)': \(error)")
                         if markRecoveryScanFailed(folderRelPath) {
                             targetsRequiringFullResync.insert(folderRelPath)
@@ -1564,15 +1824,24 @@ extension FileSystemService {
 
                 if !targetsRequiringFullResync.isEmpty {
                     do {
-                        try await allDeltas.append(contentsOf: reconcileEntireTreeAfterRecoveryFailure())
+                        try await allDeltas.append(contentsOf: reconcileEntireTreeAfterRecoveryFailure(
+                            expectedWatcherIngressGeneration: batch.watcherIngressGeneration
+                        ))
                         pendingScanTargets.removeAll(keepingCapacity: false)
                         pendingQuietFolderScanTargets.removeAll(keepingCapacity: false)
                         dirtyRecoveryScanTargets.removeAll(keepingCapacity: false)
                         recoveryScanFailureCountByFolder.removeAll(keepingCapacity: false)
                         requiresFullResync = true
                     } catch {
+                        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                            return testMode ? [] : nil
+                        }
                         print("Error during recovery full resync for '\(path)': \(error)")
                         dirtyRecoveryScanTargets.formUnion(targetsRequiringFullResync)
+                        beginOrMergeRecoveryEpisode(evidence: batch.ingressEvidence)
+                        recordFullResyncFailure(
+                            failedBatchHighWatermark: batch.watcherAcceptedHighWatermark
+                        )
                     }
                 }
             }
@@ -1665,17 +1934,105 @@ extension FileSystemService {
         } else {
             batch.publicationSource
         }
-        if !publishableDeltas.isEmpty || publishableWatcherWatermark != nil || requiresFullResync {
+        let servicePublicationSequence: UInt64? = if !publishableDeltas.isEmpty || publishableWatcherWatermark != nil || requiresFullResync {
             publishFileSystemDeltas(
                 publishableDeltas,
                 source: publicationSource,
                 watcherAcceptedWatermark: publishableWatcherWatermark,
                 requiresFullResync: requiresFullResync
             )
+        } else {
+            nil
         }
+        watcherRecoveryDiagnostics.recordRecoveryEpisode(
+            evidence: batch.ingressEvidence,
+            outcome: requiresFullResync ? .fullResyncCompleted : .rootRescan,
+            acceptedHighWatermark: batch.watcherAcceptedHighWatermark,
+            servicePublicationSequence: servicePublicationSequence
+        )
         FileSystemPublishPerf.end("coalesceAndPublishFileSystemDeltas", publishSignpost)
 
         // Return the published deltas in test mode.
         return testMode ? publishableDeltas : nil
+    }
+
+    private func reconcileUncertainWatcherBatch(
+        _ batch: PendingFSEventBatch,
+        recoveryEventID: FSEventStreamEventId?,
+        testMode: Bool
+    ) async -> [FileSystemDelta]? {
+        beginOrMergeRecoveryEpisode(evidence: batch.ingressEvidence)
+        let recoveryEvidence = recoveryEpisode?.evidence ?? batch.ingressEvidence
+        pendingQuietFolderScanTargets.subtract(dirtyRecoveryScanTargets)
+        let changedIgnoreDirs = ignoreChangeDirs(in: batch.events).union(overflowChangedIgnoreDirs)
+        overflowChangedIgnoreDirs.removeAll(keepingCapacity: false)
+        if !changedIgnoreDirs.isEmpty {
+            ignoreRulesRevision &+= 1
+            pendingIgnoreChangeDirs.formUnion(changedIgnoreDirs)
+            pendingIgnoreRulesRebuildCount += 1
+            await rebuildPerFolderIgnoreCache(changedDirs: changedIgnoreDirs)
+            pendingIgnoreRulesRebuildCount -= 1
+        }
+
+        do {
+            let allDeltas = try await reconcileEntireTreeAfterRecoveryFailure(
+                expectedWatcherIngressGeneration: batch.watcherIngressGeneration
+            )
+            guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                return testMode ? [] : nil
+            }
+            let publishableDeltas = coalescedPublishableDeltas(from: allDeltas)
+            pendingScanTargets.removeAll(keepingCapacity: false)
+            pendingQuietFolderScanTargets.removeAll(keepingCapacity: false)
+            dirtyRecoveryScanTargets.removeAll(keepingCapacity: false)
+            recoveryScanFailureCountByFolder.removeAll(keepingCapacity: false)
+            clearRecoveryEpisode()
+            recordFolderVerified("")
+
+            let source: FileSystemDeltaPublicationSource = batch.publicationSource == .overflowRootRescan
+                ? .overflowRootRescan
+                : .recoveryFullResync
+            let sequence = publishFileSystemDeltas(
+                publishableDeltas,
+                source: source,
+                watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark,
+                requiresFullResync: true
+            )
+            watcherRecoveryDiagnostics.recordRecoveryEpisode(
+                evidence: recoveryEvidence,
+                outcome: .fullResyncCompleted,
+                acceptedHighWatermark: batch.watcherAcceptedHighWatermark,
+                servicePublicationSequence: sequence
+            )
+            return testMode ? publishableDeltas : nil
+        } catch {
+            guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+                return testMode ? [] : nil
+            }
+            fileSystemDebugLog("Watcher uncertainty full resync failed for diagnostic root \(diagnosticRootToken)")
+            let targetEventID = recoveryEventID ?? pendingScanTargets[""] ?? nextFSEventStreamStartEventID
+            pendingScanTargets[""] = max(pendingScanTargets[""] ?? 0, targetEventID)
+            dirtyRecoveryScanTargets.insert("")
+            recoveryScanFailureCountByFolder[""] = (recoveryScanFailureCountByFolder[""] ?? 0) + 1
+            recordFullResyncFailure(
+                failedBatchHighWatermark: batch.watcherAcceptedHighWatermark
+            )
+            if let watermark = batch.watcherAcceptedHighWatermark {
+                pendingWatcherAcceptedHighWatermark = max(
+                    pendingWatcherAcceptedHighWatermark ?? .zero,
+                    watermark
+                )
+            }
+            if batch.publicationSource == .overflowRootRescan {
+                pendingWatcherPublicationSource = .overflowRootRescan
+            }
+            watcherRecoveryDiagnostics.recordRecoveryEpisode(
+                evidence: recoveryEvidence,
+                outcome: .fullResyncFailed,
+                acceptedHighWatermark: batch.watcherAcceptedHighWatermark,
+                servicePublicationSequence: nil
+            )
+            return testMode ? [] : nil
+        }
     }
 }

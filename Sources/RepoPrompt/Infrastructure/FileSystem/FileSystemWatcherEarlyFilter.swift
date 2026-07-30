@@ -62,11 +62,25 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
         guard !payload.entries.isEmpty else {
             return Result(payload: nil, filteredEntryCount: 0)
         }
-        if payload.entries.contains(where: { Self.isIgnoreControlPath($0.path) }) {
+        let containsIgnoreControl = payload.ingressEvidence.triggers.contains(.ignoreControl)
+            || (
+                payload.ingressEvidence.callbackCount == 0
+                    && payload.entries.contains(where: {
+                        FileSystemWatcherPathClassifier.isIgnoreControlPath($0.path)
+                    })
+            )
+        if containsIgnoreControl {
             invalidate()
             return Result(payload: payload, filteredEntryCount: 0)
         }
-        if payload.entries.contains(where: { Self.hasRecoveryFlags($0.flags) }) {
+        let containsRecovery = !payload.ingressEvidence.recoveryCauses
+            .intersection(.fseventUncertainty)
+            .isEmpty
+            || (
+                payload.ingressEvidence.callbackCount == 0
+                    && payload.entries.contains(where: { Self.hasRecoveryFlags($0.flags) })
+            )
+        if containsRecovery {
             return Result(payload: payload, filteredEntryCount: 0)
         }
 
@@ -90,7 +104,11 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
         lock.unlock()
 
         return Result(
-            payload: retainedEntries.isEmpty ? nil : FSEventCallbackPayload(entries: retainedEntries),
+            payload: retainedEntries.isEmpty ? nil : FSEventCallbackPayload(
+                entries: retainedEntries,
+                ingressEvidence: payload.ingressEvidence,
+                isTruncated: payload.isTruncated
+            ),
             filteredEntryCount: filteredCount
         )
     }
@@ -135,11 +153,6 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
             }
         }
         return false
-    }
-
-    private static func isIgnoreControlPath(_ path: String) -> Bool {
-        let filename = (path as NSString).lastPathComponent.lowercased()
-        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
     }
 
     private static func hasRecoveryFlags(_ flags: FSEventStreamEventFlags) -> Bool {

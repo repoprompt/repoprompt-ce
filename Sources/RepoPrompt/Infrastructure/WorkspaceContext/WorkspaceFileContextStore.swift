@@ -2,7 +2,6 @@ import Combine
 import CoreServices
 import Dispatch
 import Foundation
-import RepoPromptCodeMapCore
 #if DEBUG
     import CryptoKit
 #endif
@@ -43,6 +42,12 @@ struct WorkspaceBoundedCodeStructureFileResolution: Equatable {
     let files: [WorkspaceFileRecord]
     let didExceedLimit: Bool
     let visitedUniqueFileCount: Int
+}
+
+struct WorkspaceCodemapStructureSeedAdmission: Equatable {
+    let fileIDs: [UUID]
+    let issues: [WorkspaceCodemapOperationCandidateIssue]
+    let didExceedLimit: Bool
 }
 
 struct WorkspaceFileTreePresentationRequest {
@@ -182,7 +187,26 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
-    enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
+    private static let maximumRetainedCodemapProjectionDemands = 256
+    private static let maximumRetainedCodemapProjectionDemandMetadataBytes: UInt64 = 4 * 1024 * 1024
+    #if DEBUG
+        enum CodemapProjectionPreloadLaunchPolicyForTesting: Equatable {
+            case enabled
+            case disabled
+        }
+
+        enum CodemapAutomaticRetainedProjectionDemandPolicyForTesting: Equatable {
+            case enabled
+            case suppressed
+        }
+    #endif
+
+    enum CodemapProjectionPreloadTrigger: String, Equatable {
+        case rootReady
+        case watcherGap
+    }
+
+    enum CodemapProjectionPreloadStoreEventKind: String, Equatable {
         case rootInventoryAndSearchReady
         case scheduled
         case started
@@ -192,144 +216,22 @@ actor WorkspaceFileContextStore {
         case setupJoining
         case engineScheduling
         case handedOff
-        case cancelled
-        case superseded
         case retryScheduled
         case retryStarted
-        case retryExhausted
-        case prioritizeNow
         case repositoryAuthorityDetached
+        case cancelled
+        case superseded
     }
 
-    #if DEBUG
-        enum CodemapGraphIndexBuildLaunchPolicyForTesting: Equatable {
-            case enabled
-            case disabled
-        }
+    struct CodemapProjectionPreloadStoreEvent: Equatable {
+        let ordinal: UInt64
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let kind: CodemapProjectionPreloadStoreEventKind
+        let launchPhase: WorkspaceCodemapProjectionPreloadLaunchPhase
+        let trigger: CodemapProjectionPreloadTrigger
+    }
 
-        struct CodemapGraphIndexBuildStoreEvent: Hashable {
-            let ordinal: UInt64
-            let rootEpoch: WorkspaceCodemapRootEpoch
-            let kind: CodemapGraphIndexBuildStoreEventKind
-            let launchPhase: WorkspaceCodemapGraphIndexLaunchPhase
-            let uptimeNanoseconds: UInt64
-        }
-
-        enum RootCatalogShardFallbackReason: String, CaseIterable, Hashable {
-            case missingReusableShard
-            case generationGap
-            case fullResync
-            case unsafeOrAmbiguousBatch
-            case retentionBoundary
-            case patchThresholdExceeded
-            case patchApplicationBackstop
-            case shadowValidationMismatch
-        }
-
-        struct RootCatalogShardGenerationDebugSnapshot: Equatable {
-            let rootID: UUID
-            let lifetimeID: UUID?
-            let publishedTopologyGeneration: UInt64?
-            let liveTopologyGenerations: [UInt64]
-            let retainedTopologyGenerations: [UInt64]
-            let buildCount: Int
-            let pathIndexBuildCount: Int
-            let overlayPathIndexBuildCount: Int
-            let patchCount: Int
-            let authoritativeRebuildCount: Int
-            let fallbackCount: Int
-            let fallbackReasonCounts: [RootCatalogShardFallbackReason: Int]
-            let lastAppliedIndexGeneration: UInt64?
-            let deltaStateDirty: Bool
-            let backstopCount: Int
-            let maxLiveGenerationCount: Int
-        }
-
-        struct RootCatalogShardDebugSnapshot: Equatable {
-            let liveGenerationCapPerRoot: Int
-            let maxPatchLogicalMutationCount: Int
-            let publishedShardCount: Int
-            let totalBuildCount: Int
-            let totalBackstopCount: Int
-            let singleShardCompositionReuseCount: Int
-            let genericMergeElementVisitCount: Int
-            let shadowComparisonCount: Int
-            let shadowMismatchCount: Int
-            let lastShadowByteCount: Int
-            let roots: [RootCatalogShardGenerationDebugSnapshot]
-        }
-
-        struct StoreWorkDiagnosticsSnapshot: Equatable {
-            let invalidations: [CatalogInvalidationDebugEvent]
-            let catalogRebuild: CatalogRebuildDebugSnapshot
-            let rootCatalogShards: RootCatalogShardDebugSnapshot
-        }
-
-        struct PublishedSeededAuthorityDebugSnapshot: Equatable {
-            let epoch: UInt64
-            let isBlocked: Bool
-            let activeMutationDepth: Int
-            let isReconciling: Bool
-            let reconciliationFailed: Bool
-            let waiterCount: Int
-            let fullCrawlCount: Int
-        }
-
-        struct ReadSearchRootDiagnosticsSnapshot: Equatable {
-            let rootID: UUID
-            let rootToken: UUID
-            let rootPath: String
-            let rootKind: String
-            let crawlCount: Int
-            let watcherActive: Bool
-            let explicitWatcherDemand: Bool
-            let sessionWorktreeOwnerCount: Int
-            let ingress: WorkspaceFileSystemIngressCoordinator.DebugSnapshot
-            let barrier: ScopedIngressBarrierDebugSnapshot
-            let freshness: FileSystemService.FreshnessWorkDiagnosticsSnapshot
-            let invalidation: PublicationInvalidationHistoryDebugSnapshot
-            let producedAppliedIndexGeneration: UInt64
-        }
-
-        struct ApplyEditsRebaseProbePathSnapshot: Equatable {
-            let rootID: UUID
-            let rootLifetimeID: UUID
-            let rootToken: UUID
-            let rootPath: String
-            let fileID: UUID
-            let fullPath: String
-            let relativePath: String
-            let isSessionWorktree: Bool
-            let producedAppliedIndexGeneration: UInt64
-        }
-
-        private final class PublicationInvalidationRecorder: @unchecked Sendable {
-            let preparedDeltaCount: Int
-            var topologyInvalidationCount = 0
-            var catalogGenerationAdvanceCount = 0
-            var searchCatalogCacheClearCount = 0
-            var pathWorkerInvalidationRequestCount = 0
-            var contentInvalidationCount = 0
-            var decodedCacheInvalidationRequestCount = 0
-            var codemapInvalidationRequestCount = 0
-            var appliedIndexEventYieldCount = 0
-            var distinctContentKeys = Set<WorkspaceSearchContentCacheKey>()
-
-            init(preparedDeltaCount: Int) {
-                self.preparedDeltaCount = preparedDeltaCount
-            }
-        }
-
-        private struct PublicationInvalidationHistoryState {
-            var totalObservedPublicationCount = 0
-            var samples: [PublicationInvalidationDebugSample] = []
-        }
-
-        @TaskLocal private static var activePublicationInvalidationRecorder: PublicationInvalidationRecorder?
-        private static let publicationInvalidationSampleLimit = 32
-    #endif
-
-    struct CodemapGraphIndexBuildRetryPolicy: @unchecked Sendable {
+    struct CodemapProjectionPreloadRetryPolicy: @unchecked Sendable {
         let maximumRetryCount: Int
         let initialBackoffNanoseconds: UInt64
         let maximumBackoffNanoseconds: UInt64
@@ -441,34 +343,22 @@ actor WorkspaceFileContextStore {
         let result: CodemapEligibilityResolution
     }
 
-    private struct CodemapGraphIndexBuildLaunch {
+    private struct CodemapProjectionPreloadLaunch {
         let id: UUID
         let authority: CodemapRootAuthority
         let retryAttempt: Int
-        var phase: WorkspaceCodemapGraphIndexLaunchPhase
+        let trigger: CodemapProjectionPreloadTrigger
+        var phase: WorkspaceCodemapProjectionPreloadLaunchPhase
         var task: Task<Void, Never>?
-        let createdUptimeNanoseconds: UInt64
-        var phaseEnteredUptimeNanoseconds: UInt64
     }
 
-    private struct CodemapGraphIndexRetryExhaustion {
-        let attempt: Int
-        let uptimeNanoseconds: UInt64
-    }
-
-    private struct CodemapGraphIndexBuildRetry {
+    private struct CodemapProjectionPreloadRetry {
         let id: UUID
         let authority: CodemapRootAuthority
         let attempt: Int
         let deadlineNanoseconds: UInt64
+        let trigger: CodemapProjectionPreloadTrigger
         let task: Task<Void, Never>
-    }
-
-    /// UI-status lower bound for coverage that remains valid while a path-level
-    /// invalidation replaces the current projection job.
-    private struct CodemapRootStatusCoverageBaseline {
-        var retainedCandidateCount: UInt64
-        var invalidatedCandidateFileIDs: Set<UUID>
     }
 
     private enum CodemapSetupDisposition {
@@ -480,7 +370,6 @@ actor WorkspaceFileContextStore {
         case modified(Set<String>)
         case deleted(Set<String>)
         case renamed(from: String, to: String)
-        case securityExcluded(Set<String>)
         case watcherGap
         case checkout
         case repositoryAuthority
@@ -488,95 +377,11 @@ actor WorkspaceFileContextStore {
         case unload
     }
 
-    private final class CodemapDemandCompletion: @unchecked Sendable {
-        private struct Waiter {
-            let continuation: CheckedContinuation<Void, Never>
-            var deadlineTask: Task<Void, Never>?
-        }
-
-        private let lock = NSLock()
-        private var didComplete = false
-        private var waitersByID: [UUID: Waiter] = [:]
-
-        var waiterCount: Int {
-            lock.withLock { waitersByID.count }
-        }
-
-        func wait(until deadline: ContinuousClock.Instant) async {
-            let waiterID = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    guard !Task.isCancelled, ContinuousClock.now < deadline else {
-                        continuation.resume()
-                        return
-                    }
-
-                    lock.lock()
-                    guard !didComplete else {
-                        lock.unlock()
-                        continuation.resume()
-                        return
-                    }
-                    waitersByID[waiterID] = Waiter(
-                        continuation: continuation,
-                        deadlineTask: nil
-                    )
-                    lock.unlock()
-
-                    let deadlineTask = Task { [weak self] in
-                        try? await Task.sleep(until: deadline, clock: .continuous)
-                        guard !Task.isCancelled else { return }
-                        self?.resume(waiterID)
-                    }
-                    lock.lock()
-                    if waitersByID[waiterID] != nil {
-                        waitersByID[waiterID]?.deadlineTask = deadlineTask
-                        lock.unlock()
-                    } else {
-                        lock.unlock()
-                        deadlineTask.cancel()
-                    }
-                    if Task.isCancelled {
-                        resume(waiterID)
-                    }
-                }
-            } onCancel: {
-                self.resume(waiterID)
-            }
-        }
-
-        func resolve() {
-            lock.lock()
-            guard !didComplete else {
-                lock.unlock()
-                return
-            }
-            didComplete = true
-            let waiters = Array(waitersByID.values)
-            waitersByID.removeAll()
-            lock.unlock()
-
-            for waiter in waiters {
-                waiter.deadlineTask?.cancel()
-                waiter.continuation.resume()
-            }
-        }
-
-        private func resume(_ waiterID: UUID) {
-            lock.lock()
-            let waiter = waitersByID.removeValue(forKey: waiterID)
-            lock.unlock()
-            waiter?.deadlineTask?.cancel()
-            waiter?.continuation.resume()
-        }
-    }
-
     private struct CodemapDemandRecord {
         let ticket: WorkspaceCodemapArtifactDemandTicket
         let identity: WorkspaceCodemapArtifactBindingIdentity
         let language: LanguageType
         let owner: WorkspaceCodemapLiveDemandOwner
-        let completion: CodemapDemandCompletion
         var retainIDs: Set<UUID>
         var result: WorkspaceCodemapArtifactDemandResult
         var task: Task<Void, Never>?
@@ -596,12 +401,53 @@ actor WorkspaceFileContextStore {
         case stale
     }
 
+    private struct CodemapProjectionDemandRecord {
+        let ticket: WorkspaceCodemapProjectionDemandTicket
+        let fileIDs: [UUID]
+        let metadataByteCount: UInt64
+        let engine: WorkspaceCodemapBindingEngine
+        var expiryTask: Task<Void, Never>?
+    }
+
+    private struct TerminalCodemapProjectionDemandRecord {
+        let ticket: WorkspaceCodemapProjectionDemandTicket
+        let status: WorkspaceCodemapProjectionDemandStatus
+    }
+
     private struct CodemapPresentationRecord {
         let id: WorkspaceCodemapFrozenPresentationBundleID
         let rootEpoch: WorkspaceCodemapRootEpoch
         let entries: [WorkspaceCodemapFrozenPresentationEntry]
         let handles: [WorkspaceCodemapLiveFrozenArtifactHandle]
         let requestIDs: Set<UUID>
+    }
+
+    private struct CodemapSelectionGraphState {
+        let id: UUID
+        let graph: WorkspaceCodemapSelectionGraph
+        var desiredKey: WorkspaceCodemapSelectionGraphRuntimeKey?
+        var pendingSnapshot: WorkspaceCodemapLiveGraphSnapshot?
+        var publishedSummary: WorkspaceCodemapSelectionGraphRuntimePublishedSummary?
+        var lastRebuildDisposition: WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition?
+        var workerID: UUID?
+        var workerTask: Task<Void, Never>?
+    }
+
+    private enum AutomaticSelectionTargetAuthority {
+        case retainedReadyDemand
+        case currentCompletedProjection
+    }
+
+    private struct CodemapProjectionRecoveryObserver {
+        let id: UUID
+        let authority: CodemapRootAuthority
+        var latestSignalSerial: UInt64
+        var lastRecoveredContributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration?
+        var recoveringSignalSerial: UInt64?
+        var lastRecoveredSignalSerial: UInt64?
+        var publishingContributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration?
+        var publishingSignalSerial: UInt64?
+        var task: Task<Void, Never>?
     }
 
     private final class CodemapSharedTaskDeadlineRace: @unchecked Sendable {
@@ -621,6 +467,53 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private struct CodemapGraphPublicationFlight {
+        let id: UUID
+        let authority: CodemapRootAuthority
+        let projectionRecoveryObserverID: UUID?
+        var latestSignalSerial: UInt64
+        var flushingSerial: UInt64?
+        var replayRequired: Bool
+        var followUpStarted: Bool
+        var task: Task<Void, Never>?
+    }
+
+    private final class CodemapAutomaticSelectionWeakPublicationPermit {
+        weak var permit: WorkspaceCodemapAutomaticSelectionPublicationPermit?
+
+        init(_ permit: WorkspaceCodemapAutomaticSelectionPublicationPermit) {
+            self.permit = permit
+        }
+    }
+
+    private struct CodemapGraphQueryCapture {
+        let authority: CodemapRootAuthority
+        let graphStateID: UUID
+        let graph: WorkspaceCodemapSelectionGraph
+        let desiredKey: WorkspaceCodemapSelectionGraphRuntimeKey
+        let workerWasActive: Bool
+        let sources: [WorkspaceCodemapStoreSelectionGraphSourceIdentity]
+    }
+
+    private enum CodemapAutomaticSelectionSourceSnapshot: Equatable {
+        case rootEpochNotCurrent
+        case outsideRootScope
+        case staleCatalogGeneration(UInt64?)
+        case notCataloged
+        case notDemanded
+        case pending(WorkspaceCodemapArtifactDemandTicket)
+        case unavailable(WorkspaceCodemapArtifactDemandUnavailableReason)
+        case ready(WorkspaceCodemapArtifactDemandTicket)
+    }
+
+    private struct CodemapAutomaticSelectionSnapshot: Equatable {
+        let allowedRootIDs: Set<UUID>
+        let sourceStates: [
+            WorkspaceCodemapAutomaticSelectionSourceIdentity:
+                CodemapAutomaticSelectionSourceSnapshot
+        ]
+    }
+
     private struct CodemapRootSession {
         let authority: CodemapRootAuthority
         var endpoint: WorkspaceCodemapBindingIntegrationEndpoint?
@@ -637,8 +530,10 @@ actor WorkspaceFileContextStore {
         var presentationRecordsByID: [
             WorkspaceCodemapFrozenPresentationBundleID: CodemapPresentationRecord
         ] = [:]
-        var graphStatusTask: Task<Void, Never>?
-        var selectionGraph: WorkspaceCodemapSelectionGraph?
+        var graphPublicationFlight: CodemapGraphPublicationFlight?
+        var projectionRecoveryObserver: CodemapProjectionRecoveryObserver?
+        var selectionGraph: CodemapSelectionGraphState?
+        var graphSnapshotDirtyDuringPathInvalidation = false
     }
 
     private struct DetachedCodemapSession: @unchecked Sendable {
@@ -649,36 +544,29 @@ actor WorkspaceFileContextStore {
         let owners: [WorkspaceCodemapLiveDemandOwner]
         let setupTask: Task<CodemapSetupDisposition, Never>?
         let demandTasks: [Task<Void, Never>]
-        let graphStatusTask: Task<Void, Never>?
+        let projectionDemands: [CodemapProjectionDemandRecord]
+        let graphPublicationTask: Task<Void, Never>?
+        let projectionRecoveryObserverTask: Task<Void, Never>?
         let selectionGraph: WorkspaceCodemapSelectionGraph?
+        let graphWorkerTask: Task<Void, Never>?
         let preloadLaunchTask: Task<Void, Never>?
         let eligibilityTask: Task<CodemapEligibilityResolution, Never>?
-        let graphIndexRetryTask: Task<Void, Never>?
+        let preloadRetryTask: Task<Void, Never>?
         let predecessorTasks: [Task<Void, Never>]
         let invalidationCommands: [CodemapInvalidationCommand]
-        let graphInvalidationReason: WorkspaceCodemapGraphRevocationReason
+        let graphInvalidationReason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason
     }
 
     private struct CodemapPathFenceToken: Hashable {
         let id: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
         let standardizedRelativePaths: Set<String>
-        let shouldRescheduleGraphIndex: Bool
+        let shouldRescheduleProjectionPreload: Bool
     }
 
     private struct CodemapRootMutationFenceToken: Hashable {
         let id: UUID
         let rootEpoch: WorkspaceCodemapRootEpoch
-    }
-
-    enum CodemapPathInvalidationStage: String, CaseIterable {
-        case rootMutationFence = "root_mutation_fence"
-        case cleanupFlight = "cleanup_flight"
-        case predecessorFlight = "predecessor_flight"
-        case graphContributionFence = "graph_contribution_fence"
-        case setup
-        case engineInvalidation = "engine_invalidation"
-        case completionPublication = "completion_publication"
     }
 
     private struct CodemapPathInvalidationFlight {
@@ -987,63 +875,6 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private final class AppliedIngressTimeoutRace: @unchecked Sendable {
-        private let lock = NSLock()
-        private var continuation: CheckedContinuation<[WorkspaceIngressBarrierSample], Error>?
-        private var pendingResult: Result<[WorkspaceIngressBarrierSample], Error>?
-        private var operationTask: Task<Void, Never>?
-        private var timeoutTask: Task<Void, Never>?
-        private var isResolved = false
-
-        func install(continuation: CheckedContinuation<[WorkspaceIngressBarrierSample], Error>) {
-            lock.lock()
-            if let pendingResult {
-                self.pendingResult = nil
-                lock.unlock()
-                continuation.resume(with: pendingResult)
-                return
-            }
-            self.continuation = continuation
-            lock.unlock()
-        }
-
-        func install(operationTask: Task<Void, Never>, timeoutTask: Task<Void, Never>) {
-            lock.lock()
-            if isResolved {
-                lock.unlock()
-                operationTask.cancel()
-                timeoutTask.cancel()
-                return
-            }
-            self.operationTask = operationTask
-            self.timeoutTask = timeoutTask
-            lock.unlock()
-        }
-
-        func resolve(_ result: Result<[WorkspaceIngressBarrierSample], Error>) {
-            lock.lock()
-            guard !isResolved else {
-                lock.unlock()
-                return
-            }
-            isResolved = true
-            let continuation = continuation
-            self.continuation = nil
-            if continuation == nil {
-                pendingResult = result
-            }
-            let operationTask = operationTask
-            let timeoutTask = timeoutTask
-            self.operationTask = nil
-            self.timeoutTask = nil
-            lock.unlock()
-
-            operationTask?.cancel()
-            timeoutTask?.cancel()
-            continuation?.resume(with: result)
-        }
-    }
-
     private final class ScopedIngressBarrierFlight {
         let token: UInt64
         let target: ScopedIngressBarrierTarget
@@ -1158,6 +989,7 @@ actor WorkspaceFileContextStore {
             let distinctContentKeyCount: Int
             let decodedCacheInvalidationRequestCount: Int
             let codemapInvalidationRequestCount: Int
+            let watcherGapInvalidationCount: Int
             let appliedIndexEventYieldCount: Int
         }
 
@@ -1196,6 +1028,119 @@ actor WorkspaceFileContextStore {
             let lastRootCount: Int
         }
 
+        enum RootCatalogShardFallbackReason: String, CaseIterable, Hashable {
+            case missingReusableShard
+            case generationGap
+            case fullResync
+            case unsafeOrAmbiguousBatch
+            case retentionBoundary
+            case patchThresholdExceeded
+            case patchApplicationBackstop
+            case shadowValidationMismatch
+        }
+
+        struct RootCatalogShardGenerationDebugSnapshot: Equatable {
+            let rootID: UUID
+            let lifetimeID: UUID?
+            let publishedTopologyGeneration: UInt64?
+            let liveTopologyGenerations: [UInt64]
+            let retainedTopologyGenerations: [UInt64]
+            let buildCount: Int
+            let pathIndexBuildCount: Int
+            let overlayPathIndexBuildCount: Int
+            let patchCount: Int
+            let authoritativeRebuildCount: Int
+            let fallbackCount: Int
+            let fallbackReasonCounts: [RootCatalogShardFallbackReason: Int]
+            let lastAppliedIndexGeneration: UInt64?
+            let deltaStateDirty: Bool
+            let backstopCount: Int
+            let maxLiveGenerationCount: Int
+        }
+
+        struct RootCatalogShardDebugSnapshot: Equatable {
+            let liveGenerationCapPerRoot: Int
+            let maxPatchLogicalMutationCount: Int
+            let publishedShardCount: Int
+            let totalBuildCount: Int
+            let totalBackstopCount: Int
+            let singleShardCompositionReuseCount: Int
+            let genericMergeElementVisitCount: Int
+            let shadowComparisonCount: Int
+            let shadowMismatchCount: Int
+            let lastShadowByteCount: Int
+            let roots: [RootCatalogShardGenerationDebugSnapshot]
+        }
+
+        struct StoreWorkDiagnosticsSnapshot: Equatable {
+            let invalidations: [CatalogInvalidationDebugEvent]
+            let catalogRebuild: CatalogRebuildDebugSnapshot
+            let rootCatalogShards: RootCatalogShardDebugSnapshot
+        }
+
+        struct PublishedSeededAuthorityDebugSnapshot: Equatable {
+            let epoch: UInt64
+            let isBlocked: Bool
+            let activeMutationDepth: Int
+            let isReconciling: Bool
+            let reconciliationFailed: Bool
+            let waiterCount: Int
+            let fullCrawlCount: Int
+        }
+
+        struct ReadSearchRootDiagnosticsSnapshot: Equatable {
+            let rootID: UUID
+            let rootToken: UUID
+            let rootPath: String
+            let rootKind: String
+            let crawlCount: Int
+            let watcherActive: Bool
+            let explicitWatcherDemand: Bool
+            let sessionWorktreeOwnerCount: Int
+            let ingress: WorkspaceFileSystemIngressCoordinator.DebugSnapshot
+            let barrier: ScopedIngressBarrierDebugSnapshot
+            let freshness: FileSystemService.FreshnessWorkDiagnosticsSnapshot
+            let invalidation: PublicationInvalidationHistoryDebugSnapshot
+            let producedAppliedIndexGeneration: UInt64
+        }
+
+        struct ApplyEditsRebaseProbePathSnapshot: Equatable {
+            let rootID: UUID
+            let rootLifetimeID: UUID
+            let rootToken: UUID
+            let rootPath: String
+            let fileID: UUID
+            let fullPath: String
+            let relativePath: String
+            let isSessionWorktree: Bool
+            let producedAppliedIndexGeneration: UInt64
+        }
+
+        private final class PublicationInvalidationRecorder: @unchecked Sendable {
+            let preparedDeltaCount: Int
+            var topologyInvalidationCount = 0
+            var catalogGenerationAdvanceCount = 0
+            var searchCatalogCacheClearCount = 0
+            var pathWorkerInvalidationRequestCount = 0
+            var contentInvalidationCount = 0
+            var decodedCacheInvalidationRequestCount = 0
+            var codemapInvalidationRequestCount = 0
+            var watcherGapInvalidationCount = 0
+            var appliedIndexEventYieldCount = 0
+            var distinctContentKeys = Set<WorkspaceSearchContentCacheKey>()
+
+            init(preparedDeltaCount: Int) {
+                self.preparedDeltaCount = preparedDeltaCount
+            }
+        }
+
+        private struct PublicationInvalidationHistoryState {
+            var totalObservedPublicationCount = 0
+            var samples: [PublicationInvalidationDebugSample] = []
+        }
+
+        @TaskLocal private static var activePublicationInvalidationRecorder: PublicationInvalidationRecorder?
+        private static let publicationInvalidationSampleLimit = 32
     #endif
 
     #if DEBUG
@@ -1269,80 +1214,45 @@ actor WorkspaceFileContextStore {
         private var rootCatalogShardShadowMismatchCount = 0
         private var rootCatalogShardLastShadowByteCount = 0
 
-        func setCodemapGraphIndexBuildStartHandlerForTesting(
+        func setCodemapProjectionPreloadStartHandlerForTesting(
             _ handler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
         ) {
-            codemapGraphIndexBuildStartHandler = handler
+            codemapProjectionPreloadStartHandler = handler
         }
 
-        func setCodemapGraphIndexCatalogBuildHandlerForTesting(
+        func setCodemapProjectionCatalogBuildHandlerForTesting(
             _ handler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
         ) {
-            codemapGraphIndexCatalogBuildHandler = handler
+            codemapProjectionCatalogBuildHandler = handler
         }
 
-        func codemapGraphIndexBuildStoreEventsForTesting(
+        func codemapProjectionPreloadStoreEventsForTesting(
             rootID: UUID? = nil
-        ) -> [CodemapGraphIndexBuildStoreEvent] {
-            codemapGraphIndexBuildStoreEvents.filter { event in
+        ) -> [CodemapProjectionPreloadStoreEvent] {
+            codemapProjectionPreloadStoreEvents.filter { event in
                 rootID.map { event.rootEpoch.rootID == $0 } ?? true
             }
         }
 
-        func debugCodemapGraphIndexStoreEvents(
-            rootID: UUID? = nil,
-            sinceOrdinal: UInt64?,
-            limit: Int
-        ) -> CodemapGraphStatusStoreEventPage {
-            let rootEvents = codemapGraphIndexBuildStoreEvents.filter { event in
-                rootID.map { event.rootEpoch.rootID == $0 } ?? true
-            }
-            let events = Array(rootEvents.lazy.filter { event in
-                sinceOrdinal.map { event.ordinal > $0 } ?? true
-            }.prefix(min(max(0, limit), 1024)).map { event in
-                CodemapGraphStatusStoreEventSnapshot(
-                    ordinal: event.ordinal,
-                    rootEpoch: event.rootEpoch,
-                    kind: event.kind.rawValue,
-                    launchPhase: CodemapFullLoadDebugSupport.launchPhaseName(event.launchPhase),
-                    uptimeNanoseconds: event.uptimeNanoseconds
-                )
-            })
-            return CodemapGraphStatusStoreEventPage(
-                firstOrdinal: rootEvents.first?.ordinal ?? 0,
-                lastOrdinal: rootEvents.last?.ordinal ?? 0,
-                nextOrdinal: events.last?.ordinal,
-                events: events
-            )
-        }
-
-        func codemapGraphIndexBuildLaunchPhaseForTesting(
+        func codemapProjectionPreloadLaunchPhaseForTesting(
             rootEpoch: WorkspaceCodemapRootEpoch
-        ) -> WorkspaceCodemapGraphIndexLaunchPhase? {
-            codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
+        ) -> WorkspaceCodemapProjectionPreloadLaunchPhase? {
+            codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch]?.phase
         }
 
         func codemapEligibilityFlightCountForTesting() -> Int {
             codemapEligibilityFlightsByRootEpoch.count
         }
 
-        func codemapGraphIndexBuildRetrySnapshotForTesting(
+        func codemapProjectionPreloadRetrySnapshotForTesting(
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> (attempt: Int, deadlineNanoseconds: UInt64)? {
-            codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch].map {
+            codemapProjectionPreloadRetriesByRootEpoch[rootEpoch].map {
                 (attempt: $0.attempt, deadlineNanoseconds: $0.deadlineNanoseconds)
             }
         }
 
-        func codemapGraphIndexRetryExhaustionForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch
-        ) -> (attempt: Int, uptimeNanoseconds: UInt64)? {
-            codemapGraphIndexRetryExhaustionByRootEpoch[rootEpoch].map {
-                (attempt: $0.attempt, uptimeNanoseconds: $0.uptimeNanoseconds)
-            }
-        }
-
-        func debugAcquireCodemapGraphIndexAdmissionHold(
+        func debugAcquireCodemapProjectionAdmissionHold(
             rootID: UUID,
             expiresAfterMilliseconds: UInt64
         ) async -> (
@@ -1351,23 +1261,23 @@ actor WorkspaceFileContextStore {
             queueWaitMilliseconds: [UInt64]
         )? {
             guard let owner = debugCodemapBindingEngine(rootID: rootID),
-                  let acquired = await owner.engine.debugAcquireGraphIndexAdmissionHold(
+                  let acquired = await owner.engine.debugAcquireProjectionAdmissionHold(
                       rootEpoch: owner.rootEpoch,
                       expiresAfterMilliseconds: expiresAfterMilliseconds
                   )
             else { return nil }
-            debugCodemapGraphIndexHoldOwners[acquired.holdID] = owner
-            debugCodemapGraphIndexHoldExpiryTasks[acquired.holdID] = Task { [weak self] in
+            debugCodemapProjectionHoldOwners[acquired.holdID] = owner
+            debugCodemapProjectionHoldExpiryTasks[acquired.holdID] = Task { [weak self] in
                 try? await Task.sleep(
                     nanoseconds: (expiresAfterMilliseconds + 1000) * 1_000_000
                 )
                 guard !Task.isCancelled else { return }
-                await self?.debugForgetCodemapGraphIndexAdmissionHold(acquired.holdID)
+                await self?.debugForgetCodemapProjectionAdmissionHold(acquired.holdID)
             }
             return acquired
         }
 
-        func debugReleaseCodemapGraphIndexAdmissionHold(
+        func debugReleaseCodemapProjectionAdmissionHold(
             rootID: UUID,
             holdID: UUID
         ) async -> (
@@ -1376,464 +1286,30 @@ actor WorkspaceFileContextStore {
             queueWaitMilliseconds: [UInt64]
         )? {
             let owner: (rootEpoch: WorkspaceCodemapRootEpoch, engine: WorkspaceCodemapBindingEngine)
-            if let retained = debugCodemapGraphIndexHoldOwners[holdID] {
+            if let retained = debugCodemapProjectionHoldOwners[holdID] {
                 guard retained.rootEpoch.rootID == rootID else { return nil }
                 owner = retained
             } else {
                 guard let current = debugCodemapBindingEngine(rootID: rootID) else { return nil }
                 owner = current
             }
-            let released = await owner.engine.debugReleaseGraphIndexAdmissionHold(
+            let released = await owner.engine.debugReleaseProjectionAdmissionHold(
                 holdID,
                 rootEpoch: owner.rootEpoch
             )
-            debugCodemapGraphIndexHoldOwners.removeValue(forKey: holdID)
-            debugCodemapGraphIndexHoldExpiryTasks.removeValue(forKey: holdID)?.cancel()
+            debugCodemapProjectionHoldOwners.removeValue(forKey: holdID)
+            debugCodemapProjectionHoldExpiryTasks.removeValue(forKey: holdID)?.cancel()
             return released
         }
 
-        func debugCodemapGraphIndexAdmissionSnapshot(
+        func debugCodemapProjectionAdmissionSnapshot(
             rootID: UUID
         ) async -> (
             metrics: [String: UInt64],
             queueWaitMilliseconds: [UInt64]
         )? {
             guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
-            return await owner.engine.debugGraphIndexAdmissionSnapshot(rootEpoch: owner.rootEpoch)
-        }
-
-        private struct DebugCodemapFullLoadCapture {
-            let rootEpoch: WorkspaceCodemapRootEpoch
-            let catalogGeneration: UInt64
-            let ingressGeneration: UInt64
-            let rootKind: WorkspaceRootKind
-            let launchPhase: WorkspaceCodemapGraphIndexLaunchPhase?
-            let terminalReason: WorkspaceCodemapGitTerminalUnavailableReason?
-            let engine: WorkspaceCodemapBindingEngine?
-            let milestones: [CodemapFullLoadMilestone]
-
-            var identity: CodemapFullLoadRootIdentity {
-                CodemapFullLoadRootIdentity(
-                    rootEpoch: rootEpoch,
-                    catalogGeneration: catalogGeneration,
-                    ingressGeneration: ingressGeneration,
-                    engineIdentity: engine.map(ObjectIdentifier.init)
-                )
-            }
-        }
-
-        private struct DebugCodemapFullLoadEngineObservation {
-            let graph: WorkspaceCodemapGraphIncrementalAccounting?
-            let accounting: WorkspaceCodemapBindingEngineAccounting?
-            let queueWaitMilliseconds: [UInt64]
-        }
-
-        func debugCodemapGraphStatusSnapshot(
-            rootID: UUID? = nil,
-            includeEvents: Bool = false,
-            sinceStoreOrdinal: UInt64? = nil,
-            sinceEngineOrdinal: UInt64? = nil,
-            eventLimit: Int = 256
-        ) async -> CodemapGraphStatusSnapshot {
-            let captures = rootsForPathLookup(scope: .visibleWorkspace)
-                .filter { root in rootID.map { $0 == root.id } ?? true }
-                .sorted { $0.id.uuidString < $1.id.uuidString }
-                .compactMap { root -> (
-                    rootEpoch: WorkspaceCodemapRootEpoch,
-                    rootKind: WorkspaceRootKind,
-                    catalogGeneration: UInt64,
-                    ingressGeneration: UInt64,
-                    eligibilityFlightPresent: Bool,
-                    launch: CodemapGraphStatusLaunchSnapshot?,
-                    engine: WorkspaceCodemapBindingEngine?
-                )? in
-                    guard let state = rootStatesByID[root.id] else { return nil }
-                    let rootEpoch = WorkspaceCodemapRootEpoch(
-                        rootID: root.id,
-                        rootLifetimeID: state.lifetimeID
-                    )
-                    let session = codemapSessionsByRootEpoch[rootEpoch]
-                    let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]
-                    let retry = codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch]
-                    let exhaustion = codemapGraphIndexRetryExhaustionByRootEpoch[rootEpoch]
-                    let authority = session?.authority
-                        ?? launch?.authority
-                        ?? codemapEligibilityFlightsByRootEpoch[rootEpoch]?.authority
-                        ?? codemapCompletedEligibilityByRootEpoch[rootEpoch]?.authority
-                        ?? retry?.authority
-                    let launchSnapshot = launch.map {
-                        CodemapGraphStatusLaunchSnapshot(
-                            id: $0.id,
-                            phase: $0.phase,
-                            retryAttempt: $0.retryAttempt,
-                            taskPresent: $0.task != nil,
-                            createdUptimeNanoseconds: $0.createdUptimeNanoseconds,
-                            phaseEnteredUptimeNanoseconds: $0.phaseEnteredUptimeNanoseconds,
-                            retry: retry.map {
-                                CodemapGraphStatusRetrySnapshot(
-                                    attempt: $0.attempt,
-                                    deadlineUptimeNanoseconds: $0.deadlineNanoseconds
-                                )
-                            },
-                            retryExhaustion: exhaustion.map {
-                                CodemapGraphStatusRetryExhaustionSnapshot(
-                                    attempt: $0.attempt,
-                                    uptimeNanoseconds: $0.uptimeNanoseconds
-                                )
-                            }
-                        )
-                    }
-                    return (
-                        rootEpoch: rootEpoch,
-                        rootKind: root.kind,
-                        catalogGeneration: authority?.catalogGeneration
-                            ?? catalogGenerationsByRootID[root.id]
-                            ?? 0,
-                        ingressGeneration: authority?.ingressGeneration
-                            ?? codemapAuthorityGenerationsByRootEpoch[rootEpoch]
-                            ?? 0,
-                        eligibilityFlightPresent: codemapEligibilityFlightsByRootEpoch[rootEpoch] != nil,
-                        launch: launchSnapshot,
-                        engine: session?.engine
-                    )
-                }
-
-            var accountingByEngine: [ObjectIdentifier: WorkspaceCodemapBindingEngineAccounting] = [:]
-            var roots: [CodemapGraphStatusRootSnapshot] = []
-            for capture in captures {
-                let accounting: WorkspaceCodemapBindingEngineAccounting?
-                let admission: CodemapGraphStatusAdmissionSnapshot?
-                let manifest: CodemapGraphStatusManifestSnapshot?
-                let engineEvents: WorkspaceCodemapGraphIndexDebugEventPage?
-                if let engine = capture.engine {
-                    let identity = ObjectIdentifier(engine)
-                    if let existing = accountingByEngine[identity] {
-                        accounting = existing
-                    } else {
-                        let observed = await engine.accounting()
-                        accountingByEngine[identity] = observed
-                        accounting = observed
-                    }
-                    let observedAdmission = await engine.debugGraphIndexAdmissionSnapshot(
-                        rootEpoch: capture.rootEpoch
-                    )
-                    admission = CodemapGraphStatusAdmissionSnapshot(
-                        metrics: observedAdmission.metrics,
-                        queueWaitMilliseconds: observedAdmission.queueWaitMilliseconds
-                    )
-                    let observedManifest = await engine.debugManifestFailureSnapshot(
-                        rootEpoch: capture.rootEpoch
-                    )
-                    let observedManifestMeasurements = await engine.debugManifestMeasurementSnapshot(
-                        rootEpoch: capture.rootEpoch
-                    )
-                    manifest = CodemapGraphStatusManifestSnapshot(
-                        failureCounts: observedManifest.counts,
-                        lastFailure: observedManifest.lastFailure,
-                        measurements: observedManifestMeasurements
-                    )
-                    engineEvents = includeEvents
-                        ? await engine.debugGraphIndexEvents(
-                            rootID: capture.rootEpoch.rootID,
-                            sinceOrdinal: sinceEngineOrdinal,
-                            limit: eventLimit
-                        )
-                        : nil
-                } else {
-                    accounting = nil
-                    admission = nil
-                    manifest = nil
-                    engineEvents = nil
-                }
-                let milestones = codemapGraphIndexBuildStoreEvents
-                    .filter { $0.rootEpoch == capture.rootEpoch }
-                    .map {
-                        CodemapGraphStatusStoreEventSnapshot(
-                            ordinal: $0.ordinal,
-                            rootEpoch: $0.rootEpoch,
-                            kind: $0.kind.rawValue,
-                            launchPhase: CodemapFullLoadDebugSupport.launchPhaseName($0.launchPhase),
-                            uptimeNanoseconds: $0.uptimeNanoseconds
-                        )
-                    }
-                roots.append(CodemapGraphStatusRootSnapshot(
-                    rootEpoch: capture.rootEpoch,
-                    catalogGeneration: capture.catalogGeneration,
-                    ingressGeneration: capture.ingressGeneration,
-                    rootKind: capture.rootKind,
-                    eligibilityFlightPresent: capture.eligibilityFlightPresent,
-                    launch: capture.launch,
-                    job: accounting?.graphIndexRoots.first { $0.rootEpoch == capture.rootEpoch },
-                    admission: admission,
-                    manifest: manifest,
-                    milestones: milestones,
-                    engineEvents: engineEvents
-                ))
-            }
-            let accountings = Array(accountingByEngine.values)
-            return CodemapGraphStatusSnapshot(
-                sampledUptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds(),
-                roots: roots,
-                storeEvents: includeEvents
-                    ? debugCodemapGraphIndexStoreEvents(
-                        rootID: rootID,
-                        sinceOrdinal: sinceStoreOrdinal,
-                        limit: eventLimit
-                    )
-                    : nil,
-                graphIndexJobCount: accountings.reduce(0) { $0 + $1.graphIndexJobCount },
-                queuedGraphIndexBatchCount: accountings.reduce(0) {
-                    $0 + $1.queuedGraphIndexBatchCount
-                },
-                activeGraphIndexBatchCount: accountings.reduce(0) {
-                    $0 + $1.activeGraphIndexBatchCount
-                },
-                drainingGraphIndexTaskCount: accountings.reduce(0) {
-                    $0 + $1.drainingGraphIndexTaskCount
-                }
-            )
-        }
-
-        func debugCodemapFullLoadAggregateSnapshot(
-            expectedWorkspaceID: UUID
-        ) async -> CodemapFullLoadAggregateSnapshot {
-            let initial = debugCaptureCodemapFullLoadUniverse()
-            let sampled = DispatchTime.now().uptimeNanoseconds
-            guard !initial.isEmpty else {
-                return CodemapFullLoadAggregateSnapshot(
-                    expectedWorkspaceID: expectedWorkspaceID,
-                    state: .incompleteDiagnostics,
-                    sampledUptimeNanoseconds: sampled,
-                    visibleRootCount: 0,
-                    eligibleRootCount: 0,
-                    readyRootCount: 0,
-                    terminalIneligibleRootCount: 0,
-                    excludedRootCount: 0,
-                    pendingRootCount: 0,
-                    failedRootCount: 0,
-                    supersededRootCount: 0,
-                    cohort: "mixed",
-                    roots: [],
-                    metrics: [:],
-                    resources: [:],
-                    queueWaitMilliseconds: []
-                )
-            }
-
-            var observations: [WorkspaceCodemapRootEpoch: DebugCodemapFullLoadEngineObservation] = [:]
-            for capture in initial {
-                guard let engine = capture.engine else {
-                    observations[capture.rootEpoch] = DebugCodemapFullLoadEngineObservation(
-                        graph: nil,
-                        accounting: nil,
-                        queueWaitMilliseconds: []
-                    )
-                    continue
-                }
-                let graph = await engine.selectionGraph(rootEpoch: capture.rootEpoch)?.incrementalAccounting()
-                let accounting = await engine.accounting()
-                let admission = await engine.debugGraphIndexAdmissionSnapshot(rootEpoch: capture.rootEpoch)
-                observations[capture.rootEpoch] = DebugCodemapFullLoadEngineObservation(
-                    graph: graph,
-                    accounting: accounting,
-                    queueWaitMilliseconds: admission.queueWaitMilliseconds
-                )
-            }
-
-            let revalidated = debugCaptureCodemapFullLoadUniverse()
-            let universeIsCurrent = CodemapFullLoadDebugSupport.universeMatches(
-                initial.map(\.identity),
-                revalidated.map(\.identity)
-            )
-            let roots = initial.map { capture in
-                debugCodemapFullLoadRootSnapshot(
-                    capture: capture,
-                    observation: observations[capture.rootEpoch],
-                    universeIsCurrent: universeIsCurrent
-                )
-            }
-
-            let metrics = roots.reduce(into: [String: UInt64]()) {
-                $0 = CodemapFullLoadDebugSupport.adding($0, $1.metrics)
-            }
-            let resources = roots.reduce(into: [String: UInt64]()) {
-                $0 = CodemapFullLoadDebugSupport.adding($0, $1.resources)
-            }
-            let queueWaitMilliseconds = roots.flatMap(\.queueWaitMilliseconds)
-            let proofCount = roots.count(where: { $0.state == .ready })
-            let ineligibleCount = roots.count(where: { $0.state == .terminalIneligible })
-            let excludedCount = roots.count(where: { $0.state == .excluded })
-            let pendingCount = roots.count(where: { $0.state == .pending })
-            let failedCount = roots.count(where: { $0.state == .failed })
-            let supersededCount = roots.count(where: { $0.state == .superseded })
-            let eligibleCount = proofCount + pendingCount + failedCount + supersededCount
-
-            return CodemapFullLoadAggregateSnapshot(
-                expectedWorkspaceID: expectedWorkspaceID,
-                state: CodemapFullLoadDebugSupport.aggregateState(for: roots),
-                sampledUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                visibleRootCount: roots.count,
-                eligibleRootCount: eligibleCount,
-                readyRootCount: proofCount,
-                terminalIneligibleRootCount: ineligibleCount,
-                excludedRootCount: excludedCount,
-                pendingRootCount: pendingCount,
-                failedRootCount: failedCount,
-                supersededRootCount: supersededCount,
-                cohort: CodemapFullLoadDebugSupport.cohort(metrics: metrics),
-                roots: roots,
-                metrics: metrics,
-                resources: resources,
-                queueWaitMilliseconds: queueWaitMilliseconds
-            )
-        }
-
-        private func debugCaptureCodemapFullLoadUniverse() -> [DebugCodemapFullLoadCapture] {
-            rootsForPathLookup(scope: .visibleWorkspace)
-                .sorted { $0.id.uuidString < $1.id.uuidString }
-                .compactMap { root in
-                    guard let state = rootStatesByID[root.id] else { return nil }
-                    let rootEpoch = WorkspaceCodemapRootEpoch(
-                        rootID: root.id,
-                        rootLifetimeID: state.lifetimeID
-                    )
-                    let session = codemapSessionsByRootEpoch[rootEpoch]
-                    let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]
-                    let completed = codemapCompletedEligibilityByRootEpoch[rootEpoch]
-                    let authority = session?.authority
-                        ?? launch?.authority
-                        ?? codemapEligibilityFlightsByRootEpoch[rootEpoch]?.authority
-                        ?? completed?.authority
-                        ?? codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch]?.authority
-                    let terminalReason: WorkspaceCodemapGitTerminalUnavailableReason? = if case let .terminal(reason, _)? = completed?.result {
-                        reason
-                    } else {
-                        nil
-                    }
-                    let milestones = codemapGraphIndexBuildStoreEvents
-                        .filter { $0.rootEpoch == rootEpoch }
-                        .map {
-                            CodemapFullLoadMilestone(
-                                kind: $0.kind.rawValue,
-                                uptimeNanoseconds: $0.uptimeNanoseconds
-                            )
-                        }
-                    return DebugCodemapFullLoadCapture(
-                        rootEpoch: rootEpoch,
-                        catalogGeneration: authority?.catalogGeneration
-                            ?? catalogGenerationsByRootID[root.id]
-                            ?? 0,
-                        ingressGeneration: authority?.ingressGeneration
-                            ?? codemapAuthorityGenerationsByRootEpoch[rootEpoch]
-                            ?? 0,
-                        rootKind: root.kind,
-                        launchPhase: launch?.phase,
-                        terminalReason: terminalReason,
-                        engine: session?.engine,
-                        milestones: milestones
-                    )
-                }
-        }
-
-        private func debugCodemapFullLoadRootSnapshot(
-            capture: DebugCodemapFullLoadCapture,
-            observation: DebugCodemapFullLoadEngineObservation?,
-            universeIsCurrent: Bool
-        ) -> CodemapFullLoadRootSnapshot {
-            let accounting = observation?.accounting
-            let metrics = accounting.map(CodemapFullLoadDebugSupport.metrics) ?? [:]
-            let resources = accounting.map(CodemapFullLoadDebugSupport.resources) ?? [:]
-            let launchPhase = capture.launchPhase.map(CodemapFullLoadDebugSupport.launchPhaseName)
-
-            guard universeIsCurrent else {
-                return CodemapFullLoadRootSnapshot(
-                    rootEpoch: capture.rootEpoch,
-                    catalogGeneration: capture.catalogGeneration,
-                    ingressGeneration: capture.ingressGeneration,
-                    rootKind: CodemapFullLoadDebugSupport.rootKindName(capture.rootKind),
-                    state: .superseded,
-                    reason: "visible_root_universe_or_epoch_changed",
-                    launchPhase: launchPhase,
-                    graphIndexPhase: nil,
-                    supportedCandidateCount: nil,
-                    processedCandidateCount: nil,
-                    terminalCount: nil,
-                    lastGraphChangeSequence: nil,
-                    readyUptimeNanoseconds: nil,
-                    metrics: metrics,
-                    resources: resources,
-                    queueWaitMilliseconds: observation?.queueWaitMilliseconds ?? [],
-                    milestones: capture.milestones
-                )
-            }
-
-            var state: CodemapFullLoadRootState = .pending
-            var reason: String?
-            var graphIndexPhase: String?
-            var supportedCandidateCount: UInt64?
-            var processedCandidateCount: UInt64?
-            var terminalCount: UInt64?
-            var lastGraphChangeSequence: UInt64?
-            var readyUptimeNanoseconds: UInt64?
-
-            if let terminalReason = capture.terminalReason {
-                state = .terminalIneligible
-                reason = terminalReason.rawValue
-            } else {
-                if let graph = observation?.graph {
-                    lastGraphChangeSequence = graph.graphRevision
-                    if let revoked = graph.revocationReason {
-                        state = .superseded
-                        reason = "graph_revoked_\(revoked)"
-                    } else if let coverage = graph.coverage, coverage.isComplete,
-                              graph.appliedGeneration == graph.observedGeneration,
-                              !graph.updatesPending,
-                              !graph.reconciling
-                    {
-                        state = .ready
-                        graphIndexPhase = "ready"
-                        supportedCandidateCount = coverage.supportedCount
-                        processedCandidateCount = coverage.classifiedCount
-                        terminalCount = coverage.terminalCount
-                        readyUptimeNanoseconds = graph.lastCommittedUptimeNanoseconds
-                    } else {
-                        state = .pending
-                        graphIndexPhase = graph.reconciling ? "reconciling" : "indexing"
-                        supportedCandidateCount = graph.coverage?.supportedCount
-                        processedCandidateCount = graph.coverage?.classifiedCount
-                        terminalCount = graph.coverage?.terminalCount
-                        reason = graph.updatesPending ? "graph_updates_pending" : nil
-                    }
-                } else if capture.launchPhase == .handedOff {
-                    state = .failed
-                    reason = "eligible_root_missing_graph_after_handoff"
-                } else if capture.launchPhase == .cancelled || capture.launchPhase == .superseded {
-                    state = .failed
-                    reason = "graph_index_launch_\(launchPhase ?? "terminal")"
-                } else {
-                    reason = "awaiting_eligibility_setup_or_graph"
-                }
-            }
-
-            return CodemapFullLoadRootSnapshot(
-                rootEpoch: capture.rootEpoch,
-                catalogGeneration: capture.catalogGeneration,
-                ingressGeneration: capture.ingressGeneration,
-                rootKind: CodemapFullLoadDebugSupport.rootKindName(capture.rootKind),
-                state: state,
-                reason: reason,
-                launchPhase: launchPhase,
-                graphIndexPhase: graphIndexPhase,
-                supportedCandidateCount: supportedCandidateCount,
-                processedCandidateCount: processedCandidateCount,
-                terminalCount: terminalCount,
-                lastGraphChangeSequence: lastGraphChangeSequence,
-                readyUptimeNanoseconds: readyUptimeNanoseconds,
-                metrics: metrics,
-                resources: resources,
-                queueWaitMilliseconds: observation?.queueWaitMilliseconds ?? [],
-                milestones: capture.milestones
-            )
+            return await owner.engine.debugProjectionAdmissionSnapshot(rootEpoch: owner.rootEpoch)
         }
 
         func debugCodemapEnginePresent(rootID: UUID) -> Bool {
@@ -1864,9 +1340,9 @@ actor WorkspaceFileContextStore {
             return (newestSession.key, engine)
         }
 
-        private func debugForgetCodemapGraphIndexAdmissionHold(_ holdID: UUID) {
-            debugCodemapGraphIndexHoldOwners.removeValue(forKey: holdID)
-            debugCodemapGraphIndexHoldExpiryTasks.removeValue(forKey: holdID)
+        private func debugForgetCodemapProjectionAdmissionHold(_ holdID: UUID) {
+            debugCodemapProjectionHoldOwners.removeValue(forKey: holdID)
+            debugCodemapProjectionHoldExpiryTasks.removeValue(forKey: holdID)
         }
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
@@ -2427,6 +1903,7 @@ actor WorkspaceFileContextStore {
                 distinctContentKeyCount: recorder.distinctContentKeys.count,
                 decodedCacheInvalidationRequestCount: recorder.decodedCacheInvalidationRequestCount,
                 codemapInvalidationRequestCount: recorder.codemapInvalidationRequestCount,
+                watcherGapInvalidationCount: recorder.watcherGapInvalidationCount,
                 appliedIndexEventYieldCount: recorder.appliedIndexEventYieldCount
             )
         }
@@ -2576,19 +2053,19 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private struct CodemapGraphIndexCatalogShardBuildSnapshot: @unchecked Sendable {
+    private struct CodemapProjectionCatalogShardBuildSnapshot: @unchecked Sendable {
         let authority: CodemapRootAuthority
         let key: RootCatalogShardKey
         let root: WorkspaceRootRecord
         let appliedIndexGeneration: UInt64
-        let graphIndexInvalidationGeneration: UInt64
+        let projectionInvalidationGeneration: UInt64
         let files: [WorkspaceFileRecord]
         let folders: [WorkspaceFolderRecord]
         let managedOnlyFileIDs: Set<UUID>
         let managedOnlyFolderIDs: Set<UUID>
     }
 
-    private enum CodemapGraphIndexCatalogShardPublicationDisposition {
+    private enum CodemapProjectionCatalogShardPublicationDisposition {
         case ready
         case retry
         case unavailable
@@ -2737,11 +2214,10 @@ actor WorkspaceFileContextStore {
     private let codemapRuntimeProvider: CodeMapArtifactRuntimeProvider.Factory
     private let codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe
     private let codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe
-    private let codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy
+    private let codemapProjectionPreloadRetryPolicy: CodemapProjectionPreloadRetryPolicy
     private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
-    private let selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy
+    private let selectionGraphQueryBudgetPolicy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy
     private let automaticSelectionAccountingMaximum: Int
-    private let codemapDemandRequestHook: @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void
     private let codemapCancellationCleanupHook: @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void
     private let codemapReadyPublicationHook: @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void
     private let codemapGraphPublicationWaiter: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
@@ -2762,28 +2238,36 @@ actor WorkspaceFileContextStore {
     private var codemapCompletedEligibilityByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapCompletedEligibility
     ] = [:]
-    private var codemapGraphIndexBuildLaunchesByRootEpoch: [
-        WorkspaceCodemapRootEpoch: CodemapGraphIndexBuildLaunch
+    private var codemapProjectionPreloadLaunchesByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapProjectionPreloadLaunch
     ] = [:]
-    private var codemapGraphIndexBuildRetriesByRootEpoch: [
-        WorkspaceCodemapRootEpoch: CodemapGraphIndexBuildRetry
+    private var codemapProjectionPreloadRetriesByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapProjectionPreloadRetry
     ] = [:]
-    private var codemapGraphIndexRetryExhaustionByRootEpoch: [
-        WorkspaceCodemapRootEpoch: CodemapGraphIndexRetryExhaustion
+    private var codemapProjectionDemandsByID: [UUID: CodemapProjectionDemandRecord] = [:]
+    private var terminalCodemapProjectionDemandsByID: [
+        UUID: TerminalCodemapProjectionDemandRecord
     ] = [:]
     private var terminalNonGitCodemapCacheByEpoch: [
         WorkspaceCodemapRootEpoch: TerminalNonGitCodemapCacheEntry
     ] = [:]
     #if DEBUG
-        private let codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting
-        private var debugCodemapGraphIndexHoldOwners: [
+        private let codemapProjectionPreloadLaunchPolicyForTesting: CodemapProjectionPreloadLaunchPolicyForTesting
+        private let codemapAutomaticRetainedProjectionDemandPolicyForTesting:
+            CodemapAutomaticRetainedProjectionDemandPolicyForTesting
+        private let codemapSelectionGraphRuntimeQueryOverrideForTesting: (@Sendable (
+            WorkspaceCodemapRootEpoch,
+            WorkspaceCodemapSelectionGraphRuntimeQuery
+        ) async -> WorkspaceCodemapSelectionGraphRuntimeQueryDisposition?)?
+        private var debugCodemapProjectionHoldOwners: [
             UUID: (rootEpoch: WorkspaceCodemapRootEpoch, engine: WorkspaceCodemapBindingEngine)
         ] = [:]
-        private var debugCodemapGraphIndexHoldExpiryTasks: [UUID: Task<Void, Never>] = [:]
-        private var codemapGraphIndexBuildStoreEvents: [CodemapGraphIndexBuildStoreEvent] = []
-        private var nextCodemapGraphIndexBuildStoreEventOrdinal: UInt64 = 0
-        private var codemapGraphIndexBuildStartHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
-        private var codemapGraphIndexCatalogBuildHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
+        private var debugCodemapProjectionHoldExpiryTasks: [UUID: Task<Void, Never>] = [:]
+        private var codemapProjectionPreloadStoreEvents: [CodemapProjectionPreloadStoreEvent] = []
+        private var nextCodemapProjectionPreloadStoreEventOrdinal: UInt64 = 0
+        private var codemapProjectionPreloadStartHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
+        private var codemapProjectionCatalogBuildHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
+        private var codemapStructureSeedAdmissionRequestCountForTesting = 0
         private var codeStructureSelectedMetadataResolutionRequestCountForTesting = 0
         private var codemapPresentationCandidateRequestCountForTesting = 0
         private var codemapArtifactDemandRequestCountForTesting = 0
@@ -2792,12 +2276,16 @@ actor WorkspaceFileContextStore {
         private var codemapDemandTaskCreationCountForTesting = 0
         private var codemapTargetedReadyFreezeCountForTesting = 0
         private var codemapFullRootGraphFreezeCountForTesting = 0
+        private var codemapGraphBatchSignalCountForTesting = 0
+        private var codemapGraphBatchFlushCountForTesting = 0
+        private var codemapGraphWorkerStartCountForTesting = 0
+        private var codemapProjectionRecoveryObserverStartCountForTesting = 0
+        private var codemapProjectionRecoveryObserverRearmCountForTesting = 0
         private var filesInRootRequestCountForTesting = 0
-        private var appliedIndexRecordLookupRequestCountForTesting = 0
-        private var appliedIndexRecordLookupRequestedRecordCountForTesting = 0
-        private var appliedIndexRootSnapshotRequestCountForTesting = 0
-        private var codemapPathInvalidationStageHandlerForTesting:
-            (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
+        private var codemapGraphPublicationWillFlushHandlerForTesting:
+            (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
+        private var codemapProjectionRecoveryObserverWillWaitHandlerForTesting:
+            (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
     #endif
     private var codemapCleanupFlightsByRootID: [UUID: CodemapCleanupFlight] = [:]
     private var codemapPathInvalidationFlightsByRootEpoch: [
@@ -2810,27 +2298,19 @@ actor WorkspaceFileContextStore {
     private var codemapRootMutationFenceWaitersByRootEpoch: [
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
-    private var codemapPathQuiescenceWaitersByRootEpoch: [
-        WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
+    private var codemapProjectionPreloadPendingTriggerByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapProjectionPreloadTrigger
     ] = [:]
-    private var codemapGraphIndexBuildReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
-    private var codemapSuspendedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
-    private var codemapResumeTransitionIDsByRootEpoch: [WorkspaceCodemapRootEpoch: UUID] = [:]
-    private var codemapGraphAccountingByRootEpoch: [
-        WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIncrementalAccounting
-    ] = [:]
-    private var codemapRootStatusCoverageBaselinesByRootEpoch: [
-        WorkspaceCodemapRootEpoch: CodemapRootStatusCoverageBaseline
-    ] = [:]
-    private var codemapRootStatusContinuations: [
-        UUID: AsyncStream<WorkspaceCodemapRootStatusUpdate>.Continuation
-    ] = [:]
-    private var codemapRootStatusRevision: UInt64 = 0
-    private var lastPublishedCodemapRootStatuses: [WorkspaceCodemapRootStatusSnapshot] = []
     private var codemapPathLocalCatalogMutationDepthByRootID: [UUID: Int] = [:]
     private var codemapAuthorityGenerationsByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
-    private var codemapGraphIndexInvalidationGenerationsByRootEpoch: [
+    private var codemapProjectionInvalidationGenerationsByRootEpoch: [
         WorkspaceCodemapRootEpoch: UInt64
+    ] = [:]
+    private var codemapAutomaticSelectionPublicationPermitsByRootEpoch: [
+        WorkspaceCodemapRootEpoch: [UUID: CodemapAutomaticSelectionWeakPublicationPermit]
+    ] = [:]
+    private var codemapSelectionGraphReadinessContinuations: [
+        UUID: AsyncStream<WorkspaceCodemapSelectionGraphReadinessEvent>.Continuation
     ] = [:]
     private var codemapMarkerReadinessContinuations: [
         UUID: AsyncStream<WorkspaceCodemapMarkerReadinessEvent>.Continuation
@@ -2902,14 +2382,17 @@ actor WorkspaceFileContextStore {
             },
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
-            codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
-            codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
+            codemapProjectionPreloadRetryPolicy: CodemapProjectionPreloadRetryPolicy = .production,
+            codemapProjectionPreloadLaunchPolicyForTesting: CodemapProjectionPreloadLaunchPolicyForTesting = .enabled,
+            codemapAutomaticRetainedProjectionDemandPolicyForTesting:
+            CodemapAutomaticRetainedProjectionDemandPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
-            selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
+            codemapSelectionGraphRuntimeQueryOverrideForTesting: (@Sendable (
+                WorkspaceCodemapRootEpoch,
+                WorkspaceCodemapSelectionGraphRuntimeQuery
+            ) async -> WorkspaceCodemapSelectionGraphRuntimeQueryDisposition?)? = nil,
+            selectionGraphQueryBudgetPolicy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
-            codemapDemandRequestHook: @escaping @Sendable (
-                WorkspaceCodemapArtifactDemandTicket
-            ) async -> Void = { _ in },
             codemapCancellationCleanupHook: @escaping @Sendable (
                 WorkspaceCodemapArtifactDemandTicket
             ) async -> Void = { _ in },
@@ -2935,13 +2418,16 @@ actor WorkspaceFileContextStore {
             self.codemapRuntimeProvider = codemapRuntimeProvider
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
-            self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
-            self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
+            self.codemapProjectionPreloadRetryPolicy = codemapProjectionPreloadRetryPolicy
+            self.codemapProjectionPreloadLaunchPolicyForTesting = codemapProjectionPreloadLaunchPolicyForTesting
+            self.codemapAutomaticRetainedProjectionDemandPolicyForTesting =
+                codemapAutomaticRetainedProjectionDemandPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
+            self.codemapSelectionGraphRuntimeQueryOverrideForTesting =
+                codemapSelectionGraphRuntimeQueryOverrideForTesting
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
             self.automaticSelectionAccountingMaximum = automaticSelectionAccountingMaximum
-            self.codemapDemandRequestHook = codemapDemandRequestHook
             self.codemapCancellationCleanupHook = codemapCancellationCleanupHook
             self.codemapReadyPublicationHook = codemapReadyPublicationHook
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
@@ -2970,13 +2456,10 @@ actor WorkspaceFileContextStore {
             },
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
             codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
-            codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
+            codemapProjectionPreloadRetryPolicy: CodemapProjectionPreloadRetryPolicy = .production,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
-            selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
+            selectionGraphQueryBudgetPolicy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
-            codemapDemandRequestHook: @escaping @Sendable (
-                WorkspaceCodemapArtifactDemandTicket
-            ) async -> Void = { _ in },
             codemapCancellationCleanupHook: @escaping @Sendable (
                 WorkspaceCodemapArtifactDemandTicket
             ) async -> Void = { _ in },
@@ -3001,12 +2484,11 @@ actor WorkspaceFileContextStore {
             self.codemapRuntimeProvider = codemapRuntimeProvider
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
-            self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
+            self.codemapProjectionPreloadRetryPolicy = codemapProjectionPreloadRetryPolicy
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
             self.automaticSelectionAccountingMaximum = automaticSelectionAccountingMaximum
-            self.codemapDemandRequestHook = codemapDemandRequestHook
             self.codemapCancellationCleanupHook = codemapCancellationCleanupHook
             self.codemapReadyPublicationHook = codemapReadyPublicationHook
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
@@ -3036,10 +2518,15 @@ actor WorkspaceFileContextStore {
             for demand in session.demandsByFileID.values {
                 demand.task?.cancel()
             }
-            session.graphStatusTask?.cancel()
+            session.graphPublicationFlight?.task?.cancel()
+            session.projectionRecoveryObserver?.task?.cancel()
+            session.selectionGraph?.workerTask?.cancel()
             for bundle in session.bundlesByRequestID.values {
                 bundle.close()
             }
+        }
+        for projectionDemand in codemapProjectionDemandsByID.values {
+            projectionDemand.expiryTask?.cancel()
         }
         for flight in codemapCleanupFlightsByRootID.values {
             flight.task.cancel()
@@ -3053,10 +2540,10 @@ actor WorkspaceFileContextStore {
         for flight in watcherInfrastructureFlightsByKey.values {
             flight.task.cancel()
         }
-        for continuation in codemapMarkerReadinessContinuations.values {
+        for continuation in codemapSelectionGraphReadinessContinuations.values {
             continuation.finish()
         }
-        for continuation in codemapRootStatusContinuations.values {
+        for continuation in codemapMarkerReadinessContinuations.values {
             continuation.finish()
         }
         for continuation in fileSystemDeltaContinuations.values {
@@ -5285,6 +4772,7 @@ actor WorkspaceFileContextStore {
                 )
                 commit(pending.indexes)
                 rootIDsByStandardizedPath[pending.standardizedPath] = root.id
+                revokeAllAutomaticSelectionPublicationPermits()
                 rootStatesByID[root.id] = pending.state
                 rootLoadConfigurationsByPath[pending.standardizedPath] = pending.loadConfiguration
                 rootLoadOrder.append(root.id)
@@ -5406,9 +4894,8 @@ actor WorkspaceFileContextStore {
                 rootID: pending.state.root.id,
                 rootLifetimeID: pending.state.lifetimeID
             )
-            recordCodemapRootReadyForGraphIndexBuild(rootEpoch: rootEpoch)
-            publishCodemapRootStatusesIfChanged()
-            scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
+            recordCodemapRootReadyForProjectionPreload(rootEpoch: rootEpoch)
+            scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch)
         }
         scheduleOrphanedSessionWorktreeResourceCleanup(previousResources)
         return installedRoots
@@ -6152,24 +5639,6 @@ actor WorkspaceFileContextStore {
     }
 
     #if DEBUG
-        func replayPublisherFileSystemDeltasForCodemapIndependenceTesting(
-            rootID: UUID,
-            deltas: [FileSystemDelta],
-            servicePublicationSequence: UInt64
-        ) async throws {
-            let state = try state(for: rootID)
-            let preparedDeltas = prepareObservedFileSystemDeltas(deltas, root: state.root)
-            await applyPreparedIndexDeltas(
-                rootID: rootID,
-                deltas: preparedDeltas,
-                expectedLifetimeID: state.lifetimeID,
-                watcherAcceptedWatermark: nil,
-                servicePublicationSequence: servicePublicationSequence,
-                publicationCorrelation: nil,
-                diagnosticRootToken: state.service.diagnosticRootToken
-            )
-        }
-
         func replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
             rootID: UUID,
             deltas: [FileSystemDelta]
@@ -6340,8 +5809,6 @@ actor WorkspaceFileContextStore {
                 expectedLifetimeID: expectedLifetimeID,
                 watcherAcceptedWatermark: watcherAcceptedWatermark,
                 servicePublicationSequence: servicePublicationSequence,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
         #else
@@ -6349,9 +5816,6 @@ actor WorkspaceFileContextStore {
                 rootID: root.id,
                 deltas: preparedDeltas,
                 expectedLifetimeID: expectedLifetimeID,
-                servicePublicationSequence: servicePublicationSequence,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
         #endif
@@ -6625,55 +6089,7 @@ actor WorkspaceFileContextStore {
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
     }
 
-    func appliedIndexRecordLookup(
-        rootID: UUID,
-        fileIDs: [UUID],
-        folderIDs: [UUID]
-    ) -> WorkspaceAppliedIndexRecordLookup? {
-        #if DEBUG
-            appliedIndexRecordLookupRequestCountForTesting += 1
-            appliedIndexRecordLookupRequestedRecordCountForTesting += fileIDs.count + folderIDs.count
-        #endif
-        guard publishedSeededAuthorityIsQueryable(rootID: rootID),
-              let state = rootStatesByID[rootID]
-        else { return nil }
-
-        var matchingFilesByID: [UUID: WorkspaceFileRecord] = [:]
-        matchingFilesByID.reserveCapacity(fileIDs.count)
-        for fileID in fileIDs {
-            guard let record = filesByID[fileID],
-                  record.rootID == rootID,
-                  state.fileIDsByRelativePath[record.standardizedRelativePath] == fileID,
-                  isDiscoverableFileID(fileID),
-                  filesByID[fileID] == record
-            else { continue }
-            matchingFilesByID[fileID] = record
-        }
-
-        var matchingFoldersByID: [UUID: WorkspaceFolderRecord] = [:]
-        matchingFoldersByID.reserveCapacity(folderIDs.count)
-        for folderID in folderIDs {
-            guard let record = foldersByID[folderID],
-                  record.rootID == rootID,
-                  state.folderIDsByRelativePath[record.standardizedRelativePath] == folderID,
-                  isDiscoverableFolderID(folderID),
-                  foldersByID[folderID] == record
-            else { continue }
-            matchingFoldersByID[folderID] = record
-        }
-
-        return WorkspaceAppliedIndexRecordLookup(
-            root: state.root,
-            generation: appliedIndexGenerationsByRootID[rootID] ?? 0,
-            filesByID: matchingFilesByID,
-            foldersByID: matchingFoldersByID
-        )
-    }
-
     func appliedIndexRootSnapshot(rootID: UUID) -> WorkspaceAppliedIndexRootSnapshot? {
-        #if DEBUG
-            appliedIndexRootSnapshotRequestCountForTesting += 1
-        #endif
         guard publishedSeededAuthorityIsQueryable(rootID: rootID),
               let root = rootStatesByID[rootID]?.root
         else { return nil }
@@ -6741,31 +6157,15 @@ actor WorkspaceFileContextStore {
     ) -> WorkspaceSessionRootLifetimeSnapshot? {
         guard !expectedPhysicalRoots.isEmpty else { return nil }
         let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
-        let requestedMatches: Bool
-        switch rootScope {
+        let requestedMatches: Bool = switch rootScope {
         case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths):
-            requestedMatches = Set(requestedPhysicalRootPaths.map {
+            Set(requestedPhysicalRootPaths.map {
                 StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
             }) == expectedPaths
-        case let .validatedSessionBoundWorkspace(canonicalRoots, requestedPhysicalRoots):
-            let requestedValidation = WorkspaceLookupRootSelectorValidator.validate(
-                canonicalRoots: canonicalRoots,
-                physicalRoots: requestedPhysicalRoots
-            )
-            let expectedValidation = WorkspaceLookupRootSelectorValidator.validate(
-                canonicalRoots: [],
-                physicalRoots: Set(expectedPhysicalRoots)
-            )
-            if case let .valid(requestedSelector) = requestedValidation,
-               case let .valid(expectedSelector) = expectedValidation
-            {
-                requestedMatches = requestedSelector.physicalRootPathsByID
-                    == expectedSelector.physicalRootPathsByID
-            } else {
-                requestedMatches = false
-            }
+        case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
+            requestedPhysicalRoots == Set(expectedPhysicalRoots)
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
-            requestedMatches = false
+            false
         }
         guard requestedMatches,
               expectedPhysicalRoots.allSatisfy({ expectedRoot in
@@ -6804,22 +6204,16 @@ actor WorkspaceFileContextStore {
             guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
                 return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
             }
-            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
-                canonicalRoots: canonicalRoots,
-                physicalRoots: physicalRoots
-            ) else {
-                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
-            }
             missing = (
-                selector.canonicalRootPathsByID.map { ($0.key, $0.value, WorkspaceRootKind.primaryWorkspace) }
-                    + selector.physicalRootPathsByID.map { ($0.key, $0.value, WorkspaceRootKind.sessionWorktree) }
+                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
+                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
             )
-            .compactMap { rootID, expectedPath, expectedKind in
-                guard let currentRoot = rootStatesByID[rootID]?.root,
+            .compactMap { expectedRoot, expectedKind in
+                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
                       currentRoot.kind == expectedKind,
-                      currentRoot.standardizedFullPath == expectedPath,
-                      publishedSeededAuthorityIsQueryable(rootID: rootID)
-                else { return expectedPath }
+                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath,
+                      publishedSeededAuthorityIsQueryable(rootID: expectedRoot.id)
+                else { return expectedRoot.standardizedFullPath }
                 var isDirectory: ObjCBool = false
                 return FileManager.default.fileExists(
                     atPath: currentRoot.standardizedFullPath,
@@ -8668,18 +8062,6 @@ actor WorkspaceFileContextStore {
 
     func awaitAppliedIngressForExplicitRequest(
         userPath: String,
-        fallbackScope: WorkspaceLookupRootScope,
-        timeout: Duration
-    ) async throws -> [WorkspaceIngressBarrierSample] {
-        try await awaitAppliedIngressForExplicitRequest(
-            userPath: userPath,
-            fallbackRootRefs: rootRefs(scope: fallbackScope),
-            timeout: timeout
-        )
-    }
-
-    func awaitAppliedIngressForExplicitRequest(
-        userPath: String,
         fallbackRootRefs: [WorkspaceRootRef],
         timeout: Duration
     ) async throws -> [WorkspaceIngressBarrierSample] {
@@ -8691,68 +8073,21 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    /// Awaits one shared freshness barrier for every path participating in a single mutation.
-    /// Root IDs are deduplicated before waiting, so a move never spends the preflight timeout
-    /// once for its source and again for its destination.
-    func awaitAppliedIngressForExplicitRequests(
-        userPaths: [String],
-        fallbackScope: WorkspaceLookupRootScope,
-        timeout: Duration
-    ) async throws -> [WorkspaceIngressBarrierSample] {
-        let fallbackRootRefs = rootRefs(scope: fallbackScope)
-        let rootIDs = userPaths.flatMap { userPath in
-            explicitRequestIngressRootIDs(
-                userPath: userPath,
-                fallbackRootRefs: fallbackRootRefs
-            )
-        }
-        return try await awaitAppliedIngressWithTimeout(timeout) { [self] in
-            await awaitAppliedIngress(rootIDs: rootIDs)
-        }
-    }
-
-    private func explicitRequestIngressRootIDs(
-        userPath: String,
-        fallbackRootRefs: [WorkspaceRootRef]
-    ) -> [UUID] {
-        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        let expanded = (trimmed as NSString).expandingTildeInPath
-        let standardized = (expanded as NSString).standardizingPath
-        guard standardized.hasPrefix("/") else {
-            return fallbackRootRefs.map(\.id)
-        }
-        let containingRootID = fallbackRootRefs
-            .filter { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) }
-            .max { $0.standardizedFullPath.count < $1.standardizedFullPath.count }?
-            .id
-        return containingRootID.map { [$0] } ?? []
-    }
-
     private func awaitAppliedIngressWithTimeout(
         _ timeout: Duration,
         operation: @escaping @Sendable () async -> [WorkspaceIngressBarrierSample]
     ) async throws -> [WorkspaceIngressBarrierSample] {
-        let race = AppliedIngressTimeoutRace()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                race.install(continuation: continuation)
-                let operationTask = Task {
-                    let samples = await operation()
-                    race.resolve(.success(samples))
-                }
-                let timeoutTask = Task {
-                    do {
-                        try await Task.sleep(for: timeout)
-                    } catch {
-                        return
-                    }
-                    race.resolve(.failure(WorkspaceAppliedIngressWaitError.timedOut))
-                }
-                race.install(operationTask: operationTask, timeoutTask: timeoutTask)
+        try await withThrowingTaskGroup(of: [WorkspaceIngressBarrierSample].self) { group in
+            defer { group.cancelAll() }
+            group.addTask {
+                await operation()
             }
-        } onCancel: {
-            race.resolve(.failure(CancellationError()))
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw WorkspaceAppliedIngressWaitError.timedOut
+            }
+            guard let result = try await group.next() else { return [] }
+            return result
         }
     }
 
@@ -9814,6 +9149,20 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    func codemapSelectionGraphReadinessUpdates() -> AsyncStream<WorkspaceCodemapSelectionGraphReadinessEvent> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            codemapSelectionGraphReadinessContinuations[id] = continuation
+            continuation.onTermination = { _ in
+                Task { await self.removeCodemapSelectionGraphReadinessContinuation(id) }
+            }
+        }
+    }
+
+    private func removeCodemapSelectionGraphReadinessContinuation(_ id: UUID) {
+        codemapSelectionGraphReadinessContinuations.removeValue(forKey: id)
+    }
+
     func codemapMarkerReadinessUpdates() -> AsyncStream<WorkspaceCodemapMarkerReadinessEvent> {
         let id = UUID()
         return AsyncStream { continuation in
@@ -9826,220 +9175,6 @@ actor WorkspaceFileContextStore {
 
     private func removeCodemapMarkerReadinessContinuation(_ id: UUID) {
         codemapMarkerReadinessContinuations.removeValue(forKey: id)
-    }
-
-    func codemapRootStatusUpdates() -> AsyncStream<WorkspaceCodemapRootStatusUpdate> {
-        let id = UUID()
-        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            codemapRootStatusContinuations[id] = continuation
-            continuation.yield(currentCodemapRootStatusUpdate())
-            continuation.onTermination = { _ in
-                Task { await self.removeCodemapRootStatusContinuation(id) }
-            }
-        }
-    }
-
-    func codemapRootStatusSnapshot(rootID: UUID) -> WorkspaceCodemapRootStatusSnapshot? {
-        guard let state = rootStatesByID[rootID] else { return nil }
-        return makeCodemapRootStatusSnapshot(
-            rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
-        )
-    }
-
-    func setCodemapGenerationSuspended(
-        rootID: UUID,
-        suspended: Bool
-    ) async -> WorkspaceCodemapRootSuspensionUpdateResult {
-        guard let state = rootStatesByID[rootID] else { return .rootUnavailable }
-        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
-
-        if suspended {
-            let cancelledResume = codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch) != nil
-            let inserted = codemapSuspendedRootEpochs.insert(rootEpoch).inserted
-            guard inserted || cancelledResume else { return .unchanged }
-            codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
-            publishCodemapRootStatusesIfChanged()
-            if inserted {
-                let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine
-                _ = detachCodemapSession(rootEpoch: rootEpoch)
-                if let engine {
-                    await engine.cancelGraphIndex(rootEpoch: rootEpoch)
-                }
-            }
-            return .changed
-        }
-
-        guard codemapSuspendedRootEpochs.contains(rootEpoch),
-              codemapResumeTransitionIDsByRootEpoch[rootEpoch] == nil
-        else { return .unchanged }
-        let resumeID = UUID()
-        codemapResumeTransitionIDsByRootEpoch[rootEpoch] = resumeID
-        if let cleanup = codemapCleanupFlightsByRootID[rootID] {
-            await cleanup.task.value
-        }
-        guard rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID else {
-            if codemapResumeTransitionIDsByRootEpoch[rootEpoch] == resumeID {
-                codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
-            }
-            return .rootUnavailable
-        }
-        guard codemapResumeTransitionIDsByRootEpoch[rootEpoch] == resumeID,
-              codemapSuspendedRootEpochs.remove(rootEpoch) != nil
-        else { return .unchanged }
-        codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
-        scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
-        publishCodemapRootStatusesIfChanged()
-        return .changed
-    }
-
-    func prioritizeCodemapGraphIndexNow(
-        rootID: UUID
-    ) async -> WorkspaceCodemapGraphIndexPrioritizeDisposition {
-        guard let state = rootStatesByID[rootID] else { return .unavailable }
-        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
-        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch) else { return .unavailable }
-        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
-        codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
-        recordCodemapGraphIndexBuildStoreEvent(
-            .prioritizeNow,
-            rootEpoch: rootEpoch,
-            phase: codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase ?? .notScheduled
-        )
-        if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
-            let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
-            publishCodemapRootStatusesIfChanged()
-            return disposition
-        }
-        if let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] {
-            switch launch.phase {
-            case .transientRetry, .retryExhausted, .cancelled, .superseded:
-                codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
-            case .notScheduled, .eligibilityQueued, .setupJoining, .engineScheduling,
-                 .handedOff, .terminalNonGit:
-                return .promoted
-            }
-        }
-        scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
-        publishCodemapRootStatusesIfChanged()
-        return codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] == nil ? .unavailable : .scheduled
-    }
-
-    private func removeCodemapRootStatusContinuation(_ id: UUID) {
-        codemapRootStatusContinuations.removeValue(forKey: id)
-    }
-
-    private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        codemapSuspendedRootEpochs.contains(rootEpoch)
-    }
-
-    func currentCodemapRootStatusUpdate() -> WorkspaceCodemapRootStatusUpdate {
-        WorkspaceCodemapRootStatusUpdate(
-            revision: codemapRootStatusRevision,
-            roots: currentCodemapRootStatusSnapshots()
-        )
-    }
-
-    private func currentCodemapRootStatusSnapshots() -> [WorkspaceCodemapRootStatusSnapshot] {
-        rootLoadOrder.compactMap { rootID in
-            guard let state = rootStatesByID[rootID] else { return nil }
-            return makeCodemapRootStatusSnapshot(
-                rootEpoch: WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
-            )
-        }
-    }
-
-    private func makeCodemapRootStatusSnapshot(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> WorkspaceCodemapRootStatusSnapshot {
-        let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
-        let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
-        let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
-        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = switch launchPhase {
-        case .terminalNonGit: .notGitRepository
-        case .retryExhausted: .retryExhausted
-        default: nil
-        }
-        let availability: WorkspaceCodemapRootAvailability = if accounting?.revocationReason != nil {
-            .revoked
-        } else if unavailableReason != nil {
-            .unavailable
-        } else if accounting == nil || accounting?.graphRevision == 0 {
-            switch launchPhase {
-            case .eligibilityQueued, .setupJoining, .engineScheduling, .handedOff, .transientRetry:
-                .indexing
-            case .terminalNonGit, .retryExhausted:
-                .unavailable
-            case .notScheduled, .cancelled, .superseded, nil:
-                .notInitialized
-            }
-        } else if accounting?.reconciling == true {
-            .reconciling
-        } else if accounting?.coverage?.isComplete != true {
-            .indexing
-        } else if accounting?.activeApply == true || accounting?.updatesPending == true {
-            .updating
-        } else {
-            .ready
-        }
-        let zeroGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(rawValue: 0)
-        return WorkspaceCodemapRootStatusSnapshot(
-            rootEpoch: rootEpoch,
-            availability: availability,
-            isGenerationSuspended: suspended,
-            coverage: accounting?.coverage,
-            graphRevision: accounting.flatMap { $0.graphRevision == 0 ? nil : $0.graphRevision },
-            appliedGeneration: accounting?.appliedGeneration ?? zeroGeneration,
-            observedGeneration: accounting?.observedGeneration ?? zeroGeneration,
-            updatesPending: accounting?.updatesPending ?? false,
-            reconciliationAttempt: accounting?.reconciliationAttempt,
-            reconciliationDeadlineUptimeNanoseconds: accounting?.reconciliationDeadlineUptimeNanoseconds,
-            commitCadence: WorkspaceCodemapGraphCommitCadence(
-                successfulCommitCount: accounting?.successfulCommitCount ?? 0,
-                resyncCommitCount: accounting?.resyncCommitCount ?? 0,
-                lastCommittedUptimeNanoseconds: accounting?.lastCommittedUptimeNanoseconds,
-                lastCommitIntervalMilliseconds: accounting?.lastCommitIntervalMilliseconds
-            ),
-            diagnostics: WorkspaceCodemapGraphRootDiagnostics(
-                rejectedApplyCount: accounting?.rejectedApplyCount ?? 0,
-                fencedFileCount: accounting?.fencedFileCount ?? 0,
-                activeApply: accounting?.activeApply ?? false,
-                safetyCounter: accounting?.safetyCounter ?? 0,
-                revocationReason: accounting?.revocationReason,
-                diffPullCount: accounting?.diffPullCount ?? 0,
-                resyncPullCount: accounting?.resyncPullCount ?? 0,
-                revokedPullCount: accounting?.revokedPullCount ?? 0,
-                lastChangedFileCount: accounting?.lastChangedFileCount ?? 0,
-                lastAffectedSourceCount: accounting?.lastAffectedSourceCount ?? 0,
-                totalChangedFileCount: accounting?.totalChangedFileCount ?? 0,
-                totalAffectedSourceCount: accounting?.totalAffectedSourceCount ?? 0,
-                currentQueryCount: accounting?.currentQueryCount ?? 0,
-                pendingQueryCount: accounting?.pendingQueryCount ?? 0,
-                partialCoverageQueryCount: accounting?.partialCoverageQueryCount ?? 0,
-                reconciliationStartedCount: accounting?.reconciliationStartedCount ?? 0,
-                reconciliationCoalescedCount: accounting?.reconciliationCoalescedCount ?? 0,
-                reconciliationCommittedCount: accounting?.reconciliationCommittedCount ?? 0,
-                reconciliationRetryCount: accounting?.reconciliationRetryCount ?? 0,
-                reconciliationRevokedCount: accounting?.reconciliationRevokedCount ?? 0,
-                receiptValidationCount: accounting?.receiptValidationCount ?? 0,
-                receiptRejectionCount: accounting?.receiptRejectionCount ?? 0,
-                lastApplyDurationMilliseconds: accounting?.lastApplyDurationMilliseconds,
-                maximumApplyDurationMilliseconds: accounting?.maximumApplyDurationMilliseconds,
-                highFanoutApplyCount: accounting?.highFanoutApplyCount ?? 0,
-                observedToAppliedGenerationLag: accounting?.observedToAppliedGenerationLag ?? 0
-            ),
-            unavailableReason: unavailableReason
-        )
-    }
-
-    private func publishCodemapRootStatusesIfChanged() {
-        let roots = currentCodemapRootStatusSnapshots()
-        guard roots != lastPublishedCodemapRootStatuses else { return }
-        lastPublishedCodemapRootStatuses = roots
-        codemapRootStatusRevision &+= 1
-        let update = WorkspaceCodemapRootStatusUpdate(revision: codemapRootStatusRevision, roots: roots)
-        for continuation in codemapRootStatusContinuations.values {
-            continuation.yield(update)
-        }
     }
 
     @discardableResult
@@ -10435,6 +9570,7 @@ actor WorkspaceFileContextStore {
             sessionRootLifetimeClock.advance()
         }
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
+        revokeAllAutomaticSelectionPublicationPermits()
         rootStatesByID[root.id] = state
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
@@ -10460,9 +9596,8 @@ actor WorkspaceFileContextStore {
             rootID: root.id,
             rootLifetimeID: state.lifetimeID
         )
-        recordCodemapRootReadyForGraphIndexBuild(rootEpoch: rootEpoch)
-        publishCodemapRootStatusesIfChanged()
-        scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
+        recordCodemapRootReadyForProjectionPreload(rootEpoch: rootEpoch)
+        scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootLoad.end",
@@ -10676,6 +9811,12 @@ actor WorkspaceFileContextStore {
             if rootStatesByID[rootID]?.root.kind == .sessionWorktree {
                 sessionRootLifetimeClock.advance()
             }
+            if let currentState = rootStatesByID[rootID] {
+                revokeAutomaticSelectionPublicationPermits(rootEpoch: WorkspaceCodemapRootEpoch(
+                    rootID: rootID,
+                    rootLifetimeID: currentState.lifetimeID
+                ))
+            }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             invalidateRootSeedSearchShadow(rootID: rootID)
             let rootEpoch = WorkspaceCodemapRootEpoch(
@@ -10689,18 +9830,7 @@ actor WorkspaceFileContextStore {
             for continuation in rootMutationWaiters.values {
                 continuation.resume()
             }
-            let pathQuiescenceWaiters = codemapPathQuiescenceWaitersByRootEpoch.removeValue(
-                forKey: rootEpoch
-            ) ?? [:]
-            for continuation in pathQuiescenceWaiters.values {
-                continuation.resume()
-            }
-            codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
-            codemapSuspendedRootEpochs.remove(rootEpoch)
-            codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
-            codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
-            codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
-            publishCodemapRootStatusesIfChanged()
+            codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch)
             if let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
                 invalidationCommands: [.unload],
@@ -10711,13 +9841,10 @@ actor WorkspaceFileContextStore {
                 codemapCleanupFlights.append(cleanup)
             }
             codemapAuthorityGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
-            codemapGraphIndexInvalidationGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
+            codemapProjectionInvalidationGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
             terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
-            let pathFenceTokenIDs = codemapPathFenceTokensByID.compactMap { entry in
-                entry.value.rootEpoch == rootEpoch ? entry.key : nil
-            }
-            for tokenID in pathFenceTokenIDs {
-                removeCodemapPathFenceToken(id: tokenID)
+            codemapPathFenceTokensByID = codemapPathFenceTokensByID.filter {
+                $0.value.rootEpoch != rootEpoch
             }
             statesToUnload.append((rootID, state))
         }
@@ -11446,24 +10573,67 @@ actor WorkspaceFileContextStore {
                   isDiscoverableFileID(fileID),
                   let state = rootStatesByID[file.rootID],
                   state.fileIDsByRelativePath[file.standardizedRelativePath] == fileID,
-                  catalogGenerationsByRootID[file.rootID] != nil
+                  let catalogGeneration = catalogGenerationsByRootID[file.rootID]
             else { return nil }
-            let rootEpoch = WorkspaceCodemapRootEpoch(
-                rootID: file.rootID,
-                rootLifetimeID: state.lifetimeID
-            )
-            guard let session = codemapSessionsByRootEpoch[rootEpoch],
-                  codemapAuthorityIsCurrent(session.authority)
-            else { return nil }
-            let requestGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
-                ?? session.authority.ingressGeneration
             return WorkspaceCodemapAutomaticSelectionSourceIdentity(
-                rootEpoch: rootEpoch,
+                rootEpoch: WorkspaceCodemapRootEpoch(
+                    rootID: file.rootID,
+                    rootLifetimeID: state.lifetimeID
+                ),
                 fileID: fileID,
-                catalogGeneration: session.authority.catalogGeneration,
-                requestGeneration: requestGeneration
+                catalogGeneration: catalogGeneration
             )
         }
+    }
+
+    func codemapStructureSeedAdmission(
+        forFileIDs fileIDs: [UUID],
+        rootScope: WorkspaceLookupRootScope,
+        maximumUniqueFileCount: Int
+    ) -> WorkspaceCodemapStructureSeedAdmission {
+        precondition(maximumUniqueFileCount > 0)
+        #if DEBUG
+            codemapStructureSeedAdmissionRequestCountForTesting += 1
+        #endif
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        var seenInputFileIDs = Set<UUID>()
+        var seenStandardizedFullPaths = Set<String>()
+        var admittedFileIDs: [UUID] = []
+        var issues: [WorkspaceCodemapOperationCandidateIssue] = []
+
+        for fileID in fileIDs where seenInputFileIDs.insert(fileID).inserted {
+            guard let file = filesByID[fileID], isDiscoverableFileID(fileID) else {
+                issues.append(.fileNotCataloged(fileID))
+                continue
+            }
+            guard allowedRootIDs.contains(file.rootID) else {
+                issues.append(.fileOutsideRootScope(fileID))
+                continue
+            }
+            guard let state = rootStatesByID[file.rootID],
+                  state.fileIDsByRelativePath[file.standardizedRelativePath] == fileID,
+                  catalogGenerationsByRootID[file.rootID] != nil
+            else {
+                issues.append(.fileNotCataloged(fileID))
+                continue
+            }
+            guard seenStandardizedFullPaths.insert(file.standardizedFullPath).inserted else {
+                continue
+            }
+            admittedFileIDs.append(fileID)
+            if admittedFileIDs.count > maximumUniqueFileCount {
+                return WorkspaceCodemapStructureSeedAdmission(
+                    fileIDs: admittedFileIDs,
+                    issues: issues,
+                    didExceedLimit: true
+                )
+            }
+        }
+        return WorkspaceCodemapStructureSeedAdmission(
+            fileIDs: admittedFileIDs,
+            issues: issues,
+            didExceedLimit: false
+        )
     }
 
     func codemapOperationPresentationCandidates(
@@ -11589,7 +10759,297 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    func automaticCodemapSelectionSourceLimit() -> Int {
+    func planAutomaticCodemapSelectionCandidates(
+        sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
+        rootScope: WorkspaceLookupRootScope,
+        maximumCandidateDemandCount: Int = 1024
+    ) async -> WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition {
+        guard !sources.isEmpty else { return .unavailable(.noReadySources) }
+        guard maximumCandidateDemandCount > 0 else {
+            return .budget(.candidateDemandLimit(attempted: 1, limit: 0))
+        }
+        let rootScopeEpochs = codemapAutomaticSelectionRootScopeEpochs(rootScope)
+        let allowedRootIDs = Set(rootScopeEpochs.map(\.rootID))
+        let sourceIDsByRoot = Dictionary(grouping: sources, by: \.rootEpoch)
+        let orderedRootEpochs = sourceIDsByRoot.keys.sorted(by: codemapRootEpochPrecedes)
+        var graphSources: [WorkspaceCodemapStoreSelectionGraphSourceIdentity] = []
+        var sourceTicketsByIdentity: [
+            WorkspaceCodemapAutomaticSelectionSourceIdentity: WorkspaceCodemapArtifactDemandTicket
+        ] = [:]
+        var catalogShardsByRootEpoch: [WorkspaceCodemapRootEpoch: RootCatalogShard] = [:]
+
+        for rootEpoch in orderedRootEpochs {
+            guard allowedRootIDs.contains(rootEpoch.rootID),
+                  let state = rootStatesByID[rootEpoch.rootID],
+                  state.lifetimeID == rootEpoch.rootLifetimeID,
+                  let session = codemapSessionsByRootEpoch[rootEpoch]
+            else {
+                return .stale(.rootEpochNotCurrent(rootEpoch))
+            }
+            let rootSources = sourceIDsByRoot[rootEpoch] ?? []
+            for source in rootSources {
+                guard let record = session.demandsByFileID[source.fileID],
+                      case let .ready(ready) = record.result,
+                      codemapTicketsShareDemand(ready.ticket, record.ticket),
+                      codemapDemandIsCurrent(ready.ticket)
+                else {
+                    return .pending([.manifestAdmission(rootEpoch: rootEpoch)])
+                }
+                graphSources.append(WorkspaceCodemapStoreSelectionGraphSourceIdentity(
+                    ticket: ready.ticket
+                ))
+                sourceTicketsByIdentity[source] = ready.ticket
+            }
+            guard let catalogShard = automaticSelectionCatalogShard(rootEpoch: rootEpoch) else {
+                return .stale(.rootEpochNotCurrent(rootEpoch))
+            }
+            catalogShardsByRootEpoch[rootEpoch] = catalogShard
+        }
+
+        var provisionalCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var provisionalIncompleteReasons: [WorkspaceCodemapAutomaticSelectionIncompleteReason] = []
+        for rootEpoch in orderedRootEpochs {
+            guard let session = codemapSessionsByRootEpoch[rootEpoch],
+                  let engine = session.engine,
+                  let catalogShard = catalogShardsByRootEpoch[rootEpoch]
+            else { continue }
+            let rootSourceTickets = (sourceIDsByRoot[rootEpoch] ?? []).compactMap {
+                sourceTicketsByIdentity[$0]
+            }
+            let catalogCandidates = catalogShard.projectionFiles.compactMap {
+                automaticSelectionCatalogCandidate(
+                    projectionFile: $0,
+                    rootEpoch: rootEpoch,
+                    catalogShard: catalogShard
+                )
+            }
+            let engineDisposition = await engine.planAutomaticSelectionCandidates(
+                WorkspaceCodemapBindingAutomaticSelectionPlanRequest(
+                    rootEpoch: rootEpoch,
+                    sourceTickets: rootSourceTickets,
+                    candidates: catalogCandidates,
+                    maximumMatchedCandidateCount: maximumCandidateDemandCount
+                )
+            )
+            if case let .provisional(candidates, _, progress, remainingCount, retry) = engineDisposition {
+                let remainingCapacity = maximumCandidateDemandCount - provisionalCandidates.count
+                guard candidates.count <= remainingCapacity else {
+                    return .budget(.candidateDemandLimit(
+                        attempted: maximumCandidateDemandCount + 1,
+                        limit: maximumCandidateDemandCount
+                    ))
+                }
+                provisionalCandidates.append(contentsOf: candidates)
+                provisionalIncompleteReasons.append(.graph(.definitionUniverse(
+                    rootEpoch: rootEpoch,
+                    progress: progress,
+                    remainingCount: remainingCount,
+                    retry: retry
+                )))
+            }
+        }
+        let provisionalFallbackDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition? = if !provisionalCandidates.isEmpty {
+            .provisional(WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan(
+                candidates: provisionalCandidates.sorted(by: automaticSelectionCandidatePrecedes),
+                rootScopeEpochs: rootScopeEpochs,
+                incompleteReasons: provisionalIncompleteReasons
+            ))
+        } else {
+            nil
+        }
+
+        let basePolicy = selectionGraphQueryBudgetPolicy
+        let queryPolicy = WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy(
+            maximumRootCount: basePolicy.maximumRootCount,
+            maximumRawSourceCount: basePolicy.maximumRawSourceCount,
+            maximumUniqueSourceCount: basePolicy.maximumUniqueSourceCount,
+            maximumSourceIssueCount: basePolicy.maximumSourceIssueCount,
+            maximumTargetCount: maximumCandidateDemandCount,
+            maximumResolutionCount: basePolicy.maximumResolutionCount,
+            maximumReferenceFailureCount: basePolicy.maximumReferenceFailureCount,
+            maximumByteCount: basePolicy.maximumByteCount
+        )
+        let disposition = await queryCodemapSelectionGraph(
+            WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: graphSources),
+            budgetPolicy: queryPolicy
+        )
+        await codemapAutomaticSelectionQueryHook(orderedRootEpochs[0])
+        guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == rootScopeEpochs else {
+            return .stale(.rootEpochNotCurrent(orderedRootEpochs[0]))
+        }
+        for rootEpoch in orderedRootEpochs {
+            guard let capturedShard = catalogShardsByRootEpoch[rootEpoch],
+                  automaticSelectionCatalogShard(rootEpoch: rootEpoch) === capturedShard
+            else { return .stale(.coverageProof(rootEpoch)) }
+        }
+        for source in sources {
+            guard let capturedTicket = sourceTicketsByIdentity[source],
+                  let record = codemapSessionsByRootEpoch[source.rootEpoch]?
+                  .demandsByFileID[source.fileID],
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(capturedTicket, ready.ticket),
+                  codemapTicketsShareDemand(ready.ticket, record.ticket),
+                  ready.ticket.requestGeneration == capturedTicket.requestGeneration,
+                  codemapDemandIsCurrent(capturedTicket)
+            else { return .stale(.sourceStateChanged(source)) }
+        }
+
+        switch disposition {
+        case let .readyPartial(queryResult):
+            guard queryResult.roots.count == orderedRootEpochs.count else {
+                return .unavailable(.graph(.invalidGraphResult(orderedRootEpochs[0])))
+            }
+            let selectedFileIDs = Set(sources.map(\.fileID))
+            var plannedCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+            var coverageProofs: [WorkspaceCodemapProjectionCoverageProof] = []
+            for rootEpoch in orderedRootEpochs {
+                guard let catalogShard = catalogShardsByRootEpoch[rootEpoch],
+                      automaticSelectionCatalogShard(rootEpoch: rootEpoch) === catalogShard,
+                      let supportedCandidateCount = UInt64(exactly: catalogShard.projectionFiles.count)
+                else { return .stale(.coverageProof(rootEpoch)) }
+                guard let rootResult = queryResult.roots.first(where: { $0.rootEpoch == rootEpoch }),
+                      case let .complete(proof, candidateCount, _, _) =
+                      rootResult.result.definitionUniverseCoverage,
+                      candidateCount == supportedCandidateCount,
+                      proof.catalogCompletion.supportedCandidateCount == candidateCount,
+                      automaticSelectionCoverageProofIsCurrent(proof)
+                else { return .stale(.coverageProof(rootEpoch)) }
+                for endpoint in rootResult.result.targets where !selectedFileIDs.contains(endpoint.fileID) {
+                    guard let candidate = automaticSelectionCatalogCandidate(
+                        endpoint: endpoint,
+                        rootEpoch: rootEpoch,
+                        catalogShard: catalogShard
+                    )
+                    else { return .stale(.coverageProof(rootEpoch)) }
+                    plannedCandidates.append(candidate)
+                }
+                coverageProofs.append(proof)
+            }
+            plannedCandidates.sort(by: automaticSelectionCandidatePrecedes)
+            return .ready(WorkspaceCodemapAutomaticSelectionCandidatePlan(
+                candidates: plannedCandidates,
+                rootScopeEpochs: rootScopeEpochs,
+                coverageProofs: coverageProofs
+            ))
+        case let .incomplete(reason):
+            return provisionalFallbackDisposition ?? .incomplete([.graph(reason)])
+        case let .busy(reason):
+            return provisionalFallbackDisposition ?? .busy(reason)
+        case let .unavailable(reason):
+            return .unavailable(.graph(reason))
+        case let .stale(reason):
+            return .stale(.graph(reason))
+        case let .budget(reason):
+            let budgetDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition = if case let .targetLimit(attempted, _) = reason {
+                .budget(.candidateDemandLimit(
+                    attempted: attempted,
+                    limit: maximumCandidateDemandCount
+                ))
+            } else {
+                .budget(codemapAutomaticSelectionBudgetReason(
+                    reason,
+                    rootEpoch: orderedRootEpochs.first
+                ))
+            }
+            return budgetDisposition
+        }
+    }
+
+    private func automaticSelectionCatalogShard(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> RootCatalogShard? {
+        guard let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              let shard = publishedRootCatalogShardsByRootID[rootEpoch.rootID],
+              shard.key.rootID == rootEpoch.rootID,
+              shard.key.lifetimeID == rootEpoch.rootLifetimeID,
+              shard.root.id == rootEpoch.rootID,
+              shard.root.standardizedFullPath == session.authority.standardizedRootPath,
+              session.authority.rootEpoch == rootEpoch
+        else { return nil }
+        return shard
+    }
+
+    private func automaticSelectionCatalogCandidate(
+        endpoint: WorkspaceCodemapSelectionGraphRuntimeEndpoint,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        catalogShard: RootCatalogShard
+    ) -> WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate? {
+        guard endpoint.rootEpoch == rootEpoch,
+              automaticSelectionCatalogShard(rootEpoch: rootEpoch) === catalogShard,
+              let state = rootStatesByID[rootEpoch.rootID],
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              let projectionIndex = catalogShard.projectionFileIndexByID[endpoint.fileID]
+        else { return nil }
+        let projectionFile = catalogShard.projectionFiles[projectionIndex]
+        let file = projectionFile.file
+        let fileExtension = (file.name as NSString).pathExtension
+        guard isDiscoverableFileID(file.id),
+              filesByID[file.id] == file,
+              state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+              SyntaxManager.supportsCodeMap(fileExtension: fileExtension),
+              SyntaxManager.shared.language(forFileExtension: fileExtension) == projectionFile.language,
+              let identity = WorkspaceCodemapArtifactBindingIdentity(
+                  rootID: rootEpoch.rootID,
+                  rootLifetimeID: rootEpoch.rootLifetimeID,
+                  fileID: file.id,
+                  standardizedRootPath: session.authority.standardizedRootPath,
+                  standardizedRelativePath: file.standardizedRelativePath,
+                  standardizedFullPath: file.standardizedFullPath
+              )
+        else { return nil }
+        let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+            ?? session.authority.ingressGeneration
+        guard endpoint.requestGeneration == pathGeneration else { return nil }
+        return WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate(
+            identity: identity,
+            language: projectionFile.language,
+            requestGeneration: pathGeneration,
+            catalogGeneration: session.authority.catalogGeneration,
+            pathGeneration: pathGeneration,
+            ingressGeneration: session.authority.ingressGeneration
+        )
+    }
+
+    private func automaticSelectionCatalogCandidate(
+        projectionFile: RootCatalogProjectionFile,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        catalogShard: RootCatalogShard
+    ) -> WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate? {
+        guard automaticSelectionCatalogShard(rootEpoch: rootEpoch) === catalogShard,
+              let state = rootStatesByID[rootEpoch.rootID],
+              let session = codemapSessionsByRootEpoch[rootEpoch]
+        else { return nil }
+        let file = projectionFile.file
+        let fileExtension = (file.name as NSString).pathExtension
+        guard isDiscoverableFileID(file.id),
+              filesByID[file.id] == file,
+              state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+              SyntaxManager.supportsCodeMap(fileExtension: fileExtension),
+              SyntaxManager.shared.language(forFileExtension: fileExtension) == projectionFile.language,
+              let identity = WorkspaceCodemapArtifactBindingIdentity(
+                  rootID: rootEpoch.rootID,
+                  rootLifetimeID: rootEpoch.rootLifetimeID,
+                  fileID: file.id,
+                  standardizedRootPath: session.authority.standardizedRootPath,
+                  standardizedRelativePath: file.standardizedRelativePath,
+                  standardizedFullPath: file.standardizedFullPath
+              )
+        else { return nil }
+        let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+            ?? session.authority.ingressGeneration
+        return WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate(
+            identity: identity,
+            language: projectionFile.language,
+            requestGeneration: pathGeneration,
+            catalogGeneration: session.authority.catalogGeneration,
+            pathGeneration: pathGeneration,
+            ingressGeneration: session.authority.ingressGeneration
+        )
+    }
+
+    func automaticCodemapSelectionSourceDemandLimit() -> Int {
         selectionGraphQueryBudgetPolicy.maximumRawSourceCount
     }
 
@@ -11598,535 +11058,1727 @@ actor WorkspaceFileContextStore {
     ) -> [WorkspaceCodemapRootEpoch] {
         rootsForPathLookup(scope: rootScope).compactMap { root in
             guard let state = rootStatesByID[root.id] else { return nil }
-            return WorkspaceCodemapRootEpoch(rootID: root.id, rootLifetimeID: state.lifetimeID)
-        }.sorted(by: workspaceCodemapRootEpochPrecedes)
+            return WorkspaceCodemapRootEpoch(
+                rootID: root.id,
+                rootLifetimeID: state.lifetimeID
+            )
+        }.sorted(by: codemapRootEpochPrecedes)
+    }
+
+    private func automaticSelectionCoverageProofIsCurrent(
+        _ proof: WorkspaceCodemapProjectionCoverageProof
+    ) -> Bool {
+        let rootEpoch = proof.generation.rootEpoch
+        guard !codemapProjectionCatalogIsFenced(rootEpoch: rootEpoch),
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              codemapAuthorityIsCurrent(session.authority),
+              let currentCatalog = codemapProjectionCatalogShardAndToken(
+                  authority: session.authority
+              ),
+              currentCatalog.token == proof.generation.catalogToken,
+              let graphState = session.selectionGraph
+        else { return false }
+        let graphKey = WorkspaceCodemapSelectionGraphRuntimeKey(generation: proof.generation)
+        guard graphState.desiredKey == graphKey,
+              let summary = graphState.publishedSummary,
+              summary.key == graphKey,
+              case let .complete(currentProof, _, _, _) = summary.definitionUniverseCoverage,
+              currentProof == proof
+        else { return false }
+        return true
+    }
+
+    private func automaticSelectionCoverageProofsAreCurrent(
+        _ proofs: [WorkspaceCodemapProjectionCoverageProof]
+    ) -> Bool {
+        guard !proofs.isEmpty else { return false }
+        var rootEpochs = Set<WorkspaceCodemapRootEpoch>()
+        for proof in proofs {
+            guard rootEpochs.insert(proof.generation.rootEpoch).inserted,
+                  automaticSelectionCoverageProofIsCurrent(proof)
+            else { return false }
+        }
+        return true
+    }
+
+    func provisionalAutomaticCodemapSelectionResult(
+        sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
+        plan: WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan,
+        readyCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate],
+        pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason],
+        partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason],
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspaceCodemapAutomaticSelectionResult {
+        guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == plan.rootScopeEpochs else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .stale(.publicationReceipt)
+            )
+        }
+
+        var sourceTickets: [WorkspaceCodemapArtifactDemandTicket] = []
+        sourceTickets.reserveCapacity(sources.count)
+        for source in sources {
+            guard let record = codemapSessionsByRootEpoch[source.rootEpoch]?
+                .demandsByFileID[source.fileID],
+                case let .ready(ready) = record.result,
+                codemapTicketsShareDemand(record.ticket, ready.ticket),
+                codemapDemandIsCurrent(ready.ticket),
+                ready.snapshot.requestGeneration == ready.ticket.requestGeneration
+            else {
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .stale(.sourceStateChanged(source))
+                )
+            }
+            sourceTickets.append(ready.ticket)
+        }
+
+        let sourceSlots = Set(sources.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        var selectedCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var seenCandidateSlots = Set<WorkspaceCodemapRootScopedFileSlot>()
+        for candidate in readyCandidates.sorted(by: automaticSelectionCandidatePrecedes) {
+            let slot = WorkspaceCodemapRootScopedFileSlot(candidate: candidate)
+            guard seenCandidateSlots.insert(slot).inserted else { continue }
+            selectedCandidates.append(candidate)
+        }
+
+        var targetCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var targets: [WorkspaceCodemapAutomaticSelectionTarget] = []
+        var provisionalPartial = partialReasons
+        for candidate in selectedCandidates {
+            let rootEpoch = candidate.rootEpoch
+            let slot = WorkspaceCodemapRootScopedFileSlot(candidate: candidate)
+            guard !sourceSlots.contains(slot),
+                  provisionalAutomaticSelectionCandidateDemandIsCurrent(
+                      candidate: candidate,
+                      rootScope: rootScope,
+                      rootScopeEpochs: plan.rootScopeEpochs
+                  ),
+                  let state = rootStatesByID[rootEpoch.rootID],
+                  let file = filesByID[candidate.identity.fileID],
+                  let session = codemapSessionsByRootEpoch[rootEpoch],
+                  let record = session.demandsByFileID[file.id],
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(record.ticket, ready.ticket),
+                  ready.ticket.requestGeneration == candidate.requestGeneration,
+                  ready.snapshot.requestGeneration == candidate.requestGeneration,
+                  codemapDemandIsCurrent(ready.ticket),
+                  let logicalPath = WorkspaceCodemapLogicalPresentationPath(
+                      rootDisplayName: state.root.name,
+                      standardizedRelativePath: file.standardizedRelativePath
+                  )
+            else {
+                // Revalidation cannot distinguish unavailable causes here; staleCurrentness is the conservative catch-all.
+                provisionalPartial.append(.candidateUnavailable(
+                    rootEpoch: rootEpoch,
+                    fileID: candidate.identity.fileID,
+                    reason: .staleCurrentness
+                ))
+                continue
+            }
+            targetCandidates.append(candidate)
+            targets.append(WorkspaceCodemapAutomaticSelectionTarget(
+                rootEpoch: rootEpoch,
+                fileID: file.id,
+                catalogGeneration: candidate.catalogGeneration,
+                requestGeneration: candidate.requestGeneration,
+                logicalPath: logicalPath
+            ))
+        }
+
+        targets.sort(by: automaticSelectionTargetPrecedes)
+        let targetSlots = Set(targets.map { WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID) })
+        targetCandidates.sort(by: automaticSelectionCandidatePrecedes)
+        let diagnosticRootEpochs = Set(
+            plan.incompleteReasons.compactMap(automaticSelectionIncompleteReasonRootEpoch) +
+                pendingReasons.compactMap(automaticSelectionPendingReasonRootEpoch) +
+                provisionalPartial.compactMap(automaticSelectionPartialReasonRootEpoch) +
+                sources.map(\.rootEpoch) +
+                targetSlots.map(\.rootEpoch)
+        )
+        let orderedRootEpochs = diagnosticRootEpochs.sorted(by: codemapRootEpochPrecedes)
+        let fallbackRootEpoch = orderedRootEpochs.first
+        let roots: [WorkspaceCodemapAutomaticSelectionRootResult] = orderedRootEpochs.map { rootEpoch in
+            let rootTargets = targets.filter { $0.rootEpoch == rootEpoch }
+            let rootIncomplete = plan.incompleteReasons.filter {
+                automaticSelectionIncompleteReasonRootEpoch($0) == rootEpoch
+            }
+            let rootPending = pendingReasons.filter {
+                automaticSelectionPendingReasonRootEpoch($0) == rootEpoch
+            }
+            let rootPartial = provisionalPartial.filter {
+                let reasonRoot = automaticSelectionPartialReasonRootEpoch($0)
+                return reasonRoot == rootEpoch || (reasonRoot == nil && rootEpoch == fallbackRootEpoch)
+            }
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: rootTargets,
+                sourceIssues: [],
+                targetIssues: [],
+                coverage: .provisional(
+                    incomplete: rootIncomplete,
+                    pending: rootPending,
+                    partial: rootPartial
+                )
+            )
+        }
+        let aggregateCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage.provisional(
+            incomplete: plan.incompleteReasons,
+            pending: pendingReasons,
+            partial: provisionalPartial
+        )
+        guard !targets.isEmpty else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: roots,
+                aggregateCoverage: aggregateCoverage
+            )
+        }
+        guard Set(targets).count == targets.count,
+              targetSlots.count == targets.count,
+              targetCandidates.count == targets.count,
+              Set(targetCandidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) }).count == targetCandidates.count
+        else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .stale(.publicationReceipt)
+            )
+        }
+        let requestID = UUID()
+        let publicationPermit = WorkspaceCodemapAutomaticSelectionPublicationPermit()
+        registerAutomaticSelectionPublicationPermit(
+            publicationPermit,
+            requestID: requestID,
+            rootScopeEpochs: plan.rootScopeEpochs
+        )
+        let receipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: requestID,
+            rootScope: rootScope,
+            rootScopeEpochs: plan.rootScopeEpochs,
+            sourceTickets: sourceTickets,
+            graphKeys: [],
+            coverageProofs: [],
+            targets: targets,
+            publicationBasis: .provisionalCandidates(targetCandidates),
+            publicationPermit: publicationPermit
+        )
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: roots,
+            aggregateCoverage: aggregateCoverage,
+            publicationReceipt: receipt
+        )
+    }
+
+    private func automaticSelectionTargetPrecedes(
+        _ lhs: WorkspaceCodemapAutomaticSelectionTarget,
+        _ rhs: WorkspaceCodemapAutomaticSelectionTarget
+    ) -> Bool {
+        if lhs.rootEpoch != rhs.rootEpoch { return codemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch) }
+        if lhs.logicalPath.standardizedRelativePath != rhs.logicalPath.standardizedRelativePath {
+            return lhs.logicalPath.standardizedRelativePath.utf8.lexicographicallyPrecedes(
+                rhs.logicalPath.standardizedRelativePath.utf8
+            )
+        }
+        return lhs.fileID.uuidString < rhs.fileID.uuidString
+    }
+
+    private func automaticSelectionIncompleteReasonRootEpoch(
+        _ reason: WorkspaceCodemapAutomaticSelectionIncompleteReason
+    ) -> WorkspaceCodemapRootEpoch? {
+        switch reason {
+        case let .graph(.definitionUniverse(rootEpoch, _, _, _)):
+            rootEpoch
+        }
+    }
+
+    private func automaticSelectionPendingReasonRootEpoch(
+        _ reason: WorkspaceCodemapAutomaticSelectionPendingReason
+    ) -> WorkspaceCodemapRootEpoch? {
+        switch reason {
+        case let .sourceDemand(source, _), let .sourceBusy(source, _):
+            source.rootEpoch
+        case let .candidateDemand(rootEpoch, _, _), let .candidateBusy(rootEpoch, _, _),
+             let .manifestAdmission(rootEpoch), let .graphRebuild(rootEpoch):
+            rootEpoch
+        }
+    }
+
+    private func automaticSelectionPartialReasonRootEpoch(
+        _ reason: WorkspaceCodemapAutomaticSelectionPartialReason
+    ) -> WorkspaceCodemapRootEpoch? {
+        switch reason {
+        case .graph:
+            nil
+        case let .source(issue):
+            switch issue {
+            case let .outsideRootScope(source), let .notCataloged(source),
+                 let .notDemanded(source), let .pending(source, _),
+                 let .unavailable(source, _), let .staleCatalogGeneration(source, _):
+                source.rootEpoch
+            }
+        case let .sourceDemandTimedOut(source):
+            source.rootEpoch
+        case let .candidateUnavailable(rootEpoch, _, _):
+            rootEpoch
+        }
+    }
+
+    private func registerAutomaticSelectionPublicationPermit(
+        _ permit: WorkspaceCodemapAutomaticSelectionPublicationPermit,
+        requestID: UUID,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    ) {
+        for rootEpoch in rootScopeEpochs {
+            var permits = codemapAutomaticSelectionPublicationPermitsByRootEpoch[rootEpoch] ?? [:]
+            permits = permits.filter { $0.value.permit != nil }
+            permits[requestID] = CodemapAutomaticSelectionWeakPublicationPermit(permit)
+            codemapAutomaticSelectionPublicationPermitsByRootEpoch[rootEpoch] = permits
+        }
+    }
+
+    private func revokeAutomaticSelectionPublicationPermits(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        let permits = codemapAutomaticSelectionPublicationPermitsByRootEpoch
+            .removeValue(forKey: rootEpoch) ?? [:]
+        for weakPermit in permits.values {
+            weakPermit.permit?.revoke()
+        }
+    }
+
+    private func revokeAllAutomaticSelectionPublicationPermits() {
+        let permitGroups = codemapAutomaticSelectionPublicationPermitsByRootEpoch.values
+        codemapAutomaticSelectionPublicationPermitsByRootEpoch.removeAll()
+        for permits in permitGroups {
+            for weakPermit in permits.values {
+                weakPermit.permit?.revoke()
+            }
+        }
+    }
+
+    private func automaticSelectionAccountingCanRepresent(
+        _ policy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy
+    ) -> Bool {
+        addingAutomaticSelectionCount(policy.maximumSourceIssueCount, 1) != nil &&
+            addingAutomaticSelectionCount(policy.maximumTargetCount, 1) != nil &&
+            addingAutomaticSelectionCount(policy.maximumResolutionCount, 1) != nil &&
+            addingAutomaticSelectionCount(policy.maximumReferenceFailureCount, 1) != nil &&
+            addingAutomaticSelectionCount(policy.maximumByteCount, 1) != nil
+    }
+
+    private func addingAutomaticSelectionCount(_ lhs: Int, _ rhs: Int) -> Int? {
+        guard lhs >= 0, rhs >= 0,
+              lhs <= automaticSelectionAccountingMaximum,
+              rhs <= automaticSelectionAccountingMaximum
+        else { return nil }
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        guard !overflow, sum <= automaticSelectionAccountingMaximum else { return nil }
+        return sum
     }
 
     func resolveAutomaticCodemapSelection(
         sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
         rootScope: WorkspaceLookupRootScope
     ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
-        try Task.checkCancellation()
-        let policy = selectionGraphQueryBudgetPolicy
-        guard !sources.isEmpty else {
-            return WorkspaceCodemapAutomaticSelectionResult(
-                roots: [],
-                aggregateCoverage: .unavailable([.emptySources])
+        try await resolveAutomaticCodemapSelection(
+            sources: sources,
+            rootScope: rootScope,
+            targetAuthority: .retainedReadyDemand
+        )
+    }
+
+    private func resolveAutomaticCodemapSelection(
+        sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
+        rootScope: WorkspaceLookupRootScope,
+        targetAuthority: AutomaticSelectionTargetAuthority
+    ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
+        let budgetPolicy = selectionGraphQueryBudgetPolicy
+        guard automaticSelectionAccountingCanRepresent(budgetPolicy) else {
+            return codemapAutomaticSelectionAggregateBudgetResult(
+                reason: .accountingOverflow
             )
         }
-        guard sources.count <= policy.maximumRawSourceCount else {
-            let issue = WorkspaceCodemapAutomaticSelectionIssue.budget(.sourceLimit(
-                attempted: sources.count,
-                limit: policy.maximumRawSourceCount
-            ))
-            return WorkspaceCodemapAutomaticSelectionResult(
-                roots: [],
-                aggregateCoverage: .unavailable([issue])
+        guard sources.count <= budgetPolicy.maximumRawSourceCount else {
+            return codemapAutomaticSelectionAggregateBudgetResult(
+                reason: .sourceLimit(
+                    attempted: sources.count,
+                    limit: budgetPolicy.maximumRawSourceCount
+                )
             )
         }
 
-        var seenSlots = Set<WorkspaceCodemapRootScopedFileSlot>()
-        let uniqueSources = sources.filter {
-            seenSlots.insert(WorkspaceCodemapRootScopedFileSlot(source: $0)).inserted
+        var seenSources = Set<WorkspaceCodemapAutomaticSelectionSourceIdentity>()
+        var uniqueSources: [WorkspaceCodemapAutomaticSelectionSourceIdentity] = []
+        uniqueSources.reserveCapacity(min(sources.count, budgetPolicy.maximumUniqueSourceCount))
+        for source in sources where seenSources.insert(source).inserted {
+            guard uniqueSources.count < budgetPolicy.maximumUniqueSourceCount else {
+                guard let attempted = addingAutomaticSelectionCount(uniqueSources.count, 1) else {
+                    return codemapAutomaticSelectionAggregateBudgetResult(
+                        reason: .accountingOverflow
+                    )
+                }
+                return codemapAutomaticSelectionAggregateBudgetResult(
+                    reason: .uniqueSourceLimit(
+                        attempted: attempted,
+                        limit: budgetPolicy.maximumUniqueSourceCount
+                    )
+                )
+            }
+            uniqueSources.append(source)
         }
-        guard uniqueSources.count <= policy.maximumUniqueSourceCount else {
-            let issue = WorkspaceCodemapAutomaticSelectionIssue.budget(.uniqueSourceLimit(
-                attempted: uniqueSources.count,
-                limit: policy.maximumUniqueSourceCount
-            ))
+        uniqueSources.sort(by: codemapAutomaticSelectionSourcePrecedes)
+
+        var rootEpochs = Set<WorkspaceCodemapRootEpoch>()
+        for source in uniqueSources where rootEpochs.insert(source.rootEpoch).inserted {
+            guard rootEpochs.count <= budgetPolicy.maximumRootCount else {
+                return codemapAutomaticSelectionAggregateBudgetResult(
+                    reason: .rootLimit(
+                        attempted: rootEpochs.count,
+                        limit: budgetPolicy.maximumRootCount
+                    )
+                )
+            }
+        }
+        let partitions = Dictionary(grouping: uniqueSources, by: \.rootEpoch)
+        return try await resolveAutomaticCodemapSelection(
+            partitions: partitions,
+            orderedSources: uniqueSources,
+            rootScope: rootScope,
+            targetAuthority: targetAuthority,
+            retryCount: 0
+        )
+    }
+
+    private func resolveAutomaticCodemapSelection(
+        partitions: [
+            WorkspaceCodemapRootEpoch: [WorkspaceCodemapAutomaticSelectionSourceIdentity]
+        ],
+        orderedSources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
+        rootScope: WorkspaceLookupRootScope,
+        targetAuthority: AutomaticSelectionTargetAuthority,
+        retryCount: Int
+    ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
+        let budgetPolicy = selectionGraphQueryBudgetPolicy
+        let snapshot = codemapAutomaticSelectionSnapshot(
+            sources: orderedSources,
+            rootScope: rootScope
+        )
+        let orderedRootEpochs = partitions.keys.sorted(by: codemapRootEpochPrecedes)
+        var rootResults: [WorkspaceCodemapAutomaticSelectionRootResult] = []
+        rootResults.reserveCapacity(orderedRootEpochs.count)
+        var sourceIssueCount = 0
+        var targetCount = 0
+        var resolutionCount = 0
+        var referenceFailureCount = 0
+        var byteCount = 0
+
+        for rootEpoch in orderedRootEpochs {
+            try Task.checkCancellation()
+            let remainingPolicy = budgetPolicy.remaining(
+                targetCount: targetCount,
+                resolutionCount: resolutionCount,
+                referenceFailureCount: referenceFailureCount,
+                byteCount: byteCount
+            )
+            var rootResult = try await resolveAutomaticCodemapSelection(
+                sources: partitions[rootEpoch] ?? [],
+                rootEpoch: rootEpoch,
+                allowedRootIDs: snapshot.allowedRootIDs,
+                rootScope: rootScope,
+                targetAuthority: targetAuthority,
+                sourceIssueAllowance: budgetPolicy.maximumSourceIssueCount - sourceIssueCount,
+                queryBudgetPolicy: remainingPolicy
+            )
+
+            let currentSnapshot = codemapAutomaticSelectionSnapshot(
+                sources: orderedSources,
+                rootScope: rootScope
+            )
+            guard currentSnapshot == snapshot else {
+                if retryCount == 0,
+                   codemapAutomaticSelectionShouldRetry(
+                       previous: snapshot,
+                       current: currentSnapshot
+                   )
+                {
+                    return try await resolveAutomaticCodemapSelection(
+                        partitions: partitions,
+                        orderedSources: orderedSources,
+                        rootScope: rootScope,
+                        targetAuthority: targetAuthority,
+                        retryCount: 1
+                    )
+                }
+                if case .stale = rootResult.coverage {
+                    return WorkspaceCodemapAutomaticSelectionResult(roots: [rootResult])
+                }
+                return codemapAutomaticSelectionStaleResult(
+                    previous: snapshot,
+                    current: currentSnapshot,
+                    orderedRootEpochs: orderedRootEpochs,
+                    orderedSources: orderedSources
+                )
+            }
+
+            rootResult = codemapAutomaticSelectionTranslatingBudget(
+                rootResult,
+                sourceIssueCount: sourceIssueCount,
+                targetCount: targetCount,
+                resolutionCount: resolutionCount,
+                referenceFailureCount: referenceFailureCount,
+                byteCount: byteCount,
+                budgetPolicy: budgetPolicy
+            )
+            if case let .budget(reason) = rootResult.coverage {
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .budget(codemapAutomaticSelectionBudgetReason(
+                        reason,
+                        rootEpoch: rootEpoch
+                    ))
+                )
+            }
+            switch rootResult.coverage {
+            case .complete, .partial:
+                break
+            case .provisional, .incomplete, .pending, .unavailable, .stale, .busy, .budget:
+                return WorkspaceCodemapAutomaticSelectionResult(roots: [rootResult])
+            }
+
+            guard let nextSourceIssueCount = addingAutomaticSelectionCount(
+                sourceIssueCount,
+                rootResult.sourceIssues.count
+            ), let nextTargetCount = addingAutomaticSelectionCount(
+                targetCount,
+                rootResult.graphTargetCount
+            ), let nextResolutionCount = addingAutomaticSelectionCount(
+                resolutionCount,
+                rootResult.graphResolutionCount
+            ), let nextReferenceFailureCount = addingAutomaticSelectionCount(
+                referenceFailureCount,
+                rootResult.graphReferenceFailureCount
+            ), let nextByteCount = addingAutomaticSelectionCount(
+                byteCount,
+                rootResult.graphByteCount
+            ) else {
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .budget(.accountingOverflow)
+                )
+            }
+            rootResults.append(rootResult)
+            sourceIssueCount = nextSourceIssueCount
+            targetCount = nextTargetCount
+            resolutionCount = nextResolutionCount
+            referenceFailureCount = nextReferenceFailureCount
+            byteCount = nextByteCount
+        }
+
+        let finalSnapshot = codemapAutomaticSelectionSnapshot(
+            sources: orderedSources,
+            rootScope: rootScope
+        )
+        guard finalSnapshot == snapshot else {
+            if retryCount == 0 {
+                return try await resolveAutomaticCodemapSelection(
+                    partitions: partitions,
+                    orderedSources: orderedSources,
+                    rootScope: rootScope,
+                    targetAuthority: targetAuthority,
+                    retryCount: 1
+                )
+            }
+            return codemapAutomaticSelectionStaleResult(
+                previous: snapshot,
+                current: finalSnapshot,
+                orderedRootEpochs: orderedRootEpochs,
+                orderedSources: orderedSources
+            )
+        }
+        let sourceTickets = orderedSources.compactMap { source -> WorkspaceCodemapArtifactDemandTicket? in
+            guard let record = codemapSessionsByRootEpoch[source.rootEpoch]?
+                .demandsByFileID[source.fileID],
+                case let .ready(ready) = record.result,
+                codemapTicketsShareDemand(ready.ticket, record.ticket),
+                ready.snapshot.requestGeneration == ready.ticket.requestGeneration,
+                codemapDemandIsCurrent(ready.ticket)
+            else { return nil }
+            return ready.ticket
+        }
+        let aggregate = WorkspaceCodemapAutomaticSelectionResult(roots: rootResults).aggregateCoverage
+        let publicTargets = rootResults.flatMap(\.targets)
+        let coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
+        switch aggregate {
+        case let .complete(proofs):
+            coverageProofs = proofs
+        case let .partial(proofs, _):
+            coverageProofs = proofs
+        case .provisional, .incomplete, .pending, .unavailable, .stale, .busy, .budget:
             return WorkspaceCodemapAutomaticSelectionResult(
-                roots: [],
-                aggregateCoverage: .unavailable([issue])
+                roots: rootResults,
+                aggregateCoverage: aggregate
             )
         }
 
         let rootScopeEpochs = codemapAutomaticSelectionRootScopeEpochs(rootScope)
-        let allowedEpochs = Set(rootScopeEpochs)
-        let sourcesByRoot = Dictionary(grouping: uniqueSources, by: \.rootEpoch)
-        let orderedRoots = sourcesByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes)
-        guard orderedRoots.count <= policy.maximumRootCount else {
-            let issue = WorkspaceCodemapAutomaticSelectionIssue.budget(.rootLimit(
-                attempted: orderedRoots.count,
-                limit: policy.maximumRootCount
-            ))
+        let graphKeys = rootResults.compactMap(\.graphKey)
+        let resultRootEpochs = rootResults.map(\.rootEpoch)
+        guard sourceTickets.count == orderedSources.count,
+              Set(sourceTickets.map { WorkspaceCodemapRootScopedFileSlot(
+                  rootEpoch: $0.rootEpoch,
+                  fileID: $0.fileID
+              ) }) == Set(orderedSources.map { WorkspaceCodemapRootScopedFileSlot(
+                  rootEpoch: $0.rootEpoch,
+                  fileID: $0.fileID
+              ) }),
+              Set(rootScopeEpochs.map(\.rootID)) == snapshot.allowedRootIDs,
+              graphKeys.count == rootResults.count,
+              coverageProofs.count == rootResults.count,
+              Set(resultRootEpochs).count == resultRootEpochs.count,
+              zip(resultRootEpochs, graphKeys).allSatisfy({ pair in
+                  pair.1.rootEpoch == pair.0
+              }),
+              zip(resultRootEpochs, coverageProofs).allSatisfy({ pair in
+                  pair.1.generation.rootEpoch == pair.0
+              }),
+              zip(graphKeys, coverageProofs).allSatisfy({ pair in
+                  pair.0 == WorkspaceCodemapSelectionGraphRuntimeKey(generation: pair.1.generation)
+              }),
+              automaticSelectionCoverageProofsAreCurrent(coverageProofs)
+        else {
             return WorkspaceCodemapAutomaticSelectionResult(
                 roots: [],
-                aggregateCoverage: .unavailable([issue])
+                aggregateCoverage: .stale(.publicationReceipt)
             )
         }
-
-        var rootResults: [WorkspaceCodemapAutomaticSelectionRootResult] = []
-        var acceptedTargetCount = 0
-        var acceptedResolutionCount = 0
-        var acceptedFailureCount = 0
-        var acceptedByteCount = 0
-
-        for rootEpoch in orderedRoots {
-            try Task.checkCancellation()
-            let rootSources = (sourcesByRoot[rootEpoch] ?? []).sorted {
-                if $0.fileID != $1.fileID { return $0.fileID.uuidString < $1.fileID.uuidString }
-                return $0.requestGeneration < $1.requestGeneration
-            }
-            guard allowedEpochs.contains(rootEpoch),
-                  let state = rootStatesByID[rootEpoch.rootID],
-                  state.lifetimeID == rootEpoch.rootLifetimeID,
-                  let session = codemapSessionsByRootEpoch[rootEpoch],
-                  let engine = session.engine
-            else {
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .unavailable,
-                    targets: [],
-                    sources: [],
-                    issues: [.rootEpochChanged(rootEpoch)],
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-                continue
-            }
-
-            var validSources: [WorkspaceCodemapAutomaticSelectionSourceIdentity] = []
-            var sourceIssues: [WorkspaceCodemapAutomaticSelectionIssue] = []
-            for source in rootSources {
-                guard source.catalogGeneration == session.authority.catalogGeneration,
-                      let file = filesByID[source.fileID],
-                      file.rootID == rootEpoch.rootID,
-                      isDiscoverableFileID(source.fileID),
-                      state.fileIDsByRelativePath[file.standardizedRelativePath] == source.fileID
-                else {
-                    sourceIssues.append(.sourceNotCataloged(source))
-                    continue
-                }
-                let currentGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
-                    ?? session.authority.ingressGeneration
-                guard currentGeneration == source.requestGeneration else {
-                    sourceIssues.append(.sourceGenerationChanged(
-                        source,
-                        committedGeneration: currentGeneration
-                    ))
-                    continue
-                }
-                validSources.append(source)
-            }
-            guard !validSources.isEmpty else {
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .unavailable,
-                    targets: [],
-                    sources: [],
-                    issues: sourceIssues.sorted(by: automaticSelectionIssuePrecedes),
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-                continue
-            }
-
-            guard let graph = await engine.selectionGraph(rootEpoch: rootEpoch) else {
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .pending,
-                    targets: [],
-                    sources: [],
-                    issues: (sourceIssues + [.graphNotInitialized(rootEpoch)])
-                        .sorted(by: automaticSelectionIssuePrecedes),
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-                continue
-            }
-
-            let remainingTargets = max(0, policy.maximumTargetCount - acceptedTargetCount)
-            let remainingResolutions = max(0, policy.maximumResolutionCount - acceptedResolutionCount)
-            let remainingFailures = max(0, policy.maximumReferenceFailureCount - acceptedFailureCount)
-            let remainingBytes = max(0, policy.maximumByteCount - acceptedByteCount)
-            let disposition = await graph.automaticSelectionLatest(.init(
-                rootEpoch: rootEpoch,
-                sources: validSources.map {
-                    .init(fileID: $0.fileID, requestGeneration: $0.requestGeneration)
-                },
-                maximumTargetCount: remainingTargets,
-                maximumResolutionCount: remainingResolutions,
-                maximumReferenceFailureCount: remainingFailures,
-                maximumByteCount: remainingBytes
-            ))
-
-            guard let currentSession = codemapSessionsByRootEpoch[rootEpoch],
-                  currentSession.engine === engine,
-                  currentSession.authority == session.authority,
-                  rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
-            else {
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .unavailable,
-                    targets: [],
-                    sources: [],
-                    issues: [.rootEpochChanged(rootEpoch)],
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-                continue
-            }
-
-            switch disposition {
-            case .pending:
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .pending,
-                    targets: [],
-                    sources: [],
-                    issues: (sourceIssues + [.graphNotInitialized(rootEpoch)])
-                        .sorted(by: automaticSelectionIssuePrecedes),
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-            case let .revoked(reason):
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .unavailable,
-                    targets: [],
-                    sources: [],
-                    issues: (sourceIssues + [.graphRevoked(rootEpoch, reason)])
-                        .sorted(by: automaticSelectionIssuePrecedes),
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-            case let .budget(reason):
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .unavailable,
-                    targets: [],
-                    sources: [],
-                    issues: (sourceIssues + [.budget(reason)])
-                        .sorted(by: automaticSelectionIssuePrecedes),
-                    coverage: nil,
-                    graphTargetCount: 0,
-                    graphResolutionCount: 0,
-                    graphReferenceFailureCount: 0,
-                    graphByteCount: 0,
-                    receipt: nil
-                ))
-            case .cancelled:
-                throw CancellationError()
-            case let .ready(graphResult):
-                var issues = sourceIssues
-                for graphSource in graphResult.sources {
-                    guard let source = validSources.first(where: { $0.fileID == graphSource.fileID }) else { continue }
-                    switch graphSource.state {
-                    case .covered:
-                        break
-                    case .pending:
-                        issues.append(.sourcePending(source))
-                    case .notIndexed:
-                        issues.append(.sourceNotIndexed(source))
-                    case .excluded:
-                        issues.append(.sourceExcluded(source))
-                    case .fenced:
-                        issues.append(.sourceFenced(source))
-                    case let .staleGeneration(_, committed):
-                        issues.append(.sourceGenerationChanged(source, committedGeneration: committed))
-                    }
-                }
-                if case .updatesPending = graphResult.freshness {
-                    issues.append(.updatesPending(rootEpoch))
-                }
-                if graphResult.reconciling {
-                    issues.append(.reconciling(rootEpoch))
-                }
-
-                var targets: [WorkspaceCodemapAutomaticSelectionTarget] = []
-                for graphTarget in graphResult.targets {
-                    guard let file = filesByID[graphTarget.fileID],
-                          file.rootID == rootEpoch.rootID,
-                          isDiscoverableFileID(file.id),
-                          state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
-                          file.standardizedRelativePath == graphTarget.standardizedRelativePath
-                    else {
-                        issues.append(.targetNotCataloged(rootEpoch: rootEpoch, fileID: graphTarget.fileID))
-                        continue
-                    }
-                    let currentGeneration = currentSession.pathGenerationsByRelativePath[file.standardizedRelativePath]
-                        ?? currentSession.authority.ingressGeneration
-                    guard currentGeneration == graphTarget.requestGeneration else {
-                        issues.append(.targetGenerationChanged(rootEpoch: rootEpoch, fileID: graphTarget.fileID))
-                        continue
-                    }
-                    guard let logicalPath = WorkspaceCodemapLogicalPresentationPath(
-                        rootDisplayName: state.root.name,
-                        standardizedRelativePath: file.standardizedRelativePath
-                    ) else {
-                        issues.append(.targetLogicalPathUnavailable(
-                            rootEpoch: rootEpoch,
-                            fileID: graphTarget.fileID
-                        ))
-                        continue
-                    }
-                    targets.append(.init(
-                        rootEpoch: rootEpoch,
-                        fileID: file.id,
-                        catalogGeneration: currentSession.authority.catalogGeneration,
-                        requestGeneration: currentGeneration,
-                        logicalPath: logicalPath
-                    ))
-                }
-                targets.sort(by: automaticSelectionTargetPrecedes)
-                let seeds = validSources.map {
-                    WorkspaceCodemapAutomaticSelectionGraphSeed(
-                        fileID: $0.fileID,
-                        requestGeneration: $0.requestGeneration
-                    )
-                }
-                let affected = Set(seeds.map(\.fileID)).union(targets.map(\.fileID))
-                let receiptDisposition = await graph.revalidate(
-                    graphResult.receipt,
-                    affectedFileIDs: affected
-                )
-                let rootReceipt: WorkspaceCodemapAutomaticSelectionRootReceipt?
-                switch receiptDisposition {
-                case .valid:
-                    rootReceipt = WorkspaceCodemapAutomaticSelectionRootReceipt(
-                        rootEpoch: rootEpoch,
-                        graphReceipt: graphResult.receipt,
-                        sources: seeds,
-                        targets: targets
-                    )
-                case let .invalid(reason):
-                    issues.append(.receiptInvalid(rootEpoch: rootEpoch, reason: reason))
-                    rootReceipt = nil
-                    targets.removeAll()
-                case let .revoked(reason):
-                    issues.append(.graphRevoked(rootEpoch, reason))
-                    rootReceipt = nil
-                    targets.removeAll()
-                }
-
-                if rootReceipt != nil {
-                    acceptedTargetCount += targets.count
-                    acceptedResolutionCount += graphResult.resolutionCount
-                    acceptedFailureCount += graphResult.referenceFailureCount
-                    acceptedByteCount += graphResult.materializedByteCount
-                }
-                let hasPendingSource = graphResult.sources.contains {
-                    $0.state == .pending || $0.state == .notIndexed
-                }
-                let status: WorkspaceCodemapAutomaticSelectionStatus = if !targets.isEmpty, !issues.isEmpty {
-                    .partial
-                } else if hasPendingSource || graphResult.reconciling {
-                    targets.isEmpty ? .pending : .partial
-                } else if rootReceipt == nil {
-                    .unavailable
-                } else {
-                    .ok
-                }
-                rootResults.append(WorkspaceCodemapAutomaticSelectionRootResult(
-                    rootEpoch: rootEpoch,
-                    status: status,
-                    targets: targets,
-                    sources: graphResult.sources,
-                    issues: issues.sorted(by: automaticSelectionIssuePrecedes),
-                    coverage: graphResult.coverage,
-                    graphTargetCount: graphResult.targets.count,
-                    graphResolutionCount: graphResult.resolutionCount,
-                    graphReferenceFailureCount: graphResult.referenceFailureCount,
-                    graphByteCount: graphResult.materializedByteCount,
-                    receipt: rootReceipt
-                ))
-            }
-        }
-
-        let receiptRoots = rootResults.compactMap { result -> WorkspaceCodemapAutomaticSelectionRootReceipt? in
-            guard !result.targets.isEmpty else { return nil }
-            return result.receipt
-        }
-        let receipt = receiptRoots.isEmpty ? nil : WorkspaceCodemapAutomaticSelectionReceipt(
+        let requestID = UUID()
+        let publicationPermit = WorkspaceCodemapAutomaticSelectionPublicationPermit()
+        registerAutomaticSelectionPublicationPermit(
+            publicationPermit,
+            requestID: requestID,
+            rootScopeEpochs: rootScopeEpochs
+        )
+        let receipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: requestID,
             rootScope: rootScope,
             rootScopeEpochs: rootScopeEpochs,
-            roots: receiptRoots
+            sourceTickets: sourceTickets,
+            graphKeys: graphKeys,
+            coverageProofs: coverageProofs,
+            targets: publicTargets,
+            publicationPermit: publicationPermit
         )
-        return WorkspaceCodemapAutomaticSelectionResult(roots: rootResults, receipt: receipt)
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: rootResults,
+            aggregateCoverage: aggregate,
+            publicationReceipt: receipt
+        )
     }
 
-    func revalidateAutomaticCodemapSelection(
-        _ receipt: WorkspaceCodemapAutomaticSelectionReceipt,
+    private func codemapAutomaticSelectionAggregateBudgetResult(
+        reason: WorkspaceCodemapStoreSelectionGraphQueryBudgetReason
+    ) -> WorkspaceCodemapAutomaticSelectionResult {
+        WorkspaceCodemapAutomaticSelectionResult(
+            roots: [],
+            aggregateCoverage: .budget(codemapAutomaticSelectionBudgetReason(
+                reason,
+                rootEpoch: nil
+            ))
+        )
+    }
+
+    private func codemapAutomaticSelectionBudgetReason(
+        _ reason: WorkspaceCodemapStoreSelectionGraphQueryBudgetReason,
+        rootEpoch: WorkspaceCodemapRootEpoch?
+    ) -> WorkspaceCodemapAutomaticSelectionBudgetReason {
+        switch reason {
+        case let .sourceLimit(attempted, limit): .sourceLimit(attempted: attempted, limit: limit)
+        case let .uniqueSourceLimit(attempted, limit): .uniqueSourceLimit(attempted: attempted, limit: limit)
+        case let .sourceIssueLimit(attempted, limit): .sourceIssueLimit(attempted: attempted, limit: limit)
+        case let .rootLimit(attempted, limit): .rootLimit(attempted: attempted, limit: limit)
+        case let .targetLimit(attempted, limit): .targetLimit(attempted: attempted, limit: limit)
+        case let .resolutionLimit(attempted, limit): .resolutionLimit(attempted: attempted, limit: limit)
+        case let .referenceFailureLimit(attempted, limit): .referenceFailureLimit(attempted: attempted, limit: limit)
+        case let .byteLimit(attempted, limit): .byteLimit(attempted: attempted, limit: limit)
+        case .accountingOverflow:
+            if let rootEpoch {
+                .graph(rootEpoch: rootEpoch, reason: .accountingOverflow)
+            } else {
+                .accountingOverflow
+            }
+        case let .definitionUniverse(definitionRootEpoch, dimension, attempted, limit):
+            .graph(
+                rootEpoch: definitionRootEpoch,
+                reason: .definitionUniverse(
+                    rootEpoch: definitionRootEpoch,
+                    dimension: dimension,
+                    attempted: attempted,
+                    limit: limit
+                )
+            )
+        case let .runtime(runtimeRootEpoch, runtimeReason):
+            .graph(rootEpoch: runtimeRootEpoch, reason: .runtime(
+                rootEpoch: runtimeRootEpoch,
+                reason: runtimeReason
+            ))
+        }
+    }
+
+    private func codemapAutomaticSelectionSnapshot(
+        sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
         rootScope: WorkspaceLookupRootScope
-    ) async -> WorkspaceCodemapAutomaticSelectionRevalidation {
-        let currentEpochs = codemapAutomaticSelectionRootScopeEpochs(rootScope)
-        guard receipt.rootScope == rootScope, receipt.rootScopeEpochs == currentEpochs else {
-            let issues: [WorkspaceCodemapAutomaticSelectionIssue] = [.rootScopeChanged]
-            return WorkspaceCodemapAutomaticSelectionRevalidation(
-                roots: receipt.roots.map { .invalid(rootEpoch: $0.rootEpoch, issues: issues) },
-                validTargets: [],
-                issues: issues
+    ) -> CodemapAutomaticSelectionSnapshot {
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        var sourceStates: [
+            WorkspaceCodemapAutomaticSelectionSourceIdentity:
+                CodemapAutomaticSelectionSourceSnapshot
+        ] = [:]
+        sourceStates.reserveCapacity(sources.count)
+
+        for source in sources {
+            guard let state = rootStatesByID[source.rootEpoch.rootID],
+                  state.lifetimeID == source.rootEpoch.rootLifetimeID
+            else {
+                sourceStates[source] = .rootEpochNotCurrent
+                continue
+            }
+            guard allowedRootIDs.contains(source.rootEpoch.rootID) else {
+                sourceStates[source] = .outsideRootScope
+                continue
+            }
+            let catalogGeneration = catalogGenerationsByRootID[source.rootEpoch.rootID]
+            guard source.catalogGeneration == catalogGeneration else {
+                sourceStates[source] = .staleCatalogGeneration(catalogGeneration)
+                continue
+            }
+            guard let file = filesByID[source.fileID],
+                  file.rootID == source.rootEpoch.rootID,
+                  isDiscoverableFileID(file.id),
+                  state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id
+            else {
+                sourceStates[source] = .notCataloged
+                continue
+            }
+            guard let record = codemapSessionsByRootEpoch[source.rootEpoch]?
+                .demandsByFileID[source.fileID]
+            else {
+                sourceStates[source] = .notDemanded
+                continue
+            }
+            switch record.result {
+            case let .pending(ticket):
+                sourceStates[source] = codemapDemandIsCurrent(ticket)
+                    ? .pending(ticket)
+                    : .staleCatalogGeneration(catalogGeneration)
+            case let .unavailable(reason):
+                sourceStates[source] = .unavailable(reason)
+            case let .ready(ready):
+                if ready.ticket == record.ticket,
+                   ready.ticket.fileID == source.fileID,
+                   ready.ticket.rootEpoch == source.rootEpoch,
+                   codemapDemandIsCurrent(ready.ticket)
+                {
+                    sourceStates[source] = .ready(ready.ticket)
+                } else {
+                    sourceStates[source] = .staleCatalogGeneration(catalogGeneration)
+                }
+            }
+        }
+        return CodemapAutomaticSelectionSnapshot(
+            allowedRootIDs: allowedRootIDs,
+            sourceStates: sourceStates
+        )
+    }
+
+    private func codemapAutomaticSelectionShouldRetry(
+        previous: CodemapAutomaticSelectionSnapshot,
+        current: CodemapAutomaticSelectionSnapshot
+    ) -> Bool {
+        if previous.allowedRootIDs != current.allowedRootIDs {
+            return true
+        }
+        for (source, previousState) in previous.sourceStates {
+            guard case .ready = current.sourceStates[source] else { continue }
+            switch previousState {
+            case .notDemanded, .pending, .unavailable:
+                return true
+            case .rootEpochNotCurrent, .outsideRootScope, .staleCatalogGeneration,
+                 .notCataloged, .ready:
+                continue
+            }
+        }
+        return false
+    }
+
+    private func codemapAutomaticSelectionStaleResult(
+        previous: CodemapAutomaticSelectionSnapshot,
+        current: CodemapAutomaticSelectionSnapshot,
+        orderedRootEpochs: [WorkspaceCodemapRootEpoch],
+        orderedSources: [WorkspaceCodemapAutomaticSelectionSourceIdentity]
+    ) -> WorkspaceCodemapAutomaticSelectionResult {
+        if previous.allowedRootIDs != current.allowedRootIDs,
+           let rootEpoch = orderedRootEpochs.first
+        {
+            return WorkspaceCodemapAutomaticSelectionResult(roots: [
+                WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: rootEpoch,
+                    targets: [],
+                    sourceIssues: [],
+                    targetIssues: [],
+                    coverage: .stale(.rootScopeChanged(rootEpoch))
+                )
+            ])
+        }
+        if let source = orderedSources.first(where: {
+            previous.sourceStates[$0] != current.sourceStates[$0]
+        }) {
+            return WorkspaceCodemapAutomaticSelectionResult(roots: [
+                WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: source.rootEpoch,
+                    targets: [],
+                    sourceIssues: [],
+                    targetIssues: [],
+                    coverage: .stale(.sourceStateChanged(source))
+                )
+            ])
+        }
+        let rootEpoch = orderedRootEpochs[0]
+        return WorkspaceCodemapAutomaticSelectionResult(roots: [
+            WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: [],
+                targetIssues: [],
+                coverage: .stale(.rootEpochNotCurrent(rootEpoch))
+            )
+        ])
+    }
+
+    private func codemapAutomaticSelectionTranslatingBudget(
+        _ result: WorkspaceCodemapAutomaticSelectionRootResult,
+        sourceIssueCount: Int,
+        targetCount: Int,
+        resolutionCount: Int,
+        referenceFailureCount: Int,
+        byteCount: Int,
+        budgetPolicy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy
+    ) -> WorkspaceCodemapAutomaticSelectionRootResult {
+        guard case let .budget(reason) = result.coverage else { return result }
+
+        let translated: WorkspaceCodemapStoreSelectionGraphQueryBudgetReason
+        switch reason {
+        case let .sourceIssueLimit(attempted, _):
+            guard let total = addingAutomaticSelectionCount(sourceIssueCount, attempted) else {
+                translated = .accountingOverflow
+                break
+            }
+            translated = .sourceIssueLimit(
+                attempted: total,
+                limit: budgetPolicy.maximumSourceIssueCount
+            )
+        case let .targetLimit(attempted, _):
+            guard let total = addingAutomaticSelectionCount(targetCount, attempted) else {
+                translated = .accountingOverflow
+                break
+            }
+            translated = .targetLimit(attempted: total, limit: budgetPolicy.maximumTargetCount)
+        case let .resolutionLimit(attempted, _):
+            guard let total = addingAutomaticSelectionCount(resolutionCount, attempted) else {
+                translated = .accountingOverflow
+                break
+            }
+            translated = .resolutionLimit(attempted: total, limit: budgetPolicy.maximumResolutionCount)
+        case let .referenceFailureLimit(attempted, _):
+            guard let total = addingAutomaticSelectionCount(referenceFailureCount, attempted) else {
+                translated = .accountingOverflow
+                break
+            }
+            translated = .referenceFailureLimit(
+                attempted: total,
+                limit: budgetPolicy.maximumReferenceFailureCount
+            )
+        case let .byteLimit(attempted, _):
+            guard let total = addingAutomaticSelectionCount(byteCount, attempted) else {
+                translated = .accountingOverflow
+                break
+            }
+            translated = .byteLimit(attempted: total, limit: budgetPolicy.maximumByteCount)
+        case .sourceLimit, .uniqueSourceLimit, .rootLimit, .accountingOverflow,
+             .definitionUniverse, .runtime:
+            translated = reason
+        }
+        return WorkspaceCodemapAutomaticSelectionRootResult(
+            rootEpoch: result.rootEpoch,
+            targets: [],
+            sourceIssues: [],
+            targetIssues: [],
+            coverage: .budget(translated)
+        )
+    }
+
+    private func resolveAutomaticCodemapSelection(
+        sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        allowedRootIDs: Set<UUID>,
+        rootScope: WorkspaceLookupRootScope,
+        targetAuthority: AutomaticSelectionTargetAuthority,
+        sourceIssueAllowance: Int,
+        queryBudgetPolicy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy
+    ) async throws -> WorkspaceCodemapAutomaticSelectionRootResult {
+        guard let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID
+        else {
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: [],
+                targetIssues: [],
+                coverage: .stale(.rootEpochNotCurrent(rootEpoch))
+            )
+        }
+        guard allowedRootIDs.contains(rootEpoch.rootID) else {
+            guard sources.count <= sourceIssueAllowance else {
+                guard let attempted = addingAutomaticSelectionCount(sourceIssueAllowance, 1) else {
+                    return WorkspaceCodemapAutomaticSelectionRootResult(
+                        rootEpoch: rootEpoch,
+                        targets: [],
+                        sourceIssues: [],
+                        targetIssues: [],
+                        coverage: .budget(.accountingOverflow)
+                    )
+                }
+                return WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: rootEpoch,
+                    targets: [],
+                    sourceIssues: [],
+                    targetIssues: [],
+                    coverage: .budget(.sourceIssueLimit(
+                        attempted: attempted,
+                        limit: sourceIssueAllowance
+                    ))
+                )
+            }
+            let issues = sources.map(WorkspaceCodemapAutomaticSelectionSourceIssue.outsideRootScope)
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: issues,
+                targetIssues: [],
+                coverage: .unavailable(.noReadySources)
             )
         }
 
-        var roots: [WorkspaceCodemapAutomaticSelectionRootRevalidation] = []
-        var validTargets: [WorkspaceCodemapAutomaticSelectionTarget] = []
-        var allIssues: [WorkspaceCodemapAutomaticSelectionIssue] = []
-        for rootReceipt in receipt.roots.sorted(by: {
-            workspaceCodemapRootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
-        }) {
-            let rootEpoch = rootReceipt.rootEpoch
-            guard let state = rootStatesByID[rootEpoch.rootID],
-                  state.lifetimeID == rootEpoch.rootLifetimeID,
-                  let session = codemapSessionsByRootEpoch[rootEpoch],
-                  let engine = session.engine,
-                  let graph = await engine.selectionGraph(rootEpoch: rootEpoch)
-            else {
-                let issues: [WorkspaceCodemapAutomaticSelectionIssue] = [.rootEpochChanged(rootEpoch)]
-                roots.append(.invalid(rootEpoch: rootEpoch, issues: issues))
-                allIssues.append(contentsOf: issues)
-                continue
-            }
-            let graphDisposition = await graph.revalidate(
-                rootReceipt.graphReceipt,
-                affectedFileIDs: rootReceipt.affectedFileIDs
+        guard let catalogGeneration = catalogGenerationsByRootID[rootEpoch.rootID] else {
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: [],
+                targetIssues: [],
+                coverage: .stale(.rootEpochNotCurrent(rootEpoch))
             )
-            guard let currentSession = codemapSessionsByRootEpoch[rootEpoch],
-                  currentSession.engine === engine,
-                  currentSession.authority == session.authority
-            else {
-                let issues: [WorkspaceCodemapAutomaticSelectionIssue] = [.rootEpochChanged(rootEpoch)]
-                roots.append(.invalid(rootEpoch: rootEpoch, issues: issues))
-                allIssues.append(contentsOf: issues)
-                continue
-            }
-            var issues: [WorkspaceCodemapAutomaticSelectionIssue] = []
-            var rootWideFailure = false
-            switch graphDisposition {
-            case .valid:
-                break
-            case let .invalid(reason):
-                rootWideFailure = true
-                issues.append(.receiptInvalid(rootEpoch: rootEpoch, reason: reason))
-            case let .revoked(reason):
-                rootWideFailure = true
-                issues.append(.graphRevoked(rootEpoch, reason))
-            }
-            for seed in rootReceipt.sources {
-                guard let file = filesByID[seed.fileID],
+        }
+        var sourceIssues: [WorkspaceCodemapAutomaticSelectionSourceIssue] = []
+        var graphSources: [WorkspaceCodemapStoreSelectionGraphSourceIdentity] = []
+        for source in sources {
+            let issue: WorkspaceCodemapAutomaticSelectionSourceIssue?
+            if source.catalogGeneration != catalogGeneration {
+                issue = .staleCatalogGeneration(
+                    source,
+                    currentCatalogGeneration: catalogGeneration
+                )
+            } else if let file = filesByID[source.fileID],
                       file.rootID == rootEpoch.rootID,
-                      state.fileIDsByRelativePath[file.standardizedRelativePath] == seed.fileID,
-                      (
-                          currentSession.pathGenerationsByRelativePath[file.standardizedRelativePath]
-                              ?? currentSession.authority.ingressGeneration
-                      ) == seed.requestGeneration
-                else {
-                    rootWideFailure = true
-                    if let source = codemapAutomaticSelectionSourceIdentities(
-                        forFileIDs: [seed.fileID],
-                        rootScope: rootScope
-                    ).first {
-                        issues.append(.sourceGenerationChanged(source, committedGeneration: nil))
-                    } else {
-                        issues.append(.rootEpochChanged(rootEpoch))
+                      isDiscoverableFileID(file.id),
+                      state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id
+            {
+                if let record = codemapSessionsByRootEpoch[rootEpoch]?
+                    .demandsByFileID[source.fileID]
+                {
+                    switch record.result {
+                    case let .pending(ticket):
+                        if codemapDemandIsCurrent(ticket) {
+                            issue = .pending(source, ticket)
+                        } else {
+                            issue = .staleCatalogGeneration(
+                                source,
+                                currentCatalogGeneration: catalogGenerationsByRootID[rootEpoch.rootID]
+                            )
+                        }
+                    case let .unavailable(reason):
+                        issue = .unavailable(source, reason)
+                    case let .ready(ready):
+                        if ready.ticket == record.ticket,
+                           ready.ticket.fileID == source.fileID,
+                           ready.ticket.rootEpoch == source.rootEpoch,
+                           codemapDemandIsCurrent(ready.ticket)
+                        {
+                            graphSources.append(WorkspaceCodemapStoreSelectionGraphSourceIdentity(
+                                ticket: ready.ticket
+                            ))
+                            issue = nil
+                        } else {
+                            issue = .staleCatalogGeneration(
+                                source,
+                                currentCatalogGeneration: catalogGenerationsByRootID[rootEpoch.rootID]
+                            )
+                        }
                     }
+                } else {
+                    issue = .notDemanded(source)
+                }
+            } else {
+                issue = .notCataloged(source)
+            }
+
+            if let issue {
+                guard sourceIssues.count < sourceIssueAllowance else {
+                    guard let attempted = addingAutomaticSelectionCount(sourceIssues.count, 1) else {
+                        return WorkspaceCodemapAutomaticSelectionRootResult(
+                            rootEpoch: rootEpoch,
+                            targets: [],
+                            sourceIssues: [],
+                            targetIssues: [],
+                            coverage: .budget(.accountingOverflow)
+                        )
+                    }
+                    return WorkspaceCodemapAutomaticSelectionRootResult(
+                        rootEpoch: rootEpoch,
+                        targets: [],
+                        sourceIssues: [],
+                        targetIssues: [],
+                        coverage: .budget(.sourceIssueLimit(
+                            attempted: attempted,
+                            limit: sourceIssueAllowance
+                        ))
+                    )
+                }
+                sourceIssues.append(issue)
+            }
+        }
+
+        guard !graphSources.isEmpty else {
+            if let staleIssue = sourceIssues.first(where: {
+                if case .staleCatalogGeneration = $0 { return true }
+                return false
+            }), case let .staleCatalogGeneration(source, currentGeneration) = staleIssue {
+                return WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: rootEpoch,
+                    targets: [],
+                    sourceIssues: sourceIssues,
+                    targetIssues: [],
+                    coverage: .stale(.sourceCatalogGeneration(
+                        source,
+                        currentCatalogGeneration: currentGeneration
+                    ))
+                )
+            }
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .unavailable(.noReadySources)
+            )
+        }
+
+        let disposition = await queryCodemapSelectionGraph(
+            WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: graphSources),
+            budgetPolicy: queryBudgetPolicy
+        )
+        await codemapAutomaticSelectionQueryHook(rootEpoch)
+        try Task.checkCancellation()
+        guard let currentState = rootStatesByID[rootEpoch.rootID],
+              currentState.lifetimeID == rootEpoch.rootLifetimeID
+        else {
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .stale(.rootEpochNotCurrent(rootEpoch))
+            )
+        }
+        guard catalogGenerationsByRootID[rootEpoch.rootID] == catalogGeneration else {
+            let source = sources[0]
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .stale(.sourceCatalogGeneration(
+                    source,
+                    currentCatalogGeneration: catalogGenerationsByRootID[rootEpoch.rootID]
+                ))
+            )
+        }
+        guard rootsForPathLookup(scope: rootScope).contains(where: { $0.id == rootEpoch.rootID }) else {
+            let issues = sources.map(WorkspaceCodemapAutomaticSelectionSourceIssue.outsideRootScope)
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: issues,
+                targetIssues: [],
+                coverage: .unavailable(.noReadySources)
+            )
+        }
+        guard graphSources.allSatisfy({ source in
+            let ticket = source.ticket
+            guard codemapDemandIsCurrent(ticket),
+                  let record = codemapSessionsByRootEpoch[rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  case let .ready(ready) = record.result
+            else { return false }
+            return codemapTicketsShareDemand(ready.ticket, ticket)
+        }) else {
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .stale(.graph(.currentness(rootEpoch)))
+            )
+        }
+
+        switch disposition {
+        case let .readyPartial(queryResult):
+            guard queryResult.roots.count == 1,
+                  let graphRootResult = queryResult.roots.first,
+                  graphRootResult.rootEpoch == rootEpoch,
+                  case let .complete(proof, _, _, _) =
+                  graphRootResult.result.definitionUniverseCoverage,
+                  automaticSelectionCoverageProofIsCurrent(proof)
+            else {
+                return WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: rootEpoch,
+                    targets: [],
+                    sourceIssues: sourceIssues,
+                    targetIssues: [],
+                    coverage: .unavailable(.graph(.invalidGraphResult(rootEpoch)))
+                )
+            }
+            guard graphRootResult.result.targets.allSatisfy({ $0.rootEpoch == rootEpoch }) else {
+                return WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: rootEpoch,
+                    targets: [],
+                    sourceIssues: sourceIssues,
+                    targetIssues: [],
+                    coverage: .unavailable(.graph(.invalidGraphResult(rootEpoch)))
+                )
+            }
+            let selectedFileIDs = Set(sources.map(\.fileID))
+            var seenTargets = Set<WorkspaceCodemapAutomaticSelectionTarget>()
+            var targets: [WorkspaceCodemapAutomaticSelectionTarget] = []
+            var targetIssues: [WorkspaceCodemapAutomaticSelectionTargetIssue] = []
+            for endpoint in graphRootResult.result.targets where !selectedFileIDs.contains(endpoint.fileID) {
+                guard let file = filesByID[endpoint.fileID],
+                      file.rootID == rootEpoch.rootID,
+                      isDiscoverableFileID(file.id),
+                      currentState.fileIDsByRelativePath[file.standardizedRelativePath] == file.id
+                else {
+                    targetIssues.append(.notCataloged(
+                        rootEpoch: rootEpoch,
+                        fileID: endpoint.fileID
+                    ))
                     continue
                 }
-            }
-            var validRootTargets: [WorkspaceCodemapAutomaticSelectionTarget] = []
-            if !rootWideFailure {
-                for target in rootReceipt.targets {
-                    guard let file = filesByID[target.fileID],
-                          file.rootID == rootEpoch.rootID,
-                          state.fileIDsByRelativePath[file.standardizedRelativePath] == target.fileID,
-                          target.catalogGeneration == currentSession.authority.catalogGeneration,
-                          target.logicalPath.standardizedRelativePath == file.standardizedRelativePath,
-                          (
-                              currentSession.pathGenerationsByRelativePath[file.standardizedRelativePath]
-                                  ?? currentSession.authority.ingressGeneration
-                          ) == target.requestGeneration
-                    else {
-                        issues.append(.targetGenerationChanged(
-                            rootEpoch: rootEpoch,
-                            fileID: target.fileID
-                        ))
-                        continue
+                let targetAuthorityIsCurrent = switch targetAuthority {
+                case .retainedReadyDemand:
+                    if let record = codemapSessionsByRootEpoch[rootEpoch]?
+                        .demandsByFileID[endpoint.fileID],
+                        record.ticket.requestGeneration == endpoint.requestGeneration,
+                        codemapDemandIsCurrent(record.ticket),
+                        case let .ready(ready) = record.result,
+                        ready.ticket == record.ticket
+                    {
+                        true
+                    } else {
+                        false
                     }
-                    validRootTargets.append(target)
+                case .currentCompletedProjection:
+                    if let catalogShard = automaticSelectionCatalogShard(rootEpoch: rootEpoch),
+                       automaticSelectionCatalogCandidate(
+                           endpoint: endpoint,
+                           rootEpoch: rootEpoch,
+                           catalogShard: catalogShard
+                       ) != nil,
+                       automaticSelectionCoverageProofIsCurrent(proof)
+                    {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                guard targetAuthorityIsCurrent else {
+                    targetIssues.append(.staleGeneration(
+                        rootEpoch: rootEpoch,
+                        fileID: endpoint.fileID,
+                        requestGeneration: endpoint.requestGeneration
+                    ))
+                    continue
+                }
+                guard let logicalPath = WorkspaceCodemapLogicalPresentationPath(
+                    rootDisplayName: currentState.root.name,
+                    standardizedRelativePath: file.standardizedRelativePath
+                ) else {
+                    targetIssues.append(.logicalPathUnavailable(
+                        rootEpoch: rootEpoch,
+                        fileID: endpoint.fileID
+                    ))
+                    continue
+                }
+                let target = WorkspaceCodemapAutomaticSelectionTarget(
+                    rootEpoch: rootEpoch,
+                    fileID: endpoint.fileID,
+                    catalogGeneration: catalogGeneration,
+                    requestGeneration: endpoint.requestGeneration,
+                    logicalPath: logicalPath
+                )
+                if seenTargets.insert(target).inserted {
+                    targets.append(target)
                 }
             }
-            issues.sort(by: automaticSelectionIssuePrecedes)
-            if rootWideFailure || (!rootReceipt.targets.isEmpty && validRootTargets.isEmpty) {
-                roots.append(.invalid(rootEpoch: rootEpoch, issues: issues))
-            } else {
-                validRootTargets.sort(by: automaticSelectionTargetPrecedes)
-                roots.append(.valid(rootEpoch: rootEpoch, targets: validRootTargets))
-                validTargets.append(contentsOf: validRootTargets)
+            targets.sort {
+                if $0.logicalPath.standardizedRelativePath != $1.logicalPath.standardizedRelativePath {
+                    return $0.logicalPath.standardizedRelativePath < $1.logicalPath.standardizedRelativePath
+                }
+                return $0.fileID.uuidString < $1.fileID.uuidString
             }
-            allIssues.append(contentsOf: issues)
+
+            if let targetIssue = targetIssues.first {
+                return WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: rootEpoch,
+                    targets: [],
+                    sourceIssues: sourceIssues,
+                    targetIssues: targetIssues,
+                    coverage: .stale(.targetStateChanged(targetIssue))
+                )
+            }
+            var partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason] = []
+            for reason in [
+                WorkspaceCodemapStoreSelectionGraphPartialReason.sourceCoverageIncomplete,
+                .referenceFailuresPresent
+            ] where graphRootResult.partialReasons.contains(reason) {
+                partialReasons.append(.graph(reason))
+            }
+            partialReasons.append(contentsOf: sourceIssues.map {
+                WorkspaceCodemapAutomaticSelectionPartialReason.source($0)
+            })
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: targets,
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: partialReasons.isEmpty
+                    ? .complete(proof)
+                    : .partial(proof: proof, reasons: partialReasons),
+                graphTargetCount: graphRootResult.result.targets.count,
+                graphResolutionCount: graphRootResult.result.resolutions.count,
+                graphReferenceFailureCount: graphRootResult.result.referenceFailures.count,
+                graphByteCount: graphRootResult.result.materializedByteCount,
+                graphKey: graphRootResult.result.key
+            )
+        case let .incomplete(reason):
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .incomplete([.graph(reason)])
+            )
+        case let .unavailable(reason):
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .unavailable(.graph(reason))
+            )
+        case let .stale(reason):
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .stale(.graph(reason))
+            )
+        case let .busy(reason):
+            return Self.automaticSelectionBusyRootResult(
+                rootEpoch: rootEpoch,
+                sourceIssues: sourceIssues,
+                reason: reason
+            )
+        case let .budget(reason):
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: [],
+                sourceIssues: sourceIssues,
+                targetIssues: [],
+                coverage: .budget(reason)
+            )
         }
-        validTargets.sort(by: automaticSelectionTargetPrecedes)
-        allIssues.sort(by: automaticSelectionIssuePrecedes)
-        return WorkspaceCodemapAutomaticSelectionRevalidation(
-            roots: roots,
-            validTargets: validTargets,
-            issues: allIssues
+    }
+
+    static func automaticSelectionBusyRootResult(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        sourceIssues: [WorkspaceCodemapAutomaticSelectionSourceIssue],
+        reason: WorkspaceCodemapStoreSelectionGraphQueryBusyReason
+    ) -> WorkspaceCodemapAutomaticSelectionRootResult {
+        WorkspaceCodemapAutomaticSelectionRootResult(
+            rootEpoch: rootEpoch,
+            targets: [],
+            sourceIssues: sourceIssues,
+            targetIssues: [],
+            coverage: .busy(reason)
         )
     }
 
-    func requestAutomaticCodemapTargetWithOwnership(
-        target: WorkspaceCodemapAutomaticSelectionTarget,
-        rootReceipt: WorkspaceCodemapAutomaticSelectionRootReceipt,
-        rootScope: WorkspaceLookupRootScope,
-        priority: CodeMapArtifactBuildPriority = .background
-    ) async -> WorkspaceCodemapArtifactDemandOwnedResult? {
-        guard rootReceipt.rootEpoch == target.rootEpoch,
-              rootReceipt.targets.contains(target)
-        else { return nil }
-        let receipt = WorkspaceCodemapAutomaticSelectionReceipt(
-            rootScope: rootScope,
-            rootScopeEpochs: codemapAutomaticSelectionRootScopeEpochs(rootScope),
-            roots: [rootReceipt]
+    func revalidateAutomaticCodemapSelectionForPublication(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> WorkspaceCodemapAutomaticSelectionPublicationDisposition {
+        let disposition = revalidateAutomaticCodemapSelectionForPublicationUnreleased(
+            receipt,
+            rootScope: rootScope
         )
-        let revalidation = await revalidateAutomaticCodemapSelection(receipt, rootScope: rootScope)
-        guard revalidation.validTargets.contains(target) else { return nil }
-        let owned = await requestCodemapArtifactWithOwnership(forFileID: target.fileID, priority: priority)
-        let ticket: WorkspaceCodemapArtifactDemandTicket? = switch owned.result {
-        case let .pending(ticket): ticket
-        case let .ready(ready): ready.ticket
-        case .unavailable: nil
+        await receipt.publicationLease?.release()
+        return disposition
+    }
+
+    private func codemapDeadlineIsCurrent(_ deadline: ContinuousClock.Instant?) -> Bool {
+        !Task.isCancelled && deadline.map { ContinuousClock.now < $0 } != false
+    }
+
+    private func waitForCodemapSharedTask(
+        _ task: Task<Void, Never>,
+        deadline: ContinuousClock.Instant?
+    ) async -> Bool {
+        guard codemapDeadlineIsCurrent(deadline) else { return false }
+        guard let deadline else {
+            await task.value
+            return !Task.isCancelled
         }
-        if let ticket,
-           ticket.rootEpoch != target.rootEpoch ||
-           ticket.fileID != target.fileID ||
-           ticket.catalogGeneration != target.catalogGeneration ||
-           ticket.requestGeneration != target.requestGeneration ||
-           ticket.pathGeneration != target.requestGeneration
-        {
+        let completed = await withCheckedContinuation { continuation in
+            let race = CodemapSharedTaskDeadlineRace(continuation)
+            Task {
+                await task.value
+                race.resolve(ContinuousClock.now < deadline)
+            }
+            Task {
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                race.resolve(false)
+            }
+        }
+        return completed && codemapDeadlineIsCurrent(deadline)
+    }
+
+    func waitForCodemapGraphPublication(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
+        var waitedFlightIDs = Set<UUID>()
+        var waitedObserverIDs = Set<UUID>()
+        var waitedWorkerIDs = Set<UUID>()
+        var observedQuiescentPass = false
+        while codemapDeadlineIsCurrent(deadline) {
+            if let flight = codemapSessionsByRootEpoch[rootEpoch]?.graphPublicationFlight,
+               waitedFlightIDs.insert(flight.id).inserted,
+               let task = flight.task
+            {
+                observedQuiescentPass = false
+                guard await waitForCodemapSharedTask(task, deadline: deadline),
+                      codemapDeadlineIsCurrent(deadline)
+                else { return false }
+                continue
+            }
+            if let observer = codemapSessionsByRootEpoch[rootEpoch]?.projectionRecoveryObserver,
+               waitedObserverIDs.insert(observer.id).inserted,
+               let task = observer.task
+            {
+                observedQuiescentPass = false
+                guard await waitForCodemapSharedTask(task, deadline: deadline),
+                      codemapDeadlineIsCurrent(deadline)
+                else { return false }
+                continue
+            }
+            if let state = codemapSessionsByRootEpoch[rootEpoch]?.selectionGraph,
+               let workerID = state.workerID,
+               waitedWorkerIDs.insert(workerID).inserted,
+               let task = state.workerTask
+            {
+                observedQuiescentPass = false
+                guard await waitForCodemapSharedTask(task, deadline: deadline),
+                      codemapDeadlineIsCurrent(deadline)
+                else { return false }
+                continue
+            }
+            guard observedQuiescentPass else {
+                observedQuiescentPass = true
+                await Task.yield()
+                continue
+            }
+            return codemapDeadlineIsCurrent(deadline)
+        }
+        return false
+    }
+
+    func refreshAutomaticCodemapSelectionResultForCurrentProjection(
+        _ result: WorkspaceCodemapAutomaticSelectionResult,
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScope: WorkspaceLookupRootScope,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> WorkspaceCodemapAutomaticSelectionResult? {
+        guard codemapDeadlineIsCurrent(deadline),
+              let receipt = result.publicationReceipt,
+              receipt.publicationPermit.withCurrent({ true }) == true,
+              receipt.rootScope == rootScope,
+              receipt.rootScopeEpochs == codemapAutomaticSelectionRootScopeEpochs(rootScope),
+              sourceTickets.count == receipt.sourceTickets.count
+        else { return nil }
+
+        switch receipt.publicationBasis {
+        case .projectionCoverage:
+            return await refreshProjectionAutomaticCodemapSelectionResult(
+                result,
+                receipt: receipt,
+                sourceTickets: sourceTickets,
+                rootScope: rootScope,
+                deadline: deadline
+            )
+        case .provisionalCandidates:
+            return refreshProvisionalAutomaticCodemapSelectionResult(
+                result,
+                receipt: receipt,
+                sourceTickets: sourceTickets,
+                rootScope: rootScope,
+                deadline: deadline
+            )
+        }
+    }
+
+    private func refreshProjectionAutomaticCodemapSelectionResult(
+        _ result: WorkspaceCodemapAutomaticSelectionResult,
+        receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScope: WorkspaceLookupRootScope,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> WorkspaceCodemapAutomaticSelectionResult? {
+        guard receipt.coverageProofs.count == receipt.graphKeys.count,
+              !receipt.coverageProofs.isEmpty,
+              automaticSelectionSourceTicketsAreCurrent(
+                  sourceTickets,
+                  rootScopeEpochs: receipt.rootScopeEpochs
+              )
+        else { return nil }
+
+        let sources = sourceTickets.map {
+            WorkspaceCodemapAutomaticSelectionSourceIdentity(
+                rootEpoch: $0.rootEpoch,
+                fileID: $0.fileID,
+                catalogGeneration: $0.catalogGeneration
+            )
+        }
+        guard !Task.isCancelled,
+              let refreshedResult = try? await resolveAutomaticCodemapSelection(
+                  sources: sources,
+                  rootScope: rootScope,
+                  targetAuthority: .currentCompletedProjection
+              ),
+              codemapDeadlineIsCurrent(deadline),
+              let refreshedReceipt = refreshedResult.publicationReceipt
+        else { return nil }
+
+        let predecessorRootEpochs = receipt.coverageProofs.map(\.generation.rootEpoch)
+        let refreshedRootEpochs = refreshedReceipt.coverageProofs.map(\.generation.rootEpoch)
+        guard Set(predecessorRootEpochs).count == predecessorRootEpochs.count,
+              Set(refreshedRootEpochs).count == refreshedRootEpochs.count
+        else {
+            refreshedReceipt.publicationPermit.revoke()
             return nil
         }
-        return owned
+        let predecessorProofs = Dictionary(
+            uniqueKeysWithValues: receipt.coverageProofs.map {
+                ($0.generation.rootEpoch, $0)
+            }
+        )
+        let refreshedProofs = Dictionary(
+            uniqueKeysWithValues: refreshedReceipt.coverageProofs.map {
+                ($0.generation.rootEpoch, $0)
+            }
+        )
+        let sourceSlots = Set(sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        let refreshedSourceSlots = Set(refreshedReceipt.sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        guard refreshedReceipt.rootScope == receipt.rootScope,
+              refreshedReceipt.rootScopeEpochs == receipt.rootScopeEpochs,
+              refreshedReceipt.publicationBasis == .projectionCoverage,
+              refreshedReceipt.coverageProofs.count == receipt.coverageProofs.count,
+              predecessorProofs.count == receipt.coverageProofs.count,
+              refreshedProofs.count == refreshedReceipt.coverageProofs.count,
+              sourceSlots.count == sourceTickets.count,
+              refreshedSourceSlots == sourceSlots,
+              refreshedReceipt.sourceTickets.count == sourceTickets.count,
+              refreshedReceipt.targets.count == receipt.targets.count,
+              Set(refreshedReceipt.targets) == Set(receipt.targets),
+              predecessorProofs.allSatisfy({ rootEpoch, predecessor in
+                  guard let current = refreshedProofs[rootEpoch] else { return false }
+                  return predecessor == current || predecessor.successor(
+                      contributionGeneration: current.generation.contributionGeneration
+                  ) == current
+              })
+        else {
+            refreshedReceipt.publicationPermit.revoke()
+            return nil
+        }
+
+        receipt.publicationPermit.revoke()
+        let replacementReceipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: refreshedReceipt.requestID,
+            rootScope: refreshedReceipt.rootScope,
+            rootScopeEpochs: refreshedReceipt.rootScopeEpochs,
+            sourceTickets: sourceTickets,
+            graphKeys: refreshedReceipt.graphKeys,
+            coverageProofs: refreshedReceipt.coverageProofs,
+            targets: refreshedReceipt.targets,
+            publicationPermit: refreshedReceipt.publicationPermit
+        )
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: refreshedResult.roots,
+            aggregateCoverage: refreshedResult.aggregateCoverage,
+            publicationReceipt: replacementReceipt
+        )
+    }
+
+    private func refreshProvisionalAutomaticCodemapSelectionResult(
+        _ result: WorkspaceCodemapAutomaticSelectionResult,
+        receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScope _: WorkspaceLookupRootScope,
+        deadline: ContinuousClock.Instant? = nil
+    ) -> WorkspaceCodemapAutomaticSelectionResult? {
+        guard codemapDeadlineIsCurrent(deadline),
+              provisionalAutomaticSelectionReceiptIsCurrent(
+                  receipt,
+                  sourceTickets: sourceTickets
+              )
+        else { return nil }
+        receipt.publicationPermit.revoke()
+        let requestID = UUID()
+        let publicationPermit = WorkspaceCodemapAutomaticSelectionPublicationPermit()
+        registerAutomaticSelectionPublicationPermit(
+            publicationPermit,
+            requestID: requestID,
+            rootScopeEpochs: receipt.rootScopeEpochs
+        )
+        let replacementReceipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: requestID,
+            rootScope: receipt.rootScope,
+            rootScopeEpochs: receipt.rootScopeEpochs,
+            sourceTickets: sourceTickets,
+            graphKeys: [],
+            coverageProofs: [],
+            targets: receipt.targets,
+            publicationBasis: receipt.publicationBasis,
+            publicationPermit: publicationPermit
+        )
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: result.roots,
+            aggregateCoverage: result.aggregateCoverage,
+            publicationReceipt: replacementReceipt
+        )
+    }
+
+    private func automaticSelectionSourceTicketsAreCurrent(
+        _ sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    ) -> Bool {
+        let allowedRootIDs = Set(rootScopeEpochs.map(\.rootID))
+        for ticket in sourceTickets {
+            guard allowedRootIDs.contains(ticket.rootEpoch.rootID),
+                  codemapDemandIsCurrent(ticket),
+                  let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  record.retainIDs.contains(ticket.retainID),
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(ready.ticket, ticket),
+                  ready.snapshot.requestGeneration == ticket.requestGeneration
+            else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func provisionalAutomaticSelectionReceiptIsCurrent(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        sourceTickets replacementSourceTickets: [WorkspaceCodemapArtifactDemandTicket]? = nil
+    ) -> Bool {
+        guard case let .provisionalCandidates(candidates) = receipt.publicationBasis,
+              receipt.publicationPermit.withCurrent({ true }) == true,
+              receipt.rootScopeEpochs == codemapAutomaticSelectionRootScopeEpochs(receipt.rootScope),
+              receipt.graphKeys.isEmpty,
+              receipt.coverageProofs.isEmpty,
+              !receipt.targets.isEmpty,
+              candidates.count == receipt.targets.count,
+              Set(receipt.targets).count == receipt.targets.count,
+              Set(receipt.targets.map { WorkspaceCodemapRootScopedFileSlot(target: $0) }).count == receipt.targets.count,
+              Set(candidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) }).count == candidates.count
+        else { return false }
+
+        let sourceTickets = replacementSourceTickets ?? receipt.sourceTickets
+        guard sourceTickets.count == receipt.sourceTickets.count,
+              automaticSelectionSourceTicketsAreCurrent(
+                  sourceTickets,
+                  rootScopeEpochs: receipt.rootScopeEpochs
+              )
+        else { return false }
+        let sourceSlots = Set(sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        let receiptSourceSlots = Set(receipt.sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        guard sourceSlots.count == sourceTickets.count,
+              receiptSourceSlots == sourceSlots
+        else { return false }
+
+        var candidatesBySlot: [WorkspaceCodemapRootScopedFileSlot: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = [:]
+        for candidate in candidates {
+            let rootEpoch = WorkspaceCodemapRootEpoch(
+                rootID: candidate.identity.rootID,
+                rootLifetimeID: candidate.identity.rootLifetimeID
+            )
+            let slot = WorkspaceCodemapRootScopedFileSlot(rootEpoch: rootEpoch, fileID: candidate.identity.fileID)
+            guard candidatesBySlot[slot] == nil else { return false }
+            candidatesBySlot[slot] = candidate
+        }
+
+        for target in receipt.targets {
+            let slot = WorkspaceCodemapRootScopedFileSlot(rootEpoch: target.rootEpoch, fileID: target.fileID)
+            guard !sourceSlots.contains(slot),
+                  let candidate = candidatesBySlot[slot],
+                  candidate.catalogGeneration == target.catalogGeneration,
+                  candidate.requestGeneration == target.requestGeneration,
+                  candidate.pathGeneration == target.requestGeneration,
+                  provisionalAutomaticSelectionCandidateDemandIsCurrent(
+                      candidate: candidate,
+                      rootScope: receipt.rootScope,
+                      rootScopeEpochs: receipt.rootScopeEpochs
+                  ),
+                  let state = rootStatesByID[target.rootEpoch.rootID],
+                  state.lifetimeID == target.rootEpoch.rootLifetimeID,
+                  catalogGenerationsByRootID[target.rootEpoch.rootID] == target.catalogGeneration,
+                  let file = filesByID[target.fileID],
+                  file.rootID == target.rootEpoch.rootID,
+                  isDiscoverableFileID(file.id),
+                  state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+                  file.standardizedRelativePath == candidate.identity.standardizedRelativePath,
+                  file.standardizedFullPath == candidate.identity.standardizedFullPath,
+                  target.logicalPath.standardizedRelativePath == file.standardizedRelativePath
+            else { return false }
+        }
+        return true
+    }
+
+    private func revalidateAutomaticCodemapSelectionForPublicationUnreleased(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspaceCodemapAutomaticSelectionPublicationDisposition {
+        guard receipt.publicationPermit.withCurrent({ true }) == true,
+              receipt.rootScope == rootScope
+        else {
+            return .stale(.publicationReceipt)
+        }
+        switch receipt.publicationBasis {
+        case .projectionCoverage:
+            return revalidateProjectionAutomaticCodemapSelectionForPublicationUnreleased(
+                receipt,
+                rootScope: rootScope
+            )
+        case .provisionalCandidates:
+            guard provisionalAutomaticSelectionReceiptIsCurrent(receipt) else {
+                return .stale(.publicationReceipt)
+            }
+            return .current(receipt.targets)
+        }
+    }
+
+    private func revalidateProjectionAutomaticCodemapSelectionForPublicationUnreleased(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspaceCodemapAutomaticSelectionPublicationDisposition {
+        let currentRootScopeEpochs = codemapAutomaticSelectionRootScopeEpochs(rootScope)
+        guard receipt.rootScopeEpochs == currentRootScopeEpochs,
+              !receipt.sourceTickets.isEmpty,
+              receipt.graphKeys.count == receipt.coverageProofs.count,
+              !receipt.coverageProofs.isEmpty,
+              Set(receipt.targets).count == receipt.targets.count,
+              automaticSelectionCoverageProofsAreCurrent(receipt.coverageProofs)
+        else { return .stale(.publicationReceipt) }
+        let allowedRootIDs = Set(currentRootScopeEpochs.map(\.rootID))
+        let sourceSlots = receipt.sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        }
+        let sourceSlotSet = Set(sourceSlots)
+        guard sourceSlotSet.count == sourceSlots.count,
+              receipt.targets.allSatisfy({ target in
+                  !sourceSlotSet.contains(WorkspaceCodemapRootScopedFileSlot(
+                      rootEpoch: target.rootEpoch,
+                      fileID: target.fileID
+                  ))
+              })
+        else {
+            return .stale(.publicationReceipt)
+        }
+        let coveredRootEpochs = receipt.coverageProofs.map(\.generation.rootEpoch)
+        guard Set(coveredRootEpochs).count == coveredRootEpochs.count,
+              Set(receipt.sourceTickets.map(\.rootEpoch)) == Set(coveredRootEpochs),
+              zip(receipt.graphKeys, receipt.coverageProofs).allSatisfy({ pair in
+                  pair.0 == WorkspaceCodemapSelectionGraphRuntimeKey(generation: pair.1.generation)
+              }),
+              automaticSelectionSourceTicketsAreCurrent(
+                  receipt.sourceTickets,
+                  rootScopeEpochs: currentRootScopeEpochs
+              )
+        else { return .stale(.publicationReceipt) }
+        for key in receipt.graphKeys {
+            guard allowedRootIDs.contains(key.rootEpoch.rootID),
+                  let graphState = codemapSessionsByRootEpoch[key.rootEpoch]?.selectionGraph,
+                  graphState.desiredKey == key,
+                  graphState.publishedSummary?.key == key
+            else { return .stale(.publicationReceipt) }
+        }
+        for target in receipt.targets {
+            guard coveredRootEpochs.contains(target.rootEpoch),
+                  allowedRootIDs.contains(target.rootEpoch.rootID),
+                  let state = rootStatesByID[target.rootEpoch.rootID],
+                  state.lifetimeID == target.rootEpoch.rootLifetimeID,
+                  catalogGenerationsByRootID[target.rootEpoch.rootID] == target.catalogGeneration,
+                  let file = filesByID[target.fileID],
+                  file.rootID == target.rootEpoch.rootID,
+                  isDiscoverableFileID(file.id),
+                  state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+                  target.logicalPath.standardizedRelativePath == file.standardizedRelativePath,
+                  let session = codemapSessionsByRootEpoch[target.rootEpoch],
+                  (
+                      session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+                          ?? session.authority.ingressGeneration
+                  ) == target.requestGeneration
+            else { return .stale(.publicationReceipt) }
+        }
+        return .current(receipt.targets)
     }
 
     private func currentCodemapAuthority(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> CodemapRootAuthority? {
-        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
-              let state = rootStatesByID[rootEpoch.rootID],
+        guard let state = rootStatesByID[rootEpoch.rootID],
               state.lifetimeID == rootEpoch.rootLifetimeID
         else { return nil }
         if let session = codemapSessionsByRootEpoch[rootEpoch],
@@ -12134,7 +12786,7 @@ actor WorkspaceFileContextStore {
         {
             return session.authority
         }
-        if let launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch],
+        if let launch = codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch],
            codemapAuthorityMatchesLoadedRoot(launch.authority)
         {
             return launch.authority
@@ -12149,7 +12801,7 @@ actor WorkspaceFileContextStore {
         {
             return completed.authority
         }
-        if let retry = codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch],
+        if let retry = codemapProjectionPreloadRetriesByRootEpoch[rootEpoch],
            codemapAuthorityMatchesLoadedRoot(retry.authority)
         {
             return retry.authority
@@ -12165,32 +12817,37 @@ actor WorkspaceFileContextStore {
         )
     }
 
-    private func recordCodemapGraphIndexBuildStoreEvent(
-        _ kind: CodemapGraphIndexBuildStoreEventKind,
+    private func recordCodemapProjectionPreloadStoreEvent(
+        _ kind: CodemapProjectionPreloadStoreEventKind,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        phase: WorkspaceCodemapGraphIndexLaunchPhase
+        phase: WorkspaceCodemapProjectionPreloadLaunchPhase,
+        trigger: CodemapProjectionPreloadTrigger? = nil
     ) {
         #if DEBUG
-            nextCodemapGraphIndexBuildStoreEventOrdinal &+= 1
-            codemapGraphIndexBuildStoreEvents.append(CodemapGraphIndexBuildStoreEvent(
-                ordinal: nextCodemapGraphIndexBuildStoreEventOrdinal,
+            let effectiveTrigger = trigger
+                ?? codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch]?.trigger
+                ?? codemapProjectionPreloadRetriesByRootEpoch[rootEpoch]?.trigger
+                ?? .rootReady
+            nextCodemapProjectionPreloadStoreEventOrdinal &+= 1
+            codemapProjectionPreloadStoreEvents.append(CodemapProjectionPreloadStoreEvent(
+                ordinal: nextCodemapProjectionPreloadStoreEventOrdinal,
                 rootEpoch: rootEpoch,
                 kind: kind,
                 launchPhase: phase,
-                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+                trigger: effectiveTrigger
             ))
-            if codemapGraphIndexBuildStoreEvents.count > 2048 {
-                codemapGraphIndexBuildStoreEvents.removeFirst(
-                    codemapGraphIndexBuildStoreEvents.count - 2048
+            if codemapProjectionPreloadStoreEvents.count > 2048 {
+                codemapProjectionPreloadStoreEvents.removeFirst(
+                    codemapProjectionPreloadStoreEvents.count - 2048
                 )
             }
         #endif
     }
 
-    private func recordCodemapRootReadyForGraphIndexBuild(
+    private func recordCodemapRootReadyForProjectionPreload(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .rootInventoryAndSearchReady,
             rootEpoch: rootEpoch,
             phase: .notScheduled
@@ -12199,84 +12856,81 @@ actor WorkspaceFileContextStore {
 
     /// Records launch state and creates the background task only. Git eligibility, runtime,
     /// integration-route, manifest, CAS, source, and graph work all begin in the task body.
-    private func scheduleCodemapGraphIndexBuildAfterRootReady(
+    private func scheduleCodemapProjectionPreloadAfterRootReady(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        retryAttempt: Int = 0
+        retryAttempt: Int = 0,
+        trigger: CodemapProjectionPreloadTrigger = .rootReady
     ) {
         #if DEBUG
-            guard codemapGraphIndexBuildLaunchPolicyForTesting == .enabled else { return }
+            guard codemapProjectionPreloadLaunchPolicyForTesting == .enabled else { return }
         #endif
-        guard !codemapGenerationIsSuspended(rootEpoch: rootEpoch),
-              codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
+        guard codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
               codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
               let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
               codemapPreflightAuthorityIsCurrent(authority)
         else { return }
-        if let existing = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] {
+        if let existing = codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch] {
             switch existing.phase {
             case .cancelled, .superseded, .transientRetry:
                 break
             case .notScheduled, .eligibilityQueued, .setupJoining, .engineScheduling,
-                 .handedOff, .terminalNonGit, .retryExhausted:
+                 .handedOff, .terminalNonGit:
                 return
             }
         }
 
         let launchID = UUID()
-        let createdUptimeNanoseconds = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
-        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
-        codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] = CodemapGraphIndexBuildLaunch(
+        codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch] = CodemapProjectionPreloadLaunch(
             id: launchID,
             authority: authority,
             retryAttempt: retryAttempt,
+            trigger: trigger,
             phase: .eligibilityQueued,
-            task: nil,
-            createdUptimeNanoseconds: createdUptimeNanoseconds,
-            phaseEnteredUptimeNanoseconds: createdUptimeNanoseconds
+            task: nil
         )
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .scheduled,
             rootEpoch: rootEpoch,
-            phase: .eligibilityQueued
+            phase: .eligibilityQueued,
+            trigger: trigger
         )
-        let task = Task<Void, Never>(priority: .utility) { [weak self] in
+        let task = Task<Void, Never>(priority: .background) { [weak self] in
             guard let self else { return }
-            await runCodemapGraphIndexBuildLaunch(
+            await runCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority
             )
         }
-        guard var launch = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch],
+        guard var launch = codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch],
               launch.id == launchID
         else {
             task.cancel()
             return
         }
         launch.task = task
-        codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch] = launch
-        publishCodemapRootStatusesIfChanged()
+        codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch] = launch
     }
 
-    private func runCodemapGraphIndexBuildLaunch(
+    private func runCodemapProjectionPreloadLaunch(
         launchID: UUID,
         authority: CodemapRootAuthority
     ) async {
         #if DEBUG
-            if let codemapGraphIndexBuildStartHandler {
-                await codemapGraphIndexBuildStartHandler(authority.rootEpoch)
+            if let codemapProjectionPreloadStartHandler {
+                await codemapProjectionPreloadStartHandler(authority.rootEpoch)
             }
         #endif
         guard !Task.isCancelled,
-              codemapGraphIndexBuildLaunchIsCurrent(launchID: launchID, authority: authority)
+              codemapProjectionPreloadLaunchIsCurrent(launchID: launchID, authority: authority)
         else {
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .cancelled
             )
             return
         }
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .started,
             rootEpoch: authority.rootEpoch,
             phase: .eligibilityQueued
@@ -12288,9 +12942,9 @@ actor WorkspaceFileContextStore {
             await resolveCodemapEligibility(authority: authority)
         }
         guard !Task.isCancelled,
-              codemapGraphIndexBuildLaunchIsCurrent(launchID: launchID, authority: authority)
+              codemapProjectionPreloadLaunchIsCurrent(launchID: launchID, authority: authority)
         else {
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .cancelled
@@ -12299,7 +12953,7 @@ actor WorkspaceFileContextStore {
         }
         switch eligibility {
         case .eligible:
-            recordCodemapGraphIndexBuildStoreEvent(
+            recordCodemapProjectionPreloadStoreEvent(
                 .eligibilityEligible,
                 rootEpoch: authority.rootEpoch,
                 phase: .setupJoining
@@ -12307,45 +12961,45 @@ actor WorkspaceFileContextStore {
         case let .terminal(reason, _):
             let unavailable = WorkspaceCodemapArtifactDemandUnavailableReason.gitTerminal(reason)
             installCodemapTerminalSetupDisposition(unavailable, authority: authority)
-            let phase: WorkspaceCodemapGraphIndexLaunchPhase = reason == .nonGit
+            let phase: WorkspaceCodemapProjectionPreloadLaunchPhase = reason == .nonGit
                 ? .terminalNonGit
                 : .superseded
-            recordCodemapGraphIndexBuildStoreEvent(
+            recordCodemapProjectionPreloadStoreEvent(
                 .eligibilityTerminal,
                 rootEpoch: authority.rootEpoch,
                 phase: phase
             )
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: phase
             )
             return
         case .transient:
-            recordCodemapGraphIndexBuildStoreEvent(
+            recordCodemapProjectionPreloadStoreEvent(
                 .eligibilityTransient,
                 rootEpoch: authority.rootEpoch,
                 phase: .transientRetry
             )
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .transientRetry
             )
-            scheduleCodemapGraphIndexBuildRetry(
+            scheduleCodemapProjectionPreloadRetry(
                 launchID: launchID,
                 authority: authority
             )
             return
         case .stale:
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .superseded
             )
             return
         case .cancelled:
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .cancelled
@@ -12354,28 +13008,28 @@ actor WorkspaceFileContextStore {
         }
 
         guard let setup = ensureCodemapSetupTask(authority: authority) else {
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .superseded
             )
             return
         }
-        updateCodemapGraphIndexBuildLaunchPhase(
+        updateCodemapProjectionPreloadLaunchPhase(
             .setupJoining,
             launchID: launchID,
             authority: authority
         )
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .setupJoining,
             rootEpoch: authority.rootEpoch,
             phase: .setupJoining
         )
         let setupDisposition = await setup.value
         guard !Task.isCancelled,
-              codemapGraphIndexBuildLaunchIsCurrent(launchID: launchID, authority: authority)
+              codemapProjectionPreloadLaunchIsCurrent(launchID: launchID, authority: authority)
         else {
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .cancelled
@@ -12384,16 +13038,16 @@ actor WorkspaceFileContextStore {
         }
         guard case .ready = setupDisposition else {
             let retryable = codemapSetupDispositionIsRetryable(setupDisposition)
-            let phase: WorkspaceCodemapGraphIndexLaunchPhase = retryable
+            let phase: WorkspaceCodemapProjectionPreloadLaunchPhase = retryable
                 ? .transientRetry
                 : .superseded
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: phase
             )
             if retryable {
-                scheduleCodemapGraphIndexBuildRetry(
+                scheduleCodemapProjectionPreloadRetry(
                     launchID: launchID,
                     authority: authority
                 )
@@ -12401,7 +13055,7 @@ actor WorkspaceFileContextStore {
             return
         }
         guard let engine = codemapSessionsByRootEpoch[authority.rootEpoch]?.engine else {
-            finishCodemapGraphIndexBuildLaunch(
+            finishCodemapProjectionPreloadLaunch(
                 launchID: launchID,
                 authority: authority,
                 phase: .superseded
@@ -12409,27 +13063,27 @@ actor WorkspaceFileContextStore {
             return
         }
 
-        updateCodemapGraphIndexBuildLaunchPhase(
+        updateCodemapProjectionPreloadLaunchPhase(
             .engineScheduling,
             launchID: launchID,
             authority: authority
         )
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .engineScheduling,
             rootEpoch: authority.rootEpoch,
             phase: .engineScheduling
         )
-        let disposition = await engine.scheduleGraphIndex(rootEpoch: authority.rootEpoch)
-        guard codemapGraphIndexBuildLaunchIsCurrent(launchID: launchID, authority: authority) else {
+        let disposition = await engine.scheduleProjectionPreload(rootEpoch: authority.rootEpoch)
+        guard codemapProjectionPreloadLaunchIsCurrent(launchID: launchID, authority: authority) else {
             return
         }
-        finishCodemapGraphIndexBuildLaunch(
+        finishCodemapProjectionPreloadLaunch(
             launchID: launchID,
             authority: authority,
             phase: disposition
         )
         if disposition == .handedOff {
-            recordCodemapGraphIndexBuildStoreEvent(
+            recordCodemapProjectionPreloadStoreEvent(
                 .handedOff,
                 rootEpoch: authority.rootEpoch,
                 phase: .handedOff
@@ -12440,22 +13094,18 @@ actor WorkspaceFileContextStore {
     private func resolveCodemapEligibility(
         authority: CodemapRootAuthority
     ) async -> CodemapEligibilityResolution {
-        var requiresGitPreflight = false
+        var skipLocalClassification = false
         if let completed = codemapCompletedEligibilityByRootEpoch[authority.rootEpoch],
            completed.authority == authority,
            codemapPreflightAuthorityIsCurrent(authority)
         {
             if case let .terminal(.nonGit, proof?) = completed.result {
-                switch codemapLocalGitClassificationProbe.validate(proof) {
-                case .current:
+                if codemapLocalGitClassificationProbe.validate(proof) {
                     return completed.result
-                case .requiresLocalReclassification:
-                    break
-                case .requiresGitPreflight:
-                    requiresGitPreflight = true
                 }
                 codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
                 terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
+                skipLocalClassification = true
             } else {
                 return completed.result
             }
@@ -12467,15 +13117,11 @@ actor WorkspaceFileContextStore {
                 terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
                 return .stale
             }
-            switch codemapLocalGitClassificationProbe.validate(cached.proof) {
-            case .current:
+            if codemapLocalGitClassificationProbe.validate(cached.proof) {
                 return .terminal(.nonGit, cached.proof)
-            case .requiresLocalReclassification:
-                break
-            case .requiresGitPreflight:
-                requiresGitPreflight = true
             }
             terminalNonGitCodemapCacheByEpoch.removeValue(forKey: authority.rootEpoch)
+            skipLocalClassification = true
         }
 
         let flight: CodemapEligibilityFlight
@@ -12489,7 +13135,7 @@ actor WorkspaceFileContextStore {
                 guard let self else { return CodemapEligibilityResolution.cancelled }
                 return await performCodemapEligibility(
                     authority: authority,
-                    requiresGitPreflight: requiresGitPreflight
+                    skipLocalClassification: skipLocalClassification
                 )
             }
             flight = CodemapEligibilityFlight(id: id, authority: authority, task: task)
@@ -12513,7 +13159,7 @@ actor WorkspaceFileContextStore {
         }
         if case let .terminal(.nonGit, proof?) = result,
            codemapPreflightAuthorityIsCurrent(authority),
-           codemapLocalGitClassificationProbe.validate(proof) == .current
+           codemapLocalGitClassificationProbe.validate(proof)
         {
             terminalNonGitCodemapCacheByEpoch[authority.rootEpoch] = .init(
                 standardizedRootPath: authority.standardizedRootPath,
@@ -12547,21 +13193,19 @@ actor WorkspaceFileContextStore {
 
     private func performCodemapEligibility(
         authority: CodemapRootAuthority,
-        requiresGitPreflight: Bool
+        skipLocalClassification: Bool
     ) async -> CodemapEligibilityResolution {
         let rootURL = URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true)
-        if !requiresGitPreflight {
+        if !skipLocalClassification {
             let local = await codemapLocalGitClassificationProbe.resolve(rootURL)
             guard !Task.isCancelled else { return .cancelled }
             guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
             if case let .definitelyNonGit(proof) = local,
-               codemapLocalGitClassificationProbe.validate(proof) == .current
+               codemapLocalGitClassificationProbe.validate(proof)
             {
                 return .terminal(.nonGit, proof)
             }
         }
-        guard !Task.isCancelled else { return .cancelled }
-        guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
         let result = await codemapGitEligibilityProbe.resolve(rootURL)
         guard !Task.isCancelled else { return .cancelled }
         guard codemapPreflightAuthorityIsCurrent(authority) else { return .stale }
@@ -12598,9 +13242,7 @@ actor WorkspaceFileContextStore {
     private func ensureCodemapSetupTask(
         authority: CodemapRootAuthority
     ) -> Task<CodemapSetupDisposition, Never>? {
-        guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
-              codemapPreflightAuthorityIsCurrent(authority)
-        else { return nil }
+        guard codemapPreflightAuthorityIsCurrent(authority) else { return nil }
         codemapCompletedEligibilityByRootEpoch.removeValue(forKey: authority.rootEpoch)
         if let existing = codemapSessionsByRootEpoch[authority.rootEpoch] {
             guard existing.authority == authority else { return nil }
@@ -12626,52 +13268,44 @@ actor WorkspaceFileContextStore {
         return setupTask
     }
 
-    private func codemapGraphIndexBuildLaunchIsCurrent(
+    private func codemapProjectionPreloadLaunchIsCurrent(
         launchID: UUID,
         authority: CodemapRootAuthority
     ) -> Bool {
-        guard let launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
+        guard let launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority,
-              !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
               codemapPreflightAuthorityIsCurrent(authority)
         else { return false }
         return true
     }
 
-    private func updateCodemapGraphIndexBuildLaunchPhase(
-        _ phase: WorkspaceCodemapGraphIndexLaunchPhase,
+    private func updateCodemapProjectionPreloadLaunchPhase(
+        _ phase: WorkspaceCodemapProjectionPreloadLaunchPhase,
         launchID: UUID,
-        authority: CodemapRootAuthority,
-        uptimeNanoseconds: UInt64? = nil
+        authority: CodemapRootAuthority
     ) {
-        guard var launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
+        guard var launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority
         else { return }
         launch.phase = phase
-        launch.phaseEnteredUptimeNanoseconds = uptimeNanoseconds
-            ?? codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
-        codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch] = launch
-        publishCodemapRootStatusesIfChanged()
+        codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch] = launch
     }
 
-    private func finishCodemapGraphIndexBuildLaunch(
+    private func finishCodemapProjectionPreloadLaunch(
         launchID: UUID,
         authority: CodemapRootAuthority,
-        phase: WorkspaceCodemapGraphIndexLaunchPhase
+        phase: WorkspaceCodemapProjectionPreloadLaunchPhase
     ) {
-        guard var launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
+        guard var launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority
         else { return }
         launch.phase = phase
-        launch.task = nil
-        launch.phaseEnteredUptimeNanoseconds = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
-        codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch] = launch
-        publishCodemapRootStatusesIfChanged()
+        codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch] = launch
         if phase == .cancelled || phase == .superseded {
-            recordCodemapGraphIndexBuildStoreEvent(
+            recordCodemapProjectionPreloadStoreEvent(
                 phase == .cancelled ? .cancelled : .superseded,
                 rootEpoch: authority.rootEpoch,
                 phase: phase
@@ -12686,92 +13320,73 @@ actor WorkspaceFileContextStore {
         return !codemapUnavailableIsStable(reason)
     }
 
-    private func scheduleCodemapGraphIndexBuildRetry(
+    private func scheduleCodemapProjectionPreloadRetry(
         launchID: UUID,
         authority: CodemapRootAuthority
     ) {
-        guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
-              let launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
+        guard let launch = codemapProjectionPreloadLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
               launch.authority == authority,
               launch.phase == .transientRetry,
               codemapPreflightAuthorityIsCurrent(authority),
-              codemapGraphIndexBuildRetriesByRootEpoch[authority.rootEpoch] == nil
+              codemapProjectionPreloadRetriesByRootEpoch[authority.rootEpoch] == nil
         else { return }
         let attempt = launch.retryAttempt + 1
-        guard attempt <= codemapGraphIndexBuildRetryPolicy.maximumRetryCount else {
-            let exhaustionUptimeNanoseconds = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
-            let exhausted = CodemapGraphIndexRetryExhaustion(
-                attempt: attempt,
-                uptimeNanoseconds: exhaustionUptimeNanoseconds
-            )
-            codemapGraphIndexRetryExhaustionByRootEpoch[authority.rootEpoch] = exhausted
-            updateCodemapGraphIndexBuildLaunchPhase(
-                .retryExhausted,
-                launchID: launchID,
-                authority: authority,
-                uptimeNanoseconds: exhaustionUptimeNanoseconds
-            )
-            recordCodemapGraphIndexBuildStoreEvent(
-                .retryExhausted,
-                rootEpoch: authority.rootEpoch,
-                phase: .retryExhausted
-            )
-            return
-        }
-        let delay = codemapGraphIndexBuildRetryPolicy.backoffNanoseconds(forAttempt: attempt)
-        let now = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+        guard attempt <= codemapProjectionPreloadRetryPolicy.maximumRetryCount else { return }
+        let delay = codemapProjectionPreloadRetryPolicy.backoffNanoseconds(forAttempt: attempt)
+        let now = codemapProjectionPreloadRetryPolicy.nowNanoseconds()
         let (candidateDeadline, overflow) = now.addingReportingOverflow(delay)
         let deadline = overflow ? UInt64.max : candidateDeadline
         let retryID = UUID()
-        let sleep = codemapGraphIndexBuildRetryPolicy.sleep
-        let task = Task<Void, Never>(priority: .utility) { [weak self] in
+        let sleep = codemapProjectionPreloadRetryPolicy.sleep
+        let task = Task<Void, Never>(priority: .background) { [weak self] in
             do {
                 try await sleep(delay)
             } catch {
                 return
             }
             guard let self else { return }
-            await performCodemapGraphIndexBuildRetry(
+            await performCodemapProjectionPreloadRetry(
                 retryID: retryID,
                 authority: authority,
                 attempt: attempt,
                 deadlineNanoseconds: deadline
             )
         }
-        codemapGraphIndexBuildRetriesByRootEpoch[authority.rootEpoch] = .init(
+        codemapProjectionPreloadRetriesByRootEpoch[authority.rootEpoch] = .init(
             id: retryID,
             authority: authority,
             attempt: attempt,
             deadlineNanoseconds: deadline,
+            trigger: launch.trigger,
             task: task
         )
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .retryScheduled,
             rootEpoch: authority.rootEpoch,
             phase: .transientRetry
         )
     }
 
-    private func performCodemapGraphIndexBuildRetry(
+    private func performCodemapProjectionPreloadRetry(
         retryID: UUID,
         authority: CodemapRootAuthority,
         attempt: Int,
         deadlineNanoseconds: UInt64
     ) async {
-        guard let retry = codemapGraphIndexBuildRetriesByRootEpoch[authority.rootEpoch],
+        guard let retry = codemapProjectionPreloadRetriesByRootEpoch[authority.rootEpoch],
               retry.id == retryID,
               retry.authority == authority,
               retry.attempt == attempt,
               retry.deadlineNanoseconds == deadlineNanoseconds
         else { return }
-        codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: authority.rootEpoch)
+        let trigger = retry.trigger
+        codemapProjectionPreloadRetriesByRootEpoch.removeValue(forKey: authority.rootEpoch)
         guard !Task.isCancelled,
-              !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
-              codemapGraphIndexBuildRetryPolicy.nowNanoseconds() >= deadlineNanoseconds,
+              codemapProjectionPreloadRetryPolicy.nowNanoseconds() >= deadlineNanoseconds,
               codemapPreflightAuthorityIsCurrent(authority)
         else { return }
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .retryStarted,
             rootEpoch: authority.rootEpoch,
             phase: .transientRetry
@@ -12787,10 +13402,291 @@ actor WorkspaceFileContextStore {
             await awaitCodemapCleanupFlights(rootIDs: [authority.rootEpoch.rootID])
             guard !Task.isCancelled else { return }
         }
-        scheduleCodemapGraphIndexBuildAfterRootReady(
+        scheduleCodemapProjectionPreloadAfterRootReady(
             rootEpoch: authority.rootEpoch,
-            retryAttempt: attempt
+            retryAttempt: attempt,
+            trigger: trigger
         )
+    }
+
+    func publishedCodemapStructurePresentation(
+        seedFileIDs: [UUID],
+        outputLimits: WorkspaceCodemapStructureOutputLimits,
+        rootScope: WorkspaceLookupRootScope,
+        logicalRootDisplayNamesByRootID: [UUID: String]
+    ) async -> WorkspaceCodemapStructurePresentation? {
+        guard !Task.isCancelled,
+              !seedFileIDs.isEmpty,
+              outputLimits.maximumCodemapTokenCount > 0
+        else { return nil }
+
+        var orderedFileIDs: [UUID] = []
+        var seenFileIDs = Set<UUID>()
+        for fileID in seedFileIDs where seenFileIDs.insert(fileID).inserted {
+            orderedFileIDs.append(fileID)
+        }
+        guard orderedFileIDs.count <= outputLimits.maximumFileCount else { return nil }
+
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        var captures: [CodemapPublishedStructureCapture] = []
+        captures.reserveCapacity(orderedFileIDs.count)
+        for fileID in orderedFileIDs {
+            guard let file = filesByID[fileID],
+                  allowedRootIDs.contains(file.rootID),
+                  isDiscoverableFileID(file.id),
+                  let state = rootStatesByID[file.rootID],
+                  state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+                  let identity = WorkspaceCodemapArtifactBindingIdentity(
+                      rootID: file.rootID,
+                      rootLifetimeID: state.lifetimeID,
+                      fileID: file.id,
+                      standardizedRootPath: state.root.standardizedFullPath,
+                      standardizedRelativePath: file.standardizedRelativePath,
+                      standardizedFullPath: file.standardizedFullPath
+                  )
+            else { return nil }
+            let rootEpoch = WorkspaceCodemapRootEpoch(
+                rootID: file.rootID,
+                rootLifetimeID: state.lifetimeID
+            )
+            guard codemapCleanupFlightsByRootID[file.rootID] == nil,
+                  codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
+                  !codemapPathIsFenced(
+                      rootEpoch: rootEpoch,
+                      relativePath: file.standardizedRelativePath
+                  ),
+                  let session = codemapSessionsByRootEpoch[rootEpoch],
+                  codemapAuthorityIsCurrent(session.authority),
+                  case .ready? = session.setupDisposition,
+                  let engine = session.engine
+            else { return nil }
+            let fileExtension = (file.name as NSString).pathExtension
+            guard let language = SyntaxManager.shared.language(forFileExtension: fileExtension),
+                  SyntaxManager.supportsCodeMap(fileExtension: fileExtension),
+                  let logicalPath = WorkspaceCodemapLogicalPresentationPath(
+                      rootDisplayName: logicalRootDisplayNamesByRootID[file.rootID] ?? state.root.name,
+                      standardizedRelativePath: file.standardizedRelativePath
+                  )
+            else { return nil }
+            let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+                ?? session.authority.ingressGeneration
+            captures.append(CodemapPublishedStructureCapture(
+                request: WorkspaceCodemapPublishedArtifactLookupRequest(
+                    ownerID: UUID(),
+                    identity: identity,
+                    requestGeneration: pathGeneration,
+                    catalogGeneration: session.authority.catalogGeneration,
+                    pathGeneration: pathGeneration,
+                    ingressGeneration: session.authority.ingressGeneration,
+                    language: language
+                ),
+                rootEpoch: rootEpoch,
+                authority: session.authority,
+                engine: engine,
+                logicalPath: logicalPath
+            ))
+        }
+
+        var hitsByFileID: [UUID: WorkspaceCodemapPublishedArtifactLookupHit] = [:]
+        hitsByFileID.reserveCapacity(captures.count)
+        for capture in captures {
+            guard !Task.isCancelled else { return nil }
+            switch await capture.engine.lookupPublishedArtifact(capture.request) {
+            case let .hit(hit):
+                hitsByFileID[capture.request.identity.fileID] = hit
+            case .miss, .cancelled:
+                return nil
+            }
+        }
+
+        let finalAllowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        for capture in captures {
+            let identity = capture.request.identity
+            guard let file = filesByID[identity.fileID],
+                  finalAllowedRootIDs.contains(identity.rootID),
+                  isDiscoverableFileID(identity.fileID),
+                  file.rootID == identity.rootID,
+                  file.standardizedRelativePath == identity.standardizedRelativePath,
+                  file.standardizedFullPath == identity.standardizedFullPath,
+                  let state = rootStatesByID[identity.rootID],
+                  state.lifetimeID == identity.rootLifetimeID,
+                  state.fileIDsByRelativePath[identity.standardizedRelativePath] == identity.fileID,
+                  codemapCleanupFlightsByRootID[identity.rootID] == nil,
+                  codemapRootMutationFenceTokensByRootEpoch[capture.rootEpoch] == nil,
+                  !codemapPathIsFenced(
+                      rootEpoch: capture.rootEpoch,
+                      relativePath: identity.standardizedRelativePath
+                  ),
+                  let session = codemapSessionsByRootEpoch[capture.rootEpoch],
+                  session.authority == capture.authority,
+                  session.engine === capture.engine,
+                  (
+                      session.pathGenerationsByRelativePath[identity.standardizedRelativePath]
+                          ?? session.authority.ingressGeneration
+                  ) == capture.request.pathGeneration
+            else { return nil }
+        }
+
+        for capture in captures {
+            guard let hit = hitsByFileID[capture.request.identity.fileID],
+                  case .ready = hit.handle.outcome
+            else { return nil }
+        }
+        guard replayWarmPublishedCodemapMarkerReadiness(
+            captures,
+            rootScope: rootScope
+        ) != .stale else { return nil }
+
+        captures.sort {
+            if $0.logicalPath.displayPath != $1.logicalPath.displayPath {
+                return $0.logicalPath.displayPath.utf8.lexicographicallyPrecedes(
+                    $1.logicalPath.displayPath.utf8
+                )
+            }
+            return $0.request.identity.fileID.uuidString < $1.request.identity.fileID.uuidString
+        }
+
+        let bundleID = WorkspaceCodemapFrozenPresentationBundleID()
+        let separatorTokens = TokenCalculationService.estimateTokens(for: "\n\n")
+        var entries: [WorkspaceCodemapStructureRenderedEntry] = []
+        var issues: [WorkspaceCodemapStructureIssue] = []
+        var usedTokens = 0
+        for capture in captures {
+            let fileID = capture.request.identity.fileID
+            guard let hit = hitsByFileID[fileID],
+                  case let .ready(artifact) = hit.handle.outcome
+            else { return nil }
+            let text = CodeMapAPIContentFormatter.pathAndImportsBlock(
+                displayPath: capture.logicalPath.displayPath,
+                imports: artifact.imports
+            ) + artifact.apiDescription
+            let tokenCount = TokenCalculationService.estimateTokens(for: text)
+            let cost = tokenCount + (entries.isEmpty ? 0 : separatorTokens)
+            let (attempted, overflow) = usedTokens.addingReportingOverflow(cost)
+            guard !overflow, attempted <= outputLimits.maximumCodemapTokenCount else {
+                issues.append(.tokenLimit(
+                    path: capture.logicalPath.displayPath,
+                    attempted: overflow ? .max : attempted,
+                    limit: outputLimits.maximumCodemapTokenCount
+                ))
+                break
+            }
+            usedTokens = attempted
+            entries.append(WorkspaceCodemapStructureRenderedEntry(
+                entry: WorkspaceCodemapOperationRenderedEntry(
+                    bundleID: bundleID,
+                    fileID: fileID,
+                    rootEpoch: capture.rootEpoch,
+                    artifactKey: hit.handle.key,
+                    logicalPath: capture.logicalPath,
+                    text: text,
+                    tokenCount: tokenCount
+                ),
+                isSeed: true,
+                depth: 0,
+                reachedBy: []
+            ))
+        }
+        return WorkspaceCodemapStructurePresentation(
+            outcome: issues.isEmpty ? .ready : .budget,
+            entries: entries,
+            issues: issues,
+            requestedSeedCount: seedFileIDs.count,
+            resolvedSeedCount: captures.count,
+            examinedEdgeCount: 0,
+            codemapTokenCount: usedTokens
+        )
+    }
+
+    private func replayWarmPublishedCodemapMarkerReadiness(
+        _ captures: [CodemapPublishedStructureCapture],
+        rootScope: WorkspaceLookupRootScope
+    ) -> CodemapWarmPublishedMarkerReplayDisposition {
+        let requestedRootIDs = Set(rootRefs(scope: rootScope).map(\.id))
+        var changesByRootEpoch: [
+            WorkspaceCodemapRootEpoch: [WorkspaceCodemapMarkerReadinessChange]
+        ] = [:]
+        for capture in captures {
+            let request = capture.request
+            let identity = request.identity
+            guard requestedRootIDs.contains(identity.rootID),
+                  capture.rootEpoch == WorkspaceCodemapRootEpoch(
+                      rootID: identity.rootID,
+                      rootLifetimeID: identity.rootLifetimeID
+                  ),
+                  let state = rootStatesByID[identity.rootID],
+                  state.lifetimeID == identity.rootLifetimeID,
+                  state.root.standardizedFullPath == identity.standardizedRootPath,
+                  state.fileIDsByRelativePath[identity.standardizedRelativePath] == identity.fileID,
+                  let file = filesByID[identity.fileID],
+                  isDiscoverableFileID(identity.fileID),
+                  file.rootID == identity.rootID,
+                  file.standardizedRelativePath == identity.standardizedRelativePath,
+                  file.standardizedFullPath == identity.standardizedFullPath,
+                  codemapCleanupFlightsByRootID[identity.rootID] == nil,
+                  !codemapProjectionCatalogIsFenced(rootEpoch: capture.rootEpoch),
+                  let session = codemapSessionsByRootEpoch[capture.rootEpoch],
+                  case .ready? = session.setupDisposition,
+                  session.authority == capture.authority,
+                  codemapAuthorityIsCurrent(session.authority),
+                  session.engine === capture.engine,
+                  session.authority.catalogGeneration == request.catalogGeneration,
+                  session.authority.ingressGeneration == request.ingressGeneration
+            else { return .stale }
+            let currentPathGeneration = session.pathGenerationsByRelativePath[
+                identity.standardizedRelativePath
+            ] ?? session.authority.ingressGeneration
+            guard request.requestGeneration == currentPathGeneration,
+                  request.pathGeneration == currentPathGeneration
+            else { return .stale }
+            changesByRootEpoch[capture.rootEpoch, default: []].append(
+                WorkspaceCodemapMarkerReadinessChange(
+                    fileID: identity.fileID,
+                    standardizedRelativePath: identity.standardizedRelativePath,
+                    requestGeneration: request.requestGeneration,
+                    pathGeneration: request.pathGeneration,
+                    state: .ready
+                )
+            )
+        }
+
+        var applied = false
+        let rootEpochs = changesByRootEpoch.keys.sorted {
+            if $0.rootID != $1.rootID {
+                return $0.rootID.uuidString < $1.rootID.uuidString
+            }
+            return $0.rootLifetimeID.uuidString < $1.rootLifetimeID.uuidString
+        }
+        for rootEpoch in rootEpochs {
+            var session = codemapSessionsByRootEpoch[rootEpoch]!
+            let changes = changesByRootEpoch[rootEpoch]!
+            let effectiveChanges = changes.filter {
+                session.markerReadinessByFileID[$0.fileID] != $0
+            }
+            guard !effectiveChanges.isEmpty else { continue }
+            for change in effectiveChanges {
+                session.markerReadinessByFileID[change.fileID] = change
+            }
+            session.markerReadinessRevision &+= 1
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            #if DEBUG
+                WorktreeStartupInstrumentation.recordBenchmarkMarkerPublication(
+                    tag: WorktreeStartupInstrumentation.currentBenchmarkMetricTag,
+                    rootID: rootEpoch.rootID,
+                    rootLifetimeID: rootEpoch.rootLifetimeID,
+                    revision: session.markerReadinessRevision,
+                    effectiveChangeCount: effectiveChanges.count,
+                    source: .warmReplay
+                )
+            #endif
+            yieldCodemapMarkerReadiness(WorkspaceCodemapMarkerReadinessEvent(
+                rootEpoch: rootEpoch,
+                revision: session.markerReadinessRevision,
+                changes: effectiveChanges
+            ))
+            applied = true
+        }
+        return applied ? .applied : .alreadyCurrent
     }
 
     func requestCodemapArtifact(
@@ -12798,6 +13694,149 @@ actor WorkspaceFileContextStore {
         priority: CodeMapArtifactBuildPriority = .demand
     ) async -> WorkspaceCodemapArtifactDemandResult {
         await requestCodemapArtifactWithOwnership(forFileID: fileID, priority: priority).result
+    }
+
+    func requestAutomaticCodemapArtifactWithOwnership(
+        candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate,
+        rootScope: WorkspaceLookupRootScope,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch],
+        coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
+    ) async -> WorkspaceCodemapArtifactDemandOwnedResult? {
+        guard automaticSelectionCandidateDemandIsCurrent(
+            candidate: candidate,
+            rootScope: rootScope,
+            rootScopeEpochs: rootScopeEpochs,
+            coverageProofs: coverageProofs
+        ) else { return nil }
+        return await requestCodemapArtifactWithOwnership(
+            forFileID: candidate.identity.fileID,
+            priority: .background
+        )
+    }
+
+    func requestProvisionalAutomaticCodemapArtifactWithOwnership(
+        candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate,
+        rootScope: WorkspaceLookupRootScope,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    ) async -> WorkspaceCodemapArtifactDemandOwnedResult? {
+        guard provisionalAutomaticSelectionCandidateDemandIsCurrent(
+            candidate: candidate,
+            rootScope: rootScope,
+            rootScopeEpochs: rootScopeEpochs
+        ) else { return nil }
+        return await requestCodemapArtifactWithOwnership(
+            forFileID: candidate.identity.fileID,
+            priority: .background
+        )
+    }
+
+    func retryBusyAutomaticCodemapArtifactDemand(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate,
+        rootScope: WorkspaceLookupRootScope,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch],
+        coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
+    ) async -> WorkspaceCodemapArtifactDemandOwnedResult? {
+        guard automaticSelectionCandidateDemandIsCurrent(
+            candidate: candidate,
+            rootScope: rootScope,
+            rootScopeEpochs: rootScopeEpochs,
+            coverageProofs: coverageProofs
+        ), codemapDemandIsCurrent(ticket),
+        var session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+        let record = session.demandsByFileID[ticket.fileID],
+        codemapTicketsShareDemand(record.ticket, ticket),
+        record.retainIDs.contains(ticket.retainID),
+        case .unavailable(.busy) = record.result
+        else { return nil }
+        guard record.retainIDs.count == 1 else {
+            return WorkspaceCodemapArtifactDemandOwnedResult(
+                result: codemapDemandResult(record.result, for: ticket),
+                ownership: .notAcquired
+            )
+        }
+        session.demandsByFileID.removeValue(forKey: ticket.fileID)
+        let bundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
+        codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        bundle?.close()
+        if let engine = session.engine {
+            _ = await engine.cancel(owner: record.owner)
+        }
+        guard !Task.isCancelled,
+              automaticSelectionCandidateDemandIsCurrent(
+                  candidate: candidate,
+                  rootScope: rootScope,
+                  rootScopeEpochs: rootScopeEpochs,
+                  coverageProofs: coverageProofs
+              )
+        else { return nil }
+        return await requestAutomaticCodemapArtifactWithOwnership(
+            candidate: candidate,
+            rootScope: rootScope,
+            rootScopeEpochs: rootScopeEpochs,
+            coverageProofs: coverageProofs
+        )
+    }
+
+    private func automaticSelectionCandidateDemandIsCurrent(
+        candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate,
+        rootScope: WorkspaceLookupRootScope,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch],
+        coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
+    ) -> Bool {
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: candidate.identity.rootID,
+            rootLifetimeID: candidate.identity.rootLifetimeID
+        )
+        guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == rootScopeEpochs,
+              rootScopeEpochs.contains(rootEpoch),
+              coverageProofs.contains(where: { $0.generation.rootEpoch == rootEpoch }),
+              automaticSelectionCoverageProofsAreCurrent(coverageProofs),
+              let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              let file = filesByID[candidate.identity.fileID],
+              file.rootID == rootEpoch.rootID,
+              isDiscoverableFileID(file.id),
+              state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+              file.standardizedRelativePath == candidate.identity.standardizedRelativePath,
+              file.standardizedFullPath == candidate.identity.standardizedFullPath,
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority.catalogGeneration == candidate.catalogGeneration,
+              session.authority.ingressGeneration == candidate.ingressGeneration
+        else { return false }
+        let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+            ?? session.authority.ingressGeneration
+        return pathGeneration == candidate.pathGeneration &&
+            pathGeneration == candidate.requestGeneration
+    }
+
+    private func provisionalAutomaticSelectionCandidateDemandIsCurrent(
+        candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate,
+        rootScope: WorkspaceLookupRootScope,
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    ) -> Bool {
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: candidate.identity.rootID,
+            rootLifetimeID: candidate.identity.rootLifetimeID
+        )
+        guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == rootScopeEpochs,
+              rootScopeEpochs.contains(rootEpoch),
+              let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              let file = filesByID[candidate.identity.fileID],
+              file.rootID == rootEpoch.rootID,
+              isDiscoverableFileID(file.id),
+              state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+              file.standardizedRelativePath == candidate.identity.standardizedRelativePath,
+              file.standardizedFullPath == candidate.identity.standardizedFullPath,
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority.catalogGeneration == candidate.catalogGeneration,
+              session.authority.ingressGeneration == candidate.ingressGeneration
+        else { return false }
+        let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+            ?? session.authority.ingressGeneration
+        return pathGeneration == candidate.pathGeneration &&
+            pathGeneration == candidate.requestGeneration
     }
 
     func requestCodemapArtifactWithOwnership(
@@ -12840,9 +13879,6 @@ actor WorkspaceFileContextStore {
             rootID: file.rootID,
             rootLifetimeID: state.lifetimeID
         )
-        if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
-            return .init(result: .unavailable(.cancelled), ownership: .notAcquired)
-        }
         if codemapCleanupFlightsByRootID[file.rootID] != nil ||
             codemapRootMutationFenceTokensByRootEpoch[rootEpoch] != nil ||
             codemapPathIsFenced(rootEpoch: rootEpoch, relativePath: file.standardizedRelativePath)
@@ -12853,10 +13889,10 @@ actor WorkspaceFileContextStore {
         guard let authority = currentCodemapAuthority(rootEpoch: rootEpoch) else {
             return .init(result: .unavailable(.staleCurrentness), ownership: .notAcquired)
         }
-        if let retry = codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch],
+        if let retry = codemapProjectionPreloadRetriesByRootEpoch[rootEpoch],
            retry.authority == authority
         {
-            let now = codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+            let now = codemapProjectionPreloadRetryPolicy.nowNanoseconds()
             let remainingNanoseconds = retry.deadlineNanoseconds > now
                 ? retry.deadlineNanoseconds - now
                 : 0
@@ -12886,7 +13922,7 @@ actor WorkspaceFileContextStore {
                let cached = terminalNonGitCodemapCacheByEpoch[rootEpoch]
             {
                 if cached.standardizedRootPath == authority.standardizedRootPath,
-                   codemapLocalGitClassificationProbe.validate(cached.proof) == .current
+                   codemapLocalGitClassificationProbe.validate(cached.proof)
                 {
                     shouldReturnStableUnavailable = true
                 } else {
@@ -12931,7 +13967,6 @@ actor WorkspaceFileContextStore {
             switch existing.result {
             case .pending, .ready:
                 let joinedTicket = retainedCodemapTicket(for: existing.ticket)
-                await codemapDemandRequestHook(joinedTicket)
                 existing.retainIDs.insert(joinedTicket.retainID)
                 session.demandsByFileID[file.id] = existing
                 codemapSessionsByRootEpoch[rootEpoch] = session
@@ -12949,7 +13984,7 @@ actor WorkspaceFileContextStore {
             codemapSessionsByRootEpoch[rootEpoch]?.setupDisposition,
             !codemapUnavailableIsStable(reason)
         {
-            if codemapGraphIndexBuildRetriesByRootEpoch[rootEpoch] != nil {
+            if codemapProjectionPreloadRetriesByRootEpoch[rootEpoch] != nil {
                 return .init(
                     result: .unavailable(.busy(retryAfterMilliseconds: nil)),
                     ownership: .notAcquired
@@ -12975,15 +14010,12 @@ actor WorkspaceFileContextStore {
             pathGeneration: pathGeneration,
             ingressGeneration: authority.ingressGeneration
         )
-        await codemapDemandRequestHook(ticket)
         let owner = WorkspaceCodemapLiveDemandOwner()
-        let completion = CodemapDemandCompletion()
         var record = CodemapDemandRecord(
             ticket: ticket,
             identity: identity,
             language: language,
             owner: owner,
-            completion: completion,
             retainIDs: [ticket.retainID],
             result: .pending(ticket),
             task: nil
@@ -12995,8 +14027,7 @@ actor WorkspaceFileContextStore {
         #if DEBUG
             codemapDemandTaskCreationCountForTesting += 1
         #endif
-        let demandTask = Task { [weak self, completion] in
-            defer { completion.resolve() }
+        let demandTask = Task { [weak self] in
             guard let self else { return }
             await performCodemapDemand(ticket: ticket, priority: priority)
         }
@@ -13024,25 +14055,195 @@ actor WorkspaceFileContextStore {
         return codemapDemandResult(record.result, for: ticket)
     }
 
-    func waitForCodemapArtifactDemandChange(
-        _ ticket: WorkspaceCodemapArtifactDemandTicket,
-        deadline: ContinuousClock.Instant
-    ) async -> WorkspaceCodemapArtifactDemandResult {
-        guard codemapDemandIsCurrent(ticket),
-              let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
-              .demandsByFileID[ticket.fileID],
-              codemapTicketsShareDemand(record.ticket, ticket),
-              record.retainIDs.contains(ticket.retainID)
+    func acquireCodemapProjectionDemand(
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        deadlineUptimeNanoseconds: UInt64
+    ) async -> WorkspaceCodemapProjectionDemandAcquisition {
+        #if DEBUG
+            guard codemapAutomaticRetainedProjectionDemandPolicyForTesting == .enabled else {
+                return .unavailable(reason: .capabilityUnavailable, retryAfterMilliseconds: nil)
+            }
+        #endif
+        guard sourceTickets.count <= 1024 else {
+            return .busy(
+                reason: .fileIDLimit(attempted: 1025, limit: 1024),
+                retryAfterMilliseconds: 100
+            )
+        }
+        guard let first = sourceTickets.first else {
+            return .unavailable(reason: .generationMismatch, retryAfterMilliseconds: nil)
+        }
+        let rootEpoch = first.rootEpoch
+        var uniqueFileIDs: [UUID] = []
+        var seenFileIDs = Set<UUID>()
+        for ticket in sourceTickets {
+            guard ticket.rootEpoch == rootEpoch,
+                  ticket.catalogGeneration == first.catalogGeneration,
+                  ticket.ingressGeneration == first.ingressGeneration,
+                  codemapDemandIsCurrent(ticket),
+                  let record = codemapSessionsByRootEpoch[rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  record.retainIDs.contains(ticket.retainID),
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(ready.ticket, ticket)
+            else {
+                return .unavailable(reason: .generationMismatch, retryAfterMilliseconds: nil)
+            }
+            if seenFileIDs.insert(ticket.fileID).inserted {
+                uniqueFileIDs.append(ticket.fileID)
+            }
+        }
+        guard let session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority.catalogGeneration == first.catalogGeneration,
+              session.authority.ingressGeneration == first.ingressGeneration,
+              let engine = session.engine
         else {
-            return .unavailable(.staleCurrentness)
+            return .unavailable(reason: .rootNotRegistered, retryAfterMilliseconds: 100)
+        }
+        guard codemapProjectionDemandsByID.count < Self.maximumRetainedCodemapProjectionDemands else {
+            return .busy(reason: .requestLimit, retryAfterMilliseconds: 100)
+        }
+        guard let fileIDCount = UInt64(exactly: uniqueFileIDs.count) else {
+            return .busy(
+                reason: .metadataByteLimit(
+                    attempted: .max,
+                    limit: Self.maximumRetainedCodemapProjectionDemandMetadataBytes
+                ),
+                retryAfterMilliseconds: 100
+            )
+        }
+        let (fileIDBytes, multiplicationOverflow) = fileIDCount.multipliedReportingOverflow(by: 16)
+        let (metadataByteCount, metadataOverflowForRecord) = fileIDBytes.addingReportingOverflow(192)
+        guard !multiplicationOverflow, !metadataOverflowForRecord else {
+            return .busy(
+                reason: .metadataByteLimit(
+                    attempted: .max,
+                    limit: Self.maximumRetainedCodemapProjectionDemandMetadataBytes
+                ),
+                retryAfterMilliseconds: 100
+            )
+        }
+        let retainedMetadataByteCount = codemapProjectionDemandsByID.values.reduce(UInt64(0)) {
+            let (value, overflow) = $0.addingReportingOverflow($1.metadataByteCount)
+            return overflow ? .max : value
+        }
+        let (attemptedMetadataByteCount, metadataOverflow) = retainedMetadataByteCount
+            .addingReportingOverflow(metadataByteCount)
+        guard !metadataOverflow,
+              attemptedMetadataByteCount <= Self.maximumRetainedCodemapProjectionDemandMetadataBytes
+        else {
+            return .busy(
+                reason: .metadataByteLimit(
+                    attempted: metadataOverflow ? .max : attemptedMetadataByteCount,
+                    limit: Self.maximumRetainedCodemapProjectionDemandMetadataBytes
+                ),
+                retryAfterMilliseconds: 100
+            )
         }
 
-        let current = codemapDemandResult(record.result, for: ticket)
-        guard case .pending = current, record.task != nil else {
-            return current
+        let acquisition = await engine.acquireProjectionDemand(
+            rootEpoch: rootEpoch,
+            fileIDs: uniqueFileIDs,
+            catalogGeneration: first.catalogGeneration,
+            ingressGeneration: first.ingressGeneration,
+            deadlineUptimeNanoseconds: deadlineUptimeNanoseconds,
+            owner: WorkspaceCodemapLiveDemandOwner()
+        )
+        guard case let .acquired(ticket, _) = acquisition else { return acquisition }
+
+        var demandRecord = CodemapProjectionDemandRecord(
+            ticket: ticket,
+            fileIDs: uniqueFileIDs,
+            metadataByteCount: metadataByteCount,
+            engine: engine,
+            expiryTask: nil
+        )
+        let expiryTask = Task { [weak self] in
+            let now = DispatchTime.now().uptimeNanoseconds
+            if deadlineUptimeNanoseconds > now {
+                try? await Task.sleep(nanoseconds: deadlineUptimeNanoseconds - now)
+            }
+            // Preserve the engine's typed `.expired` result through the caller's final exact
+            // deadline poll. This bounded grace is cleanup-only; it does not retain priority.
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.expireCodemapProjectionDemand(ticket)
         }
-        await record.completion.wait(until: deadline)
-        return codemapArtifactDemandStatus(ticket)
+        demandRecord.expiryTask = expiryTask
+        codemapProjectionDemandsByID[ticket.id] = demandRecord
+        return acquisition
+    }
+
+    func codemapProjectionDemandStatus(
+        _ ticket: WorkspaceCodemapProjectionDemandTicket
+    ) async -> WorkspaceCodemapProjectionDemandStatus {
+        guard let record = codemapProjectionDemandsByID[ticket.id],
+              record.ticket == ticket
+        else {
+            if let terminal = terminalCodemapProjectionDemandsByID[ticket.id],
+               terminal.ticket == ticket
+            {
+                return terminal.status
+            }
+            return .stale
+        }
+        let isCurrent = record.fileIDs.allSatisfy { fileID in
+            guard let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+                  session.authority.catalogGeneration == ticket.catalogGeneration,
+                  session.authority.ingressGeneration == ticket.ingressGeneration,
+                  let demand = session.demandsByFileID[fileID],
+                  codemapDemandIsCurrent(demand.ticket),
+                  case let .ready(ready) = demand.result
+            else { return false }
+            return codemapTicketsShareDemand(ready.ticket, demand.ticket)
+        }
+        guard isCurrent else {
+            codemapProjectionDemandsByID.removeValue(forKey: ticket.id)?.expiryTask?.cancel()
+            await record.engine.releaseProjectionDemand(ticket)
+            return .stale
+        }
+        return await record.engine.projectionDemandStatus(ticket)
+    }
+
+    @discardableResult
+    func releaseCodemapProjectionDemand(
+        _ ticket: WorkspaceCodemapProjectionDemandTicket,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
+        guard let record = codemapProjectionDemandsByID.removeValue(forKey: ticket.id),
+              record.ticket == ticket
+        else {
+            return terminalCodemapProjectionDemandsByID.removeValue(forKey: ticket.id) != nil
+        }
+        record.expiryTask?.cancel()
+        terminalCodemapProjectionDemandsByID.removeValue(forKey: ticket.id)
+        let cleanupTask = Task {
+            await record.engine.releaseProjectionDemand(ticket)
+        }
+        _ = await waitForCodemapSharedTask(cleanupTask, deadline: deadline)
+        return true
+    }
+
+    private func expireCodemapProjectionDemand(
+        _ ticket: WorkspaceCodemapProjectionDemandTicket
+    ) async {
+        guard let record = codemapProjectionDemandsByID.removeValue(forKey: ticket.id),
+              record.ticket == ticket
+        else { return }
+        let terminalStatus = await record.engine.projectionDemandStatus(ticket)
+        await record.engine.releaseProjectionDemand(ticket)
+        terminalCodemapProjectionDemandsByID[ticket.id] = TerminalCodemapProjectionDemandRecord(
+            ticket: ticket,
+            status: terminalStatus
+        )
+        if terminalCodemapProjectionDemandsByID.count > Self.maximumRetainedCodemapProjectionDemands,
+           let evictedID = terminalCodemapProjectionDemandsByID.keys.sorted(by: {
+               $0.uuidString < $1.uuidString
+           }).first
+        {
+            terminalCodemapProjectionDemandsByID.removeValue(forKey: evictedID)
+        }
     }
 
     func retryBusyCodemapArtifactDemand(
@@ -13072,437 +14273,653 @@ actor WorkspaceFileContextStore {
         return await requestCodemapArtifact(forFileID: ticket.fileID, priority: priority)
     }
 
-    func queryCodemapStructureGraphs(
-        seedFileIDs: [UUID],
-        direction: WorkspaceCodemapStructureTraversalDirection?,
-        maximumDepth: Int,
-        budget: WorkspaceCodemapGraphQueryBudget,
-        rootScope: WorkspaceLookupRootScope,
-        logicalRootDisplayNamesByRootID: [UUID: String] = [:]
-    ) async throws -> WorkspaceCodemapStructureAggregateResult {
-        try Task.checkCancellation()
-        let scopedRoots = rootsForPathLookup(scope: rootScope)
-        let allowedRootIDs = Set(scopedRoots.map(\.id))
-        let defaultRootLabels = WorkspaceLogicalRootIdentity.labels(for: scopedRoots.compactMap { root in
-            guard let state = rootStatesByID[root.id] else { return nil }
-            return WorkspaceLogicalRootIdentity.RootDescriptor(
-                physicalRootID: root.id,
-                rootEpoch: WorkspaceCodemapRootEpoch(
-                    rootID: root.id,
-                    rootLifetimeID: state.lifetimeID
-                ),
-                preferredName: root.name
-            )
-        })
-        let rootLabels = defaultRootLabels.merging(logicalRootDisplayNamesByRootID) { _, supplied in supplied }
-        var requestIssues: [WorkspaceCodemapStructureIssueRecord] = []
-        var seedsByRootEpoch: [WorkspaceCodemapRootEpoch: [UUID]] = [:]
-        var seedPathsByFileID: [UUID: String] = [:]
-        var seenFileIDs = Set<UUID>()
-        for fileID in seedFileIDs where seenFileIDs.insert(fileID).inserted {
-            guard let file = filesByID[fileID], isDiscoverableFileID(fileID),
-                  allowedRootIDs.contains(file.rootID),
-                  let state = rootStatesByID[file.rootID],
-                  state.fileIDsByRelativePath[file.standardizedRelativePath] == fileID
-            else {
-                requestIssues.append(WorkspaceCodemapStructureIssueRecord(
-                    code: "path_not_found",
-                    phase: "seed_resolution",
-                    path: nil,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "A requested seed is no longer available in the captured root scope."
-                ))
-                continue
-            }
-            let rootEpoch = WorkspaceCodemapRootEpoch(
-                rootID: file.rootID,
-                rootLifetimeID: state.lifetimeID
-            )
-            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
-            seedPathsByFileID[fileID] = WorkspaceCodemapLogicalPresentationPath(
-                rootDisplayName: rootLabels[file.rootID] ?? state.root.name,
-                standardizedRelativePath: file.standardizedRelativePath
-            )?.displayPath
-        }
+    func queryCodemapSelectionGraph(
+        _ query: WorkspaceCodemapStoreSelectionGraphQuery
+    ) async -> WorkspaceCodemapStoreSelectionGraphQueryDisposition {
+        await queryCodemapSelectionGraph(query, budgetPolicy: selectionGraphQueryBudgetPolicy)
+    }
 
-        var remainingNodes = budget.maximumNodeCount
-        var remainingEdges = budget.maximumEdgeCount
-        var remainingBytes = budget.maximumGraphByteCount
-        var roots: [WorkspaceCodemapStructureRootResult] = []
-        for rootEpoch in seedsByRootEpoch.keys.sorted(by: codemapRootEpochPrecedes) {
-            try Task.checkCancellation()
-            guard let state = rootStatesByID[rootEpoch.rootID],
-                  state.lifetimeID == rootEpoch.rootLifetimeID
-            else { continue }
-            let rootName = rootLabels[rootEpoch.rootID] ?? state.root.name
-            let rootSeedIDs = (seedsByRootEpoch[rootEpoch] ?? []).sorted {
-                let lhs = seedPathsByFileID[$0] ?? $0.uuidString
-                let rhs = seedPathsByFileID[$1] ?? $1.uuidString
-                if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
-                return $0.uuidString < $1.uuidString
+    func queryCodemapStructureGraph(
+        _ query: WorkspaceCodemapStructureTraversalQuery
+    ) async -> WorkspaceCodemapStructureTraversalDisposition {
+        guard !Task.isCancelled else { return .cancelled }
+        guard !query.seeds.isEmpty else { return .unavailable(.emptySeeds) }
+
+        var uniqueSeeds: [
+            WorkspaceCodemapRootScopedFileSlot: WorkspaceCodemapStoreSelectionGraphSourceIdentity
+        ] = [:]
+        for seed in query.seeds {
+            guard seed.rootEpoch == seed.ticket.rootEpoch else {
+                return .unavailable(.foreignRootEpoch(seed.ticket.fileID))
             }
-            let raw: WorkspaceCodemapGraphStructureRootResult
-            if remainingNodes <= 0 || remainingBytes == 0 {
-                raw = WorkspaceCodemapGraphStructureRootResult(
-                    rootEpoch: rootEpoch,
-                    status: .partial,
-                    coverage: nil,
-                    updatesPending: false,
-                    reconciling: false,
-                    receipt: nil,
-                    seeds: rootSeedIDs.map {
-                        WorkspaceCodemapGraphStructureSeed(
-                            fileID: $0,
-                            standardizedRelativePath: filesByID[$0]?.standardizedRelativePath,
-                            state: .notIndexed
-                        )
-                    },
-                    nodes: [],
-                    edges: [],
-                    unresolved: [],
-                    truncation: WorkspaceCodemapGraphStructureTruncation(droppedNodeCount: rootSeedIDs.count),
-                    issues: [.sizeLimit]
-                )
-            } else if let session = codemapSessionsByRootEpoch[rootEpoch],
-                      codemapAuthorityIsCurrent(session.authority),
-                      let engine = session.engine,
-                      let graph = await engine.selectionGraph(rootEpoch: rootEpoch)
-            {
-                let capturedAuthority = session.authority
-                raw = try await graph.traverseLatest(WorkspaceCodemapGraphStructureQuery(
-                    seedFileIDs: rootSeedIDs,
-                    direction: direction,
-                    maximumDepth: maximumDepth,
-                    budget: WorkspaceCodemapGraphQueryBudget(
-                        maximumTokenCount: budget.maximumTokenCount,
-                        maximumNodeCount: remainingNodes,
-                        maximumEdgeCount: remainingEdges,
-                        maximumGraphByteCount: remainingBytes,
-                        graphEvidenceTokenCount: budget.graphEvidenceTokenCount,
-                        renderTokenCount: budget.renderTokenCount
-                    )
-                ))
-                if let receipt = raw.receipt {
-                    let affectedFileIDs = Set(raw.nodes.map(\.fileID)).union(raw.seeds.map(\.fileID))
-                    switch await graph.revalidate(receipt, affectedFileIDs: affectedFileIDs) {
-                    case .valid:
-                        break
-                    case .invalid, .revoked:
-                        roots.append(unavailableCodemapStructureRoot(
-                            rootEpoch: rootEpoch,
-                            rootName: rootName,
-                            seedFileIDs: rootSeedIDs,
-                            seedPathsByFileID: seedPathsByFileID,
-                            code: "graph_revalidation_failed",
-                            message: "The committed graph changed across a destructive safety boundary."
-                        ))
-                        continue
-                    }
-                }
-                guard codemapSessionsByRootEpoch[rootEpoch]?.authority == capturedAuthority else {
-                    roots.append(partialCodemapStructureRoot(
-                        raw,
-                        rootName: rootName,
-                        seedPathsByFileID: seedPathsByFileID,
-                        additionalIssue: WorkspaceCodemapStructureIssueRecord(
-                            code: "updates_pending",
-                            phase: "graph_revalidation",
-                            path: nil,
-                            retryable: true,
-                            retryAfterMilliseconds: 100,
-                            attempted: nil,
-                            limit: nil,
-                            message: "The root advanced while its committed graph result was being assembled."
-                        )
-                    ))
-                    continue
+            let slot = WorkspaceCodemapRootScopedFileSlot(
+                rootEpoch: seed.rootEpoch,
+                fileID: seed.ticket.fileID
+            )
+            if let existing = uniqueSeeds[slot] {
+                guard existing == seed else {
+                    return .unavailable(.duplicateSeedConflict(seed.ticket.fileID))
                 }
             } else {
-                let isNonGit = terminalNonGitCodemapCacheByEpoch[rootEpoch] != nil
-                roots.append(WorkspaceCodemapStructureRootResult(
-                    rootEpoch: rootEpoch,
-                    rootDisplayName: rootName,
-                    status: isNonGit ? .unavailable : .pending,
-                    coverage: nil,
-                    updatesPending: !isNonGit,
-                    seeds: rootSeedIDs.map {
-                        WorkspaceCodemapStructureSeedResult(
-                            fileID: $0,
-                            path: seedPathsByFileID[$0] ?? rootName,
-                            state: isNonGit ? .notIndexed : .pending
-                        )
-                    },
-                    nodes: [],
-                    edges: [],
-                    unresolved: [],
-                    truncation: nil,
-                    issues: [WorkspaceCodemapStructureIssueRecord(
-                        code: isNonGit ? "git_root_unavailable" : "graph_indexing",
-                        phase: "graph_snapshot",
-                        path: nil,
-                        retryable: !isNonGit,
-                        retryAfterMilliseconds: isNonGit ? nil : 100,
-                        attempted: nil,
-                        limit: nil,
-                        message: isNonGit
-                            ? "Code structure is unavailable because this root has no Git repository authority."
-                            : "The root-local committed graph is still being initialized."
-                    )],
-                    receipt: nil
-                ))
-                continue
+                uniqueSeeds[slot] = seed
             }
+        }
 
-            let mapped = mapCodemapStructureRoot(
-                raw,
-                rootName: rootName,
-                seedPathsByFileID: seedPathsByFileID
+        let orderedSeeds = uniqueSeeds.values.sorted(by: codemapGraphSourcePrecedes)
+        let partitions = Dictionary(grouping: orderedSeeds, by: \.rootEpoch)
+        let rootEpochs = partitions.keys.sorted(by: codemapRootEpochPrecedes)
+        let rootLimit = selectionGraphQueryBudgetPolicy.maximumRootCount
+        guard rootEpochs.count <= rootLimit else {
+            return .budget(nil, .rootLimit(attempted: rootEpochs.count, limit: rootLimit))
+        }
+
+        var captures: [CodemapGraphQueryCapture] = []
+        for rootEpoch in rootEpochs {
+            guard let state = rootStatesByID[rootEpoch.rootID],
+                  state.lifetimeID == rootEpoch.rootLifetimeID,
+                  let session = codemapSessionsByRootEpoch[rootEpoch]
+            else { return .stale(.rootEpoch(rootEpoch)) }
+            let seeds = partitions[rootEpoch] ?? []
+            guard codemapAuthorityIsCurrent(session.authority) else {
+                return .stale(.rootEpoch(rootEpoch))
+            }
+            for seed in seeds {
+                let ticket = seed.ticket
+                guard codemapDemandIsCurrent(ticket),
+                      let record = session.demandsByFileID[ticket.fileID],
+                      codemapTicketsShareDemand(record.ticket, ticket)
+                else { return .stale(.seed(ticket)) }
+                guard case let .ready(ready) = record.result,
+                      codemapTicketsShareDemand(ready.ticket, ticket)
+                else { return .unavailable(.seedNotReady(ticket.fileID)) }
+            }
+            guard let graphState = session.selectionGraph,
+                  let desiredKey = graphState.desiredKey
+            else { return .unavailable(.graphNotBuilt(rootEpoch)) }
+            captures.append(CodemapGraphQueryCapture(
+                authority: session.authority,
+                graphStateID: graphState.id,
+                graph: graphState.graph,
+                desiredKey: desiredKey,
+                workerWasActive: graphState.workerID != nil,
+                sources: seeds
+            ))
+        }
+
+        var rootReceipts: [WorkspaceCodemapStructureTraversalRootReceipt] = []
+        var nodes: [WorkspaceCodemapStructureTraversalNode] = []
+        var partialReasons = Set<WorkspaceCodemapStructureTraversalPartialReason>()
+        var referenceFailures: [WorkspaceCodemapSelectionGraphRuntimeReferenceFailureRecord] = []
+        var examinedEdgeCount = 0
+        var materializedByteCount = 0
+
+        func aggregateResult() -> WorkspaceCodemapStructureTraversalResult {
+            WorkspaceCodemapStructureTraversalResult(
+                nodes: nodes,
+                examinedEdgeCount: examinedEdgeCount,
+                partialReasons: partialReasons,
+                referenceFailures: referenceFailures,
+                publicationReceipt: WorkspaceCodemapStructureTraversalPublicationReceipt(
+                    query: query,
+                    roots: rootReceipts
+                )
             )
-            roots.append(mapped)
-            remainingNodes = max(0, remainingNodes - mapped.nodes.count)
-            remainingEdges = max(0, remainingEdges - mapped.edges.count)
-            var usedBytes = UInt64(0)
-            for node in mapped.nodes {
-                let nodeBytes = UInt64(node.path.utf8.count) + 96
-                usedBytes = usedBytes.addingReportingOverflow(nodeBytes).overflow
-                    ? .max
-                    : usedBytes + nodeBytes
-            }
-            for edge in mapped.edges {
-                var edgeBytes = UInt64(edge.fromPath.utf8.count + edge.toPath.utf8.count) + 128
-                for symbol in edge.symbols {
-                    edgeBytes = edgeBytes.addingReportingOverflow(UInt64(symbol.utf8.count)).overflow
-                        ? .max
-                        : edgeBytes + UInt64(symbol.utf8.count)
-                }
-                usedBytes = usedBytes.addingReportingOverflow(edgeBytes).overflow
-                    ? .max
-                    : usedBytes + edgeBytes
-            }
-            remainingBytes = usedBytes >= remainingBytes ? 0 : remainingBytes - usedBytes
         }
 
-        let hasUsefulData = roots.contains(where: \.hasUsefulData)
-        let status: WorkspaceCodemapStructureStatus = if hasUsefulData {
-            requestIssues.isEmpty && roots.allSatisfy { $0.status == .ok } ? .ok : .partial
-        } else if roots.contains(where: { $0.status == .pending }) {
-            .pending
-        } else {
-            .unavailable
-        }
-        return WorkspaceCodemapStructureAggregateResult(
-            status: status,
-            roots: roots,
-            issues: requestIssues
-        )
-    }
-
-    func revalidateCodemapStructureGraphs(
-        _ result: WorkspaceCodemapStructureAggregateResult
-    ) async -> [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult] {
-        var dispositions: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult] = [:]
-        for root in result.roots {
-            guard let receipt = root.receipt,
-                  let session = codemapSessionsByRootEpoch[root.rootEpoch],
-                  codemapAuthorityIsCurrent(session.authority),
-                  let engine = session.engine,
-                  let graph = await engine.selectionGraph(rootEpoch: root.rootEpoch)
-            else {
-                if root.hasUsefulData {
-                    dispositions[root.rootEpoch] = .invalid(
-                        code: "graph_unavailable",
-                        message: "The root-local graph is no longer available."
+        for capture in captures {
+            guard !Task.isCancelled else { return .cancelled }
+            guard codemapGraphQueryCaptureIsCurrent(capture) else {
+                return .stale(.graph(capture.authority.rootEpoch))
+            }
+            let remainingNodes = query.limits.maximumNodeCount - nodes.count
+            guard remainingNodes > 0 else {
+                return .budget(
+                    aggregateResult(),
+                    .nodeLimit(attempted: nodes.count + 1, limit: query.limits.maximumNodeCount)
+                )
+            }
+            let remainingEdges = query.limits.maximumEdgeCount - examinedEdgeCount
+            let remainingBytes = query.limits.maximumByteCount - materializedByteCount
+            guard remainingEdges >= 0, remainingBytes > 0 else {
+                return .budget(
+                    aggregateResult(),
+                    remainingEdges < 0
+                        ? .edgeLimit(attempted: examinedEdgeCount, limit: query.limits.maximumEdgeCount)
+                        : .byteLimit(attempted: materializedByteCount, limit: query.limits.maximumByteCount)
+                )
+            }
+            let runtimeSeeds = capture.sources.map {
+                WorkspaceCodemapSelectionGraphRuntimeQuerySource(
+                    fileID: $0.ticket.fileID,
+                    requestGeneration: $0.ticket.requestGeneration
+                )
+            }
+            let disposition = await capture.graph.queryStructure(
+                WorkspaceCodemapSelectionGraphRuntimeStructureQuery(
+                    key: capture.desiredKey,
+                    seeds: runtimeSeeds,
+                    direction: query.direction,
+                    limits: WorkspaceCodemapStructureTraversalLimits(
+                        maximumDepth: query.limits.maximumDepth,
+                        maximumNodeCount: remainingNodes,
+                        maximumEdgeCount: remainingEdges,
+                        maximumByteCount: remainingBytes
                     )
-                }
-                continue
-            }
-            let affectedFileIDs = Set(root.nodes.map(\.fileID)).union(root.seeds.map(\.fileID))
-            switch await graph.revalidate(receipt, affectedFileIDs: affectedFileIDs) {
-            case let .valid(freshness):
-                dispositions[root.rootEpoch] = .valid(updatesPending: freshness != .current)
-            case .invalid:
-                dispositions[root.rootEpoch] = .invalid(
-                    code: "graph_revalidation_failed",
-                    message: "The committed graph crossed a destructive safety boundary."
                 )
-            case .revoked:
-                dispositions[root.rootEpoch] = .invalid(
-                    code: "graph_revoked",
-                    message: "The root-local committed graph was revoked."
-                )
+            )
+            guard !Task.isCancelled else { return .cancelled }
+            guard codemapGraphQueryCaptureIsCurrent(capture) else {
+                return .stale(.graph(capture.authority.rootEpoch))
             }
-        }
-        return dispositions
-    }
 
-    private func mapCodemapStructureRoot(
-        _ raw: WorkspaceCodemapGraphStructureRootResult,
-        rootName: String,
-        seedPathsByFileID: [UUID: String]
-    ) -> WorkspaceCodemapStructureRootResult {
-        func logicalPath(fileID: UUID, relativePath: String?) -> String {
-            if let seedPath = seedPathsByFileID[fileID] { return seedPath }
-            guard let relativePath,
-                  let path = WorkspaceCodemapLogicalPresentationPath(
-                      rootDisplayName: rootName,
-                      standardizedRelativePath: relativePath
-                  )
-            else { return rootName }
-            return path.displayPath
-        }
-        let nodePaths = Dictionary(uniqueKeysWithValues: raw.nodes.map {
-            ($0.fileID, logicalPath(fileID: $0.fileID, relativePath: $0.standardizedRelativePath))
-        })
-        return WorkspaceCodemapStructureRootResult(
-            rootEpoch: raw.rootEpoch,
-            rootDisplayName: rootName,
-            status: raw.status,
-            coverage: raw.coverage,
-            updatesPending: raw.updatesPending,
-            seeds: raw.seeds.map {
-                WorkspaceCodemapStructureSeedResult(
-                    fileID: $0.fileID,
-                    path: logicalPath(fileID: $0.fileID, relativePath: $0.standardizedRelativePath),
-                    state: $0.state
-                )
-            },
-            nodes: raw.nodes.map {
-                WorkspaceCodemapStructureNodeResult(
-                    fileID: $0.fileID,
-                    path: nodePaths[$0.fileID] ?? rootName,
+            let runtimeResult: WorkspaceCodemapSelectionGraphRuntimeStructureResult
+            let budgetDimension: WorkspaceCodemapSelectionGraphRuntimeStructureBudgetDimension?
+            switch disposition {
+            case let .readyPartial(result):
+                runtimeResult = result
+                budgetDimension = nil
+            case let .budget(result, dimension):
+                runtimeResult = result
+                budgetDimension = dimension
+            case let .definitionUniverse(coverage):
+                return .unavailable(.definitionUniverse(
+                    rootEpoch: capture.authority.rootEpoch,
+                    coverage: coverage
+                ))
+            case let .unavailable(reason):
+                switch reason {
+                case .rebuilding:
+                    return .pending(.graphRebuilding(capture.authority.rootEpoch))
+                case .actorAdmissionRejected, .processAdmissionRejected:
+                    return .pending(.graphBusy(capture.authority.rootEpoch))
+                case .staleCurrentness, .explicitRootUnavailable:
+                    return .stale(.graph(capture.authority.rootEpoch))
+                case .cancelled:
+                    return .cancelled
+                case .notBuilt where capture.workerWasActive:
+                    return .pending(.graphRebuilding(capture.authority.rootEpoch))
+                case .notBuilt:
+                    return .unavailable(.graphNotBuilt(capture.authority.rootEpoch))
+                case .budgetExceeded, .outputBudgetExceeded:
+                    return .budget(nil, .accountingOverflow)
+                case .invalidSnapshot, .invalidQuery:
+                    return .unavailable(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                }
+            }
+
+            guard runtimeResult.key == capture.desiredKey,
+                  runtimeResult.publishedSummary.key == capture.desiredKey,
+                  Set(runtimeResult.seeds) == Set(runtimeSeeds),
+                  runtimeResult.nodes.allSatisfy({ $0.endpoint.rootEpoch == capture.authority.rootEpoch })
+            else { return .unavailable(.invalidGraphResult(capture.authority.rootEpoch)) }
+            guard case let .complete(proof, candidateCount, contributedCount, terminalCount) =
+                runtimeResult.definitionUniverseCoverage
+            else {
+                return .unavailable(.definitionUniverse(
+                    rootEpoch: capture.authority.rootEpoch,
+                    coverage: runtimeResult.definitionUniverseCoverage
+                ))
+            }
+            guard WorkspaceCodemapSelectionGraphRuntimeKey(generation: proof.generation) ==
+                capture.desiredKey,
+                candidateCount == proof.candidateCount,
+                contributedCount == proof.contributedCount,
+                terminalCount == proof.terminalCount,
+                runtimeResult.definitionUniverseCoverage ==
+                runtimeResult.publishedSummary.definitionUniverseCoverage
+            else { return .unavailable(.invalidGraphResult(capture.authority.rootEpoch)) }
+
+            rootReceipts.append(WorkspaceCodemapStructureTraversalRootReceipt(
+                rootEpoch: capture.authority.rootEpoch,
+                graphKey: runtimeResult.key,
+                seeds: runtimeSeeds,
+                nodes: runtimeResult.nodes,
+                examinedEdgeCount: runtimeResult.examinedEdgeCount
+            ))
+            nodes.append(contentsOf: runtimeResult.nodes.map {
+                WorkspaceCodemapStructureTraversalNode(
+                    rootEpoch: $0.endpoint.rootEpoch,
+                    fileID: $0.endpoint.fileID,
+                    requestGeneration: $0.endpoint.requestGeneration,
                     depth: $0.depth,
-                    isSeed: $0.isSeed,
                     reachedBy: $0.reachedBy
                 )
-            },
-            edges: raw.edges.compactMap {
-                guard let from = nodePaths[$0.sourceFileID], let to = nodePaths[$0.targetFileID] else { return nil }
-                return WorkspaceCodemapStructureEdgeResult(
-                    fromPath: from,
-                    toPath: to,
-                    symbols: $0.symbols,
-                    ambiguous: $0.ambiguous
-                )
-            },
-            unresolved: raw.unresolved.compactMap {
-                guard let from = nodePaths[$0.sourceFileID] else { return nil }
-                return WorkspaceCodemapStructureUnresolvedResult(
-                    fromPath: from,
-                    name: $0.referencedName,
-                    reason: $0.reason
-                )
-            },
-            truncation: raw.truncation,
-            issues: raw.issues.map {
-                codemapStructureIssueRecord(
-                    $0,
-                    path: { fileID in
-                        logicalPath(
-                            fileID: fileID,
-                            relativePath: raw.seeds.first(where: { $0.fileID == fileID })?.standardizedRelativePath
-                        )
-                    }
-                )
-            },
-            receipt: raw.receipt
-        )
-    }
-
-    private func partialCodemapStructureRoot(
-        _ raw: WorkspaceCodemapGraphStructureRootResult,
-        rootName: String,
-        seedPathsByFileID: [UUID: String],
-        additionalIssue: WorkspaceCodemapStructureIssueRecord
-    ) -> WorkspaceCodemapStructureRootResult {
-        let mapped = mapCodemapStructureRoot(raw, rootName: rootName, seedPathsByFileID: seedPathsByFileID)
-        return WorkspaceCodemapStructureRootResult(
-            rootEpoch: mapped.rootEpoch,
-            rootDisplayName: mapped.rootDisplayName,
-            status: mapped.hasUsefulData ? .partial : mapped.status,
-            coverage: mapped.coverage,
-            updatesPending: true,
-            seeds: mapped.seeds,
-            nodes: mapped.nodes,
-            edges: mapped.edges,
-            unresolved: mapped.unresolved,
-            truncation: mapped.truncation,
-            issues: mapped.issues + [additionalIssue],
-            receipt: mapped.receipt
-        )
-    }
-
-    private func unavailableCodemapStructureRoot(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        rootName: String,
-        seedFileIDs: [UUID],
-        seedPathsByFileID: [UUID: String],
-        code: String,
-        message: String
-    ) -> WorkspaceCodemapStructureRootResult {
-        WorkspaceCodemapStructureRootResult(
-            rootEpoch: rootEpoch,
-            rootDisplayName: rootName,
-            status: .unavailable,
-            coverage: nil,
-            updatesPending: false,
-            seeds: seedFileIDs.map {
-                WorkspaceCodemapStructureSeedResult(
-                    fileID: $0,
-                    path: seedPathsByFileID[$0] ?? rootName,
-                    state: .notIndexed
-                )
-            },
-            nodes: [],
-            edges: [],
-            unresolved: [],
-            truncation: nil,
-            issues: [WorkspaceCodemapStructureIssueRecord(
-                code: code,
-                phase: "graph_revalidation",
-                path: nil,
-                retryable: false,
-                retryAfterMilliseconds: nil,
-                attempted: nil,
-                limit: nil,
-                message: message
-            )],
-            receipt: nil
-        )
-    }
-
-    private func codemapStructureIssueRecord(
-        _ issue: WorkspaceCodemapGraphStructureIssue,
-        path: (UUID) -> String
-    ) -> WorkspaceCodemapStructureIssueRecord {
-        switch issue {
-        case .emptySeeds:
-            .init(code: "empty_seeds", phase: "seed_resolution", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "No usable seed files were supplied.")
-        case .updatesPending:
-            .init(code: "updates_pending", phase: "graph_snapshot", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "The committed graph is usable but newer updates are pending.")
-        case .watcherGapReconciling:
-            .init(code: "watcher_gap_reconciling", phase: "graph_snapshot", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "The root is reconciling a watcher gap; committed graph data remains usable.")
-        case .indexing:
-            .init(code: "graph_indexing", phase: "graph_snapshot", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "The root graph is still indexing.")
-        case let .seedPending(fileID):
-            .init(code: "seed_pending", phase: "graph_snapshot", path: path(fileID), retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "The seed has not contributed to the committed graph yet.")
-        case let .seedNotIndexed(fileID):
-            .init(code: "seed_not_indexed", phase: "graph_snapshot", path: path(fileID), retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "The seed is not indexed in the committed graph.")
-        case let .seedExcluded(fileID):
-            .init(code: "seed_excluded", phase: "graph_snapshot", path: path(fileID), retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "The seed is excluded from codemap indexing.")
-        case let .seedFenced(fileID):
-            .init(code: "seed_fenced", phase: "graph_revalidation", path: path(fileID), retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "The seed crossed a destructive safety fence.")
-        case .sizeLimit:
-            .init(code: "graph_size_limit", phase: "graph_traversal", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Graph output was deterministically truncated to fit the requested output size.")
-        case .deadline:
-            .init(code: "graph_deadline", phase: "graph_traversal", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "The fixed graph traversal deadline was reached; partial data remains usable.")
-        case .graphRevoked:
-            .init(code: "graph_revoked", phase: "graph_snapshot", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "The root-local committed graph is unavailable.")
-        case .graphPending:
-            .init(code: "graph_indexing", phase: "graph_snapshot", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "No committed graph snapshot is available yet.")
+            })
+            examinedEdgeCount += runtimeResult.examinedEdgeCount
+            materializedByteCount += runtimeResult.materializedByteCount
+            referenceFailures.append(contentsOf: runtimeResult.referenceFailures)
+            if !runtimeResult.referenceFailures.isEmpty {
+                partialReasons.insert(.referenceFailuresPresent(capture.authority.rootEpoch))
+            }
+            if let budgetDimension {
+                let reason: WorkspaceCodemapStructureTraversalBudgetReason = switch budgetDimension {
+                case .nodes:
+                    .nodeLimit(attempted: nodes.count + 1, limit: query.limits.maximumNodeCount)
+                case .edges:
+                    .edgeLimit(attempted: examinedEdgeCount + 1, limit: query.limits.maximumEdgeCount)
+                case .bytes:
+                    .byteLimit(attempted: materializedByteCount + 1, limit: query.limits.maximumByteCount)
+                }
+                return .budget(aggregateResult(), reason)
+            }
         }
+
+        nodes.sort {
+            if $0.depth != $1.depth { return $0.depth < $1.depth }
+            if $0.rootEpoch != $1.rootEpoch {
+                return codemapRootEpochPrecedes($0.rootEpoch, $1.rootEpoch)
+            }
+            return $0.fileID.uuidString < $1.fileID.uuidString
+        }
+        return .readyPartial(aggregateResult())
+    }
+
+    private func queryCodemapSelectionGraph(
+        _ query: WorkspaceCodemapStoreSelectionGraphQuery,
+        budgetPolicy: WorkspaceCodemapStoreSelectionGraphQueryBudgetPolicy
+    ) async -> WorkspaceCodemapStoreSelectionGraphQueryDisposition {
+        guard !query.selectedSources.isEmpty else {
+            return .unavailable(.emptySources)
+        }
+        let sourceLimit = budgetPolicy.maximumRawSourceCount
+        guard query.selectedSources.count <= sourceLimit else {
+            return .budget(.sourceLimit(
+                attempted: query.selectedSources.count,
+                limit: sourceLimit
+            ))
+        }
+
+        var uniqueSources: [
+            WorkspaceCodemapRootScopedFileSlot: WorkspaceCodemapStoreSelectionGraphSourceIdentity
+        ] = [:]
+        for source in query.selectedSources {
+            let ticket = source.ticket
+            guard source.rootEpoch == ticket.rootEpoch else {
+                return .unavailable(.foreignRootEpoch(ticket.fileID))
+            }
+            let slot = WorkspaceCodemapRootScopedFileSlot(
+                rootEpoch: source.rootEpoch,
+                fileID: ticket.fileID
+            )
+            if let existing = uniqueSources[slot] {
+                guard existing == source else {
+                    return .unavailable(.duplicateSourceConflict(ticket.fileID))
+                }
+            } else {
+                guard uniqueSources.count < budgetPolicy.maximumUniqueSourceCount else {
+                    guard let attempted = addingAutomaticSelectionCount(uniqueSources.count, 1) else {
+                        return .budget(.accountingOverflow)
+                    }
+                    return .budget(.uniqueSourceLimit(
+                        attempted: attempted,
+                        limit: budgetPolicy.maximumUniqueSourceCount
+                    ))
+                }
+                uniqueSources[slot] = source
+            }
+        }
+
+        let orderedSources = uniqueSources.values.sorted {
+            codemapGraphSourcePrecedes($0, $1)
+        }
+        let partitions = Dictionary(grouping: orderedSources) { $0.rootEpoch }
+        let orderedRootEpochs = partitions.keys.sorted(by: codemapRootEpochPrecedes)
+        let rootLimit = budgetPolicy.maximumRootCount
+        guard orderedRootEpochs.count <= rootLimit else {
+            return .budget(.rootLimit(
+                attempted: orderedRootEpochs.count,
+                limit: rootLimit
+            ))
+        }
+        var captures: [CodemapGraphQueryCapture] = []
+        captures.reserveCapacity(orderedRootEpochs.count)
+
+        for rootEpoch in orderedRootEpochs {
+            guard let state = rootStatesByID[rootEpoch.rootID],
+                  state.lifetimeID == rootEpoch.rootLifetimeID
+            else {
+                return .stale(.currentness(rootEpoch))
+            }
+            let sources = partitions[rootEpoch] ?? []
+            guard let session = codemapSessionsByRootEpoch[rootEpoch] else {
+                if let authorityGeneration = codemapAuthorityGenerationsByRootEpoch[rootEpoch],
+                   sources.contains(where: {
+                       $0.ticket.catalogGeneration != authorityGeneration ||
+                           $0.ticket.ingressGeneration != authorityGeneration
+                   })
+                {
+                    return .stale(.currentness(rootEpoch))
+                }
+                return .unavailable(.notActivated(rootEpoch))
+            }
+            guard sources.allSatisfy({ source in
+                let ticket = source.ticket
+                guard let record = session.demandsByFileID[ticket.fileID] else { return false }
+                return ticket.catalogGeneration == session.authority.catalogGeneration &&
+                    ticket.ingressGeneration == session.authority.ingressGeneration &&
+                    ticket.pathGeneration == (
+                        session.pathGenerationsByRelativePath[record.identity.standardizedRelativePath]
+                            ?? session.authority.ingressGeneration
+                    )
+            }), codemapAuthorityIsCurrent(session.authority) else {
+                return .stale(.currentness(rootEpoch))
+            }
+            for source in sources {
+                let ticket = source.ticket
+                guard codemapDemandIsCurrent(ticket),
+                      let record = session.demandsByFileID[ticket.fileID],
+                      codemapTicketsShareDemand(record.ticket, ticket)
+                else {
+                    return .stale(.currentness(rootEpoch))
+                }
+                guard case let .ready(ready) = record.result,
+                      codemapTicketsShareDemand(ready.ticket, ticket),
+                      ready.snapshot.rootEpoch == rootEpoch,
+                      ready.snapshot.fileID == ticket.fileID,
+                      ready.snapshot.requestGeneration == ticket.requestGeneration
+                else {
+                    return .unavailable(.sourceNotReady(ticket.fileID))
+                }
+            }
+            guard let graphState = session.selectionGraph,
+                  let desiredKey = graphState.desiredKey,
+                  graphState.publishedSummary?.key == desiredKey
+            else {
+                return .unavailable(.notActivated(rootEpoch))
+            }
+            captures.append(CodemapGraphQueryCapture(
+                authority: session.authority,
+                graphStateID: graphState.id,
+                graph: graphState.graph,
+                desiredKey: desiredKey,
+                workerWasActive: graphState.workerID != nil,
+                sources: sources
+            ))
+        }
+
+        var rootResults: [WorkspaceCodemapStoreSelectionGraphRootResult] = []
+        rootResults.reserveCapacity(captures.count)
+        var aggregateTargetCount = 0
+        var aggregateResolutionCount = 0
+        var aggregateReferenceFailureCount = 0
+        var aggregateByteCount = 0
+
+        for capture in captures {
+            guard codemapGraphQueryCaptureIsCurrent(capture) else {
+                return .stale(.currentness(capture.authority.rootEpoch))
+            }
+            let runtimeSources = capture.sources.map {
+                WorkspaceCodemapSelectionGraphRuntimeQuerySource(
+                    fileID: $0.ticket.fileID,
+                    requestGeneration: $0.ticket.requestGeneration
+                )
+            }
+            let runtimeQuery = WorkspaceCodemapSelectionGraphRuntimeQuery(
+                key: capture.desiredKey,
+                selectedSources: runtimeSources,
+                outputBudget: .init(
+                    maximumResolvedTargetCount: budgetPolicy.maximumTargetCount - aggregateTargetCount,
+                    maximumResolutionCount: budgetPolicy.maximumResolutionCount - aggregateResolutionCount,
+                    maximumReferenceFailureCount: budgetPolicy.maximumReferenceFailureCount - aggregateReferenceFailureCount,
+                    maximumByteCount: budgetPolicy.maximumByteCount - aggregateByteCount
+                )
+            )
+            let runtimeDisposition: WorkspaceCodemapSelectionGraphRuntimeQueryDisposition
+            #if DEBUG
+                if let override = codemapSelectionGraphRuntimeQueryOverrideForTesting,
+                   let overridden = await override(capture.authority.rootEpoch, runtimeQuery)
+                {
+                    runtimeDisposition = overridden
+                } else {
+                    runtimeDisposition = await capture.graph.query(runtimeQuery)
+                }
+            #else
+                runtimeDisposition = await capture.graph.query(runtimeQuery)
+            #endif
+            guard codemapGraphQueryCaptureIsCurrent(capture) else {
+                return .stale(.currentness(capture.authority.rootEpoch))
+            }
+
+            switch runtimeDisposition {
+            case let .readyPartial(result):
+                guard codemapGraphResultIsValid(
+                    result,
+                    capture: capture,
+                    expectedSources: runtimeSources
+                ), case .complete = result.definitionUniverseCoverage,
+                result.definitionUniverseCoverage ==
+                result.publishedSummary.definitionUniverseCoverage
+                else {
+                    return .unavailable(.invalidGraphResult(capture.authority.rootEpoch))
+                }
+                var partialReasons = Set<WorkspaceCodemapStoreSelectionGraphPartialReason>()
+                if result.sourceCoverage.count != runtimeSources.count ||
+                    result.sourceCoverage.contains(where: { $0.state != .covered })
+                {
+                    partialReasons.insert(.sourceCoverageIncomplete)
+                }
+                if !result.referenceFailures.isEmpty {
+                    partialReasons.insert(.referenceFailuresPresent)
+                }
+
+                guard let nextTargetCount = addingAutomaticSelectionCount(
+                    aggregateTargetCount,
+                    result.targets.count
+                ), let nextResolutionCount = addingAutomaticSelectionCount(
+                    aggregateResolutionCount,
+                    result.resolutions.count
+                ), let nextReferenceFailureCount = addingAutomaticSelectionCount(
+                    aggregateReferenceFailureCount,
+                    result.referenceFailures.count
+                ), let nextByteCount = addingAutomaticSelectionCount(
+                    aggregateByteCount,
+                    result.materializedByteCount
+                ) else {
+                    return .budget(.accountingOverflow)
+                }
+                guard nextTargetCount <= budgetPolicy.maximumTargetCount else {
+                    return .budget(.targetLimit(
+                        attempted: nextTargetCount,
+                        limit: budgetPolicy.maximumTargetCount
+                    ))
+                }
+                guard nextResolutionCount <= budgetPolicy.maximumResolutionCount else {
+                    return .budget(.resolutionLimit(
+                        attempted: nextResolutionCount,
+                        limit: budgetPolicy.maximumResolutionCount
+                    ))
+                }
+                guard nextReferenceFailureCount <= budgetPolicy.maximumReferenceFailureCount else {
+                    return .budget(.referenceFailureLimit(
+                        attempted: nextReferenceFailureCount,
+                        limit: budgetPolicy.maximumReferenceFailureCount
+                    ))
+                }
+                guard nextByteCount <= budgetPolicy.maximumByteCount else {
+                    return .budget(.byteLimit(
+                        attempted: nextByteCount,
+                        limit: budgetPolicy.maximumByteCount
+                    ))
+                }
+                aggregateTargetCount = nextTargetCount
+                aggregateResolutionCount = nextResolutionCount
+                aggregateReferenceFailureCount = nextReferenceFailureCount
+                aggregateByteCount = nextByteCount
+
+                rootResults.append(WorkspaceCodemapStoreSelectionGraphRootResult(
+                    rootEpoch: capture.authority.rootEpoch,
+                    result: result,
+                    partialReasons: partialReasons
+                ))
+            case let .definitionUniverse(coverage):
+                switch coverage {
+                case let .incomplete(progress, remainingCount, retry):
+                    return .incomplete(.definitionUniverse(
+                        rootEpoch: capture.authority.rootEpoch,
+                        progress: progress,
+                        remainingCount: remainingCount,
+                        retry: retry
+                    ))
+                case let .busy(progress, retryAfterMilliseconds):
+                    return .busy(.definitionUniverse(
+                        rootEpoch: capture.authority.rootEpoch,
+                        progress: progress,
+                        retryAfterMilliseconds: retryAfterMilliseconds
+                    ))
+                case let .budget(dimension, attempted, limit):
+                    return .budget(.definitionUniverse(
+                        rootEpoch: capture.authority.rootEpoch,
+                        dimension: dimension,
+                        attempted: attempted,
+                        limit: limit
+                    ))
+                case let .unavailable(reason):
+                    return .unavailable(.definitionUniverse(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                case .complete:
+                    return .unavailable(.invalidGraphResult(capture.authority.rootEpoch))
+                }
+            case let .unavailable(reason):
+                switch reason {
+                case .rebuilding:
+                    return .busy(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                case .notBuilt where capture.workerWasActive:
+                    return .busy(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: .rebuilding
+                    ))
+                case .actorAdmissionRejected, .processAdmissionRejected:
+                    return .busy(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                case .budgetExceeded:
+                    return .budget(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                case let .outputBudgetExceeded(dimension):
+                    let attempted: Int?
+                    switch dimension {
+                    case .resolvedTargets:
+                        attempted = addingAutomaticSelectionCount(budgetPolicy.maximumTargetCount, 1)
+                        guard let attempted else { return .budget(.accountingOverflow) }
+                        return .budget(.targetLimit(
+                            attempted: attempted,
+                            limit: budgetPolicy.maximumTargetCount
+                        ))
+                    case .resolutions:
+                        attempted = addingAutomaticSelectionCount(budgetPolicy.maximumResolutionCount, 1)
+                        guard let attempted else { return .budget(.accountingOverflow) }
+                        return .budget(.resolutionLimit(
+                            attempted: attempted,
+                            limit: budgetPolicy.maximumResolutionCount
+                        ))
+                    case .referenceFailures:
+                        attempted = addingAutomaticSelectionCount(budgetPolicy.maximumReferenceFailureCount, 1)
+                        guard let attempted else { return .budget(.accountingOverflow) }
+                        return .budget(.referenceFailureLimit(
+                            attempted: attempted,
+                            limit: budgetPolicy.maximumReferenceFailureCount
+                        ))
+                    case .bytes:
+                        attempted = addingAutomaticSelectionCount(budgetPolicy.maximumByteCount, 1)
+                        guard let attempted else { return .budget(.accountingOverflow) }
+                        return .budget(.byteLimit(
+                            attempted: attempted,
+                            limit: budgetPolicy.maximumByteCount
+                        ))
+                    }
+                case .staleCurrentness, .explicitRootUnavailable:
+                    return .stale(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                case .notBuilt, .cancelled, .invalidSnapshot, .invalidQuery:
+                    return .unavailable(.runtime(
+                        rootEpoch: capture.authority.rootEpoch,
+                        reason: reason
+                    ))
+                }
+            }
+        }
+
+        for capture in captures where !codemapGraphQueryCaptureIsCurrent(capture) {
+            return .stale(.currentness(capture.authority.rootEpoch))
+        }
+        return .readyPartial(WorkspaceCodemapStoreSelectionGraphQueryResult(
+            roots: rootResults
+        ))
+    }
+
+    private func codemapGraphQueryCaptureIsCurrent(
+        _ capture: CodemapGraphQueryCapture
+    ) -> Bool {
+        guard codemapAuthorityIsCurrent(capture.authority),
+              let session = codemapSessionsByRootEpoch[capture.authority.rootEpoch],
+              let graphState = session.selectionGraph,
+              graphState.id == capture.graphStateID,
+              graphState.graph === capture.graph,
+              graphState.desiredKey == capture.desiredKey
+        else { return false }
+
+        for source in capture.sources {
+            let ticket = source.ticket
+            guard codemapDemandIsCurrent(ticket),
+                  let record = session.demandsByFileID[ticket.fileID],
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(ready.ticket, ticket),
+                  ready.snapshot.requestGeneration == ticket.requestGeneration
+            else { return false }
+        }
+        return true
+    }
+
+    private func codemapGraphResultIsValid(
+        _ result: WorkspaceCodemapSelectionGraphRuntimeQueryResult,
+        capture: CodemapGraphQueryCapture,
+        expectedSources: [WorkspaceCodemapSelectionGraphRuntimeQuerySource]
+    ) -> Bool {
+        let rootEpoch = capture.authority.rootEpoch
+        let expectedSourceSet = Set(expectedSources)
+        guard result.key == capture.desiredKey,
+              result.key.rootEpoch == rootEpoch,
+              result.publishedSummary.key == capture.desiredKey,
+              Set(result.selectedSources) == expectedSourceSet,
+              result.sourceCoverage.allSatisfy({
+                  expectedSourceSet.contains($0.source)
+              }),
+              result.targets.allSatisfy({ $0.rootEpoch == rootEpoch }),
+              result.resolutions.allSatisfy({
+                  $0.source.rootEpoch == rootEpoch && $0.target.rootEpoch == rootEpoch
+              }),
+              result.referenceFailures.allSatisfy({
+                  $0.source.rootEpoch == rootEpoch
+              })
+        else { return false }
+        return true
+    }
+
+    private func codemapGraphSourcePrecedes(
+        _ lhs: WorkspaceCodemapStoreSelectionGraphSourceIdentity,
+        _ rhs: WorkspaceCodemapStoreSelectionGraphSourceIdentity
+    ) -> Bool {
+        if lhs.rootEpoch != rhs.rootEpoch {
+            return codemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch)
+        }
+        if lhs.ticket.fileID != rhs.ticket.fileID {
+            return lhs.ticket.fileID.uuidString < rhs.ticket.fileID.uuidString
+        }
+        return lhs.ticket.requestGeneration < rhs.ticket.requestGeneration
     }
 
     private func codemapRootEpochPrecedes(
@@ -13513,6 +14930,19 @@ actor WorkspaceFileContextStore {
             return lhs.rootID.uuidString < rhs.rootID.uuidString
         }
         return lhs.rootLifetimeID.uuidString < rhs.rootLifetimeID.uuidString
+    }
+
+    private func codemapAutomaticSelectionSourcePrecedes(
+        _ lhs: WorkspaceCodemapAutomaticSelectionSourceIdentity,
+        _ rhs: WorkspaceCodemapAutomaticSelectionSourceIdentity
+    ) -> Bool {
+        if lhs.rootEpoch != rhs.rootEpoch {
+            return codemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch)
+        }
+        if lhs.fileID != rhs.fileID {
+            return lhs.fileID.uuidString < rhs.fileID.uuidString
+        }
+        return lhs.catalogGeneration < rhs.catalogGeneration
     }
 
     func freezeCodemapPresentation(
@@ -13769,7 +15199,7 @@ actor WorkspaceFileContextStore {
     func revalidateCodemapOperationPresentationForPublication(
         _ receipt: WorkspaceCodemapOperationPresentationPublicationReceipt,
         rootScope: WorkspaceLookupRootScope
-    ) async -> WorkspaceCodemapOperationPublicationDisposition {
+    ) -> WorkspaceCodemapOperationPublicationDisposition {
         guard receipt.rootScope == rootScope else { return .stale(.rootScope) }
         let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
 
@@ -13886,12 +15316,87 @@ actor WorkspaceFileContextStore {
         }
 
         if let automaticReceipt = receipt.automaticReceipt {
-            let revalidation = await revalidateAutomaticCodemapSelection(
+            switch revalidateAutomaticCodemapSelectionForPublicationUnreleased(
                 automaticReceipt,
                 rootScope: rootScope
-            )
-            guard revalidation.validTargets.count == automaticReceipt.roots.flatMap(\.targets).count else {
-                return .stale(.automatic(revalidation.issues))
+            ) {
+            case .current:
+                break
+            case let .stale(reason):
+                return .stale(.automatic(reason))
+            }
+        }
+        return .current
+    }
+
+    func revalidateCodemapStructureForPublication(
+        _ receipt: WorkspaceCodemapStructurePublicationReceipt,
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspaceCodemapStructurePublicationDisposition {
+        switch revalidateCodemapOperationPresentationForPublication(
+            receipt.presentation,
+            rootScope: rootScope
+        ) {
+        case .current:
+            break
+        case let .stale(reason):
+            return .stale(.presentation(reason))
+        }
+
+        let candidateFileIDs = receipt.presentation.candidates.map(\.fileID)
+        guard candidateFileIDs == receipt.outputFileIDs else { return .stale(.output) }
+        guard Set(receipt.outputFileIDs).count == receipt.outputFileIDs.count else {
+            return .stale(.output)
+        }
+
+        guard let traversal = receipt.traversal else { return .current }
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        let seedsByRoot = Dictionary(grouping: traversal.query.seeds, by: \.rootEpoch)
+        guard Set(traversal.roots.map(\.rootEpoch)) == Set(seedsByRoot.keys) else {
+            guard let rootEpoch = traversal.roots.first?.rootEpoch
+                ?? traversal.query.seeds.first?.rootEpoch
+            else { return .stale(.output) }
+            return .stale(.traversal(.graph(rootEpoch)))
+        }
+        for rootReceipt in traversal.roots {
+            let rootEpoch = rootReceipt.rootEpoch
+            guard allowedRootIDs.contains(rootEpoch.rootID),
+                  let state = rootStatesByID[rootEpoch.rootID],
+                  state.lifetimeID == rootEpoch.rootLifetimeID,
+                  let session = codemapSessionsByRootEpoch[rootEpoch],
+                  let graphState = session.selectionGraph,
+                  graphState.desiredKey == rootReceipt.graphKey,
+                  graphState.publishedSummary?.key == rootReceipt.graphKey
+            else { return .stale(.traversal(.graph(rootEpoch))) }
+
+            let expectedSeeds = (seedsByRoot[rootEpoch] ?? []).map {
+                WorkspaceCodemapSelectionGraphRuntimeQuerySource(
+                    fileID: $0.ticket.fileID,
+                    requestGeneration: $0.ticket.requestGeneration
+                )
+            }
+            guard Set(expectedSeeds) == Set(rootReceipt.seeds) else {
+                return .stale(.traversal(.graph(rootEpoch)))
+            }
+            for seed in seedsByRoot[rootEpoch] ?? [] {
+                let ticket = seed.ticket
+                guard codemapDemandIsCurrent(ticket),
+                      let record = session.demandsByFileID[ticket.fileID],
+                      record.retainIDs.contains(ticket.retainID),
+                      codemapTicketsShareDemand(record.ticket, ticket),
+                      case let .ready(ready) = record.result,
+                      codemapTicketsShareDemand(ready.ticket, ticket)
+                else { return .stale(.traversal(.seed(ticket))) }
+            }
+            for node in rootReceipt.nodes {
+                guard node.endpoint.rootEpoch == rootEpoch,
+                      let file = filesByID[node.endpoint.fileID],
+                      file.rootID == rootEpoch.rootID,
+                      state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+                      let record = session.demandsByFileID[file.id],
+                      record.ticket.requestGeneration == node.endpoint.requestGeneration,
+                      case .ready = record.result
+                else { return .stale(.traversal(.graph(rootEpoch))) }
             }
         }
         return .current
@@ -13923,33 +15428,6 @@ actor WorkspaceFileContextStore {
               case .ready = record.result
         else { return false }
         return await cancelCodemapArtifactDemand(ticket, deadline: deadline)
-    }
-
-    private func codemapDeadlineIsCurrent(_ deadline: ContinuousClock.Instant?) -> Bool {
-        !Task.isCancelled && deadline.map { ContinuousClock.now < $0 } != false
-    }
-
-    private func waitForCodemapSharedTask(
-        _ task: Task<Void, Never>,
-        deadline: ContinuousClock.Instant?
-    ) async -> Bool {
-        guard codemapDeadlineIsCurrent(deadline) else { return false }
-        guard let deadline else {
-            await task.value
-            return !Task.isCancelled
-        }
-        let completed = await withCheckedContinuation { continuation in
-            let race = CodemapSharedTaskDeadlineRace(continuation)
-            Task {
-                await task.value
-                race.resolve(ContinuousClock.now < deadline)
-            }
-            Task {
-                try? await Task.sleep(until: deadline, clock: .continuous)
-                race.resolve(false)
-            }
-        }
-        return completed && codemapDeadlineIsCurrent(deadline)
     }
 
     func cancelCodemapArtifactDemand(
@@ -13986,6 +15464,21 @@ actor WorkspaceFileContextStore {
             session.presentationRecordsByID.removeValue(forKey: id)
         }
         let retainedBundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
+        let graphPublicationTask = session.graphPublicationFlight?.task
+        graphPublicationTask?.cancel()
+        session.graphPublicationFlight = nil
+        let projectionRecoveryObserverTask = session.projectionRecoveryObserver?.task
+        projectionRecoveryObserverTask?.cancel()
+        session.projectionRecoveryObserver = nil
+        if var selectionGraph = session.selectionGraph {
+            selectionGraph.workerTask?.cancel()
+            selectionGraph.pendingSnapshot = nil
+            selectionGraph.publishedSummary = nil
+            selectionGraph.lastRebuildDisposition = nil
+            selectionGraph.workerID = nil
+            selectionGraph.workerTask = nil
+            session.selectionGraph = selectionGraph
+        }
         record.result = .unavailable(.cancelled)
         record.task = nil
         session.demandsByFileID[ticket.fileID] = record
@@ -13996,7 +15489,9 @@ actor WorkspaceFileContextStore {
                 ticket,
                 record: record,
                 engine: session.engine,
-                shouldRevokeReadyArtifact: shouldRevokeReadyArtifact
+                shouldRevokeReadyArtifact: shouldRevokeReadyArtifact,
+                graphPublicationTask: graphPublicationTask,
+                projectionRecoveryObserverTask: projectionRecoveryObserverTask
             )
             return ()
         }
@@ -14008,7 +15503,9 @@ actor WorkspaceFileContextStore {
         _ ticket: WorkspaceCodemapArtifactDemandTicket,
         record: CodemapDemandRecord,
         engine: WorkspaceCodemapBindingEngine?,
-        shouldRevokeReadyArtifact: Bool
+        shouldRevokeReadyArtifact: Bool,
+        graphPublicationTask: Task<Void, Never>?,
+        projectionRecoveryObserverTask: Task<Void, Never>?
     ) async {
         if let engine {
             await codemapCancellationCleanupHook(ticket)
@@ -14021,6 +15518,12 @@ actor WorkspaceFileContextStore {
                 )
             }
         }
+        if let graphPublicationTask {
+            await graphPublicationTask.value
+        }
+        if let projectionRecoveryObserverTask {
+            await projectionRecoveryObserverTask.value
+        }
         if var currentSession = codemapSessionsByRootEpoch[ticket.rootEpoch],
            let currentRecord = currentSession.demandsByFileID[ticket.fileID],
            codemapTicketsShareDemand(currentRecord.ticket, ticket),
@@ -14030,10 +15533,19 @@ actor WorkspaceFileContextStore {
             currentSession.demandsByFileID.removeValue(forKey: ticket.fileID)
             codemapSessionsByRootEpoch[ticket.rootEpoch] = currentSession
         }
+        if codemapSessionsByRootEpoch[ticket.rootEpoch]?
+            .demandsByFileID.values.contains(where: {
+                if case .ready = $0.result { return true }
+                return false
+            }) == true
+        {
+            signalCodemapGraphPublication(rootEpoch: ticket.rootEpoch)
+        }
     }
 
     #if DEBUG
         struct CodemapPresentationOperationCounts: Equatable {
+            let structureSeedAdmissionRequests: Int
             let selectedMetadataResolutionRequests: Int
             let presentationCandidateRequests: Int
             let artifactDemandRequests: Int
@@ -14042,18 +15554,31 @@ actor WorkspaceFileContextStore {
             let demandTasksCreated: Int
             let targetedReadyFreezes: Int
             let fullRootGraphFreezes: Int
+            let graphBatchSignals: Int
+            let graphBatchFlushes: Int
+            let graphWorkerStarts: Int
+            let projectionRecoveryObserversStarted: Int
+            let projectionRecoveryObserverRearms: Int
         }
 
-        func setCodemapPathInvalidationStageHandlerForTesting(
-            _ handler: (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
+        struct CodemapGraphPublicationRecoveryStateForTesting: Equatable {
+            let flightActive: Bool
+            let flightFollowUpStarted: Bool
+            let flightLatestSignalSerial: UInt64?
+            let observerActive: Bool
+            let observerLatestSignalSerial: UInt64?
+        }
+
+        func setCodemapGraphPublicationWillFlushHandlerForTesting(
+            _ handler: (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
         ) {
-            codemapPathInvalidationStageHandlerForTesting = handler
+            codemapGraphPublicationWillFlushHandlerForTesting = handler
         }
 
-        func codemapPathQuiescenceWaiterCountForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch
-        ) -> Int {
-            codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?.count ?? 0
+        func setCodemapProjectionRecoveryObserverWillWaitHandlerForTesting(
+            _ handler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
+        ) {
+            codemapProjectionRecoveryObserverWillWaitHandlerForTesting = handler
         }
 
         func revokeReadyCodemapArtifactContributionForTesting(
@@ -14062,15 +15587,33 @@ actor WorkspaceFileContextStore {
             guard codemapDemandIsCurrent(ticket),
                   let engine = codemapSessionsByRootEpoch[ticket.rootEpoch]?.engine
             else { return false }
-            return await engine.revokeReadyArtifact(
+            let revoked = await engine.revokeReadyArtifact(
                 rootEpoch: ticket.rootEpoch,
                 fileID: ticket.fileID,
                 requestGeneration: ticket.requestGeneration
+            )
+            if revoked {
+                signalCodemapGraphPublication(rootEpoch: ticket.rootEpoch)
+            }
+            return revoked
+        }
+
+        func codemapGraphPublicationRecoveryStateForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> CodemapGraphPublicationRecoveryStateForTesting {
+            let session = codemapSessionsByRootEpoch[rootEpoch]
+            return CodemapGraphPublicationRecoveryStateForTesting(
+                flightActive: session?.graphPublicationFlight != nil,
+                flightFollowUpStarted: session?.graphPublicationFlight?.followUpStarted ?? false,
+                flightLatestSignalSerial: session?.graphPublicationFlight?.latestSignalSerial,
+                observerActive: session?.projectionRecoveryObserver != nil,
+                observerLatestSignalSerial: session?.projectionRecoveryObserver?.latestSignalSerial
             )
         }
 
         func codemapPresentationOperationCountsForTesting() -> CodemapPresentationOperationCounts {
             CodemapPresentationOperationCounts(
+                structureSeedAdmissionRequests: codemapStructureSeedAdmissionRequestCountForTesting,
                 selectedMetadataResolutionRequests: codeStructureSelectedMetadataResolutionRequestCountForTesting,
                 presentationCandidateRequests: codemapPresentationCandidateRequestCountForTesting,
                 artifactDemandRequests: codemapArtifactDemandRequestCountForTesting,
@@ -14078,7 +15621,12 @@ actor WorkspaceFileContextStore {
                 setupTasksCreated: codemapSetupTaskCreationCountForTesting,
                 demandTasksCreated: codemapDemandTaskCreationCountForTesting,
                 targetedReadyFreezes: codemapTargetedReadyFreezeCountForTesting,
-                fullRootGraphFreezes: codemapFullRootGraphFreezeCountForTesting
+                fullRootGraphFreezes: codemapFullRootGraphFreezeCountForTesting,
+                graphBatchSignals: codemapGraphBatchSignalCountForTesting,
+                graphBatchFlushes: codemapGraphBatchFlushCountForTesting,
+                graphWorkerStarts: codemapGraphWorkerStartCountForTesting,
+                projectionRecoveryObserversStarted: codemapProjectionRecoveryObserverStartCountForTesting,
+                projectionRecoveryObserverRearms: codemapProjectionRecoveryObserverRearmCountForTesting
             )
         }
 
@@ -14090,24 +15638,6 @@ actor WorkspaceFileContextStore {
             filesInRootRequestCountForTesting
         }
 
-        func resetAppliedIndexRecordLookupDiagnosticsForTesting() {
-            appliedIndexRecordLookupRequestCountForTesting = 0
-            appliedIndexRecordLookupRequestedRecordCountForTesting = 0
-            appliedIndexRootSnapshotRequestCountForTesting = 0
-        }
-
-        func appliedIndexRecordLookupDiagnosticsForTesting() -> (
-            lookupRequests: Int,
-            requestedRecords: Int,
-            rootSnapshots: Int
-        ) {
-            (
-                lookupRequests: appliedIndexRecordLookupRequestCountForTesting,
-                requestedRecords: appliedIndexRecordLookupRequestedRecordCountForTesting,
-                rootSnapshots: appliedIndexRootSnapshotRequestCountForTesting
-            )
-        }
-
         func codemapArtifactDemandRetainCountForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) -> Int {
@@ -14116,16 +15646,6 @@ actor WorkspaceFileContextStore {
                 codemapTicketsShareDemand(record.ticket, ticket)
             else { return 0 }
             return record.retainIDs.count
-        }
-
-        func codemapArtifactDemandWaiterCountForTesting(
-            _ ticket: WorkspaceCodemapArtifactDemandTicket
-        ) -> Int {
-            guard let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
-                .demandsByFileID[ticket.fileID],
-                codemapTicketsShareDemand(record.ticket, ticket)
-            else { return 0 }
-            return record.completion.waiterCount
         }
 
         func codemapArtifactDemandRetainCountForTesting(
@@ -14216,17 +15736,23 @@ actor WorkspaceFileContextStore {
                     relativePath: relativePath,
                     authority: authority
                 )
-            } readGraphIndexCatalogPage: { [weak self] request in
+            } readProjectionCatalogPage: { [weak self] request in
                 guard let self else { return .unavailable(.rootNotCurrent) }
-                return await readCodemapGraphIndexCatalogPage(
+                return await readCodemapProjectionCatalogPage(
                     request,
                     authority: authority
                 )
-            } revalidateGraphIndexCatalogToken: { [weak self] rootEpoch, token in
+            } revalidateProjectionCatalogToken: { [weak self] rootEpoch, token in
                 guard let self else { return .unavailable(.rootNotCurrent) }
-                return await revalidateCodemapGraphIndexCatalogToken(
+                return await revalidateCodemapProjectionCatalogToken(
                     rootEpoch: rootEpoch,
                     token: token,
+                    authority: authority
+                )
+            } publishProjection: { [weak self] snapshot in
+                guard let self else { return .superseded }
+                return await acceptCodemapProjectionSnapshot(
+                    snapshot,
                     authority: authority
                 )
             } publishMarkerReadiness: { [weak self] update in
@@ -14283,11 +15809,7 @@ actor WorkspaceFileContextStore {
             catalogGeneration: authority.catalogGeneration,
             ingressGeneration: authority.ingressGeneration
         )
-        let rootSelectionGraph = selectionGraphFactory.make(rootEpoch: authority.rootEpoch)
-        let registrationResult = await engine.registerRoot(
-            registration,
-            selectionGraph: rootSelectionGraph
-        )
+        let registrationResult = await engine.registerRoot(registration)
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
             _ = await registry.unregister(routeToken)
             await fenceLateCodemapSetup(engine: engine, authority: authority)
@@ -14312,61 +15834,7 @@ actor WorkspaceFileContextStore {
             .unavailable(.registrationFailed)
         }
         publishCodemapSetupDisposition(disposition, authority: authority)
-        if case .ready = disposition {
-            if let graph = await engine.selectionGraph(rootEpoch: authority.rootEpoch),
-               graph === rootSelectionGraph,
-               var session = codemapSessionsByRootEpoch[authority.rootEpoch],
-               session.authority == authority,
-               session.engine === engine
-            {
-                session.selectionGraph = graph
-                codemapSessionsByRootEpoch[authority.rootEpoch] = session
-            }
-            startCodemapGraphStatusObserver(authority: authority, engine: engine)
-        }
         return disposition
-    }
-
-    private func startCodemapGraphStatusObserver(
-        authority: CodemapRootAuthority,
-        engine: WorkspaceCodemapBindingEngine
-    ) {
-        guard var session = codemapSessionsByRootEpoch[authority.rootEpoch],
-              session.authority == authority,
-              session.engine === engine
-        else { return }
-        session.graphStatusTask?.cancel()
-        let task = Task { [weak self] in
-            guard let graph = await engine.selectionGraph(rootEpoch: authority.rootEpoch) else { return }
-            let stream = await graph.statusUpdates()
-            for await accounting in stream {
-                guard !Task.isCancelled else { return }
-                await self?.acceptCodemapGraphStatus(
-                    accounting,
-                    authority: authority,
-                    engine: engine,
-                    graph: graph
-                )
-            }
-        }
-        session.graphStatusTask = task
-        codemapSessionsByRootEpoch[authority.rootEpoch] = session
-    }
-
-    private func acceptCodemapGraphStatus(
-        _ accounting: WorkspaceCodemapGraphIncrementalAccounting,
-        authority: CodemapRootAuthority,
-        engine: WorkspaceCodemapBindingEngine,
-        graph: WorkspaceCodemapSelectionGraph
-    ) {
-        guard let session = codemapSessionsByRootEpoch[authority.rootEpoch],
-              session.authority == authority,
-              session.engine === engine,
-              session.selectionGraph === graph,
-              codemapAuthorityIsCurrent(authority)
-        else { return }
-        codemapGraphAccountingByRootEpoch[authority.rootEpoch] = accounting
-        publishCodemapRootStatusesIfChanged()
     }
 
     private func performCodemapDemand(
@@ -14515,6 +15983,14 @@ actor WorkspaceFileContextStore {
             bundle.close()
             return
         }
+        if var currentSession = codemapSessionsByRootEpoch[ticket.rootEpoch],
+           var graphState = currentSession.selectionGraph
+        {
+            graphState.publishedSummary = nil
+            currentSession.selectionGraph = graphState
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = currentSession
+        }
+        signalCodemapGraphPublication(rootEpoch: ticket.rootEpoch)
     }
 
     private func fenceLateCodemapSetup(
@@ -14554,9 +16030,938 @@ actor WorkspaceFileContextStore {
         return true
     }
 
-    private func codemapGraphIndexCatalogShardAndToken(
+    private func signalCodemapGraphPublication(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        #if DEBUG
+            codemapGraphBatchSignalCountForTesting += 1
+        #endif
+
+        let pathIsFenced = codemapPathInvalidationFlightsByRootEpoch[rootEpoch] != nil ||
+            codemapPathFenceTokensByID.values.contains { $0.rootEpoch == rootEpoch }
+        if pathIsFenced {
+            codemapSessionsByRootEpoch[rootEpoch]?
+                .graphSnapshotDirtyDuringPathInvalidation = true
+            return
+        }
+
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              codemapAuthorityIsCurrent(session.authority),
+              session.engine != nil
+        else { return }
+
+        if var observer = session.projectionRecoveryObserver {
+            if observer.latestSignalSerial < .max {
+                observer.latestSignalSerial += 1
+            }
+            session.projectionRecoveryObserver = observer
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+
+        if var flight = session.graphPublicationFlight {
+            if flight.latestSignalSerial < .max {
+                flight.latestSignalSerial += 1
+            }
+            flight.replayRequired = true
+            session.graphPublicationFlight = flight
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+
+        startCodemapGraphPublicationFlight(
+            rootEpoch: rootEpoch,
+            authority: session.authority,
+            initialSignalSerial: 1
+        )
+    }
+
+    private func startCodemapGraphPublicationFlight(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        authority: CodemapRootAuthority,
+        initialSignalSerial: UInt64,
+        projectionRecoveryObserverID: UUID? = nil
+    ) {
+        guard initialSignalSerial > 0,
+              var session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority == authority,
+              codemapAuthorityIsCurrent(authority),
+              session.engine != nil,
+              session.graphPublicationFlight == nil
+        else { return }
+
+        let flightID = UUID()
+        session.graphPublicationFlight = CodemapGraphPublicationFlight(
+            id: flightID,
+            authority: authority,
+            projectionRecoveryObserverID: projectionRecoveryObserverID,
+            latestSignalSerial: initialSignalSerial,
+            flushingSerial: nil,
+            replayRequired: false,
+            followUpStarted: false,
+            task: nil
+        )
+        codemapSessionsByRootEpoch[rootEpoch] = session
+
+        let waiter = codemapGraphPublicationWaiter
+        let task = Task { [weak self] in
+            await waiter(rootEpoch)
+            await self?.runCodemapGraphPublicationFlight(
+                rootEpoch: rootEpoch,
+                flightID: flightID
+            )
+        }
+        guard var installedSession = codemapSessionsByRootEpoch[rootEpoch],
+              var installedFlight = installedSession.graphPublicationFlight,
+              installedFlight.id == flightID
+        else {
+            task.cancel()
+            return
+        }
+        installedFlight.task = task
+        installedSession.graphPublicationFlight = installedFlight
+        codemapSessionsByRootEpoch[rootEpoch] = installedSession
+    }
+
+    private func runCodemapGraphPublicationFlight(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID
+    ) async {
+        guard !Task.isCancelled else {
+            finishCodemapGraphPublicationFlight(rootEpoch: rootEpoch, flightID: flightID)
+            return
+        }
+
+        var flushCount = 0
+        while flushCount < 2, !Task.isCancelled {
+            guard var session = codemapSessionsByRootEpoch[rootEpoch],
+                  var flight = session.graphPublicationFlight,
+                  flight.id == flightID,
+                  session.authority == flight.authority,
+                  codemapAuthorityIsCurrent(flight.authority),
+                  let engine = session.engine
+            else {
+                finishCodemapGraphPublicationFlight(rootEpoch: rootEpoch, flightID: flightID)
+                return
+            }
+
+            let flushingSerial = flight.latestSignalSerial
+            flight.flushingSerial = flushingSerial
+            flight.replayRequired = false
+            if flushCount == 1 {
+                flight.followUpStarted = true
+            }
+            session.graphPublicationFlight = flight
+            codemapSessionsByRootEpoch[rootEpoch] = session
+
+            #if DEBUG
+                let flushHandler = codemapGraphPublicationWillFlushHandlerForTesting
+                await flushHandler?(rootEpoch, flushCount + 1)
+                guard !Task.isCancelled,
+                      codemapSessionsByRootEpoch[rootEpoch]?.graphPublicationFlight?.id == flightID
+                else {
+                    finishCodemapGraphPublicationFlight(rootEpoch: rootEpoch, flightID: flightID)
+                    return
+                }
+                codemapGraphBatchFlushCountForTesting += 1
+                codemapFullRootGraphFreezeCountForTesting += 1
+            #endif
+            let bundle = await engine.freeze(rootEpoch: rootEpoch)
+            let snapshot = try? bundle?.graphSnapshot()
+            bundle?.close()
+
+            guard !Task.isCancelled else {
+                finishCodemapGraphPublicationFlight(rootEpoch: rootEpoch, flightID: flightID)
+                return
+            }
+            if let snapshot,
+               let acceptedSnapshot = acceptedCodemapGraphPublicationSnapshot(
+                   snapshot,
+                   authority: flight.authority
+               )
+            {
+                await enqueueCodemapGraphSnapshot(
+                    acceptedSnapshot,
+                    retiringGraphPublicationFlightID: flightID
+                )
+            }
+
+            flushCount += 1
+            guard var currentSession = codemapSessionsByRootEpoch[rootEpoch],
+                  let currentFlight = currentSession.graphPublicationFlight,
+                  currentFlight.id == flightID
+            else { return }
+
+            let replayRequired = currentFlight.replayRequired ||
+                currentFlight.latestSignalSerial != flushingSerial
+            if replayRequired, flushCount < 2 {
+                continue
+            }
+
+            let successorSerial = replayRequired
+                ? currentFlight.latestSignalSerial
+                : nil
+            currentSession.graphPublicationFlight = nil
+            codemapSessionsByRootEpoch[rootEpoch] = currentSession
+            if let successorSerial {
+                startCodemapGraphPublicationFlight(
+                    rootEpoch: rootEpoch,
+                    authority: currentFlight.authority,
+                    initialSignalSerial: successorSerial,
+                    projectionRecoveryObserverID: currentFlight.projectionRecoveryObserverID
+                )
+            }
+            return
+        }
+
+        finishCodemapGraphPublicationFlight(rootEpoch: rootEpoch, flightID: flightID)
+    }
+
+    private func finishCodemapGraphPublicationFlight(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        flightID: UUID
+    ) {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              session.graphPublicationFlight?.id == flightID
+        else { return }
+        session.graphPublicationFlight = nil
+        codemapSessionsByRootEpoch[rootEpoch] = session
+    }
+
+    private func startCodemapProjectionRecoveryObserver(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        authority: CodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
+        retiringGraphPublicationFlightID: UUID?
+    ) {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority == authority,
+              codemapAuthorityIsCurrent(authority),
+              session.engine === engine
+        else { return }
+
+        var latestSignalSerial: UInt64 = 1
+        if let retiringGraphPublicationFlightID {
+            guard let flight = session.graphPublicationFlight,
+                  flight.id == retiringGraphPublicationFlightID,
+                  flight.authority == authority
+            else { return }
+            latestSignalSerial = max(1, flight.latestSignalSerial)
+            session.graphPublicationFlight = nil
+            if let observerID = flight.projectionRecoveryObserverID {
+                guard var observer = session.projectionRecoveryObserver,
+                      observer.id == observerID,
+                      observer.authority == authority
+                else {
+                    codemapSessionsByRootEpoch[rootEpoch] = session
+                    return
+                }
+                observer.latestSignalSerial = max(observer.latestSignalSerial, latestSignalSerial)
+                guard let recoveredGeneration = observer.lastRecoveredContributionGeneration,
+                      let recoveredSignalSerial = observer.lastRecoveredSignalSerial,
+                      contributionGeneration > recoveredGeneration ||
+                      observer.latestSignalSerial > recoveredSignalSerial
+                else {
+                    session.projectionRecoveryObserver = nil
+                    codemapSessionsByRootEpoch[rootEpoch] = session
+                    return
+                }
+                observer.task = nil
+                session.projectionRecoveryObserver = observer
+                codemapSessionsByRootEpoch[rootEpoch] = session
+                #if DEBUG
+                    codemapProjectionRecoveryObserverRearmCountForTesting += 1
+                #endif
+                armCodemapProjectionRecoveryObserver(
+                    rootEpoch: rootEpoch,
+                    observerID: observerID,
+                    authority: authority,
+                    engine: engine,
+                    contributionGeneration: contributionGeneration
+                )
+                return
+            }
+        }
+        if var existing = session.projectionRecoveryObserver {
+            existing.latestSignalSerial = max(existing.latestSignalSerial, latestSignalSerial)
+            session.projectionRecoveryObserver = existing
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+
+        let observerID = UUID()
+        session.projectionRecoveryObserver = CodemapProjectionRecoveryObserver(
+            id: observerID,
+            authority: authority,
+            latestSignalSerial: latestSignalSerial,
+            lastRecoveredContributionGeneration: nil,
+            recoveringSignalSerial: nil,
+            lastRecoveredSignalSerial: nil,
+            publishingContributionGeneration: nil,
+            publishingSignalSerial: nil,
+            task: nil
+        )
+        codemapSessionsByRootEpoch[rootEpoch] = session
+        #if DEBUG
+            codemapProjectionRecoveryObserverStartCountForTesting += 1
+        #endif
+
+        armCodemapProjectionRecoveryObserver(
+            rootEpoch: rootEpoch,
+            observerID: observerID,
+            authority: authority,
+            engine: engine,
+            contributionGeneration: contributionGeneration
+        )
+    }
+
+    private func armCodemapProjectionRecoveryObserver(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        observerID: UUID,
+        authority: CodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    ) {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              let observer = session.projectionRecoveryObserver,
+              observer.id == observerID,
+              observer.authority == authority,
+              observer.task == nil,
+              codemapAuthorityIsCurrent(authority)
+        else { return }
+        var armedObserver = observer
+        armedObserver.recoveringSignalSerial = observer.latestSignalSerial
+        session.projectionRecoveryObserver = armedObserver
+        let task = Task { [weak self] in
+            await self?.runCodemapProjectionRecoveryObserver(
+                rootEpoch: rootEpoch,
+                observerID: observerID,
+                authority: authority,
+                engine: engine,
+                contributionGeneration: contributionGeneration
+            )
+            return ()
+        }
+        guard var installedObserver = session.projectionRecoveryObserver,
+              installedObserver.id == observerID
+        else {
+            task.cancel()
+            return
+        }
+        installedObserver.task = task
+        session.projectionRecoveryObserver = installedObserver
+        codemapSessionsByRootEpoch[rootEpoch] = session
+    }
+
+    private func runCodemapProjectionRecoveryObserver(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        observerID: UUID,
+        authority: CodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    ) async {
+        #if DEBUG
+            let waitHandler = codemapProjectionRecoveryObserverWillWaitHandlerForTesting
+            await waitHandler?(rootEpoch)
+        #endif
+        guard !Task.isCancelled,
+              codemapSessionsByRootEpoch[rootEpoch]?.projectionRecoveryObserver?.id == observerID
+        else {
+            finishCodemapProjectionRecoveryObserver(
+                rootEpoch: rootEpoch,
+                observerID: observerID,
+                contributionGeneration: contributionGeneration,
+                latestObservedContributionGeneration: contributionGeneration,
+                recoveredCurrentCoverage: false
+            )
+            return
+        }
+        _ = await engine.restartCompletedProjectionForOverlayAdvance(
+            rootEpoch: rootEpoch,
+            contributionGeneration: contributionGeneration
+        )
+        let recovered = await engine.waitForCurrentProjectionCoverage(rootEpoch: rootEpoch)
+        var latestObservedContributionGeneration = contributionGeneration
+        if !Task.isCancelled,
+           let bundle = await engine.freeze(rootEpoch: rootEpoch)
+        {
+            latestObservedContributionGeneration =
+                (try? bundle.graphSnapshot())?.contributionGeneration ?? contributionGeneration
+            bundle.close()
+        }
+        finishCodemapProjectionRecoveryObserver(
+            rootEpoch: rootEpoch,
+            observerID: observerID,
+            contributionGeneration: contributionGeneration,
+            latestObservedContributionGeneration: latestObservedContributionGeneration,
+            recoveredCurrentCoverage: recovered && !Task.isCancelled && codemapAuthorityIsCurrent(authority)
+        )
+    }
+
+    private func finishCodemapProjectionRecoveryObserver(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        observerID: UUID,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
+        latestObservedContributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
+        recoveredCurrentCoverage: Bool
+    ) {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              var observer = session.projectionRecoveryObserver,
+              observer.id == observerID
+        else { return }
+        let latestSignalSerial = observer.latestSignalSerial
+        let authority = observer.authority
+        guard session.authority == authority,
+              codemapAuthorityIsCurrent(authority),
+              let engine = session.engine
+        else {
+            session.projectionRecoveryObserver = nil
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+        let recoveredSignalSerial = observer.recoveringSignalSerial ?? observer.latestSignalSerial
+        let hasCoalescedRecoveryWork = latestObservedContributionGeneration > contributionGeneration ||
+            observer.latestSignalSerial > recoveredSignalSerial
+        observer.task = nil
+        observer.lastRecoveredContributionGeneration = contributionGeneration
+        observer.lastRecoveredSignalSerial = recoveredSignalSerial
+        observer.recoveringSignalSerial = nil
+        session.projectionRecoveryObserver = observer
+        codemapSessionsByRootEpoch[rootEpoch] = session
+        if hasCoalescedRecoveryWork {
+            #if DEBUG
+                codemapProjectionRecoveryObserverRearmCountForTesting += 1
+            #endif
+            armCodemapProjectionRecoveryObserver(
+                rootEpoch: rootEpoch,
+                observerID: observerID,
+                authority: authority,
+                engine: engine,
+                contributionGeneration: latestObservedContributionGeneration
+            )
+            return
+        }
+        guard recoveredCurrentCoverage else {
+            session.projectionRecoveryObserver = nil
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+        startCodemapGraphPublicationFlight(
+            rootEpoch: rootEpoch,
+            authority: authority,
+            initialSignalSerial: latestSignalSerial,
+            projectionRecoveryObserverID: observerID
+        )
+    }
+
+    private func completeCodemapProjectionRecoveryPublication(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        graphPublicationFlightID: UUID?
+    ) {
+        guard let graphPublicationFlightID,
+              var session = codemapSessionsByRootEpoch[rootEpoch],
+              let flight = session.graphPublicationFlight,
+              flight.id == graphPublicationFlightID,
+              let observerID = flight.projectionRecoveryObserverID,
+              let observer = session.projectionRecoveryObserver,
+              observer.id == observerID
+        else { return }
+
+        let publishedSignalSerial = flight.flushingSerial ?? flight.latestSignalSerial
+        if observer.latestSignalSerial > publishedSignalSerial {
+            session.graphPublicationFlight = nil
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            startCodemapGraphPublicationFlight(
+                rootEpoch: rootEpoch,
+                authority: observer.authority,
+                initialSignalSerial: observer.latestSignalSerial,
+                projectionRecoveryObserverID: observerID
+            )
+        } else {
+            session.projectionRecoveryObserver = nil
+            codemapSessionsByRootEpoch[rootEpoch] = session
+        }
+    }
+
+    private func codemapProjectionRecoveryRequiresRearm(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
+        graphPublicationFlightID: UUID?
+    ) -> Bool {
+        guard let graphPublicationFlightID,
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              let flight = session.graphPublicationFlight,
+              flight.id == graphPublicationFlightID,
+              let observerID = flight.projectionRecoveryObserverID,
+              let observer = session.projectionRecoveryObserver,
+              observer.id == observerID,
+              let recoveredGeneration = observer.lastRecoveredContributionGeneration,
+              let recoveredSignalSerial = observer.lastRecoveredSignalSerial
+        else { return false }
+        return contributionGeneration > recoveredGeneration ||
+            observer.latestSignalSerial > recoveredSignalSerial
+    }
+
+    private func markCodemapProjectionRecoveryRebuild(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
+        graphPublicationFlightID: UUID?
+    ) {
+        guard let graphPublicationFlightID,
+              var session = codemapSessionsByRootEpoch[rootEpoch],
+              let flight = session.graphPublicationFlight,
+              flight.id == graphPublicationFlightID,
+              let observerID = flight.projectionRecoveryObserverID,
+              var observer = session.projectionRecoveryObserver,
+              observer.id == observerID
+        else { return }
+        observer.publishingContributionGeneration = contributionGeneration
+        observer.publishingSignalSerial = flight.flushingSerial ?? flight.latestSignalSerial
+        session.projectionRecoveryObserver = observer
+        codemapSessionsByRootEpoch[rootEpoch] = session
+    }
+
+    private func completeCodemapProjectionRecoveryRebuild(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        publishedKey: WorkspaceCodemapSelectionGraphRuntimeKey
+    ) {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              var observer = session.projectionRecoveryObserver,
+              observer.publishingContributionGeneration == publishedKey.contributionGeneration,
+              let publishedSignalSerial = observer.publishingSignalSerial
+        else { return }
+
+        observer.publishingContributionGeneration = nil
+        observer.publishingSignalSerial = nil
+        guard observer.latestSignalSerial > publishedSignalSerial else {
+            session.projectionRecoveryObserver = nil
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+
+        if var flight = session.graphPublicationFlight,
+           flight.projectionRecoveryObserverID == observer.id
+        {
+            flight.latestSignalSerial = max(flight.latestSignalSerial, observer.latestSignalSerial)
+            flight.replayRequired = true
+            session.graphPublicationFlight = flight
+            session.projectionRecoveryObserver = observer
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
+
+        session.projectionRecoveryObserver = observer
+        codemapSessionsByRootEpoch[rootEpoch] = session
+        startCodemapGraphPublicationFlight(
+            rootEpoch: rootEpoch,
+            authority: observer.authority,
+            initialSignalSerial: observer.latestSignalSerial,
+            projectionRecoveryObserverID: observer.id
+        )
+    }
+
+    private func acceptedCodemapGraphPublicationSnapshot(
+        _ snapshot: WorkspaceCodemapLiveGraphSnapshot,
         authority: CodemapRootAuthority
-    ) -> (shard: RootCatalogShard, token: WorkspaceCodemapGraphIndexCatalogToken)? {
+    ) -> WorkspaceCodemapLiveGraphSnapshot? {
+        guard snapshot.rootEpoch == authority.rootEpoch,
+              snapshot.catalogGeneration == authority.catalogGeneration,
+              codemapAuthorityIsCurrent(authority),
+              let session = codemapSessionsByRootEpoch[authority.rootEpoch],
+              session.authority == authority
+        else { return nil }
+
+        for binding in snapshot.bindings {
+            guard let record = session.demandsByFileID[binding.identity.fileID],
+                  case let .ready(triggeringReady) = record.result,
+                  codemapTicketsShareDemand(record.ticket, triggeringReady.ticket)
+            else { continue }
+            if codemapGraphSnapshotIsAccepted(
+                snapshot,
+                triggeringReady: triggeringReady
+            ) {
+                return snapshot
+            }
+        }
+        return nil
+    }
+
+    private func codemapGraphSnapshotIsAccepted(
+        _ snapshot: WorkspaceCodemapLiveGraphSnapshot,
+        triggeringReady: WorkspaceCodemapArtifactDemandReady
+    ) -> Bool {
+        let ticket = triggeringReady.ticket
+        guard snapshot.rootEpoch == ticket.rootEpoch,
+              snapshot.catalogGeneration == ticket.catalogGeneration,
+              snapshot.contributionGeneration.rawValue > 0,
+              codemapDemandIsCurrent(ticket),
+              let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              session.authority.catalogGeneration == snapshot.catalogGeneration,
+              let state = rootStatesByID[ticket.rootEpoch.rootID],
+              state.lifetimeID == ticket.rootEpoch.rootLifetimeID
+        else { return false }
+
+        var seenFileIDs = Set<UUID>()
+        var seenRelativePaths = Set<String>()
+        var triggeringBindingCount = 0
+        for binding in snapshot.bindings {
+            let identity = binding.identity
+            guard identity.rootID == snapshot.rootEpoch.rootID,
+                  identity.rootLifetimeID == snapshot.rootEpoch.rootLifetimeID,
+                  identity.standardizedRootPath == session.authority.standardizedRootPath,
+                  state.fileIDsByRelativePath[identity.standardizedRelativePath] == identity.fileID,
+                  let file = filesByID[identity.fileID],
+                  file.rootID == identity.rootID,
+                  file.standardizedRelativePath == identity.standardizedRelativePath,
+                  file.standardizedFullPath == identity.standardizedFullPath,
+                  seenFileIDs.insert(identity.fileID).inserted,
+                  seenRelativePaths.insert(identity.standardizedRelativePath).inserted,
+                  case let .resolved(completion) = binding.availability,
+                  completion.token.isFactoryValidated,
+                  completion.sourceProof.isFactoryValidated,
+                  completion.token.identity == identity,
+                  completion.sourceProof == completion.token.sourceExpectation,
+                  completion.token.catalogGeneration == snapshot.catalogGeneration,
+                  completion.sourceProof.sourceAuthority.rootEpoch == snapshot.rootEpoch,
+                  completion.sourceProof.sourceAuthority.repositoryAuthority ==
+                  snapshot.repositoryAuthority
+            else { return false }
+
+            switch completion.outcome {
+            case .ready, .readyNoSymbols:
+                break
+            case .oversize, .decodeFailed, .parseFailed:
+                return false
+            }
+
+            if identity.fileID == ticket.fileID {
+                triggeringBindingCount += 1
+                guard identity == triggeringReady.identity,
+                      completion.token.requestGeneration == ticket.requestGeneration,
+                      completion.artifactKey == triggeringReady.snapshot.artifactKey,
+                      codemapGraphOutcomeMatches(
+                          completion.outcome,
+                          triggeringReady.snapshot.outcome
+                      )
+                else { return false }
+            }
+        }
+        return triggeringBindingCount == 1
+    }
+
+    private func codemapGraphOutcomeMatches(
+        _ completion: CodeMapSyntaxArtifactOutcome,
+        _ snapshot: WorkspaceCodemapLiveArtifactOutcome
+    ) -> Bool {
+        switch (completion, snapshot) {
+        case (.ready, .ready), (.readyNoSymbols, .readyNoSymbols):
+            true
+        case (.ready, _), (.readyNoSymbols, _), (.oversize, _), (.decodeFailed, _),
+             (.parseFailed, _):
+            false
+        }
+    }
+
+    private func enqueueCodemapGraphSnapshot(
+        _ snapshot: WorkspaceCodemapLiveGraphSnapshot,
+        retiringGraphPublicationFlightID: UUID? = nil
+    ) async {
+        guard var session = codemapSessionsByRootEpoch[snapshot.rootEpoch],
+              codemapAuthorityIsCurrent(session.authority),
+              session.authority.catalogGeneration == snapshot.catalogGeneration,
+              let engine = session.engine
+        else { return }
+
+        let key = WorkspaceCodemapSelectionGraphRuntimeKey(snapshot: snapshot)
+        let state = session.selectionGraph ?? CodemapSelectionGraphState(
+            id: UUID(),
+            graph: selectionGraphFactory.make(rootEpoch: snapshot.rootEpoch),
+            desiredKey: nil,
+            pendingSnapshot: nil,
+            publishedSummary: nil,
+            lastRebuildDisposition: nil,
+            workerID: nil,
+            workerTask: nil
+        )
+        if let desiredKey = state.desiredKey {
+            if key.contributionGeneration < desiredKey.contributionGeneration {
+                return
+            }
+            if key == desiredKey {
+                if state.publishedSummary?.key == key {
+                    completeCodemapProjectionRecoveryPublication(
+                        rootEpoch: snapshot.rootEpoch,
+                        graphPublicationFlightID: retiringGraphPublicationFlightID
+                    )
+                    return
+                }
+                if state.pendingSnapshot != nil || state.workerTask != nil {
+                    return
+                }
+            }
+        }
+
+        let graphStateID = state.id
+        let graph = state.graph
+        let previousDesiredKey = state.desiredKey
+        session.selectionGraph = state
+        codemapSessionsByRootEpoch[snapshot.rootEpoch] = session
+
+        if state.desiredKey == key,
+           state.publishedSummary == nil,
+           state.pendingSnapshot == nil,
+           state.workerTask == nil
+        {
+            let accounting = await graph.accounting()
+            if let summary = accounting.publishedSummary,
+               summary.key == key,
+               case .complete = summary.definitionUniverseCoverage,
+               var restoredSession = codemapSessionsByRootEpoch[snapshot.rootEpoch],
+               var restoredState = restoredSession.selectionGraph,
+               restoredState.id == graphStateID,
+               restoredState.graph === graph,
+               restoredState.desiredKey == key,
+               restoredState.pendingSnapshot == nil,
+               restoredState.workerTask == nil
+            {
+                restoredState.publishedSummary = summary
+                restoredSession.selectionGraph = restoredState
+                codemapSessionsByRootEpoch[snapshot.rootEpoch] = restoredSession
+                yieldCodemapSelectionGraphReadiness(rootEpoch: snapshot.rootEpoch)
+                completeCodemapProjectionRecoveryPublication(
+                    rootEpoch: snapshot.rootEpoch,
+                    graphPublicationFlightID: retiringGraphPublicationFlightID
+                )
+                return
+            }
+        }
+
+        let preparedSeal = state.workerTask == nil && state.pendingSnapshot == nil
+            ? await engine.prepareCompletedProjectionSuccessor(
+                rootEpoch: snapshot.rootEpoch,
+                liveSnapshot: snapshot
+            )
+            : nil
+        if let seal = preparedSeal,
+           state.desiredKey == WorkspaceCodemapSelectionGraphRuntimeKey(
+               generation: seal.predecessorProof.generation
+           )
+        {
+            let disposition = await graph.applyEquivalentProjectionSuccessor(
+                seal,
+                liveSnapshot: snapshot
+            )
+            switch disposition {
+            case .accepted, .exactDuplicate:
+                if await engine.commitCompletedProjectionSuccessor(seal) {
+                    let accounting = await graph.accounting()
+                    guard var resealedSession = codemapSessionsByRootEpoch[snapshot.rootEpoch],
+                          var resealedState = resealedSession.selectionGraph,
+                          resealedState.id == graphStateID,
+                          resealedState.graph === graph,
+                          resealedState.desiredKey == previousDesiredKey,
+                          let summary = accounting.publishedSummary,
+                          summary.key == key,
+                          case let .complete(proof, _, _, _) = summary.definitionUniverseCoverage,
+                          proof == seal.successorProof
+                    else { return }
+                    resealedState.desiredKey = key
+                    resealedState.publishedSummary = summary
+                    resealedState.lastRebuildDisposition = nil
+                    resealedSession.selectionGraph = resealedState
+                    codemapSessionsByRootEpoch[snapshot.rootEpoch] = resealedSession
+                    yieldCodemapSelectionGraphReadiness(rootEpoch: snapshot.rootEpoch)
+                    completeCodemapProjectionRecoveryPublication(
+                        rootEpoch: snapshot.rootEpoch,
+                        graphPublicationFlightID: retiringGraphPublicationFlightID
+                    )
+                    return
+                }
+            case .stale, .superseded, .busy, .budget, .unavailable:
+                break
+            }
+            startCodemapProjectionRecoveryObserver(
+                rootEpoch: snapshot.rootEpoch,
+                authority: session.authority,
+                engine: engine,
+                contributionGeneration: snapshot.contributionGeneration,
+                retiringGraphPublicationFlightID: retiringGraphPublicationFlightID
+            )
+            return
+        }
+
+        if codemapProjectionRecoveryRequiresRearm(
+            rootEpoch: snapshot.rootEpoch,
+            contributionGeneration: snapshot.contributionGeneration,
+            graphPublicationFlightID: retiringGraphPublicationFlightID
+        ) {
+            startCodemapProjectionRecoveryObserver(
+                rootEpoch: snapshot.rootEpoch,
+                authority: session.authority,
+                engine: engine,
+                contributionGeneration: snapshot.contributionGeneration,
+                retiringGraphPublicationFlightID: retiringGraphPublicationFlightID
+            )
+            return
+        }
+
+        guard await graph.observeDesiredKey(key) else { return }
+
+        guard var currentSession = codemapSessionsByRootEpoch[snapshot.rootEpoch],
+              var currentState = currentSession.selectionGraph,
+              currentState.id == graphStateID,
+              currentState.graph === graph,
+              currentState.desiredKey == previousDesiredKey,
+              codemapAuthorityIsCurrent(currentSession.authority),
+              currentSession.authority.catalogGeneration == snapshot.catalogGeneration
+        else { return }
+
+        currentState.desiredKey = key
+        currentState.pendingSnapshot = snapshot
+
+        if currentState.workerTask == nil {
+            let workerID = UUID()
+            currentState.workerID = workerID
+            currentState.workerTask = Task { [weak self] in
+                await self?.runCodemapGraphWorker(
+                    rootEpoch: snapshot.rootEpoch,
+                    graphStateID: graphStateID,
+                    workerID: workerID
+                )
+            }
+            #if DEBUG
+                codemapGraphWorkerStartCountForTesting += 1
+            #endif
+        }
+        currentSession.selectionGraph = currentState
+        codemapSessionsByRootEpoch[snapshot.rootEpoch] = currentSession
+        markCodemapProjectionRecoveryRebuild(
+            rootEpoch: snapshot.rootEpoch,
+            contributionGeneration: snapshot.contributionGeneration,
+            graphPublicationFlightID: retiringGraphPublicationFlightID
+        )
+    }
+
+    private func runCodemapGraphWorker(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        graphStateID: UUID,
+        workerID: UUID
+    ) async {
+        while !Task.isCancelled {
+            guard var session = codemapSessionsByRootEpoch[rootEpoch],
+                  var state = session.selectionGraph,
+                  state.id == graphStateID,
+                  state.workerID == workerID,
+                  let snapshot = state.pendingSnapshot
+            else { return }
+
+            let key = WorkspaceCodemapSelectionGraphRuntimeKey(snapshot: snapshot)
+            guard state.desiredKey == key else {
+                state.workerID = nil
+                state.workerTask = nil
+                session.selectionGraph = state
+                codemapSessionsByRootEpoch[rootEpoch] = session
+                return
+            }
+
+            state.pendingSnapshot = nil
+            let graph = state.graph
+            session.selectionGraph = state
+            codemapSessionsByRootEpoch[rootEpoch] = session
+
+            let disposition = await graph.rebuild(from: snapshot)
+
+            guard var currentSession = codemapSessionsByRootEpoch[rootEpoch],
+                  var currentState = currentSession.selectionGraph,
+                  currentState.id == graphStateID,
+                  currentState.graph === graph,
+                  currentState.workerID == workerID
+            else { return }
+
+            if currentState.desiredKey == key {
+                currentState.lastRebuildDisposition = disposition
+                switch disposition {
+                case let .published(summary):
+                    if summary.key == key {
+                        currentState.publishedSummary = summary
+                    }
+                case let .publishedEmpty(summary):
+                    if summary.key == key {
+                        currentState.publishedSummary = summary
+                    }
+                case .busy, .cancelled, .rejected, .superseded:
+                    break
+                }
+            }
+
+            let processAdmissionBindingCount: Int? = switch disposition {
+            case .busy(_, .processAdmission): snapshot.bindings.count
+            case .published, .publishedEmpty, .busy, .cancelled, .rejected, .superseded: nil
+            }
+
+            let automaticSelectionReadinessChanged = currentState.publishedSummary?.key == key
+
+            if currentState.pendingSnapshot == nil,
+               let processAdmissionBindingCount
+            {
+                currentSession.selectionGraph = currentState
+                codemapSessionsByRootEpoch[rootEpoch] = currentSession
+                await graph.waitForProcessAdmissionAvailability(
+                    bindingCount: processAdmissionBindingCount
+                )
+                guard !Task.isCancelled,
+                      var availableSession = codemapSessionsByRootEpoch[rootEpoch],
+                      var availableState = availableSession.selectionGraph,
+                      availableState.id == graphStateID,
+                      availableState.graph === graph,
+                      availableState.workerID == workerID
+                else { return }
+                if availableState.desiredKey == key {
+                    availableState.pendingSnapshot = snapshot
+                } else if availableState.pendingSnapshot == nil {
+                    availableState.workerID = nil
+                    availableState.workerTask = nil
+                    availableSession.selectionGraph = availableState
+                    codemapSessionsByRootEpoch[rootEpoch] = availableSession
+                    return
+                }
+                availableSession.selectionGraph = availableState
+                codemapSessionsByRootEpoch[rootEpoch] = availableSession
+                yieldCodemapSelectionGraphReadiness(rootEpoch: rootEpoch)
+                continue
+            }
+
+            if currentState.pendingSnapshot == nil || Task.isCancelled {
+                currentState.workerID = nil
+                currentState.workerTask = nil
+                currentSession.selectionGraph = currentState
+                codemapSessionsByRootEpoch[rootEpoch] = currentSession
+                if automaticSelectionReadinessChanged {
+                    completeCodemapProjectionRecoveryRebuild(
+                        rootEpoch: rootEpoch,
+                        publishedKey: key
+                    )
+                    yieldCodemapSelectionGraphReadiness(rootEpoch: rootEpoch)
+                }
+                return
+            }
+
+            currentSession.selectionGraph = currentState
+            codemapSessionsByRootEpoch[rootEpoch] = currentSession
+            if automaticSelectionReadinessChanged {
+                completeCodemapProjectionRecoveryRebuild(
+                    rootEpoch: rootEpoch,
+                    publishedKey: key
+                )
+                yieldCodemapSelectionGraphReadiness(rootEpoch: rootEpoch)
+            }
+        }
+    }
+
+    private func codemapProjectionCatalogShardAndToken(
+        authority: CodemapRootAuthority
+    ) -> (shard: RootCatalogShard, token: WorkspaceCodemapProjectionCatalogToken)? {
         guard codemapAuthorityIsCurrent(authority),
               let state = rootStatesByID[authority.rootEpoch.rootID],
               state.lifetimeID == authority.rootEpoch.rootLifetimeID,
@@ -14571,28 +16976,29 @@ actor WorkspaceFileContextStore {
         else { return nil }
         return (
             shard,
-            WorkspaceCodemapGraphIndexCatalogToken(
+            WorkspaceCodemapProjectionCatalogToken(
                 rootEpoch: authority.rootEpoch,
                 topologyGeneration: shard.key.topologyGeneration,
                 appliedIndexGeneration: shard.appliedIndexGeneration,
                 catalogGeneration: authority.catalogGeneration,
                 ingressGeneration: authority.ingressGeneration,
-                graphIndexInvalidationGeneration:
-                codemapGraphIndexInvalidationGenerationsByRootEpoch[authority.rootEpoch] ?? 1
+                projectionInvalidationGeneration:
+                codemapProjectionInvalidationGenerationsByRootEpoch[authority.rootEpoch] ?? 1
             )
         )
     }
 
-    private func advanceCodemapGraphIndexInvalidationGeneration(
+    private func advanceCodemapProjectionInvalidationGeneration(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        let current = codemapGraphIndexInvalidationGenerationsByRootEpoch[rootEpoch] ?? 1
-        codemapGraphIndexInvalidationGenerationsByRootEpoch[rootEpoch] = current == .max
+        revokeAutomaticSelectionPublicationPermits(rootEpoch: rootEpoch)
+        let current = codemapProjectionInvalidationGenerationsByRootEpoch[rootEpoch] ?? 1
+        codemapProjectionInvalidationGenerationsByRootEpoch[rootEpoch] = current == .max
             ? 0
             : current + 1
     }
 
-    private func codemapGraphIndexCatalogIsFenced(
+    private func codemapProjectionCatalogIsFenced(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> Bool {
         codemapPathFenceTokensByID.values.contains { $0.rootEpoch == rootEpoch }
@@ -14601,18 +17007,18 @@ actor WorkspaceFileContextStore {
             || (codemapPathLocalCatalogMutationDepthByRootID[rootEpoch.rootID] ?? 0) > 0
     }
 
-    private func ensureCodemapGraphIndexCatalogShard(
+    private func ensureCodemapProjectionCatalogShard(
         authority: CodemapRootAuthority
     ) async -> Bool {
         for _ in 0 ..< 2 {
-            if codemapGraphIndexCatalogShardAndToken(authority: authority) != nil {
+            if codemapProjectionCatalogShardAndToken(authority: authority) != nil {
                 return true
             }
-            guard let snapshot = codemapGraphIndexCatalogShardBuildSnapshot(authority: authority) else {
+            guard let snapshot = codemapProjectionCatalogShardBuildSnapshot(authority: authority) else {
                 return false
             }
             #if DEBUG
-                let buildHandler = codemapGraphIndexCatalogBuildHandler
+                let buildHandler = codemapProjectionCatalogBuildHandler
             #endif
             let shard = await Task.detached(priority: .userInitiated) { [snapshot] in
                 #if DEBUG
@@ -14620,10 +17026,10 @@ actor WorkspaceFileContextStore {
                         await buildHandler(snapshot.authority.rootEpoch)
                     }
                 #endif
-                return Self.buildCodemapGraphIndexCatalogShard(snapshot: snapshot)
+                return Self.buildCodemapProjectionCatalogShard(snapshot: snapshot)
             }.value
             guard !Task.isCancelled else { return false }
-            switch publishCodemapGraphIndexCatalogShard(shard, snapshot: snapshot) {
+            switch publishCodemapProjectionCatalogShard(shard, snapshot: snapshot) {
             case .ready:
                 return true
             case .retry:
@@ -14632,27 +17038,27 @@ actor WorkspaceFileContextStore {
                 return false
             }
         }
-        return codemapGraphIndexCatalogShardAndToken(authority: authority) != nil
+        return codemapProjectionCatalogShardAndToken(authority: authority) != nil
     }
 
-    private func codemapGraphIndexCatalogShardBuildSnapshot(
+    private func codemapProjectionCatalogShardBuildSnapshot(
         authority: CodemapRootAuthority
-    ) -> CodemapGraphIndexCatalogShardBuildSnapshot? {
+    ) -> CodemapProjectionCatalogShardBuildSnapshot? {
         guard codemapAuthorityIsCurrent(authority),
-              !codemapGraphIndexCatalogIsFenced(rootEpoch: authority.rootEpoch),
+              !codemapProjectionCatalogIsFenced(rootEpoch: authority.rootEpoch),
               let state = rootStatesByID[authority.rootEpoch.rootID],
               state.lifetimeID == authority.rootEpoch.rootLifetimeID,
               state.root.standardizedFullPath == authority.standardizedRootPath,
               let key = rootCatalogShardKey(for: state.root),
               let appliedIndexGeneration = appliedIndexGenerationsByRootID[authority.rootEpoch.rootID]
         else { return nil }
-        return CodemapGraphIndexCatalogShardBuildSnapshot(
+        return CodemapProjectionCatalogShardBuildSnapshot(
             authority: authority,
             key: key,
             root: state.root,
             appliedIndexGeneration: appliedIndexGeneration,
-            graphIndexInvalidationGeneration:
-            codemapGraphIndexInvalidationGenerationsByRootEpoch[authority.rootEpoch] ?? 1,
+            projectionInvalidationGeneration:
+            codemapProjectionInvalidationGenerationsByRootEpoch[authority.rootEpoch] ?? 1,
             files: state.fileIDsByRelativePath.values.compactMap { filesByID[$0] },
             folders: state.folderIDsByRelativePath.values.compactMap { foldersByID[$0] },
             managedOnlyFileIDs: managedOnlyFileIDs,
@@ -14660,8 +17066,8 @@ actor WorkspaceFileContextStore {
         )
     }
 
-    private nonisolated static func buildCodemapGraphIndexCatalogShard(
-        snapshot: CodemapGraphIndexCatalogShardBuildSnapshot
+    private nonisolated static func buildCodemapProjectionCatalogShard(
+        snapshot: CodemapProjectionCatalogShardBuildSnapshot
     ) -> RootCatalogShard {
         let files = snapshot.files
             .filter { !snapshot.managedOnlyFileIDs.contains($0.id) }
@@ -14690,23 +17096,23 @@ actor WorkspaceFileContextStore {
         )
     }
 
-    private func publishCodemapGraphIndexCatalogShard(
+    private func publishCodemapProjectionCatalogShard(
         _ shard: RootCatalogShard,
-        snapshot: CodemapGraphIndexCatalogShardBuildSnapshot
-    ) -> CodemapGraphIndexCatalogShardPublicationDisposition {
-        if codemapGraphIndexCatalogShardAndToken(authority: snapshot.authority) != nil {
+        snapshot: CodemapProjectionCatalogShardBuildSnapshot
+    ) -> CodemapProjectionCatalogShardPublicationDisposition {
+        if codemapProjectionCatalogShardAndToken(authority: snapshot.authority) != nil {
             return .ready
         }
         guard codemapAuthorityIsCurrent(snapshot.authority),
-              !codemapGraphIndexCatalogIsFenced(rootEpoch: snapshot.authority.rootEpoch),
+              !codemapProjectionCatalogIsFenced(rootEpoch: snapshot.authority.rootEpoch),
               let state = rootStatesByID[snapshot.authority.rootEpoch.rootID],
               state.lifetimeID == snapshot.authority.rootEpoch.rootLifetimeID,
               state.root.standardizedFullPath == snapshot.authority.standardizedRootPath,
               rootCatalogShardKey(for: state.root) == snapshot.key,
               appliedIndexGenerationsByRootID[snapshot.authority.rootEpoch.rootID]
               == snapshot.appliedIndexGeneration,
-              (codemapGraphIndexInvalidationGenerationsByRootEpoch[snapshot.authority.rootEpoch] ?? 1)
-              == snapshot.graphIndexInvalidationGeneration
+              (codemapProjectionInvalidationGenerationsByRootEpoch[snapshot.authority.rootEpoch] ?? 1)
+              == snapshot.projectionInvalidationGeneration
         else {
             return codemapAuthorityIsCurrent(snapshot.authority) ? .retry : .unavailable
         }
@@ -14721,26 +17127,25 @@ actor WorkspaceFileContextStore {
             capability: .recordsOnly
         )
         registerPublishedRootCatalogShard(shard, kind: .authoritative)
-        publishCodemapRootStatusesIfChanged()
         return .ready
     }
 
-    private func readCodemapGraphIndexCatalogPage(
-        _ request: WorkspaceCodemapGraphIndexCatalogPageRequest,
+    private func readCodemapProjectionCatalogPage(
+        _ request: WorkspaceCodemapProjectionCatalogPageRequest,
         authority: CodemapRootAuthority
-    ) async -> WorkspaceCodemapGraphIndexCatalogPageDisposition {
+    ) async -> WorkspaceCodemapProjectionCatalogPageDisposition {
         guard request.rootEpoch == authority.rootEpoch else { return .stale }
         guard request.cursor == nil || request.token != nil else { return .stale }
         guard codemapAuthorityIsCurrent(authority) else { return .stale }
-        if codemapGraphIndexCatalogIsFenced(rootEpoch: authority.rootEpoch) {
+        if codemapProjectionCatalogIsFenced(rootEpoch: authority.rootEpoch) {
             return request.token == nil ? .unavailable(.catalogNotReady) : .stale
         }
-        guard await ensureCodemapGraphIndexCatalogShard(authority: authority) else {
+        guard await ensureCodemapProjectionCatalogShard(authority: authority) else {
             return codemapAuthorityIsCurrent(authority)
                 ? .unavailable(.catalogNotReady)
                 : .stale
         }
-        guard let current = codemapGraphIndexCatalogShardAndToken(authority: authority) else {
+        guard let current = codemapProjectionCatalogShardAndToken(authority: authority) else {
             return .unavailable(.catalogNotReady)
         }
         guard request.token == nil || request.token == current.token else { return .stale }
@@ -14759,7 +17164,7 @@ actor WorkspaceFileContextStore {
             startIndex = 0
         }
 
-        var entries: [WorkspaceCodemapGraphIndexCatalogCandidate] = []
+        var entries: [WorkspaceCodemapProjectionCatalogCandidate] = []
         entries.reserveCapacity(min(
             request.maximumEntryCount,
             current.shard.projectionFiles.count - startIndex
@@ -14797,7 +17202,7 @@ actor WorkspaceFileContextStore {
 
             let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
                 ?? authority.ingressGeneration
-            entries.append(WorkspaceCodemapGraphIndexCatalogCandidate(
+            entries.append(WorkspaceCodemapProjectionCatalogCandidate(
                 identity: identity,
                 language: projectionFile.language,
                 requestGeneration: pathGeneration,
@@ -14812,24 +17217,21 @@ actor WorkspaceFileContextStore {
         }
         let isEnd = nextIndex == current.shard.projectionFiles.count
         let nextCursor = isEnd ? nil : entries.last.map {
-            WorkspaceCodemapGraphIndexCatalogCursor(
+            WorkspaceCodemapProjectionCatalogCursor(
                 standardizedRelativePath: $0.identity.standardizedRelativePath,
                 fileID: $0.identity.fileID
             )
         }
-        guard let supportedCandidateCountThroughPage = UInt64(exactly: nextIndex),
-              let projectedSupportedCandidateTotal = UInt64(exactly: current.shard.projectionFiles.count)
-        else {
+        guard let supportedCandidateCountThroughPage = UInt64(exactly: nextIndex) else {
             return .unavailable(.catalogUnavailable)
         }
-        switch WorkspaceCodemapGraphIndexCatalogPage.validated(
+        switch WorkspaceCodemapProjectionCatalogPage.validated(
             request: request,
             token: current.token,
             entries: entries,
             nextCursor: nextCursor,
             isEnd: isEnd,
-            supportedCandidateCountThroughPage: supportedCandidateCountThroughPage,
-            projectedSupportedCandidateTotal: projectedSupportedCandidateTotal
+            supportedCandidateCountThroughPage: supportedCandidateCountThroughPage
         ) {
         case let .success(page):
             return .page(page)
@@ -14838,15 +17240,15 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private func revalidateCodemapGraphIndexCatalogToken(
+    private func revalidateCodemapProjectionCatalogToken(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        token: WorkspaceCodemapGraphIndexCatalogToken,
+        token: WorkspaceCodemapProjectionCatalogToken,
         authority: CodemapRootAuthority
-    ) -> WorkspaceCodemapGraphIndexCatalogTokenDisposition {
+    ) -> WorkspaceCodemapProjectionCatalogTokenDisposition {
         guard rootEpoch == authority.rootEpoch, token.rootEpoch == rootEpoch else { return .stale }
         guard codemapAuthorityIsCurrent(authority) else { return .stale }
-        guard !codemapGraphIndexCatalogIsFenced(rootEpoch: rootEpoch) else { return .stale }
-        guard let current = codemapGraphIndexCatalogShardAndToken(authority: authority) else {
+        guard !codemapProjectionCatalogIsFenced(rootEpoch: rootEpoch) else { return .stale }
+        guard let current = codemapProjectionCatalogShardAndToken(authority: authority) else {
             return .unavailable(.catalogNotReady)
         }
         return current.token == token ? .current : .stale
@@ -14855,56 +17257,14 @@ actor WorkspaceFileContextStore {
     private func acceptCodemapMarkerReadinessUpdate(
         _ update: WorkspaceCodemapMarkerReadinessUpdate,
         authority: CodemapRootAuthority
-    ) async -> Bool {
+    ) -> Bool {
         guard update.rootEpoch == authority.rootEpoch,
               codemapAuthorityIsCurrent(authority),
-              !codemapGraphIndexCatalogIsFenced(rootEpoch: authority.rootEpoch),
-              let initialSession = codemapSessionsByRootEpoch[authority.rootEpoch],
-              initialSession.authority == authority
-        else { return false }
-
-        let securityExcludedPaths = Set(update.changes.compactMap { change -> String? in
-            guard change.state == .securityExcluded,
-                  change.standardizedRelativePath == StandardizedPath.relative(change.standardizedRelativePath),
-                  !change.standardizedRelativePath.isEmpty,
-                  let state = rootStatesByID[authority.rootEpoch.rootID],
-                  state.fileIDsByRelativePath[change.standardizedRelativePath] == change.fileID,
-                  let file = filesByID[change.fileID],
-                  file.rootID == authority.rootEpoch.rootID,
-                  file.standardizedRelativePath == change.standardizedRelativePath
-            else { return nil }
-            let pathGeneration = initialSession.pathGenerationsByRelativePath[change.standardizedRelativePath]
-                ?? authority.ingressGeneration
-            guard change.requestGeneration == pathGeneration,
-                  change.pathGeneration == pathGeneration
-            else { return nil }
-            return change.standardizedRelativePath
-        })
-        if !securityExcludedPaths.isEmpty {
-            guard let fence = destructiveCodemapGraphFence(
-                rootID: authority.rootEpoch.rootID,
-                commands: [.securityExcluded(securityExcludedPaths)]
-            ), let engine = initialSession.engine,
-            let graph = await engine.selectionGraph(rootEpoch: authority.rootEpoch)
-            else { return false }
-            switch await graph.latestSnapshot() {
-            case .pending:
-                break
-            case .ready:
-                guard case .fenced = await graph.fenceFiles(
-                    fileIDs: fence.fileIDs,
-                    reason: fence.reason
-                ) else { return false }
-            case .revoked:
-                return false
-            }
-        }
-
-        guard codemapAuthorityIsCurrent(authority),
-              !codemapGraphIndexCatalogIsFenced(rootEpoch: authority.rootEpoch),
+              !codemapProjectionCatalogIsFenced(rootEpoch: authority.rootEpoch),
               var session = codemapSessionsByRootEpoch[authority.rootEpoch],
               session.authority == authority
         else { return false }
+
         var appliedChanges: [WorkspaceCodemapMarkerReadinessChange] = []
         for change in update.changes {
             guard change.standardizedRelativePath == StandardizedPath.relative(
@@ -14932,7 +17292,7 @@ actor WorkspaceFileContextStore {
                 guard session.markerReadinessByFileID[change.fileID] != change else { continue }
                 session.markerReadinessByFileID[change.fileID] = change
                 appliedChanges.append(change)
-            case .unavailable, .securityExcluded:
+            case .unavailable:
                 guard let removed = session.markerReadinessByFileID.removeValue(forKey: change.fileID) else {
                     continue
                 }
@@ -14941,7 +17301,7 @@ actor WorkspaceFileContextStore {
                     standardizedRelativePath: removed.standardizedRelativePath,
                     requestGeneration: change.requestGeneration,
                     pathGeneration: change.pathGeneration,
-                    state: change.state
+                    state: .unavailable
                 ))
             }
         }
@@ -14971,11 +17331,11 @@ actor WorkspaceFileContextStore {
     #if DEBUG
         func acceptCodemapMarkerReadinessUpdateForTesting(
             _ update: WorkspaceCodemapMarkerReadinessUpdate
-        ) async -> Bool {
+        ) -> Bool {
             guard let authority = codemapSessionsByRootEpoch[update.rootEpoch]?.authority else {
                 return false
             }
-            return await acceptCodemapMarkerReadinessUpdate(update, authority: authority)
+            return acceptCodemapMarkerReadinessUpdate(update, authority: authority)
         }
 
         func codemapMarkerReadinessSnapshotForTesting(
@@ -15019,6 +17379,134 @@ actor WorkspaceFileContextStore {
             return true
         }
     #endif
+
+    private func acceptCodemapProjectionSnapshot(
+        _ snapshot: WorkspaceCodemapProjectionSnapshot,
+        authority: CodemapRootAuthority
+    ) async -> WorkspaceCodemapProjectionSnapshotDisposition {
+        guard codemapAuthorityIsCurrent(authority) else { return .superseded }
+        guard !codemapProjectionCatalogIsFenced(rootEpoch: authority.rootEpoch) else { return .stale }
+        guard let current = codemapProjectionCatalogShardAndToken(authority: authority),
+              let session = codemapSessionsByRootEpoch[authority.rootEpoch],
+              session.authority == authority
+        else { return .stale }
+
+        let generation: WorkspaceCodemapProjectionGeneration = switch snapshot {
+        case let .segment(segment):
+            segment.generation
+        case let .seal(proof):
+            proof.generation
+        }
+        guard generation.rootEpoch == authority.rootEpoch,
+              generation.catalogToken == current.token,
+              generation.schemaVersion == CodeMapSelectionGraphContribution.currentSchemaVersion,
+              generation.policyVersion == CodeMapSelectionGraphContribution.currentPolicyVersion
+        else { return .stale }
+
+        switch snapshot {
+        case let .segment(segment):
+            for entry in segment.entries {
+                guard let index = current.shard.projectionFileIndexByID[entry.identity.fileID] else {
+                    return .stale
+                }
+                let file = current.shard.projectionFiles[index].file
+                let language = current.shard.projectionFiles[index].language
+                let pathGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+                    ?? authority.ingressGeneration
+                guard let expectedPipelineIdentity = try? SyntaxManager.shared.pipelineIdentity(
+                    for: language,
+                    decoderPolicy: .workspaceAutomaticV1
+                ) else { return .stale }
+                guard entry.identity.rootID == authority.rootEpoch.rootID,
+                      entry.identity.rootLifetimeID == authority.rootEpoch.rootLifetimeID,
+                      entry.identity.standardizedRootPath == authority.standardizedRootPath,
+                      entry.identity.fileID == file.id,
+                      entry.identity.standardizedRelativePath == file.standardizedRelativePath,
+                      entry.identity.standardizedFullPath == file.standardizedFullPath,
+                      rootStatesByID[authority.rootEpoch.rootID]?
+                      .fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+                      filesByID[file.id] == file,
+                      entry.requestGeneration == pathGeneration,
+                      entry.pathGeneration == pathGeneration,
+                      entry.pipelineIdentity == expectedPipelineIdentity
+                else { return .stale }
+            }
+        case let .seal(proof):
+            guard proof.catalogCompletion.token == current.token,
+                  proof.catalogCompletion.supportedCandidateCount
+                  == UInt64(current.shard.projectionFiles.count)
+            else { return .stale }
+            let expectedFinalCursor = current.shard.projectionFiles.last.map {
+                WorkspaceCodemapProjectionCatalogCursor(
+                    standardizedRelativePath: $0.file.standardizedRelativePath,
+                    fileID: $0.file.id
+                )
+            }
+            guard proof.catalogCompletion.finalCursor == expectedFinalCursor else { return .stale }
+            if proof.lastSegmentSequence == UInt64.max { return .stale }
+        }
+
+        let key = WorkspaceCodemapSelectionGraphRuntimeKey(generation: generation)
+        var graphState = session.selectionGraph ?? CodemapSelectionGraphState(
+            id: UUID(),
+            graph: selectionGraphFactory.make(rootEpoch: authority.rootEpoch),
+            desiredKey: nil,
+            pendingSnapshot: nil,
+            publishedSummary: nil,
+            lastRebuildDisposition: nil,
+            workerID: nil,
+            workerTask: nil
+        )
+        if let desiredKey = graphState.desiredKey {
+            if key.contributionGeneration < desiredKey.contributionGeneration {
+                return .stale
+            }
+            if key.contributionGeneration == desiredKey.contributionGeneration,
+               key != desiredKey
+            {
+                return .superseded
+            }
+        }
+        graphState.desiredKey = key
+        let graphStateID = graphState.id
+        let graph = graphState.graph
+        var installedSession = session
+        installedSession.selectionGraph = graphState
+        codemapSessionsByRootEpoch[authority.rootEpoch] = installedSession
+
+        let disposition = await graph.applyProjectionSnapshot(snapshot)
+        guard codemapAuthorityIsCurrent(authority),
+              !codemapProjectionCatalogIsFenced(rootEpoch: authority.rootEpoch),
+              let revalidated = codemapProjectionCatalogShardAndToken(authority: authority),
+              revalidated.token == generation.catalogToken,
+              let currentSession = codemapSessionsByRootEpoch[authority.rootEpoch],
+              let currentGraphState = currentSession.selectionGraph,
+              currentGraphState.id == graphStateID,
+              currentGraphState.graph === graph,
+              currentGraphState.desiredKey == key
+        else { return .stale }
+
+        let accounting = await graph.accounting()
+        guard codemapAuthorityIsCurrent(authority),
+              !codemapProjectionCatalogIsFenced(rootEpoch: authority.rootEpoch),
+              var finalSession = codemapSessionsByRootEpoch[authority.rootEpoch],
+              var finalGraphState = finalSession.selectionGraph,
+              finalGraphState.id == graphStateID,
+              finalGraphState.graph === graph,
+              finalGraphState.desiredKey == key
+        else { return .stale }
+        finalGraphState.publishedSummary = accounting.publishedSummary
+        finalSession.selectionGraph = finalGraphState
+        codemapSessionsByRootEpoch[authority.rootEpoch] = finalSession
+
+        if case .seal = snapshot,
+           case .accepted = disposition,
+           case .complete? = accounting.publishedSummary?.definitionUniverseCoverage
+        {
+            yieldCodemapSelectionGraphReadiness(rootEpoch: authority.rootEpoch)
+        }
+        return disposition
+    }
 
     private func codemapManifestCandidate(
         rootEpoch: WorkspaceCodemapRootEpoch,
@@ -15253,10 +17741,9 @@ actor WorkspaceFileContextStore {
         relativePath: String
     ) -> Bool {
         let path = StandardizedPath.relative(relativePath)
-        return codemapPathInvalidationFlightsByRootEpoch[rootEpoch] != nil
-            || codemapPathFenceTokensByID.values.contains {
-                $0.rootEpoch == rootEpoch && $0.standardizedRelativePaths.contains(path)
-            }
+        return codemapPathFenceTokensByID.values.contains {
+            $0.rootEpoch == rootEpoch && $0.standardizedRelativePaths.contains(path)
+        }
     }
 
     private func standardizedCodemapInvalidationCommand(
@@ -15269,9 +17756,6 @@ actor WorkspaceFileContextStore {
         case let .deleted(paths):
             let safe = Set(paths.map(StandardizedPath.relative).filter { !$0.isEmpty })
             return safe.isEmpty ? nil : .deleted(safe)
-        case let .securityExcluded(paths):
-            let safe = Set(paths.map(StandardizedPath.relative).filter { !$0.isEmpty })
-            return safe.isEmpty ? nil : .securityExcluded(safe)
         case let .renamed(from, to):
             let oldPath = StandardizedPath.relative(from)
             let newPath = StandardizedPath.relative(to)
@@ -15288,8 +17772,7 @@ actor WorkspaceFileContextStore {
         var paths = Set<String>()
         for command in commands {
             switch command {
-            case let .modified(commandPaths), let .deleted(commandPaths),
-                 let .securityExcluded(commandPaths):
+            case let .modified(commandPaths), let .deleted(commandPaths):
                 paths.formUnion(commandPaths)
             case let .renamed(from, to):
                 paths.insert(from)
@@ -15305,82 +17788,46 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         commands rawCommands: [CodemapInvalidationCommand]
     ) async -> CodemapPathFenceToken? {
-        let launch = beginCodemapPathInvalidation(rootID: rootID, commands: rawCommands)
-        await launch.task?.value
-        return launch.token
-    }
-
-    /// Revokes path-level authority immediately for an explicit file mutation without making
-    /// disk I/O wait behind retained publisher-derived codemap convergence. The returned token
-    /// and retained flight continue fencing demand/projection admission until derived work settles.
-    private func beginCodemapPathFence(
-        rootID: UUID,
-        commands: [CodemapInvalidationCommand]
-    ) -> CodemapPathFenceToken? {
-        beginCodemapPathInvalidation(rootID: rootID, commands: commands).token
-    }
-
-    /// Invalidates codemap graph-index authority synchronously, while letting publisher ingress
-    /// commit the basic catalog without awaiting derived engine/graph convergence.
-    private func beginCodemapPathInvalidation(
-        rootID: UUID,
-        commands rawCommands: [CodemapInvalidationCommand],
-        publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-        diagnosticRootToken: UUID? = nil,
-        servicePublicationSequence: UInt64? = nil
-    ) -> (token: CodemapPathFenceToken?, task: Task<Void, Never>?) {
         let commands = rawCommands.compactMap(standardizedCodemapInvalidationCommand)
         let paths = codemapPaths(in: commands)
-        guard !paths.isEmpty, let state = rootStatesByID[rootID] else { return (nil, nil) }
-        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
-
-        retainCodemapRootStatusCoverageAcrossPathInvalidation(
-            rootEpoch: rootEpoch,
-            standardizedRelativePaths: paths
+        guard !paths.isEmpty,
+              let state = rootStatesByID[rootID]
+        else { return nil }
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: rootID,
+            rootLifetimeID: state.lifetimeID
         )
-        advanceCodemapGraphIndexInvalidationGeneration(rootEpoch: rootEpoch)
-        _ = cancelCodemapGraphIndexBuildLaunchForInvalidation(rootEpoch: rootEpoch)
+
+        guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch) else {
+            return nil
+        }
+
+        if let cleanup = codemapCleanupFlightsByRootID[rootID] {
+            await cleanup.task.value
+            return nil
+        }
+        if let existing = codemapPathInvalidationFlightsByRootEpoch[rootEpoch] {
+            await existing.task.value
+            guard rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID,
+                  codemapSessionsByRootEpoch[rootEpoch] != nil
+            else { return nil }
+            return await fenceCodemapPaths(rootID: rootID, commands: commands)
+        }
+        advanceCodemapProjectionInvalidationGeneration(rootEpoch: rootEpoch)
+        _ = cancelCodemapProjectionPreloadLaunchForInvalidation(
+            rootEpoch: rootEpoch
+        )
 
         let token = CodemapPathFenceToken(
             id: UUID(),
             rootEpoch: rootEpoch,
             standardizedRelativePaths: paths,
-            shouldRescheduleGraphIndex: true
+            shouldRescheduleProjectionPreload: true
         )
         codemapPathFenceTokensByID[token.id] = token
 
-        let predecessorTask = codemapPathInvalidationFlightsByRootEpoch[rootEpoch]?.task
-        let cleanupTask = codemapCleanupFlightsByRootID[rootID]?.task
         guard var session = codemapSessionsByRootEpoch[rootEpoch] else {
-            #if DEBUG
-                guard codemapPathInvalidationStageHandlerForTesting != nil else {
-                    return (token, nil)
-                }
-                let flightID = UUID()
-                let task = Task { [weak self] in
-                    guard let self else { return }
-                    await reportCodemapPathInvalidationStage(
-                        .rootMutationFence,
-                        rootEpoch: rootEpoch,
-                        flightID: flightID,
-                        publicationCorrelation: publicationCorrelation,
-                        diagnosticRootToken: diagnosticRootToken,
-                        servicePublicationSequence: servicePublicationSequence
-                    )
-                    await finishCodemapPathInvalidationWithoutAuthority(
-                        flightID: flightID,
-                        rootEpoch: rootEpoch
-                    )
-                }
-                codemapPathInvalidationFlightsByRootEpoch[rootEpoch] = CodemapPathInvalidationFlight(
-                    id: flightID,
-                    rootEpoch: rootEpoch,
-                    task: task
-                )
-                return (token, task)
-            #else
-                return (token, nil)
-            #endif
+            return token
         }
 
         let removedMarkerReadiness = session.markerReadinessByFileID.values
@@ -15417,7 +17864,9 @@ actor WorkspaceFileContextStore {
         }
 
         var affectedRecords: [CodemapDemandRecord] = []
-        for (fileID, record) in session.demandsByFileID where paths.contains(record.identity.standardizedRelativePath) {
+        for (fileID, record) in session.demandsByFileID
+            where paths.contains(record.identity.standardizedRelativePath)
+        {
             affectedRecords.append(record)
             session.demandsByFileID.removeValue(forKey: fileID)
             session.bundlesByRequestID.removeValue(forKey: record.ticket.requestID)?.close()
@@ -15434,7 +17883,27 @@ actor WorkspaceFileContextStore {
             session.pathGenerationsByRelativePath[path] = current == .max ? .max : current + 1
         }
 
-        let graph = session.selectionGraph
+        let graphPublicationTask = session.graphPublicationFlight?.task
+        graphPublicationTask?.cancel()
+        session.graphPublicationFlight = nil
+        let projectionRecoveryObserverTask = session.projectionRecoveryObserver?.task
+        projectionRecoveryObserverTask?.cancel()
+        session.projectionRecoveryObserver = nil
+        let graph = session.selectionGraph?.graph
+        let graphWorkerTask = session.selectionGraph?.workerTask
+        graphWorkerTask?.cancel()
+        if let graph {
+            session.selectionGraph = CodemapSelectionGraphState(
+                id: UUID(),
+                graph: graph,
+                desiredKey: nil,
+                pendingSnapshot: nil,
+                publishedSummary: nil,
+                lastRebuildDisposition: nil,
+                workerID: nil,
+                workerTask: nil
+            )
+        }
         codemapSessionsByRootEpoch[rootEpoch] = session
         if let markerReadinessEvent {
             yieldCodemapMarkerReadiness(markerReadinessEvent)
@@ -15443,85 +17912,26 @@ actor WorkspaceFileContextStore {
         let flightID = UUID()
         let task = Task { [weak self] in
             guard let self else { return }
-            await reportCodemapPathInvalidationStage(
-                .rootMutationFence,
-                rootEpoch: rootEpoch,
-                flightID: flightID,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
-                servicePublicationSequence: servicePublicationSequence
-            )
-            guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch) else {
-                await finishCodemapPathInvalidation(flightID: flightID, authority: session.authority)
-                return
-            }
-            if let cleanupTask {
-                await reportCodemapPathInvalidationStage(
-                    .cleanupFlight,
-                    rootEpoch: rootEpoch,
-                    flightID: flightID,
-                    publicationCorrelation: publicationCorrelation,
-                    diagnosticRootToken: diagnosticRootToken,
-                    servicePublicationSequence: servicePublicationSequence
-                )
-                await cleanupTask.value
-            }
-            if let predecessorTask {
-                await reportCodemapPathInvalidationStage(
-                    .predecessorFlight,
-                    rootEpoch: rootEpoch,
-                    flightID: flightID,
-                    publicationCorrelation: publicationCorrelation,
-                    diagnosticRootToken: diagnosticRootToken,
-                    servicePublicationSequence: servicePublicationSequence
-                )
-                await predecessorTask.value
-            }
-            guard await codemapAuthorityIsCurrent(session.authority) else {
-                await finishCodemapPathInvalidation(flightID: flightID, authority: session.authority)
-                return
-            }
             await performCodemapPathInvalidation(
                 flightID: flightID,
                 authority: session.authority,
                 engine: session.engine,
                 setupTask: session.setupTask,
+                graphPublicationTask: graphPublicationTask,
+                projectionRecoveryObserverTask: projectionRecoveryObserverTask,
                 graph: graph,
-                commands: commands,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
-                servicePublicationSequence: servicePublicationSequence
+                graphWorkerTask: graphWorkerTask,
+                commands: commands
             )
         }
-        codemapPathInvalidationFlightsByRootEpoch[rootEpoch] = CodemapPathInvalidationFlight(
+        let flight = CodemapPathInvalidationFlight(
             id: flightID,
             rootEpoch: rootEpoch,
             task: task
         )
-        return (token, task)
-    }
-
-    private func retainCodemapRootStatusCoverageAcrossPathInvalidation(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        standardizedRelativePaths: Set<String>
-    ) {
-        guard var baseline = codemapRootStatusCoverageBaselinesByRootEpoch[rootEpoch],
-              let state = rootStatesByID[rootEpoch.rootID],
-              state.lifetimeID == rootEpoch.rootLifetimeID,
-              let authority = currentCodemapAuthority(rootEpoch: rootEpoch),
-              let shard = codemapGraphIndexCatalogShardAndToken(authority: authority)?.shard
-        else { return }
-
-        for path in standardizedRelativePaths {
-            guard let fileID = state.fileIDsByRelativePath[path],
-                  shard.projectionFileIndexByID[fileID] != nil,
-                  baseline.invalidatedCandidateFileIDs.insert(fileID).inserted
-            else { continue }
-            baseline.retainedCandidateCount = baseline.retainedCandidateCount > 0
-                ? baseline.retainedCandidateCount - 1
-                : 0
-        }
-        codemapRootStatusCoverageBaselinesByRootEpoch[rootEpoch] = baseline
+        codemapPathInvalidationFlightsByRootEpoch[rootEpoch] = flight
+        await task.value
+        return token
     }
 
     private func performCodemapPathInvalidation(
@@ -15529,143 +17939,109 @@ actor WorkspaceFileContextStore {
         authority: CodemapRootAuthority,
         engine: WorkspaceCodemapBindingEngine?,
         setupTask: Task<CodemapSetupDisposition, Never>?,
+        graphPublicationTask: Task<Void, Never>?,
+        projectionRecoveryObserverTask: Task<Void, Never>?,
         graph: WorkspaceCodemapSelectionGraph?,
-        commands: [CodemapInvalidationCommand],
-        publicationCorrelation: EditFlowPerf.LifecycleCorrelation?,
-        diagnosticRootToken: UUID?,
-        servicePublicationSequence: UInt64?
+        graphWorkerTask: Task<Void, Never>?,
+        commands: [CodemapInvalidationCommand]
     ) async {
-        func report(_ stage: CodemapPathInvalidationStage) async {
-            await reportCodemapPathInvalidationStage(
-                stage,
-                rootEpoch: authority.rootEpoch,
-                flightID: flightID,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
-                servicePublicationSequence: servicePublicationSequence
+        if let graphPublicationTask {
+            await graphPublicationTask.value
+        }
+        if let projectionRecoveryObserverTask {
+            await projectionRecoveryObserverTask.value
+        }
+        if let graph {
+            _ = await graph.fenceContributionsForPathInvalidation(
+                rootEpoch: authority.rootEpoch
             )
         }
-
-        let destructiveFence = destructiveCodemapGraphFence(
-            rootID: authority.rootEpoch.rootID,
-            commands: commands
-        )
+        if let graphWorkerTask {
+            await graphWorkerTask.value
+        }
         if let setupTask {
-            await report(.setup)
             _ = await setupTask.value
         }
         let resolvedEngine = engine ?? codemapSessionsByRootEpoch[authority.rootEpoch]?.engine
         if let resolvedEngine {
-            // Destructive ordering is deliberate: remove the overlay contribution first, then
-            // install the cumulative graph fence, and only then publish consumer completion.
-            await report(.engineInvalidation)
             await applyCodemapInvalidationCommands(
                 commands,
                 rootEpoch: authority.rootEpoch,
                 engine: resolvedEngine
             )
         }
-        if let graph, let destructiveFence, !destructiveFence.fileIDs.isEmpty {
-            await report(.graphContributionFence)
-            _ = await graph.fenceFiles(
-                fileIDs: destructiveFence.fileIDs,
-                reason: destructiveFence.reason
-            )
-        }
-        await report(.completionPublication)
+        let bundle = await resolvedEngine?.freeze(rootEpoch: authority.rootEpoch)
+        let snapshot = try? bundle?.graphSnapshot()
         await finishCodemapPathInvalidation(
             flightID: flightID,
-            authority: authority
+            authority: authority,
+            snapshot: snapshot
         )
-    }
-
-    private func destructiveCodemapGraphFence(
-        rootID: UUID,
-        commands: [CodemapInvalidationCommand]
-    ) -> (fileIDs: Set<UUID>, reason: WorkspaceCodemapGraphFenceReason)? {
-        guard let fileIDsByRelativePath = rootStatesByID[rootID]?.fileIDsByRelativePath else { return nil }
-        var fileIDs = Set<UUID>()
-        var reason: WorkspaceCodemapGraphFenceReason = .deleted
-        for command in commands {
-            switch command {
-            case let .deleted(paths):
-                fileIDs.formUnion(paths.compactMap { fileIDsByRelativePath[$0] })
-            case let .renamed(from, to):
-                reason = .renamed
-                if let fileID = fileIDsByRelativePath[from] { fileIDs.insert(fileID) }
-                if let fileID = fileIDsByRelativePath[to] { fileIDs.insert(fileID) }
-            case let .securityExcluded(paths):
-                reason = .securityExcluded
-                fileIDs.formUnion(paths.compactMap { fileIDsByRelativePath[$0] })
-            case .modified, .watcherGap, .checkout, .repositoryAuthority, .catalogAdvanced, .unload:
-                break
-            }
-        }
-        return fileIDs.isEmpty ? nil : (fileIDs, reason)
-    }
-
-    private func reportCodemapPathInvalidationStage(
-        _ stage: CodemapPathInvalidationStage,
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        flightID: UUID,
-        publicationCorrelation: EditFlowPerf.LifecycleCorrelation?,
-        diagnosticRootToken: UUID?,
-        servicePublicationSequence: UInt64?
-    ) async {
-        EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.WorkspaceIngress.codemapInvalidationStage,
-            correlation: publicationCorrelation,
-            EditFlowPerf.Dimensions(
-                outcome: stage.rawValue,
-                rootToken: diagnosticRootToken?.uuidString,
-                barrierSequence: servicePublicationSequence,
-                observerToken: flightID.uuidString
-            )
-        )
-        #if DEBUG
-            await codemapPathInvalidationStageHandlerForTesting?(rootEpoch, flightID, stage)
-        #endif
-    }
-
-    @discardableResult
-    private func removeCodemapPathInvalidationFlight(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        flightID: UUID
-    ) -> Bool {
-        guard codemapPathInvalidationFlightsByRootEpoch[rootEpoch]?.id == flightID else { return false }
-        codemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: rootEpoch)
-        return true
-    }
-
-    private func removeCodemapPathFenceToken(id: UUID) {
-        codemapPathFenceTokensByID.removeValue(forKey: id)
-    }
-
-    private func finishCodemapPathInvalidationWithoutAuthority(
-        flightID: UUID,
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) {
-        guard removeCodemapPathInvalidationFlight(rootEpoch: rootEpoch, flightID: flightID) else { return }
-        schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: rootEpoch)
-        resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: rootEpoch)
+        bundle?.close()
     }
 
     private func finishCodemapPathInvalidation(
         flightID: UUID,
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        snapshot: WorkspaceCodemapLiveGraphSnapshot?
     ) async {
         guard codemapPathInvalidationFlightsByRootEpoch[authority.rootEpoch]?.id == flightID else {
             return
         }
         defer {
-            if removeCodemapPathInvalidationFlight(rootEpoch: authority.rootEpoch, flightID: flightID) {
-                schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(
+            if codemapPathInvalidationFlightsByRootEpoch[authority.rootEpoch]?.id == flightID {
+                codemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: authority.rootEpoch)
+                scheduleDirtyCodemapGraphPublicationIfUnfenced(
                     rootEpoch: authority.rootEpoch
                 )
-                resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: authority.rootEpoch)
+                schedulePendingCodemapProjectionPreloadIfFullyUnfenced(
+                    rootEpoch: authority.rootEpoch
+                )
             }
         }
         guard codemapAuthorityIsCurrent(authority) else { return }
+        if let snapshot,
+           let acceptedSnapshot = codemapPathInvalidationGraphSnapshot(
+               snapshot,
+               authority: authority
+           )
+        {
+            await enqueueCodemapGraphSnapshot(acceptedSnapshot)
+        }
+    }
+
+    private func codemapPathInvalidationGraphSnapshot(
+        _ snapshot: WorkspaceCodemapLiveGraphSnapshot,
+        authority: CodemapRootAuthority
+    ) -> WorkspaceCodemapLiveGraphSnapshot? {
+        guard snapshot.rootEpoch == authority.rootEpoch,
+              snapshot.catalogGeneration == authority.catalogGeneration,
+              let session = codemapSessionsByRootEpoch[authority.rootEpoch]
+        else { return nil }
+        let retainedBindings = snapshot.bindings.filter { binding in
+            guard let record = session.demandsByFileID[binding.identity.fileID],
+                  case let .ready(ready) = record.result,
+                  case let .resolved(completion) = binding.availability
+            else { return false }
+            return ready.identity == binding.identity &&
+                ready.ticket == record.ticket &&
+                ready.snapshot.artifactKey == completion.artifactKey
+        }
+        guard let firstBinding = retainedBindings.first,
+              let firstRecord = session.demandsByFileID[firstBinding.identity.fileID],
+              case let .ready(triggeringReady) = firstRecord.result
+        else { return nil }
+        let filtered = WorkspaceCodemapLiveGraphSnapshot(
+            rootEpoch: snapshot.rootEpoch,
+            catalogGeneration: snapshot.catalogGeneration,
+            repositoryAuthority: snapshot.repositoryAuthority,
+            contributionGeneration: snapshot.contributionGeneration,
+            bindings: retainedBindings
+        )
+        return codemapGraphSnapshotIsAccepted(
+            filtered,
+            triggeringReady: triggeringReady
+        ) ? filtered : nil
     }
 
     private func releaseCodemapPathFence(
@@ -15673,28 +18049,29 @@ actor WorkspaceFileContextStore {
         didCommitMutation: Bool = true
     ) {
         guard let token else { return }
-        removeCodemapPathFenceToken(id: token.id)
+        codemapPathFenceTokensByID.removeValue(forKey: token.id)
+        scheduleDirtyCodemapGraphPublicationIfUnfenced(rootEpoch: token.rootEpoch)
         // The fence itself advanced projection/path authority and cancelled old work. A failed
         // disk mutation still needs one restoration preload, while committed work needs the same
         // reschedule against the new public catalog.
-        if token.shouldRescheduleGraphIndex {
-            codemapGraphIndexBuildReschedulePendingRootEpochs.insert(token.rootEpoch)
+        if token.shouldRescheduleProjectionPreload {
+            if codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] == nil {
+                codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] = .rootReady
+            }
         }
         _ = didCommitMutation
-        schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: token.rootEpoch)
-        resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: token.rootEpoch)
+        schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: token.rootEpoch)
     }
 
-    private func cancelCodemapGraphIndexBuildLaunchForInvalidation(
+    private func cancelCodemapProjectionPreloadLaunchForInvalidation(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> Task<Void, Never>? {
-        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
-        codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
-        guard let launch = codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(
+        codemapProjectionPreloadRetriesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
+        guard let launch = codemapProjectionPreloadLaunchesByRootEpoch.removeValue(
             forKey: rootEpoch
         ) else { return nil }
         launch.task?.cancel()
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .superseded,
             rootEpoch: rootEpoch,
             phase: .superseded
@@ -15702,17 +18079,32 @@ actor WorkspaceFileContextStore {
         return launch.task
     }
 
+    private func scheduleDirtyCodemapGraphPublicationIfUnfenced(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        guard codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,
+              !codemapPathFenceTokensByID.values.contains(where: {
+                  $0.rootEpoch == rootEpoch
+              }),
+              var session = codemapSessionsByRootEpoch[rootEpoch],
+              session.graphSnapshotDirtyDuringPathInvalidation
+        else { return }
+        session.graphSnapshotDirtyDuringPathInvalidation = false
+        codemapSessionsByRootEpoch[rootEpoch] = session
+        signalCodemapGraphPublication(rootEpoch: rootEpoch)
+    }
+
+    @discardableResult
     private func detachCodemapSession(
         rootEpoch: WorkspaceCodemapRootEpoch,
         invalidationCommands: [CodemapInvalidationCommand] = [.catalogAdvanced],
-        graphInvalidationReason: WorkspaceCodemapGraphRevocationReason =
-            .repositoryAuthorityChanged
+        graphInvalidationReason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason =
+            .authorityRevoked
     ) -> CodemapCleanupFlight? {
-        codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
-        let launch = codemapGraphIndexBuildLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
+        let launch = codemapProjectionPreloadLaunchesByRootEpoch.removeValue(forKey: rootEpoch)
         launch?.task?.cancel()
         if launch != nil {
-            recordCodemapGraphIndexBuildStoreEvent(
+            recordCodemapProjectionPreloadStoreEvent(
                 .cancelled,
                 rootEpoch: rootEpoch,
                 phase: .cancelled
@@ -15720,15 +18112,12 @@ actor WorkspaceFileContextStore {
         }
         let eligibilityFlight = codemapEligibilityFlightsByRootEpoch.removeValue(forKey: rootEpoch)
         eligibilityFlight?.task.cancel()
-        let graphIndexRetry = codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)
-        graphIndexRetry?.task.cancel()
+        let preloadRetry = codemapProjectionPreloadRetriesByRootEpoch.removeValue(forKey: rootEpoch)
+        preloadRetry?.task.cancel()
         let completedEligibility = codemapCompletedEligibilityByRootEpoch.removeValue(
             forKey: rootEpoch
         )
         let session = codemapSessionsByRootEpoch.removeValue(forKey: rootEpoch)
-        codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
-        codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
-        publishCodemapRootStatusesIfChanged()
         if let session, !session.markerReadinessByFileID.isEmpty {
             let changes = session.markerReadinessByFileID.values.map {
                 WorkspaceCodemapMarkerReadinessChange(
@@ -15750,14 +18139,23 @@ actor WorkspaceFileContextStore {
                 changes: changes
             ))
         }
+        let projectionDemandIDs = codemapProjectionDemandsByID.compactMap { id, record in
+            record.ticket.rootEpoch == rootEpoch ? id : nil
+        }
+        let projectionDemands = projectionDemandIDs.compactMap {
+            codemapProjectionDemandsByID.removeValue(forKey: $0)
+        }
+        for record in projectionDemands {
+            record.expiryTask?.cancel()
+        }
         guard session != nil || launch != nil || eligibilityFlight != nil || completedEligibility != nil
-            || graphIndexRetry != nil
+            || preloadRetry != nil || !projectionDemands.isEmpty
         else {
             return codemapCleanupFlightsByRootID[rootEpoch.rootID]
         }
-        advanceCodemapGraphIndexInvalidationGeneration(rootEpoch: rootEpoch)
+        advanceCodemapProjectionInvalidationGeneration(rootEpoch: rootEpoch)
         guard let authority = session?.authority ?? launch?.authority ?? eligibilityFlight?.authority
-            ?? completedEligibility?.authority ?? graphIndexRetry?.authority
+            ?? completedEligibility?.authority ?? preloadRetry?.authority
         else {
             return codemapCleanupFlightsByRootID[rootEpoch.rootID]
         }
@@ -15767,7 +18165,9 @@ actor WorkspaceFileContextStore {
             ? 0
             : authorityGeneration + 1
         session?.setupTask?.cancel()
-        session?.graphStatusTask?.cancel()
+        session?.graphPublicationFlight?.task?.cancel()
+        session?.projectionRecoveryObserver?.task?.cancel()
+        session?.selectionGraph?.workerTask?.cancel()
         let demandRecords = session.map { Array($0.demandsByFileID.values) } ?? []
         for record in demandRecords {
             record.task?.cancel()
@@ -15785,11 +18185,14 @@ actor WorkspaceFileContextStore {
             owners: demandRecords.map(\.owner),
             setupTask: session?.setupTask,
             demandTasks: demandRecords.compactMap(\.task),
-            graphStatusTask: session?.graphStatusTask,
-            selectionGraph: session?.selectionGraph,
+            projectionDemands: projectionDemands,
+            graphPublicationTask: session?.graphPublicationFlight?.task,
+            projectionRecoveryObserverTask: session?.projectionRecoveryObserver?.task,
+            selectionGraph: session?.selectionGraph?.graph,
+            graphWorkerTask: session?.selectionGraph?.workerTask,
             preloadLaunchTask: launch?.task,
             eligibilityTask: eligibilityFlight?.task,
-            graphIndexRetryTask: graphIndexRetry?.task,
+            preloadRetryTask: preloadRetry?.task,
             predecessorTasks: predecessorTasks,
             invalidationCommands: invalidationCommands.compactMap(
                 standardizedCodemapInvalidationCommand
@@ -15810,10 +18213,18 @@ actor WorkspaceFileContextStore {
             for predecessorTask in detached.predecessorTasks {
                 await predecessorTask.value
             }
-            if let graphStatusTask = detached.graphStatusTask {
-                await graphStatusTask.value
+            if let graphPublicationTask = detached.graphPublicationTask {
+                await graphPublicationTask.value
             }
-            await detached.selectionGraph?.shutdown(reason: detached.graphInvalidationReason)
+            if let projectionRecoveryObserverTask = detached.projectionRecoveryObserverTask {
+                await projectionRecoveryObserverTask.value
+            }
+            if let selectionGraph = detached.selectionGraph {
+                _ = await selectionGraph.invalidateCurrentness(
+                    rootEpoch: detached.authority.rootEpoch,
+                    reason: detached.graphInvalidationReason
+                )
+            }
             if let registry = detached.registry, let routeToken = detached.routeToken {
                 _ = await registry.unregister(routeToken)
             }
@@ -15825,6 +18236,9 @@ actor WorkspaceFileContextStore {
                 )
                 for owner in detached.owners {
                     _ = await engine.cancel(owner: owner)
+                }
+                for projectionDemand in detached.projectionDemands {
+                    await projectionDemand.engine.releaseProjectionDemand(projectionDemand.ticket)
                 }
                 if detached.invalidationCommands.contains(where: {
                     if case .unload = $0 { true } else { false }
@@ -15841,11 +18255,14 @@ actor WorkspaceFileContextStore {
             if let eligibilityTask = detached.eligibilityTask {
                 _ = await eligibilityTask.value
             }
-            if let graphIndexRetryTask = detached.graphIndexRetryTask {
-                await graphIndexRetryTask.value
+            if let preloadRetryTask = detached.preloadRetryTask {
+                await preloadRetryTask.value
             }
             for demandTask in detached.demandTasks {
                 await demandTask.value
+            }
+            if let graphWorkerTask = detached.graphWorkerTask {
+                await graphWorkerTask.value
             }
             await self?.finishCodemapCleanup(
                 rootID: detached.authority.rootEpoch.rootID,
@@ -15880,10 +18297,6 @@ actor WorkspaceFileContextStore {
                 )
             case let .renamed(from, to):
                 _ = await engine.invalidateRenamed(rootEpoch: rootEpoch, from: from, to: to)
-            case .securityExcluded:
-                // GraphIndex has already replaced the visible overlay slot. This command exists
-                // only to route the immediate cumulative safety fence before marker publication.
-                break
             case .watcherGap:
                 _ = await engine.invalidateWatcherGap(rootEpoch: rootEpoch)
             case .checkout:
@@ -15903,7 +18316,7 @@ actor WorkspaceFileContextStore {
         let rootEpoch = codemapCleanupFlightsByRootID[rootID]?.rootEpoch
         codemapCleanupFlightsByRootID.removeValue(forKey: rootID)
         if let rootEpoch {
-            schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: rootEpoch)
+            schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: rootEpoch)
         }
     }
 
@@ -15923,31 +18336,26 @@ actor WorkspaceFileContextStore {
             rootID: rootID,
             rootLifetimeID: initialState.lifetimeID
         )
-        let token: CodemapRootMutationFenceToken
-        while true {
-            guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch),
-                  !Task.isCancelled,
-                  rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID
-            else {
-                return nil
-            }
-            if codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) {
-                token = CodemapRootMutationFenceToken(id: UUID(), rootEpoch: rootEpoch)
-                codemapRootMutationFenceTokensByRootEpoch[rootEpoch] = token
-                break
-            }
-            // Drain path work before acquiring the root fence. Retained path flights wait on an
-            // already-held root fence, so installing the root fence first would make each side
-            // wait for the other. After path work drains, loop back through the root-fence lane so
-            // competing root mutations remain serialized.
-            guard await waitForCodemapPathQuiescenceIfNeeded(rootEpoch: rootEpoch) else {
-                return nil
-            }
+        guard await waitForCodemapRootMutationFenceIfNeeded(rootEpoch: rootEpoch) else {
+            return nil
         }
+
+        let token = CodemapRootMutationFenceToken(id: UUID(), rootEpoch: rootEpoch)
+        codemapRootMutationFenceTokensByRootEpoch[rootEpoch] = token
         var didTransferFenceOwnership = false
         defer {
             if !didTransferFenceOwnership {
                 finishCodemapRootMutationFence(token, didCommitMutation: false)
+            }
+        }
+        while codemapPathInvalidationFlightsByRootEpoch[rootEpoch] != nil ||
+            codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch })
+        {
+            await Task.yield()
+            guard !Task.isCancelled,
+                  rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID
+            else {
+                return nil
             }
         }
         await fenceCodemapRootAuthority(rootIDs: [rootID], command: command)
@@ -15958,62 +18366,6 @@ actor WorkspaceFileContextStore {
         }
         didTransferFenceOwnership = true
         return token
-    }
-
-    private func codemapPathWorkIsQuiescent(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) -> Bool {
-        codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil &&
-            !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch })
-    }
-
-    private func waitForCodemapPathQuiescenceIfNeeded(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) async -> Bool {
-        while !codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) {
-            let waiterID = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    if codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) ||
-                        Task.isCancelled ||
-                        rootStatesByID[rootEpoch.rootID]?.lifetimeID != rootEpoch.rootLifetimeID
-                    {
-                        continuation.resume()
-                    } else {
-                        codemapPathQuiescenceWaitersByRootEpoch[rootEpoch, default: [:]][waiterID] = continuation
-                    }
-                }
-            } onCancel: {
-                Task { await self.cancelCodemapPathQuiescenceWaiter(rootEpoch: rootEpoch, waiterID: waiterID) }
-            }
-            guard !Task.isCancelled,
-                  rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
-            else { return false }
-        }
-        return true
-    }
-
-    private func cancelCodemapPathQuiescenceWaiter(
-        rootEpoch: WorkspaceCodemapRootEpoch,
-        waiterID: UUID
-    ) {
-        guard let continuation = codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?
-            .removeValue(forKey: waiterID)
-        else { return }
-        if codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?.isEmpty == true {
-            codemapPathQuiescenceWaitersByRootEpoch.removeValue(forKey: rootEpoch)
-        }
-        continuation.resume()
-    }
-
-    private func resumeCodemapPathQuiescenceWaitersIfNeeded(
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) {
-        guard codemapPathWorkIsQuiescent(rootEpoch: rootEpoch) else { return }
-        let waiters = codemapPathQuiescenceWaitersByRootEpoch.removeValue(forKey: rootEpoch) ?? [:]
-        for continuation in waiters.values {
-            continuation.resume()
-        }
     }
 
     private func waitForCodemapRootMutationFenceIfNeeded(
@@ -16064,32 +18416,30 @@ actor WorkspaceFileContextStore {
         // preload even when the disk operation fails; successful mutations observe the same
         // post-publication scheduling point.
         if rootStatesByID[token.rootEpoch.rootID]?.lifetimeID == token.rootEpoch.rootLifetimeID {
-            codemapGraphIndexBuildReschedulePendingRootEpochs.insert(token.rootEpoch)
+            if codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] == nil {
+                codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] = .rootReady
+            }
         }
         _ = didCommitMutation
         let waiters = codemapRootMutationFenceWaitersByRootEpoch.removeValue(forKey: token.rootEpoch) ?? [:]
         for continuation in waiters.values {
             continuation.resume()
         }
-        schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: token.rootEpoch)
+        schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: token.rootEpoch)
     }
 
-    private func schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(
+    private func schedulePendingCodemapProjectionPreloadIfFullyUnfenced(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
-            codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
-            return
-        }
-        guard codemapGraphIndexBuildReschedulePendingRootEpochs.contains(rootEpoch),
+        guard let trigger = codemapProjectionPreloadPendingTriggerByRootEpoch[rootEpoch],
               codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
               codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,
               !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch }),
               codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
               rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
         else { return }
-        codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
-        scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: rootEpoch)
+        codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch)
+        scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch, trigger: trigger)
     }
 
     private func fenceCodemapRootAuthority(
@@ -16099,35 +18449,12 @@ actor WorkspaceFileContextStore {
         let loadedRootIDs = Set(rootIDs.filter { rootStatesByID[$0] != nil })
         guard !loadedRootIDs.isEmpty else { return }
         let affectedRootEpochs = Set(codemapSessionsByRootEpoch.keys)
-            .union(codemapGraphIndexBuildLaunchesByRootEpoch.keys)
+            .union(codemapProjectionPreloadLaunchesByRootEpoch.keys)
             .union(codemapEligibilityFlightsByRootEpoch.keys)
             .union(codemapCompletedEligibilityByRootEpoch.keys)
-            .union(codemapGraphIndexBuildRetriesByRootEpoch.keys)
+            .union(codemapProjectionPreloadRetriesByRootEpoch.keys)
             .union(codemapAuthorityGenerationsByRootEpoch.keys)
             .filter { loadedRootIDs.contains($0.rootID) }
-        if case .watcherGap = command {
-            for rootEpoch in affectedRootEpochs {
-                if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
-                    _ = await engine.invalidateWatcherGap(rootEpoch: rootEpoch)
-                } else {
-                    // Terminal eligibility roots do not own a binding engine yet. Preserve their
-                    // store-owned retry path while graph-bearing roots reconcile through the
-                    // engine-owned pull loop above. A watcher gap invalidates the prior terminal
-                    // classification, so retire both its launch and stable setup disposition.
-                    _ = cancelCodemapGraphIndexBuildLaunchForInvalidation(rootEpoch: rootEpoch)
-                    codemapCompletedEligibilityByRootEpoch.removeValue(forKey: rootEpoch)
-                    if var session = codemapSessionsByRootEpoch[rootEpoch], session.engine == nil {
-                        session.setupTask?.cancel()
-                        session.setupTask = nil
-                        session.setupDisposition = nil
-                        codemapSessionsByRootEpoch[rootEpoch] = session
-                    }
-                    codemapGraphIndexBuildReschedulePendingRootEpochs.insert(rootEpoch)
-                    schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: rootEpoch)
-                }
-            }
-            return
-        }
         for rootEpoch in affectedRootEpochs {
             let previousGeneration = codemapAuthorityGenerationsByRootEpoch[rootEpoch]
             let cleanup = detachCodemapSession(
@@ -16138,7 +18465,7 @@ actor WorkspaceFileContextStore {
                let previousGeneration,
                codemapAuthorityGenerationsByRootEpoch[rootEpoch] == previousGeneration
             {
-                advanceCodemapGraphIndexInvalidationGeneration(rootEpoch: rootEpoch)
+                advanceCodemapProjectionInvalidationGeneration(rootEpoch: rootEpoch)
                 codemapAuthorityGenerationsByRootEpoch[rootEpoch] = previousGeneration == .max
                     ? 0
                     : previousGeneration + 1
@@ -16171,13 +18498,15 @@ actor WorkspaceFileContextStore {
         }
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
-        let codemapFence = beginCodemapPathFence(
+        guard let codemapFence = await beginCodemapRootMutationFence(
             rootID: rootID,
-            commands: [.modified([standardizedRelativePath])]
-        )
+            command: .catalogAdvanced
+        ) else {
+            throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
+        }
         var didCommitCatalogMutation = false
         defer {
-            releaseCodemapPathFence(
+            finishCodemapRootMutationFence(
                 codemapFence,
                 didCommitMutation: didCommitCatalogMutation
             )
@@ -16185,9 +18514,9 @@ actor WorkspaceFileContextStore {
         try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
         let result = try await materializeCatalogFileAfterDiskWrite(
             rootID: rootID,
-            relativePath: standardizedRelativePath,
-            codemapPathLocalMutation: true
+            relativePath: standardizedRelativePath
         )
+        await awaitCodemapCleanupFlights(rootIDs: [rootID])
         if case .materialized = result {
             didCommitCatalogMutation = true
         }
@@ -16199,7 +18528,7 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let expectedLifetimeID = state.lifetimeID
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
-        let codemapFence = beginCodemapPathFence(
+        let codemapFence = await fenceCodemapPaths(
             rootID: rootID,
             commands: [.modified([standardizedRelativePath])]
         )
@@ -16296,7 +18625,7 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let oldPath = StandardizedPath.relative(oldRelativePath)
         let newPath = StandardizedPath.relative(newRelativePath)
-        let codemapFence = beginCodemapPathFence(
+        let codemapFence = await fenceCodemapPaths(
             rootID: rootID,
             commands: [.renamed(from: oldPath, to: newPath)]
         )
@@ -16339,7 +18668,7 @@ actor WorkspaceFileContextStore {
     func deleteFile(rootID: UUID, relativePath: String) async throws {
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
-        let codemapFence = beginCodemapPathFence(
+        let codemapFence = await fenceCodemapPaths(
             rootID: rootID,
             commands: [.deleted([standardizedRelativePath])]
         )
@@ -16389,7 +18718,7 @@ actor WorkspaceFileContextStore {
         } else {
             [standardizedRelativePath]
         }
-        let codemapFence = beginCodemapPathFence(
+        let codemapFence = await fenceCodemapPaths(
             rootID: rootID,
             commands: [.deleted(affectedPaths)]
         )
@@ -17137,8 +19466,6 @@ actor WorkspaceFileContextStore {
             expectedLifetimeID: UUID? = nil,
             watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?,
             servicePublicationSequence: UInt64?,
-            publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-            diagnosticRootToken: UUID? = nil,
             requiresFullResync: Bool = false
         ) async {
             guard let servicePublicationSequence else {
@@ -17146,8 +19473,6 @@ actor WorkspaceFileContextStore {
                     rootID: rootID,
                     deltas: deltas,
                     expectedLifetimeID: expectedLifetimeID,
-                    publicationCorrelation: publicationCorrelation,
-                    diagnosticRootToken: diagnosticRootToken,
                     requiresFullResync: requiresFullResync
                 )
                 return
@@ -17156,9 +19481,6 @@ actor WorkspaceFileContextStore {
                 rootID: rootID,
                 deltas: deltas,
                 expectedLifetimeID: expectedLifetimeID,
-                servicePublicationSequence: servicePublicationSequence,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
             guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -17174,9 +19496,6 @@ actor WorkspaceFileContextStore {
             rootID: UUID,
             deltas: [PreparedFileSystemDelta],
             expectedLifetimeID: UUID? = nil,
-            servicePublicationSequence: UInt64? = nil,
-            publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-            diagnosticRootToken: UUID? = nil,
             requiresFullResync: Bool = false
         ) async -> PublicationInvalidationRecorder {
             let recorder = PublicationInvalidationRecorder(preparedDeltaCount: deltas.count)
@@ -17185,9 +19504,6 @@ actor WorkspaceFileContextStore {
                     rootID: rootID,
                     deltas: deltas,
                     expectedLifetimeID: expectedLifetimeID,
-                    servicePublicationSequence: servicePublicationSequence,
-                    publicationCorrelation: publicationCorrelation,
-                    diagnosticRootToken: diagnosticRootToken,
                     requiresFullResync: requiresFullResync
                 )
             }
@@ -17198,18 +19514,12 @@ actor WorkspaceFileContextStore {
             rootID: UUID,
             deltas: [PreparedFileSystemDelta],
             expectedLifetimeID: UUID? = nil,
-            servicePublicationSequence: UInt64? = nil,
-            publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-            diagnosticRootToken: UUID? = nil,
             requiresFullResync: Bool = false
         ) async {
             await applyPreparedIndexDeltasBody(
                 rootID: rootID,
                 deltas: deltas,
                 expectedLifetimeID: expectedLifetimeID,
-                servicePublicationSequence: servicePublicationSequence,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
                 requiresFullResync: requiresFullResync
             )
         }
@@ -17253,9 +19563,6 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         deltas: [PreparedFileSystemDelta],
         expectedLifetimeID: UUID? = nil,
-        servicePublicationSequence: UInt64? = nil,
-        publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-        diagnosticRootToken: UUID? = nil,
         requiresFullResync: Bool = false
     ) async {
         guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -17283,6 +19590,14 @@ actor WorkspaceFileContextStore {
             requiresFullResync: requiresFullResync
         )
         if let rootCommand = invalidation.rootCommand {
+            #if DEBUG
+                if case .watcherGap = rootCommand {
+                    Self.activePublicationInvalidationRecorder?.watcherGapInvalidationCount += 1
+                }
+            #endif
+            if case .watcherGap = rootCommand, let repositoryMutationFence {
+                codemapProjectionPreloadPendingTriggerByRootEpoch[repositoryMutationFence.rootEpoch] = .watcherGap
+            }
             if repositoryMutationFence == nil {
                 await fenceCodemapRootAuthority(rootIDs: [rootID], command: rootCommand)
             }
@@ -17293,17 +19608,15 @@ actor WorkspaceFileContextStore {
                 requiresFullResync: requiresFullResync
             )
             didCommitRepositoryMutation = repositoryMutationFence != nil
-            // Publisher application has already revoked the old root codemap authority. Keep the
-            // derived cleanup flight retained/fenced, but do not hold the basic catalog publication
-            // open on its completion. Direct codemap-sensitive callers retain the synchronous fence.
-            if servicePublicationSequence == nil {
-                await awaitCodemapCleanupFlights(rootIDs: [rootID])
-            }
+            await awaitCodemapCleanupFlights(rootIDs: [rootID])
             if repositoryMutationFence == nil, let current = rootStatesByID[rootID] {
-                scheduleCodemapGraphIndexBuildAfterRootReady(rootEpoch: WorkspaceCodemapRootEpoch(
-                    rootID: rootID,
-                    rootLifetimeID: current.lifetimeID
-                ))
+                scheduleCodemapProjectionPreloadAfterRootReady(
+                    rootEpoch: WorkspaceCodemapRootEpoch(
+                        rootID: rootID,
+                        rootLifetimeID: current.lifetimeID
+                    ),
+                    trigger: .watcherGap
+                )
             }
             return
         }
@@ -17319,20 +19632,10 @@ actor WorkspaceFileContextStore {
             return
         }
 
-        let token: CodemapPathFenceToken? = if let servicePublicationSequence {
-            beginCodemapPathInvalidation(
-                rootID: rootID,
-                commands: invalidation.pathCommands,
-                publicationCorrelation: publicationCorrelation,
-                diagnosticRootToken: diagnosticRootToken,
-                servicePublicationSequence: servicePublicationSequence
-            ).token
-        } else {
-            await fenceCodemapPaths(
-                rootID: rootID,
-                commands: invalidation.pathCommands
-            )
-        }
+        let token = await fenceCodemapPaths(
+            rootID: rootID,
+            commands: invalidation.pathCommands
+        )
         var didCommitPathMutation = false
         defer {
             releaseCodemapPathFence(token, didCommitMutation: didCommitPathMutation)
@@ -17373,7 +19676,7 @@ actor WorkspaceFileContextStore {
         guard repositoryLayoutMayHaveChanged else { return nil }
 
         terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
-        recordCodemapGraphIndexBuildStoreEvent(
+        recordCodemapProjectionPreloadStoreEvent(
             .repositoryAuthorityDetached,
             rootEpoch: rootEpoch,
             phase: .superseded
@@ -18710,10 +21013,10 @@ actor WorkspaceFileContextStore {
             codemapPathLocalCatalogMutationDepthByRootID[$0] == nil
         }
         let rootEpochsRequiringAuthorityFence = Set(codemapSessionsByRootEpoch.keys)
-            .union(codemapGraphIndexBuildLaunchesByRootEpoch.keys)
+            .union(codemapProjectionPreloadLaunchesByRootEpoch.keys)
             .union(codemapEligibilityFlightsByRootEpoch.keys)
             .union(codemapCompletedEligibilityByRootEpoch.keys)
-            .union(codemapGraphIndexBuildRetriesByRootEpoch.keys)
+            .union(codemapProjectionPreloadRetriesByRootEpoch.keys)
             .filter { rootIDsRequiringAuthorityFence.contains($0.rootID) }
         for rootEpoch in rootEpochsRequiringAuthorityFence {
             _ = detachCodemapSession(
@@ -18782,16 +21085,14 @@ actor WorkspaceFileContextStore {
                 }
             }
         case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
-            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
-                canonicalRoots: canonicalRoots,
-                physicalRoots: physicalRoots
-            ) else { return [] }
+            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
+            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
             return allRoots.filter { root in
                 switch root.kind {
                 case .primaryWorkspace:
-                    selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
+                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
                 case .sessionWorktree:
-                    selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
+                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }
@@ -19354,6 +21655,13 @@ actor WorkspaceFileContextStore {
         while let id = folderID {
             managedOnlyFolderIDs.remove(id)
             folderID = foldersByID[id]?.parentFolderID
+        }
+    }
+
+    private func yieldCodemapSelectionGraphReadiness(rootEpoch: WorkspaceCodemapRootEpoch) {
+        let event = WorkspaceCodemapSelectionGraphReadinessEvent(rootEpoch: rootEpoch)
+        for continuation in codemapSelectionGraphReadinessContinuations.values {
+            continuation.yield(event)
         }
     }
 
