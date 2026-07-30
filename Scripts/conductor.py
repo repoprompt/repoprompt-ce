@@ -37,7 +37,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 import failure_diagnostics
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -78,11 +78,13 @@ DEBUG_APP_PROVENANCE_RELATIVE_PATH = "Contents/Resources/RepoPromptDebugProvenan
 SHORT_TIMEOUT_SECONDS = 5 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
+RELEASE_ARTIFACT_TIMEOUT_SECONDS = 4 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
 IMPLEMENTED_OPERATIONS = {
     "doctor",
     "guardrails",
+    "codex-schema-check",
     "format",
     "format-check",
     "lint",
@@ -127,6 +129,7 @@ Job commands:
 Operation commands:
   ./conductor doctor
   ./conductor guardrails
+  ./conductor codex-schema-check      # validate bounded RPCE assumptions against generated Codex schemas
   ./conductor format                 # mutates first-party Swift files
   ./conductor format-check           # non-mutating SwiftFormat check
   ./conductor lint                   # non-mutating format-check + SwiftLint strict
@@ -145,7 +148,8 @@ Operation commands:
   ./conductor app stop                                 # latest interactive stop intent
   ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
-  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
+  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
+    --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
@@ -1245,6 +1249,8 @@ class OperationRegistry:
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
+        "REPOPROMPT_CODEX_ARCH",
+        "REPOPROMPT_CODEX_CACHE_ROOT",
     ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",
@@ -1257,6 +1263,14 @@ class OperationRegistry:
         "RPCE_ENABLE_BENCHMARK_TESTS",
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
+        "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK",
+        "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE",
+        "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE",
+        "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH",
+        "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH",
+        "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES",
+        "RP_SWIFT_CODEMAP_REFERENCE_MODE",
+        "RP_SWIFT_CODEMAP_REFERENCE_PATH",
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
@@ -1340,6 +1354,8 @@ class OperationRegistry:
             return [script("doctor.sh")], lanes, cwd, env, effective_timeout
         if operation == "guardrails":
             return [script("guardrails.sh")], lanes, cwd, env, effective_timeout
+        if operation == "codex-schema-check":
+            return [sys.executable, script("check_codex_app_server_schema.py")], lanes, cwd, env, effective_timeout
         if operation == "format":
             return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
         if operation == "format-check":
@@ -1493,11 +1509,20 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
-        if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
+        if operation in {
+            "doctor",
+            "guardrails",
+            "codex-schema-check",
+            "debug-cli-status",
+            "format-tools-status",
+            "check-format-tools",
+        }:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
-        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"artifact", "package", "local-install"}):
+        if operation == "release" and args.get("subcommand") == "artifact":
+            return RELEASE_ARTIFACT_TIMEOUT_SECONDS
+        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"package", "local-install"}):
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
@@ -3876,6 +3901,18 @@ def find_debug_app_pids() -> List[str]:
     return [str(pid) for pid in matching_processes(debug_app_executable_path())]
 
 
+def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
+    try:
+        wait_seconds = max(0.0, float(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT", "3")))
+    except ValueError:
+        wait_seconds = 3.0
+    try:
+        cycles = max(1, int(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES", "3")))
+    except ValueError:
+        cycles = 3
+    return cycles * (wait_seconds + 60.0) + 60.0
+
+
 def terminate_debug_app_processes() -> List[str]:
     return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
 
@@ -4348,6 +4385,25 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
                 print(f"FAILED stage '{name}' with status {code}", flush=True)
             return code
 
+    if args.get("executionLocationUI"):
+        debug_pids = find_debug_app_pids()
+        if len(debug_pids) != 1:
+            print(
+                "ERROR: execution-location UI smoke requires exactly one running RepoPrompt debug app "
+                f"matching {debug_app_executable_path()}; found {len(debug_pids)}.",
+                flush=True,
+            )
+            return 1
+        code, _stdout, _stderr = run_operation_command(
+            "execution location UI smoke",
+            [str(repo_root / "Scripts" / "smoke_agent_execution_location_popover.sh"), debug_pids[0]],
+            repo_root,
+            env=env,
+            timeout=execution_location_ui_smoke_timeout(env),
+        )
+        if code != 0:
+            return code
+
     if args.get("agentRun"):
         agent_timeout = float(args.get("agentTimeout") or SMOKE_AGENT_WAIT_SECONDS)
         start_payload = {
@@ -4639,6 +4695,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     if operation in {
         "doctor",
         "guardrails",
+        "codex-schema-check",
         "build",
         "install-debug-cli",
         "debug-cli-status",
@@ -4713,6 +4770,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("--window-id", type=int, default=1)
         parser.add_argument("--agent-run", action="store_true")
         parser.add_argument("--agent-timeout", type=float, default=SMOKE_AGENT_WAIT_SECONDS)
+        parser.add_argument("--execution-location-ui", action="store_true")
         ns = parser.parse_args(rest)
         if ns.agent_timeout < 0:
             raise ConductorError("--agent-timeout must be non-negative")
@@ -4720,6 +4778,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--artifact-manifest requires --packaged-app")
         if ns.packaged_app and ns.agent_run:
             raise ConductorError("--agent-run is not supported with --packaged-app")
+        if ns.packaged_app and ns.execution_location_ui:
+            raise ConductorError("--execution-location-ui is not supported with --packaged-app")
         args.update(
             {
                 "launch": ns.launch,
@@ -4729,6 +4789,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
                 "windowId": ns.window_id,
                 "agentRun": ns.agent_run,
                 "agentTimeout": ns.agent_timeout,
+                "executionLocationUI": ns.execution_location_ui,
             }
         )
     elif operation == "diagnostics":

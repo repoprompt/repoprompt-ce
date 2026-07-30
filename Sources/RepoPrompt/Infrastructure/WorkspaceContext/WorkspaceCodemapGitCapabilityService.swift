@@ -156,6 +156,14 @@ struct WorkspaceCodemapSourceAuthorityToken: Hashable {
     }
 }
 
+struct WorkspaceCodemapSourceAuthorityRequest: Hashable {
+    let candidateRepositoryRelativePath: String
+    let observedPathGeneration: UInt64
+    let currentPathGeneration: UInt64
+    let observedIngressGeneration: UInt64
+    let currentIngressGeneration: UInt64
+}
+
 struct WorkspaceCodemapGitCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
@@ -185,6 +193,7 @@ actor WorkspaceCodemapGitCapabilityService {
             let activeFlightCount: Int
             let waiterCount: Int
             let resolutionObserverCount: Int
+            let authorityCaptureCount: UInt64
         }
     #endif
 
@@ -260,6 +269,9 @@ actor WorkspaceCodemapGitCapabilityService {
     private var rootEpochByWaiterID: [UUID: WorkspaceCodemapRootEpoch] = [:]
     private var historicalRecords: [WorkspaceCodemapRootEpoch: HistoricalRecord] = [:]
     private var releaseOrdinal: UInt64 = 0
+    #if DEBUG
+        private var authorityCaptureCount: UInt64 = 0
+    #endif
 
     init(
         gitService: GitService = GitService(),
@@ -411,7 +423,8 @@ actor WorkspaceCodemapGitCapabilityService {
                 historicalRecordCount: historicalRecords.count,
                 activeFlightCount: flights.count,
                 waiterCount: flights.values.reduce(0) { $0 + $1.waiters.count },
-                resolutionObserverCount: resolutionObservers.count
+                resolutionObserverCount: resolutionObservers.count,
+                authorityCaptureCount: authorityCaptureCount
             )
         }
     #endif
@@ -648,80 +661,195 @@ actor WorkspaceCodemapGitCapabilityService {
         observedIngressGeneration: UInt64,
         currentIngressGeneration: UInt64
     ) async -> WorkspaceCodemapSourceAuthorityToken? {
-        guard let record = records[capability.rootEpoch],
+        let authorities = await makeSourceAuthorities(
+            capability: capability,
+            observedRootEpoch: observedRootEpoch,
+            observedRepositoryAuthority: observedRepositoryAuthority,
+            candidates: [WorkspaceCodemapSourceAuthorityRequest(
+                candidateRepositoryRelativePath: candidateRepositoryRelativePath,
+                observedPathGeneration: observedPathGeneration,
+                currentPathGeneration: currentPathGeneration,
+                observedIngressGeneration: observedIngressGeneration,
+                currentIngressGeneration: currentIngressGeneration
+            )]
+        )
+        return authorities.first ?? nil
+    }
+
+    /// Issues source-authority tokens for one bounded candidate batch under a single stable
+    /// repository-authority window. Root evidence is captured exactly twice; no-follow path
+    /// fingerprints and nested attribute evidence remain candidate-local and fail closed.
+    func makeSourceAuthorities(
+        capability: GitCodemapRootCapability,
+        observedRootEpoch: WorkspaceCodemapRootEpoch,
+        observedRepositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        candidates: [WorkspaceCodemapSourceAuthorityRequest]
+    ) async -> [WorkspaceCodemapSourceAuthorityToken?] {
+        guard !candidates.isEmpty else { return [] }
+        let unavailable = [WorkspaceCodemapSourceAuthorityToken?](
+            repeating: nil,
+            count: candidates.count
+        )
+        guard !Task.isCancelled,
+              let record = records[capability.rootEpoch],
               case let .eligible(activeCapability) = record.state,
               activeCapability == capability,
-              let stableAuthority = record.stableAuthority,
-              let candidatePath = Self.safeRepositoryRelativePath(candidateRepositoryRelativePath),
-              Self.isCandidate(
-                  candidatePath,
-                  insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
-              )
-        else { return nil }
+              capability.rootEpoch == observedRootEpoch,
+              capability.repositoryAuthority == observedRepositoryAuthority,
+              let stableAuthority = record.stableAuthority
+        else { return unavailable }
+
         let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
+        var candidatePaths = [String?](repeating: nil, count: candidates.count)
+        var prePathFingerprints = [GitBlobLStatFingerprint?](
+            repeating: nil,
+            count: candidates.count
+        )
+        var preAttributeGenerations = [String?](repeating: nil, count: candidates.count)
 
         do {
-            let prePathFingerprint = try pathFingerprintClient.fingerprint(
-                capability.repositoryLayout.workTreeRoot,
-                candidatePath
-            )
-            guard prePathFingerprint.isRegularFile else { return nil }
-            await hooks.afterSourcePathFingerprintCapture()
-            try Task.checkCancellation()
+            for index in candidates.indices {
+                let candidate = candidates[index]
+                guard candidate.observedPathGeneration == candidate.currentPathGeneration,
+                      candidate.observedIngressGeneration == candidate.currentIngressGeneration,
+                      let path = Self.safeRepositoryRelativePath(
+                          candidate.candidateRepositoryRelativePath
+                      ), Self.isCandidate(
+                          path,
+                          insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
+                      )
+                else { continue }
+                do {
+                    let fingerprint = try pathFingerprintClient.fingerprint(
+                        capability.repositoryLayout.workTreeRoot,
+                        path
+                    )
+                    guard fingerprint.isRegularFile else { continue }
+                    candidatePaths[index] = path
+                    prePathFingerprints[index] = fingerprint
+                    await hooks.afterSourcePathFingerprintCapture()
+                } catch {
+                    continue
+                }
+                try Task.checkCancellation()
+            }
+
             let preRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
                 expectedLayout: capability.repositoryLayout,
                 prefix: capability.repositoryRelativeLoadedRootPrefix
             )
-            guard preRepository.stableAuthority == stableAuthority else { return nil }
-            let preAttributes = try digestEvidence(
-                urls: Self.candidateAttributeURLs(
-                    layout: capability.repositoryLayout,
-                    candidateRepositoryRelativePath: candidatePath
-                ),
-                includeBoundedContents: true
-            )
+            guard preRepository.stableAuthority == stableAuthority else { return unavailable }
+            await hooks.afterFirstAuthorityCapture()
             try Task.checkCancellation()
-            let postAttributes = try digestEvidence(
-                urls: Self.candidateAttributeURLs(
-                    layout: capability.repositoryLayout,
-                    candidateRepositoryRelativePath: candidatePath
-                ),
-                includeBoundedContents: true
+
+            for index in candidates.indices {
+                guard let path = candidatePaths[index] else { continue }
+                do {
+                    preAttributeGenerations[index] = try digestEvidence(
+                        urls: Self.candidateAttributeURLs(
+                            layout: capability.repositoryLayout,
+                            candidateRepositoryRelativePath: path
+                        ),
+                        includeBoundedContents: true
+                    )
+                } catch {
+                    candidatePaths[index] = nil
+                    prePathFingerprints[index] = nil
+                }
+                try Task.checkCancellation()
+            }
+
+            var postAttributeGenerations = [String?](repeating: nil, count: candidates.count)
+            for index in candidates.indices {
+                guard let path = candidatePaths[index],
+                      let preAttributes = preAttributeGenerations[index]
+                else { continue }
+                do {
+                    let postAttributes = try digestEvidence(
+                        urls: Self.candidateAttributeURLs(
+                            layout: capability.repositoryLayout,
+                            candidateRepositoryRelativePath: path
+                        ),
+                        includeBoundedContents: true
+                    )
+                    if postAttributes == preAttributes {
+                        postAttributeGenerations[index] = postAttributes
+                    }
+                } catch {
+                    postAttributeGenerations[index] = nil
+                }
+                try Task.checkCancellation()
+            }
+
+            var postPathFingerprints = [GitBlobLStatFingerprint?](
+                repeating: nil,
+                count: candidates.count
             )
+            for index in candidates.indices {
+                guard let path = candidatePaths[index],
+                      let prePathFingerprint = prePathFingerprints[index]
+                else { continue }
+                do {
+                    let postPathFingerprint = try pathFingerprintClient.fingerprint(
+                        capability.repositoryLayout.workTreeRoot,
+                        path
+                    )
+                    #if DEBUG
+                        await hooks.afterSourcePathFingerprintCapture()
+                    #endif
+                    guard postPathFingerprint == prePathFingerprint,
+                          postPathFingerprint.isRegularFile
+                    else { continue }
+                    postPathFingerprints[index] = postPathFingerprint
+                } catch {
+                    continue
+                }
+                try Task.checkCancellation()
+            }
+
             let postRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
                 expectedLayout: capability.repositoryLayout,
                 prefix: capability.repositoryRelativeLoadedRootPrefix
             )
-            let postPathFingerprint = try pathFingerprintClient.fingerprint(
-                capability.repositoryLayout.workTreeRoot,
-                candidatePath
-            )
-            guard preAttributes == postAttributes,
-                  preRepository == postRepository,
+            guard preRepository == postRepository,
                   postRepository.stableAuthority == stableAuthority,
-                  prePathFingerprint == postPathFingerprint,
-                  postPathFingerprint.isRegularFile,
                   case let .eligible(currentCapability) = records[capability.rootEpoch]?.state,
                   currentCapability == capability
-            else { return nil }
+            else { return unavailable }
+            try Task.checkCancellation()
 
-            return WorkspaceCodemapSourceAuthorityToken.issue(
-                capability: capability,
-                observedRootEpoch: observedRootEpoch,
-                observedRepositoryAuthority: observedRepositoryAuthority,
-                candidateRepositoryRelativePath: candidatePath,
-                acceptedPrePathFingerprint: prePathFingerprint,
-                acceptedPostPathFingerprint: postPathFingerprint,
-                candidateAttributeGeneration: postAttributes,
-                observedPathGeneration: observedPathGeneration,
-                currentPathGeneration: currentPathGeneration,
-                observedIngressGeneration: observedIngressGeneration,
-                currentIngressGeneration: currentIngressGeneration
-            )
+            var authorities = unavailable
+            for index in candidates.indices {
+                guard let path = candidatePaths[index],
+                      let prePathFingerprint = prePathFingerprints[index],
+                      let postPathFingerprint = postPathFingerprints[index],
+                      let attributeGeneration = postAttributeGenerations[index]
+                else { continue }
+                let candidate = candidates[index]
+                authorities[index] = WorkspaceCodemapSourceAuthorityToken.issue(
+                    capability: capability,
+                    observedRootEpoch: observedRootEpoch,
+                    observedRepositoryAuthority: observedRepositoryAuthority,
+                    candidateRepositoryRelativePath: path,
+                    acceptedPrePathFingerprint: prePathFingerprint,
+                    acceptedPostPathFingerprint: postPathFingerprint,
+                    candidateAttributeGeneration: attributeGeneration,
+                    observedPathGeneration: candidate.observedPathGeneration,
+                    currentPathGeneration: candidate.currentPathGeneration,
+                    observedIngressGeneration: candidate.observedIngressGeneration,
+                    currentIngressGeneration: candidate.currentIngressGeneration
+                )
+                try Task.checkCancellation()
+            }
+            guard !Task.isCancelled,
+                  case let .eligible(finalCapability) = records[capability.rootEpoch]?.state,
+                  finalCapability == capability
+            else { return unavailable }
+            return authorities
         } catch {
-            return nil
+            return unavailable
         }
     }
 
@@ -951,6 +1079,9 @@ actor WorkspaceCodemapGitCapabilityService {
         expectedLayout: GitRepositoryLayout,
         prefix: String
     ) async throws -> AuthorityCapture {
+        #if DEBUG
+            authorityCaptureCount &+= 1
+        #endif
         guard let currentLayout = try await gitService.resolveGitBlobRepository(containing: loadedRoot),
               Self.repositoryRelativePrefix(
                   loadedRoot: loadedRoot,

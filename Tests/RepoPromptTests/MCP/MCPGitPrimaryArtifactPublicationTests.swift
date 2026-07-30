@@ -534,15 +534,23 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             )
         )
 
+        let readiness = try await ingress.aggregateReadiness(for: [firstSet, secondSet])
+        let readyCandidates = firstSet.primarySelectionArtifacts + [secondSet.map]
+        XCTAssertEqual(readiness.selectionReadyArtifacts, readyCandidates)
         XCTAssertEqual(
-            ingress.selectionReadyArtifacts(for: firstSet),
-            firstSet.primarySelectionArtifacts
+            readiness.advertisementReadyArtifacts,
+            firstSet.advertisedSelectionArtifacts + [secondSet.map] + secondSet.perFilePatches
         )
-        XCTAssertEqual(ingress.selectionReadyArtifacts(for: secondSet), [secondSet.map])
+        XCTAssertEqual(
+            readiness.selectionReadySnapshotDirectories,
+            Set([firstSet.snapshotRef.snapshotDirRel, secondSet.snapshotRef.snapshotDirRel])
+        )
+        XCTAssertEqual(
+            readiness.failuresBySnapshotDirectory[secondSet.snapshotRef.snapshotDirRel],
+            [WorkspacePublishedGitArtifactReadinessFailure(artifact: missingPatch, status: .missingOnDisk)]
+        )
+        XCTAssertNil(readiness.failuresBySnapshotDirectory[firstSet.snapshotRef.snapshotDirRel])
         XCTAssertEqual(ingress.failuresByArtifact[missingPatch], .missingOnDisk)
-
-        let readyCandidates = ingress.selectionReadyArtifacts(for: firstSet)
-            + ingress.selectionReadyArtifacts(for: secondSet)
         let concurrentSource = secondRepo.appendingPathComponent("Sources/Concurrent.swift").path
         let existing = StoredSelection(
             selectedPaths: [concurrentSource],

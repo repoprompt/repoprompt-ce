@@ -388,6 +388,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         AgentModel.claudeSonnet5.rawValue.lowercased(),
         AgentModel.claudeOpus.rawValue.lowercased(),
         AgentModel.claudeOpus1m.rawValue.lowercased(),
+        AgentModel.claudeOpus5.rawValue.lowercased(),
         AgentModel.claudeOpus47.rawValue.lowercased(),
         AgentModel.claudeOpus46.rawValue.lowercased(),
         AgentModel.claudeOpus45.rawValue.lowercased()

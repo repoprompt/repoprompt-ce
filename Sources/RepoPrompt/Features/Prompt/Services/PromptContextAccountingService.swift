@@ -657,6 +657,14 @@ actor PromptContextAccountingService {
                 let ranges = sliceRanges(for: path, file: file, location: result.location, in: selection.slices)
                 let useSelectedCodemap = codeMapUsage == .selected && codemapPresentation.renderedEntriesByFileID[file.id] != nil
                 let content = useSelectedCodemap ? nil : selectedFileReadResults[selectedPathIndex]?.content
+                if codeMapUsage == .selected,
+                   !useSelectedCodemap,
+                   case .loadContent = contentPolicy,
+                   content == nil
+                {
+                    missingPaths.append(file.standardizedRelativePath)
+                    continue
+                }
                 let entry = ResolvedPromptFileEntry(
                     file: file,
                     isCodemap: useSelectedCodemap,
@@ -734,6 +742,14 @@ actor PromptContextAccountingService {
                             }
                         #endif
                     }
+                    if codeMapUsage == .selected,
+                       !useSelectedCodemap,
+                       case .loadContent = contentPolicy,
+                       content == nil
+                    {
+                        missingPaths.append(file.standardizedRelativePath)
+                        continue
+                    }
                     let entry = ResolvedPromptFileEntry(
                         file: file,
                         isCodemap: useSelectedCodemap,
@@ -809,6 +825,16 @@ actor PromptContextAccountingService {
                 )
             case .cachedOnly:
                 await store.cachedSearchContentSnapshot(for: file).content
+            }
+            let hasSelectedCodemap = codeMapUsage == .selected
+                && codemapPresentation.renderedEntriesByFileID[file.id] != nil
+            if codeMapUsage == .selected,
+               !hasSelectedCodemap,
+               case .loadContent = contentPolicy,
+               content == nil
+            {
+                missingPaths.append(file.standardizedRelativePath)
+                continue
             }
             let entry = ResolvedPromptFileEntry(file: file, lineRanges: ranges, mode: .sliced, loadedContent: content ?? nil, rootFolderPath: result.location.rootPath)
             append(entry, to: &entries, seenIDs: &seenIDs)
