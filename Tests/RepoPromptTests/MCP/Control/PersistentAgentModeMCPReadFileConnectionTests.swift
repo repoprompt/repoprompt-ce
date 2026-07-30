@@ -533,6 +533,118 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
             XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
 
+            // Pause a successor after partition CAS but before planned tab application, then
+            // stale the hidden target without changing ranges. The post-CAS target recheck must
+            // prevent the already-built plan from applying to a no-longer-owned hidden session.
+            let staleTabPlanGate = PersistentAsyncGate()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillApplyTabPlansHandlerForTesting { path in
+                guard path == physicalURL.path else { return }
+                await staleTabPlanGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillApplyTabPlansHandlerForTesting(nil)
+                Task { await staleTabPlanGate.release() }
+            }
+            var postCASTabStaleLines = editedLines
+            postCASTabStaleLines.insert(contentsOf: (1 ... 10).map { "post-cas-insert-\($0)" }, at: 0)
+            let postCASReplacementURL = physicalURL.deletingLastPathComponent()
+                .appendingPathComponent(".SessionWorktree6500.swift.post-cas-\(UUID().uuidString)")
+            try (postCASTabStaleLines.joined(separator: "\n") + "\n").write(
+                to: postCASReplacementURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            _ = try FileManager.default.replaceItemAt(physicalURL, withItemAt: postCASReplacementURL)
+            let postCASAccepted = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_002
+                )]
+            )
+            XCTAssertNotNil(postCASAccepted)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+            try await requireGateStarted(staleTabPlanGate)
+            let workspaceIndex = try XCTUnwrap(
+                fixture.window.workspaceManager.workspaces.firstIndex { $0.id == fixture.workspaceID }
+            )
+            let tabIndex = try XCTUnwrap(
+                fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs.firstIndex { $0.id == Fixture.tabID }
+            )
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = nil
+            await staleTabPlanGate.release()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillApplyTabPlansHandlerForTesting(nil)
+            let postCASFence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [physicalURL.path]
+            )
+            XCTAssertTrue(fixture.window.workspaceFilesViewModel.isSliceRebaseFenceCurrent(postCASFence))
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = Fixture.agentSessionID
+
+            // Pause after ownership await inside hiddenSessionSliceRangesIfTargetCurrent, then
+            // clear the tab's active session while selection ranges stay unchanged. Post-await
+            // re-read must fail closed so ranges from the pre-await snapshot are not returned.
+            let ownershipPassGate = PersistentAsyncGate()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting { path in
+                guard path == targetLogicalPath || path == physicalURL.path else { return }
+                await ownershipPassGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting(nil)
+                Task { await ownershipPassGate.release() }
+            }
+            var ownershipRaceLines = editedLines
+            ownershipRaceLines.insert(contentsOf: (1 ... 10).map { "ownership-race-insert-\($0)" }, at: 0)
+            let ownershipReplacementURL = physicalURL.deletingLastPathComponent()
+                .appendingPathComponent(".SessionWorktree6500.swift.ownership-\(UUID().uuidString)")
+            try (ownershipRaceLines.joined(separator: "\n") + "\n").write(
+                to: ownershipReplacementURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            _ = try FileManager.default.replaceItemAt(physicalURL, withItemAt: ownershipReplacementURL)
+            let ownershipAccepted = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_004
+                )]
+            )
+            XCTAssertNotNil(ownershipAccepted)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+            try await requireGateStarted(ownershipPassGate)
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = nil
+            await ownershipPassGate.release()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRangesDidPassOwnershipHandlerForTesting(nil)
+            let ownershipFence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [physicalURL.path]
+            )
+            XCTAssertTrue(fixture.window.workspaceFilesViewModel.isSliceRebaseFenceCurrent(ownershipFence))
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = Fixture.agentSessionID
+
             // `manage_selection get` flushes pending active-UI state before replying. Hidden
             // worktree-only paths cannot materialize in the visible file tree, so the MCP-owned
             // canonical selection fence must advance with the watcher-driven rebase rather than
@@ -577,7 +689,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                             | kFSEventStreamEventFlagItemCreated
                             | kFSEventStreamEventFlagItemIsFile
                     ),
-                    eventId: 8_900_000_000_000_000_002
+                    eventId: 8_900_000_000_000_000_003
                 )]
             )
             XCTAssertNotNil(staleAccepted)
