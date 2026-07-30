@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   style:
     name: Style
@@ -13,6 +16,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Run repository guardrails
         run: make guardrails
@@ -29,6 +34,17 @@ jobs:
       - name: Run conductor tests
         run: make conductor-selftest
 
+      - name: Set up Node for pinned Codex CLI
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install pinned Codex CLI
+        run: npm install --global @openai/codex@0.145.0
+
+      - name: Validate Codex app-server schema contract
+        run: make dev-codex-schema-check
+
       - name: Run release workflow tests
         run: make release-selftest
 
@@ -42,9 +58,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -89,9 +107,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -105,15 +125,22 @@ jobs:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: swift build --product RepoPrompt
 
+      - name: Test serialized Sentry privacy boundary
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: swift test --filter SentryTelemetryPrivacyTests
+
   provider-tests:
     name: Provider Tests
     runs-on: macos-26
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -133,6 +160,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install gitleaks

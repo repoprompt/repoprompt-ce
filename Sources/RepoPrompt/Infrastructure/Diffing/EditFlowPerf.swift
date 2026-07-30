@@ -815,6 +815,7 @@ enum EditFlowPerf {
             static let storeSinkScheduled: StaticString = "WorkspaceIngress.StoreSinkScheduled"
             static let storeSinkBegan: StaticString = "WorkspaceIngress.StoreSinkBegan"
             static let storeCanonicalApplyCompleted: StaticString = "WorkspaceIngress.StoreCanonicalApplyCompleted"
+            static let codemapInvalidationStage: StaticString = "WorkspaceIngress.CodemapInvalidationStage"
             static let rootFlushBegan: StaticString = "WorkspaceIngress.RootFlushBegan"
             static let rootFlushEnded: StaticString = "WorkspaceIngress.RootFlushEnded"
         }

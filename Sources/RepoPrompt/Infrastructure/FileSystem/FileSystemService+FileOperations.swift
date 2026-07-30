@@ -73,7 +73,7 @@ extension FileSystemService {
     /// service caches plus synthetic delta publication against the eventual on-disk result.
     private func startUncancellableMutation(
         _ operation: FileSystemUncancellableMutation,
-        io: @escaping @Sendable () throws -> Void
+        io: @escaping @Sendable () async throws -> Void
     ) -> (id: UUID, task: Task<Void, any Error>) {
         let id = UUID()
         #if DEBUG
@@ -85,16 +85,34 @@ extension FileSystemService {
             if let willBegin {
                 await willBegin(operation)
             }
-            try io()
+            try await io()
         }
         return (id, task)
     }
 
-    private func awaitUncancellableMutation(_ id: UUID) async throws {
-        try Task.checkCancellation()
+    private func awaitUncancellableMutation(
+        _ id: UUID,
+        operation: FileSystemUncancellableMutation
+    ) async throws {
+        #if DEBUG
+            if let willRegister = mutationWaiterWillRegisterHandler {
+                await willRegister(operation)
+            }
+        #endif
+        if Task.isCancelled {
+            if mutationCompletionMailbox.removeValue(forKey: id) == nil {
+                cancelledMutationWaiterIDs.insert(id)
+            }
+            throw CancellationError()
+        }
+        if let completion = mutationCompletionMailbox.removeValue(forKey: id) {
+            try completion.get()
+            return
+        }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 if Task.isCancelled {
+                    cancelledMutationWaiterIDs.insert(id)
                     continuation.resume(throwing: CancellationError())
                 } else {
                     mutationWaiters[id] = FileSystemMutationWaiter(continuation: continuation)
@@ -109,11 +127,23 @@ extension FileSystemService {
 
     private func cancelMutationWaiter(_ id: UUID) {
         guard let waiter = mutationWaiters.removeValue(forKey: id) else { return }
+        cancelledMutationWaiterIDs.insert(id)
         waiter.continuation.resume(throwing: CancellationError())
     }
 
     private func completeMutationWaiter(_ id: UUID, error: (any Error)? = nil) {
-        guard let waiter = mutationWaiters.removeValue(forKey: id) else { return }
+        let completion: FileSystemMutationCompletion = if let error {
+            .failure(error)
+        } else {
+            .success
+        }
+        if cancelledMutationWaiterIDs.remove(id) != nil {
+            return
+        }
+        guard let waiter = mutationWaiters.removeValue(forKey: id) else {
+            mutationCompletionMailbox[id] = completion
+            return
+        }
         if let error {
             waiter.continuation.resume(throwing: error)
         } else {
@@ -166,7 +196,7 @@ extension FileSystemService {
                 )
             }
         }
-        try await awaitUncancellableMutation(mutation.id)
+        try await awaitUncancellableMutation(mutation.id, operation: .move)
     }
 
     private func reconcileMovedFile(
@@ -223,17 +253,28 @@ extension FileSystemService {
         guard !fm.fileExists(atPath: fullPath, isDirectory: nil) else {
             throw FileSystemError.fileAlreadyExists
         }
-        guard let data = content.data(using: .utf8) else {
-            throw FileSystemError.failedToCreateFile(
-                NSError(
+
+        // Materializing a large Swift String as UTF-8 is synchronous and potentially expensive.
+        // Keep it inside the detached mutation worker so request cancellation can always reach
+        // the actor-owned waiter while preparation and the uncancellable disk write continue.
+        #if DEBUG
+            let dataPreparation = createFileDataPreparationForTesting
+        #else
+            let dataPreparation: (@Sendable (String) async throws -> Data)? = nil
+        #endif
+        let mutation = startUncancellableMutation(.create) {
+            let data: Data
+            if let dataPreparation {
+                data = try await dataPreparation(content)
+            } else if let encoded = content.data(using: .utf8) {
+                data = encoded
+            } else {
+                throw NSError(
                     domain: "encoding",
                     code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as UTF-8"]
                 )
-            )
-        }
-
-        let mutation = startUncancellableMutation(.create) {
+            }
             try FileSystemService.writeFileRobust(to: fullURL, data: data)
         }
         Task.detached { [weak self] in
@@ -251,7 +292,7 @@ extension FileSystemService {
                 )
             }
         }
-        try await awaitUncancellableMutation(mutation.id)
+        try await awaitUncancellableMutation(mutation.id, operation: .create)
     }
 
     private func reconcileCreatedFile(
@@ -303,7 +344,7 @@ extension FileSystemService {
                 )
             }
         }
-        try await awaitUncancellableMutation(mutation.id)
+        try await awaitUncancellableMutation(mutation.id, operation: .delete)
     }
 
     private func reconcileDeletedFile(mutationID: UUID, relativePath: String, url: URL) {
@@ -336,31 +377,54 @@ extension FileSystemService {
         let mutation = startUncancellableMutation(.trash) {
             try moveItemToTrashIO(url)
         }
+        trashMutationsAwaitingReconciliation.insert(mutation.id)
+        // On macOS, FileManager.trashItem can move the item immediately and then remain
+        // synchronously blocked for tens of seconds in post-move system work. Absence of the
+        // exact source path is the durable postcondition this operation promises, so observe it
+        // independently and settle/reconcile without waiting for that unrelated tail latency.
+        Task.detached { [weak self] in
+            for _ in 0 ..< 2400 {
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    await self?.reconcileTrashedItemIfPending(
+                        mutationID: mutation.id,
+                        relativePath: normalizedRelativePath,
+                        url: url,
+                        wasDirectory: wasDirectory
+                    )
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+        }
         Task.detached { [weak self] in
             do {
                 try await mutation.task.value
-                await self?.reconcileTrashedItem(
+                await self?.reconcileTrashedItemIfPending(
                     mutationID: mutation.id,
                     relativePath: normalizedRelativePath,
                     url: url,
                     wasDirectory: wasDirectory
                 )
             } catch {
-                await self?.completeMutationWaiter(
-                    mutation.id,
-                    error: FileSystemError.failedToDeleteFile(error)
+                await self?.failTrashedItemIfPending(
+                    mutationID: mutation.id,
+                    relativePath: normalizedRelativePath,
+                    url: url,
+                    wasDirectory: wasDirectory,
+                    error: error
                 )
             }
         }
-        try await awaitUncancellableMutation(mutation.id)
+        try await awaitUncancellableMutation(mutation.id, operation: .trash)
     }
 
-    private func reconcileTrashedItem(
+    private func reconcileTrashedItemIfPending(
         mutationID: UUID,
         relativePath: String,
         url: URL,
         wasDirectory: Bool
     ) {
+        guard trashMutationsAwaitingReconciliation.remove(mutationID) != nil else { return }
         fileSystemDebugLog("File moved to Trash at \(url.path)")
         let keysToForget = encodingMap.keys.filter {
             $0 == relativePath || $0.hasPrefix(relativePath + "/")
@@ -375,6 +439,30 @@ extension FileSystemService {
         }
         publishFileSystemDeltas(deltas, source: .syntheticMutation)
         completeMutationWaiter(mutationID)
+    }
+
+    private func failTrashedItemIfPending(
+        mutationID: UUID,
+        relativePath: String,
+        url: URL,
+        wasDirectory: Bool,
+        error: any Error
+    ) {
+        guard trashMutationsAwaitingReconciliation.contains(mutationID) else { return }
+        if !FileManager.default.fileExists(atPath: url.path) {
+            reconcileTrashedItemIfPending(
+                mutationID: mutationID,
+                relativePath: relativePath,
+                url: url,
+                wasDirectory: wasDirectory
+            )
+            return
+        }
+        trashMutationsAwaitingReconciliation.remove(mutationID)
+        completeMutationWaiter(
+            mutationID,
+            error: FileSystemError.failedToDeleteFile(error)
+        )
     }
 
     private func forgetTrackedPath(_ relativePath: String) {
@@ -449,7 +537,7 @@ extension FileSystemService {
                 )
             }
         }
-        try await awaitUncancellableMutation(mutation.id)
+        try await awaitUncancellableMutation(mutation.id, operation: .edit)
         guard modificationPublicationPolicy == .deferSyntheticModificationToSuccessfulCaller,
               deferredEditPublicationsByMutationID[mutation.id] != nil
         else { return nil }
@@ -607,6 +695,12 @@ extension FileSystemService {
                 let n = Darwin.write(fd, base, remaining)
                 if n < 0 {
                     writeError = errno
+                    break
+                }
+                if n == 0 {
+                    // A zero-byte write makes no progress. Treat it as I/O failure instead of
+                    // spinning forever inside an uncancellable mutation worker.
+                    writeError = EIO
                     break
                 }
                 remaining -= n

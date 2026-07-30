@@ -6,8 +6,23 @@ public enum MCPTimeoutPolicy {
     public static let boundedToolExecutionDeadlineSeconds = 30
     public static let boundedToolExecutionDeadline: Duration = .seconds(boundedToolExecutionDeadlineSeconds)
 
+    /// macOS Finder Trash can legitimately retain synchronous post-move work after the source
+    /// path disappears. Keep destructive file_actions bounded, but allow that system tail to
+    /// settle as an applied mutation instead of reporting a false cancellation.
+    public static let fileActionTrashExecutionDeadlineSeconds = 60
+    public static let fileActionTrashExecutionDeadline: Duration = .seconds(
+        fileActionTrashExecutionDeadlineSeconds
+    )
+
     public static let workspaceFreshnessWaitTimeoutSeconds = 30
     public static let workspaceFreshnessWaitTimeout: Duration = .seconds(workspaceFreshnessWaitTimeoutSeconds)
+
+    /// Mutation preflight must settle before the ordinary bounded tool watchdog so a blocked
+    /// workspace barrier can return a retryable result instead of racing connection teardown.
+    public static let mutationPreflightFreshnessWaitTimeoutSeconds = 20
+    public static let mutationPreflightFreshnessWaitTimeout: Duration = .seconds(
+        mutationPreflightFreshnessWaitTimeoutSeconds
+    )
 
     public static let workspaceReadinessWaitTimeoutSeconds = 30
     public static let workspaceReadinessWaitTimeout: Duration = .seconds(workspaceReadinessWaitTimeoutSeconds)

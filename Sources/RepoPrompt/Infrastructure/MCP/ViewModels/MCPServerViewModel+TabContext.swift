@@ -45,14 +45,29 @@ extension MCPServerViewModel {
 
     enum ContextBuilderTeardownPublicationOutcome: Equatable {
         case peerEOFDetached
+        case detachedAfterResponseDeliveryDrained(reason: String)
+        case detachedWithoutOrderlyPeerEOF(reason: String)
         case resolvedWithoutPeerEOFDetachment(reason: String)
         case timedOut
         case cancelled
+
+        var completedDiscoveryCanCommit: Bool {
+            switch self {
+            case .peerEOFDetached, .detachedAfterResponseDeliveryDrained:
+                true
+            case .detachedWithoutOrderlyPeerEOF, .resolvedWithoutPeerEOFDetachment, .timedOut, .cancelled:
+                false
+            }
+        }
 
         var diagnosticSource: String {
             switch self {
             case .peerEOFDetached:
                 "peer_eof_detached"
+            case let .detachedAfterResponseDeliveryDrained(reason):
+                "detached_after_response_delivery_drained:\(reason)"
+            case let .detachedWithoutOrderlyPeerEOF(reason):
+                "detached_without_orderly_peer_eof:\(reason)"
             case let .resolvedWithoutPeerEOFDetachment(reason):
                 "resolved_without_detachment:\(reason)"
             case .timedOut:
@@ -940,6 +955,26 @@ extension MCPServerViewModel {
             return liveConnectionID(forRunID: runID) != nil ? runID : nil
         }
         return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
+    }
+
+    /// Returns true only for the current bidirectional run mapping.
+    ///
+    /// Pending-policy mapping tokens identify rollback/replacement generations; they do not own
+    /// application commit authority. ServerNetworkManager composes this mapping with its
+    /// actor-owned application, policy, window/tab, and live-connection state.
+    @MainActor
+    func hasCurrentRunRouteMapping(
+        runID: UUID,
+        connectionID: UUID,
+        expectedTabID: UUID?
+    ) -> Bool {
+        guard connectionIDByRunID[runID] == connectionID,
+              connectionIDToRunID[connectionID] == runID
+        else { return false }
+
+        guard let expectedTabID else { return true }
+        return tabContextByConnectionID[connectionID]?.runID == runID
+            && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
     }
 
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
@@ -2430,6 +2465,37 @@ extension MCPServerViewModel {
             pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)
         }
         return adjustedLookupContext
+    }
+
+    /// Resolves mutation routing and lookup authority together so an inactive,
+    /// persisted Agent tab can hydrate its worktree binding before the mutation
+    /// gate evaluates it. Re-resolving the snapshot after hydration keeps stale or
+    /// superseded routes fail-closed instead of falling back to the visible checkout.
+    @MainActor
+    func resolveMutationFileToolContext(
+        from metadata: RequestMetadata,
+        toolName: String
+    ) async throws -> (
+        resolvedContext: ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    ) {
+        var resolvedContext = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: toolName,
+            policy: .allowLegacyImplicitRouting
+        )
+        let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if !resolvedContext.usesActiveTabCompatibility,
+           resolvedContext.snapshot.activeAgentSessionID != nil,
+           case .unhydrated = resolvedContext.snapshot.worktreeBindingState
+        {
+            resolvedContext = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: toolName,
+                policy: .allowLegacyImplicitRouting
+            )
+        }
+        return (resolvedContext, lookupContext)
     }
 
     @MainActor
@@ -4011,7 +4077,7 @@ extension MCPServerViewModel {
 
     @MainActor
     @discardableResult
-    func detachContextBuilderTabContextForPeerEOF(
+    func detachContextBuilderTabContextForDiscoveryTeardown(
         connectionID: UUID,
         runID: UUID
     ) -> Bool {
@@ -4036,7 +4102,7 @@ extension MCPServerViewModel {
         connectionIDByRunID.removeValue(forKey: runID)
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
         connectionIDToRunID.removeValue(forKey: connectionID)
-        tabContextLog("Detached Context Builder context after peer EOF connectionID=\(connectionID) runID=\(runID)")
+        tabContextLog("Detached Context Builder context for discovery teardown connectionID=\(connectionID) runID=\(runID)")
         return true
     }
 
@@ -4440,6 +4506,10 @@ extension MCPServerViewModel {
         guard let storedTab = manager.composeTab(for: identity),
               storedTab.selection == updatedTab.selection
         else { return nil }
+        selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
+            storedTab.selection,
+            for: identity
+        )
         let committedSelectionRevision = manager.selectionRevisionForMCP(
             workspaceID: identity.workspaceID,
             tabID: identity.tabID
@@ -4470,6 +4540,11 @@ extension MCPServerViewModel {
         manager.beginApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext applying to UI: tab=\(applyTab.id) selectionCount=\(applyTab.selection.selectedPaths.count) promptChars=\(applyTab.promptText.count)")
         await manager.applyComposeTabState(applyTab)
+        // Refresh after the full UI apply because its final recount can enqueue another stale snapshot.
+        selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
+            applyTab.selection,
+            for: identity
+        )
         manager.endApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext UI applied: tab=\(applyTab.id)")
         guard isStillCurrent(), !Task.isCancelled else { return nil }

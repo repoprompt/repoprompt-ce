@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptCodeMapCore
 
 struct CodeMapSelectionGraphContribution: Hashable {
     static let currentSchemaVersion: UInt32 = 1

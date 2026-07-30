@@ -15,10 +15,48 @@ fail() {
 [[ -n "${RELEASE_COMMIT:-}" ]] ||
     fail "Missing required environment variable: RELEASE_COMMIT"
 
-cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
-    fail "Staged version.env does not match approved source"
+if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+    [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+        fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
+    python3 - "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" \
+        "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" <<'PYTHON'
+import sys
+from pathlib import Path
+
+staged_path, approved_path, build_override = sys.argv[1:]
+
+def parse(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+staged = parse(staged_path)
+approved = parse(approved_path)
+expected = dict(approved)
+expected["BUILD_NUMBER"] = build_override
+if staged != expected:
+    mismatches = sorted(set(staged) | set(expected))
+    detail = ", ".join(
+        key for key in mismatches if staged.get(key) != expected.get(key)
+    )
+    raise SystemExit(f"ERROR: staged version.env does not match approved source plus build override: {detail}")
+PYTHON
+else
+    cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
+        fail "Staged version.env does not match approved source"
+fi
 source "$SCRIPT_DIR/load_release_metadata.sh"
 load_release_metadata "$APPROVED_SOURCE_ROOT"
+if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+    BUILD_NUMBER="$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"
+fi
 
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 
@@ -105,6 +143,10 @@ PYTHON
 "$SCRIPT_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Staged app SwiftPM resource bundle layout"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Staged app MCP helper layout"
 "$SCRIPT_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "arm64,x86_64" "Staged public app"
+python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json" verify-bundle \
+    --arch all \
+    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 "$SCRIPT_DIR/write_app_artifact_manifest.py" verify \
     --app "$APP_BUNDLE" \
     --manifest "$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json" \

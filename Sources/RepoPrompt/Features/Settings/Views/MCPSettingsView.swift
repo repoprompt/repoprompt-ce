@@ -443,7 +443,12 @@ struct MCPSettingsView: View {
                         }
                         Button("Codex CLI") {
                             let result = MCPIntegrationHelper.installInCodex()
-                            showFeedback(result.success ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured") : "Codex config failed", isError: !result.success)
+                            showFeedback(
+                                result.success
+                                    ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
+                                    : (result.errorMessage ?? "Codex config failed"),
+                                isError: !result.success
+                            )
                         }
                         Button("OpenCode") {
                             let result = MCPIntegrationHelper.installInOpenCode()
@@ -568,7 +573,7 @@ struct MCPSettingsView: View {
                     }
 
                     Section {
-                        Text("Codex CLI (~/.codex/prompts)")
+                        Text("RepoPrompt Codex (isolated prompts)")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

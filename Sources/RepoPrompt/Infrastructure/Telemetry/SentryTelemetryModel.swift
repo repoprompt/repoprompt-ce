@@ -180,6 +180,7 @@ extension SentryTelemetryBootstrap {
         case gpt53Codex = "gpt_5_3_codex"
         case gpt54 = "gpt_5_4"
         case gpt55 = "gpt_5_5"
+        case gpt56 = "gpt_5_6"
         case gptMini = "gpt_mini"
         case haiku
         case kimi
