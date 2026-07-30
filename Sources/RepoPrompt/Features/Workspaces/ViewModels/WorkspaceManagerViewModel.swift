@@ -666,6 +666,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             let targetWorkspaceID: UUID
             let targetWorkspaceName: String
             let direction: String
+            let operationID: UUID
+            let acceptedUptimeNanoseconds: UInt64?
             let switchStartMS: Double
             let expectedPrimaryRootCount: Int
 
@@ -684,6 +686,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         private var currentWorkspaceOpenTrace: WorkspaceOpenTrace?
         private var lastWorkspaceOpenTrace: WorkspaceOpenTrace?
+        private var codemapFullLoadCorrelation: CodemapFullLoadCorrelation?
     #endif
 
     private var workspaceDidSwitchListeners: [WorkspaceDidSwitchListener] = []
@@ -1031,9 +1034,91 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     #if DEBUG
+        func debugArmCodemapFullLoad(
+            targetWorkspaceName: String,
+            pollIntervalMilliseconds: Int,
+            timeoutMilliseconds: Int
+        ) -> Result<CodemapFullLoadCorrelation, CodemapFullLoadArmError> {
+            let matches = workspaces.filter { $0.name == targetWorkspaceName }
+            guard !matches.isEmpty else { return .failure(.targetNotFound) }
+            guard matches.count == 1, let target = matches.first else {
+                return .failure(.targetAmbiguous)
+            }
+            guard activeWorkspaceID != target.id else {
+                return .failure(.targetAlreadyActive)
+            }
+            let correlation = CodemapFullLoadCorrelation(
+                armID: UUID(),
+                targetWorkspaceID: target.id,
+                targetWorkspaceName: target.name,
+                pollIntervalMilliseconds: pollIntervalMilliseconds,
+                timeoutMilliseconds: timeoutMilliseconds,
+                armedUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                operationID: nil,
+                acceptedUptimeNanoseconds: nil,
+                switchResult: .pending,
+                invalidReason: nil
+            )
+            codemapFullLoadCorrelation = correlation
+            return .success(correlation)
+        }
+
+        @discardableResult
+        func debugClearCodemapFullLoad(armID: UUID? = nil) -> Bool {
+            guard let correlation = codemapFullLoadCorrelation,
+                  armID == nil || correlation.armID == armID
+            else { return false }
+            codemapFullLoadCorrelation = nil
+            return true
+        }
+
+        func debugCodemapFullLoadCorrelationSnapshot(
+            armID: UUID? = nil
+        ) -> CodemapFullLoadCorrelation? {
+            guard let correlation = codemapFullLoadCorrelation,
+                  armID == nil || correlation.armID == armID
+            else { return nil }
+            return correlation
+        }
+
+        func debugInvalidateCodemapFullLoad(armID: UUID, reason: String) {
+            guard var correlation = codemapFullLoadCorrelation,
+                  correlation.armID == armID
+            else { return }
+            correlation.invalidReason = reason
+            codemapFullLoadCorrelation = correlation
+        }
+
+        private func debugRecordCodemapFullLoadAccepted(
+            operationID: UUID,
+            targetWorkspaceID: UUID
+        ) {
+            guard var correlation = codemapFullLoadCorrelation else { return }
+            if correlation.operationID != nil || correlation.targetWorkspaceID != targetWorkspaceID {
+                correlation.invalidReason = "switch_operation_superseded_or_wrong_target"
+            } else {
+                _ = correlation.recordAccepted(
+                    operationID: operationID,
+                    targetWorkspaceID: targetWorkspaceID,
+                    uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                )
+            }
+            codemapFullLoadCorrelation = correlation
+        }
+
+        private func debugRecordCodemapFullLoadCompletion(
+            operationID: UUID,
+            result: WorkspaceSwitchResult
+        ) {
+            guard var correlation = codemapFullLoadCorrelation else { return }
+            _ = correlation.recordCompletion(operationID: operationID, result: result)
+            codemapFullLoadCorrelation = correlation
+        }
+
         private func debugStartWorkspaceOpenTrace(
             targetWorkspace: WorkspaceModel,
             previousWorkspace: WorkspaceModel?,
+            operationID: UUID,
             switchStartMS: Double
         ) {
             let previousName = previousWorkspace?.name ?? "nil"
@@ -1048,6 +1133,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 targetWorkspaceID: targetWorkspace.id,
                 targetWorkspaceName: targetWorkspace.name,
                 direction: "\(previousName)->\(targetWorkspace.name)",
+                operationID: operationID,
+                acceptedUptimeNanoseconds: codemapFullLoadCorrelation.flatMap {
+                    $0.operationID == operationID ? $0.acceptedUptimeNanoseconds : nil
+                },
                 switchStartMS: switchStartMS,
                 expectedPrimaryRootCount: expectedPrimaryRootCount
             )
@@ -1368,6 +1457,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return [
                     "workspace_switch_id": trace.id.uuidString,
                     "direction": trace.direction,
+                    "operation_id": trace.operationID.uuidString,
+                    "accepted_uptime_ns": optionalValue(trace.acceptedUptimeNanoseconds),
                     "previous_workspace_id": optionalValue(trace.previousWorkspaceID?.uuidString),
                     "previous_workspace_name": trace.previousWorkspaceName,
                     "target_workspace_id": trace.targetWorkspaceID.uuidString,
@@ -2130,6 +2221,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             phaseStartedAt: now
         )
         isSwitchingWorkspace = true
+        #if DEBUG
+            debugRecordCodemapFullLoadAccepted(
+                operationID: operationID,
+                targetWorkspaceID: newWorkspace.id
+            )
+        #endif
         return operationID
     }
 
@@ -2264,6 +2361,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         if finalResult.didSwitch, committedWorkspaceSwitchOperationID == operationID {
             clearWorkspaceSwitchBlockedNotice(blockedBy: operationID)
         }
+        #if DEBUG
+            debugRecordCodemapFullLoadCompletion(operationID: operationID, result: finalResult)
+        #endif
         finishWorkspaceSwitchOperation(operationID)
         return finalResult
     }
@@ -2854,6 +2954,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 debugStartWorkspaceOpenTrace(
                     targetWorkspace: newWorkspace,
                     previousWorkspace: previousActiveWorkspace,
+                    operationID: operationID,
                     switchStartMS: restorePerfStartMS
                 )
             }

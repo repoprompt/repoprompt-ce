@@ -112,7 +112,13 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
+        "RepoPromptWorkspaceCore",
+        "RepoPromptRegexCore",
+        "RepoPromptCodeMapCore",
         "TreeSitterScannerSupport",
+        "RepoPromptWorkspaceCoreTests",
+        "RepoPromptRegexCoreTests",
+        "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
     )
     for name in required_targets:
@@ -151,13 +157,11 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptMCP",
         "RepoPromptProcessSupport",
+        "RepoPromptCodeMapCore",
         "RepoPromptShared",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
-    if (
-        len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
-        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
-    ):
+    if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, "
             "RepoPromptProcessSupport, and RepoPromptShared"
@@ -180,7 +184,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
         )
 
-    expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
+    expected_resources = {("Fixtures", True), ("Goldens", True)}
     test_targets_with_codemap_resources = []
     for target in targets.values():
         if target.get("type") != "test":
@@ -191,9 +195,10 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         }
         if expected_resources.issubset(resources):
             test_targets_with_codemap_resources.append(target.get("name"))
-    if len(test_targets_with_codemap_resources) != 1:
+    if test_targets_with_codemap_resources != ["RepoPromptCodeMapCoreTests"]:
         raise GeneratorError(
-            "Exactly one SwiftPM test target must copy CodeMap/Fixtures and CodeMap/Goldens"
+            "RepoPromptCodeMapCoreTests must be the sole SwiftPM test target "
+            "that copies Fixtures and Goldens"
         )
 
     expected_scanners = ["src/javascript/scanner.c", "src/python/scanner.c"]
@@ -882,7 +887,12 @@ def validate_xcodebuild_list(destination: Path) -> None:
     workspace = destination / WORKSPACE_NAME
     command = ["xcodebuild", "-list", "-json", "-workspace", str(workspace)]
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except FileNotFoundError as error:
         raise GeneratorError("xcodebuild is required; install/select Xcode") from error
     if result.returncode != 0:

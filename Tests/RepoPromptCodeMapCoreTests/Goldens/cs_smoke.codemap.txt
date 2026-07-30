@@ -1,0 +1,17 @@
+File: <ROOT>/cs/smoke.cs
+Imports:
+  - using System;
+---
+Classes:
+  - Task
+    Methods:
+      - L12: public string Label()
+      - L17: public void Rename(string title)
+    Properties:
+      - title
+
+Interfaces:
+  - TaskRepository
+    Methods:
+      - L5: void Save(Task task);
+---

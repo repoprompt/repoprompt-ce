@@ -42,6 +42,25 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
+        let schema = try XCTUnwrap(Value(agentRun.inputSchema).objectValue)
+        let properties = try Self.schemaProperties(for: agentRun)
+        let response = try XCTUnwrap(properties["response"]?.objectValue)
+        let responseDescription = try XCTUnwrap(response["description"]?.stringValue)
+        let required = try XCTUnwrap(schema["required"]?.arrayValue?.compactMap(\.stringValue))
+
+        XCTAssertEqual(response["type"]?.stringValue, "string")
+        XCTAssertTrue(responseDescription.contains("top-level scalar string"), responseDescription)
+        XCTAssertTrue(responseDescription.contains("response=\"accept\""), responseDescription)
+        XCTAssertTrue(responseDescription.contains("decision and nested response objects are unsupported"), responseDescription)
+        XCTAssertNil(properties["decision"])
+        XCTAssertEqual(required, ["op"])
+        XCTAssertTrue(agentRun.description.contains("response=\"accept\""), agentRun.description)
+    }
+
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
         do {
             let caseLabel = "testAgentLifecycleSchemasAdvertiseTwoMinuteDefaultsWithoutMaximumClamp"
@@ -472,7 +491,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     private static let expectedSignatures: [String] = [
         "0|manage_selection|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b2facb46e2b8f9d4cfb00551bdfa19454b7f3eecd81bac510f4fed12f99452c3|schema=4b7a043e8e48130ee84cc6bbf7b9fd597b495aef238d44f17df6600088a2bb6f",
         "1|file_actions|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=81230c22d826458cae079855b133d59da34c4a66ae4a68252727e564931335b8|schema=4fd6a59a00940e13efc05b74c81372928d3ad3de0e028c8b34586e2168d16103",
-        "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=9d2524b6470775d4f6455c7c4db134054a2f50fe2d5be59aaddacb963ec44e47|schema=63876c20e878abd0465cf824d6fa1876c7fe3388c54d3f0cb087622f644f0cd4",
+        "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=22f87c78aabfda053a0a62d731743d8ba06db649f6f2497820aea0e2a97fa769|schema=3e87702a79eee436137bef3cf5fec4ee42ab5d252bd69d4eaa7a82ca62ad736a",
         "3|get_file_tree|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=9bf648121646b463554d58373f61c2dcede04640482994e0cf1533d21ae77093|schema=91972027e030989cf242fed03377bdc5056c6317cc77d351d3fa5348dd1767a0",
         "4|read_file|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f5ccd98a8fc0956c4ebcff540ffc8c0eaf0aaeb654b2f8edc0495c059fcf2807|schema=d023edb446167481751886bebeac7dc8896e2b3f57c12b18591761f846618bb1",
         "5|file_search|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f2c9e16ca780c4e94f795b6c9489658856052e6d159aa467a64c906ee48a3fe4|schema=08904f5e241c06414ff476b80b81338a5798961a69d93227d7ed098694546b99",
@@ -487,13 +506,13 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
-        "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",
-        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=9ce2d8314f17c1b37ce3bc41b699cb9b6e0d3190ae7a66da6a5f8152109214df|schema=1d86e85b1dd38bc0438d8d002230bcadbe80c21ae621d0a2dab9e4c9d0af5f65",
-        "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=03e16bee789cb9343f6b1b16cb4d472aedd3d811a43f6f95ad8ea5e8f69dc28d|schema=f5bc6b05cf0683ef3acb7a82ee4a14b75fadf26f32c56b0314be1424688a2ba5",
+        "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
+        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=2b5e211868964f961f2d369c2aa54da7035a92a83e900770ad433e4ceb00fd96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
+        "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
-        "23|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d"
+        "23|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fdc6ec2292ef0962b5fcfadf8691d905849a28474a832042789f14c444f6b0b6|schema=584dfe4f4200b3c795505461c3889c23d455a3af97c761e3bb5dd40ae46a8d71"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {

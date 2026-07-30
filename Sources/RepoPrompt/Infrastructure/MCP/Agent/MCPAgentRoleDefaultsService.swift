@@ -60,6 +60,46 @@ final class AgentModelsProfileRoleDefaultsStore: MCPAgentRoleDefaultsStoring {
 enum MCPAgentRoleDefaultsService {
     // MARK: - Resolution Result
 
+    enum PinState: Equatable {
+        case none
+        case unavailable
+        case custom(recommendedDisplayName: String)
+        case pinnedToRecommended
+
+        var message: String? {
+            switch self {
+            case .none:
+                nil
+            case .unavailable:
+                "Saved pin unavailable; using recommended default."
+            case let .custom(recommendedDisplayName):
+                "Recommended: \(recommendedDisplayName)"
+            case .pinnedToRecommended:
+                "Pinned to recommended"
+            }
+        }
+
+        var actionTitle: String? {
+            switch self {
+            case .none:
+                nil
+            case .unavailable, .pinnedToRecommended:
+                "Clear Pin"
+            case .custom:
+                "Apply"
+            }
+        }
+
+        var usesWarningStyle: Bool {
+            switch self {
+            case .unavailable, .custom:
+                true
+            case .none, .pinnedToRecommended:
+                false
+            }
+        }
+    }
+
     struct RoleDefaultResolution: Equatable {
         let role: AgentModelCatalog.TaskLabelKind
         let roleLabel: String
@@ -83,9 +123,28 @@ enum MCPAgentRoleDefaultsService {
         var selectionID: AgentModelSelectionID {
             AgentModelSelectionID(agentRaw: effective.agent.rawValue, modelRaw: effective.modelRaw)
         }
+
+        var pinState: PinState {
+            guard hasStoredOverride else { return .none }
+            if overrideUnavailable {
+                return .unavailable
+            }
+            if hasCustomOverride {
+                return .custom(recommendedDisplayName: recommendedDisplayName)
+            }
+            return .pinnedToRecommended
+        }
     }
 
     // MARK: - Resolve All
+
+    static func hasStoredOverrides(
+        workspaceID: UUID? = nil,
+        settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
+    ) -> Bool {
+        let settingsStore = settingsStore ?? GlobalSettingsStore.shared
+        return settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)?.isEmpty == false
+    }
 
     /// Returns resolutions for all task label roles in canonical order.
     static func resolutions(

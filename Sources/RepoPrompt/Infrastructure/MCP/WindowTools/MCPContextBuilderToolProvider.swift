@@ -4,6 +4,26 @@ import MCP
 import Ontology
 import RepoPromptProcessSupport
 
+/// Carries existing non-Sendable UI snapshot/DTO values through the provider's @Sendable timeline
+/// wrappers without broadening their conformances. Each operation stores once and is fully awaited
+/// before the owning task loads once; the lock makes that narrow handoff explicit and race-safe.
+private final class ContextBuilderTimelinePhaseValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value?
+
+    func store(_ value: Value) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func load() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 private struct ContextBuilderToolResult: Codable {
     let tabID: String
     let status: String
@@ -516,7 +536,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
-                            progressReporter: progressReporter
+                            progressReporter: progressReporter,
+                            activityReporter: activityReporter
                         )
                     }
                 }
@@ -528,77 +549,125 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     "Context Builder run complete, building selection..."
                 )
 
-                let resultTab: ComposeTabState
-                switch snapshot.terminalDisposition {
-                case .completed:
-                    guard let committedTab = snapshot.committedTab else {
-                        throw MCPError.internalError(
-                            "Context Builder completed without an exact committed tab snapshot"
+                await progressTimeline.transition(to: .selectionReplyRendering)
+                let renderedSelection = ContextBuilderTimelinePhaseValue<(
+                    resultTab: ComposeTabState,
+                    effectivePrompt: String,
+                    status: String,
+                    selection: StoredSelection,
+                    fileCount: Int,
+                    reply: ToolResultDTOs.SelectionReply,
+                    formatted: String
+                )>()
+                try await withTimelinePhaseCompletion(progressTimeline) {
+                    try await withHeartbeat(
+                        connectionID: connectionID,
+                        tool: MCPWindowToolName.contextBuilder,
+                        stage: "processing",
+                        message: "Still rendering Context Builder selection...",
+                        timeline: progressTimeline
+                    ) {
+                        let committedResultTab: ComposeTabState?
+                        if let committedTab = snapshot.committedTab {
+                            guard committedTab.nestedRunID == snapshot.runID,
+                                  committedTab.identity == resolvedIdentity,
+                                  committedTab.tab.id == finalTabID
+                            else {
+                                throw MCPError.internalError(
+                                    "Context Builder committed tab identity does not match the completed run"
+                                )
+                            }
+                            if snapshot.terminalDisposition == .completed {
+                                let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
+                                    let manager = targetWindow.workspaceManager
+                                    return (
+                                        manager.composeTab(for: committedTab.identity),
+                                        manager.selectionRevisionForMCP(
+                                            workspaceID: committedTab.identity.workspaceID,
+                                            tabID: committedTab.identity.tabID
+                                        )
+                                    )
+                                }
+                                let committedSnapshotIsCurrent: Bool = if responseType == .review {
+                                    canonicalState.1 == committedTab.selectionRevision
+                                        && canonicalState.0?.selection == committedTab.tab.selection
+                                } else {
+                                    canonicalState.1 >= committedTab.selectionRevision
+                                        && (
+                                            canonicalState.1 != committedTab.selectionRevision
+                                                || canonicalState.0?.selection == committedTab.tab.selection
+                                        )
+                                }
+                                guard committedSnapshotIsCurrent else {
+                                    throw MCPError.internalError(
+                                        "Context Builder committed tab snapshot is no longer valid"
+                                    )
+                                }
+                            }
+                            committedResultTab = committedTab.tab
+                        } else {
+                            committedResultTab = nil
+                        }
+
+                        let resultTab: ComposeTabState
+                        switch snapshot.terminalDisposition {
+                        case .completed:
+                            guard let committedResultTab else {
+                                throw MCPError.internalError(
+                                    "Context Builder completed without an exact committed tab snapshot"
+                                )
+                            }
+                            resultTab = committedResultTab
+                        case .cancelled, .failed:
+                            // Cancellation or failure after a successful commit must report the exact
+                            // committed prompt and selection. Pre-commit outcomes retain the immutable
+                            // initial tab instead of consulting mutable active-tab state.
+                            resultTab = committedResultTab ?? initialResultTab
+                        }
+
+                        let overrides = resultTab.contextOverrides
+                        let effectivePrompt = overrides.useOverridePrompt
+                            ? overrides.overridePromptText
+                            : resultTab.promptText
+                        let status = switch snapshot.terminalDisposition {
+                        case .completed: "completed"
+                        case .cancelled: "cancelled"
+                        case let .failed(message): "failed: \(message)"
+                        }
+
+                        try workspaceContext?.validateAvailability()
+                        let selection = resultTab.selection
+                        let reply = try await dependencies.buildTabSelectionReply(
+                            selection,
+                            false,
+                            .relative,
+                            .auto,
+                            lookupContext,
+                            tabResolution.reviewGitContext
                         )
+                        renderedSelection.store((
+                            resultTab: resultTab,
+                            effectivePrompt: effectivePrompt,
+                            status: status,
+                            selection: selection,
+                            fileCount: selection.selectedPaths.count,
+                            reply: reply,
+                            formatted: ToolOutputFormatter.formatSelectionReplyToString(reply)
+                        ))
                     }
-                    guard committedTab.nestedRunID == snapshot.runID,
-                          committedTab.identity == resolvedIdentity,
-                          committedTab.tab.id == finalTabID
-                    else {
-                        throw MCPError.internalError(
-                            "Context Builder committed tab identity does not match the completed run"
-                        )
-                    }
-                    let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
-                        let manager = targetWindow.workspaceManager
-                        return (
-                            manager.composeTab(for: committedTab.identity),
-                            manager.selectionRevisionForMCP(
-                                workspaceID: committedTab.identity.workspaceID,
-                                tabID: committedTab.identity.tabID
-                            )
-                        )
-                    }
-                    let committedSnapshotIsCurrent: Bool = if responseType == .review {
-                        canonicalState.1 == committedTab.selectionRevision
-                            && canonicalState.0?.selection == committedTab.tab.selection
-                    } else {
-                        canonicalState.1 >= committedTab.selectionRevision
-                            && (
-                                canonicalState.1 != committedTab.selectionRevision
-                                    || canonicalState.0?.selection == committedTab.tab.selection
-                            )
-                    }
-                    guard committedSnapshotIsCurrent else {
-                        throw MCPError.internalError(
-                            "Context Builder committed tab snapshot is no longer valid"
-                        )
-                    }
-                    resultTab = committedTab.tab
-                case .cancelled, .failed:
-                    // Genuine discovery failures retain the exact immutable pre-run tab instead of
-                    // falling back to an active or duplicate tab after child cleanup.
-                    resultTab = initialResultTab
                 }
-
-                let overrides = resultTab.contextOverrides
-                let effectivePrompt = overrides.useOverridePrompt ? overrides.overridePromptText : resultTab.promptText
-
-                let status = switch snapshot.terminalDisposition {
-                case .completed: "completed"
-                case .cancelled: "cancelled"
-                case let .failed(message): "failed: \(message)"
+                guard let renderedSelection = renderedSelection.load() else {
+                    throw MCPError.internalError(
+                        "Context Builder selection reply rendering completed without a result"
+                    )
                 }
-
-                try workspaceContext?.validateAvailability()
-                let sel = resultTab.selection
-                let fileCount = sel.selectedPaths.count
-
-                let selectionReply = try await dependencies.buildTabSelectionReply(
-                    sel,
-                    false,
-                    .relative,
-                    .auto,
-                    lookupContext,
-                    tabResolution.reviewGitContext
-                )
-
-                let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
+                let resultTab = renderedSelection.resultTab
+                let effectivePrompt = renderedSelection.effectivePrompt
+                let status = renderedSelection.status
+                let sel = renderedSelection.selection
+                let fileCount = renderedSelection.fileCount
+                let selectionReply = renderedSelection.reply
+                let formattedSelection = renderedSelection.formatted
 
                 var planReply: ChatSendReply? = nil
                 var reviewReply: ChatSendReply? = nil
@@ -632,50 +701,70 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             )
                         }
 
-                        await dependencies.beforeContextBuilderFinalReviewAuthorization()
-                        let preAuthorizationCanonical = await MainActor.run {
-                            () -> (ComposeTabState?, UInt64) in
-                            let manager = targetWindow.workspaceManager
-                            return (
-                                manager.composeTab(for: committedTab.identity),
-                                manager.selectionRevisionForMCP(
-                                    workspaceID: committedTab.identity.workspaceID,
-                                    tabID: committedTab.identity.tabID
-                                )
-                            )
-                        }
-                        guard preAuthorizationCanonical.1 == committedTab.selectionRevision,
-                              preAuthorizationCanonical.0?.selection == sel
-                        else {
-                            throw MCPError.invalidParams(
-                                "Context Builder review selection changed before final repository authorization."
-                            )
-                        }
+                        await progressTimeline.transition(to: .reviewSelectionAuthorization)
+                        let retainedAuthorization =
+                            ContextBuilderTimelinePhaseValue<ContextBuilderFinalReviewAuthorization>()
+                        try await withTimelinePhaseCompletion(progressTimeline) {
+                            try await withHeartbeat(
+                                connectionID: connectionID,
+                                tool: MCPWindowToolName.contextBuilder,
+                                stage: "generating",
+                                message: "Still authorizing Context Builder review selection...",
+                                timeline: progressTimeline
+                            ) {
+                                await dependencies.beforeContextBuilderFinalReviewAuthorization()
+                                let preAuthorizationCanonical = await MainActor.run {
+                                    () -> (ComposeTabState?, UInt64) in
+                                    let manager = targetWindow.workspaceManager
+                                    return (
+                                        manager.composeTab(for: committedTab.identity),
+                                        manager.selectionRevisionForMCP(
+                                            workspaceID: committedTab.identity.workspaceID,
+                                            tabID: committedTab.identity.tabID
+                                        )
+                                    )
+                                }
+                                guard preAuthorizationCanonical.1 == committedTab.selectionRevision,
+                                      preAuthorizationCanonical.0?.selection == sel
+                                else {
+                                    throw MCPError.invalidParams(
+                                        "Context Builder review selection changed before final repository authorization."
+                                    )
+                                }
 
-                        let authorization = try await workspaceContext.authorizeFinalReviewSelection(
-                            sel,
-                            workspaceID: committedTab.identity.workspaceID,
-                            tabID: committedTab.identity.tabID,
-                            selectionRevision: committedTab.selectionRevision,
-                            store: dependencies.promptVM.workspaceFileContextStore
-                        )
-                        await dependencies.didFinalizeContextBuilderReview(authorization)
-
-                        let finalCanonical = await MainActor.run { () -> (ComposeTabState?, UInt64) in
-                            let manager = targetWindow.workspaceManager
-                            return (
-                                manager.composeTab(for: committedTab.identity),
-                                manager.selectionRevisionForMCP(
+                                let authorization = try await workspaceContext.authorizeFinalReviewSelection(
+                                    sel,
                                     workspaceID: committedTab.identity.workspaceID,
-                                    tabID: committedTab.identity.tabID
+                                    tabID: committedTab.identity.tabID,
+                                    selectionRevision: committedTab.selectionRevision,
+                                    store: dependencies.promptVM.workspaceFileContextStore
                                 )
-                            )
+                                await dependencies.didFinalizeContextBuilderReview(authorization)
+
+                                let finalCanonical = await MainActor.run {
+                                    () -> (ComposeTabState?, UInt64) in
+                                    let manager = targetWindow.workspaceManager
+                                    return (
+                                        manager.composeTab(for: committedTab.identity),
+                                        manager.selectionRevisionForMCP(
+                                            workspaceID: committedTab.identity.workspaceID,
+                                            tabID: committedTab.identity.tabID
+                                        )
+                                    )
+                                }
+                                guard finalCanonical.1 == committedTab.selectionRevision,
+                                      finalCanonical.0?.selection == sel
+                                else {
+                                    throw MCPError.invalidParams(
+                                        "Context Builder review selection changed after final repository authorization."
+                                    )
+                                }
+                                retainedAuthorization.store(authorization)
+                            }
                         }
-                        guard finalCanonical.1 == committedTab.selectionRevision,
-                              finalCanonical.0?.selection == sel
-                        else {
-                            throw MCPError.invalidParams(
-                                "Context Builder review selection changed after final repository authorization."
+                        guard let authorization = retainedAuthorization.load() else {
+                            throw MCPError.internalError(
+                                "Context Builder review authorization completed without retained authority"
                             )
                         }
                         finalReviewAuthorization = authorization
@@ -888,7 +977,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         guard let connectionID else {
             return try await operation()
         }
-        let shouldSendProgress = await ServerNetworkManager.shared.supportsControlNotifications(connectionID: connectionID)
+        let shouldSendProgress = await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
         guard shouldSendProgress else {
             return try await operation()
         }

@@ -29,7 +29,14 @@ final class MCPTerminalRecordTests: XCTestCase {
             bridgeCancellationTombstoneCount: 1,
             bridgeRecentCompletionCount: 4,
             bridgePendingTransactionCount: 5,
-            bridgeHasForwardedProtocolFrame: true
+            bridgeHasForwardedProtocolFrame: true,
+            toolName: "get_code_structure",
+            invocationID: UUID(uuidString: "99999999-8888-7777-6666-555555555555"),
+            elapsedMilliseconds: 35000,
+            handlerPhase: "get_code_structure.assembly",
+            handlerPhaseAgeMilliseconds: 5000,
+            executionDeadlineMilliseconds: 30000,
+            cleanupGraceMilliseconds: 5000
         )
 
         let fileURL = try MCPTerminalRecordStore.write(record, to: directory)
@@ -44,6 +51,21 @@ final class MCPTerminalRecordTests: XCTestCase {
         XCTAssertFalse(persistedText.contains("json-secret"))
         XCTAssertFalse(persistedText.contains("env-secret"))
         XCTAssertFalse(persistedText.contains("session-cookie"))
+        let persistedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(persistedObject["tool_name"] as? String, "get_code_structure")
+        XCTAssertEqual(
+            persistedObject["invocation_id"] as? String,
+            "99999999-8888-7777-6666-555555555555"
+        )
+        XCTAssertEqual(persistedObject["elapsed_ms"] as? Double, 35000)
+        XCTAssertEqual(persistedObject["handler_phase"] as? String, "get_code_structure.assembly")
+        XCTAssertEqual(persistedObject["handler_phase_age_ms"] as? Double, 5000)
+        XCTAssertEqual(persistedObject["execution_deadline_ms"] as? Double, 30000)
+        XCTAssertEqual(persistedObject["cleanup_grace_ms"] as? Double, 5000)
+        XCTAssertNil(persistedObject["toolName"])
+        XCTAssertNil(persistedObject["invocationID"])
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -57,6 +79,22 @@ final class MCPTerminalRecordTests: XCTestCase {
         XCTAssertFalse(decoded.errorDescription?.contains("env-secret") == true)
         XCTAssertFalse(decoded.errorDescription?.contains("session-cookie") == true)
         XCTAssertFalse(decoded.errorDescription?.contains(rawSessionToken) == true)
+    }
+
+    func testLegacyRecordDecodesWithNilWatchdogAttribution() throws {
+        let data = Data(#"{"id":"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE","timestamp":"2025-06-15T15:06:40Z","monotonicUptime":12.5,"layer":"app_accepted_socket","initiator":"peer","reason":"peer_eof","localPID":101}"#.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let decoded = try decoder.decode(MCPTerminalRecord.self, from: data)
+
+        XCTAssertNil(decoded.toolName)
+        XCTAssertNil(decoded.invocationID)
+        XCTAssertNil(decoded.elapsedMilliseconds)
+        XCTAssertNil(decoded.handlerPhase)
+        XCTAssertNil(decoded.handlerPhaseAgeMilliseconds)
+        XCTAssertNil(decoded.executionDeadlineMilliseconds)
+        XCTAssertNil(decoded.cleanupGraceMilliseconds)
     }
 
     func testStoreRetainsNewestTerminalRecordsWithoutTouchingCLIEvents() throws {
@@ -135,27 +173,34 @@ final class MCPTerminalRecordTests: XCTestCase {
     func testFirstTerminalRecordClaimRetriesOriginalRecordWithoutSubstitutingNewCause() {
         let firstRecord = MCPTerminalRecord(
             layer: .appAcceptedSocket,
-            initiator: .peer,
-            reason: "peer_eof",
+            initiator: .app,
+            reason: "tool_execution_watchdog",
             sessionToken: "first-cause-session",
             localPID: 1,
             peerPID: 2,
             appConnectionID: UUID(),
             connectionGeneration: 3,
             errno: nil,
-            errorDescription: nil
+            errorDescription: nil,
+            toolName: "get_code_structure",
+            invocationID: UUID(),
+            elapsedMilliseconds: 35000,
+            handlerPhase: "get_code_structure.assembly",
+            handlerPhaseAgeMilliseconds: 5000,
+            executionDeadlineMilliseconds: 30000,
+            cleanupGraceMilliseconds: 5000
         )
         let laterRecord = MCPTerminalRecord(
             layer: .appAcceptedSocket,
-            initiator: .app,
-            reason: "connection_start_failure",
+            initiator: .peer,
+            reason: "peer_eof",
             sessionToken: "first-cause-session",
             localPID: 1,
             peerPID: 2,
             appConnectionID: firstRecord.appConnectionID,
             connectionGeneration: 3,
             errno: nil,
-            errorDescription: "later generic startup cleanup"
+            errorDescription: "later generic transport cleanup"
         )
 
         var claim = MCPFirstTerminalRecordClaim()

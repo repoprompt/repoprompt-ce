@@ -97,6 +97,14 @@ struct AppCommand {
     }
 }
 
+typealias AgentSessionHandoffInstructionsProvider = @MainActor () -> String
+
+enum AgentChatHandoffCopyOutcome: Equatable {
+    case copied
+    case staleTarget
+    case instructionsTooLong(count: Int, maximum: Int)
+}
+
 /// Holds all of the per-window managers/services.
 /// Each new window in the app gets a fresh instance of WindowState.
 @MainActor
@@ -768,6 +776,7 @@ class WindowState: ObservableObject {
             return nil
         }
         return AgentChatOptionsMenuTarget(
+            windowID: windowID,
             workspaceID: workspace.id,
             tabID: tabID,
             agentSessionID: agentSessionID,
@@ -776,7 +785,8 @@ class WindowState: ObservableObject {
     }
 
     func agentChatTitleClusterMenuTargetIsValid(_ target: AgentChatOptionsMenuTarget) -> Bool {
-        guard let workspace = workspaceManager.activeWorkspace,
+        guard target.windowID == windowID,
+              let workspace = workspaceManager.activeWorkspace,
               workspace.id == target.workspaceID,
               workspace.composeTabs.contains(where: { $0.id == target.tabID })
         else {
@@ -804,7 +814,17 @@ class WindowState: ObservableObject {
         )
     }
 
-    func agentChatTitleClusterMenuActions() -> AgentChatOptionsMenuActions {
+    func agentChatTitleClusterMenuActions(
+        handoffInstructionsProvider: @escaping AgentSessionHandoffInstructionsProvider = {
+            GlobalSettingsStore.shared.agentSessionHandoffInstructions()
+        },
+        handoffOversizedFeedback: ((Int, Int) -> Void)? = nil,
+        copyToClipboard: @escaping (String) -> Void = { value in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
+        }
+    ) -> AgentChatOptionsMenuActions {
         AgentChatOptionsMenuActions(
             togglePin: { [weak self] target in
                 self?.toggleAgentChatPinFromTitlebar(target: target)
@@ -814,6 +834,14 @@ class WindowState: ObservableObject {
             },
             stash: { [weak self] target in
                 self?.stashAgentChatFromTitlebar(target: target)
+            },
+            copyHandoffPrompt: { [weak self] target in
+                self?.copyAgentChatHandoffPromptFromTitlebar(
+                    target: target,
+                    handoffInstructionsProvider: handoffInstructionsProvider,
+                    handoffOversizedFeedback: handoffOversizedFeedback,
+                    copyToClipboard: copyToClipboard
+                )
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
@@ -831,6 +859,62 @@ class WindowState: ObservableObject {
     private func toggleAgentChatPinFromTitlebar(target: AgentChatOptionsMenuTarget) {
         guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
         promptManager.toggleComposeTabPinned(target.tabID)
+    }
+
+    private func copyAgentChatHandoffPromptFromTitlebar(
+        target: AgentChatOptionsMenuTarget,
+        handoffInstructionsProvider: AgentSessionHandoffInstructionsProvider,
+        handoffOversizedFeedback: ((Int, Int) -> Void)?,
+        copyToClipboard: (String) -> Void
+    ) {
+        guard !isClosing, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let instructions = handoffInstructionsProvider()
+        let outcome = performAgentChatHandoffCopy(
+            target: target,
+            instructions: instructions,
+            copyToClipboard: copyToClipboard
+        )
+        guard case let .instructionsTooLong(count, maximum) = outcome else { return }
+        if let handoffOversizedFeedback {
+            handoffOversizedFeedback(count, maximum)
+        } else {
+            presentAgentChatHandoffInstructionsTooLongFeedback(count: count, maximum: maximum)
+        }
+    }
+
+    @discardableResult
+    private func performAgentChatHandoffCopy(
+        target: AgentChatOptionsMenuTarget,
+        instructions: String,
+        copyToClipboard: (String) -> Void
+    ) -> AgentChatHandoffCopyOutcome {
+        guard !isClosing, agentChatTitleClusterMenuTargetIsValid(target) else {
+            return .staleTarget
+        }
+        switch AgentSessionHandoffInstructionsPolicy.validation(of: instructions) {
+        case .valid:
+            break
+        case let .tooLong(count, maximum):
+            return .instructionsTooLong(count: count, maximum: maximum)
+        }
+
+        let prompt = AgentSessionHandoffPrompt.render(
+            target: target,
+            cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName,
+            instructions: instructions
+        )
+        copyToClipboard(prompt)
+        return .copied
+    }
+
+    private func presentAgentChatHandoffInstructionsTooLongFeedback(count: Int, maximum: Int) {
+        guard !isClosing, let window = nsWindow, window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Handoff Instructions Too Long"
+        alert.informativeText = "The saved default contains \(count) characters; the maximum is \(maximum). Shorten or clear it in Settings → Agent Mode → Handoff Instructions, then try again."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
     }
 
     private func stashAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
