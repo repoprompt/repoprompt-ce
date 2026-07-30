@@ -350,7 +350,7 @@ struct AgentModelsSettingsView: View {
 
     private var oracleSection: some View {
         settingsCard {
-            sectionHeader(title: "Oracle Model", subtitle: "Used by ask_oracle, oracle_send, plan/review, and Context Builder analysis.")
+            sectionHeader(title: "Primary Oracle Model", subtitle: "The compatibility/default response used by ask_oracle, oracle_send, plan/review, and Context Builder analysis.")
 
             HStack(alignment: .center, spacing: 12) {
                 AIModelDropdown(
@@ -388,6 +388,34 @@ struct AgentModelsSettingsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+
+            Divider()
+
+            sectionHeader(
+                title: "Secondary Oracle Model",
+                subtitle: "Optional independent second opinion. Both responses are returned without automatic synthesis."
+            )
+
+            HStack(alignment: .center, spacing: 12) {
+                AIModelDropdown(
+                    promptViewModel: promptVM,
+                    showSettingsPopover: $showSettingsPopover,
+                    windowID: windowID,
+                    useBorderlessStyle: false,
+                    isInGeneralSettings: true,
+                    destination: viewModel.secondaryOracleModelDestination
+                )
+                if viewModel.isSecondaryOracleEnabled {
+                    Button("Disable") {
+                        viewModel.setSecondaryOracleModel(raw: "")
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+
+            Text("Using: \(viewModel.currentSecondaryOracleModelName)")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
 

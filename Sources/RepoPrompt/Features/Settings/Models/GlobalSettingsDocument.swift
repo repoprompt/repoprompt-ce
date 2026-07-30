@@ -170,6 +170,7 @@ enum ContextBuilderSettingsWriteIntent {
 
 struct AgentModelsSettingsProfile: Codable, Equatable {
     var planningModelRaw: String?
+    var secondaryOracleModelRaw: String?
     var preferredComposeModelRaw: String?
     var syncChatModelWithOracle: Bool
     var contextBuilderAgentRaw: String?
@@ -179,6 +180,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     init(
         planningModelRaw: String? = nil,
+        secondaryOracleModelRaw: String? = nil,
         preferredComposeModelRaw: String? = nil,
         syncChatModelWithOracle: Bool = false,
         contextBuilderAgentRaw: String? = nil,
@@ -187,6 +189,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         restrictMCPAgentDiscoveryToRoleLabels: Bool = false
     ) {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
+        self.secondaryOracleModelRaw = Self.normalizedChatModelRaw(secondaryOracleModelRaw)
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
         self.syncChatModelWithOracle = syncChatModelWithOracle
         self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
@@ -197,6 +200,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case planningModelRaw
+        case secondaryOracleModelRaw
         case preferredComposeModelRaw
         case syncChatModelWithOracle
         case contextBuilderAgentRaw
@@ -209,6 +213,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(
             planningModelRaw: container.decodeIfPresent(String.self, forKey: .planningModelRaw),
+            secondaryOracleModelRaw: container.decodeIfPresent(String.self, forKey: .secondaryOracleModelRaw),
             preferredComposeModelRaw: container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw),
             syncChatModelWithOracle: container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false,
             contextBuilderAgentRaw: container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw),
@@ -453,15 +458,18 @@ struct GlobalScalarPreferences: Codable, Equatable {
     struct ModelSelectionSettings: Codable, Equatable {
         var preferredComposeModel: String?
         var planningModel: String?
+        var secondaryOracleModel: String?
         var syncChatModelWithOracle: Bool?
 
         init(
             preferredComposeModel: String? = nil,
             planningModel: String? = nil,
+            secondaryOracleModel: String? = nil,
             syncChatModelWithOracle: Bool? = nil
         ) {
             self.preferredComposeModel = preferredComposeModel
             self.planningModel = planningModel
+            self.secondaryOracleModel = secondaryOracleModel
             self.syncChatModelWithOracle = syncChatModelWithOracle
         }
     }

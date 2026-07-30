@@ -94,6 +94,9 @@ actor ChatDataService {
         let composeTabID: UUID?
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
+        let oraclePairID: UUID?
+        let oracleLane: OracleLane?
+        let oracleHistoryDiverged: Bool?
         let name: String
         let savedAt: Date
         let shortID: String?
@@ -264,6 +267,9 @@ actor ChatDataService {
                 composeTabID: header.composeTabID,
                 agentModeSessionID: header.agentModeSessionID,
                 agentModeRunID: header.agentModeRunID,
+                oraclePairID: header.oraclePairID,
+                oracleLane: header.oracleLane,
+                oracleHistoryDiverged: header.oracleHistoryDiverged ?? false,
                 name: header.name,
                 savedAt: header.savedAt,
                 fileURL: fileURL,

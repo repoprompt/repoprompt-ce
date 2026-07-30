@@ -701,6 +701,29 @@ private enum AppSettingsMCPRegistry {
             afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
+        optionalModelRawSetting(
+            key: "models.secondary_oracle_model",
+            group: "models",
+            label: "Secondary Oracle Model",
+            description: "Optional independent Secondary Oracle model. Null disables the second lane.",
+            read: { stringOrNull($0.secondaryOracleModelRaw()) },
+            write: { store, value in
+                let raw = try optionalString(from: value)
+                if let raw,
+                   AIModel.fromModelName(raw) == nil
+                {
+                    throw MCPError.invalidParams(
+                        "Secondary Oracle Model '\(raw)' is not a recognized model identifier."
+                    )
+                }
+                store.setSecondaryOracleModelRaw(
+                    raw,
+                    reason: "app_settings.models.secondary_oracle_model"
+                )
+            },
+            afterWrite: postRecommendationsDidApply,
+            candidateProvider: aiModelRawCandidates
+        ),
         boolSetting(
             key: "models.sync_chat_model_with_oracle",
             group: "models",

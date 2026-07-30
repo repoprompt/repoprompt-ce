@@ -355,6 +355,10 @@ class OracleViewModel: ObservableObject {
     @Published private(set) var streamingSessions: Set<UUID> = []
     @Published private(set) var messageStoreRevision: Int = 0
     @Published private(set) var currentQueryId: UUID?
+    var inFlightOraclePairClaimKeys: Set<UUID> = []
+    #if DEBUG
+        var oraclePairTestFailurePoint: OraclePairTestFailurePoint?
+    #endif
 
     /// Per-session stream state
     private var runStateBySession: [UUID: SessionRunState] = [:]
@@ -1891,16 +1895,18 @@ class OracleViewModel: ObservableObject {
     @discardableResult
     func startNewChatSession(
         name: String = "New Chat",
+        workspaceID: UUID? = nil,
         tabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         activateInUI: Bool = true,
-        setActiveForTab: Bool = true
+        setActiveForTab: Bool = true,
+        reuseBlankSession: Bool = true
     ) async -> UUID? {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         // If there's already a blank session with that name, just switch to it
-        if let existingIndex = sessions.firstIndex(where: {
+        if reuseBlankSession, let existingIndex = sessions.firstIndex(where: {
             $0.name == name &&
                 $0.effectiveMessageCount == 0 &&
                 $0.composeTabID == resolvedTabID &&
@@ -1950,7 +1956,7 @@ class OracleViewModel: ObservableObject {
         let selectedChatPresetId = promptViewModel.selectedChatPresetID
 
         let newSession = ChatSession(
-            workspaceID: workspaceManager.activeWorkspace?.id,
+            workspaceID: workspaceID ?? workspaceManager.activeWorkspace?.id,
             composeTabID: resolvedTabID,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
@@ -2472,6 +2478,9 @@ class OracleViewModel: ObservableObject {
                 sessionToSave.composeTabID = session.composeTabID
                 sessionToSave.agentModeSessionID = session.agentModeSessionID
                 sessionToSave.agentModeRunID = session.agentModeRunID
+                sessionToSave.oraclePairID = session.oraclePairID
+                sessionToSave.oracleLane = session.oracleLane
+                sessionToSave.oracleHistoryDiverged = session.oracleHistoryDiverged
                 sessionToSave.selectedFilePaths = session.selectedFilePaths
                 sessionToSave.selectedPromptIDs = session.selectedPromptIDs
                 sessionToSave.preferredAIModel = session.preferredAIModel
@@ -2772,6 +2781,99 @@ class OracleViewModel: ObservableObject {
 
     // MARK: - Main Send/Receive Flow
 
+    struct PrepublishedOracleUserTurn {
+        let sessionID: UUID
+        let messageID: UUID
+        fileprivate let previousMessages: [AIChatMessage]
+        fileprivate let previousSession: ChatSession
+        fileprivate let previousNextSequenceIndex: Int?
+    }
+
+    @MainActor
+    func prepublishOracleUserTurn(_ message: String, in sessionID: UUID) throws -> PrepublishedOracleUserTurn {
+        guard !message.isEmpty,
+              let session = sessions.first(where: { $0.id == sessionID }),
+              !session.isListStub
+        else {
+            throw ChatToolError.internalError("Failed to prepublish an Oracle user turn.")
+        }
+        ensureSessionStorage(sessionID)
+        let turn = PrepublishedOracleUserTurn(
+            sessionID: sessionID,
+            messageID: UUID(),
+            previousMessages: messageStore[sessionID] ?? [],
+            previousSession: session,
+            previousNextSequenceIndex: nextSequenceIndexBySession[sessionID]
+        )
+        let userMessage = AIChatMessage(
+            id: turn.messageID,
+            content: message,
+            isUser: true,
+            sequenceIndex: nextSequenceIndex(for: sessionID)
+        )
+        withSessionMessages(sessionID) { $0.append(userMessage) }
+        registerMessage(turn.messageID, sessionID: sessionID)
+        return turn
+    }
+
+    @MainActor
+    func rollbackPrepublishedOracleUserTurn(_ turn: PrepublishedOracleUserTurn) throws {
+        guard let index = sessions.firstIndex(where: { $0.id == turn.sessionID }) else {
+            throw ChatToolError.internalError("Failed to roll back an Oracle user turn.")
+        }
+        for message in messageStore[turn.sessionID] ?? [] {
+            sessionIDByMessageId.removeValue(forKey: message.id)
+        }
+        messageStore[turn.sessionID] = turn.previousMessages
+        messageStoreRevision &+= 1
+        for message in turn.previousMessages {
+            registerMessage(message.id, sessionID: turn.sessionID)
+        }
+        nextSequenceIndexBySession[turn.sessionID] = turn.previousNextSequenceIndex
+        sessions[index] = turn.previousSession
+    }
+
+    @MainActor
+    func persistOracleLaneHistory(_ sessionID: UUID) async throws {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }),
+              let liveMessages = messageStore[sessionID]
+        else {
+            throw ChatToolError.internalError("Failed to persist an Oracle lane history.")
+        }
+        var session = sessions[index]
+        session.messages = liveMessages.map { message in
+            StoredMessage(
+                id: message.id,
+                isUser: message.isUser,
+                rawText: message.content,
+                timestamp: Date(),
+                sequenceIndex: message.sequenceIndex,
+                allowedFilePaths: message.allowedFilePaths.isEmpty ? nil : message.allowedFilePaths,
+                promptTokens: message.promptTokens,
+                completionTokens: message.completionTokens,
+                cost: message.cost,
+                modelName: message.modelName
+            )
+        }
+        session.savedAt = Date()
+        let fileURL = try await autosaveSession(session)
+        session.fileURL = fileURL
+        sessions[index] = session
+    }
+
+    @MainActor
+    func removeOraclePairSessionState(_ sessionIDs: Set<UUID>) {
+        sessions.removeAll { sessionIDs.contains($0.id) }
+        for sessionID in sessionIDs {
+            purgeSessionStorage(sessionID)
+        }
+    }
+
+    @MainActor
+    func oracleUserHistory(in sessionID: UUID) -> [String]? {
+        messageStore[sessionID]?.filter(\.isUser).map(\.content)
+    }
+
     @MainActor
     func sendMessage(
         _ newUserMessage: String,
@@ -2785,6 +2887,7 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        prepublishedOracleUserTurn: PrepublishedOracleUserTurn? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async {
         guard !newUserMessage.isEmpty else { return }
@@ -2811,18 +2914,24 @@ class OracleViewModel: ObservableObject {
 
         ensureSessionStorage(targetSessionID)
 
-        // Create the user message
-        let userId = UUID()
-        let userMessage = AIChatMessage(
-            id: userId,
-            content: newUserMessage,
-            isUser: true,
-            sequenceIndex: nextSequenceIndex(for: targetSessionID)
-        )
-        withSessionMessages(targetSessionID) { msgs in
-            msgs.append(userMessage)
+        if let prepublishedOracleUserTurn {
+            guard prepublishedOracleUserTurn.sessionID == targetSessionID,
+                  messageStore[targetSessionID]?.last(where: { $0.isUser })?.id == prepublishedOracleUserTurn.messageID,
+                  messageStore[targetSessionID]?.first(where: { $0.id == prepublishedOracleUserTurn.messageID })?.content == newUserMessage
+            else {
+                return
+            }
+        } else {
+            let userID = UUID()
+            let userMessage = AIChatMessage(
+                id: userID,
+                content: newUserMessage,
+                isUser: true,
+                sequenceIndex: nextSequenceIndex(for: targetSessionID)
+            )
+            withSessionMessages(targetSessionID) { $0.append(userMessage) }
+            registerMessage(userID, sessionID: targetSessionID)
         }
-        registerMessage(userId, sessionID: targetSessionID)
 
         let conversation = buildConversationEntries(for: targetSessionID)
 

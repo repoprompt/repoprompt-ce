@@ -253,7 +253,7 @@ struct MCPOracleToolService {
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? normalizedChatID,
-                response: result["response"]?.stringValue,
+                response: result["oracle_combined_response"]?.stringValue ?? result["response"]?.stringValue,
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -357,7 +357,7 @@ struct MCPOracleToolService {
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? ((normalizedChatID?.isEmpty == false) ? normalizedChatID : nil),
-                response: result["response"]?.stringValue,
+                response: result["oracle_combined_response"]?.stringValue ?? result["response"]?.stringValue,
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
