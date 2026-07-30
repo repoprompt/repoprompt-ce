@@ -493,6 +493,8 @@ final class CodexNativeSessionController {
         let runtimeStatus: RuntimeStatus
         let currentTurnID: String?
         let activeTurnIDs: [String]
+        /// Identifier paired with `latestTurnStatus`; this is the last terminal turn, not an active turn.
+        let latestTerminalTurnID: String?
         let latestTurnStatus: TurnStatus?
         let activeToolItems: [ToolItemObservation]
         let hasAuthoritativeActiveTurnItems: Bool
@@ -505,6 +507,7 @@ final class CodexNativeSessionController {
             runtimeStatus: RuntimeStatus,
             currentTurnID: String?,
             activeTurnIDs: [String],
+            latestTerminalTurnID: String? = nil,
             latestTurnStatus: TurnStatus?,
             activeToolItems: [ToolItemObservation] = [],
             hasAuthoritativeActiveTurnItems: Bool = false
@@ -516,6 +519,7 @@ final class CodexNativeSessionController {
             self.runtimeStatus = runtimeStatus
             self.currentTurnID = currentTurnID
             self.activeTurnIDs = activeTurnIDs
+            self.latestTerminalTurnID = latestTerminalTurnID
             self.latestTurnStatus = latestTurnStatus
             self.activeToolItems = activeToolItems
             self.hasAuthoritativeActiveTurnItems = hasAuthoritativeActiveTurnItems
@@ -2010,6 +2014,7 @@ final class CodexNativeSessionController {
         let runtimeStatus = parseThreadRuntimeStatus(from: thread["status"])
         let turns = thread["turns"] as? [[String: Any]] ?? []
         var activeTurnIDs: [String] = []
+        var latestTerminalTurnID: String?
         var latestTurnStatus: TurnStatus?
         var activeToolItems: [ThreadSnapshot.ToolItemObservation] = []
         var authoritativeActiveTurnIDs: Set<String> = []
@@ -2033,6 +2038,7 @@ final class CodexNativeSessionController {
                 }
             }
             if let parsedStatus = parseTerminalTurnStatus(from: statusRaw) {
+                latestTerminalTurnID = turnID
                 latestTurnStatus = parsedStatus
             }
         }
@@ -2046,6 +2052,7 @@ final class CodexNativeSessionController {
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.last,
             activeTurnIDs: activeTurnIDs,
+            latestTerminalTurnID: latestTerminalTurnID,
             latestTurnStatus: latestTurnStatus,
             activeToolItems: activeToolItems,
             hasAuthoritativeActiveTurnItems: hasAuthoritativeActiveTurnItems
@@ -2883,6 +2890,12 @@ final class CodexNativeSessionController {
                 }
             }
 
+            let isCommandExecution = typeRaw == "commandexecution"
+                || typeRaw == "command_execution"
+            if method == "item/completed", isCommandExecution, let scope {
+                guard markCanonicalItemCompleted(scope) else { return }
+            }
+
             if typeRaw == "mcptoolcall" || typeRaw == "mcp_tool_call" {
                 guard let scope else { return }
                 if method == "item/completed" {
@@ -2980,6 +2993,11 @@ final class CodexNativeSessionController {
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
+            if let scope = Self.canonicalItemScope(from: params),
+               completedCanonicalItemScopes.contains(scope)
+            {
+                break
+            }
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
                 break
             }

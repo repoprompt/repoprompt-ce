@@ -5964,30 +5964,14 @@ final class MCPServerViewModel: ObservableObject {
         // The filesystem mutation is durable. From this point cancellation must not be
         // misreported as a safe-to-retry pre-mutation failure.
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)
-        var freshness = "fresh"
-        do {
-            _ = try await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectivePath,
-                fallbackScope: lookupContext.rootScope,
-                timeout: .seconds(2)
-            )
-            if let effectiveNewPath {
-                _ = try await store.awaitAppliedIngressForExplicitRequest(
-                    userPath: effectiveNewPath,
-                    fallbackScope: lookupContext.rootScope,
-                    timeout: .seconds(2)
-                )
-            }
-        } catch {
-            freshness = "pending"
-        }
+        // Workspace-backed mutations publish their catalog delta before returning.
+        // Re-entering the store here to await watcher ingress is both redundant and
+        // unsafe for request settlement: a concurrent Context Builder rebuild can hold
+        // the store actor after the durable mutation and strand this acknowledgement.
+        // External watcher reconciliation remains asynchronous by design.
+        let freshness = "fresh"
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
         var acknowledgementWarnings: [String] = []
-        if freshness == "pending" {
-            acknowledgementWarnings.append(
-                "The filesystem mutation is durable, but workspace freshness is still pending. Inspect the filesystem with read_file or file_search and use operation ID \(operationID) only to correlate this result; do not blindly replay the mutation."
-            )
-        }
         if Task.isCancelled {
             acknowledgementWarnings.append(
                 "Reply delivery was cancelled after the durable mutation. Inspect the filesystem and use operation ID \(operationID) only to correlate this result; do not blindly replay."
@@ -6024,10 +6008,6 @@ final class MCPServerViewModel: ObservableObject {
                         "The file was created, but its selection was not confirmed. \(error)"
                     )
                 }
-            } else if freshness == "pending" {
-                acknowledgementWarnings.append(
-                    "The created path selection was not confirmed while workspace freshness was pending."
-                )
             }
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
