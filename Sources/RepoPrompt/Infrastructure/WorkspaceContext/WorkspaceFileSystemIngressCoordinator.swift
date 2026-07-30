@@ -60,8 +60,12 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
     private struct QueuedPublication {
         let publication: FileSystemDeltaPublication
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
-        let drainHandler: DrainHandler
         let acceptedAtNanoseconds: UInt64
+    }
+
+    private struct ApplyingPublication {
+        let queued: QueuedPublication
+        let drainHandler: DrainHandler
     }
 
     private final class RootState {
@@ -73,6 +77,7 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         var drainTask: Task<Void, Never>?
         var activeDrainToken: UInt64?
         var drainHandler: DrainHandler?
+        var isDrainPausedForHandoff = false
         var applyingCount = 0
         var acceptedServicePublicationSequence: UInt64 = 0
         var appliedServicePublicationSequence: UInt64 = 0
@@ -158,6 +163,7 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         state.generation = nextSubscriptionGeneration
         state.isOpen = true
         state.drainHandler = drainHandler
+        state.isDrainPausedForHandoff = false
         scheduleDrainIfNeeded(rootID: rootID, stateIdentity: state.identity)
         return Subscription(rootID: rootID, generation: state.generation)
     }
@@ -195,6 +201,57 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         return state.isOpen && state.generation == subscription.generation
     }
 
+    /// Atomically hands an open subscription from hidden preparation to the
+    /// published-root drain without changing its accepted sequence identity.
+    @discardableResult
+    func replaceDrainHandler(
+        _ subscription: Subscription,
+        drainHandler: @escaping DrainHandler
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = rootStatesByID[subscription.rootID],
+              state.isOpen,
+              state.generation == subscription.generation
+        else { return false }
+        state.drainHandler = drainHandler
+        return true
+    }
+
+    /// Freezes draining at a handler boundary while continuing to accept and
+    /// order publications. Already accepted, not-yet-applied publications are
+    /// retargeted to the replacement handler when draining resumes.
+    @discardableResult
+    func pauseDrainAndReplaceHandler(
+        _ subscription: Subscription,
+        drainHandler: @escaping DrainHandler
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = rootStatesByID[subscription.rootID],
+              state.isOpen,
+              state.generation == subscription.generation,
+              state.applyingCount == 0
+        else { return false }
+        state.isDrainPausedForHandoff = true
+        state.drainHandler = drainHandler
+        return true
+    }
+
+    @discardableResult
+    func resumeDrainAfterHandoff(_ subscription: Subscription) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = rootStatesByID[subscription.rootID],
+              state.isOpen,
+              state.generation == subscription.generation,
+              state.isDrainPausedForHandoff
+        else { return false }
+        state.isDrainPausedForHandoff = false
+        scheduleDrainIfNeeded(rootID: subscription.rootID, stateIdentity: state.identity)
+        return true
+    }
+
     func hasOpenPublisherIngress(rootID: UUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -214,14 +271,13 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         guard let state = rootStatesByID[subscription.rootID],
               state.isOpen,
               state.generation == subscription.generation,
-              let drainHandler = state.drainHandler
+              state.drainHandler != nil
         else {
             return false
         }
         state.append(QueuedPublication(
             publication: publication,
             lifecycleCorrelation: lifecycleCorrelation,
-            drainHandler: drainHandler,
             acceptedAtNanoseconds: acceptedAtNanoseconds
         ))
         state.acceptedServicePublicationSequence = max(
@@ -563,6 +619,7 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         guard let state = rootStatesByID[rootID],
               state.identity == stateIdentity,
               state.drainTask == nil,
+              !state.isDrainPausedForHandoff,
               state.pendingQueueCount > 0
         else { return }
         nextDrainToken &+= 1
@@ -574,8 +631,9 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
     }
 
     private func drain(rootID: UUID, stateIdentity: UUID, token: UInt64) async {
-        while let queued = takeNextPublication(rootID: rootID, stateIdentity: stateIdentity, token: token) {
-            await queued.drainHandler(queued.publication, queued.lifecycleCorrelation)
+        while let applying = takeNextPublication(rootID: rootID, stateIdentity: stateIdentity, token: token) {
+            let queued = applying.queued
+            await applying.drainHandler(queued.publication, queued.lifecycleCorrelation)
             finishApplying(
                 rootID: rootID,
                 stateIdentity: stateIdentity,
@@ -599,17 +657,23 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func takeNextPublication(rootID: UUID, stateIdentity: UUID, token: UInt64) -> QueuedPublication? {
+    private func takeNextPublication(
+        rootID: UUID,
+        stateIdentity: UUID,
+        token: UInt64
+    ) -> ApplyingPublication? {
         lock.lock()
         defer { lock.unlock() }
         guard let state = rootStatesByID[rootID],
               state.identity == stateIdentity,
               state.activeDrainToken == token,
+              !state.isDrainPausedForHandoff,
+              let drainHandler = state.drainHandler,
               let queued = state.takeNextPublication()
         else { return nil }
         state.applyingCount += 1
         state.applyingPublicationAcceptedAtNanoseconds = queued.acceptedAtNanoseconds
-        return queued
+        return ApplyingPublication(queued: queued, drainHandler: drainHandler)
     }
 
     private func cancelWaiter(rootID: UUID, waiterID: UUID) {

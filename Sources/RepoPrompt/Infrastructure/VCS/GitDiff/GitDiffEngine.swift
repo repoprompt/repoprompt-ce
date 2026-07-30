@@ -93,6 +93,13 @@ actor GitDiffEngine {
         let normalizedPathspecs = pathspecs.map {
             GitDiffPathNormalization.gitPathspecs(from: $0, repoRootPath: repoURL.path)
         }
+        let discoveryPathspecs = pathspecs.map {
+            GitDiffPathNormalization.gitDiscoveryPathspecs(from: $0, repoRootPath: repoURL.path)
+        }
+        let hasUserAuthoredRelativePathspecs = pathspecs?.contains { rawPath in
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !(trimmed as NSString).expandingTildeInPath.hasPrefix("/")
+        } ?? false
         let scope: GitDiffScope = hasPathspecs ? .selected : .all
         let requestedPaths = hasPathspecs ? normalizedPathspecs : nil
 
@@ -111,11 +118,15 @@ actor GitDiffEngine {
             compare: normalizedCompare,
             includeUntrackedWhenApplicable: includeUntracked,
             detectRenames: detectRenames,
+            paths: hasPathspecs ? (discoveryPathspecs ?? []) : nil,
             at: repoURL
         )
 
-        // Filter by pathspecs if provided
-        let filtered: [VCSUncommittedFile] = if let normalizedPathspecs, !normalizedPathspecs.isEmpty {
+        // Keep backend-agnostic filtering as a defensive projection boundary.
+        let filtered: [VCSUncommittedFile] = if hasUserAuthoredRelativePathspecs {
+            // Git is authoritative for user-authored relative pathspec glob/magic semantics.
+            changedFiles
+        } else if let normalizedPathspecs, !normalizedPathspecs.isEmpty {
             filterByPathspecs(changedFiles, pathspecs: normalizedPathspecs)
         } else {
             changedFiles
@@ -128,7 +139,7 @@ actor GitDiffEngine {
         var diffText: String?
         var perFile: [String: String]?
         if generateDiffText, !filtered.isEmpty {
-            let pathFilter = normalizedPathspecs
+            let pathFilter = discoveryPathspecs
 
             // Get diff text via backend (handles normalization for jj)
             let trackedDiff = try await backend.getDiffText(
@@ -228,10 +239,16 @@ actor GitDiffEngine {
 
         let backend = await vcsService.backend(forRepoRoot: repoURL)
         let normalizedCompare = backend.normalizeCompareSpec(compare)
+        let discoveryPaths = scope == .selected
+            ? GitDiffPathNormalization.literalGitPathspecs(
+                gitRelativePaths(from: normalizedSelected, repoRootPath: repoURL.path)
+            )
+            : nil
         let changedFiles = try await backend.getChangedFilesStats(
             compare: normalizedCompare,
             includeUntrackedWhenApplicable: includeUntracked,
             detectRenames: detectRenames,
+            paths: discoveryPaths,
             at: repoURL
         )
         let filtered = filterChangedFiles(
@@ -248,7 +265,7 @@ actor GitDiffEngine {
         var diffText: String?
         var perFile: [String: String]?
         if generateDiffText {
-            let pathFilter = (scope == .selected) ? requestedPaths : nil
+            let pathFilter = (scope == .selected) ? discoveryPaths : nil
             if scope == .all || (pathFilter?.isEmpty == false) {
                 // Get diff text via backend (handles normalization for jj)
                 let trackedDiff = try await backend.getDiffText(
@@ -321,10 +338,16 @@ actor GitDiffEngine {
             }
 
             let compareSpec = GitDiffCompareSpec.uncommitted(base: normalizedBase)
+            let discoveryPaths = scope == .selected
+                ? GitDiffPathNormalization.literalGitPathspecs(
+                    gitRelativePaths(from: normalizedSelected, repoRootPath: repoURL.path)
+                )
+                : nil
             let changedFiles = try await backend.getChangedFilesStats(
                 compare: compareSpec,
                 includeUntrackedWhenApplicable: true,
                 detectRenames: false,
+                paths: discoveryPaths,
                 at: repoURL
             )
             let filtered = filterChangedFiles(
@@ -346,7 +369,7 @@ actor GitDiffEngine {
             let trackedDiff: String = if !tracked.isEmpty {
                 try await backend.getDiffText(
                     compare: compareSpec,
-                    paths: tracked,
+                    paths: GitDiffPathNormalization.literalGitPathspecs(tracked),
                     contextLines: 3,
                     detectRenames: false,
                     at: repoURL
@@ -389,10 +412,16 @@ actor GitDiffEngine {
             }
 
             let compareSpec = GitDiffCompareSpec.uncommittedMergeBase(base: normalizedBase)
+            let discoveryPaths = scope == .selected
+                ? GitDiffPathNormalization.literalGitPathspecs(
+                    gitRelativePaths(from: normalizedSelected, repoRootPath: repoURL.path)
+                )
+                : nil
             let changedFiles = try await backend.getChangedFilesStats(
                 compare: compareSpec,
                 includeUntrackedWhenApplicable: true,
                 detectRenames: false,
+                paths: discoveryPaths,
                 at: repoURL
             )
             let filtered = filterChangedFiles(
@@ -413,7 +442,7 @@ actor GitDiffEngine {
             let trackedDiff: String = if !tracked.isEmpty {
                 try await backend.getDiffText(
                     compare: compareSpec,
-                    paths: tracked,
+                    paths: GitDiffPathNormalization.literalGitPathspecs(tracked),
                     contextLines: 3,
                     detectRenames: false,
                     at: repoURL
@@ -516,7 +545,7 @@ actor GitDiffEngine {
             }
             diffText = try await backend.getDiffText(
                 compare: .revspec(ref),
-                paths: gitPaths,
+                paths: GitDiffPathNormalization.literalGitPathspecs(gitPaths),
                 contextLines: 3,
                 detectRenames: false,
                 at: repoURL

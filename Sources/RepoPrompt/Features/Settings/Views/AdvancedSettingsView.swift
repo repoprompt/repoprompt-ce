@@ -7,13 +7,12 @@
 
 import SwiftUI
 
-/// Slimmed Advanced Settings page. Controls are grouped into two sections
-/// ("File System" and "AI Behavior") for progressive-disclosure-friendly
-/// browsing. URL scheme details live in the docs site, which is the
-/// canonical reference.
+/// Slimmed Advanced Settings page. Controls are grouped into focused sections
+/// for progressive-disclosure-friendly browsing.
 ///
 /// SEARCH-HELPER: Advanced Settings, File System, AI Behavior, Code Maps,
-/// gitignore, symlinks, saved prompts, datetime instructions
+/// URL Opener, URL scheme, deep links, symlinks, saved prompts,
+/// datetime instructions
 ///
 /// Related:
 /// - Keyboard Shortcuts: /RepoPrompt/Views/Settings/KeyboardShortcutsSettingsView.swift
@@ -26,6 +25,13 @@ struct AdvancedSettingsView: View {
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     let windowState: WindowState
 
+    private var historyIdleThresholdDoubleBinding: Binding<Double> {
+        Binding(
+            get: { Double(globalSettings.historyIdleThresholdMinutes()) },
+            set: { globalSettings.setHistoryIdleThresholdMinutes(Int($0)) }
+        )
+    }
+
     private var enableKeyboardShortcutsBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.enableKeyboardShortcuts() },
@@ -33,11 +39,8 @@ struct AdvancedSettingsView: View {
         )
     }
 
-    private var respectGitignoreBinding: Binding<Bool> {
-        Binding(
-            get: { globalSettings.respectGitignore() },
-            set: { setFileSystemPreference($0, key: "file_system.respect_gitignore", store: { globalSettings.setRespectGitignore($0) }) }
-        )
+    private var canonicalURLPrefix: String {
+        "\(AppDeepLinkURLScheme.canonical)://"
     }
 
     private var respectRepoIgnoreBinding: Binding<Bool> {
@@ -112,7 +115,17 @@ struct AdvancedSettingsView: View {
                 Divider()
                     .padding(.horizontal, -16)
 
+                historySection
+
+                Divider()
+                    .padding(.horizontal, -16)
+
                 keyboardShortcutsSection
+
+                Divider()
+                    .padding(.horizontal, -16)
+
+                urlOpenerSection
 
                 Divider()
                     .padding(.horizontal, -16)
@@ -134,7 +147,7 @@ struct AdvancedSettingsView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            Text("File system, AI behavior, and saved-prompts utilities. Use sparingly — most daily settings live in the sections above.")
+            Text("File system, AI behavior, URL opener, and saved-prompts utilities. Use sparingly — most daily settings live in the sections above.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -153,12 +166,6 @@ struct AdvancedSettingsView: View {
                 title: "Workspace Folder Scanning",
                 description: "Changes refresh open folders and are shared with app_settings MCP writes."
             ) {
-                SettingToggle(
-                    title: "Respect .gitignore rules",
-                    description: "Honor .gitignore files while scanning workspace folders.",
-                    isOn: respectGitignoreBinding
-                )
-
                 SettingToggle(
                     title: "Respect .repo_ignore rules",
                     description: "Honor RepoPrompt-specific .repo_ignore files. Edit local .repo_ignore content through the Ignore Patterns editor or file editing tools.",
@@ -248,6 +255,40 @@ struct AdvancedSettingsView: View {
 
     // MARK: - Keyboard Shortcuts
 
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("History")
+                .font(.title3)
+                .fontWeight(.semibold)
+
+            SettingSection(
+                title: "Time Tracking",
+                description: "Controls how the history MCP tool measures active work time."
+            ) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Default idle threshold")
+                    Text("Gaps between agent turns longer than this are counted as idle (not active work) when querying time spent. Lower values are stricter — only focused work counts. Higher values include short breaks. Can be overridden per-query via the idle_threshold_minutes parameter.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Text("0")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 25)
+                        Slider(value: historyIdleThresholdDoubleBinding, in: 0 ... 60, step: 1)
+                            .accentColor(.blue)
+                        Text("\(Int(historyIdleThresholdDoubleBinding.wrappedValue)) min")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 45, alignment: .trailing)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
     private var keyboardShortcutsSection: some View {
         SettingSection(
             title: "Keyboard Shortcuts",
@@ -268,6 +309,74 @@ struct AdvancedSettingsView: View {
             }
             .buttonStyle(CustomButtonStyle())
             .hoverTooltip("Opens the Keyboard Shortcuts settings tab for this window.")
+        }
+    }
+
+    // MARK: - URL Opener
+
+    private var urlOpenerSection: some View {
+        SettingSection(
+            title: "URL Opener",
+            description: "Use RepoPrompt CE links to open folders, select files, seed prompt text, and focus windows from external tools."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Canonical scheme: \(AppDeepLinkURLScheme.canonical)://")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    urlExampleRow(
+                        title: "Open a folder",
+                        value: "\(canonicalURLPrefix)open//Users/example/Project"
+                    )
+                    urlExampleRow(
+                        title: "Select files and prompt text",
+                        value: "\(canonicalURLPrefix)open//Users/example/Project?files=Sources/App.swift,README.md&prompt=Review%20the%20selected%20files"
+                    )
+                    urlExampleRow(
+                        title: "Focus or create an ephemeral workspace",
+                        value: "\(canonicalURLPrefix)open//Users/example/Project?workspace=Review&focus=true&ephemeral=true"
+                    )
+                    urlExampleRow(
+                        title: "Create a saved prompt",
+                        value: "\(canonicalURLPrefix)prompt?title=Review&content=Review%20the%20current%20selection&focus=true"
+                    )
+                }
+
+                Text("Supported opener parameters: workspace, files, prompt, focus, ephemeral, and persist. Use \(canonicalURLPrefix) for external links.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func urlExampleRow(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+
+            HStack(alignment: .top, spacing: 8) {
+                Text(value)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .cornerRadius(6)
+
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(value, forType: .string)
+                }
+                .buttonStyle(CustomButtonStyle())
+                .hoverTooltip("Copy this URL example.")
+            }
         }
     }
 

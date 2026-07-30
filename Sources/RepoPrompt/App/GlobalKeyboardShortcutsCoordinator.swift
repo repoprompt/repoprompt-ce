@@ -37,10 +37,22 @@ final class GlobalKeyboardShortcutsCoordinator {
         WindowStatesManager.shared.allWindows.first(where: { $0.isCurrentlyFocused })
     }
 
+    private func focusedOrLatestWindowState() -> WindowState? {
+        focusedWindowState() ?? WindowStatesManager.shared.latestWindowState
+    }
+
     private func guardedFocusedWindowState() -> WindowState? {
         guard NSApplication.shared.isActive else { return nil }
         guard let win = focusedWindowState(), win.isCurrentlyFocused else { return nil }
         return win
+    }
+
+    /// On the first HUD shortcut after app activation, the Carbon handler can fire
+    /// before our SwiftUI focus flag has updated. Route to the front/latest
+    /// RepoPrompt window so the first press still opens the HUD.
+    private func guardedHUDWindowState() -> WindowState? {
+        guard NSApplication.shared.isActive else { return nil }
+        return focusedOrLatestWindowState()
     }
 
     // MARK: - Presets
@@ -157,6 +169,9 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private func switchToComposeTab(_ index: Int) {
         guard let win = guardedFocusedWindowState() else { return }
+        if selectAgentNavigationHUDResultIfPresented(index, in: win) {
+            return
+        }
 
         let tabs = win.promptManager.currentComposeTabs
         guard index < tabs.count else { return }
@@ -172,6 +187,20 @@ final class GlobalKeyboardShortcutsCoordinator {
         Task { await win.promptManager.switchComposeTab(tabID) }
     }
 
+    private func selectAgentNavigationHUDResultIfPresented(_ index: Int, in win: WindowState) -> Bool {
+        let request = AgentNavigationHUDHandledRequest()
+        NotificationCenter.default.post(
+            name: .selectAgentNavigationHUDResult,
+            object: nil,
+            userInfo: [
+                AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
+                AgentNavigationHUDNotificationUserInfoKey.resultIndex: index,
+                AgentNavigationHUDNotificationUserInfoKey.handledRequest: request
+            ]
+        )
+        return request.handled
+    }
+
     // MARK: - Font scale
 
     private func registerFontScaleShortcuts() {
@@ -184,6 +213,10 @@ final class GlobalKeyboardShortcutsCoordinator {
     private func registerAgentShortcuts() {
         register(.agentNewChat) { [weak self] in self?.startNewAgentSessionFromShortcut() }
         register(.toggleNavigationSidebar) { [weak self] in self?.toggleNavigationSidebarFromShortcut() }
+        register(.previousParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: false) }
+        register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
+        register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
+        register(.showAllAgentsNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .allAgents) }
     }
 
     private func startNewAgentSessionFromShortcut() {
@@ -197,6 +230,32 @@ final class GlobalKeyboardShortcutsCoordinator {
             name: .toggleRepoPromptNavigationSidebar,
             object: nil,
             userInfo: ["windowID": win.windowID]
+        )
+    }
+
+    private func focusAdjacentParentAgentSession(forward: Bool) {
+        guard let win = guardedFocusedWindowState() else { return }
+        let tabs = win.promptManager.currentComposeTabs
+        let activeTabID = win.promptManager.activeComposeTabID
+        guard let targetTabID = win.agentModeViewModel.adjacentParentSidebarSessionTabID(
+            from: activeTabID,
+            forward: forward,
+            in: tabs
+        ) else {
+            return
+        }
+        Task { await win.promptManager.switchComposeTab(targetTabID) }
+    }
+
+    private func showAgentNavigationHUD(mode: AgentNavigationHUDMode) {
+        guard let win = guardedHUDWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .showAgentNavigationHUD,
+            object: nil,
+            userInfo: [
+                AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
+                AgentNavigationHUDNotificationUserInfoKey.mode: mode.rawValue
+            ]
         )
     }
 }

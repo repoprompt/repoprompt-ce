@@ -1,19 +1,8 @@
-import Sparkle
 import SwiftUI
 
 struct HelpMenu: View {
-    private var sparkleManager: SparkleUpdaterManager {
-        SparkleUpdaterManager.shared
-    }
-
     var body: some View {
         Group {
-            Button("Check for Updates…") {
-                sparkleManager.checkForUpdates()
-            }
-
-            Divider()
-
             Link(
                 "What's New",
                 destination: URL(string: "https://repoprompt.com/docs#s=changelog")!

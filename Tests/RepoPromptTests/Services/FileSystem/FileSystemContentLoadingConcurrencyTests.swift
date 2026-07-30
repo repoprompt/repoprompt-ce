@@ -1,5 +1,5 @@
 import CoreServices
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
@@ -87,6 +87,223 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
     }
 
+    func testValidatedRawContentReadsExactBytesWithoutProbeOrReread() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentExactBytes")
+        let service = try await makeService(root: root)
+        let relativePath = "Source.swift"
+        let data = Data(repeating: 0x61, count: 12000)
+        try data.write(to: root.appendingPathComponent(relativePath))
+        let expectedFingerprint = try await service.contentFingerprint(ofRelativePath: relativePath)
+
+        let snapshot = try await service.loadValidatedRawContent(
+            ofRelativePath: relativePath,
+            expectedFingerprint: expectedFingerprint
+        )
+
+        XCTAssertEqual(snapshot.data, data)
+        XCTAssertEqual(snapshot.fingerprint, expectedFingerprint)
+        XCTAssertEqual(snapshot.modificationDate, expectedFingerprint.modificationDate)
+
+        try FileSystemTestSupport.write("other", to: root.appendingPathComponent("Other.swift"))
+        let otherFingerprint = try await service.contentFingerprint(ofRelativePath: "Other.swift")
+        do {
+            _ = try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                expectedFingerprint: otherFingerprint
+            )
+            XCTFail("Expected the caller fingerprint mismatch to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Expected.
+        }
+    }
+
+    func testValidatedRawContentRejectsUnsafeMissingAndOversizedInputs() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentSafety")
+        let outside = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentOutside")
+        let insideURL = root.appendingPathComponent("Inside.swift")
+        let outsideURL = outside.appendingPathComponent("Outside.swift")
+        let insideLinkURL = root.appendingPathComponent("InsideLink.swift")
+        let outsideLinkURL = root.appendingPathComponent("OutsideLink.swift")
+        try FileSystemTestSupport.write("inside", to: insideURL)
+        try FileSystemTestSupport.write("outside", to: outsideURL)
+        try createSymlinkOrSkip(at: insideLinkURL, destination: insideURL)
+        try createSymlinkOrSkip(at: outsideLinkURL, destination: outsideURL)
+
+        let service = try await makeService(root: root, skipSymlinks: false)
+        await assertInvalidRelativePath {
+            _ = try await service.loadValidatedRawContent(
+                ofRelativePath: "../\(outside.lastPathComponent)/Outside.swift"
+            )
+        }
+        await assertInvalidRelativePath {
+            _ = try await service.loadValidatedRawContent(ofRelativePath: "InsideLink.swift")
+        }
+        await assertInvalidRelativePath {
+            _ = try await service.loadValidatedRawContent(ofRelativePath: "OutsideLink.swift")
+        }
+
+        do {
+            _ = try await service.loadValidatedRawContent(ofRelativePath: "Missing.swift")
+            XCTFail("Expected a missing raw source to fail closed.")
+        } catch FileSystemError.fileNotFound {
+            // Expected.
+        }
+
+        do {
+            _ = try await service.loadValidatedRawContent(
+                ofRelativePath: "Inside.swift",
+                maximumBytes: 2
+            )
+            XCTFail("Expected an oversized raw source to fail closed.")
+        } catch FileSystemError.fileTooLarge {
+            // Expected.
+        }
+    }
+
+    func testValidatedRawContentRejectsCancellationBeforeBufferedRead() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentCancellation")
+        let service = try await makeService(root: root)
+        let relativePath = "Slow.swift"
+        try Data(repeating: 0x61, count: 1_500_000)
+            .write(to: root.appendingPathComponent(relativePath))
+        let gate = AsyncGate()
+
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == relativePath else { return }
+            await gate.markStartedAndWaitForRelease()
+        }
+        let readTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await gate.waitUntilStarted()
+        readTask.cancel()
+        await gate.release()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("Expected cancellation.")
+        } catch is CancellationError {
+            // Expected.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+    }
+
+    func testValidatedRawContentRejectsMidReadMutation() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentMutation")
+        let service = try await makeService(root: root)
+        let relativePath = "Changing.swift"
+        let sourceURL = root.appendingPathComponent(relativePath)
+        try Data(repeating: 0x61, count: 1_500_000).write(to: sourceURL)
+        let secondChunkGate = AsyncGate()
+        let chunkCounter = AsyncCounter()
+
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == relativePath else { return }
+            if await chunkCounter.incrementAndValue() == 2 {
+                await secondChunkGate.markStartedAndWaitForRelease()
+            }
+        }
+        let readTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await secondChunkGate.waitUntilStarted()
+        try Data("replacement".utf8).write(to: sourceURL, options: .atomic)
+        await secondChunkGate.release()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("Expected a mid-read replacement to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Expected.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+    }
+
+    func testValidatedRawContentRejectsSymlinkRetargetDuringRead() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentRetarget")
+        let outside = try temporaryRoots.makeRoot(suiteName: "ValidatedRawContentRetargetOutside")
+        let service = try await makeService(root: root, skipSymlinks: false)
+        let relativePath = "Retargeted.swift"
+        let sourceURL = root.appendingPathComponent(relativePath)
+        let movedURL = root.appendingPathComponent("Original.swift")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        try Data(repeating: 0x61, count: 1_500_000).write(to: sourceURL)
+        try FileSystemTestSupport.write("target", to: targetURL)
+        let secondChunkGate = AsyncGate()
+        let chunkCounter = AsyncCounter()
+
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == relativePath else { return }
+            if await chunkCounter.incrementAndValue() == 2 {
+                await secondChunkGate.markStartedAndWaitForRelease()
+            }
+        }
+        let readTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: relativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await secondChunkGate.waitUntilStarted()
+        try FileManager.default.moveItem(at: sourceURL, to: movedURL)
+        try createSymlinkOrSkip(at: sourceURL, destination: targetURL)
+        await secondChunkGate.release()
+
+        do {
+            _ = try await readTask.value
+            XCTFail("Expected a symlink retarget to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Descriptor identity changed when the original path moved.
+        } catch FileSystemError.invalidRelativePath {
+            // Pathname validation observed the symlink replacement.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+
+        let nestedRelativePath = "Nested/Intermediate.swift"
+        let nestedDirectoryURL = root.appendingPathComponent("Nested")
+        let movedDirectoryURL = outside.appendingPathComponent("MovedNested")
+        try FileManager.default.createDirectory(
+            at: nestedDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x62, count: 1_500_000)
+            .write(to: root.appendingPathComponent(nestedRelativePath))
+        let intermediateGate = AsyncGate()
+        let intermediateCounter = AsyncCounter()
+        await service.setContentReadChunkHandlerForTesting { path in
+            guard path == nestedRelativePath else { return }
+            if await intermediateCounter.incrementAndValue() == 2 {
+                await intermediateGate.markStartedAndWaitForRelease()
+            }
+        }
+        let intermediateTask = Task {
+            try await service.loadValidatedRawContent(
+                ofRelativePath: nestedRelativePath,
+                maximumBytes: 2_000_000
+            )
+        }
+        await intermediateGate.waitUntilStarted()
+        try FileManager.default.moveItem(at: nestedDirectoryURL, to: movedDirectoryURL)
+        try createSymlinkOrSkip(at: nestedDirectoryURL, destination: movedDirectoryURL)
+        await intermediateGate.release()
+
+        do {
+            _ = try await intermediateTask.value
+            XCTFail("Expected an intermediate-directory retarget outside the root to fail closed.")
+        } catch FileContentValidationError.fingerprintChanged {
+            // Descriptor identity changed when the original directory moved.
+        } catch FileSystemError.invalidRelativePath {
+            // Canonical containment observed the outside-root directory symlink.
+        }
+        await service.setContentReadChunkHandlerForTesting(nil)
+    }
+
     func testCancellationDuringChunkedReadDoesNotCommitEncodingCache() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingCancellation")
         let service = try await makeService(root: root)
@@ -115,6 +332,9 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         XCTAssertNil(cachedEncoding)
         await service.setContentReadChunkHandlerForTesting(nil)
     }
+
+    #if DEBUG
+    #endif
 
     func testSlowSameRootContentReadDoesNotDelayAcceptedWatcherFlush() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingSameRoot")
@@ -286,7 +506,10 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             }
         }
         let reachedLimit = await enteredCount.waitUntilValue(atLeast: limit)
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        let saturatedSnapshot = await waitForProcessContentReadWorkerLimiterSnapshot {
+            $0.activePermitCount == limit &&
+                $0.queuedWaiterCount >= readCount - limit
+        }
         let enteredBeforeRelease = await enteredCount.value()
         await gate.release()
         for task in tasks {
@@ -294,6 +517,8 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         XCTAssertTrue(reachedLimit)
+        XCTAssertEqual(saturatedSnapshot.activePermitCount, limit)
+        XCTAssertGreaterThanOrEqual(saturatedSnapshot.queuedWaiterCount, readCount - limit)
         XCTAssertEqual(enteredBeforeRelease, limit)
         await service.setContentReadChunkHandlerForTesting(nil)
     }
@@ -483,6 +708,53 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(idle.activePermitCount, 0)
             XCTAssertEqual(idle.queuedWaiterCount, 0)
             XCTAssertEqual(idle.ownerLaneCount, 0)
+
+            let reserveLimiter = ContentReadAsyncLimiter(
+                capacity: 1,
+                maxQueuedWaiterCount: 2,
+                retryAfterMilliseconds: 777
+            )
+            let reserveGate = AsyncGate()
+            let reserveRecorder = AsyncValueRecorder()
+            let reserveHeld = Task {
+                try await reserveLimiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                    await reserveGate.markStartedAndWaitForRelease()
+                }
+            }
+            await reserveGate.waitUntilStarted()
+            let foregroundToken = await reserveLimiter.beginForegroundActivity(kind: .storeBackedSearch)
+            let reservedCodemap = Task {
+                try await reserveLimiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
+                    await reserveRecorder.append(2)
+                }
+            }
+            _ = await waitForLimiterSnapshot(reserveLimiter) { $0.queuedCodemapWaiterCount == 1 }
+            do {
+                _ = try await reserveLimiter.withPermit(workloadClass: .codemap, ownerID: UUID()) { 0 }
+                XCTFail("Expected the codemap queue reserve to reject another background waiter")
+            } catch let error as ContentReadSchedulerError {
+                XCTAssertEqual(error, .queueFull(retryAfterMilliseconds: 777))
+            }
+            let reservedForeground = Task {
+                try await reserveLimiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                    await reserveRecorder.append(1)
+                }
+            }
+            let fullButForegroundAdmitted = await waitForLimiterSnapshot(reserveLimiter) {
+                $0.queuedWaiterCount == 2
+            }
+            XCTAssertEqual(fullButForegroundAdmitted.queuedCodemapWaiterCount, 1)
+
+            await reserveLimiter.endForegroundActivity(foregroundToken)
+            await reserveGate.release()
+            _ = try await reserveHeld.value
+            _ = try await reservedForeground.value
+            _ = try await reservedCodemap.value
+            let reservedValues = await reserveRecorder.values()
+            XCTAssertEqual(reservedValues, [1, 2])
+            let reserveIdle = await waitForLimiterSnapshot(reserveLimiter) { $0.isIdle }
+            XCTAssertTrue(reserveIdle.isIdle)
+            XCTAssertEqual(reserveIdle.overloadCount, 1)
         }
 
         func testContentReadSchedulerPrioritizesInteractiveWaitersOverBulk() async throws {
@@ -651,46 +923,151 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(idle.activeBackgroundPermitCount, 0)
         }
 
-        func testContentReadSchedulerPromotesAgedWaitersAheadOfNewInteractiveWork() async throws {
-            let clock = ContentReadTestClock()
-            let limiter = ContentReadAsyncLimiter(
-                capacity: 1,
-                maxQueuedWaiterCount: 4,
-                agePromotionNanoseconds: 10_000_000,
-                nowUptimeNanoseconds: { clock.now() }
-            )
-            let gate = AsyncGate()
+        func testContentReadSchedulerNeverPromotesAgedCodemapAheadOfForegroundWaiters() async throws {
+            for foregroundWorkload in [ContentReadWorkloadClass.interactiveRead, .contentSearch] {
+                let clock = ContentReadTestClock()
+                let limiter = ContentReadAsyncLimiter(
+                    capacity: 1,
+                    maxQueuedWaiterCount: 4,
+                    agePromotionNanoseconds: 10_000_000,
+                    nowUptimeNanoseconds: { clock.now() }
+                )
+                let gate = AsyncGate()
+                let recorder = AsyncValueRecorder()
+
+                let held = Task {
+                    try await limiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                        await gate.markStartedAndWaitForRelease()
+                    }
+                }
+                await gate.waitUntilStarted()
+                let agedCodemap = Task {
+                    try await limiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
+                        await recorder.append(2)
+                    }
+                }
+                _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 1 }
+                clock.advance(by: 20_000_000)
+                let foreground = Task {
+                    try await limiter.withPermit(workloadClass: foregroundWorkload, ownerID: UUID()) {
+                        await recorder.append(1)
+                    }
+                }
+                _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 2 }
+
+                await gate.release()
+                _ = try await held.value
+                _ = try await foreground.value
+                _ = try await agedCodemap.value
+
+                let values = await recorder.values()
+                XCTAssertEqual(values, [1, 2], foregroundWorkload.rawValue)
+                let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
+                XCTAssertTrue(idle.isIdle, foregroundWorkload.rawValue)
+            }
+        }
+
+        func testContentReadSchedulerForegroundTokensBlockCodemapReplacementUntilFinalEnd() async throws {
+            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 8)
+            let activeGate = AsyncGate()
             let recorder = AsyncValueRecorder()
-
-            let held = Task {
-                try await limiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
-                    await gate.markStartedAndWaitForRelease()
-                }
-            }
-            await gate.waitUntilStarted()
-            let agedBulk = Task {
+            let active = Task {
                 try await limiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
-                    await recorder.append(1)
+                    await activeGate.markStartedAndWaitForRelease()
                 }
             }
-            _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 1 }
-            clock.advance(by: 20_000_000)
-            let interactive = Task {
-                try await limiter.withPermit(workloadClass: .interactiveRead, ownerID: UUID()) {
-                    await recorder.append(2)
-                }
+            await activeGate.waitUntilStarted()
+
+            let materialization = await limiter.beginForegroundActivity(kind: .materialization)
+            let search = await limiter.beginForegroundActivity(kind: .storeBackedSearch)
+            let ownerA = UUID()
+            let ownerB = UUID()
+            var queued: [Task<Void, Error>] = []
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerA) { await recorder.append(1) } })
+            _ = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 1 }
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerA) { await recorder.append(2) } })
+            _ = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 2 }
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerB) { await recorder.append(3) } })
+            _ = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 3 }
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerB) { await recorder.append(4) } })
+            let blocked = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 4 }
+            XCTAssertEqual(blocked.foregroundActivityCount, 2)
+            XCTAssertEqual(blocked.foregroundActivityCountsByKind, [.materialization: 1, .storeBackedSearch: 1])
+            XCTAssertEqual(blocked.activeCodemapPermitCount, 1)
+
+            await activeGate.release()
+            _ = try await active.value
+            let noReplacement = await waitForLimiterSnapshot(limiter) {
+                $0.activeCodemapPermitCount == 0 && $0.queuedCodemapWaiterCount == 4
             }
-            _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 2 }
+            XCTAssertEqual(noReplacement.bulkGrantCount, 1)
+            XCTAssertEqual(noReplacement.codemapGrantWhileForegroundCount, 0)
 
-            await gate.release()
-            _ = try await held.value
-            _ = try await agedBulk.value
-            _ = try await interactive.value
+            await limiter.endForegroundActivity(materialization)
+            let oneToken = await limiter.snapshotForTesting()
+            XCTAssertEqual(oneToken.foregroundActivityCount, 1)
+            XCTAssertEqual(oneToken.activeCodemapPermitCount, 0)
+            XCTAssertEqual(oneToken.queuedCodemapWaiterCount, 4)
 
-            let values = await recorder.values()
-            XCTAssertEqual(values, [1, 2])
+            await limiter.endForegroundActivity(search)
+            for task in queued {
+                _ = try await task.value
+            }
+            let recordedValues = await recorder.values()
+            XCTAssertEqual(recordedValues, [1, 3, 2, 4])
             let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
             XCTAssertTrue(idle.isIdle)
+            XCTAssertEqual(idle.foregroundActivityCount, 0)
+            XCTAssertEqual(idle.activeCodemapPermitCount, 0)
+            XCTAssertEqual(idle.queuedCodemapWaiterCount, 0)
+            XCTAssertEqual(idle.codemapGrantWhileForegroundCount, 0)
+        }
+
+        func testForegroundActivityTokensCleanUpOnSuccessErrorAndCancellation() async throws {
+            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 2)
+
+            let value = await limiter.withForegroundActivity(kind: .rootLoad) {
+                let active = await limiter.snapshotForTesting()
+                XCTAssertEqual(active.foregroundActivityCountsByKind, [.rootLoad: 1])
+                return 42
+            }
+            XCTAssertEqual(value, 42)
+            let afterSuccess = await limiter.snapshotForTesting()
+            XCTAssertEqual(afterSuccess.foregroundActivityCount, 0)
+
+            do {
+                _ = try await limiter.withForegroundActivity(kind: .readResolution) {
+                    throw ForegroundActivityTestError.expected
+                }
+                XCTFail("Expected foreground body error")
+            } catch ForegroundActivityTestError.expected {
+                // Expected.
+            }
+            let afterError = await limiter.snapshotForTesting()
+            XCTAssertEqual(afterError.foregroundActivityCount, 0)
+
+            let started = AsyncSignal()
+            let cancellationGate = AsyncCancellationGate()
+            let cancelled = Task {
+                try await limiter.withForegroundActivity(kind: .interactiveRead) {
+                    await started.mark()
+                    try await cancellationGate.waitUntilCancelled()
+                }
+            }
+            let didStart = await started.waitUntilMarked()
+            XCTAssertTrue(didStart)
+            cancelled.cancel()
+            do {
+                try await cancelled.value
+                XCTFail("Expected foreground body cancellation")
+            } catch is CancellationError {
+                // Expected.
+            }
+
+            let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
+            XCTAssertTrue(idle.isIdle)
+            XCTAssertEqual(idle.foregroundActivityCount, 0)
+            XCTAssertTrue(idle.foregroundActivityCountsByKind.isEmpty)
         }
 
         func testContentReadSchedulerRoundRobinsOwnersWhilePreservingOwnerFIFO() async throws {
@@ -736,11 +1113,10 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         try FileSystemTestSupport.write("serial", to: root.appendingPathComponent("Serial.txt"))
         let service = try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true,
-            testIgnoreRules: IgnoreRules(),
+            testIgnoreRules: IgnoreRules(policy: .nonGitRoot),
             isTestMode: true
         )
         let workerHookInvoked = AsyncSignal()
@@ -760,15 +1136,38 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             timeoutNanoseconds: UInt64 = 1_000_000_000,
             predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
         ) async -> ContentReadAsyncLimiter.Snapshot {
+            await waitForLimiterSnapshot(
+                timeoutNanoseconds: timeoutNanoseconds,
+                snapshotProvider: { await limiter.snapshotForTesting() },
+                predicate: predicate
+            )
+        }
+
+        private func waitForProcessContentReadWorkerLimiterSnapshot(
+            timeoutNanoseconds: UInt64 = 1_000_000_000,
+            predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
+        ) async -> ContentReadAsyncLimiter.Snapshot {
+            await waitForLimiterSnapshot(
+                timeoutNanoseconds: timeoutNanoseconds,
+                snapshotProvider: { await FileSystemService.contentReadWorkerLimiterSnapshotForTesting() },
+                predicate: predicate
+            )
+        }
+
+        private func waitForLimiterSnapshot(
+            timeoutNanoseconds: UInt64,
+            snapshotProvider: () async -> ContentReadAsyncLimiter.Snapshot,
+            predicate: (ContentReadAsyncLimiter.Snapshot) -> Bool
+        ) async -> ContentReadAsyncLimiter.Snapshot {
             let interval: UInt64 = 10_000_000
             var waited: UInt64 = 0
             while waited < timeoutNanoseconds {
-                let snapshot = await limiter.snapshotForTesting()
+                let snapshot = await snapshotProvider()
                 if predicate(snapshot) { return snapshot }
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }
-            return await limiter.snapshotForTesting()
+            return await snapshotProvider()
         }
 
         private func saturateContentReadWorkers(
@@ -844,7 +1243,6 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
     private func makeService(root: URL, skipSymlinks: Bool = true) async throws -> FileSystemService {
         try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: skipSymlinks
@@ -902,41 +1300,40 @@ private final class ContentReadTestClock: @unchecked Sendable {
     }
 }
 
-private actor AsyncGate {
-    private var started = false
-    private var released = false
-    private var startWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+private enum ForegroundActivityTestError: Error {
+    case expected
+}
+
+/// Content-loading concurrency fence (shared `TestReleaseFence` with legacy names).
+private final class AsyncGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "file system content loading async gate")
 
     func markStartedAndWaitForRelease() async {
-        started = true
-        startWaiters.forEach { $0.resume() }
-        startWaiters.removeAll()
-        guard !released else { return }
-        await withCheckedContinuation { continuation in
-            releaseWaiters.append(continuation)
-        }
+        await fence.enterAndWaitIgnoringCancellationUntilRelease()
     }
 
-    func waitUntilStarted() async {
-        guard !started else { return }
-        await withCheckedContinuation { continuation in
-            startWaiters.append(continuation)
-        }
+    func waitUntilStarted(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        released = true
-        releaseWaiters.forEach { $0.resume() }
-        releaseWaiters.removeAll()
+        fence.release()
     }
 }
 
 private actor AsyncCounter {
+    private struct Waiter {
+        let target: Int
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private var count = 0
+    private var waiters: [UUID: Waiter] = [:]
+    private var cancelledWaiterIDs: Set<UUID> = []
 
     func incrementAndValue() -> Int {
         count += 1
+        resumeSatisfiedWaiters()
         return count
     }
 
@@ -945,13 +1342,43 @@ private actor AsyncCounter {
     }
 
     func waitUntilValue(atLeast target: Int, timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-        let interval: UInt64 = 10_000_000
-        var waited: UInt64 = 0
-        while count < target, waited < timeoutNanoseconds {
-            try? await Task.sleep(nanoseconds: interval)
-            waited += interval
+        guard count < target else { return true }
+        let waiterID = UUID()
+        // Sticky cancel handled via cancelledWaiterIDs so cancel-before-register cannot hang.
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard count < target, !Task.isCancelled, cancelledWaiterIDs.remove(waiterID) == nil else {
+                    continuation.resume(returning: count >= target)
+                    return
+                }
+                waiters[waiterID] = Waiter(target: target, continuation: continuation)
+                Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    await self.finishWaiter(waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.finishWaiter(waiterID, fromCancel: true) }
         }
-        return count >= target
+    }
+
+    private func resumeSatisfiedWaiters() {
+        let readyIDs = waiters.compactMap { id, waiter in
+            waiter.target <= count ? id : nil
+        }
+        for id in readyIDs {
+            waiters.removeValue(forKey: id)?.continuation.resume(returning: true)
+        }
+    }
+
+    private func finishWaiter(_ waiterID: UUID, fromCancel: Bool = false) {
+        if let waiter = waiters.removeValue(forKey: waiterID) {
+            waiter.continuation.resume(returning: count >= waiter.target)
+            return
+        }
+        if fromCancel {
+            cancelledWaiterIDs.insert(waiterID)
+        }
     }
 }
 
@@ -969,9 +1396,15 @@ private actor AsyncValueRecorder {
 
 private actor AsyncSignal {
     private var marked = false
+    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var cancelledWaiterIDs: Set<UUID> = []
 
     func mark() {
+        guard !marked else { return }
         marked = true
+        let continuations = Array(waiters.values)
+        waiters.removeAll()
+        continuations.forEach { $0.resume(returning: true) }
     }
 
     func isMarked() -> Bool {
@@ -979,12 +1412,34 @@ private actor AsyncSignal {
     }
 
     func waitUntilMarked(timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
-        let interval: UInt64 = 10_000_000
-        var waited: UInt64 = 0
-        while !marked, waited < timeoutNanoseconds {
-            try? await Task.sleep(nanoseconds: interval)
-            waited += interval
+        guard !marked else { return true }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !marked, !Task.isCancelled, cancelledWaiterIDs.remove(waiterID) == nil else {
+                    continuation.resume(returning: marked)
+                    return
+                }
+                waiters[waiterID] = continuation
+                Task {
+                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    await self.finishWaiter(waiterID)
+                }
+            }
+        } onCancel: {
+            Task { await self.finishWaiter(waiterID, fromCancel: true) }
         }
-        return marked
+    }
+
+    private func finishWaiter(_ waiterID: UUID, fromCancel: Bool = false) {
+        if let continuation = waiters.removeValue(forKey: waiterID) {
+            continuation.resume(returning: marked)
+            return
+        }
+        if fromCancel {
+            cancelledWaiterIDs.insert(waiterID)
+        }
     }
 }
+
+private typealias AsyncCancellationGate = TestCancellationGate

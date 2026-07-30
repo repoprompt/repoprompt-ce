@@ -138,9 +138,14 @@ actor GitBackend: VCSBackend {
 
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
-        at repoURL: URL
+        at repoURL: URL,
+        initializationContext: GitWorktreeInitializationContext? = nil
     ) async throws -> GitWorktreeCreateResult {
-        try await gitService.createWorktreeWithResult(request: request, at: repoURL)
+        try await gitService.createWorktreeWithResult(
+            request: request,
+            at: repoURL,
+            initializationContext: initializationContext
+        )
     }
 
     // MARK: - Worktree Merge Operations
@@ -199,12 +204,14 @@ actor GitBackend: VCSBackend {
         compare: GitDiffCompareSpec,
         includeUntrackedWhenApplicable: Bool,
         detectRenames: Bool,
+        paths: [String]?,
         at repoURL: URL
     ) async throws -> [VCSUncommittedFile] {
         let files = try await gitService.getChangedFilesStats(
             compare: compare,
             includeUntrackedWhenApplicable: includeUntrackedWhenApplicable,
             detectRenames: detectRenames,
+            paths: paths,
             at: repoURL
         )
         return files.map { file in

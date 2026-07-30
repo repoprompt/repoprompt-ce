@@ -1,9 +1,26 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
+    func testSpawnedChildStartsInOwnProcessGroup() throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "printf 'ready\n'; exec /bin/cat >/dev/null"],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        defer { Self.cleanup(spawned) }
+
+        XCTAssertEqual(spawned.processGroupID, spawned.pid)
+        XCTAssertEqual(Darwin.getpgid(spawned.pid), spawned.pid)
+
+        spawned.stdin?.closeFile()
+        _ = spawned.stdout.readDataToEndOfFile()
+        _ = try Self.waitForExit(spawned.pid)
+    }
+
     func testParentPipeEndsHaveCloseOnExecAndChildStdioStillWorks() throws {
         let spawned = try ProcessLauncher.spawn(
             command: "/bin/sh",
@@ -28,6 +45,38 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertEqual(status, 0)
         XCTAssertEqual(stdout, "stdout:sentinel-line\n")
         XCTAssertEqual(stderr, "stderr:ok\n")
+    }
+
+    func testSpawnedChildDoesNotInheritBlockedSIGCHLDMask() throws {
+        var blockedMask = sigset_t()
+        sigemptyset(&blockedMask)
+        sigaddset(&blockedMask, SIGCHLD)
+        sigaddset(&blockedMask, SIGTERM)
+        var previousMask = sigset_t()
+        XCTAssertEqual(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask), 0)
+        defer {
+            _ = pthread_sigmask(SIG_SETMASK, &previousMask, nil)
+        }
+
+        let spawned = try ProcessLauncher.spawn(
+            command: "/usr/bin/python3",
+            arguments: [
+                "-c",
+                "import signal; blocked = signal.pthread_sigmask(signal.SIG_BLOCK, []); print('sigchld:' + ('blocked' if signal.SIGCHLD in blocked else 'unblocked')); print('sigterm:' + ('blocked' if signal.SIGTERM in blocked else 'unblocked'))"
+            ],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        defer { Self.cleanup(spawned) }
+        spawned.stdin?.closeFile()
+
+        let stdout = String(decoding: spawned.stdout.readDataToEndOfFile(), as: UTF8.self)
+        let stderr = String(decoding: spawned.stderr.readDataToEndOfFile(), as: UTF8.self)
+        let status = try Self.waitForExit(spawned.pid)
+
+        XCTAssertEqual(status, 0)
+        XCTAssertEqual(stdout, "sigchld:unblocked\nsigterm:unblocked\n")
+        XCTAssertEqual(stderr, "")
     }
 
     func testDarwinSpawnDefaultClosesUnrelatedSentinelFDWhileStdioStillWorks() throws {
@@ -95,8 +144,8 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertFalse(Self.hasCloseOnExec(sessionFD))
 
         let spawned = try ProcessLauncher.spawn(
-            command: "/bin/sleep",
-            arguments: ["5"],
+            command: "/bin/cat",
+            arguments: [],
             environment: ProcessInfo.processInfo.environment,
             workingDirectory: nil
         )
@@ -135,7 +184,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
 
             var environment = ProcessInfo.processInfo.environment
             environment["SESSION_FD"] = String(sessionFD)
-            let script = "if [ -e \"/dev/fd/$SESSION_FD\" ]; then printf 'session:open\\n'; else printf 'session:closed\\n'; fi; sleep 5"
+            let script = "if [ -e \"/dev/fd/$SESSION_FD\" ]; then printf 'session:open\\n'; else printf 'session:closed\\n'; fi; exec /bin/cat >/dev/null"
             let spawned = try ProcessLauncher.spawn(
                 command: "/bin/sh",
                 arguments: ["-c", script],

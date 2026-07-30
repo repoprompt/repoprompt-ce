@@ -13,6 +13,15 @@ struct MCPOracleToolService {
         _ tabContext: OracleViewModel.OracleSendTabContext?
     ) async throws -> [String: Value]
     typealias ExportOracleResponse = @MainActor @Sendable (OracleExportRequest) async throws -> OracleExportFile
+    typealias StabilizedVirtualContext = @MainActor @Sendable (
+        _ context: TabScopedContext
+    ) async -> TabScopedContext
+    typealias ResolveDelegatedReviewPackaging = @MainActor @Sendable (
+        _ conversationTabID: UUID,
+        _ conversationWorkspaceID: UUID?,
+        _ conversationAgentSessionID: UUID?,
+        _ conversationAgentRunID: UUID?
+    ) async throws -> OracleViewModel.OracleSendPackagingContext?
 
     let askOracleToolName: String
     let oracleSendToolName: String
@@ -22,6 +31,8 @@ struct MCPOracleToolService {
     let captureRequestMetadata: () async -> RequestMetadata
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
     let requireCurrentTabContext: (String) async throws -> TabScopedContext
+    let stabilizedVirtualContext: StabilizedVirtualContext
+    let resolveDelegatedReviewPackaging: ResolveDelegatedReviewPackaging
     let rebindChatSessionIfNeeded: (_ metadata: RequestMetadata, _ chatIDString: String) throws -> Void
     let resolveTabIDForAgentMode: (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
     let requireTargetWindow: () throws -> WindowState
@@ -151,19 +162,56 @@ struct MCPOracleToolService {
         let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
         let tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
-            tabContext = try await oracleSendTabContext(from: virtualContext, owner: owner)
+            tabContext = try await oracleSendTabContext(
+                from: virtualContext,
+                owner: owner,
+                origin: .askOracle,
+                mode: modeRaw
+            )
         } else {
             guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
             let lookupContext = try await oraclePackagingLookupContext(owner: owner)
-            tabContext = OracleViewModel.OracleSendTabContext(
+            let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+                workspaceID: targetWindow.workspaceManager.activeWorkspace?.id,
                 tabID: tabID,
+                sessionID: owner.agentSessionID,
+                bindings: owner.worktreeBindingState.bindings ?? [],
+                base: "HEAD"
+            )
+            let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
+            let directPackaging = OracleViewModel.OracleSendPackagingContext(
+                sourceTabID: tabID,
+                sourceWorkspaceID: workspaceID,
+                sourceSelectionRevision: workspaceID.map {
+                    targetWindow.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: $0,
+                        tabID: tabID
+                    )
+                } ?? 0,
+                sourceAgentSessionID: owner.agentSessionID,
+                sourceAgentRunID: owner.runID,
                 promptText: tabSnapshot.promptText,
                 selection: tabSnapshot.selection,
                 lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
+                provenance: .direct
+            )
+            let packaging = try await reviewPackaging(
+                mode: modeRaw,
+                conversationTabID: tabID,
+                conversationWorkspaceID: workspaceID,
+                owner: owner,
+                direct: directPackaging
+            )
+            tabContext = OracleViewModel.OracleSendTabContext(
+                tabID: tabID,
+                workspaceID: workspaceID,
+                origin: .askOracle,
                 agentModeSessionID: owner.agentSessionID,
-                agentModeRunID: owner.runID
+                agentModeRunID: owner.runID,
+                packaging: packaging
             )
         }
 
@@ -172,7 +220,7 @@ struct MCPOracleToolService {
                 workspace: targetWindow.workspaceManager.activeWorkspace,
                 windowID: targetWindow.windowID,
                 tabID: tabID,
-                lookupContext: tabContext.lookupContext ?? .visibleWorkspace
+                lookupContext: tabContext.packaging.lookupContext ?? .visibleWorkspace
             )
         } else {
             nil
@@ -250,7 +298,8 @@ struct MCPOracleToolService {
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 
         if !resolvedContext.usesActiveTabCompatibility {
-            if let chatIDString = args["chat_id"]?.stringValue,
+            if runPurpose != .agentModeRun,
+               let chatIDString = args["chat_id"]?.stringValue,
                !chatIDString.isEmpty
             {
                 try rebindChatSessionIfNeeded(metadata, chatIDString)
@@ -259,9 +308,18 @@ struct MCPOracleToolService {
             let context = try await requireCurrentTabContext(oracleSendToolName)
             if runPurpose == .agentModeRun, let targetWindow {
                 let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
-                tabContext = try await oracleSendTabContext(from: context, owner: owner)
+                tabContext = try await oracleSendTabContext(
+                    from: context,
+                    owner: owner,
+                    origin: .oracleSend,
+                    mode: modeRaw
+                )
             } else {
-                tabContext = try await oracleSendTabContext(from: context)
+                tabContext = try await oracleSendTabContext(
+                    from: context,
+                    origin: .oracleSend,
+                    mode: modeRaw
+                )
             }
         }
 
@@ -270,7 +328,7 @@ struct MCPOracleToolService {
                 workspace: targetWindow.workspaceManager.activeWorkspace,
                 windowID: targetWindow.windowID,
                 tabID: tabContext?.tabID,
-                lookupContext: tabContext?.lookupContext ?? .visibleWorkspace
+                lookupContext: tabContext?.packaging.lookupContext ?? .visibleWorkspace
             )
         } else {
             nil
@@ -543,16 +601,79 @@ struct MCPOracleToolService {
             agentSessionID: nil,
             runID: nil,
             worktreeBindingState: .notApplicable
-        )
+        ),
+        origin: OracleSendOrigin,
+        mode: String
     ) async throws -> OracleViewModel.OracleSendTabContext {
-        let lookupContext = try await oraclePackagingLookupContext(for: context)
-        return OracleViewModel.OracleSendTabContext(
-            tabID: context.tabID,
-            promptText: context.promptText,
-            selection: context.selection,
-            lookupContext: lookupContext,
-            agentModeSessionID: owner.agentSessionID,
-            agentModeRunID: owner.runID
+        let stabilizedContext = await stabilizedVirtualContext(context)
+        let lookupContext = try await oraclePackagingLookupContext(for: stabilizedContext)
+        let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+            workspaceID: stabilizedContext.workspaceID,
+            tabID: stabilizedContext.tabID,
+            sessionID: owner.agentSessionID,
+            bindings: owner.worktreeBindingState.bindings ?? stabilizedContext.worktreeBindings,
+            base: "HEAD"
         )
+        let directPackaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: stabilizedContext.tabID,
+            sourceWorkspaceID: stabilizedContext.workspaceID,
+            sourceSelectionRevision: stabilizedContext.selectionRevision,
+            sourceAgentSessionID: owner.agentSessionID,
+            sourceAgentRunID: owner.runID,
+            promptText: stabilizedContext.promptText,
+            selection: stabilizedContext.selection,
+            lookupContext: lookupContext,
+            reviewGitContext: reviewGitContext,
+            provenance: .direct
+        )
+        let packaging = try await reviewPackaging(
+            mode: mode,
+            conversationTabID: stabilizedContext.tabID,
+            conversationWorkspaceID: stabilizedContext.workspaceID,
+            owner: owner,
+            direct: directPackaging
+        )
+        return OracleViewModel.OracleSendTabContext(
+            tabID: stabilizedContext.tabID,
+            workspaceID: stabilizedContext.workspaceID,
+            origin: origin,
+            agentModeSessionID: owner.agentSessionID,
+            agentModeRunID: owner.runID,
+            packaging: packaging
+        )
+    }
+
+    private func reviewPackaging(
+        mode: String,
+        conversationTabID: UUID,
+        conversationWorkspaceID: UUID?,
+        owner: AgentOracleOwner,
+        direct: OracleViewModel.OracleSendPackagingContext
+    ) async throws -> OracleViewModel.OracleSendPackagingContext {
+        guard mode == "review" else { return direct }
+        guard let delegated = try await resolveDelegatedReviewPackaging(
+            conversationTabID,
+            conversationWorkspaceID,
+            owner.agentSessionID,
+            owner.runID
+        ) else {
+            return direct
+        }
+        guard owner.agentSessionID != nil, owner.runID != nil else {
+            throw MCPError.invalidParams(
+                "Delegated Oracle review packaging requires an exact Agent Mode session and run"
+            )
+        }
+        guard delegated.sourceWorkspaceID == conversationWorkspaceID else {
+            throw MCPError.invalidParams(
+                "Delegated Oracle review packaging belongs to a different workspace"
+            )
+        }
+        guard case .delegated = delegated.provenance else {
+            throw MCPError.internalError(
+                "Delegated Oracle review packaging is missing delegation provenance"
+            )
+        }
+        return delegated
     }
 }

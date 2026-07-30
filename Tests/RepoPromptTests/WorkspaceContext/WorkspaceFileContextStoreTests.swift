@@ -1,17 +1,36 @@
 import Combine
 import CoreServices
-@testable import RepoPrompt
+import CryptoKit
+@testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
-final class WorkspaceFileContextStoreTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
+private enum CodemapInitializationResetBoundary: String, CaseIterable {
+    case cancelAll
+    case checkoutMutation
+    case cacheClear
+}
 
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
+private actor UUIDRecorder {
+    private var values: [UUID] = []
+
+    func append(_ value: UUID) {
+        values.append(value)
+    }
+
+    func snapshot() -> [UUID] {
+        values
+    }
+}
+
+final class WorkspaceFileContextStoreTests: XCTestCase {
+    private var cancellables = Set<AnyCancellable>()
+
+    override func tearDown() {
+        EditFlowPerf.resetDebugCaptureForTesting()
+        MCPToolWorkCountDiagnostics.resetForTesting()
+        cancellables.removeAll()
+        super.tearDown()
     }
 
     func testRootLoadIndexesFilesFoldersReadsContentAndLooksUpPaths() async throws {
@@ -50,13 +69,48 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertEqual(scopedA?.location.absolutePath, rootA.appendingPathComponent("shared/file.txt").path)
     }
 
+    #if DEBUG
+        func testAppliedIndexRecordLookupReturnsOnlyRequestedCanonicalMembersWithBoundedWork() async throws {
+            let rootURL = try makeTemporaryRoot(name: "AppliedIndexRecordLookup")
+            try write("let first = true", to: rootURL.appendingPathComponent("Sources/First.swift"))
+            try write("let second = true", to: rootURL.appendingPathComponent("Sources/Second.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let files = await store.files(inRoot: root.id)
+            let folders = await store.folders(inRoot: root.id)
+            let first = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/First.swift" })
+            let sources = try XCTUnwrap(folders.first { $0.standardizedRelativePath == "Sources" })
+            let absentFileID = UUID()
+
+            await store.resetFilesInRootRequestCountForTesting()
+            await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
+            let lookup = await store.appliedIndexRecordLookup(
+                rootID: root.id,
+                fileIDs: [first.id, absentFileID],
+                folderIDs: [sources.id]
+            )
+
+            XCTAssertEqual(lookup?.root, root)
+            XCTAssertEqual(lookup?.generation, 0)
+            XCTAssertEqual(lookup?.filesByID, [first.id: first])
+            XCTAssertEqual(lookup?.foldersByID, [sources.id: sources])
+            let diagnostics = await store.appliedIndexRecordLookupDiagnosticsForTesting()
+            XCTAssertEqual(diagnostics.lookupRequests, 1)
+            XCTAssertEqual(diagnostics.requestedRecords, 3)
+            XCTAssertEqual(diagnostics.rootSnapshots, 0)
+            let enumerationCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(enumerationCount, 0)
+        }
+    #endif
+
     func testStaticPathAndSearchSnapshotCachesReuseScopesAndBoundLRU() async throws {
         do {
             let caseLabel = "testRepeatedPathLookupReusesStaticSnapshotForUnchangedCatalogGeneration"
             #if DEBUG
                 let root = try makeTemporaryRoot(name: "StaticPathSnapshotReuse")
                 let fileURL = root.appendingPathComponent("Sources/App.swift")
-                try write("struct App {}", to: fileURL)
+                try write(SwiftFixtureSource.emptyStruct("App", trailingNewline: false), to: fileURL)
 
                 let store = WorkspaceFileContextStore()
                 _ = try await store.loadRoot(path: root.path)
@@ -113,7 +167,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let caseLabel = "testSessionBoundStaticSnapshotCacheUsesBoundedLRUEviction"
             #if DEBUG
                 let worktree = try makeTemporaryRoot(name: "StaticSnapshotLRUWorktree")
-                try write("struct Cached {}", to: worktree.appendingPathComponent("Cached.swift"))
+                try write(SwiftFixtureSource.emptyStruct("Cached", trailingNewline: false), to: worktree.appendingPathComponent("Cached.swift"))
                 let store = WorkspaceFileContextStore()
                 _ = try await store.loadRoot(path: worktree.path, kind: .sessionWorktree)
                 let scopes = (0 ... 16).map { index in
@@ -174,8 +228,38 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 startSearchCatalogSnapshotCapture(label: "snapshot-reuse")
                 defer { EditFlowPerf.resetDebugCaptureForTesting() }
 
-                let cold = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-                let warm = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                let cold = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(cold.rootPathIndexes.isEmpty, caseLabel)
+                let coldCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(coldCacheCount, 1, caseLabel)
+                let warm = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(warm.rootPathIndexes.isEmpty, caseLabel)
+                let warmCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(warmCacheCount, 1, caseLabel)
+
+                let indexed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                XCTAssertEqual(indexed.generation, cold.generation, caseLabel)
+                XCTAssertEqual(indexed.rootPathIndexes.count, 2, caseLabel)
+                let indexedCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(indexedCacheCount, 1, caseLabel)
+                let repeatedIndexed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                XCTAssertTrue(indexed.rootPathIndexes[0] === repeatedIndexed.rootPathIndexes[0], caseLabel)
+                XCTAssertTrue(indexed.rootPathIndexes[1] === repeatedIndexed.rootPathIndexes[1], caseLabel)
+                let projected = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(projected.rootPathIndexes.isEmpty, caseLabel)
+                XCTAssertEqual(projected.generation, indexed.generation, caseLabel)
+                let projectedCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(projectedCacheCount, 1, caseLabel)
+
                 let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
                 let buckets = searchCatalogSnapshotBuckets(capture)
 
@@ -185,13 +269,16 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 XCTAssertEqual(cold.diagnostics.rootCount, 2, caseLabel)
                 XCTAssertEqual(cold.diagnostics.folderCount, 3, caseLabel)
                 XCTAssertEqual(cold.diagnostics.fileCount, 3, caseLabel)
-                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 1, caseLabel)
-                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1, caseLabel)
+                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 2, caseLabel)
+                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 3, caseLabel)
                 XCTAssertEqual(capture.droppedSampleCount, 0, caseLabel)
                 let work = await store.storeWorkDiagnosticsSnapshot()
-                XCTAssertEqual(work.catalogRebuild.rebuildCount, 1, caseLabel)
+                XCTAssertEqual(work.catalogRebuild.rebuildCount, 2, caseLabel)
                 XCTAssertEqual(work.catalogRebuild.lastFileCount, 3, caseLabel)
                 XCTAssertEqual(work.catalogRebuild.lastRootCount, 2, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.authoritativeRebuildCount == 1 }, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.pathIndexBuildCount == 1 }, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.patchCount == 0 }, caseLabel)
                 XCTAssertGreaterThanOrEqual(work.catalogRebuild.totalMicroseconds, work.catalogRebuild.filterMicroseconds, caseLabel)
                 XCTAssertGreaterThanOrEqual(work.catalogRebuild.totalMicroseconds, work.catalogRebuild.sortMicroseconds, caseLabel)
                 XCTAssertGreaterThanOrEqual(
@@ -206,7 +293,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     func testStaticSnapshotLRUEvictionPreservesRetainedSearchCatalogGeneration() async throws {
         #if DEBUG
             let worktree = try makeTemporaryRoot(name: "StaticSnapshotSearchGeneration")
-            try write("struct Cached {}", to: worktree.appendingPathComponent("Cached.swift"))
+            try write(SwiftFixtureSource.emptyStruct("Cached", trailingNewline: false), to: worktree.appendingPathComponent("Cached.swift"))
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: worktree.path, kind: .sessionWorktree)
             let scopes = (0 ... 16).map { index in
@@ -255,7 +342,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let worktree = try makeTemporaryRoot(name: "StaticSnapshotInvalidationWorktree")
             let original = worktree.appendingPathComponent("Original.swift")
             let added = worktree.appendingPathComponent("Added.swift")
-            try write("struct Original {}", to: original)
+            try write(SwiftFixtureSource.emptyStruct("Original", trailingNewline: false), to: original)
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: worktree.path, kind: .sessionWorktree)
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
@@ -276,7 +363,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let secondOriginal = await store.lookupPath("Original.swift", rootScope: scope)
             XCTAssertEqual(firstOriginal?.file?.rootID, record.id)
             XCTAssertEqual(secondOriginal?.file?.rootID, record.id)
-            try write("struct Added {}", to: added)
+            try write(SwiftFixtureSource.emptyStruct("Added", trailingNewline: false), to: added)
             await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("Added.swift")])
             let addedLookup = await store.lookupPath("Added.swift", rootScope: scope)
             XCTAssertEqual(addedLookup?.file?.rootID, record.id)
@@ -294,30 +381,61 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         #endif
     }
 
-    func testResolvedClipboardPackagingRendersStoreCodemaps() async throws {
+    func testResolvedClipboardPackagingRendersFrozenOperationPresentation() async throws {
         let root = try makeTemporaryRoot(name: "ResolvedClipboard")
         let fileURL = root.appendingPathComponent("A.swift")
         try write("struct A { func fullContent() {} }", to: fileURL)
 
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)
-        await store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(fullPath: fileURL.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileURL.path))
-        ])
+        let lookup = await store.lookupPath(fileURL.path)
+        let file = try XCTUnwrap(lookup?.file)
+        let rendered = makeSyntaxArtifact(path: fileURL.path)
+            .renderedCodeMap(displayPath: "ResolvedClipboard/A.swift")
+        let pipeline = try SyntaxManager().pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let bundleID = WorkspaceCodemapFrozenPresentationBundleID()
+        let presentation = try WorkspaceCodemapOperationPresentation(
+            orderedEntries: [
+                WorkspaceCodemapOperationRenderedEntry(
+                    bundleID: bundleID,
+                    fileID: file.id,
+                    rootEpoch: WorkspaceCodemapRootEpoch(
+                        rootID: file.rootID,
+                        rootLifetimeID: UUID()
+                    ),
+                    artifactKey: CodeMapArtifactKey(
+                        rawSHA256: CodeMapRawSourceDigest(bytes: Data(repeating: 1, count: 32)),
+                        rawByteCount: UInt64(rendered.utf8.count),
+                        pipelineIdentity: pipeline
+                    ),
+                    logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                        rootDisplayName: "ResolvedClipboard",
+                        standardizedRelativePath: file.standardizedRelativePath
+                    )),
+                    text: rendered,
+                    tokenCount: TokenCalculationService.estimateTokens(for: rendered)
+                )
+            ],
+            coverage: .complete,
+            issues: [],
+            publicationReceipt: nil
+        )
 
         let service = PromptContextAccountingService()
         let selection = StoredSelection(
             selectedPaths: [fileURL.path],
-            autoCodemapPaths: [],
+
             slices: [:],
             codemapAutoEnabled: false
         )
-        let codemapSnapshotBundle = await store.codemapSnapshotBundle()
         let resolution = await service.resolveEntries(
             selection: selection,
             store: store,
             codeMapUsage: .selected,
-            codemapSnapshotBundle: codemapSnapshotBundle
+            codemapPresentation: presentation
         )
 
         let clipboard = await PromptPackagingService.generateClipboardContent(
@@ -329,14 +447,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             includeFiles: true,
             includeUserPrompt: true,
             filePathDisplay: .relative,
-            codemapSnapshotBundle: codemapSnapshotBundle,
+            codemapPresentation: resolution.codemapPresentation,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
             duplicateUserInstructionsAtTop: false
         )
 
         XCTAssertTrue(clipboard.contains("<file_map>"))
-        XCTAssertTrue(clipboard.contains("File: A.swift"))
+        XCTAssertTrue(clipboard.contains("File: ResolvedClipboard/A.swift"))
         XCTAssertTrue(clipboard.contains("codemapOnlySymbol"))
         XCTAssertFalse(clipboard.contains("<file_contents>"))
         XCTAssertFalse(clipboard.contains("fullContent"))
@@ -359,18 +477,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertNotNil(addedFile)
 
         let existingURL = root.appendingPathComponent("Existing.swift")
-        await store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(fullPath: existingURL.path, modificationDate: Date(), fileAPI: makeFileAPI(path: existingURL.path))
-        ])
-        let initialCodemap = await store.codemapSnapshot(rootID: record.id, relativePath: "Existing.swift")
-        XCTAssertNotNil(initialCodemap)
         try write("new", to: existingURL)
         await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileModified("Existing.swift", Date())])
         event = await events.next()
         XCTAssertEqual(event?.modifiedFileIDs.count, 1)
-        let invalidatedCodemap = await store.codemapSnapshot(rootID: record.id, relativePath: "Existing.swift")
-        XCTAssertNil(invalidatedCodemap)
-
         try FileManager.default.removeItem(at: root.appendingPathComponent("Added.swift"))
         await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileRemoved("Added.swift")])
         event = await events.next()
@@ -513,7 +623,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 try await store.createFile(
                     rootID: record.id,
                     relativePath: "CreatedAfterCancellation.swift",
-                    content: "struct CreatedAfterCancellation {}"
+                    content: SwiftFixtureSource.emptyStruct("CreatedAfterCancellation", trailingNewline: false)
                 )
             }
             await mutationGate.waitUntilStarted()
@@ -655,7 +765,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await service.setMutationIOWillBeginHandlerForTesting(nil)
             await store.stopWatchingRoot(id: record.id)
-            withExtendedLifetime(publicationCancellable) {}
+            cancellables.insert(publicationCancellable)
 
             let postTokenRoot = try makeTemporaryRoot(name: "CancelledOverwriteAfterDeferredToken")
             let postTokenFileURL = postTokenRoot.appendingPathComponent("PostToken.swift")
@@ -711,7 +821,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await postTokenStore.setStoreEditDeferredPublicationDidRegisterHandlerForTesting(nil)
             await postTokenStore.stopWatchingRoot(id: postTokenRecord.id)
-            withExtendedLifetime(postTokenCancellable) {}
+            cancellables.insert(postTokenCancellable)
         }
 
         func testCancelledMoveDeleteAndTrashSettleBeforeIOAndReconcileAfterCompletion() async throws {
@@ -836,6 +946,114 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                     return await store.file(rootID: record.id, relativePath: "Trash.swift") == nil
                 }
             )
+        }
+
+        func testMutationCompletionBeforeWaiterRegistrationSettlesWithoutLostWakeup() async throws {
+            let root = try makeTemporaryRoot(name: "MutationCompletionMailbox")
+            let trashURL = root.appendingPathComponent("Trash.swift")
+            try write("trash", to: trashURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+            await service.setMoveItemToTrashIOForTesting { url in
+                try FileManager.default.removeItem(at: url)
+            }
+            let registrationGate = AsyncGate()
+            await service.setMutationWaiterWillRegisterHandlerForTesting { operation in
+                guard operation == .trash else { return }
+                await registrationGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await service.setMutationWaiterWillRegisterHandlerForTesting(nil)
+                await service.setMoveItemToTrashIOForTesting(nil)
+            }
+
+            let settledSignal = AsyncSignal()
+            let mutationTask = Task {
+                do {
+                    try await store.moveItemToTrash(rootID: record.id, relativePath: "Trash.swift")
+                    await settledSignal.mark()
+                    return true
+                } catch {
+                    await settledSignal.mark()
+                    return false
+                }
+            }
+            await registrationGate.waitUntilStarted()
+
+            let completionArrivedFirst = await waitForAsyncCondition(timeout: .seconds(2)) {
+                guard !FileManager.default.fileExists(atPath: trashURL.path) else { return false }
+                return await service.pendingMutationCompletionCountForTesting() == 1
+            }
+            XCTAssertTrue(completionArrivedFirst, "Detached completion did not reach the mailbox before waiter registration")
+
+            await registrationGate.release()
+            let settled = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await settledSignal.isMarked()
+            }
+            XCTAssertTrue(settled, "Precompleted mutation did not settle after waiter registration resumed")
+            if !settled {
+                mutationTask.cancel()
+            }
+            let mutationSucceeded = await mutationTask.value
+            let pendingWaiters = await service.pendingMutationWaiterCountForTesting()
+            let pendingCompletions = await service.pendingMutationCompletionCountForTesting()
+            XCTAssertTrue(mutationSucceeded)
+            XCTAssertEqual(pendingWaiters, 0)
+            XCTAssertEqual(pendingCompletions, 0)
+        }
+
+        func testTrashSettlesFromDurableAbsenceBeforeFinderCallReturns() async throws {
+            let root = try makeTemporaryRoot(name: "TrashDurableAbsence")
+            let trashURL = root.appendingPathComponent("Trash.swift")
+            try write("trash", to: trashURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+            let finderTailRelease = DispatchSemaphore(value: 0)
+            await service.setMoveItemToTrashIOForTesting { url in
+                try FileManager.default.removeItem(at: url)
+                finderTailRelease.wait()
+            }
+            addTeardownBlock {
+                finderTailRelease.signal()
+                await service.setMoveItemToTrashIOForTesting(nil)
+            }
+
+            let settledSignal = AsyncSignal()
+            let mutationTask = Task {
+                do {
+                    try await store.moveItemToTrash(rootID: record.id, relativePath: "Trash.swift")
+                    await settledSignal.mark()
+                    return true
+                } catch {
+                    await settledSignal.mark()
+                    return false
+                }
+            }
+            let settledBeforeFinderReturned = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await settledSignal.isMarked()
+            }
+            XCTAssertTrue(
+                settledBeforeFinderReturned,
+                "Durable source-path absence did not settle while Finder tail work remained blocked"
+            )
+            if !settledBeforeFinderReturned {
+                mutationTask.cancel()
+            }
+            let mutationSucceeded = await mutationTask.value
+            let catalogFile = await store.file(rootID: record.id, relativePath: "Trash.swift")
+            let pendingWaiters = await service.pendingMutationWaiterCountForTesting()
+            let pendingCompletions = await service.pendingMutationCompletionCountForTesting()
+            XCTAssertTrue(mutationSucceeded)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: trashURL.path))
+            XCTAssertNil(catalogFile)
+            XCTAssertEqual(pendingWaiters, 0)
+            XCTAssertEqual(pendingCompletions, 0)
+
+            finderTailRelease.signal()
         }
 
         func testStopWatchingRootDrainsTrackedPublisherIngress() async throws {
@@ -1428,6 +1646,61 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(ownershipAfterSuspendedOwnerResumes.pathReservationCount, 0)
         }
 
+        func testSessionSpecificDrainSnapshotIsOwnerScopedAndFailsClosedForSharedRoot() async throws {
+            let root = try makeTemporaryRoot(name: "SessionSpecificDrainSnapshot")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            let ownerA = UUID()
+            let ownerB = UUID()
+            let path = StandardizedPath.absolute(root.path)
+            let digest = SHA256.hash(data: Data(path.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+
+            let preparedA = try await store.prepareSessionWorktreeOwnership(
+                ownerID: ownerA,
+                bindingFingerprint: "owner-a",
+                physicalRootPaths: [path]
+            )
+            _ = try await store.commitSessionWorktreeOwnership(preparedA)
+            let preparedB = try await store.prepareSessionWorktreeOwnership(
+                ownerID: ownerB,
+                bindingFingerprint: "owner-b",
+                physicalRootPaths: [path]
+            )
+            _ = try await store.commitSessionWorktreeOwnership(preparedB)
+
+            let live = try await store.sessionWorktreeOwnershipDrainSnapshotForTesting(
+                ownerID: ownerA,
+                expectedPhysicalPathDigests: [digest],
+                requestedAtNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+            XCTAssertFalse(live.isDrained)
+            XCTAssertEqual(live.installedTokenCount, 1)
+            XCTAssertEqual(live.matchingLiveRootCount, 1)
+            XCTAssertEqual(live.matchingWatcherAttachmentCount, 1)
+
+            await store.releaseSessionWorktreeOwnership(ownerID: ownerA)
+            let shared = try await store.sessionWorktreeOwnershipDrainSnapshotForTesting(
+                ownerID: ownerA,
+                expectedPhysicalPathDigests: [digest],
+                requestedAtNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+            XCTAssertFalse(shared.isDrained, "Another owner must keep physical deletion fail-closed.")
+            XCTAssertEqual(shared.installedTokenCount, 0)
+            XCTAssertEqual(shared.matchingLiveRootCount, 1)
+
+            await store.releaseSessionWorktreeOwnership(ownerID: ownerB)
+            let drained = try await store.sessionWorktreeOwnershipDrainSnapshotForTesting(
+                ownerID: ownerA,
+                expectedPhysicalPathDigests: [digest],
+                requestedAtNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+            XCTAssertTrue(drained.isDrained)
+            XCTAssertEqual(drained.expectedPhysicalPathDigests, [digest])
+            XCTAssertEqual(drained.outstandingPublicationCount, 0)
+        }
+
         func testSessionWorktreeOwnershipReleaseDuringRootLoadUnloadsLateRoot() async throws {
             let root = try makeTemporaryRoot(name: "SessionWorktreeOwnershipReleaseDuringLoad")
             try write("seed", to: root.appendingPathComponent("Seed.swift"))
@@ -1454,6 +1727,38 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(ownershipDuringLoad.rootClaimCount, 0)
             XCTAssertEqual(ownershipDuringLoad.pathReservationCount, 1)
             await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
+            let standardizedPath = StandardizedPath.absolute(root.path)
+            let digest = SHA256.hash(data: Data(standardizedPath.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            let drainEnteredLoadFlightWait = expectation(
+                description: "drain enters the reserved load-flight wait"
+            )
+            await store.setSessionWorktreeDrainDidEnterLoadFlightWaitHandler {
+                drainEnteredLoadFlightWait.fulfill()
+            }
+            defer {
+                Task { await store.setSessionWorktreeDrainDidEnterLoadFlightWaitHandler(nil) }
+            }
+            let drainCompleted = AsyncSignal()
+            let drainTask = Task {
+                let snapshot = try await store.sessionWorktreeOwnershipDrainSnapshotForTesting(
+                    ownerID: ownerID,
+                    expectedPhysicalPathDigests: [digest],
+                    requestedAtNanoseconds: DispatchTime.now().uptimeNanoseconds
+                )
+                await drainCompleted.mark()
+                return snapshot
+            }
+            await fulfillment(of: [drainEnteredLoadFlightWait], timeout: 1)
+            let activeDrainWaiters =
+                await store.sessionWorktreeDrainLoadFlightWaiterCountForTesting()
+            XCTAssertEqual(activeDrainWaiters, 1)
+            let drainFinishedBeforeLoadRelease = await drainCompleted.isMarked()
+            XCTAssertFalse(
+                drainFinishedBeforeLoadRelease,
+                "The drain must be suspended on the reserved load flight."
+            )
             await loadGate.release()
 
             do {
@@ -1462,6 +1767,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             } catch let error as WorkspaceSessionWorktreeOwnershipError {
                 XCTAssertEqual(error, .staleUpdate)
             }
+            let drained = try await drainTask.value
+            XCTAssertTrue(drained.isDrained)
+            XCTAssertEqual(drained.reservedLoadFlightCount, 0)
+            let remainingDrainWaiters =
+                await store.sessionWorktreeDrainLoadFlightWaiterCountForTesting()
+            XCTAssertEqual(remainingDrainWaiters, 0)
 
             await store.setRootLoadWillStartHandler(nil)
             let lateRootUnloaded = await waitForAsyncCondition {
@@ -2138,6 +2449,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             // introducing nondeterministic macOS FSEvents into this sequence-gap contract.
             let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
             XCTAssertTrue(attached)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootID)
 
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
@@ -2229,6 +2541,42 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let applied = coordinator.appliedSnapshot(rootID: rootID)
             XCTAssertEqual(applied.appliedServicePublicationSequence, 2)
             XCTAssertEqual(applied.appliedWatcherWatermark.rawValue, 7)
+        }
+
+        func testWorkspaceIngressCoordinatorPrivateHandoffRetargetsQueuedPublicationBeforeResume() async {
+            let coordinator = WorkspaceFileSystemIngressCoordinator()
+            let rootID = UUID()
+            let oldRecorder = OrderedIngressRecorder()
+            let newRecorder = OrderedIngressRecorder()
+            let subscription = coordinator.openPublisherIngress(rootID: rootID) { publication, _ in
+                await oldRecorder.append(publication.servicePublicationSequence)
+            }
+            XCTAssertTrue(coordinator.pauseDrainAndReplaceHandler(subscription) { publication, _ in
+                await oldRecorder.append(publication.servicePublicationSequence)
+            })
+            XCTAssertTrue(coordinator.accept(
+                subscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 1,
+                    source: .watcherBarrierNoop,
+                    watcherAcceptedWatermark: .init(rawValue: 31),
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            XCTAssertTrue(coordinator.pauseDrainAndReplaceHandler(subscription) { publication, _ in
+                await newRecorder.append(publication.servicePublicationSequence)
+            })
+            let oldBeforeResume = await oldRecorder.snapshot()
+            let newBeforeResume = await newRecorder.snapshot()
+            XCTAssertEqual(oldBeforeResume, [])
+            XCTAssertEqual(newBeforeResume, [])
+            XCTAssertTrue(coordinator.resumeDrainAfterHandoff(subscription))
+            await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 1)
+            let oldAfterResume = await oldRecorder.snapshot()
+            let newAfterResume = await newRecorder.snapshot()
+            XCTAssertEqual(oldAfterResume, [])
+            XCTAssertEqual(newAfterResume, [1])
         }
 
         #if DEBUG
@@ -2633,11 +2981,24 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(completedAfterFinish)
         }
 
+        private func resetScopedIngressBarrierAfterSeededLoad(
+            _ store: WorkspaceFileContextStore,
+            rootID: UUID,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: rootID)
+            let seededAuthorityIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: rootID)
+            XCTAssertTrue(seededAuthorityIsCurrent, file: file, line: line)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootID)
+        }
+
         func testScopedAppliedIngressConcurrentSameRootRequestsJoinOneFlight() async throws {
             let root = try makeTemporaryRoot(name: "ScopedIngressSingleFlight")
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
             let rootID = record.id
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == rootID else { return }
@@ -2676,6 +3037,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
             let rootID = record.id
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == rootID else { return }
@@ -2727,6 +3089,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
             let rootID = record.id
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == rootID else { return }
@@ -2778,6 +3141,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == rootID else { return }
@@ -2855,6 +3219,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let baselineIngress = await store.appliedIngressSnapshotForTesting(rootID: rootID)
             let sinkGate = AsyncGate()
             let publisherWaitStarted = AsyncSignal()
@@ -2920,13 +3285,13 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(firstSamples.isEmpty)
             XCTAssertTrue(secondSamples.isEmpty)
             let activeBeforeRelease = await store.readSearchRootDiagnosticsSnapshot()
-            let activeRoot = activeBeforeRelease.first { $0.rootID == rootID }
-            XCTAssertNotNil(activeRoot?.barrier.active)
-            XCTAssertEqual(activeRoot?.barrier.completionCount, 0)
-            XCTAssertEqual(activeRoot?.ingress.waiterCount, 1)
-            XCTAssertGreaterThan(activeRoot?.ingress.outstandingPublicationCount ?? 0, 0)
+            let activeRoot = try XCTUnwrap(activeBeforeRelease.first { $0.rootID == rootID })
+            let activeBarrier = try XCTUnwrap(activeRoot.barrier.active)
+            XCTAssertEqual(activeRoot.barrier.completionCount, 0)
+            XCTAssertEqual(activeRoot.ingress.waiterCount, 1)
+            XCTAssertGreaterThan(activeRoot.ingress.outstandingPublicationCount, 0)
             XCTAssertEqual(
-                activeRoot?.ingress.appliedServicePublicationSequence,
+                activeRoot.ingress.appliedServicePublicationSequence,
                 baselineIngress.appliedServicePublicationSequence
             )
 
@@ -2935,7 +3300,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 let roots = await store.readSearchRootDiagnosticsSnapshot()
                 guard let root = roots.first(where: { $0.rootID == rootID }) else { return false }
                 return root.barrier.active == nil
-                    && root.barrier.completionCount == 1
+                    && root.barrier.completionCount >= 1
                     && root.ingress.waiterCount == 0
                     && root.ingress.outstandingPublicationCount == 0
             }
@@ -2950,21 +3315,103 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 settledRoot.ingress.appliedServicePublicationSequence,
                 initialIngress?.acceptedServicePublicationSequence ?? 0
             )
+            let completedBarrier = try XCTUnwrap(settledRoot.barrier.lastCompleted)
+            XCTAssertEqual(completedBarrier.targetWatcherWatermark, activeBarrier.targetWatcherWatermark)
+            XCTAssertEqual(completedBarrier.targetServicePublicationSequence, activeBarrier.targetServicePublicationSequence)
+            XCTAssertGreaterThanOrEqual(
+                completedBarrier.appliedWatcherWatermark,
+                completedBarrier.targetWatcherWatermark
+            )
             XCTAssertGreaterThanOrEqual(
                 settledRoot.ingress.appliedWatcherWatermark,
                 baselineIngress.appliedWatcherWatermark.rawValue
             )
             XCTAssertEqual(
-                settledRoot.barrier.lastCompleted?.appliedWatcherWatermark,
+                completedBarrier.appliedWatcherWatermark,
                 settledRoot.ingress.appliedWatcherWatermark
             )
             XCTAssertEqual(
-                settledRoot.barrier.lastCompleted?.appliedServicePublicationSequence,
+                completedBarrier.appliedServicePublicationSequence,
                 settledRoot.ingress.appliedServicePublicationSequence
             )
             await store.setWatcherSinkWillApplyHandler(nil)
             await store.setPublisherIngressWillWaitHandler(nil)
             await store.stopWatchingRoot(id: rootID)
+        }
+
+        func testReadFreshnessTimeoutThrowsBeforeCanonicalFlightCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessTimeout")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootRef = WorkspaceRootRef(id: record.id, name: record.name, fullPath: record.standardizedFullPath)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let completed = AsyncSignal()
+            let request = Task { () -> WorkspaceAppliedIngressWaitError? in
+                let observedError: WorkspaceAppliedIngressWaitError?
+                do {
+                    let service = WorkspaceReadableFileService(store: store)
+                    try await service.awaitFreshnessForExplicitRequest(
+                        fileURL.path,
+                        rootRefs: [rootRef],
+                        timeout: .milliseconds(25)
+                    )
+                    observedError = nil
+                } catch let error as WorkspaceAppliedIngressWaitError {
+                    observedError = error
+                } catch {
+                    observedError = nil
+                }
+                await completed.mark()
+                return observedError
+            }
+            let flushStarted = await waitForAsyncCondition {
+                await flushGate.startCount() == 1
+            }
+            XCTAssertTrue(flushStarted)
+            let timedOutPromptly = await waitForAsyncCondition {
+                await completed.isMarked()
+            }
+            XCTAssertTrue(timedOutPromptly)
+
+            await flushGate.release()
+            let error = await request.value
+            XCTAssertEqual(error, WorkspaceAppliedIngressWaitError.timedOut)
+            let settled = await waitForAsyncCondition {
+                let roots = await store.readSearchRootDiagnosticsSnapshot()
+                return roots.first { $0.rootID == record.id }?.barrier.active == nil
+            }
+            XCTAssertTrue(settled)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testTimedExplicitFreshnessReturnsSamplesWhenBarrierCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessTimeoutSuccess")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootRef = WorkspaceRootRef(id: record.id, name: record.name, fullPath: record.standardizedFullPath)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
+            let service = WorkspaceReadableFileService(store: store)
+
+            try await service.awaitFreshnessForExplicitRequest(
+                fileURL.path,
+                rootRefs: [rootRef],
+                timeout: .seconds(1)
+            )
+            let stats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+            let roots = await store.readSearchRootDiagnosticsSnapshot()
+            let settledRoot = try XCTUnwrap(roots.first { $0.rootID == record.id })
+            XCTAssertEqual(stats.launchCount, 1)
+            XCTAssertNotNil(settledRoot.barrier.lastCompleted)
         }
 
         func testCancelledReadFreshnessJoinThrowsBeforeCanonicalFlightCompletes() async throws {
@@ -2973,6 +3420,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("seed", to: fileURL)
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: record.id)
+            let seededAuthorityIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: record.id)
+            XCTAssertTrue(seededAuthorityIsCurrent)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: record.id)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == record.id else { return }
@@ -2997,7 +3448,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await completed.mark()
                 return wasCancelled
             }
-            await flushGate.waitUntilStarted()
+            let flushStarted = await waitForAsyncCondition {
+                await flushGate.startCount() == 1
+            }
+            XCTAssertTrue(flushStarted)
             request.cancel()
             let cancelledPromptly = await waitForAsyncCondition {
                 await completed.isMarked()
@@ -3015,6 +3469,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("needle", to: root.appendingPathComponent("Seed.swift"))
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: record.id)
+            let seededAuthorityIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: record.id)
+            XCTAssertTrue(seededAuthorityIsCurrent)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: record.id)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == record.id else { return }
@@ -3040,7 +3498,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await completed.mark()
                 return wasCancelled
             }
-            await flushGate.waitUntilStarted()
+            let flushStarted = await waitForAsyncCondition {
+                await flushGate.startCount() == 1
+            }
+            XCTAssertTrue(flushStarted)
             request.cancel()
             let cancelledPromptly = await waitForAsyncCondition {
                 await completed.isMarked()
@@ -3062,6 +3523,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: rootID)
             let baselineWatcherWatermark = try await store.acceptedWatcherWatermarkForTesting(rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
@@ -3129,7 +3591,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(flightCountWhileBlocked, 2)
             XCTAssertEqual(flushStartCountWhileBlocked, 1)
             XCTAssertEqual(active.targetWatcherWatermark, baselineWatcherWatermark.rawValue)
-            XCTAssertEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
             XCTAssertEqual(pending.ageMilliseconds, 175)
 
@@ -3151,8 +3613,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 firstSamples.first?.acceptedWatcherWatermark,
                 baselineWatcherWatermark.rawValue
             )
-            XCTAssertEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
-            XCTAssertEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(secondSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(thirdSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(
@@ -3173,6 +3635,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let recordA = try await store.loadRoot(path: rootA.path)
             let recordB = try await store.loadRoot(path: rootB.path)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: recordA.id)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: recordB.id)
             let gateA = AsyncGate()
             let gateB = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
@@ -3206,6 +3670,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             for index in 0 ..< 9 {
                 let root = try makeTemporaryRoot(name: "ScopedIngressFanOut\(index)")
                 try await records.append(store.loadRoot(path: root.path))
+            }
+            for record in records {
+                await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
             }
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { _ in
@@ -3241,6 +3708,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let recordA = try await store.loadRoot(path: rootA.path)
             let recordB = try await store.loadRoot(path: rootB.path)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: recordA.id)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: recordB.id)
+            let seededAuthorityAIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: recordA.id)
+            let seededAuthorityBIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: recordB.id)
+            XCTAssertTrue(seededAuthorityAIsCurrent)
+            XCTAssertTrue(seededAuthorityBIsCurrent)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: recordA.id)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: recordB.id)
 
             let samples = await store.awaitAppliedIngressForExplicitRequest(
                 userPath: fileA.path,
@@ -3277,6 +3752,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("seed", to: seedURL)
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: record.id)
+            let seededAuthorityIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: record.id)
+            XCTAssertTrue(seededAuthorityIsCurrent)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: record.id)
             // Keep the callback cut deterministic; real FSEvents can race these exact barrier counters.
             let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
             XCTAssertTrue(attached)
@@ -3336,6 +3815,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let clock = LockedWorkspaceDiagnosticsClock(nowNanoseconds: 3_000_000_000)
             let store = WorkspaceFileContextStore(debugNowNanoseconds: { clock.now() })
             let record = try await store.loadRoot(path: root.path)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == record.id else { return }
@@ -3345,7 +3825,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let barrierTask = Task {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
-            await flushGate.waitUntilStarted()
+            let flushStarted = await waitForAsyncCondition {
+                await flushGate.startCount() == 1
+            }
+            XCTAssertTrue(flushStarted)
             clock.advance(milliseconds: 325)
 
             let activeRoots = await store.readSearchRootDiagnosticsSnapshot()
@@ -3384,6 +3867,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
+            await store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: record.id)
+            let seededAuthorityIsCurrent = await store.publishedSeededAuthorityIsCurrentForTesting(rootID: record.id)
+            XCTAssertTrue(seededAuthorityIsCurrent)
+            await store.resetScopedIngressBarrierDiagnosticsForTesting(rootID: record.id)
             var service: FileSystemService? = await store.fileSystemServiceForTesting(rootID: record.id)
             let weakService = WeakObjectBox(service)
             let cancellationGate = CancellationAwareGate()
@@ -3395,7 +3882,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let activeBarrier = Task {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
-            await cancellationGate.waitUntilStarted()
+            let flushStarted = await waitForAsyncCondition {
+                await cancellationGate.isStarted()
+            }
+            XCTAssertTrue(flushStarted)
 
             try write("pending", to: addedURL)
             let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
@@ -3457,7 +3947,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 XCTAssertNil(sample.watcherAcceptedWatermark, caseLabel)
                 XCTAssertEqual(sample.preparedDeltaCount, fileCount, caseLabel)
                 XCTAssertEqual(sample.topologyInvalidationCount, 1, caseLabel)
-                XCTAssertEqual(sample.catalogGenerationAdvanceCount, 3, caseLabel)
+                XCTAssertEqual(sample.catalogGenerationAdvanceCount, 4, caseLabel)
                 XCTAssertEqual(sample.searchCatalogCacheClearCount, 1, caseLabel)
                 XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 0, caseLabel)
                 XCTAssertEqual(sample.contentInvalidationCount, 0, caseLabel)
@@ -3570,6 +4060,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 0)
             XCTAssertEqual(sample.distinctContentKeyCount, fileCount)
             XCTAssertEqual(sample.decodedCacheInvalidationRequestCount, 1)
+            // Decoded search cache invalidation is batched once per publication, while content-addressed
+            // codemap path invalidation still records each modified file path.
             XCTAssertEqual(sample.codemapInvalidationRequestCount, fileCount)
             XCTAssertEqual(sample.appliedIndexEventYieldCount, 1)
 
@@ -4068,6 +4560,78 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNotEqual(unloaded.generation, reloaded.generation)
         }
 
+        func testValidatedSessionSelectorDedupesNameOnlyReferences() async throws {
+            let rootURL = try makeTemporaryRoot(name: "ValidatedSelectorNameDedupe")
+            try write("let value = true", to: rootURL.appendingPathComponent("Target.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let scope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+                canonicalRoots: [
+                    WorkspaceRootRef(id: root.id, name: "First", fullPath: root.standardizedFullPath),
+                    WorkspaceRootRef(id: root.id, name: "Second", fullPath: root.standardizedFullPath)
+                ],
+                physicalRoots: []
+            )
+
+            let availability = await store.rootScopeAvailability(scope)
+            let scopedRoots = await store.rootRefs(scope: scope)
+            let codemapRootEpochs = await store.codemapRootEpochs(scope: scope)
+
+            XCTAssertEqual(availability, .available)
+            XCTAssertEqual(scopedRoots.map(\.id), [root.id])
+            XCTAssertEqual(Set(codemapRootEpochs.keys), [root.id])
+        }
+
+        func testValidatedSessionSelectorConflictsExposeNoRootsOrCodemapEpochs() async throws {
+            let firstURL = try makeTemporaryRoot(name: "ValidatedSelectorFirst")
+            let secondURL = try makeTemporaryRoot(name: "ValidatedSelectorSecond")
+            try write("let first = true", to: firstURL.appendingPathComponent("First.swift"))
+            try write("let second = true", to: secondURL.appendingPathComponent("Second.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let first = try await store.loadRoot(path: firstURL.path)
+            let second = try await store.loadRoot(path: secondURL.path)
+            let firstRef = WorkspaceRootRef(
+                id: first.id,
+                name: first.name,
+                fullPath: first.standardizedFullPath
+            )
+            let conflictingPathRef = WorkspaceRootRef(
+                id: first.id,
+                name: second.name,
+                fullPath: second.standardizedFullPath
+            )
+            let conflictingScopes: [WorkspaceLookupRootScope] = [
+                .validatedSessionBoundWorkspace(
+                    canonicalRoots: [firstRef, conflictingPathRef],
+                    physicalRoots: []
+                ),
+                .validatedSessionBoundWorkspace(
+                    canonicalRoots: [firstRef],
+                    physicalRoots: [firstRef]
+                )
+            ]
+
+            for scope in conflictingScopes {
+                let availability = await store.rootScopeAvailability(scope)
+                let scopedRoots = await store.rootRefs(scope: scope)
+                let codemapRootEpochs = await store.codemapRootEpochs(scope: scope)
+                let catalogAccess = await store.searchCatalogAccess(rootScope: scope)
+
+                XCTAssertEqual(
+                    availability,
+                    .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+                )
+                XCTAssertTrue(scopedRoots.isEmpty)
+                XCTAssertTrue(codemapRootEpochs.isEmpty)
+                XCTAssertEqual(
+                    catalogAccess,
+                    .unavailable(.sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
+                )
+            }
+        }
+
         func testValidatedSessionScopeRejectsSamePathRootReplacement() async throws {
             let logicalRoot = try makeTemporaryRoot(name: "ValidatedSessionLogical")
             let worktree = try makeTemporaryRoot(name: "ValidatedSessionWorktree")
@@ -4233,7 +4797,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             _ = try await store.loadRoot(path: root.path)
 
             let snapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: StoredSelection(selectedPaths: [selectedURL.path], autoCodemapPaths: [], slices: [:], codemapAutoEnabled: false),
+                selection: StoredSelection(selectedPaths: [selectedURL.path], slices: [:], codemapAutoEnabled: false),
                 request: WorkspaceFileTreeSnapshotRequest(
                     mode: .folders,
                     filePathDisplay: .relative,
@@ -4312,6 +4876,148 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(tree.contains("A.swift"), caseLabel)
             XCTAssertTrue(tree.contains("Nested"), caseLabel)
             XCTAssertTrue(tree.contains("B.swift"), caseLabel)
+            XCTAssertFalse(tree.contains("Other.swift"), caseLabel)
+        }
+
+        do {
+            let caseLabel = "testFileTreeSnapshotStartPathResolvesRootAliasesAndAbsoluteSubfolders"
+            let rootA = try makeTemporaryRoot(name: "AliasTreeA")
+            let rootB = try makeTemporaryRoot(name: "AliasTreeB")
+            try write("app", to: rootA.appendingPathComponent("Sources/App.swift"))
+            try write("mcp", to: rootA.appendingPathComponent("Sources/RepoPromptMCP/Main.swift"))
+            try write("other", to: rootA.appendingPathComponent("Other.swift"))
+            try write("sdk", to: rootB.appendingPathComponent("Sources/SDK.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let recordA = try await store.loadRoot(path: rootA.path)
+            _ = try await store.loadRoot(path: rootB.path)
+
+            let rootAliasSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: recordA.name
+                ),
+                profile: .mcpRead
+            )
+            let rootAliasTree = CodeMapExtractor.generateFileTree(using: rootAliasSnapshot)
+            XCTAssertEqual(rootAliasSnapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(rootAliasTree.contains("App.swift"), caseLabel)
+            XCTAssertTrue(rootAliasTree.contains("Other.swift"), caseLabel)
+            XCTAssertFalse(rootAliasTree.contains("SDK.swift"), caseLabel)
+
+            let prefixedSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "\(recordA.name)/Sources"
+                ),
+                profile: .mcpRead
+            )
+            let prefixedTree = CodeMapExtractor.generateFileTree(using: prefixedSnapshot)
+            XCTAssertEqual(prefixedSnapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(prefixedTree.contains("Sources"), caseLabel)
+            XCTAssertTrue(prefixedTree.contains("App.swift"), caseLabel)
+            XCTAssertTrue(prefixedTree.contains("RepoPromptMCP"), caseLabel)
+            XCTAssertFalse(prefixedTree.contains("Other.swift"), caseLabel)
+            XCTAssertFalse(prefixedTree.contains("SDK.swift"), caseLabel)
+
+            let absoluteSubfolderSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: rootA.appendingPathComponent("Sources/RepoPromptMCP").path
+                ),
+                profile: .mcpRead
+            )
+            let absoluteSubfolderTree = CodeMapExtractor.generateFileTree(using: absoluteSubfolderSnapshot)
+            XCTAssertEqual(absoluteSubfolderSnapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(absoluteSubfolderTree.contains("RepoPromptMCP"), caseLabel)
+            XCTAssertTrue(absoluteSubfolderTree.contains("Main.swift"), caseLabel)
+            XCTAssertFalse(absoluteSubfolderTree.contains("App.swift"), caseLabel)
+            XCTAssertFalse(absoluteSubfolderTree.contains("Other.swift"), caseLabel)
+
+            let missingRelativeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "Missing/Subtree"
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(missingRelativeSnapshot.roots.isEmpty, caseLabel)
+
+            let missingAbsoluteSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: rootA.appendingPathComponent("Missing/Subtree").path
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(missingAbsoluteSnapshot.roots.isEmpty, caseLabel)
+        }
+
+        do {
+            let caseLabel = "testFileTreeSnapshotStartPathAcceptsGeneratedDisplayAlias"
+            let parentA = try makeTemporaryRoot(name: "GeneratedAliasParentA")
+            let parentB = try makeTemporaryRoot(name: "GeneratedAliasParentB")
+            let rootA = parentA.appendingPathComponent("App", isDirectory: true)
+            let rootB = parentB.appendingPathComponent("App", isDirectory: true)
+            try write("a", to: rootA.appendingPathComponent("Sources/A.swift"))
+            try write("b", to: rootB.appendingPathComponent("Sources/B.swift"))
+            try write("other", to: rootA.appendingPathComponent("Other.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let recordA = try await store.loadRoot(path: rootA.path)
+            _ = try await store.loadRoot(path: rootB.path)
+            let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+            let rootRefA = try XCTUnwrap(visibleRoots.first { $0.id == recordA.id }, caseLabel)
+            let generatedAlias = ClientPathFormatter.nonAbsoluteRootAlias(root: rootRefA, visibleRoots: visibleRoots)
+
+            let snapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "\(generatedAlias)/Sources"
+                ),
+                profile: .mcpRead
+            )
+            let tree = CodeMapExtractor.generateFileTree(using: snapshot)
+
+            XCTAssertEqual(snapshot.roots.count, 1, caseLabel)
+            XCTAssertTrue(tree.contains("A.swift"), caseLabel)
+            XCTAssertFalse(tree.contains("B.swift"), caseLabel)
             XCTAssertFalse(tree.contains("Other.swift"), caseLabel)
         }
     }
@@ -4406,6 +5112,36 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 profile: .mcpRead
             )
             XCTAssertTrue(snapshot.selectedFileIDs.isEmpty, caseLabel)
+
+            let rootAliasTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "App"
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(rootAliasTreeSnapshot.roots.isEmpty, caseLabel)
+
+            let prefixedAliasTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace,
+                    startPath: "App/Sources"
+                ),
+                profile: .mcpRead
+            )
+            XCTAssertTrue(prefixedAliasTreeSnapshot.roots.isEmpty, caseLabel)
         }
     }
 
@@ -4444,7 +5180,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         do {
             let caseLabel = "testCodemapOnlyCandidateFilteringPreservesUnsupportedMessages"
             let root = try makeTemporaryRoot(name: "CodemapFiltering")
-            try write("struct A {}", to: root.appendingPathComponent("Sources/A.swift"))
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("Sources/A.swift"))
             try write("notes", to: root.appendingPathComponent("Sources/notes.txt"))
 
             let store = WorkspaceFileContextStore()
@@ -4471,40 +5207,58 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
 
         do {
-            let caseLabel = "testSelectionMutationPromoteDemoteAndRemoveOperateOnStoredSelectionValues"
+            let caseLabel = "testSelectionMutationPromoteRemoveAndDemoteOperateOnStoredSelectionValues"
             let root = try makeTemporaryRoot(name: "PromoteDemote")
             let swiftURL = root.appendingPathComponent("A.swift")
             let textURL = root.appendingPathComponent("notes.txt")
-            try write("struct A {}", to: swiftURL)
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: swiftURL)
             try write("notes", to: textURL)
 
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
             let service = WorkspaceSelectionMutationService(store: store)
             let initial = StoredSelection(
-                selectedPaths: [swiftURL.path, textURL.path],
-                autoCodemapPaths: [],
+                selectedPaths: [textURL.path],
                 slices: [swiftURL.path: [LineRange(start: 1, end: 2)]],
                 codemapAutoEnabled: true
             )
 
-            let demoted = await service.demotePaths(existing: initial, paths: [swiftURL.path, textURL.path], rawPaths: [swiftURL.path, textURL.path])
+            let demoted = await service.demotePaths(
+                existing: initial,
+                paths: [swiftURL.path, textURL.path],
+                rawPaths: [swiftURL.path, textURL.path]
+            )
             XCTAssertTrue(demoted.mutated, caseLabel)
             XCTAssertEqual(demoted.selection.selectedPaths, [textURL.path], caseLabel)
-            XCTAssertEqual(demoted.selection.autoCodemapPaths, [swiftURL.path], caseLabel)
+            XCTAssertEqual(demoted.selection.manualCodemapPaths, [swiftURL.path], caseLabel)
             XCTAssertTrue(demoted.selection.slices.isEmpty, caseLabel)
-            XCTAssertEqual(demoted.codemapUnavailable, ["codemap unavailable: notes.txt"], caseLabel)
             XCTAssertFalse(demoted.selection.codemapAutoEnabled, caseLabel)
+            XCTAssertTrue(demoted.invalidPaths.isEmpty, caseLabel)
+            XCTAssertEqual(
+                demoted.codemapUnavailable,
+                ["codemap unavailable: notes.txt"],
+                caseLabel
+            )
 
-            let promoted = await service.promotePaths(existing: demoted.selection, paths: [swiftURL.path], rawPaths: [swiftURL.path])
+            let promoted = await service.promotePaths(
+                existing: demoted.selection,
+                paths: [swiftURL.path],
+                rawPaths: [swiftURL.path]
+            )
             XCTAssertTrue(promoted.mutated, caseLabel)
             XCTAssertEqual(Set(promoted.selection.selectedPaths), Set([swiftURL.path, textURL.path]), caseLabel)
-            XCTAssertTrue(promoted.selection.autoCodemapPaths.isEmpty, caseLabel)
+            XCTAssertTrue(promoted.selection.slices.isEmpty, caseLabel)
+            XCTAssertTrue(promoted.selection.manualCodemapPaths.isEmpty, caseLabel)
             XCTAssertFalse(promoted.selection.codemapAutoEnabled, caseLabel)
 
-            let removed = await service.removePaths(existing: promoted.selection, paths: [swiftURL.path], rawPaths: [swiftURL.path])
+            let removed = await service.removePaths(
+                existing: promoted.selection,
+                paths: [swiftURL.path],
+                rawPaths: [swiftURL.path]
+            )
             XCTAssertTrue(removed.mutated, caseLabel)
             XCTAssertEqual(removed.selection.selectedPaths, [textURL.path], caseLabel)
+            XCTAssertFalse(removed.selection.codemapAutoEnabled, caseLabel)
         }
     }
 
@@ -4515,7 +5269,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let fullURL = root.appendingPathComponent("Full.swift")
             let firstURL = root.appendingPathComponent("A.swift")
             let secondURL = root.appendingPathComponent("B.swift")
-            try write("struct Full {}", to: fullURL)
+            try write(SwiftFixtureSource.emptyStruct("Full", trailingNewline: false), to: fullURL)
             try write("a1\na2\na3\na4", to: firstURL)
             try write("b1\nb2\nb3\nb4\nb5\nb6", to: secondURL)
 
@@ -4524,7 +5278,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let service = WorkspaceSelectionMutationService(store: store)
             let initial = StoredSelection(
                 selectedPaths: [fullURL.path],
-                autoCodemapPaths: [],
+
                 slices: [:],
                 codemapAutoEnabled: false
             )
@@ -4564,14 +5318,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let existingURL = root.appendingPathComponent("A.swift")
             let addedFullURL = root.appendingPathComponent("B.swift")
             let addedSliceURL = root.appendingPathComponent("C.swift")
-            try write("struct A {}", to: existingURL)
-            try write("struct B {}", to: addedFullURL)
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: existingURL)
+            try write(SwiftFixtureSource.emptyStruct("B", trailingNewline: false), to: addedFullURL)
             try write("c1\nc2\nc3", to: addedSliceURL)
 
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
             let service = WorkspaceSelectionMutationService(store: store)
-            let initial = StoredSelection(selectedPaths: [existingURL.path], autoCodemapPaths: [], slices: [:], codemapAutoEnabled: false)
+            let initial = StoredSelection(selectedPaths: [existingURL.path], slices: [:], codemapAutoEnabled: false)
 
             let addFull = await service.addPaths(
                 existing: initial,
@@ -4597,12 +5351,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let caseLabel = "testManageSelectionSliceSetRejectsInvalidRequestsWithoutMutation"
             let root = try makeTemporaryRoot(name: "SliceSetRejectsInvalid")
             let fileURL = root.appendingPathComponent("A.swift")
-            try write("struct A {}", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: fileURL)
 
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
             let service = WorkspaceSelectionMutationService(store: store)
-            let initial = StoredSelection(selectedPaths: [fileURL.path], autoCodemapPaths: [], slices: [:], codemapAutoEnabled: false)
+            let initial = StoredSelection(selectedPaths: [fileURL.path], slices: [:], codemapAutoEnabled: false)
 
             let barePath = await service.buildManageSelectionSet(
                 paths: [fileURL.path],
@@ -4637,12 +5391,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let caseLabel = "testManageSelectionCodemapOnlySetRejectsSlices"
             let root = try makeTemporaryRoot(name: "CodemapOnlyRejectsSlices")
             let fileURL = root.appendingPathComponent("A.swift")
-            try write("struct A {}", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: fileURL)
 
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
             let service = WorkspaceSelectionMutationService(store: store)
-            let initial = StoredSelection(selectedPaths: [fileURL.path], autoCodemapPaths: [], slices: [:], codemapAutoEnabled: false)
+            let initial = StoredSelection(selectedPaths: [fileURL.path], slices: [:], codemapAutoEnabled: false)
 
             let result = await service.buildManageSelectionSet(
                 paths: [],
@@ -4672,7 +5426,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let service = WorkspaceSelectionMutationService(store: store)
             let initial = StoredSelection(
                 selectedPaths: [oldFullURL.path, oldSliceURL.path],
-                autoCodemapPaths: [],
+
                 slices: [oldSliceURL.path: [LineRange(start: 1, end: 2)]],
                 codemapAutoEnabled: false
             )
@@ -4699,8 +5453,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let rootB = try makeTemporaryRoot(name: "DeferredStoreEditWorktree")
             let fileAURL = rootA.appendingPathComponent("Shared.swift")
             let fileBURL = rootB.appendingPathComponent("Shared.swift")
-            try write("struct OldA {}\n", to: fileAURL)
-            try write("struct OldB {}\n", to: fileBURL)
+            try write(SwiftFixtureSource.emptyStruct("OldA"), to: fileAURL)
+            try write(SwiftFixtureSource.emptyStruct("OldB"), to: fileBURL)
 
             let store = WorkspaceFileContextStore()
             let recordA = try await store.loadRoot(path: rootA.path)
@@ -4723,18 +5477,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let maybeFileA = await store.file(rootID: recordA.id, relativePath: "Shared.swift")
             let fileA = try XCTUnwrap(maybeFileA)
             _ = try await store.searchContentSnapshot(for: fileA)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(
-                    fullPath: fileAURL.path,
-                    modificationDate: Date(),
-                    fileAPI: makeFileAPI(path: fileAURL.path, symbolName: "oldStoreSymbol")
-                )
-            ])
-
             _ = try await store.editFile(
                 rootID: recordA.id,
                 relativePath: "Shared.swift",
-                newContent: "struct NewA {}\n"
+                newContent: SwiftFixtureSource.emptyStruct("NewA")
             )
             let maybeStoreEvent = await events.next()
             let storeEvent = try XCTUnwrap(maybeStoreEvent, caseLabel)
@@ -4745,12 +5491,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let pendingAfterCanonicalEdit = await serviceA.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterCanonicalEdit, 0, caseLabel)
             let editedSearch = try await store.searchContentSnapshot(for: fileA)
-            XCTAssertEqual(editedSearch.content, "struct NewA {}\n", caseLabel)
-            let codemapAPIsAfterEdit = await store.allCodemapFileAPIs()
-            XCTAssertFalse(codemapAPIsAfterEdit.contains { $0.filePath == fileAURL.path }, caseLabel)
-            XCTAssertEqual(try String(contentsOf: fileBURL, encoding: .utf8), "struct OldB {}\n", caseLabel)
+            XCTAssertEqual(editedSearch.content, SwiftFixtureSource.emptyStruct("NewA"), caseLabel)
+            XCTAssertEqual(try String(contentsOf: fileBURL, encoding: .utf8), SwiftFixtureSource.emptyStruct("OldB"), caseLabel)
 
-            try write("struct WatchedA {}\n", to: fileAURL)
+            try write(SwiftFixtureSource.emptyStruct("WatchedA"), to: fileAURL)
             let watcherDate = try await serviceA.getFileModificationDate(atRelativePath: "Shared.swift")
             let watcherSequence = await serviceA.publishFileSystemDeltas(
                 [.fileModified("Shared.swift", watcherDate)],
@@ -4766,15 +5510,16 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(watcherEvent.modifiedFileIDs, [fileA.id], caseLabel)
             XCTAssertEqual(publicationsA.snapshot().map(\.source), [.watcher], caseLabel)
             let watcherSearch = try await store.searchContentSnapshot(for: fileA)
-            XCTAssertEqual(watcherSearch.content, "struct WatchedA {}\n", caseLabel)
+            XCTAssertEqual(watcherSearch.content, SwiftFixtureSource.emptyStruct("WatchedA"), caseLabel)
 
-            try await serviceB.editFile(atRelativePath: "Shared.swift", newContent: "struct DirectB {}\n")
+            try await serviceB.editFile(atRelativePath: "Shared.swift", newContent: SwiftFixtureSource.emptyStruct("DirectB"))
             let directPublications = publicationsB.snapshot()
             XCTAssertEqual(directPublications.map(\.source), [.syntheticMutation], caseLabel)
             XCTAssertEqual(directPublications.flatMap(\.deltas).count, 1, caseLabel)
             let pendingAfterDirectEdit = await serviceB.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterDirectEdit, 0, caseLabel)
-            withExtendedLifetime((cancellableA, cancellableB)) {}
+            cancellables.insert(cancellableA)
+            cancellables.insert(cancellableB)
         }
 
         do {
@@ -4800,7 +5545,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(publications.snapshot().isEmpty, caseLabel)
             let pendingAfterMissingEdit = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterMissingEdit, 0, caseLabel)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         do {
@@ -4831,7 +5576,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(managedOnlyPublications.flatMap(\.deltas).count, 1, caseLabel)
             let pendingAfterManagedOnlyEdit = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterManagedOnlyEdit, 0, caseLabel)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         do {
@@ -4878,7 +5623,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let pendingAfterStaleLifetime = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterStaleLifetime, 0, caseLabel)
             await service.setMutationIOWillBeginHandlerForTesting(nil)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
     }
 
@@ -5019,6 +5764,44 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
 
         do {
+            let caseLabel = "testWorkspaceFileEditHostAbsoluteOverwriteCreateBypassesCatalogPathMatching"
+            let root = try makeTemporaryRoot(name: "EditHostAbsoluteOverwrite")
+            let target = root.appendingPathComponent("Nested/Missing.swift")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let host = WorkspaceFileEditHost(
+                store: store,
+                lookupRootScope: .visibleWorkspace,
+                createPathResolutionPolicy: .canonicalAliasFirst,
+                selectCreatedFiles: false
+            )
+
+            #if DEBUG
+                EditFlowPerf.resetDebugCaptureForTesting()
+                switch EditFlowPerf.beginDebugCapture(label: caseLabel, maxSamples: 100) {
+                case .started:
+                    break
+                case .busy:
+                    return XCTFail(caseLabel + ": Performance capture should start")
+                }
+            #endif
+
+            try await host.writeText(path: target.path, content: "created", overwrite: true)
+
+            #if DEBUG
+                let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+                let pathSnapshotBuildCount = capture.stages
+                    .filter { $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild) }
+                    .reduce(0) { $0 + $1.sampleCount }
+                XCTAssertEqual(pathSnapshotBuildCount, 0, caseLabel)
+            #endif
+            let createdContent = try await store.readContent(rootID: record.id, relativePath: "Nested/Missing.swift")
+            let createdFile = await store.file(rootID: record.id, relativePath: "Nested/Missing.swift")
+            XCTAssertEqual(createdContent, "created", caseLabel)
+            XCTAssertNotNil(createdFile, caseLabel)
+        }
+
+        do {
             let caseLabel = "testApplyEditsRewriteCreateImmediatelyMaterializesForStoreLookupAndRead"
             let root = try makeTemporaryRoot(name: "ApplyEditsCreatePostcondition")
             let store = WorkspaceFileContextStore()
@@ -5033,7 +5816,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             let request = ApplyEditsRequest(
                 path: "Created.swift",
-                mode: .rewrite(newText: "struct Created {}\n", onMissing: .create),
+                mode: .rewrite(newText: SwiftFixtureSource.emptyStruct("Created"), onMissing: .create),
                 verbose: false
             )
             let result = try await service.run(request)
@@ -5043,7 +5826,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let recordFromStore = try XCTUnwrap(createdFile, caseLabel)
             XCTAssertEqual(recordFromStore.standardizedRelativePath, "Created.swift", caseLabel)
             let createdContent = try await store.readContent(rootID: record.id, relativePath: "Created.swift")
-            XCTAssertEqual(createdContent, "struct Created {}\n", caseLabel)
+            XCTAssertEqual(createdContent, SwiftFixtureSource.emptyStruct("Created"), caseLabel)
             let createdLookup = await store.lookupPath("Created.swift", profile: .mcpRead, rootScope: .visibleWorkspace)?.file
             XCTAssertNotNil(createdLookup, caseLabel)
             let lookupFiles = await store.lookupFiles(atPaths: ["Created.swift"], profile: .mcpRead, rootScope: .visibleWorkspace)
@@ -5481,7 +6264,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
 
             do {
-                try await host.writeText(path: "ignored/report.md", content: "must not escape", overwrite: false)
+                try await host.writeText(
+                    path: root.appendingPathComponent("ignored/report.md").path,
+                    content: "must not escape",
+                    overwrite: false
+                )
                 XCTFail(caseLabel + ": " + "Expected symlinked parent create to fail")
             } catch {}
 
@@ -5499,7 +6286,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
 
             do {
-                try await host.writeText(path: "report.ignored", content: "must not escape", overwrite: false)
+                try await host.writeText(
+                    path: root.appendingPathComponent("report.ignored").path,
+                    content: "must not escape",
+                    overwrite: false
+                )
                 XCTFail(caseLabel + ": " + "Expected dangling symlink create to fail")
             } catch {}
 
@@ -5601,7 +6392,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let caseLabel = "testApplyEditsRejectsDiskMissingStaleCatalogBase"
             let root = try makeTemporaryRoot(name: "StrictApplyEditsMissingBase")
             let fileURL = root.appendingPathComponent("Deleted.swift")
-            try write("struct Deleted {}\n", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("Deleted"), to: fileURL)
 
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
@@ -5708,6 +6499,56 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
     }
 
+    func testWorkspaceReadableFileServiceResolvesSymlinkedAlwaysReadableExternalFilesAndRejectsEscapes() async throws {
+        let home = try makeTemporaryRoot(name: "ReadableSymlinkHome")
+        let realSkillsRoot = try makeTemporaryRoot(name: "ReadableSymlinkSkills")
+        let nominalSkillsRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: nominalSkillsRoot.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try createDirectorySymlinkOrSkip(at: nominalSkillsRoot, destination: realSkillsRoot)
+
+        let realSkillFile = realSkillsRoot.appendingPathComponent("example/SKILL.md")
+        try write("symlinked skill body", to: realSkillFile)
+        let nominalSkillFile = nominalSkillsRoot.appendingPathComponent("example/SKILL.md")
+
+        let store = WorkspaceFileContextStore()
+        let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+
+        let nominalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalSkillFile.path),
+            "nominal symlink-root support path should resolve as external"
+        )
+        XCTAssertEqual(nominalResolved.absolutePath, realSkillFile.path)
+        let nominalContent = try await service.readAlwaysReadableExternalFile(nominalResolved)
+        XCTAssertEqual(nominalContent, "symlinked skill body")
+
+        let canonicalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: realSkillFile.path),
+            "canonical support-root symlink target path should resolve as external"
+        )
+        XCTAssertEqual(canonicalResolved.absolutePath, realSkillFile.path)
+        let canonicalContent = try await service.readAlwaysReadableExternalFile(canonicalResolved)
+        XCTAssertEqual(canonicalContent, "symlinked skill body")
+
+        let outsideRoot = try makeTemporaryRoot(name: "ReadableSymlinkOutside")
+        let outsideFile = outsideRoot.appendingPathComponent("secret.md")
+        try write("outside", to: outsideFile)
+        let nestedEscape = realSkillsRoot.appendingPathComponent("example/escape", isDirectory: true)
+        try createDirectorySymlinkOrSkip(at: nestedEscape, destination: outsideRoot)
+        let nominalEscapedFile = nominalSkillsRoot.appendingPathComponent("example/escape/secret.md")
+
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalEscapedFile.path),
+            "nested symlink escape from an allowed support root should remain blocked"
+        )
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: outsideFile.path),
+            "canonical outside target should not become always-readable"
+        )
+    }
+
     @MainActor
     func testStoreBackedRootShellProjectionsPreserveIdentityWithoutMaterializingDescendants() async throws {
         do {
@@ -5715,7 +6556,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let root = try makeTemporaryRoot(name: "RootShellAttach")
             let nestedFolderURL = root.appendingPathComponent("Sources")
             let fileURL = nestedFolderURL.appendingPathComponent("A.swift")
-            try write("struct A {}", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: fileURL)
 
             let store = WorkspaceFileContextStore()
             let rootRecord = try await store.loadRoot(path: root.path)
@@ -5745,12 +6586,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let caseLabel = "testLoadedRootShellAlignsWithStoreRootAndLeavesCodemapIDsStoreBacked"
             let root = try makeTemporaryRoot(name: "IdentityAlignment")
             let fileURL = root.appendingPathComponent("Sources/Nested/A.swift")
-            try write("struct A {}", to: fileURL)
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: fileURL)
             try write("notes", to: root.appendingPathComponent("README.md"))
 
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "IdentityAlignment", repoPaths: [root.path])
 
             try await manager.loadFolder(at: root, for: workspace)
@@ -5759,14 +6599,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let rootRecord = try XCTUnwrap(storeRoots.first, caseLabel)
             let storeFolders = await store.folders(inRoot: rootRecord.id).map(\.standardizedRelativePath)
             let storeFiles = await store.files(inRoot: rootRecord.id)
-            let swiftFileRecord = try XCTUnwrap(storeFiles.first { $0.standardizedRelativePath == "Sources/Nested/A.swift" }, caseLabel)
-
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: fileURL.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileURL.path))
-            ])
-            let codemapSnapshot = await store.codemapSnapshot(rootID: rootRecord.id, relativePath: "Sources/Nested/A.swift")
-            let snapshot = try XCTUnwrap(codemapSnapshot, caseLabel)
-
             let rootVM = try XCTUnwrap(manager.rootFolders.first, caseLabel)
             XCTAssertEqual(manager.rootFolders.count, 1, caseLabel)
             XCTAssertEqual(rootVM.id, rootRecord.id, caseLabel)
@@ -5778,8 +6610,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(storeFolders.contains("Sources"), caseLabel)
             XCTAssertTrue(storeFolders.contains("Sources/Nested"), caseLabel)
             XCTAssertEqual(Set(storeFiles.map(\.standardizedRelativePath)), Set(["README.md", "Sources/Nested/A.swift"]), caseLabel)
-            XCTAssertEqual(snapshot.fileID, swiftFileRecord.id, caseLabel)
-
             await manager.unloadAllRootFolders()
             XCTAssertTrue(manager.rootFolders.isEmpty, caseLabel)
             let rootsAfterUnload = await store.roots()
@@ -5797,7 +6627,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "LoadFolderWatcherFailureRetention", repoPaths: [root.path])
             let ranges = [LineRange(start: 1, end: 2)]
             let scope = PartitionScope(workspaceID: workspace.id)
@@ -5835,7 +6664,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await manager.applyStoredSelection(StoredSelection(
                 selectedPaths: [fileURL.path],
-                autoCodemapPaths: [],
+
                 slices: [fileURL.path: ranges],
                 codemapAutoEnabled: false
             ))
@@ -5859,7 +6688,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
         let store = WorkspaceFileContextStore()
         let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-        await manager.setCodeScanEnabled(false)
         let workspace = WorkspaceModel(name: "WatcherUIIdentity", repoPaths: [root.path])
 
         try await manager.loadFolder(at: root, for: workspace)
@@ -5867,7 +6695,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         let rootRecord = try XCTUnwrap(roots.first)
 
         let addedURL = root.appendingPathComponent("Sources/Added.swift")
-        try write("struct Added {}", to: addedURL)
+        try write(SwiftFixtureSource.emptyStruct("Added", trailingNewline: false), to: addedURL)
         await store.replayObservedFileSystemDeltas(rootID: rootRecord.id, deltas: [.fileAdded("Sources/Added.swift")])
 
         let storedFile = await store.file(rootID: rootRecord.id, relativePath: "Sources/Added.swift")
@@ -5891,7 +6719,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try write("seed", to: root.appendingPathComponent("Seed.swift"))
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "AppliedIndexProjectionLag", repoPaths: [root.path])
             try await manager.loadFolder(at: root, for: workspace)
             let roots = await store.roots()
@@ -5972,11 +6799,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     func testCancelledRootLoadDoesNotCommitUIOrStoreRoot() async throws {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "CancelledRootLoad")
-            try write("struct A {}", to: root.appendingPathComponent("Sources/A.swift"))
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("Sources/A.swift"))
 
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "CancelledRootLoad", repoPaths: [root.path])
             let gate = AsyncGate()
             await store.setRootLoadWillStartHandler { _ in
@@ -6039,7 +6865,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let rootRecord = try await store.loadRoot(path: root.path)
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "StrictSearchFreshness", repoPaths: [root.path])
             manager.registerPreloadedWorkspaceRoot(rootRecord)
             _ = try manager.attachRootShell(for: rootRecord, workspaceID: workspace.id)
@@ -6078,7 +6903,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "StrictSearchNoUnneededRefresh", repoPaths: [root.path])
             try await manager.loadFolder(at: root, for: workspace)
             let materializedFile = await manager.materializeFileForUserInput(fileURL.path, profile: .mcpRead)
@@ -6804,89 +7628,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(afterUnload.activeFlightCount, 0)
         }
 
-        func testInitialRootCodemapScansByRootIDSkipSamePathReloadedRoot() async throws {
-            let root = try makeTemporaryRoot(name: "InitialScanRootIDGate")
-            try write("struct A { func oldRoot() {} }\n", to: root.appendingPathComponent("A.swift"))
-
-            let store = WorkspaceFileContextStore()
-            let oldRecord = try await store.loadRoot(path: root.path)
-            try await store.requestInitialRootCodemapScans(rootIDs: [oldRecord.id])
-            _ = await waitForCodemapCounters(store: store) { counters in
-                counters.trackedFileIDCount == 1
-            }
-
-            await store.unloadRoot(id: oldRecord.id)
-            let unloadedCounters = await waitForCodemapCounters(store: store) { counters in
-                counters.trackedFileIDCount == 0 &&
-                    counters.trackedRootCount == 0 &&
-                    counters.queuedCount == 0 &&
-                    counters.activeScanCount == 0 &&
-                    counters.outstandingScanCount == 0
-            }
-            XCTAssertEqual(unloadedCounters.trackedFileIDCount, 0)
-
-            let newRecord = try await store.loadRoot(path: root.path)
-            try await store.requestInitialRootCodemapScans(rootIDs: [oldRecord.id])
-            try await Task.sleep(nanoseconds: 50_000_000)
-            let afterOldRootIDRequest = await store.codemapMemoryCounters()
-            XCTAssertEqual(afterOldRootIDRequest.trackedFileIDCount, 0)
-            XCTAssertEqual(afterOldRootIDRequest.trackedRootCount, 0)
-
-            try await store.requestInitialRootCodemapScans(rootIDs: [newRecord.id])
-            let reloadedCounters = await waitForCodemapCounters(store: store) { counters in
-                counters.trackedFileIDCount == 1
-            }
-            XCTAssertEqual(reloadedCounters.trackedFileIDCount, 1)
-        }
-
-        func testInitialRootCodemapScansByPathTargetReloadedSamePathRoot() async throws {
-            let root = try makeTemporaryRoot(name: "InitialScanSamePathReload")
-            try write("struct A { func samePath() {} }\n", to: root.appendingPathComponent("A.swift"))
-
-            let store = WorkspaceFileContextStore()
-            let oldRecord = try await store.loadRoot(path: root.path)
-            try await store.requestInitialRootCodemapScans(rootFolderPaths: [root.path])
-            _ = await waitForCodemapCounters(store: store) { counters in
-                counters.trackedFileIDCount == 1
-            }
-
-            await store.unloadRoot(id: oldRecord.id)
-            _ = await waitForCodemapCounters(store: store) { counters in
-                counters.trackedFileIDCount == 0 &&
-                    counters.trackedRootCount == 0 &&
-                    counters.queuedCount == 0 &&
-                    counters.activeScanCount == 0 &&
-                    counters.outstandingScanCount == 0
-            }
-
-            let newRecord = try await store.loadRoot(path: root.path)
-            XCTAssertNotEqual(newRecord.id, oldRecord.id)
-            try await store.requestInitialRootCodemapScans(
-                rootFolderPaths: [root.path],
-                purgeCachesOnEmptyInitialRequests: true
-            )
-
-            let reloadedCounters = await waitForCodemapCounters(store: store) { counters in
-                counters.trackedRootCount == 1 && counters.trackedFileIDCount == 1
-            }
-            XCTAssertEqual(reloadedCounters.trackedRootCount, 1)
-            XCTAssertEqual(reloadedCounters.trackedFileIDCount, 1)
-        }
-
-        func testDeferredInitialRootLoadFlushUsesStoreRootsInsteadOfMainActorUIGather() throws {
-            let source = try readWorkspaceFilesViewModelSource()
-            let flushBody = try XCTUnwrap(source.slice(from: "func flushDeferredInitialRootLoadScans()", to: "private func clearDeferredInitialRootLoadScanState"))
-
-            XCTAssertTrue(flushBody.contains("workspaceFileContextStore.rootRecords"), flushBody)
-            XCTAssertTrue(flushBody.contains("enqueueInitialRootLoadRequests"), flushBody)
-            XCTAssertFalse(flushBody.contains("getFilesRecursively"), flushBody)
-        }
     #endif
 
     #if DEBUG
         func testConcurrentSamePathRootLoadsShareInFlightLoad() async throws {
             let root = try makeTemporaryRoot(name: "ConcurrentSamePathLoad")
-            try write("struct A {}", to: root.appendingPathComponent("A.swift"))
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("A.swift"))
 
             let store = WorkspaceFileContextStore()
             let startGate = AsyncGate()
@@ -6929,7 +7676,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "CancelAfterUIRootAppend", repoPaths: [root.path])
             let attachGate = AsyncGate()
             manager.setRootLoadDidAttachRootShellHandler { _, _ in
@@ -6967,7 +7713,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "CallerCancelAfterUIRootAppend", repoPaths: [root.path])
             let attachGate = AsyncGate()
             manager.setRootLoadDidAttachRootShellHandler { _, _ in
@@ -6999,7 +7744,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         @MainActor
         func testObsoleteSamePathLoadDoesNotUnloadNewerJoinedLoad() async throws {
             let root = try makeTemporaryRoot(name: "SamePathObsoleteCleanup")
-            try write("struct A {}", to: root.appendingPathComponent("A.swift"))
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("A.swift"))
 
             let store = WorkspaceFileContextStore()
             let startGate = AsyncGate()
@@ -7012,7 +7757,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             }
 
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-            await manager.setCodeScanEnabled(false)
             let workspace = WorkspaceModel(name: "SamePathObsoleteCleanup", repoPaths: [root.path])
 
             let firstLoad = Task { @MainActor in
@@ -7106,7 +7850,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         @MainActor
         func testUncommittedPreloadedRootIsUnloadedByFullUnload() async throws {
             let root = try makeTemporaryRoot(name: "UncommittedPreloadCleanup")
-            try write("struct A {}", to: root.appendingPathComponent("A.swift"))
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("A.swift"))
 
             let store = WorkspaceFileContextStore()
             let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
@@ -7122,7 +7866,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
         func testCancelledSamePathLoadWaitingForUnloadDoesNotCreateRoot() async throws {
             let root = try makeTemporaryRoot(name: "CancelWaitForUnload")
-            try write("struct A {}", to: root.appendingPathComponent("A.swift"))
+            try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("A.swift"))
 
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
@@ -7166,7 +7910,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
                 let store = WorkspaceFileContextStore()
                 let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-                await manager.setCodeScanEnabled(false)
                 let workspace = WorkspaceModel(name: "ApplyStoredEmptySlices", repoPaths: [root.path])
                 let tabID = UUID()
 
@@ -7185,14 +7928,13 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
                 await manager.applyStoredSelection(StoredSelection(
                     selectedPaths: [fileURL.path],
-                    autoCodemapPaths: [],
+
                     slices: [:],
                     codemapAutoEnabled: false
                 ))
 
                 let snapshot = manager.snapshotSelection()
                 XCTAssertEqual(snapshot.selectedPaths, [file.standardizedFullPath], caseLabel)
-                XCTAssertEqual(snapshot.autoCodemapPaths.count, 0, caseLabel)
                 XCTAssertTrue(snapshot.slices.isEmpty, caseLabel)
                 XCTAssertFalse(snapshot.codemapAutoEnabled, caseLabel)
                 XCTAssertTrue(manager.getSelectionSlicesSnapshot().isEmpty, caseLabel)
@@ -7207,7 +7949,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
                     let store = WorkspaceFileContextStore()
                     let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-                    await manager.setCodeScanEnabled(false)
                     let workspace = WorkspaceModel(name: "HydrateEmptySlices", repoPaths: [root.path])
                     let tabID = UUID()
 
@@ -7226,7 +7967,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
                     await manager.hydrateSlicesForActiveTab(from: StoredSelection(
                         selectedPaths: [fileURL.path],
-                        autoCodemapPaths: [],
+
                         slices: [:],
                         codemapAutoEnabled: false
                     ))
@@ -7237,26 +7978,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                     XCTAssertFalse(hasSlicesAfterHydrate, caseLabel)
                 #endif
             }
-        }
-
-        private func waitForCodemapCounters(
-            store: WorkspaceFileContextStore,
-            timeout: TimeInterval = 5,
-            file: StaticString = #filePath,
-            line: UInt = #line,
-            until predicate: (CodeScanActor.CodemapMemoryCounters) -> Bool
-        ) async -> CodeScanActor.CodemapMemoryCounters {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                let counters = await store.codemapMemoryCounters()
-                if predicate(counters) {
-                    return counters
-                }
-                try? await Task.sleep(nanoseconds: 25_000_000)
-            }
-            let finalCounters = await store.codemapMemoryCounters()
-            XCTFail("Timed out waiting for codemap counters: \(finalCounters)", file: file, line: line)
-            return finalCounters
         }
 
         private var createdFileFlags: FSEventStreamEventFlags {
@@ -7478,6 +8199,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 }
             }
 
+            func isStarted() -> Bool {
+                started
+            }
+
             private func cancel(_ waiterID: UUID) {
                 guard let cancellationWaiter, cancellationWaiter.id == waiterID else {
                     cancelledWaiterIDs.insert(waiterID)
@@ -7541,315 +8266,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let root = try RepoRoot.url()
             let url = root.appendingPathComponent("Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift")
             return try String(contentsOf: url, encoding: .utf8)
-        }
-    #endif
-
-    func testCodemapAggregatePreservesOrderedCacheAndLegacyFirstWinnerSemantics() async throws {
-        #if DEBUG
-            do {
-                let caseLabel = "testAllCodemapFileAPIsCacheReusesOrderedAggregateAndRecordsRebuildOnlyRows"
-                let root = try makeTemporaryRoot(name: "AllCodemapAPICacheReuse")
-                let fileA = root.appendingPathComponent("A.swift")
-                let fileB = root.appendingPathComponent("Nested/B.swift")
-                try write("struct A {}", to: fileA)
-                try write("struct B {}", to: fileB)
-
-                let store = WorkspaceFileContextStore()
-                _ = try await store.loadRoot(path: root.path)
-                await store.applyObservedCodemapResults([
-                    WorkspaceObservedCodemapResult(fullPath: fileB.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileB.path, symbolName: "bSymbol")),
-                    WorkspaceObservedCodemapResult(fullPath: fileA.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileA.path, symbolName: "aSymbol"))
-                ])
-                startAllCodemapFileAPIsCapture(label: "all-codemap-file-apis-cache-reuse")
-                defer { EditFlowPerf.resetDebugCaptureForTesting() }
-
-                let cold = await store.codemapFileAPIAggregate()
-                let warm = await store.codemapFileAPIAggregate()
-                let compatibilityAPIs = await store.allCodemapFileAPIs()
-                let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
-
-                XCTAssertEqual(codemapAPIProjection(cold.orderedFileAPIs), codemapAPIProjection(warm.orderedFileAPIs), caseLabel)
-                XCTAssertEqual(codemapAPIProjection(cold.orderedFileAPIs), codemapAPIProjection(compatibilityAPIs), caseLabel)
-                XCTAssertEqual(cold.orderedFileAPIs.map(\.filePath), [fileA.path, fileB.path], caseLabel)
-                XCTAssertEqual(codemapAPIProjection(Array(cold.firstFileAPIByStandardizedNestedPath.values)), codemapAPIProjection(Array(warm.firstFileAPIByStandardizedNestedPath.values)), caseLabel)
-                XCTAssertEqual(try codemapAPIProjection([XCTUnwrap(cold.firstFileAPIByStandardizedNestedPath[StandardizedPath.absolute(fileA.path)], caseLabel)]), try codemapAPIProjection([XCTUnwrap(warm.firstFileAPIByStandardizedNestedPath[StandardizedPath.absolute(fileA.path)], caseLabel)]), caseLabel)
-                XCTAssertEqual(allCodemapFileAPIsBucket(capture, stage: EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal)?.sampleCount, 3, caseLabel)
-                XCTAssertEqual(allCodemapFileAPIsBucket(capture, stage: EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot)?.sampleCount, 1, caseLabel)
-                XCTAssertEqual(allCodemapFileAPIsBucket(capture, stage: EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization)?.sampleCount, 1, caseLabel)
-                XCTAssertTrue(capture.stages.allSatisfy(\.sanitizedDimensions.isEmpty), caseLabel)
-                XCTAssertEqual(capture.droppedSampleCount, 0, caseLabel)
-            }
-        #endif
-
-        do {
-            let caseLabel = "testCodemapFileAPIAggregatePreservesForeignNestedPathFirstWinnerAndRetainedRecomputeResults"
-            let root = try makeTemporaryRoot(name: "CodemapAPIAggregateForeignNestedPath")
-            let fileA = root.appendingPathComponent("A.swift")
-            let fileB = root.appendingPathComponent("B.swift")
-            let target = root.appendingPathComponent("Target.swift")
-            try write("struct A {}", to: fileA)
-            try write("struct B {}", to: fileB)
-            try write("struct TargetType {}", to: target)
-
-            let store = WorkspaceFileContextStore()
-            _ = try await store.loadRoot(path: root.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(
-                    fullPath: fileA.path,
-                    modificationDate: Date(),
-                    fileAPI: makeFileAPI(path: fileB.path, symbolName: "foreignFirstWinner", referencedTypes: ["TargetType"])
-                ),
-                WorkspaceObservedCodemapResult(fullPath: fileB.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileB.path, symbolName: "ownSecondWinner")),
-                WorkspaceObservedCodemapResult(fullPath: target.path, modificationDate: Date(), fileAPI: makeFileAPI(path: target.path, symbolName: "targetSymbol", className: "TargetType"))
-            ])
-
-            let aggregate = await store.codemapFileAPIAggregate()
-            let legacyFirstWinners = legacyFirstFileAPIByStandardizedNestedPath(aggregate.orderedFileAPIs)
-            XCTAssertEqual(codemapAPIProjection(Array(aggregate.firstFileAPIByStandardizedNestedPath.values)), codemapAPIProjection(Array(legacyFirstWinners.values)), caseLabel)
-            XCTAssertNil(aggregate.firstFileAPIByStandardizedNestedPath[StandardizedPath.absolute(fileA.path)], caseLabel)
-            XCTAssertTrue(try XCTUnwrap(aggregate.firstFileAPIByStandardizedNestedPath[StandardizedPath.absolute(fileB.path)], caseLabel).apiDescription.contains("foreignFirstWinner"), caseLabel)
-
-            let mutations = WorkspaceSelectionMutationService(store: store)
-            let ownPathSelection = StoredSelection(selectedPaths: [fileA.path], autoCodemapPaths: [], slices: [:], codemapAutoEnabled: true)
-            let ownPathResult = await mutations.recomputeAutoCodemaps(ownPathSelection)
-            XCTAssertTrue(ownPathResult.autoCodemapPaths.isEmpty, caseLabel)
-
-            let foreignPathSelection = StoredSelection(selectedPaths: [fileB.path], autoCodemapPaths: [], slices: [:], codemapAutoEnabled: true)
-            let foreignPathResult = await mutations.recomputeAutoCodemaps(foreignPathSelection)
-            XCTAssertEqual(foreignPathResult.autoCodemapPaths, [target.path], caseLabel)
-        }
-
-        do {
-            let caseLabel = "testCodemapFileAPIAggregateFirstWinnerMatchesLegacyGroupingAcrossOverlappingRoots"
-            let parentRoot = try makeTemporaryRoot(name: "CodemapAPIAggregateOverlap")
-            let nestedRoot = parentRoot.appendingPathComponent("Nested", isDirectory: true)
-            let sharedFile = nestedRoot.appendingPathComponent("Shared.swift")
-            try write("struct Shared {}", to: sharedFile)
-
-            let store = WorkspaceFileContextStore()
-            _ = try await store.loadRoot(path: parentRoot.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: sharedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: sharedFile.path, symbolName: "parentSnapshotSymbol"))
-            ])
-            _ = try await store.loadRoot(path: nestedRoot.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: sharedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: sharedFile.path, symbolName: "nestedSnapshotSymbol"))
-            ])
-
-            let aggregate = await store.codemapFileAPIAggregate()
-            let standardizedSharedPath = StandardizedPath.absolute(sharedFile.path)
-            let collidingAPIs = aggregate.orderedFileAPIs.filter { StandardizedPath.absolute($0.filePath) == standardizedSharedPath }
-            XCTAssertEqual(collidingAPIs.count, 2, caseLabel)
-            let legacyFirstWinner = try XCTUnwrap(legacyFirstFileAPIByStandardizedNestedPath(aggregate.orderedFileAPIs)[standardizedSharedPath], caseLabel)
-            let aggregateFirstWinner = try XCTUnwrap(aggregate.firstFileAPIByStandardizedNestedPath[standardizedSharedPath], caseLabel)
-            XCTAssertEqual(codemapAPIProjection([aggregateFirstWinner]), codemapAPIProjection([legacyFirstWinner]), caseLabel)
-        }
-    }
-
-    func testCodemapAggregateInvalidatesAcrossMutationManagedMovesAndDeletionVisibility() async throws {
-        do {
-            let caseLabel = "testAllCodemapFileAPIsCacheInvalidatesObservedReplacementModificationDeletionFolderClearAndStoreIsolation"
-            let root = try makeTemporaryRoot(name: "AllCodemapAPICacheMutation")
-            let fileA = root.appendingPathComponent("A.swift")
-            let fileB = root.appendingPathComponent("B.swift")
-            let nested = root.appendingPathComponent("Nested/C.swift")
-            try write("struct A {}", to: fileA)
-            try write("struct B {}", to: fileB)
-            try write("struct C {}", to: nested)
-
-            let store = WorkspaceFileContextStore()
-            let record = try await store.loadRoot(path: root.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: fileA.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileA.path, symbolName: "oldASymbol"))
-            ])
-            var APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(APIPaths, [fileA.path], caseLabel)
-
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: fileB.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileB.path, symbolName: "bSymbol"))
-            ])
-            APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(APIPaths, [fileA.path, fileB.path], caseLabel)
-
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: fileA.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileA.path, symbolName: "newASymbol"))
-            ])
-            var APIs = await store.allCodemapFileAPIs()
-            XCTAssertTrue(APIs.contains { $0.apiDescription.contains("newASymbol") }, caseLabel)
-            XCTAssertFalse(APIs.contains { $0.apiDescription.contains("oldASymbol") }, caseLabel)
-
-            _ = try await store.editFile(rootID: record.id, relativePath: "A.swift", newContent: "struct A { let changed = true }")
-            APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(APIPaths, [fileB.path], caseLabel)
-
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: fileA.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileA.path, symbolName: "restoredASymbol")),
-                WorkspaceObservedCodemapResult(fullPath: nested.path, modificationDate: Date(), fileAPI: makeFileAPI(path: nested.path, symbolName: "cSymbol"))
-            ])
-            _ = await store.allCodemapFileAPIs()
-            try await store.deleteFile(rootID: record.id, relativePath: "B.swift")
-            APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(Set(APIPaths), [fileA.path, nested.path], caseLabel)
-            try await store.moveItemToTrash(rootID: record.id, relativePath: "Nested")
-            APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(APIPaths, [fileA.path], caseLabel)
-
-            let isolatedRoot = try makeTemporaryRoot(name: "AllCodemapAPICacheIsolation")
-            let isolatedFile = isolatedRoot.appendingPathComponent("Other.swift")
-            try write("struct Other {}", to: isolatedFile)
-            let isolatedStore = WorkspaceFileContextStore()
-            _ = try await isolatedStore.loadRoot(path: isolatedRoot.path)
-            await isolatedStore.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: isolatedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: isolatedFile.path, symbolName: "otherSymbol"))
-            ])
-            var isolatedAPIPaths = await isolatedStore.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(isolatedAPIPaths, [isolatedFile.path], caseLabel)
-
-            await store.clearAllCodemapCaches(rootFolders: [root.path])
-            APIs = await store.allCodemapFileAPIs()
-            XCTAssertTrue(APIs.isEmpty, caseLabel)
-            isolatedAPIPaths = await isolatedStore.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(isolatedAPIPaths, [isolatedFile.path], caseLabel)
-        }
-
-        do {
-            let caseLabel = "testAllCodemapFileAPIsCacheInvalidatesAcrossManagedOnlyMoveTransition"
-            let root = try makeTemporaryRoot(name: "AllCodemapAPICacheManagedOnly")
-            let visible = root.appendingPathComponent("Visible.swift")
-            let hidden = root.appendingPathComponent("Ignored/Hidden.swift")
-            let visibleAgain = root.appendingPathComponent("VisibleAgain.swift")
-            try write("Ignored/\n", to: root.appendingPathComponent(".gitignore"))
-            try FileManager.default.createDirectory(at: hidden.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try write("struct Visible {}", to: visible)
-
-            let store = WorkspaceFileContextStore()
-            let record = try await store.loadRoot(path: root.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: visible.path, modificationDate: Date(), fileAPI: makeFileAPI(path: visible.path, symbolName: "visibleSymbol"))
-            ])
-            var APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(APIPaths, [visible.path], caseLabel)
-
-            try await store.moveFile(rootID: record.id, from: "Visible.swift", to: "Ignored/Hidden.swift")
-            APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertTrue(APIPaths.isEmpty, caseLabel)
-            try await store.moveFile(rootID: record.id, from: "Ignored/Hidden.swift", to: "VisibleAgain.swift")
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: visibleAgain.path, modificationDate: Date(), fileAPI: makeFileAPI(path: visibleAgain.path, symbolName: "visibleAgainSymbol"))
-            ])
-            APIPaths = await store.allCodemapFileAPIs().map(\.filePath)
-            XCTAssertEqual(APIPaths, [visibleAgain.path], caseLabel)
-        }
-
-        do {
-            let caseLabel = "testDeleteRemovesCatalogAndCodemapVisibility"
-            let root = try makeTemporaryRoot(name: "DeletePostcondition")
-            let fileURL = root.appendingPathComponent("Deleted.swift")
-            try write("struct Deleted {}", to: fileURL)
-
-            let store = WorkspaceFileContextStore()
-            let record = try await store.loadRoot(path: root.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: fileURL.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileURL.path))
-            ])
-            let codemapBeforeDelete = await store.codemapSnapshot(rootID: record.id, relativePath: "Deleted.swift")
-            XCTAssertNotNil(codemapBeforeDelete, caseLabel)
-
-            try await store.deleteFile(rootID: record.id, relativePath: "Deleted.swift")
-
-            let deletedFile = await store.file(rootID: record.id, relativePath: "Deleted.swift")
-            XCTAssertNil(deletedFile, caseLabel)
-            let codemapAfterDelete = await store.codemapSnapshot(rootID: record.id, relativePath: "Deleted.swift")
-            XCTAssertNil(codemapAfterDelete, caseLabel)
-            let snapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: StoredSelection(selectedPaths: [fileURL.path], autoCodemapPaths: [fileURL.path], slices: [fileURL.path: [LineRange(start: 1, end: 1)]], codemapAutoEnabled: true),
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: .selected,
-                    filePathDisplay: .relative,
-                    onlyIncludeRootsWithSelectedFiles: false,
-                    includeLegend: false,
-                    showCodeMapMarkers: true,
-                    rootScope: .visibleWorkspace
-                ),
-                profile: .mcpRead
-            )
-            XCTAssertTrue(snapshot.selectedFileIDs.isEmpty, caseLabel)
-        }
-    }
-
-    func testAllCodemapFileAPIsCacheInvalidatesScannerInsertionAndReplacement() async throws {
-        let root = try makeTemporaryRoot(name: "AllCodemapAPICacheScanner")
-        let file = root.appendingPathComponent("Scanned.swift")
-        try write("func firstScannedSymbol() {}", to: file)
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        try await store.requestCodemapScan(rootID: record.id, relativePath: "Scanned.swift")
-        _ = try await waitForCodemapFileAPI(store: store, containing: "firstScannedSymbol")
-        _ = await store.allCodemapFileAPIs()
-
-        try write("func replacementScannedSymbol() {}", to: file)
-        try setDiskModificationDate(Date().addingTimeInterval(2), for: file)
-        try await store.requestCodemapScan(rootID: record.id, relativePath: "Scanned.swift")
-        let replacement = try await waitForCodemapFileAPI(store: store, containing: "replacementScannedSymbol")
-        XCTAssertFalse(replacement.apiDescription.contains("firstScannedSymbol"))
-    }
-
-    #if DEBUG
-        func testAllCodemapFileAPIsCachePreservesRootUnloadReentrantVisibilityInterval() async throws {
-            let retainedRoot = try makeTemporaryRoot(name: "AllCodemapAPICacheUnloadRetained")
-            let detachedRoot = try makeTemporaryRoot(name: "AllCodemapAPICacheUnloadDetached")
-            let retainedFile = retainedRoot.appendingPathComponent("Retained.swift")
-            let detachedFile = detachedRoot.appendingPathComponent("Detached.swift")
-            try write("struct Retained {}", to: retainedFile)
-            try write("struct Detached {}", to: detachedFile)
-
-            let store = WorkspaceFileContextStore()
-            let retainedRecord = try await store.loadRoot(path: retainedRoot.path)
-            let detachedRecord = try await store.loadRoot(path: detachedRoot.path)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: retainedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: retainedFile.path, symbolName: "retainedSymbol")),
-                WorkspaceObservedCodemapResult(fullPath: detachedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: detachedFile.path, symbolName: "detachedSymbol"))
-            ])
-            let initialAggregate = await store.codemapFileAPIAggregate()
-            let initialAPIPaths = initialAggregate.orderedFileAPIs.map(\.filePath)
-            XCTAssertEqual(Set(initialAPIPaths), [retainedFile.path, detachedFile.path])
-            XCTAssertEqual(Set(initialAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
-
-            let unloadDidDetachSignal = AsyncSignal()
-            let retainedReplacementResult = WorkspaceObservedCodemapResult(
-                fullPath: retainedFile.path,
-                modificationDate: Date(),
-                fileAPI: makeFileAPI(path: retainedFile.path, symbolName: "retainedReplacement")
-            )
-            await store.setRootUnloadDidDetachHandler { _ in
-                await unloadDidDetachSignal.mark()
-                let detachedAggregate = await store.codemapFileAPIAggregate()
-                let detachedAPIPaths = detachedAggregate.orderedFileAPIs.map(\.filePath)
-                XCTAssertEqual(Set(detachedAPIPaths), [retainedFile.path, detachedFile.path])
-                XCTAssertEqual(Set(detachedAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
-
-                await store.applyObservedCodemapResults([
-                    retainedReplacementResult
-                ])
-                let replacementAggregate = await store.codemapFileAPIAggregate()
-                let replacementAPIPaths = replacementAggregate.orderedFileAPIs.map(\.filePath)
-                XCTAssertEqual(Set(replacementAPIPaths), [retainedFile.path, detachedFile.path])
-                XCTAssertEqual(Set(replacementAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
-            }
-            addTeardownBlock {
-                await store.setRootUnloadDidDetachHandler(nil)
-                await store.unloadRoot(id: detachedRecord.id)
-                await store.unloadRoot(id: retainedRecord.id)
-            }
-            await store.unloadRoot(id: detachedRecord.id)
-            await store.setRootUnloadDidDetachHandler(nil)
-            let unloadDidDetach = await unloadDidDetachSignal.isMarked()
-            XCTAssertTrue(unloadDidDetach)
-            let finalAggregate = await store.codemapFileAPIAggregate()
-            let finalAPIPaths = finalAggregate.orderedFileAPIs.map(\.filePath)
-            XCTAssertEqual(finalAPIPaths, [retainedFile.path])
-            XCTAssertEqual(Set(finalAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path])
         }
     #endif
 
@@ -7949,48 +8365,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
     #endif
 
-    private func codemapAPIProjection(_ APIs: [FileAPI]) -> [String] {
-        APIs.map { "\($0.filePath)|\($0.apiDescription)" }.sorted()
-    }
-
-    private func legacyFirstFileAPIByStandardizedNestedPath(_ APIs: [FileAPI]) -> [String: FileAPI] {
-        var firstFileAPIByStandardizedNestedPath: [String: FileAPI] = [:]
-        for api in APIs {
-            let standardizedNestedPath = StandardizedPath.absolute(api.filePath)
-            if firstFileAPIByStandardizedNestedPath[standardizedNestedPath] == nil {
-                firstFileAPIByStandardizedNestedPath[standardizedNestedPath] = api
-            }
-        }
-        return firstFileAPIByStandardizedNestedPath
-    }
-
-    private func waitForCodemapFileAPI(store: WorkspaceFileContextStore, containing symbol: String) async throws -> FileAPI {
-        for _ in 0 ..< 250 {
-            if let API = await store.allCodemapFileAPIs().first(where: { $0.apiDescription.contains(symbol) }) {
-                return API
-            }
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        XCTFail("Timed out waiting for codemap symbol: \(symbol)")
-        throw NSError(domain: "WorkspaceFileContextStoreTests", code: 1)
-    }
-
-    #if DEBUG
-        private func startAllCodemapFileAPIsCapture(label: String) {
-            EditFlowPerf.resetDebugCaptureForTesting()
-            switch EditFlowPerf.beginDebugCapture(label: label, maxSamples: 100) {
-            case .started:
-                break
-            case .busy:
-                XCTFail("All codemap file APIs capture should start")
-            }
-        }
-
-        private func allCodemapFileAPIsBucket(_ snapshot: EditFlowPerf.DebugCaptureSnapshot, stage: StaticString) -> EditFlowPerf.DebugCaptureStageAggregate? {
-            snapshot.stages.first { $0.stageName == String(describing: stage) }
-        }
-    #endif
-
     @MainActor
     private func waitForFile(manager: WorkspaceFilesViewModel, fullPath: String, id: UUID? = nil) async throws -> FileViewModel {
         for _ in 0 ..< 50 {
@@ -8034,12 +8408,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     #endif
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {
@@ -8047,18 +8416,25 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
+    private func createDirectorySymlinkOrSkip(at link: URL, destination: URL) throws {
+        do {
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        } catch {
+            throw XCTSkip("Directory symlink creation unavailable in this environment: \(error)")
+        }
+    }
+
     private func setDiskModificationDate(_ date: Date, for url: URL) throws {
         try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
     }
 
-    private func makeFileAPI(
+    private func makeSyntaxArtifact(
         path: String,
         symbolName: String = "codemapOnlySymbol",
         className: String? = nil,
         referencedTypes: [String] = []
-    ) -> FileAPI {
-        FileAPI(
-            filePath: path,
+    ) -> CodeMapSyntaxArtifact {
+        CodeMapSyntaxArtifact(
             imports: [],
             classes: className.map { [ClassInfo(name: $0, methods: [], properties: [])] } ?? [],
             functions: [

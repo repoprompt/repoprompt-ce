@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -26,18 +26,21 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
+        let steeringMessage = "single wait-any steering"
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: sessionID),
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage
         )
 
         let interrupted = await firstWait.value
         XCTAssertEqual(interrupted.sessionID, sessionID)
         XCTAssertEqual(interrupted.disposition, "steering_interrupted")
         XCTAssertEqual(interrupted.wakeReason, AgentRunSessionStore.WakeReason.steeringRequested.rawValue)
+        XCTAssertEqual(interrupted.steeringMessage, steeringMessage)
         XCTAssertEqual(interrupted.snapshotStatus, AgentRunMCPSnapshot.Status.running.rawValue)
 
         let secondWait = Task {
@@ -46,7 +49,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
         _ = await AgentRunSessionStore.publishTerminal(
             .init(epoch: epoch, snapshot: terminal),
@@ -58,6 +61,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         let resumed = await secondWait.value
         XCTAssertEqual(resumed.disposition, "actionable")
         XCTAssertNil(resumed.wakeReason)
+        XCTAssertNil(resumed.steeringMessage)
         XCTAssertEqual(resumed.snapshotStatus, AgentRunMCPSnapshot.Status.completed.rawValue)
         await AgentRunSessionStore.cleanup(registration: registration)
     }
@@ -78,14 +82,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: sessionID),
             cursor: cursor,
             reason: .instructionDelivered
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
         _ = await AgentRunSessionStore.publishTerminal(
             .init(epoch: epoch, snapshot: terminal),
@@ -97,6 +101,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         let result = await waitTask.value
         XCTAssertEqual(result.disposition, "actionable")
         XCTAssertNil(result.wakeReason)
+        XCTAssertNil(result.steeringMessage)
         XCTAssertEqual(result.snapshotStatus, AgentRunMCPSnapshot.Status.completed.rawValue)
         await AgentRunSessionStore.cleanup(registration: registration)
     }
@@ -124,18 +129,21 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: firstRegistration)
-        try await waitForWaiter(registration: secondRegistration)
+        try await waitForAgentRunSessionStoreWaiter(registration: firstRegistration)
+        try await waitForAgentRunSessionStoreWaiter(registration: secondRegistration)
 
+        let steeringMessage = "second session steering"
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: secondID),
             cursor: .init(registration: secondRegistration, epoch: secondEpoch),
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage
         )
 
         let result = await waitTask.value
         XCTAssertEqual(result.sessionID, secondID)
         XCTAssertEqual(result.disposition, "steering_interrupted")
+        XCTAssertEqual(result.steeringMessage, steeringMessage)
         let retainedFirstEpoch = await AgentRunSessionStore.currentEpoch(for: firstRegistration)
         XCTAssertEqual(retainedFirstEpoch, firstEpoch)
         await AgentRunSessionStore.cleanup(registration: firstRegistration)
@@ -158,7 +166,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let steering = try await beginEpoch(
             registration: registration,
@@ -166,14 +174,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
             expected: first,
             kind: .steering
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let related = try await beginEpoch(
             registration: registration,
             activationID: activationID,
             expected: steering,
             kind: .relatedFollowUp
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         _ = await AgentRunSessionStore.beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -203,14 +211,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 timeoutSeconds: 0.1
             )
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let second = try await beginEpoch(
             registration: registration,
             activationID: activationID,
             expected: first,
             kind: .steering
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         _ = try await beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -230,6 +238,15 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         let meta = try XCTUnwrap(object["_meta"]?.objectValue)
         XCTAssertEqual(meta["wait_result"]?.stringValue, "expired")
         XCTAssertNil(meta["wake_reason"])
+
+        let statusText = try XCTUnwrap(object["status_text"]?.stringValue)
+        XCTAssertFalse(statusText.isEmpty)
+        XCTAssertTrue(statusText.contains("run/control/wait handle has expired"))
+        XCTAssertTrue(statusText.contains("`agent_run`"))
+        XCTAssertTrue(statusText.contains("`op: \"steer\"`"))
+        XCTAssertTrue(statusText.contains("`session_id`"))
+        XCTAssertTrue(statusText.contains("`message`"))
+        XCTAssertFalse(statusText.contains("Start a new run or use a more recent session ID"))
     }
 
     func testWaitAnyCutoffExcludesSteeringProducedAfterSiblingCancellation() async {
@@ -248,6 +265,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
     func testWaitAnySteeringInterruptValueShapeOmitsNonTerminalAssistantText() throws {
         let firstID = UUID()
         let secondID = UUID()
+        let steeringMessage = "formatted multi-wait steering"
         let value = AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
             sessionIDs: [firstID, secondID],
             snapshots: [
@@ -255,7 +273,8 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
                 makeRunningSnapshot(sessionID: secondID)
             ],
             pendingSessionIDs: [firstID, secondID],
-            interruptedSessionID: secondID
+            interruptedSessionID: secondID,
+            steeringMessage: steeringMessage
         )
 
         let object = try XCTUnwrap(value.objectValue)
@@ -265,6 +284,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         XCTAssertEqual(object["session_id"]?.stringValue, secondID.uuidString)
         XCTAssertEqual(wait["mode"]?.stringValue, "any")
         XCTAssertEqual(wait["result"]?.stringValue, "interrupted_by_steering")
+        XCTAssertEqual(wait["steering_message"]?.stringValue, steeringMessage)
         XCTAssertNil(wait["winner_session_id"]?.stringValue)
         XCTAssertEqual(wait["interrupted_session_id"]?.stringValue, secondID.uuidString)
         XCTAssertEqual(
@@ -275,7 +295,53 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         let snapshots = try XCTUnwrap(object["snapshots"]?.arrayValue)
         for snapshot in snapshots {
             XCTAssertNil(snapshot.objectValue?["assistant_text"])
+            XCTAssertNil(snapshot.objectValue?["wait"]?.objectValue?["steering_message"])
         }
+
+        let sameParentRunID = UUID()
+        let sameParentValue = AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
+            sessionIDs: [firstID, secondID],
+            snapshots: [
+                makeRunningSnapshot(sessionID: firstID),
+                makeRunningSnapshot(sessionID: secondID)
+            ],
+            pendingSessionIDs: [firstID, secondID],
+            interruptedSessionID: secondID,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: sameParentRunID,
+            waitConsumerParentRunID: sameParentRunID
+        )
+        XCTAssertNil(sameParentValue.objectValue?["wait"]?.objectValue?["steering_message"])
+
+        let differentParentValue = AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
+            sessionIDs: [firstID, secondID],
+            snapshots: [
+                makeRunningSnapshot(sessionID: firstID),
+                makeRunningSnapshot(sessionID: secondID)
+            ],
+            pendingSessionIDs: [firstID, secondID],
+            interruptedSessionID: secondID,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: sameParentRunID,
+            waitConsumerParentRunID: UUID()
+        )
+        XCTAssertEqual(
+            differentParentValue.objectValue?["wait"]?.objectValue?["steering_message"]?.stringValue,
+            steeringMessage
+        )
+
+        let attachmentOnlyValue = AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
+            sessionIDs: [firstID, secondID],
+            snapshots: [
+                makeRunningSnapshot(sessionID: firstID),
+                makeRunningSnapshot(sessionID: secondID)
+            ],
+            pendingSessionIDs: [firstID, secondID],
+            interruptedSessionID: secondID
+        )
+        XCTAssertNil(
+            attachmentOnlyValue.objectValue?["wait"]?.objectValue?["steering_message"]
+        )
     }
 
     func testWaitAnySteeringInterruptKeepsRunningTriggerAsRepresentativeWhenFreshSnapshotIsTerminal() throws {
@@ -283,12 +349,14 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         let siblingID = UUID()
         let triggeringSnapshot = makeRunningSnapshot(sessionID: interruptedID)
         let terminalSnapshot = makeSnapshot(sessionID: interruptedID, status: .completed)
+        let steeringMessage = "running trigger steering"
         let value = AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
             sessionIDs: [interruptedID, siblingID],
             representativeSnapshot: triggeringSnapshot,
             snapshots: [terminalSnapshot, makeRunningSnapshot(sessionID: siblingID)],
             pendingSessionIDs: [siblingID],
-            interruptedSessionID: interruptedID
+            interruptedSessionID: interruptedID,
+            steeringMessage: steeringMessage
         )
 
         let object = try XCTUnwrap(value.objectValue)
@@ -297,6 +365,10 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         XCTAssertEqual(
             object["status_text"]?.stringValue,
             "Wait interrupted by a new steering instruction; the agent run is still running."
+        )
+        XCTAssertEqual(
+            object["wait"]?.objectValue?["steering_message"]?.stringValue,
+            steeringMessage
         )
         let snapshots = try XCTUnwrap(object["snapshots"]?.arrayValue)
         let interruptedAggregate = try XCTUnwrap(snapshots.first { snapshot in
@@ -369,16 +441,6 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
             throw TestFailure.missingEpoch
         }
         return epoch
-    }
-
-    private func waitForWaiter(registration: AgentRunSessionStore.Registration) async throws {
-        for _ in 0 ..< 200 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            await Task.yield()
-        }
-        XCTFail("Timed out waiting for waiter")
     }
 
     private func makeRunningSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {

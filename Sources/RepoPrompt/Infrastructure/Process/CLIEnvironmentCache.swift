@@ -4,19 +4,21 @@ import Foundation
 actor CLIEnvironmentCache {
     static let shared = CLIEnvironmentCache()
 
-    private var cachedSnapshot: CLIEnvironmentSnapshot?
-    private var fallbackEnvironment: [String: String]?
-    private var loadTask: Task<CLIEnvironmentSnapshot, Never>?
-    private var loadGeneration: UInt64 = 0
+    private var cachedSnapshots: [ShellEnvironmentCaptureMode: CLIEnvironmentSnapshot] = [:]
+    private var fallbackEnvironments: [ShellEnvironmentCaptureMode: [String: String]] = [:]
+    private var loadTasks: [ShellEnvironmentCaptureMode: Task<CLIEnvironmentSnapshot, Never>] = [:]
+    private var loadGenerations: [ShellEnvironmentCaptureMode: UInt64] = [:]
 
     func invalidate() {
-        loadGeneration &+= 1
-        loadTask?.cancel()
-        loadTask = nil
-        if let cachedSnapshot {
-            fallbackEnvironment = cachedSnapshot.environment
+        for mode in ShellEnvironmentCaptureMode.allCases {
+            loadGenerations[mode, default: 0] &+= 1
+            loadTasks[mode]?.cancel()
+            loadTasks[mode] = nil
+            if let cachedSnapshot = cachedSnapshots[mode] {
+                fallbackEnvironments[mode] = cachedSnapshot.environment
+            }
+            cachedSnapshots[mode] = nil
         }
-        cachedSnapshot = nil
     }
 
     func environment(enableLogging: Bool) async -> [String: String] {
@@ -25,47 +27,65 @@ actor CLIEnvironmentCache {
 
     func environmentSnapshot(
         enableLogging: Bool,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        captureMode: ShellEnvironmentCaptureMode = .interactiveLoginShell
     ) async -> CLIEnvironmentSnapshot {
         if forceRefresh {
-            invalidate()
+            invalidate(captureMode: captureMode)
         }
 
-        // Return cached result if available
-        if let cachedSnapshot {
+        // Return cached result if available.
+        if let cachedSnapshot = cachedSnapshots[captureMode] {
             return cachedSnapshot
         }
 
-        // If a load is already in progress, wait for it
-        if let existingTask = loadTask {
+        // If a load is already in progress for this mode, wait for it.
+        if let existingTask = loadTasks[captureMode] {
             return await existingTask.value
         }
 
-        // Start a new load task
-        let previousEnvironment = fallbackEnvironment
-        loadGeneration &+= 1
-        let generation = loadGeneration
+        // Start a new load task for this capture mode. Interactive and non-interactive
+        // login shells are cached separately so fast Codex app-server launches do not
+        // downgrade providers that explicitly need interactive shell initialization.
+        let previousEnvironment = fallbackEnvironments[captureMode]
+        loadGenerations[captureMode, default: 0] &+= 1
+        let generation = loadGenerations[captureMode, default: 0]
         let task = Task<CLIEnvironmentSnapshot, Never> {
             Self.loadLoginShellEnvironment(
                 enableLogging: enableLogging,
-                previousEnvironment: previousEnvironment
+                previousEnvironment: previousEnvironment,
+                captureMode: captureMode
             )
         }
-        loadTask = task
+        loadTasks[captureMode] = task
         let snapshot = await task.value
-        if loadGeneration == generation {
-            cachedSnapshot = snapshot
-            fallbackEnvironment = snapshot.environment
-            loadTask = nil
+        if loadGenerations[captureMode, default: 0] == generation {
+            cachedSnapshots[captureMode] = snapshot
+            fallbackEnvironments[captureMode] = snapshot.environment
+            loadTasks[captureMode] = nil
         }
         return snapshot
+    }
+
+    private func invalidate(captureMode: ShellEnvironmentCaptureMode) {
+        loadGenerations[captureMode, default: 0] &+= 1
+        loadTasks[captureMode]?.cancel()
+        loadTasks[captureMode] = nil
+        if let cachedSnapshot = cachedSnapshots[captureMode] {
+            fallbackEnvironments[captureMode] = cachedSnapshot.environment
+        }
+        cachedSnapshots[captureMode] = nil
     }
 
     private static func log(_ message: @autoclosure () -> String, enabled: Bool) {
         ProcessDebugLogging.log(prefix: "CLIEnvironmentCache", message(), enabled: enabled)
     }
 
-    private static func loadLoginShellEnvironment(enableLogging: Bool, previousEnvironment: [String: String]?) -> CLIEnvironmentSnapshot {
+    private static func loadLoginShellEnvironment(
+        enableLogging: Bool,
+        previousEnvironment: [String: String]?,
+        captureMode: ShellEnvironmentCaptureMode
+    ) -> CLIEnvironmentSnapshot {
         // Native app launches can inherit a minimal launchd PATH, while terminal launches
         // usually inherit a fully initialized shell PATH. Capture the user's login shell
         // when possible and then enrich with shared native defaults so providers do not
@@ -88,18 +108,26 @@ actor CLIEnvironmentCache {
         guard let shell = userLoginShell() else {
             return fallbackEnv("Unable to determine user login shell")
         }
-        log("Launching login shell \(shell) to capture environment", enabled: enableLogging)
+        log("Launching login shell \(shell) to capture environment mode=\(captureMode)", enabled: enableLogging)
         let seededEnv = composeShellCommandEnvironment(from: baseEnv, shell: shell)
+        let primaryArguments: [String] = switch captureMode {
+        case .interactiveLoginShell:
+            ["-l", "-i", "-c", "env"]
+        case .loginShell:
+            ["-l", "-c", "env"]
+        }
         guard var captured = captureEnvironment(
             shell: shell,
-            arguments: ["-l", "-i", "-c", "env"],
+            arguments: primaryArguments,
             environment: seededEnv,
             enableLogging: enableLogging,
             timeout: loginShellCaptureTimeout
         ) else {
             return fallbackEnv("Login shell capture failed or timed out")
         }
-        if pathLooksInsufficient(captured["PATH"]) {
+        if captureMode == .interactiveLoginShell,
+           pathLooksInsufficient(captured["PATH"])
+        {
             log("Captured PATH is minimal; retrying without interactive flag", enabled: enableLogging)
             if let retry = captureEnvironment(
                 shell: shell,

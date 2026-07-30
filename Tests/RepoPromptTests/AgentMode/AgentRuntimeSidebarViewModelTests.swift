@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -98,6 +98,46 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 0)
+        XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
+    }
+
+    func testLiveSelectionCountMismatchSuppressesStaleToolSelectionTokens() throws {
+        let store = AgentRuntimeMetricsUIStore()
+        let manageSelectionItem = try makeManageSelectionItem(fileCount: 3)
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(latestManageSelectionItem: manageSelectionItem),
+            codexUsage: nil,
+            liveSelectedFileCount: 2,
+            selectedAgent: .codexExec,
+            selectedModelRaw: "gpt-5.1-codex"
+        )
+
+        XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 2)
+        XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
+    }
+
+    func testLiveSlicedSelectionSuppressesSameCountToolSelectionTokens() throws {
+        let store = AgentRuntimeMetricsUIStore()
+        let manageSelectionItem = try makeManageSelectionItem(fileCount: 1)
+        let liveSummary = AgentContextExportResolver.selectionSummary(
+            for: StoredSelection(
+                selectedPaths: ["Sources/File0.swift"],
+                slices: ["Sources/File0.swift": [LineRange(start: 4, end: 8)]],
+                codemapAutoEnabled: false
+            )
+        )
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(latestManageSelectionItem: manageSelectionItem),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            liveSelectionSummary: liveSummary,
+            selectedAgent: .codexExec,
+            selectedModelRaw: "gpt-5.1-codex"
+        )
+
+        XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 1)
+        XCTAssertEqual(store.runtimeVM.snapshot.selectionSummary, liveSummary)
+        XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
     }
 
     func testClaudeFableSelectionFallsBackToOneMillionTokenContextWindow() {
@@ -111,6 +151,15 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
 
         XCTAssertNil(store.runtimeVM.snapshot.contextWindowTokens)
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-sonnet-5"
+        )
         XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
     }
 
@@ -131,6 +180,24 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             liveSelectedFileCount: nil,
             selectedAgent: .claudeCode,
             selectedModelRaw: "opus[1m]:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-sonnet-5:max"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-sonnet-5:xhigh"
         )
         XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
 
@@ -241,9 +308,15 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-fable-5")
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
 
+        viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-sonnet-5")
+        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
+
         // Encoded selections need the agent to disambiguate the specifier
         // grammar; without one they pin to the conservative default.
         viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-fable-5:xhigh")
+        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 200_000)
+
+        viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-sonnet-5:xhigh")
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 200_000)
 
         // Supplying the agent unlocks encoded-raw resolution on the items path.
@@ -252,6 +325,14 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             codexUsage: nil,
             selectedAgent: .claudeCode,
             selectedModelRaw: "claude-fable-5:xhigh"
+        )
+        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        viewModel.update(
+            items: [],
+            codexUsage: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-sonnet-5:xhigh"
         )
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
     }

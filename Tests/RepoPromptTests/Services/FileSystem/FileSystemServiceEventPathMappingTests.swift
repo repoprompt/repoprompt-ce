@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class FileSystemServiceEventPathMappingTests: XCTestCase {
@@ -54,7 +54,6 @@ final class FileSystemServiceEventPathMappingTests: XCTestCase {
     private func makeService(root: URL) async throws -> FileSystemService {
         try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true

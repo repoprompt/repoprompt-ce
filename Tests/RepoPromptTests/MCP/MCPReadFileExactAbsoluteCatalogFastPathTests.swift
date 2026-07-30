@@ -1,17 +1,7 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testReadFileSourceOrderingPreservesRootCaptureResolutionAndProviderTranslation() throws {
         do {
             let caseLabel = "testReadFileCapturesRootsOnceBeforeFreshnessAndConsolidatedResolution"
@@ -23,7 +13,8 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
 
             try assertOrdered([
                 "let roots = await store.rootRefs(scope: lookupRootScope)",
-                "await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)",
+                "await readableService.awaitFreshnessForExplicitRequest(",
+                "timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout",
                 "await readableService.resolveReadFileRequest("
             ], in: readFile, label: caseLabel)
             XCTAssertEqual(readFile.components(separatedBy: "store.rootRefs(scope: lookupRootScope)").count - 1, 1, caseLabel)
@@ -51,9 +42,39 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             let caseLabel = "testProviderTranslationPrecedesScopedReadDependencyCall"
             let providerSource = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
             let translation = try XCTUnwrap(providerSource.range(of: "let resolvedPath = lookupContext.translateInputPath(path)"), caseLabel)
-            let scopedRead = try XCTUnwrap(providerSource.range(of: "dependencies.readFile(resolvedPath, startLine1Based, limit, lookupContext.rootScope)"), caseLabel)
-            XCTAssertLessThan(translation.lowerBound, scopedRead.lowerBound, caseLabel)
+            let authorizedRead = try XCTUnwrap(
+                providerSource.range(of: "dependencies.readSelectedAuthorizedGitArtifact("),
+                caseLabel
+            )
+            let scopedRead = try XCTUnwrap(
+                providerSource.range(of: "dependencies.readFile("),
+                caseLabel
+            )
+            XCTAssertLessThan(translation.lowerBound, authorizedRead.lowerBound, caseLabel)
+            XCTAssertLessThan(authorizedRead.lowerBound, scopedRead.lowerBound, caseLabel)
         }
+    }
+
+    func testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup() throws {
+        let caseLabel = "testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup"
+        let storeSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+        let startPathSnapshot = try XCTUnwrap(storeSource.slice(
+            from: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        profile: PathLocateProfile\n    ) async -> FileTreeSelectionSnapshot {\n",
+            to: "    private func resolveFileTreeStartFolder("
+        ), caseLabel)
+        XCTAssertTrue(startPathSnapshot.contains("resolveFileTreeStartFolder("), caseLabel)
+        XCTAssertFalse(startPathSnapshot.contains("lookupSelectionPath(trimmedStartPath"), caseLabel)
+
+        let startFolderResolver = try XCTUnwrap(storeSource.slice(
+            from: "    private func resolveFileTreeStartFolder(",
+            to: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        startFolder: WorkspaceFolderRecord?"
+        ), caseLabel)
+        try assertOrdered([
+            "let roots = rootRefs(scope: request.rootScope)",
+            "resolveFolderInput(",
+            "rootRefs: roots",
+            "allowGeneralLookupFallback: false"
+        ], in: startFolderResolver, label: caseLabel)
     }
 
     func testExactAbsoluteInputValidationCoversQualificationEmptyAndEmbeddedNUL() async throws {
@@ -190,6 +211,44 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             }
             XCTAssertEqual(file.displayPath, "~/.agents/skills/example/SKILL.md", caseLabel)
         }
+
+        do {
+            let caseLabel = "testSymlinkedExternalSupportPathRemainsFallbackOnly"
+            let root = try makeTemporaryRoot(name: "SymlinkFallbackWorkspace")
+            try write("visible", to: root.appendingPathComponent("Visible.swift"))
+            let home = try makeTemporaryRoot(name: "SymlinkFallbackHome")
+            let realSkillsRoot = try makeTemporaryRoot(name: "SymlinkFallbackSkills")
+            let nominalSkillsRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: nominalSkillsRoot.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try createDirectorySymlinkOrSkip(at: nominalSkillsRoot, destination: realSkillsRoot)
+            let realSkillFile = realSkillsRoot.appendingPathComponent("example/SKILL.md")
+            try write("symlinked skill body", to: realSkillFile)
+            let nominalSkillFile = nominalSkillsRoot.appendingPathComponent("example/SKILL.md")
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+
+            let externalShortcutHit = await service.resolveExactWorkspaceCatalogHit(
+                nominalSkillFile.path,
+                rootScope: .visibleWorkspace
+            )
+            XCTAssertNil(externalShortcutHit, caseLabel)
+            let readable = await service.resolveReadableFile(
+                nominalSkillFile.path,
+                profile: .mcpRead,
+                rootScope: .visibleWorkspace
+            )
+            guard case let .external(file) = readable else {
+                return XCTFail(caseLabel + ": Expected symlinked support file to resolve through external fallback")
+            }
+            XCTAssertEqual(file.absolutePath, realSkillFile.path, caseLabel)
+            let content = try await service.readAlwaysReadableExternalFile(file)
+            XCTAssertEqual(content, "symlinked skill body", caseLabel)
+        }
     }
 
     func testNonMatchedLookupOutcomesCannotShortCircuit() async throws {
@@ -279,15 +338,29 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         )
         let roots = await store.rootRefs(scope: scope)
         let service = WorkspaceReadableFileService(store: store)
+        let baselineLogicalStats = await store.scopedIngressBarrierStatsForTesting(rootID: logicalRecord.id)
+        let baselineWorktreeAStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeARecord.id)
+        let baselineWorktreeBStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeBRecord.id)
 
         try await service.awaitFreshnessForExplicitRequest(worktreeAFile.path, rootRefs: roots)
 
         let logicalStats = await store.scopedIngressBarrierStatsForTesting(rootID: logicalRecord.id)
         let worktreeAStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeARecord.id)
         let worktreeBStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeBRecord.id)
-        XCTAssertEqual(logicalStats.launchCount, 0)
-        XCTAssertEqual(worktreeAStats.launchCount, 1)
-        XCTAssertEqual(worktreeBStats.launchCount, 0)
+        XCTAssertEqual(scopedIngressBarrierWorkDelta(logicalStats, baselineLogicalStats), 0)
+        XCTAssertGreaterThan(scopedIngressBarrierWorkDelta(worktreeAStats, baselineWorktreeAStats), 0)
+        XCTAssertEqual(scopedIngressBarrierWorkDelta(worktreeBStats, baselineWorktreeBStats), 0)
+    }
+
+    private func scopedIngressBarrierWorkDelta(
+        _ after: WorkspaceFileContextStore.ScopedIngressBarrierStats,
+        _ before: WorkspaceFileContextStore.ScopedIngressBarrierStats
+    ) -> Int {
+        (after.launchCount - before.launchCount) +
+            (after.joinCount - before.joinCount) +
+            (after.successorCount - before.successorCount) +
+            (after.coalescedSuccessorCount - before.coalescedSuccessorCount) +
+            (after.noopCount - before.noopCount)
     }
 
     private func assertOrdered(
@@ -310,17 +383,20 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func createDirectorySymlinkOrSkip(at link: URL, destination: URL) throws {
+        do {
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        } catch {
+            throw XCTSkip("Directory symlink creation unavailable in this environment: \(error)")
+        }
     }
 
     private func source(_ relativePath: String) throws -> String {

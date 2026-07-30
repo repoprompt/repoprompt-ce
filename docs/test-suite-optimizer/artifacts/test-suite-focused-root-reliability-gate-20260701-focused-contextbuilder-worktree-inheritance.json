@@ -1,0 +1,671 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-reliability-gate-20260701-focused-contextbuilder-worktree-inheritance.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+  "git": {
+    "commit": "c96fade22b69cd8ed424037b4d3fc84112873533",
+    "working_tree": " M Tests/RepoPromptTests/ContextBuilder/ContextBuilderWorktreeInheritanceTests.swift"
+  },
+  "inventory": "docs/test-suite-optimizer/artifacts/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+  "label": "reliability-gate-20260701-focused-contextbuilder-worktree-inheritance",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 211.00679802894592,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/a83511d3-1eed-4332-853e-6ff934cf9cb6.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004709720611572266,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 149.90047216415405,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8d35a158-0224-49fa-99b0-395e84e66ce9.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0022721290588378906,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 255.80021810531616,
+      "exit_code": 1,
+      "index": 3,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b4d274e5-e7cc-44fa-bb56-a61e8ca7befe.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0043811798095703125,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 221.5109899044037,
+      "exit_code": 1,
+      "index": 4,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/95e57ead-eec3-4cc5-9f8f-07255b960ed9.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.004215717315673828,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 172.95901203155518,
+      "exit_code": 0,
+      "index": 5,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/66493d78-93e8-44e9-b018-f98ae1835d16.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0030858516693115234,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 16.87982487678528,
+      "exit_code": 130,
+      "index": 6,
+      "invalid_reasons": [
+        "conductor process exit 130",
+        "terminal state canceled",
+        "test exit 130",
+        "canceled or lifecycle-superseded"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7499d374-223e-4451-904b-b1e358f99561.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 130,
+      "queue_wait_seconds": 0.004849910736083984,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "canceled",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 121.78777885437012,
+      "exit_code": 0,
+      "index": 7,
+      "invalid_reasons": [
+        "measurement source changed during execution"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3a58fb84-8f68-4b44-87cb-ffb599e2779d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0033271312713623047,
+      "source_changed": true,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 3.383028984069824,
+      "exit_code": 1,
+      "index": 8,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/71a08595-a427-487c-ab97-12af77942b82.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.002351045608520508,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.977005958557129,
+      "exit_code": 1,
+      "index": 9,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/5a4c24b0-9f1a-4866-a3f4-ab47a17a4193.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0035848617553710938,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.9184000492095947,
+      "exit_code": 1,
+      "index": 10,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c37ceba6-c806-4c48-a4b1-948e9b911aeb.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.003985166549682617,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.928438901901245,
+      "exit_code": 1,
+      "index": 11,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/9c218a8b-3832-4573-aab3-dde0a2bf96af.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0038971900939941406,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 3.201601028442383,
+      "exit_code": 1,
+      "index": 12,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/d3ab11a5-353a-4d06-8b7a-77adb3ec214a.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0024580955505371094,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.817192792892456,
+      "exit_code": 1,
+      "index": 13,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/c6947055-7011-448f-8064-aa6cbcf816eb.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.004445075988769531,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 2.9335501194000244,
+      "exit_code": 1,
+      "index": 14,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1",
+        "measurement source changed during execution",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3d4e05e6-0a5a-4da5-93ac-2710e62fffad.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.004622936248779297,
+      "source_changed": true,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 318.65827083587646,
+      "exit_code": 0,
+      "index": 15,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/1dcf6b5d-2188-41bb-ae75-0db7d0365830.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 5,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.003599882125854492,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.9554648399353027,
+      "exit_code": 130,
+      "index": 16,
+      "invalid_reasons": [
+        "conductor process exit 130",
+        "terminal state canceled",
+        "test exit 130",
+        "canceled or lifecycle-superseded",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/0fed5aca-130e-4084-9ce5-26508f3ead3d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 130,
+      "queue_wait_seconds": 109.10672378540039,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "canceled",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 315.44403290748596,
+      "exit_code": 1,
+      "index": 17,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/531454aa-af5d-48da-bba3-07d37dadd82a.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0032320022583007812,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.7449936866760254,
+      "exit_code": 130,
+      "index": 18,
+      "invalid_reasons": [
+        "conductor process exit 130",
+        "terminal state canceled",
+        "test exit 130",
+        "canceled or lifecycle-superseded",
+        "measurement source changed during execution",
+        "filtered baseline produced no parsed XCTest timings"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ddf0375d-e9ff-44b7-a715-1460cdf8f05d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 0,
+      "process_exit_code": 130,
+      "queue_wait_seconds": 149.91775608062744,
+      "source_changed": true,
+      "source_guard_kind": "content",
+      "state": "canceled",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 393.4149420261383,
+      "exit_code": 130,
+      "index": 19,
+      "invalid_reasons": [
+        "conductor process exit 130",
+        "terminal state canceled",
+        "test exit 130",
+        "canceled or lifecycle-superseded"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/470ac6ba-8179-4c29-8a7c-b9a3c8144094.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 130,
+      "queue_wait_seconds": 0.004430055618286133,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "canceled",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 266.69174098968506,
+      "exit_code": 0,
+      "index": 20,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/02c28a92-e90d-47e2-93a2-c121c826df45.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.6265048980712891,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 280.755,
+      "median_aggregate_seconds": 210.283,
+      "method_count": 5,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 169.196,
+      "median_seconds": 99.368,
+      "method": "testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+      "observations": 4,
+      "observed_p95_seconds": 169.196,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 33.792,
+      "median_seconds": 26.661,
+      "method": "testAgentModeContextBuilderUsesFrozenWorktreeAcrossNestedToolsAccountingAndFollowUps",
+      "observations": 5,
+      "observed_p95_seconds": 33.792,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 33.822,
+      "median_seconds": 24.883,
+      "method": "testAgentModeTwoRootContextBuilderImplicitGitPublishesSelectedRepository",
+      "observations": 5,
+      "observed_p95_seconds": 33.822,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 280.755,
+      "median_seconds": 2.715,
+      "method": "testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext",
+      "observations": 5,
+      "observed_p95_seconds": 280.755,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.459,
+      "median_seconds": 0.298,
+      "method": "testAgentModeContextBuilderFailsClosedBeforeProviderCreationWhenWorktreeIsUnavailable",
+      "observations": 5,
+      "observed_p95_seconds": 0.459,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 20,
+    "invalid_samples": 15,
+    "median_seconds": 211.00679802894592,
+    "noise_classification": "unstable",
+    "observed_p95_seconds": 318.65827083587646,
+    "raw_execution_seconds": [
+      211.00679802894592,
+      149.90047216415405,
+      172.95901203155518,
+      318.65827083587646,
+      266.69174098968506
+    ],
+    "relative_mad": 0.26390117987146683,
+    "valid_samples": 5
+  },
+  "target": "root",
+  "timestamp": "2026-07-01T18:25:51+00:00"
+}

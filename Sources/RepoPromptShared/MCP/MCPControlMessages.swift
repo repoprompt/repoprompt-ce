@@ -50,6 +50,9 @@ public enum TerminationReason: String, Codable, Sendable {
 
     /// Connection was replaced by a new connection for the same runID
     case connectionReplaced = "connection_replaced"
+
+    /// An unresponsive tool execution exceeded its watchdog and the app force-disconnected
+    case toolExecutionWatchdog = "tool_execution_watchdog"
 }
 
 // MARK: - Control Notification Payloads

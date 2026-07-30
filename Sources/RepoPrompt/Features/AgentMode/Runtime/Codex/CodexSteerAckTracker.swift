@@ -8,6 +8,7 @@ import Foundation
 @MainActor
 final class CodexSteerAckTracker {
     nonisolated static let defaultTimeoutSeconds: TimeInterval = 2.5
+    private var terminalStateTimeoutSeconds = CodexSteerAckTracker.defaultTimeoutSeconds
 
     private final class CancellationFlag: @unchecked Sendable {
         private let lock = NSLock()
@@ -35,6 +36,34 @@ final class CodexSteerAckTracker {
         case cancelled
         case stale(reason: String)
         case timedOut
+
+        var confirmsInstructionDeliveryOrDurableQueue: Bool {
+            switch self {
+            case .steerAccepted, .startAccepted, .controlAccepted, .durablyQueued:
+                true
+            case .failed, .cancelled, .stale, .timedOut:
+                false
+            }
+        }
+
+        var failureDescriptionForMCP: String? {
+            switch self {
+            case .steerAccepted, .startAccepted, .controlAccepted, .durablyQueued:
+                nil
+            case let .failed(message):
+                message.isEmpty
+                    ? "Codex steer failed before reaching the active run."
+                    : message
+            case .cancelled:
+                "Codex steer was cancelled before it reached the active run."
+            case let .stale(reason):
+                reason.isEmpty
+                    ? "Codex steer was dropped because the active run changed before delivery."
+                    : reason
+            case .timedOut:
+                "Timed out waiting for Codex to acknowledge the steer message. The run may have changed state."
+            }
+        }
     }
 
     private struct AttemptRecord {
@@ -51,6 +80,25 @@ final class CodexSteerAckTracker {
     private let maxTerminalTombstones = 512
     #if DEBUG
         private(set) var test_latestAttemptID: UUID?
+
+        var test_openAttemptIDs: [UUID] {
+            attempts.compactMap { attemptID, record in
+                record.terminalState == nil ? attemptID : nil
+            }
+        }
+
+        @discardableResult
+        func test_cancelOpenAttempts() -> [UUID] {
+            let attemptIDs = test_openAttemptIDs
+            for attemptID in attemptIDs {
+                cancel(attemptID: attemptID)
+            }
+            return attemptIDs
+        }
+
+        func test_setTerminalStateTimeoutSeconds(_ timeoutSeconds: TimeInterval) {
+            terminalStateTimeoutSeconds = timeoutSeconds
+        }
     #endif
 
     func beginAttempt() -> UUID {
@@ -141,7 +189,7 @@ final class CodexSteerAckTracker {
 
     func awaitTerminalState(
         attemptID: UUID,
-        timeoutSeconds: TimeInterval = CodexSteerAckTracker.defaultTimeoutSeconds
+        timeoutSeconds: TimeInterval? = nil
     ) async -> TerminalState {
         guard let cancellationFlag = attempts[attemptID]?.cancellationFlag else {
             return .stale(reason: "Codex dispatch attempt was not registered.")
@@ -164,7 +212,7 @@ final class CodexSteerAckTracker {
                     return
                 }
                 record.terminalContinuation = continuation
-                let timeout = max(0.1, timeoutSeconds)
+                let timeout = max(0.1, timeoutSeconds ?? terminalStateTimeoutSeconds)
                 record.timeoutTask = Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                     self?.resolve(attemptID: attemptID, state: .timedOut)

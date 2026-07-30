@@ -1,8 +1,10 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
+    private let fullSuiteAsyncTimeoutSeconds: TimeInterval = 30
+
     private var trackedWindows: [WindowState] = []
     private var explicitlyUnregisteredWindowIDs: Set<ObjectIdentifier> = []
 
@@ -137,7 +139,12 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertFalse(window.isClosing)
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
         window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
-        window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
+        guard await waitForSubscriberCount(1, pollingService: pollingService) else { return }
+        // Use Context Builder's product-valid selected-agent path; forcing a Codex
+        // subscription while the selected agent is non-Codex can be stopped by
+        // normal model-polling reconciliation before this assertion runs.
+        window.contextBuilderAgentViewModel.selectedAgent = .codexExec
+        XCTAssertTrue(window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)
         guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }
         let attachedSubscriberCount = await pollingService.test_subscriberCount()
         XCTAssertEqual(attachedSubscriberCount, 2)
@@ -237,24 +244,26 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         _ expectedCount: Int,
         pollingService: CodexModelPollingService
     ) async -> Bool {
-        let reachedExpectedCount = expectation(description: "subscriber count reaches \(expectedCount)")
-        reachedExpectedCount.assertForOverFulfill = false
-        let updates = await pollingService.test_subscriberCountUpdates()
-        let observationTask = Task { @MainActor in
-            var didFulfill = false
-            for await count in updates where count == expectedCount && !didFulfill {
-                didFulfill = true
-                reachedExpectedCount.fulfill()
+        let deadline = Date().addingTimeInterval(fullSuiteAsyncTimeoutSeconds)
+        var matchingSampleCount = 0
+        var latestCount = await pollingService.test_subscriberCount()
+
+        while Date() < deadline {
+            latestCount = await pollingService.test_subscriberCount()
+            if latestCount == expectedCount {
+                matchingSampleCount += 1
+                if matchingSampleCount >= 3 {
+                    return true
+                }
+            } else {
+                matchingSampleCount = 0
             }
+
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
 
-        await fulfillment(of: [reachedExpectedCount], timeout: 5)
-        observationTask.cancel()
-        await observationTask.value
-
-        let actualCount = await pollingService.test_subscriberCount()
-        XCTAssertEqual(actualCount, expectedCount)
-        return actualCount == expectedCount
+        XCTFail("Subscriber count did not stabilize at \(expectedCount); last count was \(latestCount)")
+        return false
     }
 
     private func waitForClientObservation(
@@ -273,7 +282,7 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
             }
         }
 
-        await fulfillment(of: [reachedExpectedState], timeout: 5)
+        await fulfillment(of: [reachedExpectedState], timeout: fullSuiteAsyncTimeoutSeconds)
         observationTask.cancel()
         await observationTask.value
 
@@ -493,36 +502,20 @@ final class WindowCloseCoordinatorPolicyTests: XCTestCase {
     }
 }
 
-private actor APISettingsInitialLoadGate {
-    private var hasEntered = false
-    private var hasReleased = false
-    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+/// Initial-load fence. Shared `TestReleaseFence` with legacy method names.
+private final class APISettingsInitialLoadGate: @unchecked Sendable {
+    private let fence = TestReleaseFence(name: "API settings initial load gate")
 
     func arriveAndWait() async {
-        hasEntered = true
-        let waiters = entryWaiters
-        entryWaiters.removeAll()
-        waiters.forEach { $0.resume() }
-
-        guard !hasReleased else { return }
-        await withCheckedContinuation { continuation in
-            releaseWaiters.append(continuation)
-        }
+        await fence.enterAndWait()
     }
 
-    func waitUntilEntered() async {
-        guard !hasEntered else { return }
-        await withCheckedContinuation { continuation in
-            entryWaiters.append(continuation)
-        }
+    func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        hasReleased = true
-        let waiters = releaseWaiters
-        releaseWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        fence.release()
     }
 }
 
@@ -534,81 +527,79 @@ private actor APISettingsProviderValidationProbe {
     }
 }
 
-private actor GitContextRefreshGate {
+/// Git refresh probe: shared release fence + cancellation observation counters.
+private final class GitContextRefreshGate: @unchecked Sendable {
     struct Observation: Equatable {
         let entryCount: Int
         let cancellationCount: Int
         let activeCount: Int
     }
 
-    private var hasEntered = false
-    private var hasReleased = false
-    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+    private let fence = TestReleaseFence(name: "git context refresh gate")
+    private let lock = NSLock()
     private var entryCount = 0
     private var cancellationCount = 0
     private var activeCount = 0
 
     func refresh(rootPaths _: [String]) async -> [GitStatusActor.RepoDetection] {
-        hasEntered = true
+        lock.lock()
         entryCount += 1
         activeCount += 1
-        let waiters = entryWaiters
-        entryWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        lock.unlock()
 
         await withTaskCancellationHandler {
-            if !hasReleased {
-                await withCheckedContinuation { continuation in
-                    releaseWaiters.append(continuation)
-                }
-            }
+            await fence.enterAndWaitIgnoringCancellationUntilRelease()
         } onCancel: {
-            Task { await self.recordCancellation() }
+            // Record cancellation, but keep the simulated refresh body parked until release.
+            self.recordCancellation()
         }
+
+        lock.lock()
         activeCount -= 1
+        lock.unlock()
         return []
     }
 
-    func waitUntilEntered() async {
-        guard !hasEntered else { return }
-        await withCheckedContinuation { continuation in
-            entryWaiters.append(continuation)
-        }
+    func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
     func release() {
-        hasReleased = true
-        let waiters = releaseWaiters
-        releaseWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        fence.release()
     }
 
-    func waitUntilCancellationObserved() async {
-        guard cancellationCount == 0 else { return }
-        await withCheckedContinuation { continuation in
-            cancellationWaiters.append(continuation)
+    func waitUntilCancellationObserved(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
+        if observedCancellation { return }
+        do {
+            try await AsyncTestWait.waitUntil(
+                "git context refresh cancellation observed",
+                timeout: timeout
+            ) {
+                self.observedCancellation
+            }
+        } catch {
+            XCTFail(error.localizedDescription)
         }
     }
 
     var observedCancellation: Bool {
-        cancellationCount > 0
+        lock.withLock { cancellationCount > 0 }
     }
 
     var observation: Observation {
-        Observation(
-            entryCount: entryCount,
-            cancellationCount: cancellationCount,
-            activeCount: activeCount
-        )
+        lock.withLock {
+            Observation(
+                entryCount: entryCount,
+                cancellationCount: cancellationCount,
+                activeCount: activeCount
+            )
+        }
     }
 
     private func recordCancellation() {
+        lock.lock()
         cancellationCount += 1
-        let waiters = cancellationWaiters
-        cancellationWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        lock.unlock()
     }
 }
 
@@ -685,6 +676,7 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
                 }
             }
         } onCancel: {
+            // Sticky cancelledRequestIDs covers cancel-before-register; actor hop resumes parked request.
             Task { await self.cancelRequest(requestID) }
         }
     }

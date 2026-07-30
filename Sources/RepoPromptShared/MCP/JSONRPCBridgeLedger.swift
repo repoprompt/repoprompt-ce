@@ -36,6 +36,74 @@ public enum JSONRPCBridgeID: Hashable, Codable, Sendable, CustomStringConvertibl
         }
         return nil
     }
+
+    public static func parseJSONValue(_ value: Any?) -> JSONRPCBridgeID? {
+        guard let value else { return nil }
+        if value is NSNull { return .null }
+        if let value = value as? String { return .string(value) }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
+            return nil
+        }
+        let double = number.doubleValue
+        let integer = number.int64Value
+        guard double.isFinite, double == Double(integer) else { return nil }
+        return .number(integer)
+    }
+}
+
+public enum JSONRPCBridgeReplayPolicy {
+    private static let replayableMethods: Set<String> = [
+        "initialize",
+        "ping",
+        "tools/list",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+        "prompts/list",
+        "prompts/get",
+        "completion/complete"
+    ]
+
+    private static let replayableToolCalls: Set<String> = [
+        "file_search",
+        "get_code_structure",
+        "get_file_tree",
+        "git",
+        "oracle_utils",
+        "read_file",
+        "workspace_context"
+    ]
+
+    public static func isReplayableClientRequest(
+        method: String?,
+        tool: String?,
+        toolArguments: [String: Any]? = nil
+    ) -> Bool {
+        guard let method else { return false }
+        if replayableMethods.contains(method) {
+            return true
+        }
+        guard method == "tools/call", let tool else {
+            return false
+        }
+        if tool == "workspace_context" {
+            return isReplayableWorkspaceContext(arguments: toolArguments)
+        }
+        return replayableToolCalls.contains(tool)
+    }
+
+    private static func isReplayableWorkspaceContext(arguments: [String: Any]?) -> Bool {
+        guard let rawOperation = arguments?["op"] else {
+            return true
+        }
+        guard let operation = rawOperation as? String else {
+            return false
+        }
+        let normalized = operation.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty || normalized == "snapshot"
+    }
 }
 
 public struct JSONRPCBridgeMessageMetadata: Equatable, Sendable {
@@ -425,12 +493,13 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public let cancellationTombstoneCount: Int
     public let recentCompletionCount: Int
     public let pendingTransactionCount: Int
+    public let replayableClientRequestCount: Int
+    public let unreplayableActiveRequestCount: Int
     public let hasForwardedProtocolFrame: Bool
     public let terminalReason: String?
 
     public var canReconnect: Bool {
-        !hasForwardedProtocolFrame
-            && activeRequestCount == 0
+        unreplayableActiveRequestCount == 0
             && responseInDeliveryCount == 0
             && pendingTransactionCount == 0
             && terminalReason == nil
@@ -446,6 +515,8 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public func socketDrainBlockerDescription(partialByteCount: Int) -> String {
         [
             "active_requests=\(activeRequestCount)",
+            "replayable_client_requests=\(replayableClientRequestCount)",
+            "unreplayable_active_requests=\(unreplayableActiveRequestCount)",
             "pending_transactions=\(pendingTransactionCount)",
             "partial_bytes=\(max(0, partialByteCount))",
             "response_in_delivery=\(responseInDeliveryCount)",
@@ -513,6 +584,7 @@ public actor JSONRPCBridgeLedger {
         let method: String?
         let tool: String?
         let ordinal: UInt64
+        let isReplayable: Bool
     }
 
     private struct SuccessorRequest: Equatable {
@@ -571,7 +643,7 @@ public actor JSONRPCBridgeLedger {
 
     private struct ParsedMessage {
         enum Kind {
-            case request(id: JSONRPCBridgeID, method: String?, tool: String?)
+            case request(id: JSONRPCBridgeID, method: String?, tool: String?, toolArguments: [String: Any]?)
             case response(id: JSONRPCBridgeID)
             case notification(method: String?, cancellationID: JSONRPCBridgeID?)
             case invalidClientMessage(id: JSONRPCBridgeID?)
@@ -607,8 +679,10 @@ public actor JSONRPCBridgeLedger {
         guard terminalReason == nil else {
             throw JSONRPCBridgeLedgerError.terminal(terminalReason ?? "unknown")
         }
-        guard !hasForwardedProtocolFrame, active.isEmpty, pendingTransactions.isEmpty else {
-            throw failTerminal("reconnection_attempted_after_protocol_traffic")
+        guard pendingTransactions.isEmpty,
+              Self.unreplayableActiveRequestCount(in: active) == 0
+        else {
+            throw failTerminal("reconnection_attempted_with_unreplayable_work")
         }
         connectionGeneration &+= 1
         emit(phase: "connection_started", direction: nil, messages: [], prepared: nil, terminalReason: nil)
@@ -637,6 +711,7 @@ public actor JSONRPCBridgeLedger {
         }
 
         let token = UUID()
+        let frameIsBatch = Self.frameIsBatch(frame)
         var simulatedActive = active
         var simulatedNextOrdinal = nextRequestOrdinal
         var operations: [Operation] = []
@@ -645,7 +720,7 @@ public actor JSONRPCBridgeLedger {
 
         for (messageIndex, parsedMessage) in parsed.enumerated() {
             switch parsedMessage.kind {
-            case let .request(id, method, tool):
+            case let .request(id, method, tool, toolArguments):
                 guard id != .null else {
                     messages.append(JSONRPCBridgeMessageMetadata(
                         kind: .invalidClientMessage,
@@ -667,7 +742,18 @@ public actor JSONRPCBridgeLedger {
                     )
                 }
                 simulatedNextOrdinal &+= 1
-                let metadata = RequestMetadata(method: method, tool: tool, ordinal: simulatedNextOrdinal)
+                let metadata = RequestMetadata(
+                    method: method,
+                    tool: tool,
+                    ordinal: simulatedNextOrdinal,
+                    isReplayable: direction == .clientToServer
+                        && !frameIsBatch
+                        && JSONRPCBridgeReplayPolicy.isReplayableClientRequest(
+                            method: method,
+                            tool: tool,
+                            toolArguments: toolArguments
+                        )
+                )
                 if let existingState = simulatedActive[key] {
                     guard case let .responseInDelivery(
                         responseMetadata,
@@ -766,7 +852,12 @@ public actor JSONRPCBridgeLedger {
                         )
                     }
                     simulatedNextOrdinal &+= 1
-                    let metadata = RequestMetadata(method: nil, tool: nil, ordinal: simulatedNextOrdinal)
+                    let metadata = RequestMetadata(
+                        method: nil,
+                        tool: nil,
+                        ordinal: simulatedNextOrdinal,
+                        isReplayable: false
+                    )
                     if let existingState = simulatedActive[key] {
                         guard case let .responseInDelivery(
                             responseMetadata,
@@ -1021,18 +1112,49 @@ public actor JSONRPCBridgeLedger {
         return reason
     }
 
-    public func recordConnectionFailure(_ reason: String) -> Bool {
+    public func recordConnectionFailure(
+        _ reason: String,
+        now: TimeInterval = Date().timeIntervalSinceReferenceDate
+    ) -> Bool {
         if terminalReason != nil {
             emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: terminalReason)
             return true
         }
-        guard hasForwardedProtocolFrame || !active.isEmpty || !pendingTransactions.isEmpty else {
-            emit(phase: "startup_connection_failure", direction: nil, messages: [], prepared: nil, terminalReason: nil)
-            return false
+        if !pendingTransactions.isEmpty {
+            _ = failTerminal(reason)
+            emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
+            return true
+        }
+
+        abandonServerOriginatedRequests(now: now)
+        if terminalReason != nil {
+            emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: terminalReason)
+            return true
+        }
+
+        guard Self.unreplayableActiveRequestCount(in: active) == 0 else {
+            _ = failTerminal(reason)
+            emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
+            return true
+        }
+
+        let phase: String = if !active.isEmpty {
+            "active_connection_failure"
+        } else {
+            hasForwardedProtocolFrame ? "idle_connection_failure" : "startup_connection_failure"
+        }
+        emit(phase: phase, direction: nil, messages: [], prepared: nil, terminalReason: nil)
+        return false
+    }
+
+    @discardableResult
+    public func terminalizeConnection(reason: String) -> String {
+        if let terminalReason {
+            return terminalReason
         }
         _ = failTerminal(reason)
         emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
-        return true
+        return reason
     }
 
     public func snapshot(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> JSONRPCBridgeLedgerSnapshot {
@@ -1044,9 +1166,30 @@ public actor JSONRPCBridgeLedger {
             cancellationTombstoneCount: tombstones.count,
             recentCompletionCount: recentCompletions.count,
             pendingTransactionCount: pendingTransactions.count,
+            replayableClientRequestCount: Self.replayableClientRequestCount(in: active),
+            unreplayableActiveRequestCount: Self.unreplayableActiveRequestCount(in: active),
             hasForwardedProtocolFrame: hasForwardedProtocolFrame,
             terminalReason: terminalReason
         )
+    }
+
+    private func abandonServerOriginatedRequests(now: TimeInterval) {
+        guard !active.isEmpty else { return }
+        let abandoned = active.filter { key, _ in key.direction == .serverToClient }
+        for (key, state) in abandoned {
+            let metadata = state.metadata
+            guard tombstones.count < configuration.maximumCancellationTombstones else {
+                _ = failTerminal("cancellation_tombstone_capacity_exceeded")
+                return
+            }
+            tombstones[key] = Tombstone(
+                expiresAt: now + configuration.cancellationTombstoneTTL,
+                ordinal: metadata.ordinal,
+                method: metadata.method,
+                tool: metadata.tool
+            )
+            active.removeValue(forKey: key)
+        }
     }
 
     private func purgeExpiredTombstones(now: TimeInterval) {
@@ -1055,6 +1198,22 @@ public actor JSONRPCBridgeLedger {
 
     private static func activeRequestCount(in states: [RequestKey: RequestState]) -> Int {
         states.values.reduce(0) { $0 + $1.requestCount }
+    }
+
+    private static func replayableClientRequestCount(in states: [RequestKey: RequestState]) -> Int {
+        states.reduce(0) { partial, element in
+            guard element.key.direction == .clientToServer,
+                  case let .forwarded(metadata) = element.value,
+                  metadata.isReplayable
+            else {
+                return partial
+            }
+            return partial + 1
+        }
+    }
+
+    private static func unreplayableActiveRequestCount(in states: [RequestKey: RequestState]) -> Int {
+        activeRequestCount(in: states) - replayableClientRequestCount(in: states)
     }
 
     private static func appendCompletion(
@@ -1141,6 +1300,7 @@ public actor JSONRPCBridgeLedger {
 
             let hasID = dictionary.keys.contains("id")
             let id = hasID ? parseID(dictionary["id"]) : nil
+            let hasMethod = dictionary.keys.contains("method")
             let method = dictionary["method"] as? String
             let hasResult = dictionary.keys.contains("result")
             let hasError = dictionary.keys.contains("error")
@@ -1150,6 +1310,7 @@ public actor JSONRPCBridgeLedger {
                     dictionary,
                     hasID: hasID,
                     id: id,
+                    hasMethod: hasMethod,
                     method: method,
                     hasResult: hasResult,
                     hasError: hasError
@@ -1170,8 +1331,14 @@ public actor JSONRPCBridgeLedger {
 
             if let method {
                 let tool = extractTool(from: dictionary, method: method)
+                let toolArguments = extractToolArguments(from: dictionary, method: method)
                 if let id, id != .null {
-                    messages.append(ParsedMessage(kind: .request(id: id, method: method, tool: tool)))
+                    messages.append(ParsedMessage(kind: .request(
+                        id: id,
+                        method: method,
+                        tool: tool,
+                        toolArguments: toolArguments
+                    )))
                 } else if hasID {
                     if direction == .clientToServer {
                         messages.append(ParsedMessage(kind: .invalidClientMessage(id: id)))
@@ -1199,25 +1366,27 @@ public actor JSONRPCBridgeLedger {
         return messages
     }
 
-    private static func parseID(_ value: Any?) -> JSONRPCBridgeID? {
-        guard let value else { return nil }
-        if value is NSNull { return .null }
-        if let value = value as? String { return .string(value) }
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID()
-        else {
-            return nil
+    private static func frameIsBatch(_ frame: Data) -> Bool {
+        for byte in frame {
+            switch byte {
+            case UInt8(ascii: " "), UInt8(ascii: "\n"), UInt8(ascii: "\r"), UInt8(ascii: "\t"):
+                continue
+            default:
+                return byte == UInt8(ascii: "[")
+            }
         }
-        let double = number.doubleValue
-        let integer = number.int64Value
-        guard double.isFinite, double == Double(integer) else { return nil }
-        return .number(integer)
+        return false
+    }
+
+    private static func parseID(_ value: Any?) -> JSONRPCBridgeID? {
+        JSONRPCBridgeID.parseJSONValue(value)
     }
 
     private static func validateBackendEnvelope(
         _ dictionary: [String: Any],
         hasID: Bool,
         id: JSONRPCBridgeID?,
+        hasMethod: Bool,
         method: String?,
         hasResult: Bool,
         hasError: Bool
@@ -1232,7 +1401,7 @@ public actor JSONRPCBridgeLedger {
             throw JSONRPCBridgeLedgerError.malformedBackendFrame
         }
         if hasResult || hasError {
-            guard method == nil,
+            guard !hasMethod,
                   hasID,
                   id != nil,
                   hasResult != hasError
@@ -1293,6 +1462,15 @@ public actor JSONRPCBridgeLedger {
         return params["name"] as? String
     }
 
+    private static func extractToolArguments(from dictionary: [String: Any], method: String) -> [String: Any]? {
+        guard method == "tools/call",
+              let params = dictionary["params"] as? [String: Any]
+        else {
+            return nil
+        }
+        return params["arguments"] as? [String: Any]
+    }
+
     private static func cancellationID(from dictionary: [String: Any]) -> JSONRPCBridgeID? {
         guard let params = dictionary["params"] as? [String: Any] else { return nil }
         return parseID(params["requestId"] ?? params["id"])
@@ -1341,18 +1519,7 @@ public enum JSONRPCBridgeFrameInspector {
     }
 
     private static func parseID(_ value: Any?) -> JSONRPCBridgeID? {
-        guard let value else { return nil }
-        if value is NSNull { return .null }
-        if let value = value as? String { return .string(value) }
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID()
-        else {
-            return nil
-        }
-        let double = number.doubleValue
-        let integer = number.int64Value
-        guard double.isFinite, double == Double(integer) else { return nil }
-        return .number(integer)
+        JSONRPCBridgeID.parseJSONValue(value)
     }
 }
 

@@ -10,6 +10,7 @@ struct AgentRunTerminalCommitRevision: Equatable {
     let commitID: UUID
     let ownership: AgentRunOwnership
     let terminalState: AgentSessionRunState
+    let expectedRunID: UUID?
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
     let providerDrainGeneration: UInt64
@@ -278,6 +279,7 @@ final class AgentRunTerminalCommitBarrier {
             commitID: UUID(),
             ownership: request.ownership,
             terminalState: request.terminalState,
+            expectedRunID: request.expectedRunID,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: request.providerDrainGeneration,

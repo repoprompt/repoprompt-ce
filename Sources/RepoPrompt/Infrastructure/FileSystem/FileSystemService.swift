@@ -26,6 +26,28 @@ struct FileSystemMutationWaiter {
     let continuation: CheckedContinuation<Void, any Error>
 }
 
+enum FileSystemMutationCompletion {
+    case success
+    case failure(any Error)
+
+    func get() throws {
+        switch self {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
+        }
+    }
+}
+
+final class FileSystemServiceFSEventCallbackContext {
+    weak var service: FileSystemService?
+
+    init(service: FileSystemService) {
+        self.service = service
+    }
+}
+
 actor FileSystemService {
     // Internal for FileSystemService same-target extensions only.
     // These are not public API; preserve actor isolation when accessing them.
@@ -66,6 +88,13 @@ actor FileSystemService {
         if let watcherAcceptedWatermark {
             lastPublishedWatcherAcceptedWatermark = max(lastPublishedWatcherAcceptedWatermark, watcherAcceptedWatermark)
         }
+        recordSeedReplayPublication(
+            source: source,
+            watcherAcceptedWatermark: watcherAcceptedWatermark,
+            requiresFullResync: requiresFullResync,
+            deltas: deltas,
+            servicePublicationSequence: servicePublicationSequence
+        )
         let publication = FileSystemDeltaPublication(
             servicePublicationSequence: servicePublicationSequence,
             source: source,
@@ -143,8 +172,17 @@ actor FileSystemService {
         /// Test-only hook invoked inside each real-filesystem parallel folder enumeration worker.
         var parallelFolderEnumerationHookForTesting: (@Sendable (String) async throws -> Void)?
 
+        /// Test-only barrier immediately before namespace-manifest authority fencing.
+        var workspaceRootNamespaceEnumerationWillFinishHandler: (@Sendable () async -> Void)?
+
         /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+
+        /// Test-only gate immediately before the request installs its mutation waiter.
+        var mutationWaiterWillRegisterHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+
+        /// Test-only replacement for UTF-8 materialization inside the detached create worker.
+        var createFileDataPreparationForTesting: (@Sendable (String) async throws -> Data)?
 
         /// Test-only replacement for the real Finder Trash operation.
         var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
@@ -155,22 +193,35 @@ actor FileSystemService {
         }
 
         var watcherActivationFailurePointForTesting: WatcherActivationFailurePoint?
+        var seededPublicationActivationShouldFailForTesting = false
         var folderScanFailuresRemainingForTesting: [String: Int] = [:]
     #endif
 
     /// Request waiters are actor-owned and may be cancelled independently from detached filesystem I/O.
     var mutationWaiters: [UUID: FileSystemMutationWaiter] = [:]
+    /// A detached mutation may reconcile before its request installs a waiter. Retain that
+    /// terminal result so the request consumes it instead of waiting forever.
+    var mutationCompletionMailbox: [UUID: FileSystemMutationCompletion] = [:]
+    /// Cancellation wins over a later uncancellable I/O completion, which must still reconcile
+    /// but must not leave an unconsumed mailbox entry.
+    var cancelledMutationWaiterIDs: Set<UUID> = []
+    /// Finder Trash can remove the source promptly but keep `trashItem` blocked for tens of
+    /// seconds. The first terminal observer owns reconciliation for each trash mutation.
+    var trashMutationsAwaitingReconciliation: Set<UUID> = []
     var deferredEditPublicationsByMutationID: [UUID: FileSystemDeferredEditPublication] = [:]
 
-    /// Tracks paths we know about, to detect additions/removals
-    var visitedPaths = Set<String>()
+    /// Tracks paths we know about, to detect additions/removals. Ordinary roots
+    /// keep the legacy in-memory representation; seeded roots retain their
+    /// authenticated spill manifest and only overlay post-cut mutations.
+    let visitedInventory = FileSystemVisitedInventory()
+    lazy var visitedPaths = visitedInventory.paths
 
     /// Ignored regular files retained only because an explicit app/MCP request manages them.
     /// Ordinary catalog files that later become ignored must not acquire this provenance.
     var explicitlyManagedIgnoredFilePaths = Set<String>()
 
     /// True => directory, False => file
-    var visitedItems = [String: Bool]()
+    lazy var visitedItems = visitedInventory.items
 
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
@@ -183,6 +234,7 @@ actor FileSystemService {
     var nextServicePublicationSequence: UInt64 = 0
     var lastServicePublicationSequence: UInt64 = 0
     var lastPublishedWatcherAcceptedWatermark = FileSystemWatcherIngressMailbox.Watermark.zero
+    var seedInitializationState: FileSystemSeedInitializationState?
     #if DEBUG
         struct FreshnessWorkDiagnosticsSnapshot: Equatable {
             let flushCallCount: Int
@@ -204,11 +256,13 @@ actor FileSystemService {
         var freshnessMaxWatcherBatchSize = 0
     #endif
 
-    /// Retained pointer to self (to avoid deallocation while FSEvent stream is active)
-    var selfPointer: UnsafeMutableRawPointer?
+    /// Retained FSEvent callback context. The context holds the service weakly so an
+    /// un-stopped stream cannot keep the actor alive forever.
+    var fseventCallbackContextPointer: UnsafeMutableRawPointer?
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules
+    var catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity
 
     var ignoreCacheStore = IgnoreCacheStore()
 
@@ -219,6 +273,7 @@ actor FileSystemService {
     let path: String
     let rootURL: URL
     let canonicalRootURL: URL
+    let ignoreRulePolicy: IgnoreRulePolicy
     var canonicalRootPath: String {
         canonicalRootURL.path
     }
@@ -227,7 +282,10 @@ actor FileSystemService {
         rootURL.path
     }
 
-    var respectGitignore: Bool
+    deinit {
+        stopFSEventStream()
+    }
+
     var respectRepoIgnore: Bool
     var respectCursorignore: Bool
     var skipSymlinks: Bool
@@ -237,6 +295,7 @@ actor FileSystemService {
 
     /// Monotonic revision incremented each time ignore files change
     var ignoreRulesRevision: UInt64 = 0
+    var pendingIgnoreRulesRebuildCount = 0
     /// Directories affected by ignore file changes since last consumption
     var pendingIgnoreChangeDirs: Set<String> = []
 
@@ -316,7 +375,6 @@ actor FileSystemService {
     /// an FSEvents replay cut before the caller begins the initial crawl.
     init(
         path: String,
-        respectGitignore: Bool = true,
         respectRepoIgnore: Bool = true,
         respectCursorignore: Bool = true,
         skipSymlinks: Bool = true,
@@ -325,7 +383,7 @@ actor FileSystemService {
         self.path = path
         rootURL = URL(fileURLWithPath: path).standardizedFileURL
         canonicalRootURL = rootURL.resolvingSymlinksInPath()
-        self.respectGitignore = respectGitignore
+        ignoreRulePolicy = try IgnoreRulePolicy.resolvingLoadedRoot(rootURL)
         self.respectRepoIgnore = respectRepoIgnore
         self.respectCursorignore = respectCursorignore
         self.skipSymlinks = skipSymlinks
@@ -345,12 +403,22 @@ actor FileSystemService {
             try? await Task.sleep(nanoseconds: nanoseconds)
         }
 
-        // Load fresh ignore rules from manager, no caching done by manager
-        ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+        // Load fresh ignore rules and the exact global-policy provenance together.
+        let resolvedIgnoreRules = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
             for: path,
-            respectGitignore: respectGitignore,
             respectRepoIgnore: respectRepoIgnore,
-            respectCursorignore: respectCursorignore
+            respectCursorignore: respectCursorignore,
+            policy: ignoreRulePolicy
+        )
+        ignoreRules = resolvedIgnoreRules.rules
+        catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+            schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+            mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+            globalIgnoreDefaultsDigest: resolvedIgnoreRules.globalIgnoreDefaultsDigest,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            enableHierarchicalIgnores: enableHierarchicalIgnores,
+            skipSymlinks: skipSymlinks
         )
 
         // Initialize root-level ignore rules in per-folder cache
@@ -365,12 +433,38 @@ actor FileSystemService {
             mutationIOWillBeginHandler = handler
         }
 
+        func setMutationWaiterWillRegisterHandlerForTesting(
+            _ handler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+        ) {
+            mutationWaiterWillRegisterHandler = handler
+        }
+
+        func setCreateFileDataPreparationForTesting(
+            _ preparation: (@Sendable (String) async throws -> Data)?
+        ) {
+            createFileDataPreparationForTesting = preparation
+        }
+
         func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
             moveItemToTrashIOForTesting = operation
         }
 
+        func setWorkspaceRootNamespaceEnumerationWillFinishHandlerForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            workspaceRootNamespaceEnumerationWillFinishHandler = handler
+        }
+
+        func setPendingIgnoreRulesRebuildCountForTesting(_ count: Int) {
+            pendingIgnoreRulesRebuildCount = count
+        }
+
         func pendingMutationWaiterCountForTesting() -> Int {
             mutationWaiters.count
+        }
+
+        func pendingMutationCompletionCountForTesting() -> Int {
+            mutationCompletionMailbox.count
         }
 
         func pendingDeferredEditPublicationCountForTesting() -> Int {
@@ -380,7 +474,6 @@ actor FileSystemService {
         /// Test-only initializer that allows injecting initial state
         init(
             path: String,
-            respectGitignore: Bool = true,
             respectRepoIgnore: Bool = true,
             respectCursorignore: Bool = true,
             skipSymlinks: Bool = true,
@@ -402,7 +495,7 @@ actor FileSystemService {
             self.path = path
             rootURL = URL(fileURLWithPath: path).standardizedFileURL
             canonicalRootURL = rootURL.resolvingSymlinksInPath()
-            self.respectGitignore = respectGitignore
+            ignoreRulePolicy = try IgnoreRulePolicy.resolvingLoadedRoot(rootURL)
             self.respectRepoIgnore = respectRepoIgnore
             self.respectCursorignore = respectCursorignore
             self.skipSymlinks = skipSymlinks
@@ -424,17 +517,28 @@ actor FileSystemService {
             recoveryScanRetryBaseNanoseconds = recoveryScanRetryBaseNanosecondsOverride ?? 50_000_000
             self.recoveryScanSleep = recoveryScanSleep
 
-            // Use test data if provided
-            if let paths = testVisitedPaths {
-                visitedPaths = paths
-            }
-            if let items = testVisitedItems {
-                visitedItems = items
+            // Use test data if provided.
+            if testVisitedPaths != nil || testVisitedItems != nil {
+                visitedInventory.installOrdinary(
+                    paths: testVisitedPaths ?? [],
+                    items: testVisitedItems ?? [:]
+                )
             }
 
-            // Use test ignore rules or load fresh ones
+            // Use test ignore rules or load fresh rules with their exact global-policy provenance.
             if let rules = testIgnoreRules {
                 ignoreRules = rules
+                catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+                    schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+                    mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+                    globalIgnoreDefaultsDigest: IgnoreRulesManager.globalIgnoreDefaultsDigest(
+                        for: IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
+                    ),
+                    respectRepoIgnore: respectRepoIgnore,
+                    respectCursorignore: respectCursorignore,
+                    enableHierarchicalIgnores: enableHierarchicalIgnores,
+                    skipSymlinks: skipSymlinks
+                )
             } else {
                 #if DEBUG
                     // Pass the fileManagerOverride to IgnoreRulesManager if we have one
@@ -442,11 +546,21 @@ actor FileSystemService {
                         await IgnoreRulesManager.shared.setFileManagerOverride(override)
                     }
                 #endif
-                ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
+                let resolvedIgnoreRules = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
                     for: path,
-                    respectGitignore: respectGitignore,
                     respectRepoIgnore: respectRepoIgnore,
-                    respectCursorignore: respectCursorignore
+                    respectCursorignore: respectCursorignore,
+                    policy: ignoreRulePolicy
+                )
+                ignoreRules = resolvedIgnoreRules.rules
+                catalogPolicyIdentity = WorkspaceRootCatalogPolicyIdentity(
+                    schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
+                    mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
+                    globalIgnoreDefaultsDigest: resolvedIgnoreRules.globalIgnoreDefaultsDigest,
+                    respectRepoIgnore: respectRepoIgnore,
+                    respectCursorignore: respectCursorignore,
+                    enableHierarchicalIgnores: enableHierarchicalIgnores,
+                    skipSymlinks: skipSymlinks
                 )
             }
 

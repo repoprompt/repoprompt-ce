@@ -408,6 +408,11 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         for meta in aiMessage.metaPrompts {
             additionsForFinalUserMessage += meta + "\n"
         }
+        if !aiMessage.disabledPromptSections.contains(.gitDiff),
+           !aiMessage.gitDiffXML.isEmpty
+        {
+            additionsForFinalUserMessage += aiMessage.gitDiffXML + "\n"
+        }
 
         // Find the index of the last user message
         let conversation = aiMessage.conversationMessages
@@ -445,6 +450,14 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
 
         return results
     }
+
+    #if DEBUG
+        func serializedMessagesForTesting(
+            _ aiMessage: AIMessage
+        ) -> [CompletionParams.Message] {
+            createMessages(for: aiMessage)
+        }
+    #endif
 
     /// completeMessage now accepts temperature as a param
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {

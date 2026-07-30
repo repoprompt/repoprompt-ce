@@ -1,0 +1,162 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/wave1-after-mention-coordinator-20260702.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.MentionCoordinatorTests",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.MentionCoordinatorTests",
+  "git": {
+    "commit": "4423bf1dbe103a11fc2a83a4c1e0fbdea098101e",
+    "working_tree": " M docs/test-suite-optimizer/scoreboard.md\n?? docs/test-suite-optimizer/artifacts/wave1-after-contextbuilder-startup-20260702.json\n?? docs/test-suite-optimizer/artifacts/wave1-after-worktree-exact-20260702.json"
+  },
+  "inventory": null,
+  "label": "wave1-after-mention-coordinator-20260702",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.MentionCoordinatorTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.936492919921875,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/84a3a792-bd5c-4a81-a754-b3d9f276d991.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0020720958709716797,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.MentionCoordinatorTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.9761831760406494,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/8c6cca86-301d-4e71-ac17-4ab00254c3aa.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0027098655700683594,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.MentionCoordinatorTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.9782528877258301,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3693c67a-621f-4aa7-be2f-6566ef665e67.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0032930374145507812,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.155,
+      "median_aggregate_seconds": 0.158,
+      "method_count": 4,
+      "suite": "RepoPromptTests.MentionCoordinatorTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.155,
+      "median_seconds": 0.154,
+      "method": "testClickingAncestorWindowMakesThatLevelCurrentForFurtherNavigation",
+      "observations": 3,
+      "observed_p95_seconds": 0.155,
+      "suite": "RepoPromptTests.MentionCoordinatorTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testWorkspaceReuseKeepsSuggestionsAndCommitRemovalOnNewFileManager",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.MentionCoordinatorTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testDeallocatedManagerUpdatingToNilInvalidatesActiveMentionState",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.MentionCoordinatorTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testWorkspaceSwitchInvalidatesStaleDebouncedQuery",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.MentionCoordinatorTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 0,
+    "median_seconds": 0.9761831760406494,
+    "noise_classification": "stable",
+    "observed_p95_seconds": 0.9782528877258301,
+    "raw_execution_seconds": [
+      0.936492919921875,
+      0.9761831760406494,
+      0.9782528877258301
+    ],
+    "relative_mad": 0.002120208313336552,
+    "valid_samples": 3
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T16:15:14+00:00"
+}

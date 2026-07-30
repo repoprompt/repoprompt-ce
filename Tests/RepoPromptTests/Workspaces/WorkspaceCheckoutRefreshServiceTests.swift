@@ -1,45 +1,23 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class WorkspaceCheckoutRefreshServiceTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
-    func testRefreshAfterCheckoutMutationRemovesStaleCodemapSnapshotsBeforeFreshScanCompletes() async throws {
+    func testRefreshAfterCheckoutMutationFencesCodemapAuthorityWithoutRescan() async throws {
         let root = try makeTemporaryRoot(name: "CheckoutRefreshCodemap")
         let file = root.appendingPathComponent("Sources/App.swift")
         try write("func branchBSymbol() {}\n", to: file)
 
         let store = WorkspaceFileContextStore()
         let record = try await store.loadRoot(path: root.path)
-        let staleAPI = makeFileAPI(path: file.path, symbolName: "branchASymbol")
-        await store.applyObservedCodemapResults([
-            WorkspaceObservedCodemapResult(fullPath: file.path, modificationDate: Date(), fileAPI: staleAPI)
-        ])
-        let snapshotBeforeRefresh = await store.codemapSnapshot(rootID: record.id, relativePath: "Sources/App.swift")
-        XCTAssertNotNil(snapshotBeforeRefresh)
-
         let service = WorkspaceCheckoutRefreshService(store: store, searchService: WorkspaceSearchService())
         let result = await service.refreshAfterCheckoutMutation(rootPath: root.path)
+        await Task.yield()
 
-        let resolvedFileID = await storeFileID(in: record.id, relativePath: "Sources/App.swift", store: store)
-        let fileID = try XCTUnwrap(resolvedFileID)
+        let operations = await store.codemapPresentationOperationCountsForTesting()
         XCTAssertTrue(result.didRefreshLoadedRoot)
         XCTAssertEqual(result.refreshedRootIDs, [record.id])
-        XCTAssertTrue(result.removedStaleCodemapFileIDs.contains(fileID))
-        let snapshotAfterRefresh = await store.codemapSnapshot(rootID: record.id, relativePath: "Sources/App.swift")
-        XCTAssertNil(snapshotAfterRefresh)
-        let snapshots = await store.codemapSnapshotDictionary()
-        XCTAssertFalse(snapshots.values.contains { snapshot in
-            snapshot.fileAPI?.apiDescription.contains("branchASymbol") == true
-        })
+        XCTAssertEqual(operations.artifactDemandRequests, 0)
+        XCTAssertEqual(operations.presentationFreezeRequests, 0)
     }
 
     func testRefreshAfterCheckoutMutationRebuildsVisibleSearchIndexFromFreshCatalogSnapshot() async throws {
@@ -126,42 +104,12 @@ final class WorkspaceCheckoutRefreshServiceTests: XCTestCase {
         XCTAssertTrue(branchSearch.results.isEmpty)
     }
 
-    private func storeFileID(in rootID: UUID, relativePath: String, store: WorkspaceFileContextStore) async -> UUID? {
-        await store.file(rootID: rootID, relativePath: relativePath)?.id
-    }
-
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
-    }
-
-    private func makeFileAPI(path: String, symbolName: String) -> FileAPI {
-        FileAPI(
-            filePath: path,
-            imports: [],
-            classes: [],
-            functions: [
-                FunctionInfo(
-                    name: symbolName,
-                    parameters: [],
-                    returnType: nil,
-                    definitionLine: "func \(symbolName)()",
-                    lineNumber: 1
-                )
-            ],
-            enums: [],
-            globalVars: [],
-            macros: [],
-            referencedTypes: []
-        )
     }
 }

@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class AgentRunSessionStoreRegistrationTests: XCTestCase {
@@ -14,7 +14,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: firstCursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: first)
+        try await waitForAgentRunSessionStoreWaiter(registration: first)
 
         let replacement = await AgentRunSessionStore.register(sessionID: sessionID)
         let disposition = await waiter.value
@@ -49,7 +49,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let epoch = try await beginEpoch(
             registration: registration,
@@ -80,7 +80,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
         let commitID = UUID()
@@ -122,6 +122,12 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
             expected: nil,
             kind: .initial
         )
+        await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
+            makeSnapshot(sessionID: sessionID, status: .running),
+            cursor: .init(registration: registration, epoch: firstEpoch),
+            reason: .steeringRequested,
+            steeringMessage: "old epoch steering"
+        )
         let secondEpoch = try await beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -132,7 +138,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: secondCursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let oldTerminal = makeSnapshot(sessionID: sessionID, status: .completed)
         let staleResult = await AgentRunSessionStore.publishTerminal(
@@ -215,7 +221,8 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeSnapshot(sessionID: sessionID, status: .running),
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: "late steering after terminal"
         )
         let stored = await AgentRunSessionStore.snapshot(for: cursor)
         let disposition = await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 0)
@@ -240,7 +247,8 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         await AgentRunSessionStore.wakeCurrentWaiters(
             running,
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: "edge-triggered only"
         )
 
         let disposition = await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 0)
@@ -263,25 +271,33 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let firstWait = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
+        let steeringMessage = "deliver this steering once"
         await AgentRunSessionStore.wakeCurrentWaiters(
             running,
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage
         )
         let firstDisposition = await firstWait.value
-        XCTAssertEqual(firstDisposition, .noteworthySnapshot(running, .steeringRequested))
+        XCTAssertEqual(firstDisposition, .noteworthySnapshot(.init(
+            snapshot: running,
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage
+        )))
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             running,
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: "dropped duplicate one"
         )
         await AgentRunSessionStore.wakeCurrentWaiters(
             running,
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: "dropped duplicate two"
         )
 
         let freshDisposition = await AgentRunSessionStore.waitUntilInteresting(
@@ -304,11 +320,17 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let cursor = AgentRunSessionStore.WaitCursor(registration: registration, epoch: epoch)
         let running = makeSnapshot(sessionID: sessionID, status: .running)
 
+        let steeringMessage = "sticky signaled steering"
+        let steeringOriginRunID = UUID()
         await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
             running,
             cursor: cursor,
-            reason: .instructionDelivered
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: steeringOriginRunID
         )
+        let refreshedRunning = makeSnapshot(sessionID: sessionID, status: .running)
+        await AgentRunSessionStore.signalSnapshot(refreshedRunning, cursor: cursor)
 
         let firstDisposition = await AgentRunSessionStore.waitUntilInteresting(
             cursor: cursor,
@@ -318,7 +340,12 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
             cursor: cursor,
             timeoutSeconds: 0
         )
-        XCTAssertEqual(firstDisposition, .noteworthySnapshot(running, .instructionDelivered))
+        XCTAssertEqual(firstDisposition, .noteworthySnapshot(.init(
+            snapshot: refreshedRunning,
+            reason: .steeringRequested,
+            steeringMessage: steeringMessage,
+            steeringOriginRunID: steeringOriginRunID
+        )))
         XCTAssertEqual(secondDisposition, .timedOut)
         await AgentRunSessionStore.cleanup(registration: registration)
     }
@@ -339,7 +366,8 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
             running,
             cursor: cursor,
-            reason: .steeringRequested
+            reason: .steeringRequested,
+            steeringMessage: "discarded by actionable publication"
         )
         await AgentRunSessionStore.signalSnapshot(actionable, cursor: cursor)
 
@@ -361,7 +389,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         var interactionSnapshot = makeSnapshot(sessionID: sessionID, status: .waitingForInput)
         interactionSnapshot = AgentRunMCPSnapshot(
@@ -414,7 +442,7 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         let waiter = Task {
             await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 1)
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
 
         let result = await AgentRunSessionStore.publishTerminal(
             .init(epoch: epoch, snapshot: makeSnapshot(sessionID: sessionID, status: .completed)),
@@ -452,14 +480,14 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
                 return disposition
             }
         }
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         let first = try await beginEpoch(
             registration: registration,
             activationID: activationID,
             expected: nil,
             kind: .initial
         )
-        try await waitForWaiter(registration: registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: registration)
         _ = try await beginEpoch(
             registration: registration,
             activationID: activationID,
@@ -514,16 +542,6 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
             throw TestFailure.missingEpoch
         }
         return epoch
-    }
-
-    private func waitForWaiter(registration: AgentRunSessionStore.Registration) async throws {
-        for _ in 0 ..< 200 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            await Task.yield()
-        }
-        XCTFail("Timed out waiting for waiter registration")
     }
 
     private func durationSeconds(_ duration: Duration) -> TimeInterval {

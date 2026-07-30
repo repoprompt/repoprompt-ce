@@ -23,6 +23,12 @@ jobs:
       - name: Package ad-hoc release candidate
         run: ./Scripts/release.sh artifact
 
+      - name: Smoke release-candidate packaged MCP roundtrip
+        run: |
+          ./Scripts/smoke_packaged_mcp_roundtrip.sh \
+            ".build/release/RepoPrompt.app" \
+            "Release-candidate packaged app" \
+            ".build/release/RepoPrompt-artifact-manifest.json"
       - name: Upload release-candidate artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

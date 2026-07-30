@@ -26,11 +26,14 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
-    private var fileCount: Int {
-        AgentContextExportResolver.displayFileCount(
-            resolvedModel: nil,
-            sourceSelection: currentExportSourceSelection
-        )
+    private var selectionSummary: AgentContextSelectionSummary {
+        if let summary = runtimeVM.snapshot.selectionSummary {
+            return summary
+        }
+        if let count = runtimeVM.snapshot.selectionFileCount {
+            return .filesOnly(count)
+        }
+        return AgentContextExportResolver.selectionSummary(for: currentExportSourceSelection)
     }
 
     private var currentExportSourceSelection: StoredSelection {
@@ -55,11 +58,7 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
-    private var fileSummaryText: String {
-        "\(fileCount) file\(fileCount == 1 ? "" : "s")"
-    }
-
-    private var contextUsageTooltip: String {
+    private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
         if let usedTokens = estimatedUsedTokens,
@@ -74,7 +73,7 @@ struct AgentContextPill: View {
             lines.append("Context usage unavailable")
         }
 
-        lines.append("Selected: \(fileSummaryText)")
+        lines.append("Selected: \(detailedFileSummaryText)")
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
@@ -87,14 +86,19 @@ struct AgentContextPill: View {
             let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.context")
         #endif
         let cornerRadius = AgentPillMetrics.cornerRadius()
+        let summary = selectionSummary
+        let compactFileSummaryText = summary.compactText
+        let detailedFileSummaryText = summary.headlineText
+
         Button {
             showPopover.toggle()
         } label: {
             HStack(spacing: 6) {
-                Text(fileSummaryText)
+                Text(compactFileSummaryText)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
 
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
@@ -112,7 +116,9 @@ struct AgentContextPill: View {
             )
         }
         .buttonStyle(.plain)
-        .hoverTooltip(contextUsageTooltip, .top)
+        .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
+        .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
+        .accessibilityHint("Opens context export controls and usage details")
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             contextPopoverContent
         }
@@ -122,8 +128,13 @@ struct AgentContextPill: View {
     private var contextPopoverContent: some View {
         // Width grows with the font scale so the export card never feels
         // pinched at Large/Extra Large.
-        let popoverWidth = fontPreset.scaledClamped(360, max: 480)
-        VStack(alignment: .leading, spacing: 10) {
+        let popoverWidth = fontPreset.scaledClamped(420, max: 520)
+        let summary = selectionSummary
+        let fileCount = summary.totalExplicitFileCount
+        let visibleManagerRows = min(max(fileCount, 3), 7)
+        let managerIdealHeight = min(360, Double(visibleManagerRows) * 40 + 54)
+
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
@@ -134,14 +145,21 @@ struct AgentContextPill: View {
                     style: .labeled
                 )
                 Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Selected")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                        .foregroundStyle(.tertiary)
-                    Text("\(fileCount) files")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                }
             }
+
+            AgentSelectedFilesInlineManager(
+                promptManager: promptManager,
+                selectionCoordinator: selectionCoordinator,
+                currentTabID: currentTabID,
+                activeAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: worktreeBindingsProvider,
+                summary: summary
+            )
+            .frame(
+                minHeight: 124,
+                idealHeight: managerIdealHeight,
+                maxHeight: 360
+            )
 
             Divider()
 
@@ -151,6 +169,7 @@ struct AgentContextPill: View {
                 selectionCoordinator: selectionCoordinator,
                 fileCount: fileCount,
                 selectionTokens: selectionTokens,
+                showsFilesButton: false,
                 currentTabID: currentTabID,
                 activeAgentSessionID: activeAgentSessionID,
                 worktreeBindingsProvider: worktreeBindingsProvider

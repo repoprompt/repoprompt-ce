@@ -35,9 +35,17 @@ struct AgentModeView: View {
         _navigationController = StateObject(wrappedValue: AgentModeNavigationController(isSystemWorkspaceMode: isSystem))
         _rootsSidebarStore = StateObject(wrappedValue: AgentWorkspaceRootsSidebarStore(
             rootProjections: { windowState.workspaceFilesViewModel.visibleRootShellProjections },
-            rootChanges: windowState.workspaceFilesViewModel.objectWillChange.map { _ in () }.eraseToAnyPublisher(),
+            rootChanges: windowState.workspaceFilesViewModel.rootShellProjectionsChangedPublisher,
             gitContextLookup: { promptManager.gitViewModel.gitWorktreeContext(forStandardizedRootPath: $0) },
             gitContextChanges: promptManager.gitViewModel.gitWorktreeContextChanges,
+            codemapStatusLookup: { windowState.workspaceFilesViewModel.codemapRootStatus(rootID: $0) },
+            codemapStatusChanges: windowState.workspaceFilesViewModel.codemapRootStatusesChangedPublisher,
+            setCodemapSuspended: { rootID, suspended in
+                await windowState.workspaceFilesViewModel.setCodemapGenerationSuspended(
+                    rootID: rootID,
+                    suspended: suspended
+                )
+            },
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))
@@ -192,6 +200,7 @@ struct AgentModeChatDetailView: View {
 
     // Non-grouped state
     @State private var resetTextFieldTrigger = false
+    @State private var isTranscriptWindowExpanded = false
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
 
     // MARK: - Computed Shims (bridge existing references to struct members)
@@ -1550,7 +1559,7 @@ struct AgentModeChatDetailView: View {
             !block.rows.isEmpty
         case .groupedHistory:
             !(block.groupedHistory?.sections.isEmpty ?? true)
-        case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
+        case .request, .collapsedHistoryRange, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             false
         }
     }
@@ -1602,6 +1611,8 @@ struct AgentModeChatDetailView: View {
             }
         case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             return block.rows
+        case .collapsedHistoryRange:
+            return []
         }
     }
 
@@ -1940,6 +1951,7 @@ struct AgentModeChatDetailView: View {
                 .onAppear {
                     if let currentTabID {
                         agentModeVM.setCompressedHistoryVisibility(tabID: currentTabID, isRevealed: showCompressedHistory)
+                        agentModeVM.setTranscriptWindowExpanded(tabID: currentTabID, isExpanded: isTranscriptWindowExpanded)
                     }
                     debugLog("onAppear", details: "visibleBlocks=\(visibleTranscriptBlocks.count) rows=\(renderedTranscriptRows.count)")
                     syncTranscriptBlockExpansion(for: visibleTranscriptBlocks)
@@ -2082,11 +2094,14 @@ struct AgentModeChatDetailView: View {
                         clearManualDetachOverride()
                         resetPinnedBottomRequestState()
                         showCompressedHistory = false
+                        isTranscriptWindowExpanded = false
                         if let oldTabID {
                             agentModeVM.setCompressedHistoryVisibility(tabID: oldTabID, isRevealed: false)
+                            agentModeVM.setTranscriptWindowExpanded(tabID: oldTabID, isExpanded: false)
                         }
                         if let newTabID {
                             agentModeVM.setCompressedHistoryVisibility(tabID: newTabID, isRevealed: false)
+                            agentModeVM.setTranscriptWindowExpanded(tabID: newTabID, isExpanded: false)
                         }
                         pendingCompressionRestoreStrategy = nil
                         transcriptBlockExpansion.removeAll()
@@ -2169,6 +2184,9 @@ struct AgentModeChatDetailView: View {
 
         if showCompressedHistory != newSnapshot.isCompressedHistoryRevealed {
             showCompressedHistory = newSnapshot.isCompressedHistoryRevealed
+        }
+        if isTranscriptWindowExpanded != newSnapshot.isTranscriptWindowExpanded {
+            isTranscriptWindowExpanded = newSnapshot.isTranscriptWindowExpanded
         }
 
         syncTranscriptBlockExpansion(for: newSnapshot.visibleBlocks)
@@ -2595,6 +2613,11 @@ struct AgentModeChatDetailView: View {
                 }
             }
             .accessibilityIdentifier("agentTranscript.activityCluster")
+        case .collapsedHistoryRange:
+            transcriptBlockRow {
+                collapsedHistoryRangeRow(for: block)
+            }
+            .accessibilityIdentifier("agentTranscript.collapsedHistoryRange")
         case .groupedHistory:
             let supportsExpansion = transcriptBlockSupportsExpansion(block)
             let persistedExpansion = persistedTranscriptBlockExpansion(for: block)
@@ -2643,12 +2666,16 @@ struct AgentModeChatDetailView: View {
             .accessibilityIdentifier("agentTranscript.groupedHistory")
         default:
             VStack(alignment: .leading, spacing: 8) {
+                let transcript = transcriptSnapshot
+                let runInteraction = runInteractionSnapshot
                 ForEach(block.rows) { item in
                     transcriptRowView(
                         item: item,
                         block: block,
                         renderContext: renderContext,
-                        autoExpandEnabled: toolCardAutoExpandEnabled(for: block)
+                        autoExpandEnabled: toolCardAutoExpandEnabled(for: block),
+                        transcript: transcript,
+                        runInteraction: runInteraction
                     )
                 }
             }
@@ -2661,16 +2688,17 @@ struct AgentModeChatDetailView: View {
     /// Only shows for current-turn items in non-archived, full-retention blocks during an active run.
     private func showRunScopedToolCancel(
         for item: AgentChatItem,
-        in block: AgentTranscriptRenderBlock
+        in block: AgentTranscriptRenderBlock,
+        runInteraction: AgentRunInteractionUISnapshot
     ) -> Bool {
-        guard runInteractionSnapshot.runState == .running,
-              runInteractionSnapshot.activeRunID != nil,
+        guard runInteraction.runState == .running,
+              runInteraction.activeRunID != nil,
               !block.isArchived,
               block.retentionTier == .full,
               item.kind == .toolCall
         else { return false }
         // Only show cancel for items after the latest user message in this turn
-        if let latestUserSeqIndex = runInteractionSnapshot.latestUserSequenceIndex,
+        if let latestUserSeqIndex = runInteraction.latestUserSequenceIndex,
            item.sequenceIndex > latestUserSeqIndex
         {
             return true
@@ -2679,8 +2707,8 @@ struct AgentModeChatDetailView: View {
     }
 
     /// Stable cancel closure for the active run, captured at render time.
-    private var cancelActiveToolsAction: (() -> Void)? {
-        guard let runID = runInteractionSnapshot.activeRunID else { return nil }
+    private func cancelActiveToolsAction(runInteraction: AgentRunInteractionUISnapshot) -> (() -> Void)? {
+        guard let runID = runInteraction.activeRunID else { return nil }
         return { [weak agentModeVM] in
             agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel")
         }
@@ -2690,11 +2718,13 @@ struct AgentModeChatDetailView: View {
         item: AgentChatItem,
         block: AgentTranscriptRenderBlock,
         renderContext: TranscriptRenderContext,
-        autoExpandEnabled: Bool
+        autoExpandEnabled: Bool,
+        transcript: AgentTranscriptUISnapshot,
+        runInteraction: AgentRunInteractionUISnapshot
     ) -> some View {
-        let showCancel = showRunScopedToolCancel(for: item, in: block)
-        let cancelAction = showCancel ? cancelActiveToolsAction : nil
-        let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
+        let showCancel = showRunScopedToolCancel(for: item, in: block, runInteraction: runInteraction)
+        let cancelAction = showCancel ? cancelActiveToolsAction(runInteraction: runInteraction) : nil
+        let ownerTabID = transcript.presentation.tabID ?? transcript.currentTabID ?? currentTabID
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
         return AgentMessageBubble(
             item: item,
@@ -2717,9 +2747,10 @@ struct AgentModeChatDetailView: View {
                 cancelActiveToolsAction: cancelAction
             ),
             promptManager: promptManager,
-            handoffConfig: runInteractionSnapshot.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
+            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
-            rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation.rawToolResultPayloadRenderRevision,
+            rawToolResultPayloadRenderRevision: transcript.presentation
+                .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
             showRunScopedToolCancel: showCancel,
             cancelActiveToolsAction: cancelAction,
             codexManagedLoginAction: codexManagedLoginAction
@@ -2727,7 +2758,7 @@ struct AgentModeChatDetailView: View {
         .id(item.id)
         .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)
         .environment(\.agentToolCardAutoExpandEnabled, autoExpandEnabled)
-        .environment(\.agentLiveBashExecutionByItemID, transcriptSnapshot.activeBashLiveExecutionByItemID)
+        .environment(\.agentLiveBashExecutionByItemID, transcript.activeBashLiveExecutionByItemID)
         .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
         .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
     }
@@ -2922,29 +2953,37 @@ struct AgentModeChatDetailView: View {
     }
 
     private func expandedClusterContent(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let transcript = transcriptSnapshot
+        let runInteraction = runInteractionSnapshot
+        return VStack(alignment: .leading, spacing: 6) {
             ForEach(block.rows) { item in
                 transcriptRowView(
                     item: item,
                     block: block,
                     renderContext: renderContext,
-                    autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block)
+                    autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block),
+                    transcript: transcript,
+                    runInteraction: runInteraction
                 )
             }
         }
     }
 
     private func expandedGroupedContent(sections: [AgentTranscriptGroupedSection], renderContext: TranscriptRenderContext) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let transcript = transcriptSnapshot
+        let runInteraction = runInteractionSnapshot
+        return VStack(alignment: .leading, spacing: 8) {
             ForEach(sections) { section in
-                groupedHistorySectionView(section: section, renderContext: renderContext)
+                groupedHistorySectionView(section: section, renderContext: renderContext, transcript: transcript, runInteraction: runInteraction)
             }
         }
     }
 
     private func groupedHistorySectionView(
         section: AgentTranscriptGroupedSection,
-        renderContext: TranscriptRenderContext
+        renderContext: TranscriptRenderContext,
+        transcript: AgentTranscriptUISnapshot,
+        runInteraction: AgentRunInteractionUISnapshot
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             // Section header — compact inline
@@ -2987,7 +3026,9 @@ struct AgentModeChatDetailView: View {
                             item: item,
                             block: childBlock,
                             renderContext: renderContext,
-                            autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: childBlock)
+                            autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: childBlock),
+                            transcript: transcript,
+                            runInteraction: runInteraction
                         )
                     }
                 }
@@ -3304,6 +3345,45 @@ struct AgentModeChatDetailView: View {
         .buttonStyle(.plain)
     }
 
+    private func collapsedHistoryRangeRow(for block: AgentTranscriptRenderBlock) -> some View {
+        let range = block.collapsedHistoryRange
+        let hiddenTurnCount = range?.hiddenTurnCount ?? 0
+        let turnLabel = hiddenTurnCount == 1 ? "earlier turn" : "earlier turns"
+        return Button {
+            expandTranscriptWindowIfNeeded()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.stack.badge.plus")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Earlier transcript turns are hidden")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text("Show \(hiddenTurnCount) \(turnLabel).")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Text("Expand")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.96))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     private func shouldAbortPinnedMaintenanceScrollExecution(_ intent: AgentTranscriptScrollIntent) -> Bool {
         guard case let .bottom(_, reason) = intent else {
             return false
@@ -3585,6 +3665,15 @@ struct AgentModeChatDetailView: View {
         }
     }
 
+    private func expandTranscriptWindowIfNeeded() {
+        guard !isTranscriptWindowExpanded else { return }
+        prepareCompressionTransition(targetShowCompressedHistory: showCompressedHistory)
+        isTranscriptWindowExpanded = true
+        if let currentTabID {
+            agentModeVM.setTranscriptWindowExpanded(tabID: currentTabID, isExpanded: true)
+        }
+    }
+
     private func resolveVisibleBlockID(for anchor: AgentTranscriptAnchor) -> String? {
         guard let blockID = transcriptPresentation.anchorBlockIndex[anchor] else { return nil }
         return visibleTranscriptBlockIDs.contains(blockID) ? blockID : nil
@@ -3593,9 +3682,17 @@ struct AgentModeChatDetailView: View {
     private func resolveVisibleViewportTargetID(_ targetID: AgentTranscriptViewportTargetID) -> AgentTranscriptViewportTargetID? {
         switch targetID {
         case let .row(rowID):
-            renderedTranscriptRowIDs.contains(rowID) ? targetID : nil
+            if renderedTranscriptRowIDs.contains(rowID) {
+                return targetID
+            }
+            if let semanticAnchor = transcriptPresentation.rowAnchorIndex[rowID],
+               let blockID = resolveVisibleBlockID(for: semanticAnchor)
+            {
+                return .block(blockID)
+            }
+            return nil
         case let .block(blockID):
-            visibleTranscriptBlockIDs.contains(blockID) ? targetID : nil
+            return visibleTranscriptBlockIDs.contains(blockID) ? targetID : nil
         }
     }
 

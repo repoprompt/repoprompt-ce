@@ -54,8 +54,7 @@ struct RepoPromptFileLogHandler: LogHandler {
     }
 }
 
-@main
-struct RepoPromptApp: App {
+struct RepoPromptSwiftUIApp: App {
     init() {
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
@@ -69,18 +68,28 @@ struct RepoPromptApp: App {
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
+        // Pre-warm date formatter cache on a background thread to avoid blocking the main
+        // thread with ICU locale processing (ulocimp_addLikelySubtags) on first render.
+        Task.detached(priority: .utility) {
+            MessageTimestampFormatter.warmUp()
+        }
+
+        SentryTelemetryBootstrap.start()
+
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
             "RepoPromptApp.init scheduling ServerNetworkManager.start",
             flushStdout: true
         )
         Task.detached {
+            SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
             ProcessDebugLogging.log(
                 prefix: "MCPStartup",
                 "RepoPromptApp.init start task running",
                 flushStdout: true
             )
             await ServerController.shared.startServer()
+            SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {
@@ -129,7 +138,7 @@ struct RepoPromptApp: App {
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
         .commands {
-            UpdateMenu()
+            UpdateMenu(sparkleManager: appDelegate.sparkleManager)
 
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {
@@ -160,5 +169,12 @@ struct RepoPromptApp: App {
                     .environmentObject(versionManager)
             }
         }
+    }
+}
+
+@MainActor
+public enum RepoPromptApplication {
+    public static func main() {
+        RepoPromptSwiftUIApp.main()
     }
 }

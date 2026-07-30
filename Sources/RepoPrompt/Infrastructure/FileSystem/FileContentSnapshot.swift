@@ -22,6 +22,12 @@ struct FileContentFingerprint: Hashable {
     }
 }
 
+struct ValidatedRawFileContentSnapshot {
+    let data: Data
+    let modificationDate: Date
+    let fingerprint: FileContentFingerprint
+}
+
 struct ValidatedFileContentSnapshot {
     let content: String?
     let detectedEncodingRawValue: UInt?

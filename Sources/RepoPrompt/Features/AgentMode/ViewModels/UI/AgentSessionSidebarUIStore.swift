@@ -4,6 +4,11 @@ struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
     var visibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
+    /// Thread keys that have already received one-shot default collapse handling
+    /// during this view-model lifetime. Explicit user expand/collapse actions
+    /// and Expand All mark keys handled so later renders do not immediately
+    /// re-collapse them by default.
+    var defaultCollapsedThreadKeysHandled: Set<AgentSidebarThreadKey> = []
     /// Per-tab "unseen" run-state attention. Populated when a session's run
     /// transitions to a user-relevant state (completed / failed / waiting) in
     /// the background — i.e. while the user is looking at a different tab —
@@ -11,6 +16,9 @@ struct AgentSessionSidebarSnapshot: Equatable {
     /// badge on that row. Persists across sidebar re-renders but never to
     /// disk; ephemeral per `AgentModeViewModel` instance.
     var attentionRunStateByTabID: [UUID: AgentSessionRunState] = [:]
+    /// Deterministic mark time for each unseen-attention badge. Kept in lockstep
+    /// with `attentionRunStateByTabID` and intentionally not persisted.
+    var attentionMarkedAtByTabID: [UUID: Date] = [:]
     var revision: Int = 0
 }
 
@@ -39,6 +47,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         } else {
             next.collapsedThreadKeys.remove(key)
         }
+        next.defaultCollapsedThreadKeysHandled.insert(key)
         _ = publish(next, eventName: "sessionSidebar.threadCollapse", force: false)
     }
 
@@ -50,6 +59,22 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var next = snapshot
         next.collapsedThreadKeys.removeAll()
         _ = publish(next, eventName: "sessionSidebar.threadCollapse.clear", force: false)
+    }
+
+    func expandAllSidebarThreads(eligibleKeys: [AgentSidebarThreadKey]) {
+        var next = snapshot
+        next.collapsedThreadKeys.removeAll()
+        next.defaultCollapsedThreadKeysHandled.formUnion(eligibleKeys)
+        _ = publish(next, eventName: "sessionSidebar.threadCollapse.expandAll", force: false)
+    }
+
+    func seedDefaultCollapsedThreads(eligibleKeys: [AgentSidebarThreadKey]) {
+        let newKeys = eligibleKeys.filter { !snapshot.defaultCollapsedThreadKeysHandled.contains($0) }
+        guard !newKeys.isEmpty else { return }
+        var next = snapshot
+        next.collapsedThreadKeys.formUnion(newKeys)
+        next.defaultCollapsedThreadKeysHandled.formUnion(newKeys)
+        _ = publish(next, eventName: "sessionSidebar.threadCollapse.seedDefaults", force: false)
     }
 
     // MARK: - Run-state attention
@@ -72,18 +97,25 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         snapshot.attentionRunStateByTabID[tabID]
     }
 
+    /// Time when the current unseen-attention state was first marked.
+    func attentionMarkedAt(for tabID: UUID) -> Date? {
+        snapshot.attentionMarkedAtByTabID[tabID]
+    }
+
     /// Mark a tab as having unseen attention-worthy run state. No-op for
     /// states that are not attention-eligible, or when the stored state is
     /// already identical.
     @discardableResult
     func markRunStateAttention(
         tabID: UUID,
-        state: AgentSessionRunState
+        state: AgentSessionRunState,
+        markedAt: Date = Date()
     ) -> Bool {
         guard Self.isAttentionEligible(state) else { return false }
         if snapshot.attentionRunStateByTabID[tabID] == state { return false }
         var next = snapshot
         next.attentionRunStateByTabID[tabID] = state
+        next.attentionMarkedAtByTabID[tabID] = markedAt
         return publish(next, eventName: "sessionSidebar.attention.mark", force: false)
     }
 
@@ -93,6 +125,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         guard snapshot.attentionRunStateByTabID[tabID] != nil else { return false }
         var next = snapshot
         next.attentionRunStateByTabID.removeValue(forKey: tabID)
+        next.attentionMarkedAtByTabID.removeValue(forKey: tabID)
         return publish(next, eventName: "sessionSidebar.attention.clear", force: false)
     }
 
@@ -104,6 +137,9 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var changed = false
         for tabID in tabIDs {
             if next.attentionRunStateByTabID.removeValue(forKey: tabID) != nil {
+                changed = true
+            }
+            if next.attentionMarkedAtByTabID.removeValue(forKey: tabID) != nil {
                 changed = true
             }
         }

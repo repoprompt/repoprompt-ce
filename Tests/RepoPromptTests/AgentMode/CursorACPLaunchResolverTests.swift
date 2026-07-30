@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class CursorACPLaunchResolverTests: XCTestCase {
@@ -431,7 +431,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             "/first/cursor-agent: first failure",
             "/second/cursor-agent: second failure"
         ]
-        let error = CursorACPLaunchResolutionError.noValidLaunchCandidate("cursor-agent", failures)
+        let error = CursorACPLaunchResolutionError.noValidLaunchCandidate("cursor-agent", failures, nil)
 
         XCTAssertEqual(
             error.errorDescription,
@@ -765,13 +765,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CursorACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: directory)
-        }
-        return directory
+        try makeTestDirectory(name: "CursorACPLaunchResolverTests")
     }
 
     private func canonicalExecutablePath(_ url: URL) throws -> String {

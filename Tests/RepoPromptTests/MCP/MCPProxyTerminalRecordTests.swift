@@ -80,6 +80,28 @@ final class MCPProxyTerminalRecordTests: XCTestCase {
         XCTAssertEqual(record.errno, ECONNRESET)
     }
 
+    func testAppSocketClosedRemainsRetryablePeerTransportFailure() async throws {
+        let ledger = JSONRPCBridgeLedger(connectionID: "socket-closed-test")
+        _ = try await ledger.beginConnection()
+        let runtimeError = CLIRuntimeError.connectionFailed(
+            underlying: SocketProxyError.serverClosed
+        )
+
+        XCTAssertTrue(CLIProxyRuntimePolicy.shouldRetry(after: runtimeError))
+        XCTAssertEqual(CLIProxyRuntimePolicy.failureReason(for: runtimeError), "app_socket_closed")
+
+        let record = await CLIProxyRuntimePolicy.makeTerminalRecord(
+            sessionToken: "socket-closed-session",
+            localPID: 303,
+            initialParentPID: 404,
+            ledgerSnapshot: ledger.snapshot(),
+            runtimeError: runtimeError,
+            fallbackReason: "unexpected_fallback"
+        )
+        XCTAssertEqual(record.initiator, .peer)
+        XCTAssertEqual(record.reason, "app_socket_closed")
+    }
+
     func testLocalSocketReadFailureIsAttributedToTransport() async throws {
         let ledger = JSONRPCBridgeLedger(connectionID: "local-read-test")
         _ = try await ledger.beginConnection()

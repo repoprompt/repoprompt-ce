@@ -1,17 +1,7 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class GitRepoTargetResolverTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for root in temporaryRoots {
-            try? FileManager.default.removeItem(at: root)
-        }
-        temporaryRoots = []
-        try super.tearDownWithError()
-    }
-
     func testResolvesSupportedRepositorySelectorSyntax() async throws {
         let fixture = ResolverFixture()
         let scenarios = [
@@ -52,6 +42,31 @@ final class GitRepoTargetResolverTests: XCTestCase {
             XCTAssertTrue(error.message.contains("@wt:feature/demo"))
             XCTAssertTrue(error.message.contains("@main:feature/demo"))
         }
+    }
+
+    func testRejectsStalePrunableWorktreeSelector() async throws {
+        let fixture = ResolverFixture(linkedWorktreePrunable: true)
+
+        do {
+            _ = try await fixture.resolver.resolveWorktree(
+                selector: "@branch:feature/demo",
+                repo: fixture.mainRepo,
+                allRepos: [fixture.mainRepo]
+            )
+            XCTFail("Expected a stale/prunable worktree to be rejected")
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.lowercased().contains("stale"), error.message)
+            XCTAssertTrue(error.message.contains("git worktree prune"), error.message)
+        }
+
+        // A healthy (non-prunable) worktree resolved by the same selector still succeeds.
+        let healthy = ResolverFixture()
+        let resolved = try await healthy.resolver.resolveWorktree(
+            selector: "@branch:feature/demo",
+            repo: healthy.mainRepo,
+            allRepos: [healthy.mainRepo]
+        )
+        XCTAssertEqual(resolved.path, healthy.linkedRepo.rootPath)
     }
 
     func testDeduplicatesReposByResolvedPath() async throws {
@@ -158,7 +173,9 @@ final class GitRepoTargetResolverTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("GitRepoTargetResolverSeparateGitDirTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        temporaryRoots.append(root)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
 
         let repo = root.appendingPathComponent("repo", isDirectory: true)
         let gitDir = root.appendingPathComponent("repo-git", isDirectory: true)
@@ -334,7 +351,7 @@ private struct ResolverFixture {
     let visibleRoots: [WorkspaceRootRef]
     let resolver: GitRepoTargetResolver
 
-    init() {
+    init(linkedWorktreePrunable: Bool = false) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("GitRepoTargetResolverTests", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -378,8 +395,8 @@ private struct ResolverFixture {
             isDetached: false,
             isLocked: false,
             lockReason: nil,
-            isPrunable: false,
-            prunableReason: nil
+            isPrunable: linkedWorktreePrunable,
+            prunableReason: linkedWorktreePrunable ? "gitdir file points to non-existent location" : nil
         )
         let visibleRoots = [
             WorkspaceRootRef(id: UUID(), name: "repo", fullPath: mainURL.path)

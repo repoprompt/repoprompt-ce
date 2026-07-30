@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -98,72 +98,14 @@ final class CodexSteerAckTrackerTests: XCTestCase {
     func testCancellingMCPDispatchTombstonesItsAttemptBeforeLateProviderAcceptance() async throws {
         let gate = AckTrackerSteerGate()
         let controller = AckTrackerCodexController(gate: gate)
-        let viewModel = AgentModeViewModel(
-            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        let (viewModel, session, sessionID, registration) = try await makeMCPRunningSession(
+            controller: controller,
+            source: "test.mcpAckCancellation"
         )
-        viewModel.test_initializeRunService()
-        let tabID = UUID()
-        let sessionID = UUID()
-        let session = viewModel.session(for: tabID)
-        let runID = UUID()
-        session.testInstallPersistentSessionBinding(sessionID: sessionID)
-        session.hasLoadedPersistedState = true
-        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
         defer {
             Task {
                 await AgentRunSessionStore.cleanup(registration: registration)
             }
-        }
-        session.mcpControlContext = .init(
-            sessionID: sessionID,
-            activationID: UUID(),
-            registration: registration,
-            currentEpoch: nil,
-            preparedEpoch: nil,
-            pendingEpochTransition: nil,
-            originatingConnectionID: nil,
-            interactionTransport: .mcp(
-                sessionID: sessionID,
-                originatingConnectionID: nil
-            ),
-            suppressUserNotifications: true,
-            forceAutoEditEnabled: false,
-            autoEditEnabledBeforeOverride: true,
-            taskLabelKind: nil
-        )
-        viewModel.test_setMCPControlledTabIDs([tabID])
-        session.selectedAgent = .codexExec
-        session.runID = runID
-        session.runState = .running
-        session.beginRunAttempt(source: "test.mcpAckCancellation")
-        session.codexController = controller
-        session.codexConversationID = "thread"
-        session.codexAuthoritativeActiveTurn = try .init(
-            threadID: "thread",
-            turnID: "turn",
-            turnKind: .user,
-            controllerInstanceID: ObjectIdentifier(controller),
-            controllerGeneration: session.codexControllerGeneration,
-            runID: runID,
-            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
-        )
-        session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
-        controller.onEnsureEventsStreamReady = { [weak session, weak controller] in
-            guard let session, let controller,
-                  let runID = session.runID,
-                  let runAttemptID = session.activeRunAttemptID
-            else { return }
-            session.codexAuthoritativeActiveTurn = .init(
-                threadID: "thread",
-                turnID: "turn",
-                turnKind: .user,
-                controllerInstanceID: ObjectIdentifier(controller),
-                controllerGeneration: session.codexControllerGeneration,
-                runID: runID,
-                runAttemptID: runAttemptID
-            )
-            session.codexRoutingObservedTurnID = "turn"
         }
 
         let dispatch = Task {
@@ -190,28 +132,377 @@ final class CodexSteerAckTrackerTests: XCTestCase {
             }
         }
         let attemptID = try XCTUnwrap(session.codexSteerAckTracker.test_latestAttemptID)
+        XCTAssertTrue(
+            session.codexSteerAckTracker.test_openAttemptIDs.contains(attemptID),
+            "Expected the MCP dispatch attempt to remain open before cancellation."
+        )
 
         dispatch.cancel()
+        let attemptCancelledByProductionPath = await waitUntil {
+            !session.codexSteerAckTracker.test_openAttemptIDs.contains(attemptID)
+        }
+        XCTAssertTrue(
+            attemptCancelledByProductionPath,
+            "Expected cancellation to tombstone the MCP dispatch attempt."
+        )
+        await gate.release()
         do {
             _ = try await dispatch.value
             XCTFail("Expected MCP dispatch cancellation")
         } catch is CancellationError {
             // Expected.
         } catch {
-            XCTFail("Expected CancellationError, got \(error)")
+            XCTAssertTrue(String(describing: error).contains("cancelled"), String(describing: error))
         }
         let cancelledState = await session.codexSteerAckTracker.awaitTerminalState(
             attemptID: attemptID
         )
         XCTAssertEqual(cancelledState, .cancelled)
 
-        await gate.release()
         let providerCompleted = await gate.waitUntilCompleted()
         XCTAssertTrue(providerCompleted)
         let lateState = await session.codexSteerAckTracker.awaitTerminalState(
             attemptID: attemptID
         )
         XCTAssertEqual(lateState, .cancelled)
+    }
+
+    func testActiveMCPWaiterIsNotInterruptedBeforeCodexProviderAck() async throws {
+        let gate = AckTrackerSteerGate()
+        let controller = AckTrackerCodexController(gate: gate)
+        let (viewModel, session, sessionID, registration) = try await makeMCPRunningSession(
+            controller: controller,
+            source: "test.codexAckDelayedWake"
+        )
+        defer {
+            Task {
+                await AgentRunSessionStore.cleanup(registration: registration)
+            }
+        }
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: registration,
+            epoch: session.mcpControlContext?.currentEpoch
+        )
+        let wait = await AckTrackerWaiterStarter().start(cursor: cursor, timeoutSeconds: 5)
+
+        let dispatch = Task {
+            try await viewModel.mcpDispatchInstruction(
+                sessionID: sessionID,
+                text: "ack before wake",
+                allowStartingRun: false
+            )
+        }
+        guard await gate.waitUntilStarted() else {
+            dispatch.cancel()
+            return XCTFail("Provider steer was not reached")
+        }
+        let prematureDisposition = await AgentRunSessionStore.waitUntilInteresting(
+            cursor: cursor,
+            timeoutSeconds: 0.05
+        )
+        assertDidNotReleaseAsSteering(prematureDisposition, sessionID: sessionID)
+
+        await gate.release()
+        let delivery = try await dispatch.value
+        XCTAssertEqual(delivery, .dispatchedCodexTurn)
+        let disposition = await wait.value
+        assertAcceptedDispatchReleasedWaiter(
+            disposition,
+            sessionID: sessionID,
+            expectedSteeringMessage: "ack before wake"
+        )
+    }
+
+    func testAcceptedCodexAckAfterRunReplacementDoesNotWakeReplacementWaiters() async throws {
+        let gate = AckTrackerSteerGate()
+        let controller = AckTrackerCodexController(gate: gate)
+        let (viewModel, session, sessionID, registration) = try await makeMCPRunningSession(
+            controller: controller,
+            source: "test.codexAckReplacementNoWake"
+        )
+        defer {
+            Task {
+                await AgentRunSessionStore.cleanup(registration: registration)
+            }
+        }
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: registration,
+            epoch: session.mcpControlContext?.currentEpoch
+        )
+        let wait = await AckTrackerWaiterStarter().start(cursor: cursor, timeoutSeconds: 0.2)
+
+        let dispatch = Task {
+            try await viewModel.mcpDispatchInstruction(
+                sessionID: sessionID,
+                text: "ack after replacement",
+                allowStartingRun: false
+            )
+        }
+        guard await gate.waitUntilStarted() else {
+            dispatch.cancel()
+            return XCTFail("Provider steer was not reached")
+        }
+
+        let replacementController = AckTrackerCodexController(gate: AckTrackerSteerGate())
+        let replacementRunID = UUID()
+        session.runID = replacementRunID
+        session.runState = .running
+        session.beginRunAttempt(source: "test.codexAckReplacementNoWake.replacement")
+        session.codexController = replacementController
+        session.codexConversationID = "replacement-thread"
+        session.codexAuthoritativeActiveTurn = try .init(
+            threadID: "replacement-thread",
+            turnID: "replacement-turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(replacementController),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: replacementRunID,
+            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+        session.codexRoutingObservedTurnID = "replacement-turn"
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
+
+        await gate.release()
+        let delivery = try await dispatch.value
+        XCTAssertEqual(delivery, .dispatchedCodexTurn)
+
+        let disposition = await wait.value
+        assertDidNotReleaseAsSteering(disposition, sessionID: sessionID)
+    }
+
+    func testFailedActiveCodexMCPAckDoesNotInterruptExistingWaiter() async throws {
+        let gate = AckTrackerSteerGate()
+        let controller = AckTrackerCodexController(
+            gate: gate,
+            steerResult: .failure(AckTrackerTestError.providerRejected)
+        )
+        let (viewModel, session, sessionID, registration) = try await makeMCPRunningSession(
+            controller: controller,
+            source: "test.codexAckFailureNoWake"
+        )
+        defer {
+            Task {
+                await AgentRunSessionStore.cleanup(registration: registration)
+            }
+        }
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: registration,
+            epoch: session.mcpControlContext?.currentEpoch
+        )
+        let wait = await AckTrackerWaiterStarter().start(cursor: cursor, timeoutSeconds: 0.2)
+
+        let dispatch = Task {
+            try await viewModel.mcpDispatchInstruction(
+                sessionID: sessionID,
+                text: "failed steer",
+                allowStartingRun: false
+            )
+        }
+        guard await gate.waitUntilStarted() else {
+            dispatch.cancel()
+            return XCTFail("Provider steer was not reached")
+        }
+        let prematureDisposition = await AgentRunSessionStore.waitUntilInteresting(
+            cursor: cursor,
+            timeoutSeconds: 0.05
+        )
+        assertDidNotReleaseAsSteering(prematureDisposition, sessionID: sessionID)
+
+        await gate.release()
+        do {
+            _ = try await dispatch.value
+            XCTFail("Expected Codex steer failure to be reported to the MCP caller")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("provider rejected steer"),
+                String(describing: error)
+            )
+        }
+        XCTAssertFalse(
+            session.items.filter { $0.kind == .user }.map(\.text).contains("failed steer"),
+            "The optimistic MCP Codex user bubble should be removed when the steer never reaches Codex."
+        )
+
+        let disposition = await wait.value
+        assertDidNotReleaseAsSteering(disposition, sessionID: sessionID)
+    }
+
+    func testTerminalStateClassifiesConfirmedDeliveryAndFailureDescriptions() {
+        let queueID = UUID()
+        XCTAssertTrue(CodexSteerAckTracker.TerminalState.steerAccepted.confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertTrue(CodexSteerAckTracker.TerminalState.startAccepted.confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertTrue(CodexSteerAckTracker.TerminalState.controlAccepted.confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertTrue(CodexSteerAckTracker.TerminalState.durablyQueued(queueID: queueID).confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertFalse(CodexSteerAckTracker.TerminalState.failed(message: "nope").confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertFalse(CodexSteerAckTracker.TerminalState.cancelled.confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertFalse(CodexSteerAckTracker.TerminalState.stale(reason: "changed").confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertFalse(CodexSteerAckTracker.TerminalState.timedOut.confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertEqual(
+            CodexSteerAckTracker.TerminalState.failed(message: "").failureDescriptionForMCP,
+            "Codex steer failed before reaching the active run."
+        )
+        XCTAssertEqual(
+            CodexSteerAckTracker.TerminalState.stale(reason: "").failureDescriptionForMCP,
+            "Codex steer was dropped because the active run changed before delivery."
+        )
+    }
+
+    private func makeMCPRunningSession(
+        controller: AckTrackerCodexController,
+        source: String
+    ) async throws -> (
+        AgentModeViewModel,
+        AgentModeViewModel.TabSession,
+        UUID,
+        AgentRunSessionStore.Registration
+    ) {
+        let viewModel = AgentModeViewModel(
+            codexControllerFactory: { _, _, _, _, _, _ in controller }
+        )
+        viewModel.test_initializeRunService()
+        let tabID = UUID()
+        let sessionID = UUID()
+        let session = viewModel.session(for: tabID)
+        let runID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        session.hasLoadedPersistedState = true
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+        let activationID = UUID()
+        let epochResult = await AgentRunSessionStore.beginEpoch(
+            registration: registration,
+            activationID: activationID,
+            expectedCurrentEpoch: nil,
+            transitionKind: .initial
+        )
+        let currentEpoch: AgentRunTurnEpoch?
+        switch epochResult {
+        case let .accepted(epoch):
+            currentEpoch = epoch
+        case let .stale(epoch):
+            currentEpoch = epoch
+        case let .rejected(reason):
+            XCTFail("Failed to start MCP wait epoch: \(reason)")
+            throw CancellationError()
+        }
+        session.mcpControlContext = .init(
+            sessionID: sessionID,
+            activationID: activationID,
+            registration: registration,
+            currentEpoch: currentEpoch,
+            preparedEpoch: nil,
+            pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(
+                sessionID: sessionID,
+                originatingConnectionID: nil
+            ),
+            suppressUserNotifications: true,
+            forceAutoEditEnabled: false,
+            autoEditEnabledBeforeOverride: true,
+            taskLabelKind: nil
+        )
+        viewModel.test_setMCPControlledTabIDs([tabID])
+        session.selectedAgent = .codexExec
+        session.runID = runID
+        session.runState = .running
+        session.beginRunAttempt(source: source)
+        session.codexController = controller
+        session.codexSteerAckTracker.test_setTerminalStateTimeoutSeconds(30)
+        session.codexConversationID = "thread"
+        session.codexAuthoritativeActiveTurn = try .init(
+            threadID: "thread",
+            turnID: "turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+        session.codexRoutingObservedTurnID = "turn"
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
+        controller.onEnsureEventsStreamReady = { [weak session, weak controller] in
+            guard let session, let controller,
+                  let runID = session.runID,
+                  let runAttemptID = session.activeRunAttemptID
+            else { return }
+            session.codexAuthoritativeActiveTurn = .init(
+                threadID: "thread",
+                turnID: "turn",
+                turnKind: .user,
+                controllerInstanceID: ObjectIdentifier(controller),
+                controllerGeneration: session.codexControllerGeneration,
+                runID: runID,
+                runAttemptID: runAttemptID
+            )
+            session.codexRoutingObservedTurnID = "turn"
+        }
+        return (viewModel, session, sessionID, registration)
+    }
+
+    private func assertAcceptedDispatchReleasedWaiter(
+        _ disposition: AgentRunSessionStore.WaitDisposition,
+        sessionID: UUID,
+        expectedSteeringMessage: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        switch disposition {
+        case let .noteworthySnapshot(wake):
+            XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+            XCTAssertEqual(wake.steeringMessage, expectedSteeringMessage, file: file, line: line)
+        case let .snapshotReady(snapshot):
+            XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
+        default:
+            XCTFail("Expected accepted dispatch to release waiter, got \(disposition)", file: file, line: line)
+        }
+    }
+
+    private func assertDidNotReleaseAsSteering(
+        _ disposition: AgentRunSessionStore.WaitDisposition,
+        sessionID: UUID,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        if case let .noteworthySnapshot(wake) = disposition,
+           wake.reason == .steeringRequested
+        {
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+            XCTFail("Failed Codex steer must not release waiters as steeringRequested", file: file, line: line)
+        }
+    }
+
+    private func assertSteeringRequested(
+        _ disposition: AgentRunSessionStore.WaitDisposition,
+        sessionID: UUID,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .noteworthySnapshot(wake) = disposition else {
+            return XCTFail("Expected steering wake, got \(disposition)", file: file, line: line)
+        }
+        XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+        XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        _ condition: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
     }
 
     func testSerialDispatchGatePreservesIssuedOrderAcrossSuspension() async {
@@ -236,13 +527,43 @@ final class CodexSteerAckTrackerTests: XCTestCase {
     }
 }
 
+private actor AckTrackerWaiterStarter {
+    func start(
+        cursor: AgentRunSessionStore.WaitCursor,
+        timeoutSeconds: TimeInterval
+    ) -> Task<AgentRunSessionStore.WaitDisposition, Never> {
+        Task {
+            await AgentRunSessionStore.waitUntilInteresting(
+                cursor: cursor,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+    }
+}
+
+private enum AckTrackerTestError: LocalizedError {
+    case providerRejected
+
+    var errorDescription: String? {
+        switch self {
+        case .providerRejected:
+            "provider rejected steer"
+        }
+    }
+}
+
 private final class AckTrackerCodexController: CodexSessionControlling {
     private let gate: AckTrackerSteerGate
+    private let steerResult: Result<CodexTurnSteerReceipt, Error>?
     private(set) var hasActiveThread = true
     var onEnsureEventsStreamReady: (() -> Void)?
 
-    init(gate: AckTrackerSteerGate) {
+    init(
+        gate: AckTrackerSteerGate,
+        steerResult: Result<CodexTurnSteerReceipt, Error>? = nil
+    ) {
         self.gate = gate
+        self.steerResult = steerResult
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -283,6 +604,9 @@ private final class AckTrackerCodexController: CodexSessionControlling {
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         await gate.block()
+        if let steerResult {
+            return try steerResult.get()
+        }
         return .init(acceptedTurnID: expectedTurnID)
     }
 
@@ -315,6 +639,8 @@ private final class AckTrackerCodexController: CodexSessionControlling {
 }
 
 private actor AckTrackerSteerGate {
+    private static let waitPollLimit = 5000
+
     private var started = false
     private var completed = false
     private var releaseContinuation: CheckedContinuation<Void, Never>?
@@ -328,7 +654,7 @@ private actor AckTrackerSteerGate {
     }
 
     func waitUntilStarted() async -> Bool {
-        for _ in 0 ..< 500 {
+        for _ in 0 ..< Self.waitPollLimit {
             if started { return true }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
@@ -341,7 +667,7 @@ private actor AckTrackerSteerGate {
     }
 
     func waitUntilCompleted() async -> Bool {
-        for _ in 0 ..< 500 {
+        for _ in 0 ..< Self.waitPollLimit {
             if completed { return true }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 
 enum AgentConversationReplayMode: String, Equatable {
     case equivalent
@@ -1908,6 +1909,239 @@ enum AgentTranscriptSummaryTextFormatter {
     }
 }
 
+enum AgentSourceItemIDRepair {
+    struct Result: Equatable {
+        let items: [AgentChatItem]
+        let diagnostics: [DuplicateDiagnostic]
+
+        var didRepair: Bool {
+            !diagnostics.isEmpty
+        }
+    }
+
+    enum RepairAction: Equatable {
+        case droppedExactDuplicate
+        case rekeyedNonIdenticalDuplicate(newID: UUID)
+
+        var logValue: String {
+            switch self {
+            case .droppedExactDuplicate:
+                "dropped_exact_duplicate"
+            case .rekeyedNonIdenticalDuplicate:
+                "rekeyed_non_identical_duplicate"
+            }
+        }
+
+        var newID: UUID? {
+            switch self {
+            case .droppedExactDuplicate:
+                nil
+            case let .rekeyedNonIdenticalDuplicate(newID):
+                newID
+            }
+        }
+    }
+
+    enum RetainedPayloadRelationship: String, Equatable {
+        case neitherRetained = "neither_retained"
+        case firstOnly = "first_only"
+        case duplicateOnly = "duplicate_only"
+        case equal
+        case different
+    }
+
+    struct ItemSummary: Equatable {
+        let kind: AgentChatItemKind
+        let sequenceIndex: Int
+        let toolName: String?
+        let invocationID: UUID?
+        let summaryOnly: Bool?
+        let preservesRawPayload: Bool?
+        let retainsEphemeralRawPayload: Bool
+        let rawPayloadByteCount: Int
+        let persistedPayloadByteCount: Int?
+
+        var logValue: String {
+            let toolValue = toolName ?? "nil"
+            let invocationValue = invocationID?.uuidString ?? "nil"
+            let summaryOnlyValue = summaryOnly.map { String($0) } ?? "nil"
+            let preservesRawPayloadValue = preservesRawPayload.map { String($0) } ?? "nil"
+            let persistedPayloadByteCountValue = persistedPayloadByteCount.map { String($0) } ?? "nil"
+            return [
+                "kind=\(kind.rawValue)",
+                "sequence_index=\(sequenceIndex)",
+                "tool=\(toolValue)",
+                "invocation=\(invocationValue)",
+                "summary_only=\(summaryOnlyValue)",
+                "preserves_raw=\(preservesRawPayloadValue)",
+                "retains_raw=\(retainsEphemeralRawPayload)",
+                "raw_bytes=\(rawPayloadByteCount)",
+                "persisted_bytes=\(persistedPayloadByteCountValue)"
+            ].joined(separator: ",")
+        }
+    }
+
+    struct DuplicateDiagnostic: Equatable {
+        let duplicateID: UUID
+        let firstIndex: Int
+        let duplicateIndex: Int
+        let action: RepairAction
+        let firstSummary: ItemSummary
+        let duplicateSummary: ItemSummary
+        let retainedPayloadRelationship: RetainedPayloadRelationship
+    }
+
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.agents",
+        category: "AgentModeSourceItemIntegrity"
+    )
+
+    static func repairDuplicateIDs(
+        in items: [AgentChatItem],
+        context: AgentToolResultProcessingContext? = nil
+    ) -> Result {
+        guard !items.isEmpty else { return Result(items: items, diagnostics: []) }
+        var acceptedItems: [AgentChatItem] = []
+        acceptedItems.reserveCapacity(items.count)
+        var firstItemByID: [UUID: (index: Int, item: AgentChatItem)] = [:]
+        let originalIDs = Set(items.map(\.id))
+        var reservedIDs = originalIDs
+        var diagnostics: [DuplicateDiagnostic] = []
+
+        for (index, item) in items.enumerated() {
+            guard let first = firstItemByID[item.id] else {
+                firstItemByID[item.id] = (index, item)
+                acceptedItems.append(item)
+                continue
+            }
+
+            if item == first.item {
+                diagnostics.append(makeDiagnostic(
+                    duplicateID: item.id,
+                    firstIndex: first.index,
+                    duplicateIndex: index,
+                    action: .droppedExactDuplicate,
+                    firstItem: first.item,
+                    duplicateItem: item,
+                    context: context
+                ))
+                continue
+            }
+
+            let newID = uniqueReplacementID(reservedIDs: &reservedIDs)
+            let repairedItem = item.replacingID(newID)
+            firstItemByID[newID] = (index, repairedItem)
+            acceptedItems.append(repairedItem)
+            diagnostics.append(makeDiagnostic(
+                duplicateID: item.id,
+                firstIndex: first.index,
+                duplicateIndex: index,
+                action: .rekeyedNonIdenticalDuplicate(newID: newID),
+                firstItem: first.item,
+                duplicateItem: item,
+                context: context
+            ))
+        }
+
+        return Result(items: acceptedItems, diagnostics: diagnostics)
+    }
+
+    static func logDiagnostics(_ diagnostics: [DuplicateDiagnostic], context: String?) {
+        let contextValue = context ?? "unknown"
+        for diagnostic in diagnostics {
+            let newIDValue = diagnostic.action.newID?.uuidString ?? "nil"
+            logger.error(
+                "Agent source item duplicate ID repaired context=\(contextValue, privacy: .public) duplicate_id=\(diagnostic.duplicateID.uuidString, privacy: .public) first_index=\(diagnostic.firstIndex, privacy: .public) duplicate_index=\(diagnostic.duplicateIndex, privacy: .public) action=\(diagnostic.action.logValue, privacy: .public) new_id=\(newIDValue, privacy: .public) retained_payload=\(diagnostic.retainedPayloadRelationship.rawValue, privacy: .public) first=\(diagnostic.firstSummary.logValue, privacy: .public) duplicate=\(diagnostic.duplicateSummary.logValue, privacy: .public)"
+            )
+        }
+    }
+
+    static func logDuplicateRetainedToolResultPayload(
+        duplicateID: UUID,
+        firstIndex: Int,
+        duplicateIndex: Int,
+        firstItem: AgentChatItem,
+        duplicateItem: AgentChatItem,
+        firstPayload: String,
+        duplicatePayload: String,
+        context: String?,
+        toolResultContext: AgentToolResultProcessingContext? = nil
+    ) {
+        let contextValue = context ?? "unknown"
+        let firstSummary = itemSummary(for: firstItem, context: toolResultContext)
+        let duplicateSummary = itemSummary(for: duplicateItem, context: toolResultContext)
+        logger.error(
+            "Duplicate retained tool-result payload item ID ignored context=\(contextValue, privacy: .public) duplicate_id=\(duplicateID.uuidString, privacy: .public) first_index=\(firstIndex, privacy: .public) duplicate_index=\(duplicateIndex, privacy: .public) payload_equal=\(firstPayload == duplicatePayload, privacy: .public) first_payload_bytes=\(firstPayload.utf8.count, privacy: .public) duplicate_payload_bytes=\(duplicatePayload.utf8.count, privacy: .public) first=\(firstSummary.logValue, privacy: .public) duplicate=\(duplicateSummary.logValue, privacy: .public)"
+        )
+    }
+
+    private static func makeDiagnostic(
+        duplicateID: UUID,
+        firstIndex: Int,
+        duplicateIndex: Int,
+        action: RepairAction,
+        firstItem: AgentChatItem,
+        duplicateItem: AgentChatItem,
+        context: AgentToolResultProcessingContext?
+    ) -> DuplicateDiagnostic {
+        DuplicateDiagnostic(
+            duplicateID: duplicateID,
+            firstIndex: firstIndex,
+            duplicateIndex: duplicateIndex,
+            action: action,
+            firstSummary: itemSummary(for: firstItem, context: context),
+            duplicateSummary: itemSummary(for: duplicateItem, context: context),
+            retainedPayloadRelationship: retainedPayloadRelationship(firstItem: firstItem, duplicateItem: duplicateItem, context: context)
+        )
+    }
+
+    private static func itemSummary(
+        for item: AgentChatItem,
+        context: AgentToolResultProcessingContext?
+    ) -> ItemSummary {
+        let inspection = AgentToolResultPersistencePolicy.inspectRetention(for: item, context: context)
+        return ItemSummary(
+            kind: item.kind,
+            sequenceIndex: item.sequenceIndex,
+            toolName: item.toolName,
+            invocationID: item.toolInvocationID,
+            summaryOnly: inspection.summaryOnly,
+            preservesRawPayload: inspection.preservesRawPayload,
+            retainsEphemeralRawPayload: inspection.retainsEphemeralRawPayload,
+            rawPayloadByteCount: inspection.rawPayloadByteCount,
+            persistedPayloadByteCount: inspection.persistedPayloadByteCount
+        )
+    }
+
+    private static func retainedPayloadRelationship(
+        firstItem: AgentChatItem,
+        duplicateItem: AgentChatItem,
+        context: AgentToolResultProcessingContext?
+    ) -> RetainedPayloadRelationship {
+        let firstPayload = AgentToolResultPersistencePolicy.inspectRetention(for: firstItem, context: context).retainedPayload
+        let duplicatePayload = AgentToolResultPersistencePolicy.inspectRetention(for: duplicateItem, context: context).retainedPayload
+        switch (firstPayload, duplicatePayload) {
+        case (nil, nil):
+            return .neitherRetained
+        case (.some, nil):
+            return .firstOnly
+        case (nil, .some):
+            return .duplicateOnly
+        case let (.some(firstPayload), .some(duplicatePayload)):
+            return firstPayload == duplicatePayload ? .equal : .different
+        }
+    }
+
+    private static func uniqueReplacementID(reservedIDs: inout Set<UUID>) -> UUID {
+        var candidate = UUID()
+        while reservedIDs.contains(candidate) {
+            candidate = UUID()
+        }
+        reservedIDs.insert(candidate)
+        return candidate
+    }
+}
+
 enum AgentTranscriptIO {
     private static let hiddenTranscriptToolNames: Set<String> = [
         "wait_for_next_user_instruction",
@@ -1924,6 +2158,17 @@ enum AgentTranscriptIO {
     static func shouldHideToolFromTranscript(_ name: String?) -> Bool {
         guard let name else { return false }
         return hiddenTranscriptToolNames.contains(AgentTranscriptToolNormalizer.normalizedToolName(name) ?? "")
+    }
+
+    private static func repairedSourceItems(
+        _ items: [AgentChatItem],
+        diagnosticContext: String
+    ) -> [AgentChatItem] {
+        let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: items)
+        if repair.didRepair {
+            AgentSourceItemIDRepair.logDiagnostics(repair.diagnostics, context: diagnosticContext)
+        }
+        return repair.items
     }
 
     static func shouldIncludeLegacyItem(
@@ -2023,17 +2268,18 @@ enum AgentTranscriptIO {
                 }
                 return lhs.sequenceIndex < rhs.sequenceIndex
             }
+        let repairedRows = repairedSourceItems(rows, diagnosticContext: "working_source_items")
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 AgentTranscriptDebugInstrumentation.workingSourceItemsHandler?(.init(
                     transcriptTurnCount: transcript.turns.count,
                     fullTurnCount: transcript.turns.count(where: { $0.retentionTier == .full }),
-                    itemCount: rows.count,
+                    itemCount: repairedRows.count,
                     durationMS: AgentTranscriptDebugInstrumentation.durationMS(since: startedAt)
                 ))
             }
         #endif
-        return rows
+        return repairedRows
     }
 
     #if DEBUG
@@ -2051,7 +2297,8 @@ enum AgentTranscriptIO {
             from oldTranscript: AgentTranscript,
             to newTranscript: AgentTranscript
         ) -> (all: Int, legacyNonFull: Int) {
-            let newTierByTurnID = Dictionary(uniqueKeysWithValues: newTranscript.turns.map { ($0.id, $0.retentionTier) })
+            // Use uniquingKeysWith to tolerate duplicate turn IDs without crashing; keep first.
+            let newTierByTurnID = Dictionary(newTranscript.turns.map { ($0.id, $0.retentionTier) }, uniquingKeysWith: { first, _ in first })
             var all = 0
             var legacyNonFull = 0
             for turn in oldTranscript.turns {
@@ -2699,6 +2946,44 @@ enum AgentTranscriptIO {
             return activity.text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return nil
+    }
+
+    /// Assemble the terminal MCP response from the contiguous trailing assistant run.
+    ///
+    /// This intentionally leaves historical activities and conclusion selection unchanged.
+    static func terminalAssistantResponseText(in turn: AgentTranscriptTurn) -> String? {
+        contiguousTrailingAssistantText(
+            turn.allActivities.map { (kind: $0.itemKind, text: $0.text) }
+        )
+    }
+
+    /// Source-item fallback for terminal MCP snapshots whose derived transcript is missing or stale.
+    static func terminalAssistantResponseText(from items: [AgentChatItem]) -> String? {
+        let orderedItems = items.sorted { lhs, rhs in
+            if lhs.sequenceIndex == rhs.sequenceIndex {
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.sequenceIndex < rhs.sequenceIndex
+        }
+        return contiguousTrailingAssistantText(
+            orderedItems.map { (kind: $0.kind, text: $0.text) }
+        )
+    }
+
+    private static func contiguousTrailingAssistantText(
+        _ fragments: [(kind: AgentChatItemKind, text: String)]
+    ) -> String? {
+        var trailingFragments: [String] = []
+        for fragment in fragments.reversed() {
+            guard fragment.kind == .assistant || fragment.kind == .assistantInline else {
+                break
+            }
+            trailingFragments.append(fragment.text)
+        }
+        guard !trailingFragments.isEmpty else { return nil }
+        let text = trailingFragments.reversed().joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return AgentDisplayableText.hasDisplayableBody(text) ? text : nil
     }
 
     /// Extract the latest error text from the transcript.
@@ -3516,8 +3801,10 @@ enum AgentTranscriptIO {
         )
         let projection = materialized.projection
         let blocks = projection.archivedBlocks + projection.workingBlocks
-        // Build turn lookup for rewriting baked summary text in handoff
-        let turnsByID = Dictionary(uniqueKeysWithValues: materialized.transcript.turns.map { ($0.id, $0) })
+        // Build turn lookup for rewriting baked summary text in handoff.
+        // Use uniquingKeysWith to tolerate duplicate turn IDs without crashing;
+        // keep the first occurrence when duplicates are present.
+        let turnsByID = Dictionary(materialized.transcript.turns.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         // Collect collapsedSummary structs by turnID so we can reformat baked system rows
         var collapsedSummaryByTurnID: [UUID: AgentTranscriptGroupedHistorySummary] = [:]
         for turn in materialized.transcript.turns {
@@ -3918,7 +4205,7 @@ enum AgentTranscriptIO {
                         isToolBoundary: false
                     ))
                 }
-            case .request, .activityCluster, .groupedHistory, .middleSummary, .conclusion:
+            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
                 break
             }
         }
@@ -5098,6 +5385,15 @@ enum AgentTranscriptProjectionBuilder {
         let collapseDigest: String
     }
 
+    private struct AppendedProjectionState {
+        let workingBlocks: [AgentTranscriptRenderBlock]
+        let archivedBlocks: [AgentTranscriptRenderBlock]
+        let workingRows: [AgentChatItem]
+        let archivedRows: [AgentChatItem]
+        let rowAnchorIndex: [UUID: AgentTranscriptAnchor]
+        let anchorBlockIndex: [AgentTranscriptAnchor: String]
+    }
+
     /// Refreshes completed full-turn grouped-history summary caches.
     /// Also intentionally tightens `frozenDetailedToolTailLimit` when an eligible completed
     /// full turn emits grouped history under the current newest-first allocation. Callers
@@ -5302,9 +5598,7 @@ enum AgentTranscriptProjectionBuilder {
                 continue
             }
 
-            let workingBlockStart = workingBlocks.count
-            let archivedBlockStart = archivedBlocks.count
-            appendProjectionState(
+            let appendedState = appendProjectionState(
                 for: turn,
                 detailedToolTailLimit: detailedToolTailLimits[turn.id] ?? 0,
                 context: context,
@@ -5316,17 +5610,15 @@ enum AgentTranscriptProjectionBuilder {
                 anchorBlockIndex: &anchorBlockIndex
             )
             if turn.isCompleted, turn.id != protectedTurnID {
-                let newWorkingBlocks = Array(workingBlocks.dropFirst(workingBlockStart))
-                let newArchivedBlocks = Array(archivedBlocks.dropFirst(archivedBlockStart))
                 updatedTurnCaches[turn.id] = projectionCache(
                     for: turn,
                     token: validationToken(for: turn),
-                    workingBlocks: newWorkingBlocks,
-                    archivedBlocks: newArchivedBlocks,
-                    workingRows: projectionRows(for: newWorkingBlocks),
-                    archivedRows: projectionRows(for: newArchivedBlocks),
-                    rowAnchorIndex: rowAnchorIndex,
-                    anchorBlockIndex: anchorBlockIndex
+                    workingBlocks: appendedState.workingBlocks,
+                    archivedBlocks: appendedState.archivedBlocks,
+                    workingRows: appendedState.workingRows,
+                    archivedRows: appendedState.archivedRows,
+                    rowAnchorIndex: appendedState.rowAnchorIndex,
+                    anchorBlockIndex: appendedState.anchorBlockIndex
                 )
             } else if !turn.isCompleted {
                 updatedTurnCaches.removeValue(forKey: turn.id)
@@ -5479,6 +5771,72 @@ enum AgentTranscriptProjectionBuilder {
         )
     }
 
+    static func tailWindowedProjection(
+        from projection: AgentTranscriptProjection,
+        transcript: AgentTranscript,
+        isExpanded: Bool,
+        tailTurnLimit: Int = 40
+    ) -> AgentTranscriptProjection {
+        guard !isExpanded, tailTurnLimit > 0 else { return projection }
+        let nonArchivedTurns = transcript.turns.filter { $0.retentionTier != .archived }
+        guard nonArchivedTurns.count > tailTurnLimit else { return projection }
+
+        let tailTurnIDs = Set(nonArchivedTurns.suffix(tailTurnLimit).map(\.id))
+        let hiddenTurnIDs = Set(nonArchivedTurns.compactMap { turn -> UUID? in
+            guard turn.isCompleted, !tailTurnIDs.contains(turn.id) else { return nil }
+            return turn.id
+        })
+        guard !hiddenTurnIDs.isEmpty else { return projection }
+
+        let hiddenBlocks = projection.workingBlocks.filter { hiddenTurnIDs.contains($0.turnID) }
+        guard let firstHiddenBlock = hiddenBlocks.first else { return projection }
+        let hiddenBlockIDs = Set(hiddenBlocks.map(\.id))
+        let collapsedBlockID = "collapsed-range:\(firstHiddenBlock.turnID.uuidString)"
+        let collapsedBlock = AgentTranscriptRenderBlock(
+            id: collapsedBlockID,
+            kind: .collapsedHistoryRange,
+            turnID: firstHiddenBlock.turnID,
+            retentionTier: firstHiddenBlock.retentionTier,
+            rows: [],
+            isArchived: false,
+            primaryAnchor: firstHiddenBlock.primaryAnchor ?? .request(turnID: firstHiddenBlock.turnID),
+            collapsedHistoryRange: .init(hiddenTurnCount: hiddenTurnIDs.count),
+            defaultPresentation: .collapsed
+        )
+
+        var didInsertCollapsedBlock = false
+        var windowedBlocks: [AgentTranscriptRenderBlock] = []
+        windowedBlocks.reserveCapacity(projection.workingBlocks.count - hiddenBlocks.count + 1)
+        for block in projection.workingBlocks {
+            if hiddenBlockIDs.contains(block.id) {
+                if !didInsertCollapsedBlock {
+                    windowedBlocks.append(collapsedBlock)
+                    didInsertCollapsedBlock = true
+                }
+                continue
+            }
+            windowedBlocks.append(block)
+        }
+
+        let visibleRowIDs = Set(windowedBlocks.flatMap(projectionRows(for:)).map(\.id))
+        var anchorBlockIndex = projection.anchorBlockIndex
+        for (anchor, blockID) in projection.anchorBlockIndex where hiddenBlockIDs.contains(blockID) {
+            anchorBlockIndex[anchor] = collapsedBlockID
+        }
+        let visibleBlockIDs = Set(windowedBlocks.map(\.id)).union(projection.archivedBlocks.map(\.id))
+        anchorBlockIndex = anchorBlockIndex.filter { visibleBlockIDs.contains($0.value) }
+
+        return .init(
+            workingBlocks: windowedBlocks,
+            archivedBlocks: projection.archivedBlocks,
+            workingRows: projection.workingRows.filter { visibleRowIDs.contains($0.id) },
+            archivedRows: projection.archivedRows,
+            rowAnchorIndex: projection.rowAnchorIndex,
+            anchorBlockIndex: anchorBlockIndex,
+            workingUnitCount: windowedBlocks.count
+        )
+    }
+
     static func archivedSnapshot(from fullProjection: AgentTranscriptProjection) -> AgentArchivedTranscriptSnapshot {
         let archivedRowIDs = Set(fullProjection.archivedRows.map(\.id))
         let archivedBlockIDs = Set(fullProjection.archivedBlocks.map(\.id))
@@ -5540,6 +5898,8 @@ enum AgentTranscriptProjectionBuilder {
             []
         case .request, .activityCluster, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             block.rows
+        case .collapsedHistoryRange:
+            []
         }
     }
 
@@ -5578,7 +5938,7 @@ enum AgentTranscriptProjectionBuilder {
         archivedRows: inout [AgentChatItem],
         rowAnchorIndex: inout [UUID: AgentTranscriptAnchor],
         anchorBlockIndex: inout [AgentTranscriptAnchor: String]
-    ) {
+    ) -> AppendedProjectionState {
         let archived = turn.retentionTier == .archived
         let blocks = blocksForTurn(
             turn,
@@ -5587,18 +5947,41 @@ enum AgentTranscriptProjectionBuilder {
             context: context,
             protectDetachedFocus: false
         )
+        var appendedWorkingBlocks: [AgentTranscriptRenderBlock] = []
+        var appendedArchivedBlocks: [AgentTranscriptRenderBlock] = []
+        var appendedWorkingRows: [AgentChatItem] = []
+        var appendedArchivedRows: [AgentChatItem] = []
         for block in blocks {
             let projectedRows = projectionRows(for: block)
             if archived {
                 archivedBlocks.append(block)
                 archivedRows.append(contentsOf: projectedRows)
+                appendedArchivedBlocks.append(block)
+                appendedArchivedRows.append(contentsOf: projectedRows)
             } else {
                 workingBlocks.append(block)
                 workingRows.append(contentsOf: projectedRows)
+                appendedWorkingBlocks.append(block)
+                appendedWorkingRows.append(contentsOf: projectedRows)
             }
         }
-        registerAnchors(for: turn, blocks: blocks, into: &rowAnchorIndex)
-        registerBlockAnchors(for: turn, blocks: blocks, into: &anchorBlockIndex)
+
+        var appendedRowAnchorIndex: [UUID: AgentTranscriptAnchor] = [:]
+        registerAnchors(for: turn, blocks: blocks, into: &appendedRowAnchorIndex)
+        rowAnchorIndex.merge(appendedRowAnchorIndex) { _, new in new }
+
+        var appendedAnchorBlockIndex: [AgentTranscriptAnchor: String] = [:]
+        registerBlockAnchors(for: turn, blocks: blocks, into: &appendedAnchorBlockIndex)
+        anchorBlockIndex.merge(appendedAnchorBlockIndex) { _, new in new }
+
+        return AppendedProjectionState(
+            workingBlocks: appendedWorkingBlocks,
+            archivedBlocks: appendedArchivedBlocks,
+            workingRows: appendedWorkingRows,
+            archivedRows: appendedArchivedRows,
+            rowAnchorIndex: appendedRowAnchorIndex,
+            anchorBlockIndex: appendedAnchorBlockIndex
+        )
     }
 
     static func validationToken(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnProjectionCache.ValidationToken {
@@ -6336,7 +6719,7 @@ enum AgentTranscriptProjectionBuilder {
 
     private static func presentedItemCount(for block: AgentTranscriptRenderBlock) -> Int {
         switch block.kind {
-        case .activityCluster, .groupedHistory:
+        case .activityCluster, .groupedHistory, .collapsedHistoryRange:
             1
         case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             block.rows.count
@@ -7142,7 +7525,7 @@ enum AgentTranscriptProjectionBuilder {
             .activity
         case .standaloneNote:
             block.rows.contains(where: { $0.kind == .thinking }) ? .activity : .notes
-        case .request, .activityCluster, .groupedHistory, .middleSummary, .conclusion:
+        case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
             .mixed
         }
     }
@@ -7166,7 +7549,7 @@ enum AgentTranscriptProjectionBuilder {
                 } else {
                     containsNotes = true
                 }
-            case .request, .activityCluster, .groupedHistory, .middleSummary, .conclusion:
+            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
                 containsMixed = true
             }
         }

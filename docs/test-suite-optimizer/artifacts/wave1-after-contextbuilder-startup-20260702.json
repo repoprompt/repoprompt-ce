@@ -1,0 +1,234 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/wave1-after-contextbuilder-startup-20260702.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.ContextBuilderModelStartupSelectionTests",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.ContextBuilderModelStartupSelectionTests",
+  "git": {
+    "commit": "4423bf1dbe103a11fc2a83a4c1e0fbdea098101e",
+    "working_tree": " M docs/test-suite-optimizer/scoreboard.md\n?? docs/test-suite-optimizer/artifacts/wave1-after-worktree-exact-20260702.json"
+  },
+  "inventory": null,
+  "label": "wave1-after-contextbuilder-startup-20260702",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderModelStartupSelectionTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.8275918960571289,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/18b6ef0e-7953-4047-9619-258ccf8c801d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 12,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004538059234619141,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderModelStartupSelectionTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.9543368816375732,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e4734fa0-bd52-4a58-bda7-1068e97243aa.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 12,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004086732864379883,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderModelStartupSelectionTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.8188621997833252,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/b09a0da0-c72e-4f5e-bdc8-38b880311f35.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 12,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.005270957946777344,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.11,
+      "median_aggregate_seconds": 0.051000000000000004,
+      "method_count": 12,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.043,
+      "median_seconds": 0.043,
+      "method": "testCachedCLIFlagIsNotReadyUntilCurrentProcessVerification",
+      "observations": 3,
+      "observed_p95_seconds": 0.043,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.003,
+      "median_seconds": 0.003,
+      "method": "testTransientFallbackResolutionDoesNotMutatePersistedSelection",
+      "observations": 3,
+      "observed_p95_seconds": 0.003,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testValidPersistedSelectionSurvivesStoreReloadAndStartupResolution",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.11,
+      "median_seconds": 0.001,
+      "method": "testOpenCodeStartupReadinessJoinsRunningPollAndEmitsLiveSnapshot",
+      "observations": 3,
+      "observed_p95_seconds": 0.11,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testCursorStartupReadinessJoinsRunningPollWithoutDynamicMetadata",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testDynamicPersistedSelectionSurvivesAfterACPDiscovery",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.0,
+      "method": "testPersistedDynamicSelectionSurvivesStandardCatalogWarmup",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testFallbackUsesWizardRecommendationProviderFilter",
+      "observations": 3,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testFilteredRecommendationProvidersDoNotReappearThroughGenericFallback",
+      "observations": 3,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testStaticOpenCodeDefaultSurvivesAfterACPDiscovery",
+      "observations": 3,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testUnavailablePersistedSelectionFallsBackToRecommendedAvailableProvider",
+      "observations": 3,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testUnconfiguredClaudeCodeCannotBecomeEffectiveStartupSelection",
+      "observations": 3,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptTests.ContextBuilderModelStartupSelectionTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 0,
+    "median_seconds": 0.8275918960571289,
+    "noise_classification": "stable",
+    "observed_p95_seconds": 0.9543368816375732,
+    "raw_execution_seconds": [
+      0.8275918960571289,
+      0.9543368816375732,
+      0.8188621997833252
+    ],
+    "relative_mad": 0.010548310484182288,
+    "valid_samples": 3
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T16:15:05+00:00"
+}

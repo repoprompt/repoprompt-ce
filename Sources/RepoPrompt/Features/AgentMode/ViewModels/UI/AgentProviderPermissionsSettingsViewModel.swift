@@ -97,72 +97,45 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         finalizeProviderMutation(for: id.providerID)
     }
 
-    func setCodexBashToolEnabled(_ enabled: Bool) {
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) {
         if let bindingService {
-            bindingService.setCodexBashToolEnabled(enabled)
+            bindingService.applyCodexToolSettingMutation(mutation)
         } else {
-            CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            switch mutation {
+            case let .bashTool(enabled):
+                CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .searchTool(enabled):
+                CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
+            case let .goalSupport(enabled):
+                CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
+            case let .reasoningSummaries(enabled):
+                CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
+            case let .mcpServer(normalizedName, enabled):
+                CodexAgentToolPreferences.setMCPServerEnabled(
+                    normalizedName: normalizedName,
+                    isEnabled: enabled,
+                    defaults: defaults,
+                    secureStore: securePermissions
+                )
+            }
         }
         finalizeProviderMutation(for: .codex)
     }
 
-    func setCodexSearchToolEnabled(_ enabled: Bool) {
+    func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) {
         if let bindingService {
-            bindingService.setCodexSearchToolEnabled(enabled)
+            bindingService.applyClaudeToolSettingMutation(mutation)
         } else {
-            CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
-        }
-        finalizeProviderMutation(for: .codex)
-    }
-
-    func setCodexGoalSupportEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setCodexGoalSupportEnabled(enabled)
-        } else if defaults === UserDefaults.standard {
-            GlobalSettingsStore.shared.setCodexGoalSupportEnabled(enabled)
-        } else {
-            CodexGoalSupport.setEnabled(enabled, defaults: defaults)
-        }
-        finalizeProviderMutation(for: .codex)
-    }
-
-    func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
-        if let bindingService {
-            bindingService.setCodexMCPServerEnabled(normalizedName: normalizedName, enabled: enabled)
-        } else {
-            CodexAgentToolPreferences.setMCPServerEnabled(
-                normalizedName: normalizedName,
-                isEnabled: enabled,
-                defaults: defaults,
-                secureStore: securePermissions
-            )
-        }
-        finalizeProviderMutation(for: .codex)
-    }
-
-    func setClaudeBashToolEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setClaudeBashToolEnabled(enabled)
-        } else {
-            ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        }
-        finalizeProviderMutation(for: .claude)
-    }
-
-    func setClaudeMCPStrictModeEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setClaudeMCPStrictModeEnabled(enabled)
-        } else {
-            ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        }
-        finalizeProviderMutation(for: .claude)
-    }
-
-    func setClaudeToolSearchEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setClaudeToolSearchEnabled(enabled)
-        } else {
-            ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
+            switch mutation {
+            case let .bashTool(enabled):
+                ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .mcpStrictMode(enabled):
+                ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .toolSearch(enabled):
+                ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
+            case let .agentModePromptDelivery(delivery):
+                ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
+            }
         }
         finalizeProviderMutation(for: .claude)
     }

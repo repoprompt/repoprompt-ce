@@ -313,7 +313,7 @@ enum MCPToolArgsNormalizer {
     }
 
     private static func allowedSiblingKeys(for tool: String) -> Set<String> {
-        let common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args"]
+        let common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args", "operation_id"]
         switch tool {
         case "bind_context":
             return common.union(["op", "window_id", "working_dirs", "create_if_missing", "tab_name"])
@@ -323,6 +323,8 @@ enum MCPToolArgsNormalizer {
             return common.union(["start_line", "offset", "limit"])
         case "file_search":
             return common.union(["pattern", "regex", "mode", "context_lines", "count_only", "max_results"])
+        case "get_code_structure":
+            return common.union(["paths", "expand", "depth", "signatures", "size"])
         default:
             return common // conservative fallback
         }

@@ -705,6 +705,7 @@ public enum AgentTranscriptRenderBlockKind: String, Sendable, Equatable {
     case request
     case activityCluster
     case groupedHistory
+    case collapsedHistoryRange
     case standaloneAssistant
     case standaloneTool
     case standaloneNote
@@ -872,6 +873,14 @@ public struct AgentTranscriptGroupedHistory: Sendable, Equatable {
     }
 }
 
+public struct AgentTranscriptCollapsedHistoryRange: Sendable, Equatable {
+    public let hiddenTurnCount: Int
+
+    public init(hiddenTurnCount: Int) {
+        self.hiddenTurnCount = max(0, hiddenTurnCount)
+    }
+}
+
 public struct AgentTranscriptRenderBlock: Identifiable, Sendable, Equatable {
     public let id: String
     public let kind: AgentTranscriptRenderBlockKind
@@ -885,6 +894,7 @@ public struct AgentTranscriptRenderBlock: Identifiable, Sendable, Equatable {
     public let activityIDs: [UUID]
     public let clusterSummary: AgentTranscriptClusterSummary?
     public let groupedHistory: AgentTranscriptGroupedHistory?
+    public let collapsedHistoryRange: AgentTranscriptCollapsedHistoryRange?
     public let defaultPresentation: AgentTranscriptBlockPresentation
 
     public init(
@@ -900,6 +910,7 @@ public struct AgentTranscriptRenderBlock: Identifiable, Sendable, Equatable {
         activityIDs: [UUID] = [],
         clusterSummary: AgentTranscriptClusterSummary? = nil,
         groupedHistory: AgentTranscriptGroupedHistory? = nil,
+        collapsedHistoryRange: AgentTranscriptCollapsedHistoryRange? = nil,
         defaultPresentation: AgentTranscriptBlockPresentation = .expanded
     ) {
         self.id = id
@@ -914,6 +925,7 @@ public struct AgentTranscriptRenderBlock: Identifiable, Sendable, Equatable {
         self.activityIDs = activityIDs
         self.clusterSummary = clusterSummary
         self.groupedHistory = groupedHistory
+        self.collapsedHistoryRange = collapsedHistoryRange
         self.defaultPresentation = defaultPresentation
     }
 }
@@ -989,13 +1001,14 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
     let anchorBlockIndex: [AgentTranscriptAnchor: String]
     let archivedHistoryState: AgentArchivedHistoryState
     let isCompressedHistoryRevealed: Bool
+    let isTranscriptWindowExpanded: Bool
     let isWindowCappedWhileActive: Bool
     let bindingsHydrated: Bool
     let hydratedPersistentBinding: AgentPersistentSessionBindingIdentity?
     let hydratedBindingTransitionGeneration: UInt64?
     let performanceSnapshot: AgentTranscriptPerformanceSnapshot
     let metadata: AgentTranscriptPresentationMetadata
-    let rawToolResultPayloadRenderRevision: Int
+    let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
 
     init(
         tabID: UUID? = nil,
@@ -1008,13 +1021,14 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
         anchorBlockIndex: [AgentTranscriptAnchor: String] = [:],
         archivedHistoryState: AgentArchivedHistoryState = .empty,
         isCompressedHistoryRevealed: Bool = false,
+        isTranscriptWindowExpanded: Bool = false,
         isWindowCappedWhileActive: Bool = false,
         bindingsHydrated: Bool = true,
         hydratedPersistentBinding: AgentPersistentSessionBindingIdentity? = nil,
         hydratedBindingTransitionGeneration: UInt64? = nil,
         performanceSnapshot: AgentTranscriptPerformanceSnapshot = .empty,
         metadata: AgentTranscriptPresentationMetadata = .empty,
-        rawToolResultPayloadRenderRevision: Int = 0
+        rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
     ) {
         self.tabID = tabID
         self.revision = revision
@@ -1026,13 +1040,14 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
         self.anchorBlockIndex = anchorBlockIndex
         self.archivedHistoryState = archivedHistoryState
         self.isCompressedHistoryRevealed = isCompressedHistoryRevealed
+        self.isTranscriptWindowExpanded = isTranscriptWindowExpanded
         self.isWindowCappedWhileActive = isWindowCappedWhileActive
         self.bindingsHydrated = bindingsHydrated
         self.hydratedPersistentBinding = hydratedPersistentBinding
         self.hydratedBindingTransitionGeneration = hydratedBindingTransitionGeneration
         self.performanceSnapshot = performanceSnapshot
         self.metadata = metadata
-        self.rawToolResultPayloadRenderRevision = rawToolResultPayloadRenderRevision
+        self.rawToolResultPayloadRenderRevisionByItemID = rawToolResultPayloadRenderRevisionByItemID
     }
 
     func contentEqualsExcludingPerformance(_ other: Self) -> Bool {
@@ -1045,12 +1060,13 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
             && anchorBlockIndex == other.anchorBlockIndex
             && archivedHistoryState == other.archivedHistoryState
             && isCompressedHistoryRevealed == other.isCompressedHistoryRevealed
+            && isTranscriptWindowExpanded == other.isTranscriptWindowExpanded
             && isWindowCappedWhileActive == other.isWindowCappedWhileActive
             && bindingsHydrated == other.bindingsHydrated
             && hydratedPersistentBinding == other.hydratedPersistentBinding
             && hydratedBindingTransitionGeneration == other.hydratedBindingTransitionGeneration
             && metadata == other.metadata
-            && rawToolResultPayloadRenderRevision == other.rawToolResultPayloadRenderRevision
+            && rawToolResultPayloadRenderRevisionByItemID == other.rawToolResultPayloadRenderRevisionByItemID
     }
 
     func hasVisiblePresentationDelta(comparedTo other: Self) -> Bool {
@@ -1058,8 +1074,9 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
             || visibleRows != other.visibleRows
             || archivedHistoryState != other.archivedHistoryState
             || isCompressedHistoryRevealed != other.isCompressedHistoryRevealed
+            || isTranscriptWindowExpanded != other.isTranscriptWindowExpanded
             || isWindowCappedWhileActive != other.isWindowCappedWhileActive
-            || rawToolResultPayloadRenderRevision != other.rawToolResultPayloadRenderRevision
+            || rawToolResultPayloadRenderRevisionByItemID != other.rawToolResultPayloadRenderRevisionByItemID
     }
 
     static let empty = AgentTranscriptPresentationSnapshot()

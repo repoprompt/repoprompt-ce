@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class AgentModeMCPWaitEpochTests: XCTestCase {
@@ -50,6 +50,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             commitID: UUID(),
             ownership: firstOwnership,
             terminalState: .completed,
+            expectedRunID: nil,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: session.providerTerminalDrainGeneration,
@@ -233,6 +234,38 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         XCTAssertEqual(steeringEpoch.ordinal, initialEpoch.ordinal + 1)
         XCTAssertEqual(steeringEpoch.transitionKind, .steering)
         XCTAssertNil(steeringContext.pendingEpochTransition)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    func testScopedSteeringWithNilCurrentEpochCreatesSteeringEpoch() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true,
+            markSessionAsMCPOriginated: false,
+            requireInactiveRunState: true
+        )
+        let initialContext = try XCTUnwrap(session.mcpControlContext)
+        XCTAssertNil(initialContext.currentEpoch)
+        XCTAssertFalse(session.isMCPOriginated)
+
+        try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
+            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        }
+
+        let steeringContext = try XCTUnwrap(session.mcpControlContext)
+        let steeringEpoch = try XCTUnwrap(steeringContext.currentEpoch)
+        XCTAssertEqual(steeringContext.activationID, initialContext.activationID)
+        XCTAssertEqual(steeringContext.registration, initialContext.registration)
+        XCTAssertEqual(steeringEpoch.ordinal, 1)
+        XCTAssertEqual(steeringEpoch.transitionKind, .steering)
+        XCTAssertNil(steeringContext.pendingEpochTransition)
+        XCTAssertFalse(session.isMCPOriginated)
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
@@ -435,6 +468,191 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testBackgroundTerminalPublicationCatchesUpTranscriptWithoutTakingActivePresentation() async throws {
+        let viewModel = makeViewModel()
+        viewModel.test_initializeRunService()
+        viewModel.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(true)
+        let activeTabID = UUID()
+        let backgroundTabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(activeTabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
+        activeSession.replaceItems([
+            .user("foreground question", sequenceIndex: 0),
+            .assistant("foreground answer.", sequenceIndex: 1)
+        ])
+        viewModel.refreshDerivedTranscriptState(for: activeSession)
+        viewModel.applySessionToBindings(activeSession)
+        let activePresentation = viewModel.activeTranscriptPresentation
+
+        let sessionID = UUID()
+        let backgroundSession = await viewModel.ensureSessionReady(tabID: backgroundTabID)
+        _ = viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: backgroundSession
+        )
+        try await viewModel.mcpActivateControlContext(
+            forTabID: backgroundTabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: backgroundSession)
+        let controller = EpochTestCodexController()
+        let runID = UUID()
+        backgroundSession.selectedAgent = .codexExec
+        backgroundSession.runID = runID
+        backgroundSession.runState = .running
+        let ownership = backgroundSession.beginRunAttempt(source: "test.backgroundTerminal")
+        backgroundSession.codexController = controller
+        backgroundSession.codexConversationID = "epoch-test"
+        backgroundSession.codexAuthoritativeActiveTurn = try .init(
+            threadID: "epoch-test",
+            turnID: "turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: backgroundSession.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: XCTUnwrap(backgroundSession.activeRunAttemptID)
+        )
+        backgroundSession.codexRoutingObservedTurnID = "turn"
+        let context = try XCTUnwrap(backgroundSession.mcpControlContext)
+        let epoch = try XCTUnwrap(ownership.turnEpoch)
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: context.registration,
+            epoch: epoch
+        )
+        backgroundSession.replaceItems([
+            .user("background question", sequenceIndex: 0),
+            .assistant("answer", sequenceIndex: 1)
+        ])
+        viewModel.refreshDerivedTranscriptState(for: backgroundSession)
+        XCTAssertEqual(
+            AgentTranscriptIO.latestAssistantPreviewText(from: backgroundSession.transcript),
+            "answer"
+        )
+
+        backgroundSession.appendItem(
+            .assistantInline(".", sequenceIndex: backgroundSession.nextSequenceIndex)
+        )
+        backgroundSession.assistantDeltaFlushGeneration &+= 1
+        let finalSourceRevision = backgroundSession.sourceItemsRevision
+        let finalFlushGeneration = backgroundSession.assistantDeltaFlushGeneration
+        XCTAssertNotNil(backgroundSession.derivedTranscriptRefreshTask)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: backgroundSession
+        )
+        await Task.yield()
+
+        XCTAssertNil(backgroundSession.derivedTranscriptRefreshTask)
+        XCTAssertEqual(
+            backgroundSession.derivedTranscriptSyncState?.sourceItemsRevision,
+            finalSourceRevision
+        )
+        XCTAssertEqual(viewModel.activeTranscriptPresentation, activePresentation)
+
+        let revision = try XCTUnwrap(backgroundSession.lastTerminalCommitRevision)
+        XCTAssertEqual(backgroundSession.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
+        XCTAssertEqual(backgroundSession.runState, .completed)
+        XCTAssertTrue(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(backgroundSession))
+
+        let storedSnapshot = await AgentRunSessionStore.snapshot(for: cursor)
+        let stored = try XCTUnwrap(storedSnapshot)
+        XCTAssertEqual(stored.latestAssistantPreview, "answer.")
+        XCTAssertEqual(revision.sourceItemsRevision, finalSourceRevision)
+        XCTAssertEqual(revision.assistantDeltaFlushGeneration, finalFlushGeneration)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation, activePresentation)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    func testFinalContentDiagnosticPublishesAsTerminalAssistantTextForMCPWait() async throws {
+        #if DEBUG
+            let viewModel = makeViewModel()
+            let sessionID = UUID()
+            let session = await viewModel.ensureSessionReady(tabID: UUID())
+            _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+            try await viewModel.mcpActivateControlContext(
+                forTabID: session.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: nil,
+                startPending: true
+            )
+            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            let runID = UUID()
+            session.selectedAgent = .openCode
+            session.runID = runID
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "test.finalContentDiagnostic")
+            let runAttemptID = try XCTUnwrap(session.activeRunAttemptID)
+            let diagnostic = "OpenCode ACP completed with stopReason=end_turn but emitted no assistant content or reasoning chunks."
+
+            await viewModel.test_handleStreamResult(
+                AIStreamResult(type: "final_content", text: diagnostic),
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID
+            )
+            viewModel.refreshDerivedTranscriptState(for: session)
+            session.runState = .completed
+
+            let envelope = try XCTUnwrap(viewModel.test_makeTerminalPublicationEnvelope(
+                for: session,
+                ownership: ownership,
+                terminalState: .completed
+            ))
+            XCTAssertEqual(envelope.snapshot.latestAssistantPreview, diagnostic)
+            XCTAssertEqual(envelope.snapshot.asObject()["assistant_text"]?.stringValue, diagnostic)
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        #else
+            throw XCTSkip("Stream-result test hook is DEBUG-only.")
+        #endif
+    }
+
+    func testStaleTranscriptDoesNotOverrideAuthoritativeSourceWithoutAssistantTail() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        let ownership = session.beginRunAttempt(source: "test.staleTranscript")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("old question", sequenceIndex: 0),
+                .assistant("old answer.", sequenceIndex: 1)
+            ],
+            terminalState: .completed,
+            compact: false
+        )
+        session.replaceItems([
+            .user("new question", sequenceIndex: 2),
+            AgentChatItem(
+                kind: .toolResult,
+                text: "terminal tool result",
+                toolName: "read_file",
+                sequenceIndex: 3
+            )
+        ])
+        session.runState = .completed
+
+        let envelope = try XCTUnwrap(viewModel.test_makeTerminalPublicationEnvelope(
+            for: session,
+            ownership: ownership,
+            terminalState: .completed
+        ))
+
+        XCTAssertNil(envelope.snapshot.latestAssistantPreview)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     func testControlledTerminalPublicationRejectsMissingCanonicalEnvelope() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
@@ -450,6 +668,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             commitID: UUID(),
             ownership: ownership,
             terminalState: .completed,
+            expectedRunID: nil,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: session.providerTerminalDrainGeneration,

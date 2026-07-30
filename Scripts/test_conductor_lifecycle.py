@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -75,7 +77,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 9)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -182,26 +184,55 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(enqueue.call_args.args[2], {"subcommand": "relaunch", "appArgs": ["--demo"]})
         with self.assertRaises(conductor.ConductorError):
             conductor.handle_real_operation(state.paths, "app", ["relaunch", "--demo"])
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue_launch:
+            code = conductor.handle_real_operation(state.paths, "app", ["launch-existing", "--", "--demo"])
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue_launch.call_args.args[2], {"subcommand": "launch-existing", "appArgs": ["--demo"]})
 
-    def test_app_relaunch_delegates_run_script_with_run_lanes_and_timeout(self) -> None:
+    def test_app_relaunch_delegates_split_internal_runner_with_live_lane_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
             argv, lanes, _cwd, _env, timeout = registry.prepare(
                 {"operation": "app", "args": {"subcommand": "relaunch", "appArgs": ["--demo"]}}
             )
-            _guarded_argv, _guarded_lanes, _guarded_cwd, guarded_env, _guarded_timeout = registry.prepare(
-                {"operation": "app", "args": {"subcommand": "relaunch", "appArgs": [], "guardDelayedLaunch": True}}
+            launch_existing_argv, launch_existing_lanes, _cwd, _env, _timeout = registry.prepare(
+                {"operation": "app", "args": {"subcommand": "launch-existing", "appArgs": ["--demo"]}}
             )
 
-        self.assertEqual(Path(argv[-2]).name, "run.sh")
-        self.assertEqual(Path(argv[-2]).parent.name, "Scripts")
-        self.assertEqual(argv[-1], "--demo")
-        self.assertEqual(lanes, ["build", "debugArtifact", "liveApp"])
+        self.assertIn("__operation_runner", argv)
+        self.assertIn("debug_app_build_then_launch", argv[-1])
+        self.assertEqual(lanes, ["liveApp"])
         self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
-        self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
+        self.assertIn("app_launch_existing", launch_existing_argv[-1])
+        self.assertEqual(launch_existing_lanes, ["liveApp"])
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
-    def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
+    def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            argv, lanes, cwd, _env, _timeout = registry.prepare({"operation": "guardrails", "args": {}})
+
+        self.assertEqual(Path(argv[0]).name, "guardrails.sh")
+        self.assertEqual(Path(argv[0]).parent.name, "Scripts")
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, repo_root)
+
+    def test_codex_schema_check_delegates_bounded_gate_without_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            argv, lanes, cwd, _env, timeout = registry.prepare(
+                {"operation": "codex-schema-check", "args": {}}
+            )
+
+        self.assertEqual(Path(argv[0]).name, Path(sys.executable).name)
+        self.assertEqual(Path(argv[1]).name, "check_codex_app_server_schema.py")
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, repo_root)
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
+
+    def test_release_artifact_delegates_release_script_with_release_lanes_and_extended_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
@@ -215,7 +246,30 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(Path(argv[0]).name, "release.sh")
         self.assertEqual(argv[1], "artifact")
         self.assertEqual(lanes, ["build", "debugArtifact", "release"])
-        self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
+        self.assertEqual(timeout, conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS)
+
+    def test_release_artifact_timeout_is_distinct_from_other_release_packaging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            _argv, _lanes, _cwd, _env, artifact_timeout = registry.prepare(
+                {"operation": "release", "args": {"subcommand": "artifact"}}
+            )
+            normal_release_requests = {
+                "package release": {"operation": "package", "args": {"config": "release"}},
+                "release package": {"operation": "release", "args": {"subcommand": "package"}},
+                "release local-install": {"operation": "release", "args": {"subcommand": "local-install"}},
+            }
+            normal_timeouts = {
+                label: registry.prepare(request)[4]
+                for label, request in normal_release_requests.items()
+            }
+
+        self.assertEqual(conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS, 4 * 60 * 60)
+        self.assertEqual(artifact_timeout, conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS)
+        self.assertEqual(conductor.RELEASE_TIMEOUT_SECONDS, 2 * 60 * 60)
+        for label, timeout in normal_timeouts.items():
+            with self.subTest(operation=label):
+                self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
 
     def test_packaged_smoke_uses_only_live_app_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +281,49 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(lanes, ["liveApp"])
         self.assertTrue(Path(argv[0]).name.startswith("python3"))
         self.assertIn('"kind":"smoke"', argv[-1].replace(" ", ""))
+
+    def test_diagnostics_build_cache_delegates_read_only_without_lanes(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "diagnostics", ["build-cache", "--limit", "3"])
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        argv, lanes, cwd, _env, timeout = registry.prepare(
+            {"operation": "diagnostics", "args": {"subcommand": "build-cache", "limit": 3}}
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[1], "diagnostics")
+        self.assertEqual(enqueue.call_args.args[2], {"subcommand": "build-cache", "limit": 3})
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, state.paths.repo_root)
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
+        self.assertTrue(Path(argv[0]).name.startswith("python3"))
+        self.assertIn('"kind":"diagnostics_build_cache"', argv[-1].replace(" ", ""))
+
+    def test_diagnostics_build_cache_reports_managed_worktree_build_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp) / ".repoprompt-worktrees" / "repoprompt-ce-upstream"
+            repo_root = container / "wt-a"
+            sibling = container / "wt-b"
+            (repo_root / ".build").mkdir(parents=True)
+            (sibling / ".build").mkdir(parents=True)
+            (repo_root / ".build" / "a.bin").write_bytes(b"a" * 1024)
+            (sibling / ".build" / "b.bin").write_bytes(b"b" * 2 * 1024 * 1024)
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = conductor.operation_diagnostics_build_cache(repo_root, {"limit": 1})
+
+        text = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("Build cache diagnostics", text)
+        self.assertIn("Current .build:", text)
+        self.assertIn("Worktree .build total:", text)
+        self.assertIn("across 2 build directories", text)
+        self.assertIn("Top .build directories:", text)
+        self.assertIn("wt-b", text)
 
     def test_release_local_install_delegates_installer_with_release_lanes_and_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,7 +377,9 @@ class LifecycleQueueTests(LifecycleTestCase):
         fake_process.stdout = fake_stdout
         fake_process.wait.return_value = 0
 
-        with mock.patch.object(conductor.subprocess, "Popen", return_value=fake_process) as popen, mock.patch.object(
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            conductor.subprocess, "Popen", return_value=fake_process
+        ) as popen, mock.patch.object(
             conductor, "process_table_snapshot", return_value={os.getpid(): (os.getppid(), "fixture-start")}
         ), mock.patch.object(state, "_schedule_locked"), mock.patch.object(state, "_refresh_output_summary"):
             state._run_job(job.ticket)
@@ -306,7 +405,9 @@ class LifecycleQueueTests(LifecycleTestCase):
             subprocess.TimeoutExpired(["fixture"], conductor.KILL_GRACE_SECONDS),
         ]
 
-        with mock.patch.object(conductor.subprocess, "Popen", return_value=fake_process), mock.patch.object(
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            conductor.subprocess, "Popen", return_value=fake_process
+        ), mock.patch.object(
             conductor, "process_table_snapshot", return_value={os.getpid(): (os.getppid(), "fixture-start")}
         ), mock.patch.object(state, "_terminate_process_group_locked"), mock.patch.object(
             state, "_kill_process_group_locked"
@@ -324,6 +425,139 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertTrue(job.timed_out)
         self.assertIn("job processes remained alive after SIGKILL escalation", job.error or "")
         self.assertNotIn("daemon runner error", job.result_summary or "")
+
+    def test_process_group_signal_requires_verified_job_identity(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "job-pgid-unverified", "fixture", {}, ["build"], job_state="running")
+        job.process_pgid = 123456
+        state.jobs[job.ticket] = job
+
+        with mock.patch.object(conductor.os, "killpg") as killpg:
+            with state.condition:
+                state._terminate_process_group_locked(job, reason="unverified group")
+
+        killpg.assert_not_called()
+        self.assertFalse(job.process_group_identity_confirmed)
+        self.assertIn("terminating process tree: unverified group", "".join(job.tail))
+        self.assertNotIn("terminating process group: unverified group", "".join(job.tail))
+
+    def test_cancel_signals_process_group_for_reparented_descendant(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        grandchild_pid_path = root / "grandchild.pid"
+        grandchild_ready_path = root / "grandchild.ready"
+        job = self.make_job(state, "job-pgid-orphan", "fixture", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        state.active_lanes = {"build": job.ticket}
+
+        grandchild_code = textwrap.dedent(
+            """
+            import os
+            import signal
+            import sys
+            import time
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            pid_path = sys.argv[1]
+            ready_path = sys.argv[2]
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            with open(ready_path, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} {os.getppid()} {os.getpgid(0)}")
+            while True:
+                time.sleep(1)
+            """
+        )
+        intermediate_code = textwrap.dedent(
+            """
+            import subprocess
+            import sys
+
+            subprocess.Popen(
+                [sys.executable, "-u", "-c", sys.argv[1], sys.argv[2], sys.argv[3]],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=False,
+            )
+            """
+        )
+        root_code = textwrap.dedent(
+            """
+            import os
+            import subprocess
+            import sys
+            import time
+
+            grandchild_code = sys.argv[1]
+            pid_path = sys.argv[2]
+            ready_path = sys.argv[3]
+            subprocess.run(
+                [sys.executable, "-u", "-c", sys.argv[4], grandchild_code, pid_path, ready_path],
+                check=True,
+            )
+            deadline = time.time() + 5.0
+            while not os.path.exists(ready_path) and time.time() < deadline:
+                time.sleep(0.05)
+            print("ROOT_READY", flush=True)
+            while True:
+                time.sleep(1)
+            """
+        )
+        argv = [
+            sys.executable,
+            "-u",
+            "-c",
+            root_code,
+            grandchild_code,
+            str(grandchild_pid_path),
+            str(grandchild_ready_path),
+            intermediate_code,
+        ]
+        state.registry.prepare = lambda _request: (argv, ["build"], root, os.environ.copy(), 30.0)  # type: ignore[method-assign]
+
+        def cleanup_grandchild() -> None:
+            if not grandchild_pid_path.exists() or not grandchild_ready_path.exists():
+                return
+            with contextlib.suppress(ValueError, ProcessLookupError, PermissionError, OSError):
+                grandchild_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+                grandchild_pgid = int(grandchild_ready_path.read_text(encoding="utf-8").split()[2])
+                if os.getpgid(grandchild_pid) == grandchild_pgid:
+                    os.kill(grandchild_pid, signal.SIGKILL)
+
+        self.addCleanup(cleanup_grandchild)
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False):
+            worker = threading.Thread(target=state._run_job, args=(job.ticket,), daemon=True)
+            worker.start()
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                with state.condition:
+                    process_pgid = job.process_pgid
+                if grandchild_ready_path.exists() and process_pgid:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(grandchild_ready_path.exists())
+            grandchild_pid = int(grandchild_pid_path.read_text(encoding="utf-8"))
+            with state.condition:
+                self.assertEqual(os.getpgid(grandchild_pid), job.process_pgid)
+
+            with mock.patch.multiple(
+                conductor,
+                TERMINATE_GRACE_SECONDS=0.2,
+                KILL_GRACE_SECONDS=1.0,
+                PROCESS_TREE_POLL_SECONDS=0.02,
+            ):
+                state.job_cancel(job.ticket, None)
+            worker.join(timeout=5.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(job.state, "canceled")
+        deadline = time.time() + 3.0
+        while time.time() < deadline and conductor.pid_alive(grandchild_pid):
+            time.sleep(0.05)
+        self.assertFalse(conductor.pid_alive(grandchild_pid))
 
     def test_run_operation_command_uses_devnull_stdin(self) -> None:
         completed = subprocess.CompletedProcess(["echo", "ok"], 0, "ok\n", "")
@@ -348,6 +582,7 @@ class LifecycleQueueTests(LifecycleTestCase):
 
             tmp = tempfile.TemporaryDirectory()
             root = Path(tmp.name)
+            conductor.machine_lock_dir = lambda: root / "machine-locks"
             jobs_dir = root / "jobs"
             scripts_dir = root / "Scripts"
             jobs_dir.mkdir()
@@ -387,9 +622,13 @@ class LifecycleQueueTests(LifecycleTestCase):
                 }}
             )
             ticket = payload["ticket"]
+            job = state.jobs[ticket]
+            job.state = "running"
+            job.started_at = conductor.now()
+            for lane in job.lanes:
+                state.active_lanes[lane] = ticket
             os.close(0)
             state._run_job(ticket)
-            job = state.jobs[ticket]
             log = job.log_path.read_text(encoding="utf-8")
             if job.state != "completed" or "STDIN_DEVNULL_OK" not in log:
                 print(f"job_state={{job.state}} exit={{job.exit_code}}")
@@ -588,6 +827,231 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(payload["blockedBy"][0]["ticket"], active.ticket)
         self.assertEqual(payload["blockedBy"][0]["conflictingLanes"], ["build"])
 
+    def wait_for_terminal_job(self, state: conductor.DaemonState, ticket: str, timeout: float = 5.0) -> conductor.Job:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with state.condition:
+                job = state.jobs[ticket]
+                if job.state in conductor.TERMINAL_STATES:
+                    return job
+            time.sleep(0.01)
+        with state.condition:
+            return state.jobs[ticket]
+
+    def make_state_for_global_slot(
+        self,
+        root: Path,
+        name: str,
+        shared_socket_parent: Path,
+    ) -> conductor.DaemonState:
+        state_dir = root / name
+        jobs_dir = state_dir / "jobs"
+        jobs_dir.mkdir(parents=True)
+        paths = conductor.Paths(
+            repo_root=state_dir,
+            repo_hash=name,
+            state_dir=state_dir,
+            socket_path=shared_socket_parent / f"{name}.sock",
+            pid_path=state_dir / "conductor.pid",
+            lock_path=state_dir / "conductor.lock",
+            jobs_dir=jobs_dir,
+            daemon_log_path=state_dir / "daemon.log",
+            daemon_meta_path=state_dir / "daemon.json",
+            running_processes_path=state_dir / "running.json",
+        )
+        return conductor.DaemonState(paths)
+
+    def test_global_heavy_slot_serializes_build_lane_jobs_across_daemons(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        shared_socket_parent = root / "shared"
+        shared_socket_parent.mkdir()
+        state_a = self.make_state_for_global_slot(root, "daemon-a", shared_socket_parent)
+        state_b = self.make_state_for_global_slot(root, "daemon-b", shared_socket_parent)
+
+        lock_root = root / "machine-locks"
+        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01), mock.patch.object(
+            conductor, "machine_lock_dir", return_value=lock_root
+        ):
+            payload_a = state_a.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-a"},
+                }
+            )
+            payload_b = state_b.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-b"},
+                }
+            )
+            job_a = self.wait_for_terminal_job(state_a, payload_a["ticket"])
+            job_b = self.wait_for_terminal_job(state_b, payload_b["ticket"])
+
+        self.assertEqual(job_a.state, "completed", job_a.result_summary)
+        self.assertEqual(job_b.state, "completed", job_b.result_summary)
+        self.assertEqual(job_a.global_heavy_slot_path, str(lock_root / "global-heavy-0.lock"))
+        self.assertEqual(job_b.global_heavy_slot_path, str(lock_root / "global-heavy-0.lock"))
+        self.assertIsNotNone(job_a.process_started_at)
+        self.assertIsNotNone(job_a.process_finished_at)
+        self.assertIsNotNone(job_b.process_started_at)
+        self.assertIsNotNone(job_b.process_finished_at)
+
+        first, second = sorted([job_a, job_b], key=lambda job: job.process_started_at or 0)
+        self.assertGreaterEqual(second.process_started_at or 0, first.process_finished_at or 0)
+        self.assertGreater(max(job_a.global_heavy_slot_wait_seconds or 0, job_b.global_heavy_slot_wait_seconds or 0), 0.05)
+
+    def test_cancel_waiting_for_global_heavy_slot_does_not_spawn_process(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        shared_socket_parent = root / "shared"
+        shared_socket_parent.mkdir()
+        state = self.make_state_for_global_slot(root, "daemon", shared_socket_parent)
+        lock_root = root / "machine-locks"
+        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01), mock.patch.object(
+            conductor, "machine_lock_dir", return_value=lock_root
+        ):
+            lock_path = lock_root / "global-heavy-0.lock"
+            lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock_file = lock_path.open("a+", encoding="utf-8")
+            self.addCleanup(lock_file.close)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self.addCleanup(lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN))
+            payload = state.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.5, "lanes": ["build"], "message": "blocked"},
+                }
+            )
+            ticket = payload["ticket"]
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with state.condition:
+                    job = state.jobs[ticket]
+                    if job.global_heavy_slot_path and job.process_started_at is None:
+                        break
+                time.sleep(0.01)
+            with state.condition:
+                self.assertEqual(state.jobs[ticket].state, "running")
+                self.assertIsNone(state.jobs[ticket].process_started_at)
+            state.job_cancel(ticket, None)
+            job = self.wait_for_terminal_job(state, ticket)
+
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(job.exit_code, 130)
+        self.assertEqual(job.result_summary, "canceled before global heavy slot")
+        self.assertIsNone(job.process_pid)
+        self.assertIsNone(job.process_started_at)
+        self.assertIn("job canceled before global heavy slot", "".join(job.tail))
+
+    def test_socket_parent_does_not_shard_global_heavy_slots(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        state_a = self.make_state_for_global_slot(root, "daemon-a", root / "socket-a")
+        state_b = self.make_state_for_global_slot(root, "daemon-b", root / "socket-b")
+        lock_root = root / "machine-locks"
+
+        with mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root):
+            self.assertEqual(state_a._global_heavy_slot_paths(), [lock_root / "global-heavy-0.lock"])
+            self.assertEqual(state_b._global_heavy_slot_paths(), [lock_root / "global-heavy-0.lock"])
+
+    def test_configured_global_heavy_slots_allow_two_cross_daemon_builds(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        state_a = self.make_state_for_global_slot(root, "daemon-a", root / "socket-a")
+        state_b = self.make_state_for_global_slot(root, "daemon-b", root / "socket-b")
+        lock_root = root / "machine-locks"
+
+        with mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root), mock.patch.dict(
+            os.environ,
+            {"REPOPROMPT_DEV_HEAVY_SLOTS": "2"},
+        ):
+            payload_a = state_a.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-a"},
+                    "env": {"REPOPROMPT_DEV_HEAVY_SLOTS": "2"},
+                }
+            )
+            payload_b = state_b.enqueue(
+                {
+                    "operation": "fake-sleep",
+                    "args": {"seconds": 0.25, "lanes": ["build"], "message": "daemon-b"},
+                    "env": {"REPOPROMPT_DEV_HEAVY_SLOTS": "2"},
+                }
+            )
+            job_a = self.wait_for_terminal_job(state_a, payload_a["ticket"])
+            job_b = self.wait_for_terminal_job(state_b, payload_b["ticket"])
+
+        self.assertEqual(job_a.state, "completed", job_a.result_summary)
+        self.assertEqual(job_b.state, "completed", job_b.result_summary)
+        self.assertNotEqual(job_a.global_heavy_slot_path, job_b.global_heavy_slot_path)
+        latest_start = max(job_a.process_started_at or 0, job_b.process_started_at or 0)
+        earliest_finish = min(job_a.process_finished_at or 0, job_b.process_finished_at or 0)
+        self.assertLess(latest_start, earliest_finish)
+
+    def test_live_app_lock_serializes_across_processes_without_gui_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_root = root / "machine-locks"
+            events = root / "events.log"
+            ready = root / "ready-a"
+            child = textwrap.dedent(
+                """\
+                import sys, time
+                from pathlib import Path
+                sys.path.insert(0, sys.argv[1])
+                import conductor
+                conductor.MACHINE_LOCK_POLL_SECONDS = 0.01
+                conductor.machine_lock_dir = lambda: Path(sys.argv[2])
+                label = sys.argv[3]
+                events = Path(sys.argv[4])
+                ready = Path(sys.argv[5]) if sys.argv[5] != '-' else None
+                metadata = conductor.display_lock_metadata(
+                    lock_kind='live-app',
+                    ticket=label,
+                    operation='test-live-app',
+                    operation_label='test live app',
+                    repo_root=Path(sys.argv[2]),
+                )
+                with conductor.machine_exclusive_lock(conductor.live_app_lock_path(), metadata, 'live-app lock'):
+                    with events.open('a', encoding='utf-8') as handle:
+                        handle.write(f'start {label} {time.time()}\\n')
+                    if ready is not None:
+                        ready.write_text('ready', encoding='utf-8')
+                    time.sleep(0.25)
+                    with events.open('a', encoding='utf-8') as handle:
+                        handle.write(f'end {label} {time.time()}\\n')
+                """
+            )
+            proc_a = subprocess.Popen(
+                [sys.executable, "-c", child, str(SCRIPT_DIR), str(lock_root), "a", str(events), str(ready)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not ready.exists():
+                time.sleep(0.01)
+            self.assertTrue(ready.exists())
+            proc_b = subprocess.Popen(
+                [sys.executable, "-c", child, str(SCRIPT_DIR), str(lock_root), "b", str(events), "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout_a, stderr_a = proc_a.communicate(timeout=5)
+            stdout_b, stderr_b = proc_b.communicate(timeout=5)
+            self.assertEqual(proc_a.returncode, 0, stdout_a + stderr_a)
+            self.assertEqual(proc_b.returncode, 0, stdout_b + stderr_b)
+            rows = events.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual([row.split()[0:2] for row in rows], [["start", "a"], ["end", "a"], ["start", "b"], ["end", "b"]])
+
 
 class XCTestStallWatchdogTests(LifecycleTestCase):
     def make_watchdog_job(
@@ -763,7 +1227,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
             return argv, ["build"], root, os.environ.copy(), 5.0
 
-        with mock.patch.object(state.registry, "prepare", side_effect=prepare), mock.patch.object(
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            state.registry, "prepare", side_effect=prepare
+        ), mock.patch.object(
             conductor.os, "openpty", side_effect=tracking_openpty
         ), mock.patch.object(
             state,
@@ -802,7 +1268,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             opened_fds.extend(pair)
             return pair
 
-        with mock.patch.object(conductor.os, "openpty", side_effect=tracking_openpty), mock.patch.object(
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            conductor.os, "openpty", side_effect=tracking_openpty
+        ), mock.patch.object(
             conductor.subprocess,
             "Popen",
             side_effect=OSError("fixture launch failure"),
@@ -844,7 +1312,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
 
                     fake_process.wait.side_effect = cancel_then_exit
 
-                with mock.patch.object(state, "_create_process_output_transport", return_value=transport), mock.patch.object(
+                with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+                    state, "_create_process_output_transport", return_value=transport
+                ), mock.patch.object(
                     conductor.subprocess,
                     "Popen",
                     return_value=fake_process,
@@ -1101,10 +1571,27 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 for pid in candidates
             }
 
-        with mock.patch.object(state.registry, "prepare", side_effect=prepare), mock.patch.object(
+        fake_tree = [
+            {
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "depth": 0,
+                "startToken": "fixture-start",
+                "command": str(fake_xctest),
+            }
+        ]
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            state.registry, "prepare", side_effect=prepare
+        ), mock.patch.object(
             state,
             "_capture_xctest_stall_diagnostics",
             side_effect=lambda _job, diagnostic, _identity: diagnostic,
+        ), mock.patch.object(
+            state,
+            "_xctest_process_snapshot_locked",
+            return_value=((os.getpid(), "fixture-start"), fake_tree),
+        ), mock.patch.object(state, "_signal_process_identity", return_value=True), mock.patch.object(
+            state, "_wait_for_xctest_progress_after_probe", return_value=True
         ), mock.patch.object(conductor, "process_command_snapshot", side_effect=controlled_commands):
             state._run_job(job.ticket)
 
@@ -1165,6 +1652,37 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         )
         self.assertIsNone(job.xctest_progress_deadline)
 
+    def test_test_cli_forwards_test_product_for_focused_split_targets(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            {"filter": "WorkspaceTests", "testProduct": "RepoPromptWorkspaceTests"},
+        )
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        root_argv, root_lanes, root_cwd, _env, _timeout = registry.prepare(
+            {
+                "operation": "test",
+                "args": {"filter": "WorkspaceTests", "testProduct": "RepoPromptWorkspaceTests"},
+            }
+        )
+
+        self.assertEqual(
+            root_argv,
+            ["swift", "test", "--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+        )
+        self.assertEqual(root_lanes, ["build"])
+        self.assertEqual(root_cwd, state.paths.repo_root)
+
     def test_test_list_cli_preserves_build_lane_and_package_roots(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -1203,6 +1721,12 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 "provider-test",
                 ["--list", "--xctest-stall-seconds", "10"],
             )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined"):
+            conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--list", "--test-product", "RepoPromptWorkspaceTests"],
+            )
 
         registry = conductor.OperationRegistry(state.paths.repo_root)
         with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with a filter"):
@@ -1212,6 +1736,126 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     "args": {"list": True, "filter": "ExampleTests"},
                 }
             )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with --test-product"):
+            registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"list": True, "testProduct": "RepoPromptWorkspaceTests"},
+                }
+            )
+
+    def test_codex_packaging_environment_survives_client_snapshot_and_build_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REPOPROMPT_CODEX_ARCH": "all",
+                    "REPOPROMPT_CODEX_CACHE_ROOT": "/tmp/repoprompt-codex-cache",
+                    "REPOPROMPT_UNRELATED_BUILD_SETTING": "discard-me",
+                },
+                clear=False,
+            ):
+                snapshot = conductor.OperationRegistry.client_env_snapshot()
+
+            self.assertEqual(snapshot["REPOPROMPT_CODEX_ARCH"], "all")
+            self.assertEqual(
+                snapshot["REPOPROMPT_CODEX_CACHE_ROOT"],
+                "/tmp/repoprompt-codex-cache",
+            )
+            self.assertNotIn("REPOPROMPT_UNRELATED_BUILD_SETTING", snapshot)
+
+            _argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "build",
+                    "args": {},
+                    "env": snapshot,
+                }
+            )
+
+        self.assertEqual(env["REPOPROMPT_CODEX_ARCH"], "all")
+        self.assertEqual(
+            env["REPOPROMPT_CODEX_CACHE_ROOT"],
+            "/tmp/repoprompt-codex-cache",
+        )
+        self.assertNotIn("REPOPROMPT_UNRELATED_BUILD_SETTING", env)
+
+    def test_codex_packaging_environment_reaches_release_package_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            argv, lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "release",
+                    "args": {"subcommand": "package"},
+                    "env": {
+                        "REPOPROMPT_CODEX_ARCH": "all",
+                        "REPOPROMPT_CODEX_CACHE_ROOT": "/tmp/release-codex-cache",
+                    },
+                }
+            )
+
+        self.assertEqual(Path(argv[0]).name, "package_app.sh")
+        self.assertEqual(argv[1], "release")
+        self.assertEqual(lanes, ["build", "debugArtifact", "release"])
+        self.assertEqual(env["REPOPROMPT_CODEX_ARCH"], "all")
+        self.assertEqual(env["REPOPROMPT_CODEX_CACHE_ROOT"], "/tmp/release-codex-cache")
+
+    def test_test_gate_environment_survives_client_snapshot_and_job_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RPCE_ENABLE_BENCHMARK_TESTS": "1",
+                    "RPCE_RUN_CODEMAP_E2E": "1",
+                    "RPCE_RUN_SCALE_TESTS": "1",
+                    "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK": "1",
+                    "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE": "1",
+                    "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE": "compare",
+                    "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH": "/tmp/typescript-reference.json",
+                    "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH": "/tmp/tsx-reference.json",
+                    "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES": "type.class",
+                    "RP_SWIFT_CODEMAP_REFERENCE_MODE": "compare",
+                    "RP_SWIFT_CODEMAP_REFERENCE_PATH": "/tmp/reference.json",
+                    "RPCE_UNRELATED_TEST_GATE": "1",
+                },
+                clear=False,
+            ):
+                snapshot = conductor.OperationRegistry.client_env_snapshot()
+
+            self.assertEqual(snapshot["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+            self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
+            self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
+            self.assertEqual(snapshot["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+            self.assertEqual(snapshot["RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"], "1")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"], "compare")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"], "/tmp/typescript-reference.json")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"], "/tmp/tsx-reference.json")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
+            self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
+            self.assertNotIn("RPCE_UNRELATED_TEST_GATE", snapshot)
+
+            _argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"filter": "CodemapBindingEngineProjectionTests"},
+                    "env": snapshot,
+                }
+            )
+
+        self.assertEqual(env["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+        self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
+        self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertEqual(env["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+        self.assertEqual(env["RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"], "1")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"], "compare")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"], "/tmp/typescript-reference.json")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"], "/tmp/tsx-reference.json")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
+        self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
+        self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
 
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:
         tmp, state = self.make_state()
@@ -1338,7 +1982,9 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
         def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
             return argv, ["build"], root, os.environ.copy(), float(job.timeout or 30.0)
 
-        with mock.patch.object(state.registry, "prepare", side_effect=prepare), mock.patch.multiple(
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            state.registry, "prepare", side_effect=prepare
+        ), mock.patch.multiple(
             conductor,
             TERMINATE_GRACE_SECONDS=0.2,
             KILL_GRACE_SECONDS=1.0,
@@ -1392,6 +2038,23 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
 
 
 class SmokeOperationTests(unittest.TestCase):
+    def test_execution_location_ui_smoke_resolves_process_by_numeric_pid_without_name_fallback(self) -> None:
+        source = (SCRIPT_DIR / "smoke_agent_execution_location_popover.sh").read_text(encoding="utf-8")
+
+        self.assertIn("repeat with candidateProcess in application processes", source)
+        self.assertIn("set candidatePID to (unix id of candidateProcess) as integer", source)
+        self.assertIn("if candidatePID is targetPID then", source)
+        self.assertIn("if ((unix id of candidateProcess) as integer) is targetPID then return", source)
+        self.assertIn("set frontmost to true", source)
+        self.assertIn("key code 53", source)
+        self.assertIn("entire contents of window windowIndex whose value of attribute", source)
+        self.assertIn("repeat with windowIndex from 1 to 1", source)
+        self.assertNotIn("first application process whose unix id is targetPID", source)
+        self.assertNotIn("process appProcessName", source)
+        self.assertNotIn("contents of candidateProcess", source)
+        self.assertNotIn("my targetPID", source)
+        self.assertNotIn("on firstElementWithIdentifier", source)
+
     def test_manage_worktree_list_stage_runs_after_tree_roots_before_agent_manage(self) -> None:
         calls: list[tuple[str, list[str]]] = []
 
@@ -1426,6 +2089,63 @@ class SmokeOperationTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_execution_location_ui_smoke_runs_after_worktree_readiness_stages(self) -> None:
+        calls: list[tuple[str, list[str], dict[str, object]]] = []
+
+        def record_command(name: str, argv: list[str], *_args: object, **kwargs: object) -> tuple[int, str, str]:
+            calls.append((name, argv, kwargs))
+            return 0, "", ""
+
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "find_debug_app_pids", return_value=["4242"]
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT": "2",
+                "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES": "2",
+            },
+            clear=False,
+        ), mock.patch.object(
+            conductor, "run_operation_command", side_effect=record_command
+        ):
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"windowId": "7", "workspace": "test-workspace", "executionLocationUI": True},
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [name for name, _argv, _kwargs in calls],
+            [
+                "windows",
+                "workspace switch",
+                "tree roots",
+                "manage_worktree list",
+                "agent_manage roles",
+                "execution location UI smoke",
+            ],
+        )
+        self.assertEqual(
+            calls[-1][1],
+            ["/tmp/repo/Scripts/smoke_agent_execution_location_popover.sh", "4242"],
+        )
+        self.assertEqual(calls[-1][2]["timeout"], 184.0)
+
+    def test_execution_location_ui_smoke_requires_one_exact_debug_app(self) -> None:
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "find_debug_app_pids", return_value=[]
+        ), mock.patch.object(conductor, "run_operation_command", return_value=(0, "", "")) as run_command, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as output:
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"windowId": "7", "workspace": "test-workspace", "executionLocationUI": True},
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(run_command.call_count, 5)
+        self.assertIn("requires exactly one running RepoPrompt debug app", output.getvalue())
 
     def test_structured_smoke_calls_route_to_requested_window_with_fake_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1498,13 +2218,15 @@ class SmokeOperationTests(unittest.TestCase):
 
             with mock.patch.object(conductor, "debug_app_bundle_path", return_value=app), mock.patch.object(
                 conductor, "require_debug_cli"
-            ) as fallback, mock.patch.object(conductor, "run_operation_command", side_effect=record_command):
+            ) as fallback, mock.patch.object(
+                conductor, "operation_debug_app_build_then_launch", return_value=0
+            ) as launch, mock.patch.object(conductor, "run_operation_command", side_effect=record_command):
                 code = conductor.operation_smoke(Path(tmp), {"launch": True, "windowId": 1, "workspace": "fixture"})
 
         self.assertEqual(code, 0)
         fallback.assert_not_called()
-        self.assertEqual(calls[0][0], "launch debug app")
-        for name, argv in calls[1:]:
+        launch.assert_called_once_with(Path(tmp), {"appArgs": []})
+        for name, argv in calls:
             self.assertEqual(argv[0], str(helper.resolve()), name)
 
     def test_embedded_helper_resolution_rejects_symlink_escape(self) -> None:
@@ -1545,6 +2267,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             scripts.mkdir()
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
+            shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
             run_script.chmod(0o755)
             package_script = scripts / "package_app.sh"
             package_script.write_text("#!/usr/bin/env bash\necho package failed\nexit 23\n", encoding="utf-8")
@@ -1552,7 +2275,23 @@ class RunScriptTransitionTests(unittest.TestCase):
             marker = root / "process-helper-invoked"
             helper = scripts / "debug_app_process.py"
             helper.write_text(
-                "from pathlib import Path\nimport os\nPath(os.environ['PROCESS_HELPER_MARKER']).write_text('invoked')\n",
+                textwrap.dedent(
+                    """\
+                    from pathlib import Path
+                    import os
+
+                    class ProcessIdentityError(Exception):
+                        pass
+
+                    def matching_processes(_executable):
+                        Path(os.environ['PROCESS_HELPER_MARKER']).write_text('invoked')
+                        return []
+
+                    def terminate_matching_processes(_executable):
+                        Path(os.environ['PROCESS_HELPER_MARKER']).write_text('invoked')
+                        return []
+                    """
+                ),
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -1560,36 +2299,37 @@ class RunScriptTransitionTests(unittest.TestCase):
                 {
                     "PROCESS_HELPER_MARKER": str(marker),
                     "REPOPROMPT_GUARD_DELAYED_LAUNCH": "1",
+                    "REPOPROMPT_DEV_HEAVY_SLOTS": "8",
                 }
             )
 
-            result = subprocess.run(["bash", str(run_script)], env=env, text=True, capture_output=True, timeout=2)
+            result = subprocess.run(["bash", str(run_script)], env=env, text=True, capture_output=True, timeout=10)
             helper_invoked = marker.exists()
 
-        self.assertEqual(result.returncode, 23)
-        self.assertIn("Packaging debug app", result.stdout)
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        self.assertIn("package staged debug app", result.stdout)
         self.assertNotIn("Stopping existing RepoPrompt CE debug app instance", result.stdout)
         self.assertFalse(helper_invoked)
 
-    def test_successful_relaunch_uses_debug_executable_for_stop_and_readiness(self) -> None:
+    def test_direct_run_packages_before_waiting_for_live_lock_then_activates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "Scripts"
             scripts.mkdir()
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
+            shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"
             app_bundle = root / "DebugApps" / "RepoPrompt.app"
-            app_executable = app_bundle / "Contents" / "MacOS" / "RepoPrompt"
             package_script = scripts / "package_app.sh"
             package_script.write_text(
                 textwrap.dedent(
                     """\
                     #!/usr/bin/env bash
                     set -e
-                    echo package >> "$EVENT_LOG"
+                    echo package:$REPOPROMPT_DEBUG_APP_BUNDLE >> "$EVENT_LOG"
                     mkdir -p "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS"
                     printf binary > "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS/RepoPrompt"
                     chmod +x "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS/RepoPrompt"
@@ -1603,16 +2343,25 @@ class RunScriptTransitionTests(unittest.TestCase):
                 textwrap.dedent(
                     """\
                     import os
-                    import sys
                     from pathlib import Path
 
-                    operation = sys.argv[1]
-                    executable = sys.argv[sys.argv.index("--executable") + 1]
-                    state = "launched" if Path(os.environ["LAUNCHED_MARKER"]).exists() else "stopped"
-                    with Path(os.environ["EVENT_LOG"]).open("a", encoding="utf-8") as handle:
-                        handle.write(f"{operation}:{state}:{executable}\\n")
-                    if operation == "list" and state == "launched":
-                        print("4242")
+                    class ProcessIdentityError(Exception):
+                        pass
+
+                    def _state():
+                        return "launched" if Path(os.environ["LAUNCHED_MARKER"]).exists() else "stopped"
+
+                    def _log(operation, executable):
+                        with Path(os.environ["EVENT_LOG"]).open("a", encoding="utf-8") as handle:
+                            handle.write(f"{operation}:{_state()}:{executable}\\n")
+
+                    def matching_processes(executable):
+                        _log("list", executable)
+                        return [4242] if _state() == "launched" else []
+
+                    def terminate_matching_processes(executable):
+                        _log("terminate", executable)
+                        return []
                     """
                 ),
                 encoding="utf-8",
@@ -1634,27 +2383,213 @@ class RunScriptTransitionTests(unittest.TestCase):
                     "EVENT_LOG": str(event_log),
                     "LAUNCHED_MARKER": str(launched_marker),
                     "REPOPROMPT_DEBUG_APP_BUNDLE": str(app_bundle),
+                    "REPOPROMPT_DEV_HEAVY_SLOTS": "8",
+                }
+            )
+            lock_ready = threading.Event()
+            release_lock = threading.Event()
+
+            def hold_live_lock() -> None:
+                metadata = conductor.display_lock_metadata(
+                    lock_kind="live-app",
+                    ticket="direct-run-test",
+                    operation="test-live-lock",
+                    operation_label="test live lock",
+                    repo_root=root,
+                )
+                with conductor.machine_exclusive_lock(conductor.live_app_lock_path(), metadata, "live-app lock"):
+                    with event_log.open("a", encoding="utf-8") as handle:
+                        handle.write("lock-start\n")
+                    lock_ready.set()
+                    release_lock.wait(timeout=5.0)
+                    with event_log.open("a", encoding="utf-8") as handle:
+                        handle.write("lock-release\n")
+
+            holder = threading.Thread(target=hold_live_lock, daemon=True)
+            holder.start()
+            self.assertTrue(lock_ready.wait(timeout=2.0))
+            proc = subprocess.Popen(["bash", str(run_script)], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                rows = event_log.read_text(encoding="utf-8").splitlines() if event_log.exists() else []
+                if any(row.startswith("package:") for row in rows):
+                    break
+                time.sleep(0.02)
+            rows_before_release = event_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any(row.startswith("package:") for row in rows_before_release), rows_before_release)
+            self.assertFalse(any(row.startswith(("list:", "terminate:")) for row in rows_before_release), rows_before_release)
+            release_lock.set()
+            stdout, stderr = proc.communicate(timeout=10)
+            holder.join(timeout=2.0)
+            rows = event_log.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(proc.returncode, 0, stdout + stderr)
+        self.assertLess(
+            rows.index("lock-release"),
+            next(index for index, row in enumerate(rows) if row.startswith(("list:", "terminate:"))),
+        )
+        self.assertIn("Activated staged debug app bundle", stdout)
+
+    def test_successful_relaunch_uses_debug_executable_for_stop_and_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "Scripts"
+            scripts.mkdir()
+            run_script = scripts / "run.sh"
+            shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
+            shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            run_script.chmod(0o755)
+            event_log = root / "events.log"
+            launched_marker = root / "launched"
+            app_bundle = root / "DebugApps" / "RepoPrompt.app"
+            app_executable = app_bundle / "Contents" / "MacOS" / "RepoPrompt"
+            package_script = scripts / "package_app.sh"
+            package_script.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -e
+                    echo package:$REPOPROMPT_DEBUG_APP_BUNDLE >> "$EVENT_LOG"
+                    mkdir -p "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS"
+                    printf binary > "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS/RepoPrompt"
+                    chmod +x "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS/RepoPrompt"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            package_script.chmod(0o755)
+            helper = scripts / "debug_app_process.py"
+            helper.write_text(
+                textwrap.dedent(
+                    """\
+                    import os
+                    from pathlib import Path
+
+                    class ProcessIdentityError(Exception):
+                        pass
+
+                    def _state():
+                        return "launched" if Path(os.environ["LAUNCHED_MARKER"]).exists() else "stopped"
+
+                    def _log(operation, executable):
+                        with Path(os.environ["EVENT_LOG"]).open("a", encoding="utf-8") as handle:
+                            handle.write(f"{operation}:{_state()}:{executable}\\n")
+
+                    def matching_processes(executable):
+                        _log("list", executable)
+                        return [4242] if _state() == "launched" else []
+
+                    def terminate_matching_processes(executable):
+                        _log("terminate", executable)
+                        return []
+                    """
+                ),
+                encoding="utf-8",
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "codesign").write_text("#!/usr/bin/env bash\necho TeamIdentifier=TEST >&2\n", encoding="utf-8")
+            (bin_dir / "plutil").write_text("#!/usr/bin/env bash\necho memory\n", encoding="utf-8")
+            (bin_dir / "open").write_text(
+                "#!/usr/bin/env bash\necho open >> \"$EVENT_LOG\"\ntouch \"$LAUNCHED_MARKER\"\n",
+                encoding="utf-8",
+            )
+            for command in ["codesign", "plutil", "open"]:
+                (bin_dir / command).chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "EVENT_LOG": str(event_log),
+                    "LAUNCHED_MARKER": str(launched_marker),
+                    "REPOPROMPT_DEBUG_APP_BUNDLE": str(app_bundle),
+                    "REPOPROMPT_DEV_HEAVY_SLOTS": "8",
                 }
             )
 
-            result = subprocess.run(["bash", str(run_script), "--demo"], env=env, text=True, capture_output=True, timeout=5)
+            result = subprocess.run(["bash", str(run_script), "--demo"], env=env, text=True, capture_output=True, timeout=20)
             events = event_log.read_text(encoding="utf-8").splitlines()
+            activated_executable_exists = app_executable.exists()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         expected_suffix = f":{app_executable}"
-        self.assertEqual(events[0], "package")
-        self.assertEqual(events[1], f"terminate:stopped:{app_executable}")
-        self.assertEqual(events[2], f"list:stopped:{app_executable}")
-        self.assertEqual(events[3], "open")
-        self.assertEqual(events[4], f"list:launched:{app_executable}")
+        self.assertTrue(events[0].startswith("package:"), events)
+        self.assertIn("/.staging/", events[0])
+        self.assertNotIn(str(app_bundle), events[0])
+        open_index = events.index("open")
+        self.assertGreater(open_index, 1, events)
+        self.assertTrue(all(event == f"list:stopped:{app_executable}" for event in events[1:open_index]), events)
+        self.assertEqual(events[open_index + 1], f"list:launched:{app_executable}")
         self.assertTrue(all(event.endswith(expected_suffix) for event in events if event.startswith(("list:", "terminate:"))))
         source = (SCRIPT_DIR / "run.sh").read_text(encoding="utf-8")
+        self.assertTrue(activated_executable_exists)
+        self.assertIn("Activated staged debug app bundle", result.stdout)
         self.assertIn("Observed launched RepoPrompt CE debug PID(s): 4242", result.stdout)
         self.assertNotIn("pgrep", source)
         self.assertNotIn("pkill", source)
 
 
 class AppStatusIdentityTests(unittest.TestCase):
+    def make_bundle(self, bundle: Path, marker: str = "binary") -> None:
+        executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_text(marker, encoding="utf-8")
+        executable.chmod(0o755)
+
+    def test_activate_staged_debug_bundle_replaces_live_and_cleans_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            staged = root / "DebugApps" / ".staging" / "token" / "RepoPrompt.app"
+            self.make_bundle(live, "old")
+            self.make_bundle(staged, "new")
+
+            conductor.activate_staged_debug_bundle(staged, live)
+
+            self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "new")
+            self.assertFalse(staged.parent.exists())
+            self.assertFalse(any(live.parent.glob(".RepoPrompt.app.previous.*")))
+
+    def test_staged_launch_stop_failure_preserves_live_and_cleans_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            staged = root / "DebugApps" / ".staging" / "token" / "RepoPrompt.app"
+            self.make_bundle(live, "old")
+            self.make_bundle(staged, "new")
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "_operation_app_stop_unlocked", return_value=7
+            ), mock.patch.object(conductor, "run_operation_command") as run, contextlib.redirect_stdout(io.StringIO()):
+                code = conductor.operation_app_launch_existing(root, {"stagedBundle": str(staged), "appArgs": []})
+
+            self.assertEqual(code, 7)
+            self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "old")
+            self.assertFalse(staged.parent.exists())
+            run.assert_not_called()
+
+    def test_launch_existing_requires_bundle_and_does_not_build(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {"REPOPROMPT_DEBUG_APP_BUNDLE": str(Path(tmp) / "missing" / "RepoPrompt.app")},
+        ), mock.patch.object(conductor, "package_debug_app_under_heavy") as package, contextlib.redirect_stdout(output):
+            code = conductor.operation_app_launch_existing(Path(tmp), {"appArgs": []})
+
+        self.assertEqual(code, 1)
+        package.assert_not_called()
+        self.assertIn("existing debug app bundle is not launchable", output.getvalue())
+
+    def test_split_build_failure_performs_no_lifecycle_action(self) -> None:
+        with mock.patch.object(conductor, "package_debug_app_under_heavy", return_value=(23, None)) as package, mock.patch.object(
+            conductor, "operation_app_launch_existing"
+        ) as launch, contextlib.redirect_stdout(io.StringIO()) as output:
+            code = conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), {"appArgs": []})
+
+        self.assertEqual(code, 23)
+        package.assert_called_once()
+        launch.assert_not_called()
+        self.assertIn("no live bundle or stop/launch lifecycle action", output.getvalue())
+
     def test_status_treats_missing_debug_executable_as_not_installed(self) -> None:
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(

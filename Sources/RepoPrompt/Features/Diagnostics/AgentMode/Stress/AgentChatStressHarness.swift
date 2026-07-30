@@ -1401,7 +1401,7 @@
                 switch event {
                 case .toolCall, .commandExecutionRunning:
                     true
-                case .toolResult, .turnStarted, .turnCompleted, .assistantDelta, .reasoningDelta, .tokenUsage, .contextCompacted, .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest, .serverRequestIssue, .livenessActivity, .errorNotification, .error, .system:
+                case .toolResult, .turnStarted, .turnCompleted, .assistantDelta, .canonicalAssistantDelta, .assistantCompleted, .reasoningDelta, .reasoningCompleted, .tokenUsage, .contextCompacted, .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest, .serverRequestIssue, .livenessActivity, .errorNotification, .error, .system:
                     false
                 }
             }
@@ -1425,7 +1425,7 @@
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: windowID,
-                workspacePath: configuration.workspaceRootPaths.first
+                workspacePaths: .uniform(configuration.workspaceRootPaths.first)
             )
             let recorder = PersistedCodexFixtureEventRecorder()
             let eventTask = Task {

@@ -1,5 +1,19 @@
 import Foundation
 
+enum AppDeepLinkURLScheme {
+    static let canonical = "repoprompt-ce"
+    static let legacy = "repoprompt"
+
+    static func isSupported(_ scheme: String?) -> Bool {
+        switch scheme?.lowercased() {
+        case canonical, legacy:
+            true
+        default:
+            false
+        }
+    }
+}
+
 struct AgentSessionDeepLinkRoute: Equatable {
     let windowID: Int?
     let workspaceID: UUID
@@ -31,7 +45,7 @@ struct AgentSessionDeepLinkRoute: Equatable {
 
     var url: URL {
         var components = URLComponents()
-        components.scheme = "repoprompt"
+        components.scheme = AppDeepLinkURLScheme.canonical
         components.host = "agent"
         components.path = "/session"
 
@@ -47,7 +61,7 @@ struct AgentSessionDeepLinkRoute: Equatable {
         }
         components.queryItems = queryItems
 
-        return components.url ?? URL(string: "repoprompt://agent/session")!
+        return components.url ?? URL(string: "\(AppDeepLinkURLScheme.canonical)://agent/session")!
     }
 
     static func parse(notificationUserInfo userInfo: [AnyHashable: Any]) -> AgentSessionDeepLinkRoute? {
@@ -83,7 +97,7 @@ struct AgentSessionDeepLinkRoute: Equatable {
 
     static func parse(url: URL) -> AgentSessionDeepLinkRoute? {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "repoprompt",
+              AppDeepLinkURLScheme.isSupported(components.scheme),
               components.host?.lowercased() == "agent",
               components.path == "/session"
         else {
@@ -177,7 +191,7 @@ enum AppDeepLinkRoute: Equatable {
 
     static func parse(url: URL) -> AppDeepLinkURLParseResult {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "repoprompt"
+              AppDeepLinkURLScheme.isSupported(components.scheme)
         else {
             return .unsupported
         }

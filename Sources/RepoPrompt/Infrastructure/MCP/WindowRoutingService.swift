@@ -316,6 +316,7 @@ final class WindowRoutingService: Service {
     }
 
     // ---------------------------------------------------------------------
+
     // MARK: Stored references
 
     // ---------------------------------------------------------------------
@@ -331,6 +332,7 @@ final class WindowRoutingService: Service {
     private var windowCountObserver: NSObjectProtocol?
 
     // ---------------------------------------------------------------------
+
     // MARK: Init & registration
 
     /// ---------------------------------------------------------------------
@@ -424,6 +426,7 @@ final class WindowRoutingService: Service {
     }
 
     // ---------------------------------------------------------------------
+
     // MARK: Cleanup
 
     /// ---------------------------------------------------------------------
@@ -438,6 +441,7 @@ final class WindowRoutingService: Service {
     }
 
     // ---------------------------------------------------------------------
+
     // MARK: Workspace Resolution Helpers
 
     // ---------------------------------------------------------------------
@@ -681,7 +685,9 @@ final class WindowRoutingService: Service {
         let sel = tab.selection
         let sampleK = 3
         var allPaths = Set<String>()
-        allPaths.reserveCapacity(sel.selectedPaths.count + sel.slices.count + sel.autoCodemapPaths.count)
+        allPaths.reserveCapacity(
+            sel.selectedPaths.count + sel.manualCodemapPaths.count + sel.slices.count
+        )
 
         var samplePaths: [String] = []
         samplePaths.reserveCapacity(sampleK)
@@ -702,10 +708,10 @@ final class WindowRoutingService: Service {
         for path in sel.selectedPaths where allPaths.insert(path).inserted {
             considerForSample(path)
         }
-        for path in sel.slices.keys where allPaths.insert(path).inserted {
+        for path in sel.manualCodemapPaths where allPaths.insert(path).inserted {
             considerForSample(path)
         }
-        for path in sel.autoCodemapPaths where allPaths.insert(path).inserted {
+        for path in sel.slices.keys where allPaths.insert(path).inserted {
             considerForSample(path)
         }
 
@@ -1945,6 +1951,7 @@ final class WindowRoutingService: Service {
     }
 
     // ---------------------------------------------------------------------
+
     // MARK: Private Helpers
 
     /// ---------------------------------------------------------------------
@@ -2204,6 +2211,7 @@ final class WindowRoutingService: Service {
                     throw MCPError.invalidParams("Missing or invalid 'action' parameter")
                 }
 
+                let routingService = self
                 switch action {
                 case "list":
                     let includeHidden = args["include_hidden"]?.boolValue ?? false
@@ -2212,7 +2220,7 @@ final class WindowRoutingService: Service {
 
                     // Get a workspace manager to load disk snapshot
                     guard let referenceManager = await MainActor.run(body: {
-                        self.windowStates.allWindows.first?.workspaceManager
+                        routingService.windowStates.allWindows.first?.workspaceManager
                     }) else {
                         return ManageWorkspacesResponse(action: "list", workspaces: [], status: "ok")
                     }
@@ -2223,7 +2231,7 @@ final class WindowRoutingService: Service {
                     // Build map of which windows are showing each workspace
                     let windowsByWorkspaceID: [UUID: Set<Int>] = await MainActor.run {
                         var result: [UUID: Set<Int>] = [:]
-                        for ws in self.windowStates.allWindows {
+                        for ws in routingService.windowStates.allWindows {
                             if let activeID = ws.workspaceManager.activeWorkspace?.id {
                                 result[activeID, default: []].insert(ws.windowID)
                             }
@@ -2275,12 +2283,12 @@ final class WindowRoutingService: Service {
                         // ═══════════════════════════════════════════════════════════════
 
                         // First, resolve the workspace model from disk (don't require an existing window)
-                        let targetWorkspace = try await resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
+                        let targetWorkspace = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
                         // Open a new window
                         let newWindow: WindowState
                         do {
-                            newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
+                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
                         } catch let error as WindowOpenError {
                             throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
                         } catch {
@@ -2303,7 +2311,7 @@ final class WindowRoutingService: Service {
                         }
 
                         // Bind this MCP connection to the new window
-                        try await networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
+                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
 
                         // Return success with the new window ID
                         return ManageWorkspacesResponse(
@@ -2320,7 +2328,7 @@ final class WindowRoutingService: Service {
 
                     // Determine target window
                     let targetWindowIDArg = args["window_id"]?.intValue
-                    let windows = await MainActor.run { self.windowStates.allWindows }
+                    let windows = await MainActor.run { routingService.windowStates.allWindows }
 
                     // Safe target window selection (no force-unwrap)
                     let targetWindowOpt: WindowState? = if let wid = targetWindowIDArg {
@@ -2342,7 +2350,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Resolve the target workspace model using hidden-aware UUID-or-name logic.
-                    let targetModel = try await resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
+                    let targetModel = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
                     // Perform the switch on the target window
                     let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: targetModel, saveState: true)
@@ -2351,7 +2359,7 @@ final class WindowRoutingService: Service {
                     }
 
                     if Self.shouldBindConnectionAfterStandardWorkspaceSwitch(explicitWindowIDProvided: targetWindowIDArg != nil) {
-                        try await networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
+                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
                     }
 
                     return ManageWorkspacesResponse(action: "switch", workspaces: nil, status: "ok")
@@ -2387,7 +2395,7 @@ final class WindowRoutingService: Service {
                     // Determine target window for approval
                     let targetWindowIDArg = args["window_id"]?.intValue
                     let (windows, focusedWindowID) = await MainActor.run { () -> ([WindowState], Int?) in
-                        let allWindows = self.windowStates.allWindows
+                        let allWindows = routingService.windowStates.allWindows
                         let focusedID = allWindows.first(where: { $0.isCurrentlyFocused })?.windowID
                         return (allWindows, focusedID)
                     }
@@ -2417,7 +2425,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Get client ID for approval
-                    let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
@@ -2434,7 +2442,7 @@ final class WindowRoutingService: Service {
                         // Open a new window for the workspace
                         let newWindow: WindowState
                         do {
-                            newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: switchToCreated)
+                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: switchToCreated)
                         } catch let error as WindowOpenError {
                             throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
                         } catch {
@@ -2461,7 +2469,7 @@ final class WindowRoutingService: Service {
                         }
 
                         // Bind this MCP connection to the new window
-                        try await networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
+                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
 
                         let summary = MCPWorkspaceSummary(
                             id: newWorkspace.id,
@@ -2507,12 +2515,12 @@ final class WindowRoutingService: Service {
                     }
 
                     let shouldHide = action == "hide"
-                    let resolvedWorkspace = try await resolveWorkspaceForHiddenMutation(rawWorkspaceParam: rawWorkspaceParam, hidden: shouldHide)
+                    let resolvedWorkspace = try await routingService.resolveWorkspaceForHiddenMutation(rawWorkspaceParam: rawWorkspaceParam, hidden: shouldHide)
                     guard !resolvedWorkspace.isSystemWorkspace else {
                         throw MCPError.invalidParams("Cannot \(action) system workspace '\(resolvedWorkspace.name)'.")
                     }
                     let mutationManagers = await MainActor.run {
-                        self.windowStates.allWindows.map(\.workspaceManager)
+                        routingService.windowStates.allWindows.map(\.workspaceManager)
                     }
                     guard let writerManager = mutationManagers.first else {
                         throw MCPError.invalidParams("No windows available to update workspace hidden state. Open at least one window first.")
@@ -2530,7 +2538,7 @@ final class WindowRoutingService: Service {
                     }
 
                     let showingWindowIDs = await MainActor.run { () -> [Int] in
-                        self.windowStates.allWindows.compactMap { window in
+                        routingService.windowStates.allWindows.compactMap { window in
                             guard window.workspaceManager.activeWorkspace?.id == updatedWorkspace.id else { return nil }
                             return window.windowID
                         }.sorted()
@@ -2557,7 +2565,7 @@ final class WindowRoutingService: Service {
 
                     // Determine target window
                     let targetWindowIDArg = args["window_id"]?.intValue
-                    let windows = await MainActor.run { self.windowStates.allWindows }
+                    let windows = await MainActor.run { routingService.windowStates.allWindows }
 
                     let targetWindowOpt: WindowState? = if let wid = targetWindowIDArg {
                         windows.first(where: { $0.windowID == wid })
@@ -2576,14 +2584,14 @@ final class WindowRoutingService: Service {
                         throw MCPError.invalidParams("No valid target window found")
                     }
 
-                    let workspace = try await resolveWorkspaceForDelete(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
+                    let workspace = try await routingService.resolveWorkspaceForDelete(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
                     await MainActor.run {
                         targetWindow.workspaceManager.reloadWorkspacesFromDisk()
                     }
 
                     let showingWindowIDs = await MainActor.run { () -> [Int] in
-                        self.windowStates.allWindows.compactMap { window in
+                        routingService.windowStates.allWindows.compactMap { window in
                             guard window.workspaceManager.activeWorkspace?.id == workspace.id else { return nil }
                             return window.windowID
                         }.sorted()
@@ -2609,7 +2617,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Get client ID for approval
-                    let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestDeleteWorkspaceApproval(
@@ -2641,7 +2649,7 @@ final class WindowRoutingService: Service {
                     if closeWindow {
                         let authorization = Self.workspaceDeleteCloseAuthorization()
                         try await MainActor.run {
-                            try self.windowStates.requestCloseWindow(
+                            try routingService.windowStates.requestCloseWindow(
                                 windowID: targetWindow.windowID,
                                 authorization: authorization
                             )
@@ -2677,7 +2685,7 @@ final class WindowRoutingService: Service {
 
                     // Determine target window
                     let targetWindowIDArg = args["window_id"]?.intValue
-                    let windows = await MainActor.run { self.windowStates.allWindows }
+                    let windows = await MainActor.run { routingService.windowStates.allWindows }
 
                     let targetWindowOpt: WindowState? = if let wid = targetWindowIDArg {
                         windows.first(where: { $0.windowID == wid })
@@ -2725,7 +2733,7 @@ final class WindowRoutingService: Service {
                     try Self.validateAddFolderWorkspace(workspace)
 
                     // Get client ID for approval
-                    let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestAddFolderApproval(
@@ -2781,7 +2789,7 @@ final class WindowRoutingService: Service {
 
                     // Determine target window
                     let targetWindowIDArg = args["window_id"]?.intValue
-                    let windows = await MainActor.run { self.windowStates.allWindows }
+                    let windows = await MainActor.run { routingService.windowStates.allWindows }
 
                     let targetWindowOpt: WindowState? = if let wid = targetWindowIDArg {
                         windows.first(where: { $0.windowID == wid })
@@ -2839,7 +2847,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Get client ID for approval
-                    let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestRemoveFolderApproval(
@@ -2876,8 +2884,8 @@ final class WindowRoutingService: Service {
                     return ManageWorkspacesResponse(action: "remove_folder", workspaces: nil, status: "ok")
 
                 case "list_tabs":
-                    let targetWindow = try await resolveTargetWindow(windowID: args["window_id"]?.intValue)
-                    let connectionID = await networkMgr.currentConnectionUUID()
+                    let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
+                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
                     let (workspace, activeTabID, tabs, boundTabID): (WorkspaceModel?, UUID?, [ComposeTabState], UUID?) = await MainActor.run {
                         let workspace = targetWindow.workspaceManager.activeWorkspace
                         return (
@@ -2894,7 +2902,7 @@ final class WindowRoutingService: Service {
 
                     let summaries = await MainActor.run {
                         tabs.map {
-                            self.makeComposeTabSummary(
+                            routingService.makeComposeTabSummary(
                                 tab: $0,
                                 workspace: workspace,
                                 windowID: targetWindow.windowID,
@@ -2912,10 +2920,10 @@ final class WindowRoutingService: Service {
                         throw MCPError.invalidParams("Missing required 'tab' parameter (UUID or name) for 'select_tab' action.")
                     }
 
-                    let targetWindow = try await resolveTargetWindow(windowID: args["window_id"]?.intValue)
+                    let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
                     let shouldFocus = args["focus"]?.boolValue ?? false
-                    let connectionID = await networkMgr.currentConnectionUUID()
-                    let clientName = await networkMgr.currentClientIdentifier()
+                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
+                    let clientName = await routingService.networkMgr.currentClientIdentifier()
                     let (workspace, tabs): (WorkspaceModel?, [ComposeTabState]) = await MainActor.run {
                         let workspace = targetWindow.workspaceManager.activeWorkspace
                         return (workspace, workspace?.composeTabs ?? [])
@@ -2929,10 +2937,10 @@ final class WindowRoutingService: Service {
                     }
 
                     let tab = try await MainActor.run {
-                        try self.resolveComposeTab(rawTabParam: rawTabParam, tabs: tabs)
+                        try routingService.resolveComposeTab(rawTabParam: rawTabParam, tabs: tabs)
                     }
 
-                    try await networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
+                    try await routingService.networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
                     try await MainActor.run {
                         try targetWindow.mcpServer.bindTabForConnection(
                             connectionID: connectionID,
@@ -2950,9 +2958,9 @@ final class WindowRoutingService: Service {
                     return ManageWorkspacesResponse(action: "select_tab", workspaces: nil, status: "ok")
 
                 case "create_tab":
-                    let targetWindow = try await resolveTargetWindow(windowID: args["window_id"]?.intValue)
-                    let connectionID = await networkMgr.currentConnectionUUID()
-                    let clientName = await networkMgr.currentClientIdentifier()
+                    let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
+                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
+                    let clientName = await routingService.networkMgr.currentClientIdentifier()
                     let mode = args["mode"]?.stringValue?.lowercased() ?? "blank"
                     let shouldBind = args["bind"]?.boolValue ?? true
                     let shouldFocus = args["focus"]?.boolValue ?? false
@@ -2984,7 +2992,7 @@ final class WindowRoutingService: Service {
                         let sourceTab: ComposeTabState
                         if let sourceRaw, !sourceRaw.isEmpty {
                             sourceTab = try await MainActor.run {
-                                try self.resolveComposeTab(rawTabParam: sourceRaw, tabs: tabs)
+                                try routingService.resolveComposeTab(rawTabParam: sourceRaw, tabs: tabs)
                             }
                         } else if let boundTabID, let boundTab = tabs.first(where: { $0.id == boundTabID }) {
                             sourceTab = boundTab
@@ -3001,7 +3009,7 @@ final class WindowRoutingService: Service {
                         throw MCPError.invalidParams("Unsupported create_tab mode '\(mode)'. Use 'blank' or 'fork'.")
                     }
 
-                    try await networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
+                    try await routingService.networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
 
                     if shouldBind, let connectionID {
                         try await MainActor.run {
@@ -3020,7 +3028,7 @@ final class WindowRoutingService: Service {
                     }
 
                     let summary = await MainActor.run {
-                        self.makeComposeTabSummary(
+                        routingService.makeComposeTabSummary(
                             tab: newTab,
                             workspace: workspace,
                             windowID: targetWindow.windowID,
@@ -3034,9 +3042,9 @@ final class WindowRoutingService: Service {
                     let rawTabParam = args["tab"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
                     let contextID = try Self.parseContextID(args["context_id"], action: "close_tab")
 
-                    let targetWindow = try await resolveTargetWindow(windowID: args["window_id"]?.intValue)
+                    let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
                     let allowActive = args["allow_active"]?.boolValue ?? false
-                    let connectionID = await networkMgr.currentConnectionUUID()
+                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
                     let (workspace, activeTabID, tabs, boundTabID): (WorkspaceModel?, UUID?, [ComposeTabState], UUID?) = await MainActor.run {
                         let workspace = targetWindow.workspaceManager.activeWorkspace
                         return (
@@ -3052,7 +3060,7 @@ final class WindowRoutingService: Service {
                     }
 
                     let tab = try await MainActor.run {
-                        try self.resolveComposeTab(
+                        try routingService.resolveComposeTab(
                             rawTabParam: rawTabParam,
                             contextID: contextID,
                             tabs: tabs,
@@ -3075,7 +3083,7 @@ final class WindowRoutingService: Service {
                     }
 
                     let summary = await MainActor.run {
-                        self.makeComposeTabSummary(
+                        routingService.makeComposeTabSummary(
                             tab: tab,
                             workspace: workspace,
                             windowID: targetWindow.windowID,
@@ -3099,6 +3107,7 @@ final class WindowRoutingService: Service {
     }
 
     // ---------------------------------------------------------------------
+
     // MARK: Tools
 
     /// ---------------------------------------------------------------------

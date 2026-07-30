@@ -1,0 +1,138 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-before-m3-contextbuilder-registrationfailed-nonagent-20260702T181503Z.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.ContextBuilderWorktreeInheritanceTests/testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests/testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+  "git": {
+    "commit": "25a0d3fe8159604d4379e131491b9b9b1639a542",
+    "working_tree": "?? prompt-exports/oracle-plan-2026-07-02-141304-wave2-m3-retry-efa3a-cdb7.md"
+  },
+  "inventory": null,
+  "label": "wave2-before-m3-contextbuilder-registrationfailed-nonagent-20260702T181503Z",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests/testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 32.6055748462677,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/04a0163a-bf14-4cac-8a43-dd4aaf8c6a4d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.003917217254638672,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests/testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 18.722654819488525,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/48c907b2-c4eb-4bd8-8702-d8d191050f85.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004481077194213867,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.ContextBuilderWorktreeInheritanceTests/testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 5.188724994659424,
+      "exit_code": 1,
+      "index": 3,
+      "invalid_reasons": [
+        "conductor process exit 1",
+        "terminal state failed",
+        "test exit 1"
+      ],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/2e72a83b-0538-4d70-9ca6-bef72d4dee30.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 1,
+      "queue_wait_seconds": 0.0048677921295166016,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "failed",
+      "target": "root",
+      "timed_out": false,
+      "valid": false
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 18.071,
+      "median_aggregate_seconds": 17.9965,
+      "method_count": 1,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 18.071,
+      "median_seconds": 17.9965,
+      "method": "testNonAgentContextBuilderKeepsCanonicalWorkspaceBehavior",
+      "observations": 2,
+      "observed_p95_seconds": 18.071,
+      "suite": "RepoPromptTests.ContextBuilderWorktreeInheritanceTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 1,
+    "median_seconds": 25.664114832878113,
+    "noise_classification": "unstable",
+    "observed_p95_seconds": 32.6055748462677,
+    "raw_execution_seconds": [
+      32.6055748462677,
+      18.722654819488525
+    ],
+    "relative_mad": 0.270473385058928,
+    "valid_samples": 2
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T18:16:00+00:00"
+}

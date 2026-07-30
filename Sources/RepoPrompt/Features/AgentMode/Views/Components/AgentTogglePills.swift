@@ -55,19 +55,40 @@ struct AgentInterviewPill: View {
         fontScale.preset
     }
 
+    private var tooltipPlainText: String {
+        if isOn {
+            return "Interview on: Asks questions before starting"
+        }
+        return "Interview off: Work begins immediately"
+    }
+
+    private var tooltipText: AttributedString {
+        var text = AttributedString(tooltipPlainText)
+        if let range = text.range(of: isOn ? "on" : "off") {
+            text[range].foregroundColor = isOn ? .green : .red
+        }
+        return text
+    }
+
+    private var accessibilityTraits: AccessibilityTraits {
+        isOn ? [.isSelected] : []
+    }
+
     var body: some View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
+        let size = AgentPillMetrics.height()
         Button(action: onToggle) {
-            HStack(spacing: 5) {
-                Image(systemName: "questionmark.bubble")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    .foregroundStyle(isOn ? Color.accentColor : .secondary)
-                Text("Interview")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+            ZStack {
+                if isOn {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.12))
+                }
+
+                Image(systemName: isOn ? "questionmark.bubble.fill" : "questionmark.bubble")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                     .foregroundStyle(isOn ? Color.accentColor : .secondary)
             }
-            .padding(.horizontal, AgentPillMetrics.horizontalPadding())
-            .frame(height: AgentPillMetrics.height())
+            .frame(width: size, height: size)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(
@@ -76,6 +97,9 @@ struct AgentInterviewPill: View {
             )
         }
         .buttonStyle(.plain)
-        .hoverTooltip(isOn ? "Interview is on: the agent will ask clarifying questions before starting" : "Interview is off: the agent will start working immediately", .top)
+        .hoverTooltip(tooltipText, plainText: tooltipPlainText, .top)
+        .accessibilityLabel("Interview")
+        .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityAddTraits(accessibilityTraits)
     }
 }

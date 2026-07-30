@@ -7,6 +7,11 @@ enum ShellEnvironmentSource: Equatable {
     case enrichedFallback
 }
 
+enum ShellEnvironmentCaptureMode: Hashable, CaseIterable {
+    case interactiveLoginShell
+    case loginShell
+}
+
 struct CLIEnvironmentSnapshot: Equatable {
     let environment: [String: String]
     let source: ShellEnvironmentSource
@@ -58,10 +63,12 @@ enum ProcessEnvironmentBuilder {
     typealias ShellEnvironmentProvider = @Sendable (_ enableLogging: Bool, _ forceRefresh: Bool) async -> CLIEnvironmentSnapshot
 
     static func build(_ request: ProcessEnvironmentRequest) async -> ProcessEnvironmentResult {
-        await build(request) { enableLogging, forceRefresh in
+        let captureMode = preferredShellCaptureMode(for: request.purpose)
+        return await build(request) { enableLogging, forceRefresh in
             await CLIEnvironmentCache.shared.environmentSnapshot(
                 enableLogging: enableLogging,
-                forceRefresh: forceRefresh
+                forceRefresh: forceRefresh,
+                captureMode: captureMode
             )
         }
     }
@@ -99,6 +106,15 @@ enum ProcessEnvironmentBuilder {
             launchContext: launchContext,
             shellEnvironmentSource: baseSnapshot.source
         )
+    }
+
+    private static func preferredShellCaptureMode(for purpose: ProcessLaunchPurpose) -> ShellEnvironmentCaptureMode {
+        switch purpose {
+        case .codexAppServer, .codexPreflight:
+            .loginShell
+        default:
+            .interactiveLoginShell
+        }
     }
 
     private static func shouldUseInheritedEnvironment(

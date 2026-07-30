@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
@@ -49,7 +49,93 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         let retainedRawPayload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: toolResult.id))
         XCTAssertTrue(retainedRawPayload.contains(marker))
         XCTAssertGreaterThan(session.ephemeralToolResultPayloadRevisionByItemID[toolResult.id] ?? 0, 0)
-        XCTAssertGreaterThan(viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevision, 0)
+        XCTAssertGreaterThan(
+            viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevisionByItemID[toolResult.id] ?? 0,
+            0
+        )
+    }
+
+    func testRetainedPayloadRefreshChangesOnlyMatchingResultRenderIdentity() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.runState = .running
+        let invocationA = UUID()
+        let invocationB = UUID()
+        let markerA1 = "RESULT_A_INITIAL_\(UUID().uuidString)"
+        let markerA2 = "RESULT_A_UPDATED_\(UUID().uuidString)"
+        let markerB = "RESULT_B_\(UUID().uuidString)"
+        let rawA1 = retainedApplyEditsPayload(marker: markerA1)
+        let rawA2 = retainedApplyEditsPayload(marker: markerA2)
+        let rawB = retainedApplyEditsPayload(marker: markerB)
+        let callA = AgentChatItem.toolCall(
+            name: "apply_edits",
+            invocationID: invocationA,
+            argsJSON: #"{"path":"A.swift"}"#,
+            sequenceIndex: 1
+        )
+        let callB = AgentChatItem.toolCall(
+            name: "apply_edits",
+            invocationID: invocationB,
+            argsJSON: #"{"path":"B.swift"}"#,
+            sequenceIndex: 3
+        )
+        let resultA = AgentChatItem.toolResult(
+            name: "apply_edits",
+            invocationID: invocationA,
+            resultJSON: rawA1,
+            sequenceIndex: 2
+        )
+        let resultB = AgentChatItem.toolResult(
+            name: "apply_edits",
+            invocationID: invocationB,
+            resultJSON: rawB,
+            sequenceIndex: 4
+        )
+
+        session.replaceItems([
+            .user("Start", sequenceIndex: 0),
+            callA,
+            resultA,
+            callB,
+            resultB,
+            .assistant("Done", sequenceIndex: 5)
+        ])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+
+        let initialRevisions = viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevisionByItemID
+        let initialRevisionA = try XCTUnwrap(initialRevisions[resultA.id])
+        let initialRevisionB = try XCTUnwrap(initialRevisions[resultB.id])
+        XCTAssertTrue(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultA.id)?.contains(markerA1) == true)
+        XCTAssertTrue(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultB.id)?.contains(markerB) == true)
+
+        var updatedResultA = resultA
+        updatedResultA.text = rawA2
+        updatedResultA.toolResultJSON = rawA2
+        session.replaceItems([
+            .user("Start", sequenceIndex: 0),
+            callA,
+            updatedResultA,
+            callB,
+            resultB,
+            .assistant("Done", sequenceIndex: 5)
+        ])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+
+        let updatedRevisions = viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevisionByItemID
+        XCTAssertGreaterThan(try XCTUnwrap(updatedRevisions[resultA.id]), initialRevisionA)
+        XCTAssertEqual(updatedRevisions[resultB.id], initialRevisionB)
+        let updatedPayloadA = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultA.id))
+        let unchangedPayloadB = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: tabID, itemID: resultB.id))
+        XCTAssertTrue(updatedPayloadA.contains(markerA2))
+        XCTAssertFalse(updatedPayloadA.contains(markerB))
+        XCTAssertTrue(unchangedPayloadB.contains(markerB))
+        XCTAssertFalse(unchangedPayloadB.contains(markerA2))
     }
 
     func testLiveToolResultRefreshUsesIncrementalRetentionCompaction() async throws {
@@ -927,6 +1013,122 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(rows.map(\.depth), [0, 1, 2])
     }
 
+    func testNestedSidebarThreadsDefaultCollapseAndPreserveSearchActiveAndExpandAll() async throws {
+        let viewModel = makeViewModel()
+        let rootTabID = UUID()
+        let childTabID = UUID()
+        let grandchildTabID = UUID()
+        let rootSessionID = UUID()
+        let childSessionID = UUID()
+        let grandchildSessionID = UUID()
+        let tabs = [
+            ComposeTabState(id: rootTabID, name: "Root", activeAgentSessionID: rootSessionID),
+            ComposeTabState(id: childTabID, name: "Child", activeAgentSessionID: childSessionID),
+            ComposeTabState(id: grandchildTabID, name: "Grandchild", activeAgentSessionID: grandchildSessionID)
+        ]
+        let entries = [
+            makeIndexEntry(id: rootSessionID, tabID: rootTabID),
+            makeIndexEntry(id: childSessionID, tabID: childTabID, parentSessionID: rootSessionID),
+            makeIndexEntry(id: grandchildSessionID, tabID: grandchildTabID, parentSessionID: childSessionID)
+        ]
+        let gate = SidebarIndexStreamGate()
+        let harness = SidebarIndexStreamHarness(plans: [
+            .init(batches: [makeBatch(entries)], gate: gate)
+        ])
+        installSidebarIndexHarness(harness, on: viewModel)
+        let workspace = makeWorkspace(name: "Nested sidebar", tabs: tabs, activeTabID: rootTabID)
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
+        await harness.waitForRequestCount(1)
+        await gate.release()
+        await viewModel.test_waitForSessionListCacheRefresh()
+        try await waitUntil {
+            Set(viewModel.test_ownerValidatedSessionIndex.keys) == [rootSessionID, childSessionID, grandchildSessionID]
+        }
+
+        let rootKey = AgentSidebarThreadKey.session(rootSessionID)
+        let childKey = AgentSidebarThreadKey.session(childSessionID)
+        XCTAssertEqual(
+            Set(viewModel.collapsibleSidebarThreadKeys(
+                for: tabs,
+                currentTabID: rootTabID,
+                searchText: ""
+            )),
+            [rootKey, childKey]
+        )
+
+        let defaultCollapsedKeys = viewModel.defaultCollapsedSidebarThreadKeys(
+            for: tabs,
+            searchText: ""
+        )
+        XCTAssertEqual(defaultCollapsedKeys, [childKey])
+        XCTAssertTrue(viewModel.defaultCollapsedSidebarThreadKeys(for: tabs, searchText: "Grandchild").isEmpty)
+
+        let revisionBeforeRender = viewModel.ui.sessionSidebar.snapshot.revision
+        let rowsBeforeLifecycleSeed = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(rowsBeforeLifecycleSeed.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionBeforeRender)
+
+        viewModel.seedDefaultCollapsedSidebarThreads(defaultCollapsedKeys)
+        let revisionAfterLifecycleSeed = viewModel.ui.sessionSidebar.snapshot.revision
+        let initialRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(initialRows.map(\.tabID), [rootTabID, childTabID])
+        XCTAssertEqual(initialRows.map(\.isThreadCollapsed), [false, true])
+        XCTAssertEqual(initialRows.map(\.hiddenThreadDescendantCount), [0, 1])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [childKey])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionAfterLifecycleSeed)
+
+        let activeGrandchildRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: grandchildTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(activeGrandchildRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(activeGrandchildRows.map(\.isThreadCollapsed), [false, false, false])
+
+        let effectiveChildRow = try XCTUnwrap(activeGrandchildRows.first { $0.tabID == childTabID })
+        viewModel.requestSidebarThreadDisclosureToggle(for: effectiveChildRow)
+        let rowsAfterSwitchingAway = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(rowsAfterSwitchingAway.map(\.tabID), [rootTabID, childTabID])
+        XCTAssertEqual(rowsAfterSwitchingAway.last?.isThreadCollapsed, true)
+
+        let searchRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: "Grandchild"
+        )
+        XCTAssertEqual(searchRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(searchRows.map(\.isThreadCollapsed), [false, false, false])
+
+        viewModel.expandAllSidebarThreads(for: tabs, currentTabID: rootTabID)
+        XCTAssertTrue(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys.isEmpty)
+        XCTAssertEqual(
+            viewModel.ui.sessionSidebar.snapshot.defaultCollapsedThreadKeysHandled,
+            [rootKey, childKey]
+        )
+        let expandedRows = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(expandedRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+
+        viewModel.collapseAllSidebarThreads(for: tabs, currentTabID: rootTabID)
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [rootKey, childKey])
+    }
+
     func testConflictingBindingStartsSuccessorRefresh() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
@@ -1491,6 +1693,17 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertTrue(JSONSerialization.isValidJSONObject(object), file: file, line: line)
         let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         return String(data: data, encoding: .utf8)!
+    }
+
+    private func retainedApplyEditsPayload(marker: String) -> String {
+        jsonString([
+            "status": "success",
+            "edits_requested": 1,
+            "edits_applied": 1,
+            "review_status": "approved",
+            "raw_output": String(repeating: marker, count: 4),
+            "diffs": [["path": "File.swift", "diff": String(repeating: marker, count: 4)]]
+        ])
     }
 
     private func makeTranscriptItems(prefix: String, turnCount: Int) -> [AgentChatItem] {

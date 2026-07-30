@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin // for stat()
@@ -103,8 +104,90 @@ enum IgnoreSettingsDefaults {
     }
 }
 
+enum IgnoreRulePolicyResolutionError: Error {
+    case ambiguousGitTopology
+}
+
+enum MandatoryGitIgnoreControlError: Error {
+    case unavailable
+    case notRegularFile
+    case contentLimitExceeded
+    case invalidEncoding
+    case changedDuringRead
+}
+
+extension IgnoreRulePolicy {
+    static func resolvingLoadedRoot(_ rawRoot: URL) throws -> IgnoreRulePolicy {
+        let loadedRoot = rawRoot.resolvingSymlinksInPath().standardizedFileURL
+        var loadedStatus = stat()
+        guard lstat(loadedRoot.path, &loadedStatus) == 0,
+              loadedStatus.st_mode & S_IFMT == S_IFDIR
+        else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+
+        var candidate = loadedRoot
+        while true {
+            let dotGit = candidate.appendingPathComponent(".git")
+            var dotGitStatus = stat()
+            if lstat(dotGit.path, &dotGitStatus) == 0 {
+                let kind = dotGitStatus.st_mode & S_IFMT
+                guard kind == S_IFDIR || kind == S_IFREG,
+                      let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: candidate),
+                      validatedContainingGitLayout(layout)
+                else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+                let repositoryRoot = layout.workTreeRoot.resolvingSymlinksInPath().standardizedFileURL
+                guard repositoryRoot == candidate,
+                      loadedRoot.path == repositoryRoot.path
+                      || loadedRoot.path.hasPrefix(repositoryRoot.path + "/")
+                else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+                let relativePath = loadedRoot.path == repositoryRoot.path
+                    ? ""
+                    : String(loadedRoot.path.dropFirst(repositoryRoot.path.count + 1))
+                let prefix = try GitRepositoryRelativeRootPrefix(relativePath)
+                guard prefix.value.split(separator: "/").first != ".git" else {
+                    throw IgnoreRulePolicyResolutionError.ambiguousGitTopology
+                }
+                return .gitRoot(repositoryRelativeRootPrefix: prefix)
+            }
+            guard errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            guard candidate.path != "/" else { break }
+            let parent = candidate.deletingLastPathComponent()
+            guard parent.path != candidate.path else { break }
+            candidate = parent
+        }
+        return .nonGitRoot
+    }
+
+    private static func validatedContainingGitLayout(_ layout: GitRepositoryLayout) -> Bool {
+        func isRegularFile(_ url: URL) -> Bool {
+            var value = stat()
+            return lstat(url.path, &value) == 0 && value.st_mode & S_IFMT == S_IFREG
+        }
+        func isDirectory(_ url: URL) -> Bool {
+            var value = stat()
+            return lstat(url.path, &value) == 0 && value.st_mode & S_IFMT == S_IFDIR
+        }
+        return isDirectory(layout.gitDir)
+            && isDirectory(layout.commonDir)
+            && isRegularFile(layout.gitDir.appendingPathComponent("HEAD"))
+            && isRegularFile(layout.commonDir.appendingPathComponent("config"))
+            && isDirectory(layout.commonDir.appendingPathComponent("objects"))
+    }
+}
+
 /// A lightweight manager that builds `IgnoreRules` on demand, with no caching.
 actor IgnoreRulesManager {
+    struct CompiledRootAuthority {
+        let gitignore: CompiledIgnoreRules?
+        let global: CompiledIgnoreRules
+        let repoIgnore: CompiledIgnoreRules?
+        let cursorignore: CompiledIgnoreRules?
+    }
+
+    struct ResolvedIgnoreRules {
+        let rules: IgnoreRules
+        let globalIgnoreDefaultsDigest: String
+    }
+
     static let shared = IgnoreRulesManager()
     private let fileManager = FileManager.default
 
@@ -168,46 +251,250 @@ actor IgnoreRulesManager {
     }
 
     /// Loads .gitignore and/or .repo_ignore content from disk, merges them into a single IgnoreRules.
-    func getIgnoreRules(
+    func resolvedIgnoreRules(
         for path: String,
-        respectGitignore: Bool = true,
         respectRepoIgnore: Bool = true,
-        respectCursorignore: Bool = true
-    ) async throws -> IgnoreRules {
-        let ignoreRules = IgnoreRules()
-
-        // If we want to load .gitignore content:
-        if respectGitignore {
-            let gitignorePath = (path as NSString).appendingPathComponent(".gitignore")
-            if fm.fileExists(atPath: gitignorePath, isDirectory: nil) {
-                let gitignoreContent = try await loadFileContent(at: gitignorePath)
-                ignoreRules.addIgnoreFile(content: gitignoreContent, priority: 1)
-            }
+        respectCursorignore: Bool = true,
+        policy: IgnoreRulePolicy
+    ) async throws -> ResolvedIgnoreRules {
+        if case let .gitRoot(repositoryRelativeRootPrefix) = policy {
+            return try await resolvedGitIgnoreRules(
+                loadedPath: path,
+                repositoryRelativeRootPrefix: repositoryRelativeRootPrefix,
+                respectRepoIgnore: respectRepoIgnore,
+                respectCursorignore: respectCursorignore,
+                policy: policy
+            )
         }
+        let gitignorePath = (path as NSString).appendingPathComponent(".gitignore")
+        let gitignoreContent: String? = if fm.fileExists(atPath: gitignorePath, isDirectory: nil) {
+            try await loadFileContent(at: gitignorePath)
+        } else { nil }
 
         // Always add global ignore defaults from user settings (lower priority)
         let globalIgnoreContent = fetchGlobalDefaults()
-        ignoreRules.addIgnoreFile(content: globalIgnoreContent, priority: 2)
 
         // If enabled and a local .repo_ignore exists, add it with higher priority (overriding global defaults)
+        let repoIgnoreContent: String?
         if respectRepoIgnore {
             let repoIgnorePath = (path as NSString).appendingPathComponent(".repo_ignore")
             if fm.fileExists(atPath: repoIgnorePath, isDirectory: nil) {
-                let repoIgnoreContent = try await loadFileContent(at: repoIgnorePath)
-                ignoreRules.addIgnoreFile(content: repoIgnoreContent, priority: 3)
-            }
-        }
+                repoIgnoreContent = try await loadFileContent(at: repoIgnorePath)
+            } else { repoIgnoreContent = nil }
+        } else { repoIgnoreContent = nil }
 
         // If enabled and a local .cursorignore exists, add it with highest local priority.
+        let cursorignoreContent: String?
         if respectCursorignore {
             let cursorignorePath = (path as NSString).appendingPathComponent(".cursorignore")
             if fm.fileExists(atPath: cursorignorePath, isDirectory: nil) {
-                let cursorignoreContent = try await loadFileContent(at: cursorignorePath)
-                ignoreRules.addIgnoreFile(content: cursorignoreContent, priority: 4)
-            }
-        }
+                cursorignoreContent = try await loadFileContent(at: cursorignorePath)
+            } else { cursorignoreContent = nil }
+        } else { cursorignoreContent = nil }
 
-        return ignoreRules
+        let authority = Self.compileRootAuthority(
+            gitignoreContent: gitignoreContent,
+            globalIgnoreContent: globalIgnoreContent,
+            repoIgnoreContent: repoIgnoreContent,
+            cursorignoreContent: cursorignoreContent
+        )
+        let ignoreRules = Self.makeRootRules(
+            authority: authority,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            policy: policy
+        )
+
+        return ResolvedIgnoreRules(
+            rules: ignoreRules,
+            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent)
+        )
+    }
+
+    private func resolvedGitIgnoreRules(
+        loadedPath: String,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        respectRepoIgnore: Bool,
+        respectCursorignore: Bool,
+        policy: IgnoreRulePolicy
+    ) async throws -> ResolvedIgnoreRules {
+        let loadedRoot = URL(fileURLWithPath: loadedPath).resolvingSymlinksInPath().standardizedFileURL
+        let prefixComponents = repositoryRelativeRootPrefix.value.split(separator: "/").map(String.init)
+        var repositoryRoot = loadedRoot
+        for _ in prefixComponents {
+            repositoryRoot.deleteLastPathComponent()
+        }
+        guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repositoryRoot),
+              layout.workTreeRoot.resolvingSymlinksInPath().standardizedFileURL == repositoryRoot
+        else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+
+        let globalIgnoreContent = fetchGlobalDefaults()
+        let rules = IgnoreRules(policy: policy)
+        var directory = repositoryRoot
+        var relativeDirectory = ""
+        for depth in 0 ... prefixComponents.count {
+            let gitignoreURL = directory.appendingPathComponent(".gitignore")
+            if try Self.mandatoryGitIgnoreControlExists(at: gitignoreURL) {
+                let content = try Self.loadMandatoryGitIgnoreContent(
+                    at: gitignoreURL
+                )
+                rules.addCompiledLayer(
+                    GitignoreCompiler.compile(content: content, directoryPath: relativeDirectory),
+                    authority: .mandatoryGit
+                )
+            }
+            if depth == 0 {
+                rules.addCompiledLayer(
+                    GitignoreCompiler.compile(content: globalIgnoreContent),
+                    authority: .secondary
+                )
+            }
+            if respectRepoIgnore {
+                let repoIgnorePath = directory.appendingPathComponent(".repo_ignore").path
+                if fm.fileExists(atPath: repoIgnorePath, isDirectory: nil) {
+                    let content = try await loadFileContent(at: repoIgnorePath)
+                    rules.addCompiledLayer(
+                        GitignoreCompiler.compile(content: content, directoryPath: relativeDirectory),
+                        authority: .secondary
+                    )
+                }
+            }
+            if respectCursorignore {
+                let cursorignorePath = directory.appendingPathComponent(".cursorignore").path
+                if fm.fileExists(atPath: cursorignorePath, isDirectory: nil) {
+                    let content = try await loadFileContent(at: cursorignorePath)
+                    rules.addCompiledLayer(
+                        GitignoreCompiler.compile(content: content, directoryPath: relativeDirectory),
+                        authority: .secondary
+                    )
+                }
+            }
+            guard depth < prefixComponents.count else { break }
+            let component = prefixComponents[depth]
+            directory.appendPathComponent(component, isDirectory: true)
+            relativeDirectory = relativeDirectory.isEmpty ? component : relativeDirectory + "/" + component
+        }
+        guard directory == loadedRoot else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
+        return ResolvedIgnoreRules(
+            rules: rules,
+            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent)
+        )
+    }
+
+    nonisolated static func globalIgnoreDefaultsDigest(for content: String) -> String {
+        Data(SHA256.hash(data: Data(content.utf8)))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    nonisolated static func loadMandatoryGitIgnoreContent(
+        at url: URL,
+        maximumBytes: Int = 4 * 1024 * 1024
+    ) throws -> String {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw MandatoryGitIgnoreControlError.unavailable }
+        defer { Darwin.close(descriptor) }
+        var before = stat()
+        guard fstat(descriptor, &before) == 0 else {
+            throw MandatoryGitIgnoreControlError.unavailable
+        }
+        guard before.st_mode & S_IFMT == S_IFREG else {
+            throw MandatoryGitIgnoreControlError.notRegularFile
+        }
+        var data = Data()
+        var buffer = Data(count: 64 * 1024)
+        while true {
+            try Task.checkCancellation()
+            let amount = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+            if amount == 0 { break }
+            if amount < 0 {
+                if errno == EINTR { continue }
+                throw MandatoryGitIgnoreControlError.unavailable
+            }
+            let (nextCount, overflow) = data.count.addingReportingOverflow(amount)
+            guard !overflow, nextCount <= maximumBytes else {
+                throw MandatoryGitIgnoreControlError.contentLimitExceeded
+            }
+            data.append(buffer.prefix(amount))
+        }
+        var after = stat()
+        var rebound = stat()
+        guard fstat(descriptor, &after) == 0,
+              lstat(url.path, &rebound) == 0,
+              rebound.st_mode & S_IFMT == S_IFREG,
+              before.st_dev == after.st_dev,
+              before.st_ino == after.st_ino,
+              before.st_size == after.st_size,
+              before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
+              before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
+              before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec,
+              rebound.st_dev == before.st_dev,
+              rebound.st_ino == before.st_ino
+        else { throw MandatoryGitIgnoreControlError.changedDuringRead }
+        return try decodeMandatoryGitIgnoreContent(data, maximumBytes: maximumBytes)
+    }
+
+    nonisolated static func decodeMandatoryGitIgnoreContent(
+        _ data: Data,
+        maximumBytes: Int = 4 * 1024 * 1024
+    ) throws -> String {
+        guard data.count <= maximumBytes else {
+            throw MandatoryGitIgnoreControlError.contentLimitExceeded
+        }
+        guard let content = String(data: data, encoding: .utf8) else {
+            throw MandatoryGitIgnoreControlError.invalidEncoding
+        }
+        return content
+    }
+
+    private nonisolated static func mandatoryGitIgnoreControlExists(at url: URL) throws -> Bool {
+        var value = stat()
+        if lstat(url.path, &value) == 0 { return true }
+        guard errno == ENOENT else { throw MandatoryGitIgnoreControlError.unavailable }
+        return false
+    }
+
+    nonisolated static func compileRootAuthority(
+        gitignoreContent: String?,
+        globalIgnoreContent: String,
+        repoIgnoreContent: String?,
+        cursorignoreContent: String?
+    ) -> CompiledRootAuthority {
+        CompiledRootAuthority(
+            gitignore: gitignoreContent.map { GitignoreCompiler.compile(content: $0) },
+            global: GitignoreCompiler.compile(content: globalIgnoreContent),
+            repoIgnore: repoIgnoreContent.map { GitignoreCompiler.compile(content: $0) },
+            cursorignore: cursorignoreContent.map { GitignoreCompiler.compile(content: $0) }
+        )
+    }
+
+    /// Builds the authoritative ordinary-crawl root chain. For Git roots, Git's
+    /// own ignore chain is a mandatory floor: global/app controls may add
+    /// exclusions but their negations cannot re-include a Git-ignored path.
+    /// Non-Git callers retain the historical single-chain precedence.
+    nonisolated static func makeRootRules(
+        authority: CompiledRootAuthority,
+        respectRepoIgnore: Bool,
+        respectCursorignore: Bool,
+        policy: IgnoreRulePolicy
+    ) -> IgnoreRules {
+        let rules = IgnoreRules(policy: policy)
+        if let gitignore = authority.gitignore {
+            rules.addCompiledLayer(gitignore, authority: .mandatoryGit)
+        }
+        rules.addCompiledLayer(authority.global, authority: .secondary)
+        if respectRepoIgnore, let repoIgnore = authority.repoIgnore {
+            rules.addCompiledLayer(repoIgnore, authority: .secondary)
+        }
+        if respectCursorignore, let cursorignore = authority.cursorignore {
+            rules.addCompiledLayer(cursorignore, authority: .secondary)
+        }
+        return rules
+    }
+
+    func resolvedGlobalIgnoreContent() -> String {
+        fetchGlobalDefaults()
     }
 
     private func loadFileContent(at path: String) async throws -> String {
@@ -276,24 +563,5 @@ actor IgnoreRulesManager {
             compiledCache.removeValue(forKey: key)
             throw error
         }
-    }
-
-    /// Deprecated synchronous helper kept for backward compatibility.
-    /// Internally forwards to the new async version.
-    func compileIgnoreFile(at url: URL) throws -> CompiledIgnoreRules {
-        // Blocking on async helper – acceptable because it is used only in tests.
-        let semaphore = DispatchSemaphore(value: 0)
-        var output: CompiledIgnoreRules!
-        var caughtErr: Error?
-
-        Task {
-            do { output = try await compiledIgnoreFile(at: url) }
-            catch { caughtErr = error }
-            semaphore.signal()
-        }
-        semaphore.wait()
-
-        if let err = caughtErr { throw err }
-        return output
     }
 }

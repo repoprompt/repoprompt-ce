@@ -49,6 +49,16 @@ enum AgentOracleToolRouting {
             tabID: tabID
         )?.notificationUserInfo
     }
+
+    static func latestPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        tabID: UUID? = nil
+    ) -> [AnyHashable: Any]? {
+        AgentOracleLatestPopoverRoute(
+            openContext: openContext,
+            tabID: tabID
+        )?.notificationUserInfo
+    }
 }
 
 struct ContextBuilderCardContext {
@@ -314,12 +324,16 @@ private enum ToolCardSubtitleBuilder {
             }
         case "get_code_structure":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: argsJSON) {
-                if args.scope == "selected" {
-                    return "selected"
+                let target = if let count = args.paths?.count, count > 0 {
+                    "\(count) path\(count == 1 ? "" : "s")"
+                } else {
+                    "selection"
                 }
-                if let count = args.paths?.count, count > 0 {
-                    return "\(count) path\(count == 1 ? "" : "s")"
+                if let expand = args.expand {
+                    let depth = args.depth ?? 1
+                    return "\(target) • \(expand), depth \(depth)"
                 }
+                return target
             }
         case "file_actions":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.FileActionsArgs.self, from: argsJSON),
@@ -733,11 +747,25 @@ func oracleToolCallPopoverUserInfo(
     guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
           toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
     else { return nil }
-    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
-    return AgentOracleToolRouting.operationPopoverUserInfo(
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
-        chatID: chatID
-    )
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
+    ) {
+        return exact
+    }
+    guard item.toolResultJSON == nil, item.toolIsError == nil else { return nil }
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
+    ) {
+        return exact
+    }
+    guard AgentOracleAuthoritativeChatIDPolicy.allowsLatestFallback(fromSerializedJSON: item.toolArgsJSON) else {
+        return nil
+    }
+    return AgentOracleToolRouting.latestPopoverUserInfo(openContext: openContext)
 }
 
 enum ToolCallCardStateResolver {

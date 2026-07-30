@@ -68,7 +68,6 @@ struct WorkspaceSaveSelectionSummary: Equatable {
     let tabID: UUID?
     let signature: String?
     let selectedPaths: Int
-    let autoCodemapPaths: Int
     let sliceFiles: Int
     let sliceRanges: Int
     let codemapAutoEnabled: Bool
@@ -76,7 +75,6 @@ struct WorkspaceSaveSelectionSummary: Equatable {
     init(tabID: UUID?, selection: StoredSelection?) {
         self.tabID = tabID
         selectedPaths = selection?.selectedPaths.count ?? 0
-        autoCodemapPaths = selection?.autoCodemapPaths.count ?? 0
         sliceFiles = selection?.slices.count ?? 0
         sliceRanges = selection?.slices.values.reduce(0) { $0 + $1.count } ?? 0
         codemapAutoEnabled = selection?.codemapAutoEnabled ?? true
@@ -91,7 +89,6 @@ struct WorkspaceSaveSelectionSummary: Equatable {
         var result: [String: String] = [
             "\(prefix)TabID": tabID.map { String($0.uuidString.prefix(8)) } ?? "<none>",
             "\(prefix)SelectedPaths": "\(selectedPaths)",
-            "\(prefix)AutoCodemapPaths": "\(autoCodemapPaths)",
             "\(prefix)SliceFiles": "\(sliceFiles)",
             "\(prefix)SliceRanges": "\(sliceRanges)",
             "\(prefix)CodemapAutoEnabled": "\(codemapAutoEnabled)"

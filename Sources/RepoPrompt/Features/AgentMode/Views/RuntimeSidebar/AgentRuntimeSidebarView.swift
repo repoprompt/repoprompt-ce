@@ -322,6 +322,7 @@ struct AgentRuntimeSidebarView: View {
             selectionCoordinator: selectionCoordinator,
             fileCount: runtimeVM.snapshot.selectionFileCount,
             selectionTokens: runtimeVM.snapshot.selectionTokens,
+            showsFilesButton: true,
             currentTabID: currentTabID,
             activeAgentSessionID: activeAgentSessionID,
             worktreeBindingsProvider: worktreeBindingsProvider

@@ -703,43 +703,49 @@ enum MCPCommandParser {
             args["mode"] = UncheckedSendableValue(mode)
             return .aliasCall(toolName: "get_file_tree", args: args)
 
-        // Code structure: structure <path> [path2] ... [--scope paths|selected] [--max-results N]
+        // Code structure: structure [path ...] [--expand uses|used_by|both] [--depth 1...4] [--size small|medium|large]
+        // Omitting paths targets the current selection.
         case "structure", "struct", "map":
             let remaining = Array(parts.dropFirst())
             let flags = parseFlagArgs(remaining)
+            let allowedFlags: Set = ["paths", "path", "p", "expand", "depth", "signatures", "size"]
+            if let unknown = flags.named.keys.first(where: {
+                !allowedFlags.contains($0.replacingOccurrences(of: "-", with: "_"))
+            }) {
+                throw CommandParseError.invalidArgument("unknown structure flag --\(unknown)")
+            }
 
             var args: [String: UncheckedSendableValue] = [:]
-
-            // Scope: selected or paths (default)
-            if let scope = flags["scope"] ?? flags["s"] {
-                args["scope"] = UncheckedSendableValue(scope)
-                // For scope=selected, paths are not required
-                if scope.lowercased() == "selected" {
-                    // No paths needed
-                }
-            }
-
-            // Max results
-            if let maxStr = flags["max-results"] ?? flags["max_results"] ?? flags["max"] ?? flags["m"],
-               let maxResults = Int(maxStr)
-            {
-                args["max_results"] = UncheckedSendableValue(maxResults)
-            }
-
-            // Paths from positional arguments or --paths/--path
             var paths = flags.positional.map { ctx.resolveWorkspacePathArg($0) }
             if let pathsArg = flags["paths"] ?? flags["path"] ?? flags["p"] {
-                let rawPaths = pathsArg.split(separator: ",")
-                let resolved = rawPaths.map {
+                paths.append(contentsOf: pathsArg.split(separator: ",").map {
                     ctx.resolveWorkspacePathArg(String($0).trimmingCharacters(in: .whitespaces))
-                }
-                paths.append(contentsOf: resolved)
+                })
             }
             if !paths.isEmpty {
                 args["paths"] = UncheckedSendableValue(paths)
-            } else if args["scope"] == nil {
-                // No paths and no scope - require at least one path
-                throw CommandParseError.missingArgument("file or directory path (or use --scope selected)")
+            }
+
+            if let expand = flags["expand"] {
+                args["expand"] = UncheckedSendableValue(expand)
+            }
+            if let rawDepth = flags["depth"] {
+                guard let depth = Int(rawDepth), (1 ... 4).contains(depth) else {
+                    throw CommandParseError.invalidArgument("structure --depth must be an integer from 1 through 4")
+                }
+                args["depth"] = UncheckedSendableValue(depth)
+            }
+            if let rawSignatures = flags["signatures"] {
+                guard let signatures = parseBoolFlag(rawSignatures) else {
+                    throw CommandParseError.invalidArgument("structure --signatures must be true or false")
+                }
+                args["signatures"] = UncheckedSendableValue(signatures)
+            }
+            if let size = flags["size"] {
+                guard ["small", "medium", "large"].contains(size) else {
+                    throw CommandParseError.invalidArgument("structure --size must be small, medium, or large")
+                }
+                args["size"] = UncheckedSendableValue(size)
             }
 
             return .aliasCall(toolName: "get_code_structure", args: args)

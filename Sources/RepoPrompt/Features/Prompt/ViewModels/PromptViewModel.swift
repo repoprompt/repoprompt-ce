@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptCodeMapCore
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
@@ -47,6 +48,16 @@ enum FilesTabChangeSource {
 class PromptViewModel: ObservableObject {
     /// Set to true to enable debug logging for settings sync
     static var debugLoggingEnabled = false
+
+    #if DEBUG
+        private var automaticReviewGitDiffProviderOverrideForTesting: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+
+        func setAutomaticReviewGitDiffProviderOverrideForTesting(
+            _ override: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+        ) {
+            automaticReviewGitDiffProviderOverrideForTesting = override
+        }
+    #endif
 
     // MARK: - Type Definitions and Enums
 
@@ -334,6 +345,10 @@ class PromptViewModel: ObservableObject {
         )
     }
 
+    func mcpOracleIsProviderConfigured(for model: AIModel) -> Bool {
+        isProviderConfigured(for: model)
+    }
+
     nonisolated static func mcpOraclePlanningModelErrorMessage(
         for resolution: MCPOraclePlanningModelResolution,
         availabilityGuidance: ((AIModel) -> String)? = nil
@@ -360,31 +375,44 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    private func setPreferredModelRaw(_ rawValue: String, markDirty: Bool, reason: String? = nil) {
+    private func setPreferredModelRaw(_ rawValue: String, markDirty: Bool, reason _: String? = nil) {
         sessionPreferredModelOverrideRaw = nil
-        let shouldSync = settingsManager.syncChatModelWithOracle()
+        var profile = currentAgentModelsProfile()
+        let shouldSync = profile.syncChatModelWithOracle
         if _preferredModel != rawValue {
             _preferredModel = rawValue
         }
-        if shouldSync, _planningModel != rawValue {
-            _planningModel = rawValue
+        profile.preferredComposeModelRaw = rawValue
+        // Mirror the store-level Oracle guard in memory too: a blank/whitespace chat model
+        // (pickDiffCapableFallback's empty branch) must not blank the in-memory Oracle, or the
+        // Oracle dropdown briefly shows empty until the next settings sync re-reads it.
+        if shouldSync, !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            profile.planningModelRaw = rawValue
+            if _planningModel != rawValue {
+                _planningModel = rawValue
+            }
         }
-        settingsManager.setPreferredComposeModelRaw(rawValue, commit: true, reason: reason, honorSync: shouldSync)
+        persistCurrentAgentModelsProfile(profile)
         if markDirty {
             isDirty = true
         }
     }
 
-    private func setPlanningModelRaw(_ rawValue: String, markDirty: Bool, reason: String? = nil) {
-        let shouldSync = settingsManager.syncChatModelWithOracle()
+    private func setPlanningModelRaw(_ rawValue: String, markDirty: Bool, reason _: String? = nil) {
+        var profile = currentAgentModelsProfile()
+        let shouldSync = profile.syncChatModelWithOracle
         if _planningModel != rawValue {
             _planningModel = rawValue
         }
-        if shouldSync, _preferredModel != rawValue {
-            sessionPreferredModelOverrideRaw = nil
-            _preferredModel = rawValue
+        profile.planningModelRaw = rawValue
+        if shouldSync {
+            profile.preferredComposeModelRaw = rawValue
+            if _preferredModel != rawValue {
+                sessionPreferredModelOverrideRaw = nil
+                _preferredModel = rawValue
+            }
         }
-        settingsManager.setPlanningModelRaw(rawValue, commit: true, reason: reason, honorSync: shouldSync)
+        persistCurrentAgentModelsProfile(profile)
         if markDirty {
             isDirty = true
         }
@@ -397,7 +425,7 @@ class PromptViewModel: ObservableObject {
 
     @Published private(set) var availableAgentKinds: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
 
-    /// Preferred context-builder agent (global, persisted via GlobalSettingsStore)
+    /// Preferred context-builder agent from the effective Agent Models profile.
     @Published var contextBuilderAgent: AgentProviderKind = .claudeCode {
         didSet {
             guard oldValue != contextBuilderAgent else { return }
@@ -405,11 +433,7 @@ class PromptViewModel: ObservableObject {
             if !isContextBuilderModelRawValidForAgent(contextBuilderAgentModelRaw, agent: contextBuilderAgent) {
                 contextBuilderAgentModelRaw = defaultModelRaw(for: contextBuilderAgent)
             }
-            settingsManager.setGlobalContextBuilderAgentSelection(
-                agentRaw: contextBuilderAgent.rawValue,
-                modelRaw: contextBuilderAgentModelRaw,
-                markUserDefined: true
-            )
+            persistContextBuilderSelectionToEffectiveProfile()
             postRecommendationsShouldRefresh(reason: "contextBuilderAgentChanged")
         }
     }
@@ -429,11 +453,7 @@ class PromptViewModel: ObservableObject {
                 contextBuilderAgentModelRaw = defaultModelRaw(for: contextBuilderAgent)
                 return
             }
-            settingsManager.setGlobalContextBuilderAgentSelection(
-                agentRaw: contextBuilderAgent.rawValue,
-                modelRaw: effectiveRaw,
-                markUserDefined: true
-            )
+            persistContextBuilderSelectionToEffectiveProfile(modelRaw: effectiveRaw)
             postRecommendationsShouldRefresh(reason: "contextBuilderAgentModelChanged")
         }
     }
@@ -474,10 +494,12 @@ class PromptViewModel: ObservableObject {
         else {
             return nil
         }
-        let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
+        let profile = currentAgentModelsProfile()
+        let agentRaw = profile.contextBuilderAgentRaw
+        let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
         return AutoRecommendationEngine.resolveContextBuilderSelection(
-            persistedAgentRaw: persisted.agentRaw,
-            persistedModelRaw: persisted.modelRaw,
+            persistedAgentRaw: agentRaw,
+            persistedModelRaw: modelRaw,
             availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
             enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
@@ -505,21 +527,22 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    /// Force-commit context builder settings to the global store so other components (like recommendation engine) see them.
+    /// Persist the visible Context Builder selection to the active Agent Models profile even
+    /// when the user re-selects the same runtime fallback and observers do not fire.
     func commitContextBuilderSettings() {
-        settingsManager.setGlobalContextBuilderAgentSelection(
-            agentRaw: contextBuilderAgent.rawValue,
-            modelRaw: contextBuilderAgentModelRaw,
-            markUserDefined: true
-        )
+        persistContextBuilderSelectionToEffectiveProfile()
         postRecommendationsShouldRefresh(reason: "contextBuilderSettingsCommitted")
     }
 
     private func postRecommendationsShouldRefresh(reason: String) {
+        var userInfo: [String: Any] = ["reason": reason]
+        if case let .workspace(workspaceID) = currentAgentModelsEditingScope {
+            userInfo["workspaceID"] = workspaceID
+        }
         NotificationCenter.default.post(
             name: .recommendationsShouldRefresh,
             object: nil,
-            userInfo: ["reason": reason]
+            userInfo: userInfo
         )
     }
 
@@ -636,6 +659,45 @@ class PromptViewModel: ObservableObject {
         fileManager.currentWorkspaceID
     }
 
+    private var currentAgentModelsEditingScope: AgentModelsEditingScope {
+        guard let workspaceID = currentWorkspaceID,
+              settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        else {
+            return .global
+        }
+        return .workspace(workspaceID)
+    }
+
+    private func currentAgentModelsProfile() -> AgentModelsSettingsProfile {
+        settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+    }
+
+    private func persistCurrentAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
+    ) {
+        switch currentAgentModelsEditingScope {
+        case .global:
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
+        case let .workspace(workspaceID):
+            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+        }
+    }
+
+    private func persistContextBuilderSelectionToEffectiveProfile(modelRaw: String? = nil) {
+        var profile = currentAgentModelsProfile()
+        let rawModel = modelRaw ?? contextBuilderAgentModelRaw
+        profile.contextBuilderAgentRaw = contextBuilderAgent.rawValue
+        profile = profile.replacingContextBuilderModel(rawModel, for: contextBuilderAgent.rawValue)
+        persistCurrentAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .userInitiated
+        )
+    }
+
     private var isSyncingSettings = false
     private var suppressPromptPackagingSettingInvalidation = false
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
@@ -691,10 +753,6 @@ class PromptViewModel: ObservableObject {
                 }
 
                 isDirty = true
-            }
-
-            Task {
-                await refreshCodeScanEnabledForEffectiveState()
             }
         }
     }
@@ -768,10 +826,6 @@ class PromptViewModel: ObservableObject {
             }
 
             isDirty = true
-
-            Task {
-                await refreshCodeScanEnabledForEffectiveState()
-            }
         }
     }
 
@@ -799,14 +853,15 @@ class PromptViewModel: ObservableObject {
     // MARK: - Auto-Switch to Manual Mode Wrapper Methods
 
     private func syncModelSelectionFromSettingsManager() {
+        let profile = currentAgentModelsProfile()
         _planningModel = Self.modelRawAfterSettingsSync(
             currentRaw: _planningModel,
-            persistedRaw: settingsManager.planningModelRaw()
+            persistedRaw: profile.planningModelRaw
         )
         if sessionPreferredModelOverrideRaw == nil {
             _preferredModel = Self.modelRawAfterSettingsSync(
                 currentRaw: _preferredModel,
-                persistedRaw: settingsManager.preferredComposeModelRaw()
+                persistedRaw: profile.preferredComposeModelRaw
             )
         }
     }
@@ -816,8 +871,28 @@ class PromptViewModel: ObservableObject {
         return persistedRaw
     }
 
+    private func syncAgentModelsSettingsFromSettingsManager() {
+        refreshAvailableAgentKinds()
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            if Self.debugLoggingEnabled {
+                print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)")
+            }
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+            if Self.debugLoggingEnabled {
+                print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)")
+            }
+        }
+        syncModelSelectionFromSettingsManager()
+    }
+
     func syncSettingsFromSettingsManager() {
-        guard let workspaceID = currentWorkspaceID else { return }
+        guard let workspaceID = currentWorkspaceID else {
+            isSyncingSettings = true
+            syncAgentModelsSettingsFromSettingsManager()
+            isSyncingSettings = false
+            return
+        }
 
         let copySettings = settingsManager.copySettings(for: workspaceID)
         let chatSettings = settingsManager.chatSettings(for: workspaceID)
@@ -875,17 +950,8 @@ class PromptViewModel: ObservableObject {
         }
         _contextBuilderModel = chatSettings.contextBuilderModelRaw ?? ""
 
-        // Sync Context Builder agent/model from global Context Builder settings (single source of truth)
-        refreshAvailableAgentKinds()
-        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
-            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
-            contextBuilderAgent = normalizedContextBuilder.agent
-            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
-            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
-        }
-
-        // Sync model selection from the global settings store (may have been set by recommendation engine).
-        syncModelSelectionFromSettingsManager()
+        // Sync model and Context Builder selection from the effective Agent Models profile.
+        syncAgentModelsSettingsFromSettingsManager()
 
         isSyncingSettings = false
 
@@ -893,11 +959,24 @@ class PromptViewModel: ObservableObject {
         lastNonManualCopyPresetID = copySettings.lastNonManualCopyPresetID
         lastNonManualChatPresetID = chatSettings.lastNonManualChatPresetID
         lastNonManualChatPresetName = chatSettings.lastNonManualChatPresetName ?? ""
-
-        Task {
-            await refreshCodeScanEnabledForEffectiveState()
-        }
         gitViewModel.gitDiffInclusionMode = gitDiffInclusionModeForCopy
+    }
+
+    /// Narrow re-sync of only the global-derived cache (Oracle model, preferred model,
+    /// Context Builder agent/model), invoked when the shared global store is mutated from
+    /// another window. Deliberately does NOT touch per-window copy/chat overlays.
+    private func syncGlobalDerivedSettingsFromStore() {
+        isSyncingSettings = true
+        defer { isSyncingSettings = false }
+
+        // Sync Context Builder agent/model from global settings (single source of truth).
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+        }
+
+        // Sync model selection (Oracle + preferred) from the global store.
+        syncModelSelectionFromSettingsManager()
     }
 
     /// Updates fileTreeOption and auto-switches to Manual mode if needed
@@ -1040,7 +1119,10 @@ class PromptViewModel: ObservableObject {
         )
 
         // Ensure _git_data is visible and refreshed
-        await fileManager.ensureGitDataRootLoaded(workspace: workspace, workspaceManager: workspaceManager)
+        _ = try await fileManager.ensureGitDataRootLoaded(
+            workspace: workspace,
+            workspaceManager: workspaceManager
+        )
         await fileManager.flushPendingDeltas(aggressive: true)
 
         return result
@@ -1104,7 +1186,7 @@ class PromptViewModel: ObservableObject {
         let selectionVersion: UInt64
         let slicesVersion: UInt64
         let autoCodemapVersion: UInt64
-        let fileAPIsVersion: UInt64
+        let codemapAuthorityVersion: UInt64
     }
 
     private struct ChatPresetTokenBaselineKey: Equatable {
@@ -1168,7 +1250,7 @@ class PromptViewModel: ObservableObject {
         let selectionVersion: UInt64
         let slicesVersion: UInt64
         let autoCodemapVersion: UInt64
-        let fileAPIsVersion: UInt64
+        let codemapAuthorityVersion: UInt64
         let fileSystemDeltaVersion: UInt64
     }
 
@@ -1183,11 +1265,10 @@ class PromptViewModel: ObservableObject {
     }
 
     var chatPromptEntriesCache: (key: ChatPromptEntriesCacheKey, entries: [PromptFileEntry])?
-    var chatCodemapFileAPIs: [FileAPI] = []
     var chatSelectionVersion: UInt64 = 0
     var chatSlicesVersion: UInt64 = 0
     var chatAutoCodemapVersion: UInt64 = 0
-    var chatFileAPIsVersion: UInt64 = 0
+    var chatCodemapAuthorityVersion: UInt64 = 0
     private var chatFileSystemDeltaVersion: UInt64 = 0
     private var chatContextTokenBaselineCache: ChatContextTokenBaselineCache?
 
@@ -1227,10 +1308,6 @@ class PromptViewModel: ObservableObject {
 
     var codeMapTokenCount: Int {
         tokenCountingViewModel.codeMapTokenCount
-    }
-
-    var cachedFileAPIs: [FileAPI] {
-        tokenCountingViewModel.cachedFileAPIs
     }
 
     var fileTreeContent: String {
@@ -2045,7 +2122,6 @@ class PromptViewModel: ObservableObject {
             await self.refreshAvailableModels()
         }
 
-        self.fileManager.initCodeScanState(shouldEnableCodeScanning())
         syncSettingsFromSettingsManager()
 
         // Initialize/migrate prompt-packaging settings without marking a new tab dirty on launch.
@@ -2067,6 +2143,18 @@ class PromptViewModel: ObservableObject {
     // MARK: - Setup and Observer Configuration
 
     private func setupObservers() {
+        // Live cross-window sync: when another window mutates the shared global store
+        // (Oracle model, Context Builder agent, role defaults, …), re-seed this window's
+        // global-derived cache. Dispatched to the main queue to avoid synchronous re-entry
+        // during our own write-back, and guarded by `isSyncingSettings` to prevent loops.
+        settingsManager.globalSettingsStore.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, !self.isSyncingSettings else { return }
+                syncGlobalDerivedSettingsFromStore()
+            }
+            .store(in: &cancellables)
+
         // Sync prompt text with workspace manager after debounce
         $promptText
             .removeDuplicates()
@@ -2113,6 +2201,16 @@ class PromptViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        fileManager.$manualCodemapFiles
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.workspaceManager?.markWorkspaceDirty()
+                self?.updateActiveTabDirtyState()
+                self?.bumpChatPromptEntriesAutoCodemapVersion()
+            }
+            .store(in: &cancellables)
+
         GlobalSettingsStore.shared.$codeMapsGloballyDisabled
             .dropFirst()
             .removeDuplicates()
@@ -2130,20 +2228,14 @@ class PromptViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // New subscription for code map updates
-        fileManager.codeMapUpdatePublisher
+        tokenCountingViewModel.tokenCalculationCompletedPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                self?.isDirty = true
-                // ⬇️ Heavy changes (code-map impacts baseline)
-                self?.tokenCountingViewModel.markDirty(.codeMap)
-                self?.workspaceManager?.markWorkspaceDirty()
-                self?.updateActiveTabDirtyState()
-                self?.refreshChatCodemapFileAPIsFromStore()
+                self?.bumpChatPromptEntriesCodemapAuthorityVersion()
             }
             .store(in: &cancellables)
 
-        refreshChatCodemapFileAPIsFromStore()
+        bumpChatPromptEntriesCodemapAuthorityVersion()
 
         fileManager.fileSystemDeltasAppliedPublisher
             .receive(on: DispatchQueue.main)
@@ -2201,6 +2293,26 @@ class PromptViewModel: ObservableObject {
                 syncSettingsFromSettingsManager()
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.handleAgentModelsSettingsDidChange(notification)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleAgentModelsSettingsDidChange(_ notification: Notification) {
+        let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+        if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+           workspaceID != currentWorkspaceID
+        {
+            return
+        }
+        isSyncingSettings = true
+        syncAgentModelsSettingsFromSettingsManager()
+        isSyncingSettings = false
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
@@ -2223,21 +2335,9 @@ class PromptViewModel: ObservableObject {
         invalidateChatPromptEntriesCache()
     }
 
-    private func bumpChatPromptEntriesFileAPIsVersion() {
-        chatFileAPIsVersion &+= 1
+    private func bumpChatPromptEntriesCodemapAuthorityVersion() {
+        chatCodemapAuthorityVersion &+= 1
         invalidateChatPromptEntriesCache()
-    }
-
-    private func refreshChatCodemapFileAPIsFromStore() {
-        Task { [weak self] in
-            guard let self else { return }
-            let apis = await workspaceFileContextStore.allCodemapFileAPIs()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                chatCodemapFileAPIs = apis
-                bumpChatPromptEntriesFileAPIsVersion()
-            }
-        }
     }
 
     // MARK: - Compose Tab Management
@@ -2704,8 +2804,14 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func closeComposeTab(_ id: UUID) async {
-        await closeComposeTabs(withIDs: [id])
+    func closeComposeTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        await closeComposeTabs(
+            withIDs: [id],
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @MainActor
@@ -2744,7 +2850,8 @@ class PromptViewModel: ObservableObject {
         preferredActiveID: UUID? = nil,
         reason: ComposeTabRemovalReason = .close,
         expandCascade: Bool = true,
-        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        isMutationOwnerCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard !ids.isEmpty else { return }
         guard
@@ -2761,6 +2868,16 @@ class PromptViewModel: ObservableObject {
                 return false
             }
             return isMutationContextCurrent?() ?? true
+        }
+
+        func mutationOwnerIsCurrent() -> Bool {
+            guard manager.activeWorkspace?.id == workspace.id,
+                  manager.workspaces.indices.contains(index),
+                  manager.workspaces[index].id == workspace.id
+            else {
+                return false
+            }
+            return isMutationOwnerCurrent?() ?? true
         }
 
         guard mutationContextIsCurrent() else { return }
@@ -2793,12 +2910,14 @@ class PromptViewModel: ObservableObject {
             return adjacentTabID(afterClosing: previousActiveID, tabs: tabsBeforeClose, closingIDs: tabsBeingClosed)
         }()
 
-        // Notify listeners BEFORE mutation so they can cancel running tasks
+        // Notify listeners BEFORE mutation so they can cancel running tasks.
+        // The caller's target context may be invalidated by this intentional cleanup,
+        // so post-notify checks use the stable mutation owner instead.
         guard mutationContextIsCurrent() else { return }
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
-        guard mutationContextIsCurrent() else { return }
+        guard mutationOwnerIsCurrent() else { return }
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
-        guard mutationContextIsCurrent() else { return }
+        guard mutationOwnerIsCurrent() else { return }
         #if DEBUG
             for tabID in tabsBeingClosed {
                 AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
@@ -3032,11 +3151,15 @@ class PromptViewModel: ObservableObject {
     @Published private(set) var currentStashedTabs: [StashedTab] = []
 
     @MainActor
-    func stashTab(_ id: UUID) async {
+    func stashTab(
+        _ id: UUID,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
+            isMutationContextCurrent?() ?? true
         else { return }
 
         // Don't allow stashing if it's the last tab
@@ -3047,7 +3170,11 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        await closeComposeTabs(withIDs: [id], reason: .stash)
+        await closeComposeTabs(
+            withIDs: [id],
+            reason: .stash,
+            isMutationContextCurrent: isMutationContextCurrent
+        )
     }
 
     @discardableResult
@@ -3146,6 +3273,10 @@ class PromptViewModel: ObservableObject {
             reason: .stash,
             expandCascade: false,
             isMutationContextCurrent: {
+                isArchiveContextCurrent()
+                    && manager.activeWorkspace?.id == expectedWorkspaceID
+            },
+            isMutationOwnerCurrent: {
                 isArchiveContextCurrent()
                     && manager.activeWorkspace?.id == expectedWorkspaceID
             }
@@ -3553,9 +3684,6 @@ class PromptViewModel: ObservableObject {
         if lhs.selection.selectedPaths != rhs.selection.selectedPaths {
             return true
         }
-        if lhs.selection.autoCodemapPaths != rhs.selection.autoCodemapPaths {
-            return true
-        }
 
         // Other fields (promptText, slices, overrides, discover config, etc.)
         // do not currently affect the tab header and can change without
@@ -3621,7 +3749,6 @@ class PromptViewModel: ObservableObject {
         case let .preset(preset):
             let selection = StoredSelection(
                 selectedPaths: preset.selectedFilePaths,
-                autoCodemapPaths: [],
                 slices: [:],
                 codemapAutoEnabled: true
             )
@@ -3749,7 +3876,7 @@ class PromptViewModel: ObservableObject {
                 localFolder // legacy behaviour
             }
             groups[key, default: []].append(file)
-            let tokenCount = tokenInfoByID[file.id]?.count ?? (file.cachedTokenCount ?? 0)
+            let tokenCount = tokenInfoByID[file.id]?.count ?? 0
             folderTokenSums[key, default: 0] += tokenCount
         }
 
@@ -3847,15 +3974,15 @@ class PromptViewModel: ObservableObject {
             case .nameDescending:
                 return isNameDescending(lhs, rhs)
             case .tokenAscending:
-                let lhsTokens = tokenInfo[lhs.id]?.count ?? (lhs.cachedTokenCount ?? 0)
-                let rhsTokens = tokenInfo[rhs.id]?.count ?? (rhs.cachedTokenCount ?? 0)
+                let lhsTokens = tokenInfo[lhs.id]?.count ?? 0
+                let rhsTokens = tokenInfo[rhs.id]?.count ?? 0
                 if lhsTokens != rhsTokens {
                     return lhsTokens < rhsTokens
                 }
                 return isNameAscending(lhs, rhs)
             case .tokenDescending:
-                let lhsTokens = tokenInfo[lhs.id]?.count ?? (lhs.cachedTokenCount ?? 0)
-                let rhsTokens = tokenInfo[rhs.id]?.count ?? (rhs.cachedTokenCount ?? 0)
+                let lhsTokens = tokenInfo[lhs.id]?.count ?? 0
+                let rhsTokens = tokenInfo[rhs.id]?.count ?? 0
                 if lhsTokens != rhsTokens {
                     return lhsTokens > rhsTokens
                 }
@@ -4078,31 +4205,35 @@ class PromptViewModel: ObservableObject {
         }()
 
         Task {
-            let preAssembly = await self.preAssemblePromptContext(
-                cfg: promptContext,
-                selection: selectionSnapshot,
-                lookupContext: self.allLoadedWorkspaceLookupContext()
-            )
-            let includeFiles = includeFilesInClipboard && !preAssembly.entries.isEmpty
-
-            // Use captured values inside the Task
-            let clipboardContent = await PromptPackagingService.generateClipboardContent(
-                metaInstructions: metaInstructions,
-                userInstructions: promptText,
-                files: preAssembly.entries,
-                fileTreeContent: preAssembly.fileTreeContent,
-                gitDiff: preAssembly.gitDiff,
-                includeSavedPrompts: includeSavedPrompts,
-                includeFiles: includeFiles,
-                includeUserPrompt: includeUserPrompt,
-                filePathDisplay: filePathDisplayOption,
-                codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-                includeDatetimeInUserInstructions: includeDatetime,
-                promptSectionsOrder: promptSectionsOrder,
-                disabledPromptSections: disabledPromptSections,
-                duplicateUserInstructionsAtTop: duplicateUserInstructions,
-                tabTitle: tabTitleForClipboard
-            )
+            let clipboardContent: String
+            do {
+                clipboardContent = try await self.withPreassembledPromptContext(
+                    cfg: promptContext,
+                    selection: selectionSnapshot,
+                    lookupContext: self.allLoadedWorkspaceLookupContext()
+                ) { preAssembly in
+                    let includeFiles = includeFilesInClipboard && !preAssembly.entries.isEmpty
+                    return await PromptPackagingService.generateClipboardContent(
+                        metaInstructions: metaInstructions,
+                        userInstructions: promptText,
+                        files: preAssembly.entries,
+                        fileTreeContent: preAssembly.fileTreeContent,
+                        gitDiff: preAssembly.gitDiff,
+                        includeSavedPrompts: includeSavedPrompts,
+                        includeFiles: includeFiles,
+                        includeUserPrompt: includeUserPrompt,
+                        filePathDisplay: filePathDisplayOption,
+                        codemapPresentation: preAssembly.codemapPresentation,
+                        includeDatetimeInUserInstructions: includeDatetime,
+                        promptSectionsOrder: promptSectionsOrder,
+                        disabledPromptSections: disabledPromptSections,
+                        duplicateUserInstructionsAtTop: duplicateUserInstructions,
+                        tabTitle: tabTitleForClipboard
+                    )
+                }
+            } catch {
+                return
+            }
 
             await MainActor.run {
                 NSPasteboard.general.clearContents()
@@ -4653,13 +4784,6 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Ensure codemap scanning runs when the newly selected preset requires it.
-        let preset = CopyPresetManager.shared.preset(with: id) ?? BuiltInCopyPresets.standard
-        let cfg = resolvePromptContext(preset, custom: workingCopyCustomizations)
-        if cfg.codeMapUsage != .none {
-            Task { await fileManager.setCodeScanEnabled(true) }
-        }
-
         // Only force-sync when switching to a non-manual preset
         if !willBeManual {
             syncPromptSelectionToPreset(for: .copy, force: true)
@@ -4842,7 +4966,8 @@ class PromptViewModel: ObservableObject {
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
-        lookupContextOverride: WorkspaceLookupContext? = nil
+        lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
     ) async -> AIMessage {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
@@ -4879,14 +5004,11 @@ class PromptViewModel: ObservableObject {
         // active chat packaging no longer needs FileViewModel selection snapshots.
         let filePathDisplay = filePathDisplayOption
         let temperature = setModelTemperature ? modelTemperature : nil
-        let preAssembly = await preAssemblePromptContext(
-            cfg: activeConfig,
-            selection: logicalSelection,
-            lookupContext: lookupContext,
-            gitBaseOverride: gitBaseOverride
-        )
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
-
+        let frozenReviewGitContext = if let reviewGitContextOverride {
+            reviewGitContextOverride
+        } else {
+            await freezePromptGitReviewContext(base: gitBaseOverride ?? gitViewModel.selectedDiffBranch)
+        }
         // Identify a stored prompt to be used as SYSTEM prompt when configured
         let idsCandidate = activeConfig.storedPromptIds ?? preset.storedPromptIds
         var systemStoredPrompt: StoredPrompt? = nil
@@ -4919,22 +5041,6 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Render the canonical codemap partition with the file map and full/sliced content separately.
-        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-            codeEntries,
-            filePathDisplay: filePathDisplay,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            displayPathResolver: { entry in
-                preAssembly.displayPath(for: entry)
-            }
-        )
-        let fileBlocks = partitionedBlocks.contentBlocks
-        let fileTreeString = PromptPackagingService.combinedFileMapContent(
-            fileTreeContent: preAssembly.fileTreeContent,
-            codemapBlocks: partitionedBlocks.codemapBlocks
-        ) ?? ""
-        let gitDiff = preAssembly.gitDiff
-
         // Meta prompts:
         // - If override supplies stored prompts AND they are NOT used as system, use them.
         // - Otherwise, use global chat meta; when a stored prompt is used as system, exclude it from meta.
@@ -4949,18 +5055,60 @@ class PromptViewModel: ObservableObject {
             return metaInstructionsForChat
         }()
 
-        return PromptPackagingService.buildAIMessage(
-            systemPrompt: systemPrompt,
-            metaInstructions: metaForThisChat,
-            fileTree: fileTreeString,
-            fileContents: fileBlocks,
-            gitDiff: gitDiff,
-            conversation: conversation, // Pass conversation unchanged (no MCP metadata injection in chat history)
-            temperature: temperature,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
+        let packaged: (message: AIMessage, preAssembly: PromptContextPreAssemblyResult)
+        do {
+            packaged = try await withPreassembledPromptContext(
+                cfg: activeConfig,
+                selection: logicalSelection,
+                lookupContext: lookupContext,
+                reviewGitContext: frozenReviewGitContext
+            ) { preAssembly in
+                let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
+                    preAssembly.entries
+                )
+                let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
+                    codeEntries,
+                    filePathDisplay: filePathDisplay,
+                    codemapPresentation: preAssembly.codemapPresentation,
+                    displayPathResolver: { entry in
+                        preAssembly.displayPath(for: entry)
+                    }
+                )
+                let fileTreeString = PromptPackagingService.combinedFileMapContent(
+                    fileTreeContent: preAssembly.fileTreeContent,
+                    codemapBlocks: partitionedBlocks.codemapBlocks
+                ) ?? ""
+                let message = PromptPackagingService.buildAIMessage(
+                    systemPrompt: systemPrompt,
+                    metaInstructions: metaForThisChat,
+                    fileTree: fileTreeString,
+                    fileContents: partitionedBlocks.contentBlocks,
+                    gitDiff: preAssembly.gitDiff,
+                    conversation: conversation,
+                    temperature: temperature,
+                    promptSectionsOrder: self.promptSectionsOrder,
+                    disabledPromptSections: self.disabledPromptSections,
+                    duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
+                )
+                return (message, preAssembly)
+            }
+        } catch {
+            return AIMessage(systemPrompt: systemPrompt, userMessage: "")
+        }
+        #if DEBUG
+            OracleReviewPackagingDiagnostics.recordPreassembly(
+                mode: effectiveMode,
+                model: overrideModel,
+                chatPreset: preset,
+                config: activeConfig,
+                selectedArtifactPolicy: .includeBeforeGitInclusion,
+                logicalSelection: logicalSelection,
+                preassembly: packaged.preAssembly,
+                message: packaged.message,
+                disabledPromptSections: disabledPromptSections
+            )
+        #endif
+        return packaged.message
     }
 
     func getSystemPrompt() -> String {
@@ -5217,45 +5365,11 @@ class PromptViewModel: ObservableObject {
 
     // MARK: - Code Map Methods
 
-    private var hasEffectiveCodeMapAccess: Bool {
-        true && !codeMapsGloballyDisabled
-    }
-
-    private func shouldEnableCodeScanning() -> Bool {
-        hasEffectiveCodeMapAccess && (codeMapUsage != .none || codeMapUsageForChat != .none)
-    }
-
-    @MainActor
-    private func refreshCodeScanEnabledForEffectiveState() async {
-        await fileManager.setCodeScanEnabled(shouldEnableCodeScanning())
-    }
-
-    @MainActor
-    func cancelCodeMapScans() async {
-        await fileManager.cancelCodeMapScans()
-    }
-
     private func handleCodeMapsGloballyDisabledChanged(_ disabled: Bool) {
         guard codeMapsGloballyDisabled != disabled else { return }
         codeMapsGloballyDisabled = disabled
         tokenCountingViewModel.markDirty(.codeMap.union(.fileTree))
         isDirty = true
-        Task {
-            await refreshCodeScanEnabledForEffectiveState()
-        }
-    }
-
-    func updateCodeMapEffectiveState() {
-        Task {
-            await refreshCodeScanEnabledForEffectiveState()
-        }
-    }
-
-    /// Resets the code map cache and triggers a rescan of all files
-    @MainActor
-    func resetCodeMapCache() async {
-        // Clear all code map caches and trigger rescan
-        await fileManager.clearCodeMapCaches()
     }
 
     func resetPlanningPromptToDefault() {
@@ -5462,12 +5576,124 @@ extension PromptViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         includeLocalDefinitionsInFileTree: Bool = false,
-        gitBaseOverride: String? = nil
+        reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> PromptContextPreAssemblyResult {
-        let diffBase = gitBaseOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveBase = (diffBase?.isEmpty == false) ? diffBase : nil
+        let request = await makePromptContextPreAssemblyRequest(
+            cfg: cfg,
+            selection: selection,
+            lookupContext: lookupContext,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            reviewGitContext: reviewGitContext
+        )
+        return await PromptContextPreAssemblyService.resolve(request)
+    }
+
+    func withPreassembledPromptContext<Value>(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        includeLocalDefinitionsInFileTree: Bool = false,
+        reviewGitContext: FrozenPromptGitReviewContext? = nil,
+        sourceTabID: UUID? = nil,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
+        operation: (PromptContextPreAssemblyResult) async throws -> Value
+    ) async throws -> Value {
+        let request = await makePromptContextPreAssemblyRequest(
+            cfg: cfg,
+            selection: selection,
+            lookupContext: lookupContext,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            reviewGitContext: reviewGitContext,
+            sourceTabID: sourceTabID,
+            finalReviewAuthorization: finalReviewAuthorization
+        )
+        if finalReviewAuthorization != nil {
+            return try await PromptContextPreAssemblyService.withResolvedStrict(
+                request,
+                operation: operation
+            )
+        }
+        return try await PromptContextPreAssemblyService.withResolved(
+            request,
+            operation: operation
+        )
+    }
+
+    private func makePromptContextPreAssemblyRequest(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        includeLocalDefinitionsInFileTree: Bool,
+        reviewGitContext: FrozenPromptGitReviewContext?,
+        sourceTabID: UUID? = nil,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
+    ) async -> PromptContextPreAssemblyRequest {
+        let frozenReviewContext = if let reviewGitContext {
+            reviewGitContext
+        } else {
+            await freezePromptGitReviewContext(base: gitViewModel.selectedDiffBranch)
+        }
+        let effectiveBase: String? = switch frozenReviewContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
         let gitVM = gitViewModel
-        return await PromptContextPreAssemblyService.resolve(
+        let coordinator = AutomaticReviewGitDiffCoordinator()
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
+        return PromptContextPreAssemblyRequest(
+            cfg: cfg,
+            selection: selection,
+            store: workspaceFileContextStore,
+            lookupContext: lookupContext,
+            filePathDisplay: filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !codeMapsGloballyDisabled,
+            selectedGitDiffFolderPolicy: .expandFolders,
+            selectedGitDiffLookupProfile: .uiAssisted,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            reviewGitContext: frozenReviewContext,
+            sourceTabID: sourceTabID,
+            finalReviewAuthorization: finalReviewAuthorization,
+            selectedGitDiffProvider: { request in
+                #if DEBUG
+                    if let automaticReviewGitDiffProviderOverrideForTesting {
+                        return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                    }
+                #endif
+                return await coordinator.resolve(request)
+            },
+            completeGitDiffProvider: { [gitVM] in
+                await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+            }
+        )
+    }
+
+    func preAssembleStrictPromptContext(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        sourceTabID: UUID,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization
+    ) async throws -> PromptContextPreAssemblyResult {
+        let effectiveBase: String? = switch reviewGitContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
+        let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator(
+            dependencies: .live(store: workspaceFileContextStore)
+        )
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
+        return try await PromptContextPreAssemblyService.resolveStrict(
             PromptContextPreAssemblyRequest(
                 cfg: cfg,
                 selection: selection,
@@ -5478,15 +5704,68 @@ extension PromptViewModel {
                 showCodeMapMarkers: !codeMapsGloballyDisabled,
                 selectedGitDiffFolderPolicy: .expandFolders,
                 selectedGitDiffLookupProfile: .uiAssisted,
-                includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
-                selectedGitDiffProvider: { [gitVM] selectedPaths in
-                    await gitVM.getDiffForAbsolutePaths(selectedPaths, vs: effectiveBase, forceRefreshStatus: true)
+                reviewGitContext: reviewGitContext,
+                sourceTabID: sourceTabID,
+                finalReviewAuthorization: finalReviewAuthorization,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
                 },
                 completeGitDiffProvider: { [gitVM] in
                     await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
                 }
             )
         )
+    }
+
+    func freezePromptGitReviewContext(
+        workspaceID: UUID? = nil,
+        tabID: UUID? = nil,
+        sessionID: UUID? = nil,
+        bindings: [AgentSessionWorktreeBinding] = [],
+        base: String? = nil
+    ) async -> FrozenPromptGitReviewContext {
+        let effectiveBase = base ?? gitViewModel.selectedDiffBranch
+        guard let manager = workspaceManager else {
+            return .automaticOnly(base: effectiveBase, bindings: bindings)
+        }
+        guard let workspace = Self.workspaceForFrozenPromptGitReviewContext(
+            requestedWorkspaceID: workspaceID,
+            workspaces: manager.workspaces,
+            activeWorkspace: manager.activeWorkspace
+        ),
+            let creatorTabID = tabID ?? activeComposeTabID
+        else {
+            return .automaticOnly(
+                base: effectiveBase,
+                bindings: bindings
+            )
+        }
+        return await FrozenPromptGitReviewContext.make(
+            workspaceID: workspace.id,
+            workspaceDirectoryPath: manager.workspaceDirectory(for: workspace).path,
+            workspaceRootPaths: workspace.repoPaths,
+            tabID: creatorTabID,
+            sessionID: sessionID,
+            bindings: bindings,
+            base: effectiveBase,
+            store: workspaceFileContextStore
+        )
+    }
+
+    static func workspaceForFrozenPromptGitReviewContext(
+        requestedWorkspaceID: UUID?,
+        workspaces: [WorkspaceModel],
+        activeWorkspace: WorkspaceModel?
+    ) -> WorkspaceModel? {
+        if let requestedWorkspaceID {
+            return workspaces.first { $0.id == requestedWorkspaceID }
+        }
+        return activeWorkspace
     }
 
     /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.
@@ -5499,34 +5778,35 @@ extension PromptViewModel {
         let cfg = applyingGlobalCodeMapOverride(inputConfig)
         let promptText = promptTextOverride ?? promptText
         let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
-        let preAssembly = await preAssemblePromptContext(
-            cfg: cfg,
-            selection: effectiveSelection,
-            lookupContext: allLoadedWorkspaceLookupContext(),
-            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree
-        )
-
-        // 2.5) Meta prompts assembly.
         let combinedMeta = metaInstructions(for: cfg)
         let includeMetaBlock = !combinedMeta.isEmpty
-
-        // 3) Generate clipboard string via existing packaging service
-        return await PromptPackagingService.generateClipboardContent(
-            metaInstructions: combinedMeta,
-            userInstructions: cfg.includeUserPrompt ? promptText : "",
-            files: preAssembly.entries,
-            fileTreeContent: preAssembly.fileTreeContent,
-            gitDiff: preAssembly.gitDiff,
-            includeSavedPrompts: includeMetaBlock,
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
+        do {
+            return try await withPreassembledPromptContext(
+                cfg: cfg,
+                selection: effectiveSelection,
+                lookupContext: allLoadedWorkspaceLookupContext(),
+                includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree
+            ) { preAssembly in
+                await PromptPackagingService.generateClipboardContent(
+                    metaInstructions: combinedMeta,
+                    userInstructions: cfg.includeUserPrompt ? promptText : "",
+                    files: preAssembly.entries,
+                    fileTreeContent: preAssembly.fileTreeContent,
+                    gitDiff: preAssembly.gitDiff,
+                    includeSavedPrompts: includeMetaBlock,
+                    includeFiles: cfg.includeFiles,
+                    includeUserPrompt: cfg.includeUserPrompt,
+                    filePathDisplay: self.filePathDisplayOption,
+                    codemapPresentation: preAssembly.codemapPresentation,
+                    includeDatetimeInUserInstructions: self.includeDatetimeInUserInstructions,
+                    promptSectionsOrder: self.promptSectionsOrder,
+                    disabledPromptSections: self.disabledPromptSections,
+                    duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
+                )
+            }
+        } catch {
+            return ""
+        }
     }
 
     /// Estimates the token count for the current Copy context (what would be copied now)
@@ -5616,7 +5896,7 @@ extension PromptViewModel {
             selectionVersion: chatSelectionVersion,
             slicesVersion: chatSlicesVersion,
             autoCodemapVersion: chatAutoCodemapVersion,
-            fileAPIsVersion: chatFileAPIsVersion,
+            codemapAuthorityVersion: chatCodemapAuthorityVersion,
             fileSystemDeltaVersion: chatFileSystemDeltaVersion
         )
     }
@@ -5739,11 +6019,6 @@ extension PromptViewModel {
                 markSettingsDirty()
             }
             return
-        }
-
-        let cfg: PromptContextResolved = resolvedPromptContext(from: preset) ?? resolvePromptContext()
-        if cfg.codeMapUsage != .none {
-            Task { await fileManager.setCodeScanEnabled(true) }
         }
 
         // Preset-specific configs are resolved on demand; avoid mutating manual defaults.

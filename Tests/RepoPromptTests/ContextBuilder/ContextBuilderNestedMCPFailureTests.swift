@@ -1,6 +1,6 @@
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -27,6 +27,7 @@ import XCTest
                 )
                 let recorder = NestedContextBuilderExecutionTraceRecorder()
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                defer { MCPToolExecutionTracer.setTestSink(nil) }
 
                 do {
                     let outerEndpoint = try fixture.endpointA()
@@ -72,7 +73,7 @@ import XCTest
             }
         }
 
-        func testNestedReadHandlerNeverReturnsAndWatchdogDisconnectSettlesOuterContextBuilder() async throws {
+        func testNestedReadHandlerNeverReturnsAndDetachedTimeoutSettlesOuterContextBuilder() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let state = NestedContextBuilderFailureState()
                 let gate = MCPExecutionIgnoringCancellationGate()
@@ -94,15 +95,17 @@ import XCTest
                 let manager = fixture.networkManager
                 let recorder = NestedContextBuilderExecutionTraceRecorder()
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                defer { MCPToolExecutionTracer.setTestSink(nil) }
                 await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
                 await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
                     await gate.enterAndWait()
                     return .null
                 }
+                var responseTask: Task<PersistentMCPTestRPCResponse, Error>?
 
                 do {
                     let outerEndpoint = try fixture.endpointA()
-                    let responseTask = Task {
+                    responseTask = Task {
                         try await outerEndpoint.callTool(
                             name: MCPWindowToolName.contextBuilder,
                             arguments: [
@@ -119,7 +122,8 @@ import XCTest
                     try await clock.waitForSleeperCount(1)
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
 
-                    let response = try await responseTask.value
+                    let activeResponseTask = try XCTUnwrap(responseTask)
+                    let response = try await activeResponseTask.value
                     let events = recorder.snapshot()
                     let nestedEvents = events.filter {
                         $0.connectionID == nestedConnectionID &&
@@ -127,11 +131,12 @@ import XCTest
                     }
                     XCTAssertFalse(nestedEvents.contains { $0.phase == .handlerCompleted })
                     XCTAssertTrue(nestedEvents.contains { $0.phase == .cleanupGraceExpired })
-                    XCTAssertTrue(nestedEvents.contains { $0.phase == .connectionForceDisconnectRequested })
+                    XCTAssertTrue(nestedEvents.contains { $0.phase == .detachedForSettlement })
+                    XCTAssertFalse(nestedEvents.contains { $0.phase == .connectionForceDisconnectRequested })
                     let nestedConnectionIsTerminal = await manager.debugIsExecutionWatchdogTerminal(
                         connectionID: nestedConnectionID
                     )
-                    XCTAssertTrue(nestedConnectionIsTerminal)
+                    XCTAssertFalse(nestedConnectionIsTerminal)
                     let providerFailureCount = await state.providerFailureCount()
                     XCTAssertEqual(providerFailureCount, 1)
                     XCTAssertTrue(try Self.toolResultText(response).contains("failed:"))
@@ -146,6 +151,19 @@ import XCTest
                     XCTAssertNil(outerContracts.first?.executionDeadlineSeconds)
 
                     await gate.release()
+                    await manager.debugAwaitCodeStructureSettlementDrain(
+                        windowID: fixture.contextA.window.windowID
+                    )
+                    let settledNestedEvents = recorder.snapshot().filter {
+                        $0.connectionID == nestedConnectionID &&
+                            $0.toolName == MCPWindowToolName.readFile
+                    }
+                    XCTAssertTrue(settledNestedEvents.contains { $0.phase == .detachedSettled })
+                    XCTAssertFalse(settledNestedEvents.contains { $0.phase == .handlerCompleted })
+                    let settlementSnapshot = await manager.debugCodeStructureSettlementSnapshot(
+                        windowID: fixture.contextA.window.windowID
+                    )
+                    XCTAssertEqual(settlementSnapshot, .init(activeCount: 0, detachedCount: 0))
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
@@ -153,6 +171,13 @@ import XCTest
                     try await fixture.assertCleanedUp()
                 } catch {
                     await gate.release()
+                    responseTask?.cancel()
+                    if let responseTask {
+                        _ = try? await responseTask.value
+                    }
+                    await manager.debugAwaitCodeStructureSettlementDrain(
+                        windowID: fixture.contextA.window.windowID
+                    )
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
@@ -170,6 +195,10 @@ import XCTest
                 to: workspace,
                 saveState: false,
                 reason: "ContextBuilderNestedMCPFailureTests"
+            )
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: context.window.apiSettingsViewModel,
+                workspaceID: context.workspaceID
             )
         }
 
@@ -317,28 +346,79 @@ import XCTest
         private static let synchronizationTimeout: Duration = .seconds(10)
 
         private var nestedConnectionID: UUID?
+        private var nestedConnectionWaiters: [UUID: CheckedContinuation<UUID, Error>] = [:]
+        private var failedNestedConnectionWaiters: [UUID: Error] = [:]
+        private var grantedNestedConnectionWaiterIDs: Set<UUID> = []
         private var failureCount = 0
 
         func recordNestedConnectionID(_ id: UUID) {
             nestedConnectionID = id
+            failedNestedConnectionWaiters.removeAll()
+            let waiters = nestedConnectionWaiters
+            nestedConnectionWaiters.removeAll()
+            grantedNestedConnectionWaiterIDs.formUnion(waiters.keys)
+            waiters.values.forEach { $0.resume(returning: id) }
         }
 
         func requireNestedConnectionID(
             timeout: Duration = synchronizationTimeout
         ) async throws -> UUID {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            while nestedConnectionID == nil {
-                try Task.checkCancellation()
-                guard clock.now < deadline else {
-                    throw NestedContextBuilderFailureError.nestedConnectionDidNotRegister
+            if let nestedConnectionID { return nestedConnectionID }
+
+            let waiterID = UUID()
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(for: timeout)
+                    await self.failNestedConnectionWaiter(
+                        id: waiterID,
+                        error: NestedContextBuilderFailureError.nestedConnectionDidNotRegister
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
                 }
-                try await Task.sleep(for: .milliseconds(10))
             }
-            guard let nestedConnectionID else {
-                throw NestedContextBuilderFailureError.nestedConnectionDidNotRegister
+
+            do {
+                let id = try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        registerNestedConnectionWaiter(id: waiterID, continuation: continuation)
+                    }
+                } onCancel: {
+                    Task {
+                        await self.failNestedConnectionWaiter(id: waiterID, error: CancellationError())
+                    }
+                }
+                grantedNestedConnectionWaiterIDs.remove(waiterID)
+                try Task.checkCancellation()
+                timeoutTask.cancel()
+                return id
+            } catch {
+                timeoutTask.cancel()
+                throw error
             }
-            return nestedConnectionID
+        }
+
+        private func registerNestedConnectionWaiter(
+            id: UUID,
+            continuation: CheckedContinuation<UUID, Error>
+        ) {
+            if let nestedConnectionID {
+                continuation.resume(returning: nestedConnectionID)
+            } else if let error = failedNestedConnectionWaiters.removeValue(forKey: id) {
+                continuation.resume(throwing: error)
+            } else {
+                nestedConnectionWaiters[id] = continuation
+            }
+        }
+
+        private func failNestedConnectionWaiter(id: UUID, error: Error) async {
+            if let continuation = nestedConnectionWaiters.removeValue(forKey: id) {
+                continuation.resume(throwing: error)
+            } else if nestedConnectionID == nil, !grantedNestedConnectionWaiterIDs.contains(id) {
+                failedNestedConnectionWaiters[id] = error
+            }
         }
 
         func recordProviderFailure() {

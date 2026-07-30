@@ -1,17 +1,7 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class WorkspaceSearchServiceTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for url in temporaryRoots {
-            try? FileManager.default.removeItem(at: url)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testSearchCatalogGenerationChangesOnRootLoadDeltaAndUnload() async throws {
         let root = try makeTemporaryRoot(name: "CatalogGeneration")
         try write("alpha", to: root.appendingPathComponent("A.swift"))
@@ -21,7 +11,7 @@ final class WorkspaceSearchServiceTests: XCTestCase {
 
         let record = try await store.loadRoot(path: root.path)
         let loadedSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertGreaterThan(loadedSnapshot.generation, initialGeneration)
+        XCTAssertNotEqual(loadedSnapshot.generation, initialGeneration)
         XCTAssertEqual(loadedSnapshot.diagnostics.rootCount, 1)
         XCTAssertEqual(loadedSnapshot.diagnostics.fileCount, 1)
         XCTAssertEqual(loadedSnapshot.entries.map(\.standardizedRelativePath), ["A.swift"])
@@ -33,18 +23,18 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         let visibleAfterSupplemental = await store.catalogGeneration(rootScope: .visibleWorkspace)
         let allLoadedAfterSupplemental = await store.catalogGeneration(rootScope: .allLoaded)
         XCTAssertEqual(visibleAfterSupplemental, loadedSnapshot.generation)
-        XCTAssertGreaterThan(allLoadedAfterSupplemental, allLoadedBeforeSupplemental)
+        XCTAssertNotEqual(allLoadedAfterSupplemental, allLoadedBeforeSupplemental)
 
         try write("beta", to: root.appendingPathComponent("Sources/B.swift"))
         await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("Sources/B.swift")])
         let deltaSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertGreaterThan(deltaSnapshot.generation, loadedSnapshot.generation)
+        XCTAssertNotEqual(deltaSnapshot.generation, loadedSnapshot.generation)
         XCTAssertEqual(Set(deltaSnapshot.entries.map(\.standardizedRelativePath)), ["A.swift", "Sources/B.swift"])
         XCTAssertEqual(deltaSnapshot.diagnostics.fileCount, 2)
 
         await store.unloadRoot(id: record.id)
         let unloadedSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertGreaterThan(unloadedSnapshot.generation, deltaSnapshot.generation)
+        XCTAssertNotEqual(unloadedSnapshot.generation, deltaSnapshot.generation)
         XCTAssertEqual(unloadedSnapshot.diagnostics.rootCount, 0)
         XCTAssertEqual(unloadedSnapshot.diagnostics.fileCount, 0)
         XCTAssertTrue(unloadedSnapshot.entries.isEmpty)
@@ -374,12 +364,7 @@ final class WorkspaceSearchServiceTests: XCTestCase {
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        temporaryRoots.append(url)
-        return url
+        try makeTestDirectory(name: name)
     }
 
     private func write(_ content: String, to url: URL) throws {

@@ -97,6 +97,14 @@ struct AppCommand {
     }
 }
 
+typealias AgentSessionHandoffInstructionsProvider = @MainActor () -> String
+
+enum AgentChatHandoffCopyOutcome: Equatable {
+    case copied
+    case staleTarget
+    case instructionsTooLong(count: Int, maximum: Int)
+}
+
 /// Holds all of the per-window managers/services.
 /// Each new window in the app gets a fresh instance of WindowState.
 @MainActor
@@ -167,12 +175,14 @@ class WindowState: ObservableObject {
 
     // MARK: - Agent Mode Titlebar Accessory
 
-    /// Titlebar accessory controller for Agent mode ("New Session" button near traffic lights)
+    /// Native titlebar edge accessory controller for the Agent mode New Session button
     private weak var agentTitlebarAccessory: AgentModeTitlebarAccessoryViewController?
     /// Whether Agent mode has requested the titlebar accessory be visible
     private var wantsAgentTitlebarAccessory: Bool = false
     /// Action to call when the "New Session" button is tapped
     private var agentNewSessionAction: (() -> Void)?
+    /// Narrow titlebar state observed only by the principal toolbar title cluster.
+    let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
     /// The sticky instance number assigned for this window's current workspace (monotonically increasing per workspace).
     /// Nil when no workspace is active yet.
@@ -300,6 +310,7 @@ class WindowState: ObservableObject {
     }
 
     private var pendingRestoreEntry: WindowSessionEntry?
+    private var pendingRestoreCompletion: (() -> Void)?
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
 
@@ -333,12 +344,22 @@ class WindowState: ObservableObject {
             )
         }
 
+        convenience init(workspaceFileContextStore: WorkspaceFileContextStore) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                workspaceFileContextStore: workspaceFileContextStore
+            )
+        }
+
     #endif
 
     private init(
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
-        codexModelPollingService: CodexModelPollingService
+        codexModelPollingService: CodexModelPollingService,
+        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil
     ) {
         // Assign a unique window ID
         WindowState.windowCounter += 1
@@ -358,6 +379,7 @@ class WindowState: ObservableObject {
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
+            workspaceFileContextStore: injectedWorkspaceFileContextStore,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
             codexModelPollingService: codexModelPollingService
         )
@@ -436,6 +458,19 @@ class WindowState: ObservableObject {
                 requestWindowTitleUpdate(reason: .agentSessionNameChanged)
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+                      notifiedWindowID == windowID,
+                      let tabID = notification.userInfo?["tabID"] as? UUID,
+                      tabID == promptManager.activeComposeTabID
+                else { return }
+                refreshAgentChatTitleCluster()
+            }
+            .store(in: &cancellables)
     }
 
     private func setupMCPAutoStart() {
@@ -501,9 +536,15 @@ class WindowState: ObservableObject {
     private func configureWindowChrome(for window: NSWindow) {
         // Keep titlebar visually continuous with content (no horizontal separator).
         window.toolbar?.showsBaselineSeparator = false
+        if #unavailable(macOS 15.0) {
+            window.titleVisibility = .hidden
+        }
         // SwiftUI can recreate toolbar chrome during toolbar updates; re-apply on next runloop.
         DispatchQueue.main.async { [weak window] in
             window?.toolbar?.showsBaselineSeparator = false
+            if #unavailable(macOS 15.0) {
+                window?.titleVisibility = .hidden
+            }
         }
     }
 
@@ -616,6 +657,7 @@ class WindowState: ObservableObject {
         if displayedWindowTitle != title {
             displayedWindowTitle = title
         }
+        refreshAgentChatTitleCluster()
         guard let window = nsWindow else { return }
         if window.title == title, lastAppliedWindowTitle == title {
             return
@@ -723,7 +765,244 @@ class WindowState: ObservableObject {
         agentNewSessionAction = nil
     }
 
-    /// Shows or hides the Agent mode titlebar accessory ("New Session" button near traffic lights).
+    private func currentAgentTitlebarChatOptionsTarget() -> AgentChatOptionsMenuTarget? {
+        guard wantsAgentTitlebarAccessory,
+              let workspace = workspaceManager.activeWorkspace,
+              let tabID = promptManager.activeComposeTabID,
+              agentModeViewModel.currentTabID == tabID,
+              let tab = workspace.composeTabs.first(where: { $0.id == tabID }),
+              let agentSessionID = agentModeViewModel.explicitActiveSessionID(for: tabID)
+        else {
+            return nil
+        }
+        return AgentChatOptionsMenuTarget(
+            windowID: windowID,
+            workspaceID: workspace.id,
+            tabID: tabID,
+            agentSessionID: agentSessionID,
+            tabName: tab.name
+        )
+    }
+
+    func agentChatTitleClusterMenuTargetIsValid(_ target: AgentChatOptionsMenuTarget) -> Bool {
+        guard target.windowID == windowID,
+              let workspace = workspaceManager.activeWorkspace,
+              workspace.id == target.workspaceID,
+              workspace.composeTabs.contains(where: { $0.id == target.tabID })
+        else {
+            return false
+        }
+        guard let tab = workspace.composeTabs.first(where: { $0.id == target.tabID }),
+              tab.name == target.tabName
+        else {
+            return false
+        }
+        return agentModeViewModel.explicitActiveSessionID(for: target.tabID) == target.agentSessionID
+    }
+
+    func agentChatTitleClusterMenuSnapshot() -> AgentChatOptionsMenuSnapshot? {
+        guard let target = currentAgentTitlebarChatOptionsTarget(),
+              agentChatTitleClusterMenuTargetIsValid(target),
+              let tab = workspaceManager.activeWorkspace?.composeTabs.first(where: { $0.id == target.tabID })
+        else {
+            refreshAgentChatTitleCluster()
+            return nil
+        }
+        return AgentChatOptionsMenuSnapshot(
+            target: target,
+            isPinned: tab.isPinned
+        )
+    }
+
+    func agentChatTitleClusterMenuActions(
+        handoffInstructionsProvider: @escaping AgentSessionHandoffInstructionsProvider = {
+            GlobalSettingsStore.shared.agentSessionHandoffInstructions()
+        },
+        handoffOversizedFeedback: ((Int, Int) -> Void)? = nil,
+        copyToClipboard: @escaping (String) -> Void = { value in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(value, forType: .string)
+        }
+    ) -> AgentChatOptionsMenuActions {
+        AgentChatOptionsMenuActions(
+            togglePin: { [weak self] target in
+                self?.toggleAgentChatPinFromTitlebar(target: target)
+            },
+            rename: { [weak self] target in
+                self?.renameAgentChatFromTitlebar(target: target)
+            },
+            stash: { [weak self] target in
+                self?.stashAgentChatFromTitlebar(target: target)
+            },
+            copyHandoffPrompt: { [weak self] target in
+                self?.copyAgentChatHandoffPromptFromTitlebar(
+                    target: target,
+                    handoffInstructionsProvider: handoffInstructionsProvider,
+                    handoffOversizedFeedback: handoffOversizedFeedback,
+                    copyToClipboard: copyToClipboard
+                )
+            },
+            delete: { [weak self] target in
+                self?.confirmDeleteAgentChatFromTitlebar(target: target)
+            }
+        )
+    }
+
+    private func refreshAgentChatTitleCluster() {
+        agentChatTitleCluster.update(
+            title: displayedWindowTitle,
+            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
+        )
+    }
+
+    private func toggleAgentChatPinFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        promptManager.toggleComposeTabPinned(target.tabID)
+    }
+
+    private func copyAgentChatHandoffPromptFromTitlebar(
+        target: AgentChatOptionsMenuTarget,
+        handoffInstructionsProvider: AgentSessionHandoffInstructionsProvider,
+        handoffOversizedFeedback: ((Int, Int) -> Void)?,
+        copyToClipboard: (String) -> Void
+    ) {
+        guard !isClosing, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let instructions = handoffInstructionsProvider()
+        let outcome = performAgentChatHandoffCopy(
+            target: target,
+            instructions: instructions,
+            copyToClipboard: copyToClipboard
+        )
+        guard case let .instructionsTooLong(count, maximum) = outcome else { return }
+        if let handoffOversizedFeedback {
+            handoffOversizedFeedback(count, maximum)
+        } else {
+            presentAgentChatHandoffInstructionsTooLongFeedback(count: count, maximum: maximum)
+        }
+    }
+
+    @discardableResult
+    private func performAgentChatHandoffCopy(
+        target: AgentChatOptionsMenuTarget,
+        instructions: String,
+        copyToClipboard: (String) -> Void
+    ) -> AgentChatHandoffCopyOutcome {
+        guard !isClosing, agentChatTitleClusterMenuTargetIsValid(target) else {
+            return .staleTarget
+        }
+        switch AgentSessionHandoffInstructionsPolicy.validation(of: instructions) {
+        case .valid:
+            break
+        case let .tooLong(count, maximum):
+            return .instructionsTooLong(count: count, maximum: maximum)
+        }
+
+        let prompt = AgentSessionHandoffPrompt.render(
+            target: target,
+            cliCommandName: MCPFilesystemConstants.identity.pathCLICommandName,
+            instructions: instructions
+        )
+        copyToClipboard(prompt)
+        return .copied
+    }
+
+    private func presentAgentChatHandoffInstructionsTooLongFeedback(count: Int, maximum: Int) {
+        guard !isClosing, let window = nsWindow, window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Handoff Instructions Too Long"
+        alert.informativeText = "The saved default contains \(count) characters; the maximum is \(maximum). Shorten or clear it in Settings → Agent Mode → Handoff Instructions, then try again."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
+    }
+
+    private func stashAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        Task { @MainActor [weak self] in
+            guard let self, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+            await promptManager.stashTab(
+                target.tabID,
+                isMutationContextCurrent: { [weak self] in
+                    self?.agentChatTitleClusterMenuTargetIsValid(target) == true
+                }
+            )
+        }
+    }
+
+    private func renameAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let currentName = target.tabName
+        let alert = NSAlert()
+        alert.messageText = "Rename chat"
+        alert.informativeText = "Choose a new name for this chat."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(string: currentName)
+        input.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        input.selectText(nil)
+        alert.accessoryView = input
+
+        let applyRename: (NSApplication.ModalResponse) -> Void = { [weak self, weak input] response in
+            guard response == .alertFirstButtonReturn,
+                  let self,
+                  let input,
+                  agentChatTitleClusterMenuTargetIsValid(target)
+            else { return }
+            let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !newName.isEmpty, newName != currentName else { return }
+            agentModeViewModel.renameSession(tabID: target.tabID, to: newName)
+        }
+
+        if let window = nsWindow {
+            alert.beginSheetModal(for: window, completionHandler: applyRename)
+        } else {
+            applyRename(alert.runModal())
+        }
+    }
+
+    private func confirmDeleteAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete chat?"
+        alert.informativeText = "This permanently deletes “\(target.tabName)”."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+
+        let applyDelete: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn,
+                  let self,
+                  agentChatTitleClusterMenuTargetIsValid(target)
+            else { return }
+            Task { @MainActor [weak self] in
+                guard let self, agentChatTitleClusterMenuTargetIsValid(target) else { return }
+                #if DEBUG
+                    agentModeViewModel.debugBeginSidebarDeleteRequest(
+                        tabID: target.tabID,
+                        source: "WindowState.titlebarDelete",
+                        reason: "titlebar_delete_confirmation"
+                    )
+                #endif
+                await promptManager.closeComposeTab(
+                    target.tabID,
+                    isMutationContextCurrent: { [weak self] in
+                        self?.agentChatTitleClusterMenuTargetIsValid(target) == true
+                    }
+                )
+            }
+        }
+
+        if let window = nsWindow {
+            alert.beginSheetModal(for: window, completionHandler: applyDelete)
+        } else {
+            applyDelete(alert.runModal())
+        }
+    }
+
+    /// Shows or hides the Agent mode New Session titlebar edge accessory.
     /// - Parameters:
     ///   - visible: Whether to show the accessory
     ///   - onNewSession: Action to call when button is tapped (required when visible is true)
@@ -732,11 +1011,13 @@ class WindowState: ObservableObject {
             guard !shouldSuppressObservationSideEffects else { return }
             wantsAgentTitlebarAccessory = true
             agentNewSessionAction = onNewSession
+            refreshAgentChatTitleCluster()
             applyAgentTitlebarAccessoryIfPossible()
         } else {
             wantsAgentTitlebarAccessory = false
             agentNewSessionAction = nil
             removeAgentTitlebarAccessory()
+            refreshAgentChatTitleCluster()
         }
     }
 
@@ -761,6 +1042,21 @@ class WindowState: ObservableObject {
             agentTitlebarAccessory = accessory
         }
         configureWindowChrome(for: window)
+        collapseRedundantSingleWindowTabBarIfNeeded(for: window)
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window else { return }
+            collapseRedundantSingleWindowTabBarIfNeeded(for: window)
+        }
+    }
+
+    private func collapseRedundantSingleWindowTabBarIfNeeded(for window: NSWindow) {
+        guard let tabbedWindows = window.tabbedWindows,
+              tabbedWindows.count == 1,
+              window.tabGroup?.isTabBarVisible == true
+        else {
+            return
+        }
+        window.toggleTabBar(nil)
     }
 
     /// Removes the titlebar accessory from the window
@@ -830,9 +1126,18 @@ class WindowState: ObservableObject {
         }
     }
 
-    func applyWindowRestoreEntry(_ entry: WindowSessionEntry) {
-        guard !entry.isEphemeral else { return }
+    /// Applies a restore entry to this window. `completion` is invoked exactly once,
+    /// after the restore attempt finished (successfully or not) or when the entry is
+    /// skipped, so callers can release restore-in-progress guards.
+    func applyWindowRestoreEntry(_ entry: WindowSessionEntry, completion: (() -> Void)? = nil) {
+        guard !entry.isEphemeral else {
+            completion?()
+            return
+        }
+        // Never drop a previously pending completion if the entry is replaced.
+        pendingRestoreCompletion?()
         pendingRestoreEntry = entry
+        pendingRestoreCompletion = completion
         applyPendingRestoreEntryIfPossible()
     }
 
@@ -840,9 +1145,12 @@ class WindowState: ObservableObject {
         guard workspaceManager.isInitialized else { return }
         guard let entry = pendingRestoreEntry else { return }
         pendingRestoreEntry = nil
+        let completion = pendingRestoreCompletion
+        pendingRestoreCompletion = nil
 
         Task {
             await restoreWorkspace(from: entry)
+            completion?()
         }
     }
 
@@ -1022,12 +1330,12 @@ class WindowState: ObservableObject {
 
     func handleIncomingURL(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              comps.scheme == "repoprompt"
+              AppDeepLinkURLScheme.isSupported(comps.scheme)
         else {
             return
         }
 
-        // Check for prompt:// URLs first
+        // Check for prompt opener URLs first
         if comps.host?.lowercased() == "prompt" {
             let title = comps.queryItems?.first(where: { $0.name == "title" })?.value?
                 .removingPercentEncoding?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Untitled Prompt"
@@ -1066,7 +1374,7 @@ class WindowState: ObservableObject {
             return // ← we handled the prompt command
         }
 
-        // Require host == "open" to match repoprompt://open/~/MyProject
+        // Require host == "open" to match canonical repoprompt-ce://open/~/MyProject links
         guard let host = comps.host?.lowercased(), host == "open" else {
             return
         }
@@ -1322,15 +1630,13 @@ class WindowState: ObservableObject {
             return
         }
 
+        await contextBuilderAgentViewModel.cancelAllActiveRuns()
         await workspaceManager.cancelActiveSessions()
         await agentModeViewModel.prepareForWindowClose()
         WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
 
         // Stop the local MCP server
         await mcpServer.stopServer()
-
-        // Release per-window codemap work before the closed window can contend with later windows.
-        await workspaceFilesViewModel.cancelAllScans()
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()

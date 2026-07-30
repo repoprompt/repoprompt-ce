@@ -636,10 +636,13 @@ class OracleViewModel: ObservableObject {
                 && session.workspaceID == workspaceID
                 && session.composeTabID == tabID
         }
-        func registeredMatch(for sessionID: UUID) -> ChatSession? {
-            sessions.first(where: { $0.id == sessionID }).flatMap { session in
-                matchesRequestedTab(session) ? session : nil
+        func stableScopedSession(_ loaded: ChatSession) -> ChatSession? {
+            guard matchesRequestedTab(loaded), workspaceManager.activeWorkspaceID == workspaceID else { return nil }
+            if let registered = sessions.first(where: { $0.id == loaded.id }) {
+                return matchesRequestedTab(registered) ? registered : nil
             }
+            sessions.append(loaded)
+            return loaded
         }
 
         let initialIdentityMatches = sessions.filter(matchesIdentity)
@@ -650,7 +653,7 @@ class OracleViewModel: ObservableObject {
                   let loaded = await ensureSessionLoadedForBackground(inMemory),
                   matchesRequestedTab(loaded)
             else { return nil }
-            return registeredMatch(for: loaded.id)
+            return stableScopedSession(loaded)
         }
         if targetUUID != nil, !initialIdentityMatches.isEmpty { return nil }
 
@@ -689,7 +692,7 @@ class OracleViewModel: ObservableObject {
                   let loaded = await ensureSessionLoadedForBackground(inMemory),
                   matchesRequestedTab(loaded)
             else { return nil }
-            return registeredMatch(for: loaded.id)
+            return stableScopedSession(loaded)
         }
         if targetUUID != nil, !refreshedIdentityMatches.isEmpty { return nil }
         guard let persisted else { return nil }
@@ -698,7 +701,7 @@ class OracleViewModel: ObservableObject {
         guard let loaded = await ensureSessionLoadedForBackground(persisted), matchesRequestedTab(loaded) else {
             return nil
         }
-        return registeredMatch(for: loaded.id)
+        return stableScopedSession(loaded)
     }
 
     var isAnySessionStreaming: Bool {
@@ -856,6 +859,13 @@ class OracleViewModel: ObservableObject {
         (pinnedSessionRefCounts[sessionID] ?? 0) > 0
     }
 
+    #if DEBUG
+        @MainActor
+        func isSessionPinnedForTesting(_ sessionID: UUID) -> Bool {
+            isSessionPinned(sessionID)
+        }
+    #endif
+
     nonisolated static func shouldUseLivePromptStateForAutosave(
         sessionID: UUID,
         currentSessionID: UUID?,
@@ -965,6 +975,33 @@ class OracleViewModel: ObservableObject {
     // Dependencies
     let aiQueriesService: AIQueriesService
     var promptViewModel: PromptViewModel
+
+    #if DEBUG
+        typealias OraclePostPackagingTransportOverride = @MainActor @Sendable (
+            _ message: AIMessage,
+            _ model: AIModel
+        ) async throws -> (
+            id: ChatStreamID,
+            stream: AsyncThrowingStream<ChatStreamOutput, Error>
+        )
+
+        var oracleReviewPackagingTraceObserverForTesting:
+            OracleReviewPackagingTraceContext.Observer?
+        private var oraclePostPackagingTransportOverrideForTesting:
+            OraclePostPackagingTransportOverride?
+
+        func setOracleReviewPackagingTraceObserverForTesting(
+            _ observer: OracleReviewPackagingTraceContext.Observer?
+        ) {
+            oracleReviewPackagingTraceObserverForTesting = observer
+        }
+
+        func setOraclePostPackagingTransportOverrideForTesting(
+            _ override: OraclePostPackagingTransportOverride?
+        ) {
+            oraclePostPackagingTransportOverrideForTesting = override
+        }
+    #endif
 
     /// Track the active retry task so it can be properly cancelled
     private var activeRetryTask: Task<Void, Error>?
@@ -1598,7 +1635,6 @@ class OracleViewModel: ObservableObject {
         var updatedTab = newTab
         updatedTab.selection = StoredSelection(
             selectedPaths: session.selectedFilePaths,
-            autoCodemapPaths: [],
             slices: [:],
             codemapAutoEnabled: true
         )
@@ -2747,6 +2783,7 @@ class OracleViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async {
@@ -2842,6 +2879,7 @@ class OracleViewModel: ObservableObject {
         }
 
         Task {
+            var providerCleanupHandle: ProviderConversationCleanupHandle?
             do {
                 let shouldContinueStreaming: () async -> Bool = {
                     await MainActor.run {
@@ -2883,16 +2921,28 @@ class OracleViewModel: ObservableObject {
                         gitInclusionOverride: gitInclusionOverride,
                         gitBaseOverride: gitBaseOverride,
                         selectionOverride: selectionOverride,
-                        lookupContextOverride: lookupContextOverride
+                        lookupContextOverride: lookupContextOverride,
+                        reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
                 }
-                let (streamID, stream) = try await aiQueriesService.sendPrompt(
-                    aiMessage,
-                    model: model
-                )
+                #if DEBUG
+                    OracleReviewPackagingDiagnostics.recordSubmission(aiMessage)
+                    let (streamID, stream) = if let transportOverride =
+                        oraclePostPackagingTransportOverrideForTesting
+                    {
+                        try await transportOverride(aiMessage, model)
+                    } else {
+                        try await aiQueriesService.sendPrompt(aiMessage, model: model)
+                    }
+                #else
+                    let (streamID, stream) = try await aiQueriesService.sendPrompt(
+                        aiMessage,
+                        model: model
+                    )
+                #endif
 
                 guard await shouldContinueStreaming() else {
                     await aiQueriesService.cancelStream(id: streamID)
@@ -2913,6 +2963,9 @@ class OracleViewModel: ObservableObject {
                     let reasoningDelta = output.reasoning
                     let tokenInfo = output.tokens
                     let isStreamFinalized = output.isFinal
+                    if let cleanupHandle = output.cleanupHandle {
+                        providerCleanupHandle = cleanupHandle
+                    }
 
                     partialBuffer += delta
                     reasoningBuffer += reasoningDelta ?? ""
@@ -2972,6 +3025,7 @@ class OracleViewModel: ObservableObject {
 
                         Task {
                             await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer)
+                            await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                         }
                     }
                 }
@@ -2980,17 +3034,35 @@ class OracleViewModel: ObservableObject {
                     await MainActor.run {
                         self.cancelStreamInactivityWatchdog(for: aiResponseId)
                     }
-                    Task { await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer) }
+                    Task {
+                        await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer)
+                        await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
+                    }
                 }
             } catch {
+                #if DEBUG
+                    OracleReviewPackagingDiagnostics.recordFailure(error)
+                #endif
                 await MainActor.run {
                     self.clearSessionStreaming(targetSessionID)
                 }
                 Task {
                     await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID)
+                    await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                 }
             }
         }
+    }
+
+    func cleanupOracleProviderConversation(
+        _ handle: ProviderConversationCleanupHandle?,
+        model: AIModel
+    ) async {
+        guard let handle else { return }
+        let outcome = await aiQueriesService.cleanupProviderConversation(handle: handle, model: model, action: .delete)
+        #if DEBUG
+            print("[OracleViewModel] provider conversation cleanup action=delete provider=\(handle.provider) status=\(outcome.status) message=\(outcome.message ?? "")")
+        #endif
     }
 
     // MARK: - Finalise an AI response

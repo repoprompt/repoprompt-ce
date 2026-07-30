@@ -1,9 +1,36 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class WorkspaceSwitchRecoveryTests: XCTestCase {
+    private var originalMCPAutoStart: Bool?
+    private var originalGlobalCustomStorageURL: Any?
+    private var hadOriginalGlobalCustomStorageURL = false
+
+    override func setUp() {
+        super.setUp()
+        originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        originalGlobalCustomStorageURL = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
+        hadOriginalGlobalCustomStorageURL =
+            UserDefaults.standard.object(forKey: "GlobalCustomStorageURL") != nil
+    }
+
+    override func tearDown() {
+        if let originalMCPAutoStart {
+            GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+        }
+        if hadOriginalGlobalCustomStorageURL {
+            UserDefaults.standard.set(originalGlobalCustomStorageURL, forKey: "GlobalCustomStorageURL")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+        }
+        originalMCPAutoStart = nil
+        originalGlobalCustomStorageURL = nil
+        hadOriginalGlobalCustomStorageURL = false
+        super.tearDown()
+    }
+
     func testConcurrentStaleRequestReportsActiveSwitchAndForcedUnloadEventuallyClearsGuard() async throws {
         let root = try makeTemporaryDirectory(named: "ForcedUnloadRecovery")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -298,6 +325,43 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(result, .switched)
         XCTAssertEqual(manager.activeWorkspaceID, target.id)
         XCTAssertFalse(manager.isSwitchingWorkspace)
+    }
+
+    func testListenerRemovalTokensDropRegisteredCallbacks() async {
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        let initialBeforeSaveCount = manager.test_beforeSaveListenerCount()
+
+        let workspaceSwitchToken = manager.addWorkspaceDidSwitchListener(label: "removal-token-test") { _ in
+            XCTFail("Removed workspace-switch listener should not be invoked")
+        }
+        let beforeSaveToken = manager.addBeforeSaveListener { _ in
+            XCTFail("Removed before-save listener should not be invoked")
+        }
+
+        XCTAssertEqual(manager.test_workspaceDidSwitchListenerCount(label: "removal-token-test"), 1)
+        XCTAssertEqual(manager.test_beforeSaveListenerCount(), initialBeforeSaveCount + 1)
+
+        manager.removeWorkspaceDidSwitchListener(workspaceSwitchToken)
+        manager.removeBeforeSaveListener(beforeSaveToken)
+
+        XCTAssertEqual(manager.test_workspaceDidSwitchListenerCount(label: "removal-token-test"), 0)
+        XCTAssertEqual(manager.test_beforeSaveListenerCount(), initialBeforeSaveCount)
+
+        let target = manager.createWorkspace(
+            name: "Removed Listener Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let result = await manager.requestWorkspaceSwitch(
+            to: target,
+            saveState: true,
+            reason: "listenerRemovalToken"
+        )
+
+        XCTAssertEqual(result, .switched)
+        XCTAssertEqual(manager.activeWorkspaceID, target.id)
     }
 
     func testCancellationAfterUnloadRetainsOwnershipUntilFallbackRecoveryCompletes() async throws {
@@ -715,7 +779,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try "VERSION=1\n".write(to: versionFile, atomically: true, encoding: .utf8)
-        try "struct MCPBootstrapLease {}\n".write(
+        try SwiftFixtureSource.emptyStruct("MCPBootstrapLease").write(
             to: bootstrapLease,
             atomically: true,
             encoding: .utf8
@@ -1256,11 +1320,11 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let selected = sources.appendingPathComponent("Selected.swift")
         let dependency = sources.appendingPathComponent("Dependency.swift")
         try "one\ntwo\nthree\n".write(to: selected, atomically: true, encoding: .utf8)
-        try "struct Dependency {}\n".write(to: dependency, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("Dependency").write(to: dependency, atomically: true, encoding: .utf8)
 
         let selection = StoredSelection(
             selectedPaths: [selected.path],
-            autoCodemapPaths: [dependency.path],
+
             codemapAutoEnabled: false
         )
         let tab = ComposeTabState(selection: selection)
@@ -1286,7 +1350,6 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     ) {
         let actual = composition.workspaceFilesViewModel.snapshotSelection()
         XCTAssertEqual(actual.selectedPaths, fixture.selection.selectedPaths, file: file, line: line)
-        XCTAssertEqual(actual.autoCodemapPaths, fixture.selection.autoCodemapPaths, file: file, line: line)
         XCTAssertEqual(actual.codemapAutoEnabled, fixture.selection.codemapAutoEnabled, file: file, line: line)
     }
 

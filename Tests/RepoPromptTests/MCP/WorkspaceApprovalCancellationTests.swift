@@ -1,5 +1,5 @@
 import AppKit
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 /// Regression coverage for cancellation-aware workspace approval waits: a cancelled

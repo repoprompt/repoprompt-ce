@@ -36,15 +36,33 @@ enum ToolResultDTOs {
 
         static func sessionBound(from projection: WorkspaceRootBindingProjection?) -> WorktreeScopeDTO? {
             guard let projection, !projection.isEmpty else { return nil }
-            let mappings = projection.boundRootsForMetadata.compactMap { boundRoot -> RootMappingDTO? in
+            let orderedMetadataBoundRoots = projection.boundRootsForMetadata
+            var seenLabelSourcePhysicalRootIDs = Set<UUID>()
+            let labelSourceBoundRoots = orderedMetadataBoundRoots.filter { boundRoot in
+                seenLabelSourcePhysicalRootIDs.insert(boundRoot.physicalRoot.id).inserted
+            }
+            let rootLabels = WorkspaceLogicalRootIdentity.labels(
+                for: labelSourceBoundRoots.map { boundRoot in
+                    WorkspaceLogicalRootIdentity.RootDescriptor(
+                        physicalRootID: boundRoot.physicalRoot.id,
+                        rootEpoch: WorkspaceCodemapRootEpoch(
+                            rootID: boundRoot.logicalRoot.id,
+                            rootLifetimeID: boundRoot.physicalRoot.id
+                        ),
+                        preferredName: boundRoot.logicalRoot.name
+                    )
+                }
+            )
+            let mappings = orderedMetadataBoundRoots.compactMap { boundRoot -> RootMappingDTO? in
                 let logicalPath = boundRoot.logicalRoot.standardizedFullPath
                 let effectivePath = boundRoot.physicalRoot.standardizedFullPath
                 guard logicalPath != effectivePath else { return nil }
+                let logicalRootLabel = rootLabels[boundRoot.physicalRoot.id] ?? boundRoot.logicalRoot.name
                 return RootMappingDTO(
-                    logicalRootName: boundRoot.logicalRoot.name,
-                    logicalRootPath: logicalPath,
+                    logicalRootName: logicalRootLabel,
+                    logicalRootPath: logicalRootLabel,
                     effectiveRootName: effectiveRootName(for: boundRoot),
-                    effectiveRootPath: effectivePath,
+                    effectiveRootPath: "session-bound",
                     worktreeID: boundRoot.binding.worktreeID,
                     worktreeName: boundRoot.binding.worktreeName,
                     branch: boundRoot.binding.branch,
@@ -265,6 +283,179 @@ enum ToolResultDTOs {
     }
 
     // MARK: - Code Structure
+
+    struct CodeStructureReplyDTO: Codable, Equatable {
+        enum Status: String, Codable {
+            case ok
+            case partial
+            case pending
+            case unavailable
+        }
+
+        enum SeedState: String, Codable {
+            case covered
+            case pending
+            case notIndexed = "not_indexed"
+            case excluded
+        }
+
+        enum IndexState: String, Codable {
+            case complete
+            case indexing
+        }
+
+        enum UnresolvedReason: String, Codable {
+            case notIndexedYet = "not_indexed_yet"
+            case missing
+            case tooCommon = "too_common"
+        }
+
+        struct FileDTO: Codable, Equatable {
+            let path: String
+            let role: String
+            let depth: Int
+            let reachedBy: [String]
+            let content: String
+            let tokens: Int
+
+            private enum CodingKeys: String, CodingKey {
+                case path, role, depth, content, tokens
+                case reachedBy = "reached_by"
+            }
+        }
+
+        struct IndexDTO: Codable, Equatable {
+            let state: IndexState
+            let indexed: UInt64
+            let total: UInt64
+        }
+
+        struct SeedDTO: Codable, Equatable {
+            let path: String
+            let state: SeedState
+        }
+
+        struct NodeDTO: Codable, Equatable {
+            let path: String
+            let depth: Int
+            let seed: Bool?
+            let reachedBy: [String]
+
+            private enum CodingKeys: String, CodingKey {
+                case path, depth, seed
+                case reachedBy = "reached_by"
+            }
+        }
+
+        struct EdgeDTO: Codable, Equatable {
+            let from: String
+            let to: String
+            let symbols: [String]
+            let ambiguous: Bool?
+        }
+
+        struct UnresolvedDTO: Codable, Equatable {
+            let from: String
+            let name: String
+            let reason: UnresolvedReason
+        }
+
+        struct TruncatedDTO: Codable, Equatable {
+            let reason: String
+            let droppedNodes: Int
+
+            private enum CodingKeys: String, CodingKey {
+                case reason
+                case droppedNodes = "dropped_nodes"
+            }
+        }
+
+        struct IssueDTO: Codable, Equatable {
+            let code: String
+            let phase: String
+            let path: String?
+            let retryable: Bool
+            let retryAfterMilliseconds: Int?
+            let attempted: Int?
+            let limit: Int?
+            let message: String
+
+            private enum CodingKeys: String, CodingKey {
+                case code, phase, path, retryable, attempted, limit, message
+                case retryAfterMilliseconds = "retry_after_ms"
+            }
+        }
+
+        struct RootDTO: Codable, Equatable {
+            let root: String
+            let status: Status
+            let index: IndexDTO
+            let updatesPending: Bool?
+            let seeds: [SeedDTO]
+            let nodes: [NodeDTO]
+            let edges: [EdgeDTO]
+            let unresolved: [UnresolvedDTO]
+            let truncated: TruncatedDTO?
+            let issues: [IssueDTO]
+
+            private enum CodingKeys: String, CodingKey {
+                case root, status, index, seeds, nodes, edges, unresolved, truncated, issues
+                case updatesPending = "updates_pending"
+            }
+        }
+
+        struct SummaryDTO: Codable, Equatable {
+            let seeds: Int
+            let nodes: Int
+            let edges: Int
+            let files: Int
+            let tokens: Int
+        }
+
+        struct RetryDTO: Codable, Equatable {
+            let retryable: Bool
+            let retryAfterMilliseconds: Int?
+
+            private enum CodingKeys: String, CodingKey {
+                case retryable
+                case retryAfterMilliseconds = "retry_after_ms"
+            }
+        }
+
+        let status: Status
+        let size: WorkspaceCodemapGraphOutputSize
+        let roots: [RootDTO]
+        let files: [FileDTO]
+        let summary: SummaryDTO
+        let issues: [IssueDTO]
+        let retry: RetryDTO?
+        let worktreeScope: WorktreeScopeDTO?
+
+        init(
+            status: Status,
+            size: WorkspaceCodemapGraphOutputSize,
+            roots: [RootDTO],
+            files: [FileDTO],
+            summary: SummaryDTO,
+            issues: [IssueDTO],
+            retry: RetryDTO?,
+            worktreeScope: WorktreeScopeDTO?
+        ) {
+            self.status = status
+            self.size = size
+            self.roots = roots
+            self.files = files
+            self.summary = summary
+            self.issues = issues
+            self.retry = retry
+            self.worktreeScope = worktreeScope
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case status, size, roots, files, summary, issues, retry
+            case worktreeScope = "worktree_scope"
+        }
+    }
 
     struct SelectedCodeStructureDTO: Codable, Equatable {
         let fileCount: Int
@@ -626,6 +817,10 @@ enum ToolResultDTOs {
         let message: String?
         let displayPath: String?
         let worktreeScope: WorktreeScopeDTO?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
 
         init(
             content: String,
@@ -634,7 +829,11 @@ enum ToolResultDTOs {
             lastLine: Int,
             message: String? = nil,
             displayPath: String? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil
         ) {
             self.content = content
             self.totalLines = totalLines
@@ -643,6 +842,10 @@ enum ToolResultDTOs {
             self.message = message
             self.displayPath = displayPath
             self.worktreeScope = worktreeScope
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -653,6 +856,10 @@ enum ToolResultDTOs {
             case message
             case displayPath = "display_path"
             case worktreeScope = "worktree_scope"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
         }
     }
 
@@ -681,6 +888,66 @@ enum ToolResultDTOs {
         let reviewStatus: String?
         let rejectionReason: String?
         let requiresUserApproval: Bool?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
+        let suggestion: String?
+        let operationID: String?
+        let mutationState: String?
+        let freshness: String?
+
+        init(
+            status: String,
+            editsRequested: Int,
+            editsApplied: Int,
+            addedLines: Int?,
+            deletedLines: Int?,
+            totalLinesChanged: Int?,
+            totalChunks: Int?,
+            results: [EditOutcome]?,
+            unifiedDiff: String?,
+            cardUnifiedDiff: String?,
+            note: String?,
+            fileCreated: Bool?,
+            fileOverwritten: Bool?,
+            reviewStatus: String?,
+            rejectionReason: String?,
+            requiresUserApproval: Bool?,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil,
+            suggestion: String? = nil,
+            operationID: String? = nil,
+            mutationState: String? = nil,
+            freshness: String? = nil
+        ) {
+            self.status = status
+            self.editsRequested = editsRequested
+            self.editsApplied = editsApplied
+            self.addedLines = addedLines
+            self.deletedLines = deletedLines
+            self.totalLinesChanged = totalLinesChanged
+            self.totalChunks = totalChunks
+            self.results = results
+            self.unifiedDiff = unifiedDiff
+            self.cardUnifiedDiff = cardUnifiedDiff
+            self.note = note
+            self.fileCreated = fileCreated
+            self.fileOverwritten = fileOverwritten
+            self.reviewStatus = reviewStatus
+            self.rejectionReason = rejectionReason
+            self.requiresUserApproval = requiresUserApproval
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
+            self.suggestion = suggestion
+            self.operationID = operationID
+            self.mutationState = mutationState
+            self.freshness = freshness
+        }
 
         private enum CodingKeys: String, CodingKey {
             case status
@@ -699,6 +966,14 @@ enum ToolResultDTOs {
             case reviewStatus = "review_status"
             case rejectionReason = "rejection_reason"
             case requiresUserApproval = "requires_user_approval"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
+            case suggestion
+            case operationID = "operation_id"
+            case mutationState = "mutation_state"
+            case freshness
         }
     }
 
@@ -948,19 +1223,43 @@ enum ToolResultDTOs {
         let path: String
         let newPath: String? // present for move/rename
         let warning: String?
+        let operationID: String?
+        let mutationState: String?
+        let freshness: String?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
+        let suggestion: String?
 
         init(
             status: String,
             action: String,
             path: String,
             newPath: String?,
-            warning: String? = nil
+            warning: String? = nil,
+            operationID: String? = nil,
+            mutationState: String? = nil,
+            freshness: String? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil,
+            suggestion: String? = nil
         ) {
             self.status = status
             self.action = action
             self.path = path
             self.newPath = newPath
             self.warning = warning
+            self.operationID = operationID
+            self.mutationState = mutationState
+            self.freshness = freshness
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
+            self.suggestion = suggestion
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -969,6 +1268,14 @@ enum ToolResultDTOs {
             case path
             case newPath = "new_path"
             case warning
+            case operationID = "operation_id"
+            case mutationState = "mutation_state"
+            case freshness
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
+            case suggestion
         }
     }
 

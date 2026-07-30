@@ -1,12 +1,14 @@
 import Combine
 import CoreServices
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class FileSystemServiceRecoveryTests: XCTestCase {
     private var temporaryRoots = FileSystemTemporaryRoots()
+    private var cancellables = Set<AnyCancellable>()
 
     override func tearDownWithError() throws {
+        cancellables.removeAll()
         temporaryRoots.removeAll()
         try super.tearDownWithError()
     }
@@ -15,7 +17,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemServiceRecovery")
         let service = try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true
@@ -43,7 +44,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
 
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -85,7 +85,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertNil(state.lastScannedEventIdByFolder["Sources/Nested"])
             XCTAssertNil(state.lastVerifiedAtByFolder["Sources/Nested"])
             XCTAssertNil(state.fileEventCountSinceLastScan["Sources/Nested"])
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         func testFolderScanCapSchedulesQuietFollowUpBatchesThroughAcceptedWatermark() async throws {
@@ -103,7 +103,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
 
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -139,6 +138,114 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertEqual(publication.lastPublishedWatcherAcceptedWatermark, watermark)
         }
 
+        func testAuthorityTargetedReconcileRemovesMissingFolderBeforeParallelEnumeration() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAuthorityTargetedMissingFolder")
+            let nestedFolder = root.appendingPathComponent("A/B/C", isDirectory: true)
+            let stableFolder = root.appendingPathComponent("Stable", isDirectory: true)
+            let otherFolder = root.appendingPathComponent("Other", isDirectory: true)
+            try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: stableFolder, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: otherFolder, withIntermediateDirectories: true)
+            try "old".write(to: nestedFolder.appendingPathComponent("old.txt"), atomically: true, encoding: .utf8)
+            try "keep".write(to: stableFolder.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+            try "keep".write(to: otherFolder.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+
+            let visitedPaths: Set = [
+                "A",
+                "A/B",
+                "A/B/C",
+                "A/B/C/old.txt",
+                "Stable",
+                "Stable/keep.txt",
+                "Other",
+                "Other/keep.txt"
+            ]
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: visitedPaths,
+                testVisitedItems: [
+                    "A": true,
+                    "A/B": true,
+                    "A/B/C": true,
+                    "A/B/C/old.txt": false,
+                    "Stable": true,
+                    "Stable/keep.txt": false,
+                    "Other": true,
+                    "Other/keep.txt": false
+                ],
+                isTestMode: false,
+                maxParallelScansOverride: 3
+            )
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+
+            try FileManager.default.removeItem(at: nestedFolder)
+            let reconciled = await service.reconcileFoldersForAuthorityChange(
+                folders: ["A/B/C", "Stable", "Other"]
+            )
+
+            XCTAssertTrue(reconciled)
+            let publication = try XCTUnwrap(publications.snapshot().last)
+            XCTAssertEqual(publication.source, .authorityTargetedReconcile)
+            XCTAssertFalse(publication.requiresFullResync)
+            XCTAssertTrue(publication.deltas.contains(.fileRemoved("A/B/C/old.txt")))
+            XCTAssertTrue(publication.deltas.contains(.folderRemoved("A/B/C")))
+            let state = await service.getTestState()
+            XCTAssertFalse(state.visitedPaths.contains("A/B/C"))
+            XCTAssertFalse(state.visitedPaths.contains("A/B/C/old.txt"))
+            XCTAssertTrue(state.visitedPaths.contains("Stable/keep.txt"))
+            XCTAssertTrue(state.visitedPaths.contains("Other/keep.txt"))
+            cancellables.insert(cancellable)
+        }
+
+        func testAuthorityTargetedReconcilePublishesModifiedFilesWithoutFolderMembershipChange() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAuthorityTargetedModifiedFile")
+            let folderURL = root.appendingPathComponent("Sources", isDirectory: true)
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+            let fileURL = folderURL.appendingPathComponent("Known.swift")
+            try "let value = 1\n".write(to: fileURL, atomically: true, encoding: .utf8)
+
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: ["Sources", "Sources/Known.swift"],
+                testVisitedItems: [
+                    "Sources": true,
+                    "Sources/Known.swift": false
+                ],
+                isTestMode: true
+            )
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+
+            try "let value = 2\n".write(to: fileURL, atomically: true, encoding: .utf8)
+            let reconciled = await service.reconcileFoldersForAuthorityChange(
+                folders: [],
+                modifiedFiles: ["Sources/Known.swift"]
+            )
+
+            XCTAssertTrue(reconciled)
+            let publication = try XCTUnwrap(publications.snapshot().last)
+            XCTAssertEqual(publication.source, .authorityTargetedReconcile)
+            XCTAssertFalse(publication.requiresFullResync)
+            XCTAssertTrue(publication.deltas.contains { delta in
+                if case .fileModified("Sources/Known.swift", _) = delta {
+                    return true
+                }
+                return false
+            })
+            cancellables.insert(cancellable)
+        }
+
         func testDualRecoveryScanFailureBlocksWatermarkUntilFullResyncSucceeds() async throws {
             let root = try temporaryRoots.makeRoot(suiteName: "FileSystemRecoveryFullResync")
             let folderURL = root.appendingPathComponent("A", isDirectory: true)
@@ -151,7 +258,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             let retryGate = SteppedBatchGate()
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -215,7 +321,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertEqual(fullResyncPublication.source, .recoveryFullResync)
             XCTAssertEqual(fullResyncPublication.watcherAcceptedWatermark, accepted)
             XCTAssertTrue(fullResyncPublication.deltas.contains(.fileAdded("A/recovered.txt")))
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         func testParallelScanFailureRestoresStateBeforeSerialFallback() async throws {
@@ -243,7 +349,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
 
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -304,7 +409,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
 
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: true,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -348,7 +452,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
 
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: true,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -391,7 +494,6 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
 
             let service = try await FileSystemService(
                 path: root.path,
-                respectGitignore: false,
                 respectRepoIgnore: false,
                 respectCursorignore: false,
                 skipSymlinks: true,
@@ -458,6 +560,110 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertEqual(state.lastScannedEventIdByFolder["C"], 1)
             XCTAssertEqual(publication.lastPublishedWatcherAcceptedWatermark, latestWatermark)
             await service.setWatcherBatchWillProcessHandlerForTesting(nil)
+        }
+
+        func testSeedReplayRejectsEveryLossyFSEventSignalWithoutPublication() async throws {
+            let unsafeFlags: [FSEventStreamEventFlags] = [
+                FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs),
+                FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped),
+                FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped),
+                FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged),
+                FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)
+            ]
+
+            for (index, unsafeFlag) in unsafeFlags.enumerated() {
+                let root = try temporaryRoots.makeRoot(suiteName: "FileSystemSeedUnsafe-\(index)")
+                let service = try await FileSystemService(
+                    path: root.path,
+                    respectRepoIgnore: false,
+                    respectCursorignore: false,
+                    skipSymlinks: true,
+                    isTestMode: true
+                )
+                let publications = LockedPublications()
+                let publisher = await service.publisherForChanges()
+                let cancellable = publisher.sink { publications.append($0) }
+                let initializationID = FileSystemSeedInitializationID()
+                _ = try await service.startWatchingForSeedPreparation(
+                    since: FileSystemSeedReplayJournalCut(fseventID: max(1, FSEventsGetCurrentEventId())),
+                    initializationID: initializationID
+                )
+                let preparation = try await service.prepareSeededInventoryForTesting(
+                    relativeFilePaths: [],
+                    relativeFolderPaths: [],
+                    initializationID: initializationID
+                )
+                try await service.installSeededInventory(preparation)
+                let accepted = await service.acceptWatcherPayloadForTesting([
+                    (
+                        absolutePath: root.path,
+                        flags: unsafeFlag | FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir),
+                        eventId: FSEventStreamEventId(80 + index)
+                    )
+                ])
+                let cut = try XCTUnwrap(accepted)
+
+                do {
+                    _ = try await service.flushSeedReplay(through: cut, initializationID: initializationID)
+                    XCTFail("Expected unsafe signal \(index) to reject seeded replay")
+                } catch let error as FileSystemSeedReplayError {
+                    XCTAssertEqual(error, .unsafeEventFlags)
+                }
+                XCTAssertTrue(publications.snapshot().isEmpty)
+                await service.abortSeededPreparation(initializationID: initializationID)
+                cancellables.insert(cancellable)
+            }
+        }
+
+        func testSeedReplayRejectsScanRecoveryBeforeAnyPublication() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemSeedRecoveryReject")
+            let folderURL = root.appendingPathComponent("A", isDirectory: true)
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+            let service = try await FileSystemService(
+                path: root.path,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                isTestMode: true
+            )
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+            let initializationID = FileSystemSeedInitializationID()
+            _ = try await service.startWatchingForSeedPreparation(
+                since: FileSystemSeedReplayJournalCut(fseventID: max(1, FSEventsGetCurrentEventId())),
+                initializationID: initializationID
+            )
+            let preparation = try await service.prepareSeededInventoryForTesting(
+                relativeFilePaths: [],
+                relativeFolderPaths: ["A"],
+                initializationID: initializationID
+            )
+            try await service.installSeededInventory(preparation)
+            let newFileURL = folderURL.appendingPathComponent("new.txt")
+            try "new".write(to: newFileURL, atomically: true, encoding: .utf8)
+            await service.setFolderScanFailureCountForTesting(1, folder: "A")
+            let createdFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
+            )
+            let accepted = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: newFileURL.path, flags: createdFlags, eventId: 90)
+            ])
+            let cut = try XCTUnwrap(accepted)
+
+            do {
+                _ = try await service.flushSeedReplay(through: cut, initializationID: initializationID)
+                XCTFail("Expected scan recovery to reject seeded replay")
+            } catch let error as FileSystemSeedReplayError {
+                XCTAssertEqual(error, .recoveryRequired)
+            }
+            XCTAssertTrue(publications.snapshot().isEmpty)
+            let publication = await service.publicationStateForTesting()
+            XCTAssertEqual(publication.lastServicePublicationSequence, 0)
+            XCTAssertEqual(publication.lastPublishedWatcherAcceptedWatermark, .zero)
+            await service.abortSeededPreparation(initializationID: initializationID)
+            cancellables.insert(cancellable)
         }
 
         private final class LockedPublications: @unchecked Sendable {

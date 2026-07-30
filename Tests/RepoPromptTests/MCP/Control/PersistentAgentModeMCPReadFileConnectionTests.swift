@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -172,6 +172,17 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #endif
     }
 
+    func testThreeRootSessionScopeReplacesCanonicalGitRootAndPreservesIndependentNonGitRoot() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true, gitBacked: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .threeRootFileToolScope)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testReadAutoSelectionDeclinesWhenBoundTabClosesDuringPersistenceSuspension() async throws {
         #if DEBUG
             try await withFixture { fixture in
@@ -224,6 +235,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case worktreeCoverageCertificatePersistenceBoundary
             case worktreeCoverageCertificateFailClosed
             case worktreeSearchPhysicalCoverage
+            case threeRootFileToolScope
             case hiddenWorktreeReadSliceRebase
 
             var requiresSerialReadPrelude: Bool {
@@ -231,7 +243,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
                      .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
-                     .worktreeSearchPhysicalCoverage, .hiddenWorktreeReadSliceRebase:
+                     .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase:
                     false
                 default:
                     true
@@ -242,9 +254,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func withFixture(
             agentOwned: Bool = false,
             inactiveAgentTab: Bool = false,
+            gitBacked: Bool = false,
             _ operation: (Fixture) async throws -> Void
         ) async throws {
-            let fixture = try await Fixture.make(agentOwned: agentOwned, inactiveAgentTab: inactiveAgentTab)
+            let fixture = try await Fixture.make(
+                agentOwned: agentOwned,
+                inactiveAgentTab: inactiveAgentTab,
+                gitBacked: gitBacked
+            )
             do {
                 try await operation(fixture)
                 await fixture.cleanup()
@@ -422,6 +439,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertWorktreeCoverageCertificateFailClosed(fixture: fixture)
             case .worktreeSearchPhysicalCoverage:
                 try await assertWorktreeSearchPhysicalCoverage(fixture: fixture)
+            case .threeRootFileToolScope:
+                try await assertThreeRootFileToolScope(fixture: fixture)
             case .hiddenWorktreeReadSliceRebase:
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
             }
@@ -471,6 +490,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 25).map { "middle-insert-\($0)" }, at: 3039)
             editedLines.removeSubrange(5064 ..< 5084)
             let physicalURL = try fixture.worktreeLargeFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -541,6 +561,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting(nil)
                 Task { await staleCommitGate.release() }
             }
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let staleReplacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.stale-\(UUID().uuidString)")
             let staleReplacementText = try String(contentsOf: physicalURL, encoding: .utf8)
@@ -664,6 +685,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try Self.assertSuccessfulResponse(fullSet, id: 4)
 
             let physicalURL = try fixture.worktreeSearchCreatedFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             var originalLines = (1 ... 29).map { "search-line-\($0)" }
             originalLines[3] = "WATCHER_BEGIN_ANCHOR_9F3A7C"
             originalLines[14] = "WATCHER_MIDDLE_ANCHOR_9F3A7C"
@@ -734,6 +758,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 4).map { "top-insert-\($0)" }, at: 0)
             editedLines.insert(contentsOf: (1 ... 3).map { "middle-insert-\($0)" }, at: 13)
             editedLines.removeSubrange(26 ... 27)
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SearchCreated.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -818,6 +845,71 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             XCTAssertEqual(preservedFull.selectedPaths, [matchingLogicalPath])
             XCTAssertNil(preservedFull.slices[matchingLogicalPath])
+        }
+
+        func assertThreeRootFileToolScope(fixture: Fixture) async throws {
+            let searchCases: [(id: Int, pattern: String, expectedMatches: Int, filterPath: String?)] = try [
+                (10, Fixture.canonicalOnlyMarker, 0, nil),
+                (11, Fixture.worktreeOnlyMarker, 1, nil),
+                (12, Fixture.nonGitVisibleMarker, 1, nil),
+                (13, Fixture.nonGitVisibleMarker, 1, fixture.auxiliaryRootPath)
+            ]
+            for testCase in searchCases {
+                var arguments: [String: Any] = [
+                    "pattern": testCase.pattern,
+                    "mode": "content",
+                    "regex": false
+                ]
+                if let filterPath = testCase.filterPath {
+                    arguments["filter"] = ["paths": [filterPath]]
+                }
+                let response = try await fixture.socketClient.request(
+                    id: testCase.id,
+                    method: "tools/call",
+                    params: ["name": MCPWindowToolName.search, "arguments": arguments]
+                )
+                let text = try Self.readFileText(from: response, id: testCase.id)
+                XCTAssertTrue(text.contains("- **Total matches**: \(testCase.expectedMatches)"), text)
+                XCTAssertFalse(try text.contains(fixture.worktreeRootPath), text)
+            }
+
+            let nonGitFile = try fixture.auxiliarySwiftFileURL
+            let readResponse = try await fixture.socketClient.request(
+                id: 14,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": nonGitFile.path]
+                ]
+            )
+            let readText = try Self.readFileText(from: readResponse, id: 14)
+            XCTAssertTrue(readText.contains(Fixture.nonGitVisibleMarker), readText)
+
+            MCPToolWorkCountDiagnostics.resetForTesting()
+            let structureResponse = try await fixture.socketClient.request(
+                id: 15,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.getCodeStructure,
+                    "arguments": [
+                        "paths": [nonGitFile.path]
+                    ]
+                ]
+            )
+            let structureText = try Self.readFileText(from: structureResponse, id: 15)
+            XCTAssertTrue(
+                structureText.contains("## Code Structure ❌ unavailable — requested root is unavailable"),
+                structureText
+            )
+            XCTAssertTrue(structureText.contains("- Resolve the reported root issue, then retry."), structureText)
+            XCTAssertFalse(structureText.contains("git_root_unavailable"), structureText)
+            let work = MCPToolWorkCountDiagnostics.debugSnapshots().git
+            XCTAssertEqual(work.count, 1)
+            XCTAssertEqual(work.first?.operation, MCPWindowToolName.getCodeStructure)
+            let gitCommands = work.first?.commands ?? []
+            XCTAssertEqual(work.first?.commandCount, 0, gitCommands.joined(separator: "\n"))
+            XCTAssertTrue(gitCommands.isEmpty)
+            XCTAssertEqual(work.first?.outcome, "success")
         }
 
         func assertWorktreeCoverageCertificateRepeats(fixture: Fixture) async throws {
@@ -927,7 +1019,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     fixture.liveFileURL.path,
                     fixture.worktreeOnlyLogicalURL.path
                 ],
-                autoCodemapPaths: selectionAdvancedAfterIngressSnapshot.selection.autoCodemapPaths,
+
                 slices: [
                     fixture.liveFileURL.path: [LineRange(start: 1, end: 20)],
                     fixture.worktreeOnlyLogicalURL.path: [LineRange(start: 30, end: 40)]
@@ -1114,14 +1206,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 await gate.markStartedAndWaitForRelease()
             }
             fixture.window.mcpServer.setReadFileAutoSelectionFinalRevalidationHandlerForTesting {
-                guard var tab = fixture.window.workspaceManager.composeTab(with: Fixture.tabID) else {
-                    return XCTFail("Missing canonical tab during final certificate revalidation")
+                do {
+                    try await self.persistCertificateBoundaryFinalSelectionAdvance(fixture: fixture)
+                } catch {
+                    XCTFail("Failed final certificate revalidation selection advance: \(error)")
                 }
-                tab.selection = StoredSelection(selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path])
-                XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(
-                    tab,
-                    inWorkspaceID: fixture.workspaceID
-                ))
             }
             defer {
                 fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting(nil)
@@ -1136,18 +1225,79 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             await gate.release()
             await assertReadFileAutoSelectionSettled(fixture: fixture)
-            let certificate = try XCTUnwrap(fixture.readFileAutoSelectionCoverageCertificate())
-            XCTAssertEqual(certificate.selectionRevision, fixture.canonicalSelectionRevision())
+            let certificate = try XCTUnwrap(
+                fixture.readFileAutoSelectionCoverageCertificate(),
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+            XCTAssertEqual(
+                certificate.selectionRevision,
+                fixture.canonicalSelectionRevision(),
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
             XCTAssertEqual(
                 fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection.selectedPaths,
-                [fixture.fileURL.path, fixture.liveFileURL.path]
+                [fixture.fileURL.path, fixture.liveFileURL.path],
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
             )
 
             _ = try await readFile(fixture: fixture, id: 5, path: fixture.fileURL.path)
             await assertReadFileAutoSelectionSettled(fixture: fixture)
             let final = try fixture.readFileAutoSelectionContextSnapshot()
-            XCTAssertEqual(final.coverageCertificateHitCount, 1)
-            XCTAssertEqual(final.authoritativeFallbackCount, 1)
+            XCTAssertEqual(
+                final.coverageCertificateHitCount,
+                1,
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+            XCTAssertEqual(
+                final.authoritativeFallbackCount,
+                1,
+                readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
+            )
+        }
+
+        func persistCertificateBoundaryFinalSelectionAdvance(fixture: Fixture) async throws {
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let currentSelection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(for: identity)?.selection,
+                "Missing canonical tab during final certificate revalidation"
+            )
+            let advancedSelection = StoredSelection(
+                selectedPaths: [fixture.fileURL.path, fixture.liveFileURL.path],
+                manualCodemapPaths: currentSelection.manualCodemapPaths,
+                slices: [:],
+                codemapAutoEnabled: currentSelection.codemapAutoEnabled
+            )
+            let persisted = await fixture.window.selectionCoordinator.persistSelection(
+                advancedSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: false,
+                expectedCurrentSelection: currentSelection
+            )
+            XCTAssertEqual(
+                persisted,
+                advancedSelection,
+                "Final certificate revalidation selection advance did not persist through the canonical coordinator. \(readFileAutoSelectionBoundaryFailureContext(fixture: fixture))"
+            )
+        }
+
+        func readFileAutoSelectionBoundaryFailureContext(fixture: Fixture) -> String {
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let diagnostics = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
+            let contextSnapshot = (try? fixture.readFileAutoSelectionContextSnapshot()).map(String.init(describing:))
+                ?? "<unavailable>"
+            let certificate = (try? fixture.readFileAutoSelectionCoverageCertificate()).map(String.init(describing:))
+                ?? "<nil>"
+            let canonicalSelection = fixture.window.workspaceManager.composeTab(for: identity)?.selection
+            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            let boundRevision = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selectionRevision
+            return "readFileAutoSelectionBoundary diagnostics=\(diagnostics) context=\(contextSnapshot) certificate=\(certificate) canonicalRevision=\(fixture.canonicalSelectionRevision()) canonicalSelection=\(String(describing: canonicalSelection)) boundSelection=\(String(describing: boundSelection)) boundRevision=\(String(describing: boundRevision))"
         }
 
         func assertWorktreeCoverageCertificateFailClosed(fixture: Fixture) async throws {
@@ -2600,6 +2750,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         static let worktreeOnlyRelativePath = "Tests/RepoPromptTests/MCP/WorktreeOnlySelection.swift"
         static let largeWorktreeRelativePath = "Tests/RepoPromptTests/MCP/SessionWorktree6500.swift"
         static let searchCreatedRelativePath = "Tests/RepoPromptTests/MCP/SearchCreated.swift"
+        static let canonicalOnlyMarker = "RPCE_CANONICAL_ONLY"
+        static let worktreeOnlyMarker = "RPCE_WORKTREE_ONLY"
+        static let nonGitVisibleMarker = "RPCE_NONGIT_VISIBLE"
         static func liveContents() throws -> (logical: String, worktree: String) {
             let targetURL = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -2628,6 +2781,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let spec: MCPBootstrapLeaseSpec
         let lease: MCPBootstrapLease
         let agentOwned: Bool
+        let gitBacked: Bool
         private var worktreeRootURL: URL?
         private var worktreeRootID: UUID?
         private var retiredWorktreeRootURLs: [URL] = []
@@ -2654,7 +2808,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             connectionManager: BootstrapSocketConnectionManager,
             spec: MCPBootstrapLeaseSpec,
             lease: MCPBootstrapLease,
-            agentOwned: Bool
+            agentOwned: Bool,
+            gitBacked: Bool
         ) {
             self.rootURL = rootURL
             self.fileURL = fileURL
@@ -2670,13 +2825,19 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.spec = spec
             self.lease = lease
             self.agentOwned = agentOwned
+            self.gitBacked = gitBacked
         }
 
-        static func make(agentOwned: Bool = false, inactiveAgentTab: Bool = false) async throws -> Fixture {
+        static func make(
+            agentOwned: Bool = false,
+            inactiveAgentTab: Bool = false,
+            gitBacked: Bool = false
+        ) async throws -> Fixture {
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             let fileURL = rootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
+            let canonicalOnlyFileURL = rootURL.appendingPathComponent("Sources/CanonicalOnly.swift")
             let liveFileURL = rootURL.appendingPathComponent(liveRelativePath)
             let liveContents = try liveContents()
             do {
@@ -2689,7 +2850,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     withIntermediateDirectories: true
                 )
                 try sentinelContent.write(to: fileURL, atomically: true, encoding: .utf8)
+                try "let \(canonicalOnlyMarker) = true\n".write(
+                    to: canonicalOnlyFileURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
                 try liveContents.logical.write(to: liveFileURL, atomically: true, encoding: .utf8)
+                if gitBacked {
+                    _ = try GitWorktreeTestSupport.runGit(["init"], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(["config", "user.name", "RepoPrompt Test"], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(
+                        ["config", "user.email", "repoprompt@example.test"],
+                        cwd: rootURL
+                    )
+                    _ = try GitWorktreeTestSupport.runGit(["config", "commit.gpgSign", "false"], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(["add", "."], cwd: rootURL)
+                    _ = try GitWorktreeTestSupport.runGit(["commit", "-m", "fixture"], cwd: rootURL)
+                }
             } catch {
                 try? FileManager.default.removeItem(at: rootURL)
                 throw error
@@ -2888,7 +3065,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionManager: resolvedConnectionManager,
                     spec: spec,
                     lease: resolvedLease,
-                    agentOwned: agentOwned
+                    agentOwned: agentOwned,
+                    gitBacked: gitBacked
                 )
             } catch {
                 await connectionManager?.stop()
@@ -2952,6 +3130,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 atomically: true,
                 encoding: .utf8
             )
+            try "struct \(Self.nonGitVisibleMarker) {}\n".write(
+                to: auxiliaryRootURL.appendingPathComponent("Plain.swift"),
+                atomically: true,
+                encoding: .utf8
+            )
             let auxiliaryRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: auxiliaryRootURL.path)
             auxiliaryRootID = auxiliaryRoot.id
 
@@ -2959,6 +3142,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests-Worktree", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             self.worktreeRootURL = worktreeRootURL
+            if gitBacked {
+                _ = try GitWorktreeTestSupport.runGit(
+                    ["worktree", "add", "--detach", worktreeRootURL.path, "HEAD"],
+                    cwd: rootURL
+                )
+                try FileManager.default.removeItem(
+                    at: worktreeRootURL.appendingPathComponent("Sources/CanonicalOnly.swift")
+                )
+            }
             let worktreeFileURL = worktreeRootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
             let worktreeLiveFileURL = worktreeRootURL.appendingPathComponent(Self.liveRelativePath)
             let worktreeOnlyFileURL = worktreeRootURL.appendingPathComponent(Self.worktreeOnlyRelativePath)
@@ -2982,7 +3174,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let liveContents = try Self.liveContents()
             try Self.sentinelContent.write(to: worktreeFileURL, atomically: true, encoding: .utf8)
             try liveContents.worktree.write(to: worktreeLiveFileURL, atomically: true, encoding: .utf8)
-            try "let worktreeOnlySelection = true\n".write(
+            try "let \(Self.worktreeOnlyMarker) = true\n".write(
                 to: worktreeOnlyFileURL,
                 atomically: true,
                 encoding: .utf8
@@ -3035,6 +3227,41 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         var installedWorktreeRootID: UUID {
             get throws {
                 try XCTUnwrap(worktreeRootID)
+            }
+        }
+
+        func useOnlySyntheticWatcherIngressForInstalledWorktree(
+            qualifyCachedSearchContent: Bool = false
+        ) async throws {
+            let rootID = try installedWorktreeRootID
+            let store = window.workspaceFileContextStore
+            let maybeService = await store.fileSystemServiceForTesting(rootID: rootID)
+            let service = try XCTUnwrap(maybeService)
+            await service.stopWatchingForChanges()
+            let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(
+                rootID: rootID
+            )
+            guard attachedPublisherIngress else {
+                throw ClientFixtureError.syntheticWatcherPublisherIngressUnavailable(rootID)
+            }
+            let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            guard !watcherIsActive else {
+                throw ClientFixtureError.syntheticWatcherStillActive(rootID)
+            }
+            if qualifyCachedSearchContent {
+                try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: rootID, true)
+            }
+        }
+
+        var auxiliaryRootPath: String {
+            get throws {
+                try XCTUnwrap(auxiliaryRootURL).path
+            }
+        }
+
+        var auxiliarySwiftFileURL: URL {
+            get throws {
+                try XCTUnwrap(auxiliaryRootURL).appendingPathComponent("Plain.swift")
             }
         }
 
@@ -3678,6 +3905,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case syntheticWatcherPublisherIngressUnavailable(UUID)
+        case syntheticWatcherStillActive(UUID)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {
@@ -3808,6 +4037,49 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
     }
 
+    private final class SocketPairResponseWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+
+        init(_ continuation: CheckedContinuation<String, Error>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: String) {
+            take()?.resume(returning: value)
+        }
+
+        func resume(throwing error: Error) {
+            take()?.resume(throwing: error)
+        }
+
+        private func take() -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            defer { continuation = nil }
+            return continuation
+        }
+    }
+
+    private final class SocketPairResponseWaiterHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiter: SocketPairResponseWaiter?
+
+        func install(_ waiter: SocketPairResponseWaiter) {
+            lock.lock()
+            self.waiter = waiter
+            lock.unlock()
+        }
+
+        func resume(throwing error: Error) {
+            lock.lock()
+            let waiter = waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(throwing: error)
+        }
+    }
+
     private final class SocketPairJSONRPCClient: @unchecked Sendable {
         enum ClientError: Error {
             case closed
@@ -3820,6 +4092,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var fd: Int32
         private var buffer = Data()
         private var nonMatchingFrames: [String] = []
+        private let responseTimeout: TimeInterval = 10
 
         init(fd: Int32) {
             self.fd = fd
@@ -3864,37 +4137,58 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         private func response(matching expectedID: Int) async throws -> String {
-            try await withCheckedThrowingContinuation { continuation in
-                queue.async {
-                    do {
-                        while true {
-                            let line = try self.readLine()
-                            let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
-                            guard let object else { throw ClientError.invalidResponse }
-                            if let rawID = object["id"] {
-                                guard let responseID = (rawID as? NSNumber)?.intValue else {
-                                    throw ClientError.invalidResponse
-                                }
-                                guard responseID == expectedID else {
-                                    throw ClientError.invalidResponse
-                                }
-                                guard let rawJSON = String(data: line, encoding: .utf8) else {
-                                    throw ClientError.invalidResponse
-                                }
-                                continuation.resume(returning: rawJSON)
-                                return
-                            }
-                            guard object["method"] as? String != nil,
-                                  let rawJSON = String(data: line, encoding: .utf8)
-                            else {
-                                throw ClientError.invalidResponse
-                            }
-                            self.nonMatchingFrames.append(rawJSON)
+            let waitState = SocketResponseWaitState()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    guard waitState.install(continuation) else { return }
+                    let deadline = Date().addingTimeInterval(responseTimeout)
+                    queue.async {
+                        let result: Result<String, Error>
+                        do {
+                            result = try .success(self.readResponse(
+                                matching: expectedID,
+                                deadline: deadline,
+                                isCancelled: { waitState.isCancelled }
+                            ))
+                        } catch {
+                            result = .failure(error)
                         }
-                    } catch {
-                        continuation.resume(throwing: error)
+                        waitState.resume(with: result)
                     }
                 }
+            } onCancel: {
+                waitState.cancel()
+            }
+        }
+
+        private func readResponse(
+            matching expectedID: Int,
+            deadline: Date,
+            isCancelled: () -> Bool
+        ) throws -> String {
+            while true {
+                if isCancelled() { throw CancellationError() }
+                let line = try readLine(deadline: deadline, isCancelled: isCancelled)
+                let object = try JSONSerialization.jsonObject(with: line) as? [String: Any]
+                guard let object else { throw ClientError.invalidResponse }
+                if let rawID = object["id"] {
+                    guard let responseID = (rawID as? NSNumber)?.intValue else {
+                        throw ClientError.invalidResponse
+                    }
+                    guard responseID == expectedID else {
+                        throw ClientError.invalidResponse
+                    }
+                    guard let rawJSON = String(data: line, encoding: .utf8) else {
+                        throw ClientError.invalidResponse
+                    }
+                    return rawJSON
+                }
+                guard object["method"] as? String != nil,
+                      let rawJSON = String(data: line, encoding: .utf8)
+                else {
+                    throw ClientError.invalidResponse
+                }
+                nonMatchingFrames.append(rawJSON)
             }
         }
 
@@ -3914,8 +4208,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
         }
 
-        private func readLine() throws -> Data {
+        private func readLine(deadline: Date, isCancelled: () -> Bool) throws -> Data {
             while true {
+                if isCancelled() { throw CancellationError() }
                 if let newline = buffer.firstIndex(of: 0x0A) {
                     let line = Data(buffer[..<newline])
                     buffer.removeSubrange(buffer.startIndex ... newline)
@@ -3923,8 +4218,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
                 guard fd >= 0 else { throw ClientError.closed }
                 var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-                let pollResult = Darwin.poll(&descriptor, 1, 10000)
-                if pollResult == 0 { throw ClientError.timedOut }
+                let remainingMilliseconds = Int32(deadline.timeIntervalSinceNow * 1000)
+                if remainingMilliseconds <= 0 { throw ClientError.timedOut }
+                let pollResult = Darwin.poll(&descriptor, 1, min(100, remainingMilliseconds))
+                if pollResult == 0 { continue }
                 if pollResult < 0 {
                     if errno == EINTR { continue }
                     throw ClientError.posix(operation: "poll", code: errno)
@@ -3947,6 +4244,56 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 if errno == EINTR { continue }
                 throw ClientError.posix(operation: "read", code: errno)
             }
+        }
+    }
+
+    private final class SocketResponseWaitState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+        private var cancelled = false
+        private var completed = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            let result = cancelled
+            lock.unlock()
+            return result
+        }
+
+        func install(_ continuation: CheckedContinuation<String, Error>) -> Bool {
+            lock.lock()
+            if cancelled || completed {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return false
+            }
+            self.continuation = continuation
+            lock.unlock()
+            return true
+        }
+
+        func cancel() {
+            let continuation = takeContinuation(cancelled: true)
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        func resume(with result: Result<String, Error>) {
+            guard let continuation = takeContinuation(cancelled: false) else { return }
+            continuation.resume(with: result)
+        }
+
+        private func takeContinuation(cancelled: Bool) -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            if completed {
+                lock.unlock()
+                return nil
+            }
+            self.cancelled = self.cancelled || cancelled
+            completed = true
+            let continuation = continuation
+            self.continuation = nil
+            lock.unlock()
+            return continuation
         }
     }
 #endif

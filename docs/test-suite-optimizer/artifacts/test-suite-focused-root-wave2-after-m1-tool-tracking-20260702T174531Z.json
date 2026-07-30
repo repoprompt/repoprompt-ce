@@ -1,0 +1,162 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T174531Z.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.AgentToolTrackingControllerTests",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.AgentToolTrackingControllerTests",
+  "git": {
+    "commit": "8654b62b34455f12ce9ddf595b8733cf1f1328f7",
+    "working_tree": " M Tests/RepoPromptTests/AgentMode/AgentToolTrackingControllerTests.swift\n M docs/test-suite-optimizer/scoreboard.md\n?? prompt-exports/oracle-plan-2026-07-02-132744-wave2-m1-tools-bfd9d-45c4.md\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173417Z.json\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-after-m1-tool-tracking-20260702T173633Z.json\n?? docs/test-suite-optimizer/artifacts/test-suite-focused-root-wave2-before-m1-tool-tracking-20260702T172942Z.json"
+  },
+  "inventory": "docs/test-suite-optimizer/artifacts/test-suite-inventory-phase3-setup-20260701T141721Z.json",
+  "label": "wave2-after-m1-tool-tracking-20260702T174531Z",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.AgentToolTrackingControllerTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.7746050357818604,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/672c6469-f879-42d3-8c74-83ddbec1dd42.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004157066345214844,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.AgentToolTrackingControllerTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.7119002342224121,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/7d9c9a47-5283-45a1-9762-04198ae80ebd.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0026738643646240234,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.AgentToolTrackingControllerTests",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 0.7158529758453369,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/25f5a14d-1dd7-4a90-9315-ef55b9b6c573.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 4,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.002939939498901367,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 0.002,
+      "median_aggregate_seconds": 0.004,
+      "method_count": 4,
+      "suite": "RepoPromptTests.AgentToolTrackingControllerTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.002,
+      "median_seconds": 0.002,
+      "method": "testConcurrentRawUnregisterAndStopJoinCapturedDeliveryBarrier",
+      "observations": 3,
+      "observed_p95_seconds": 0.002,
+      "suite": "RepoPromptTests.AgentToolTrackingControllerTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.AgentToolTrackingControllerTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.001,
+      "median_seconds": 0.001,
+      "method": "testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes",
+      "observations": 3,
+      "observed_p95_seconds": 0.001,
+      "suite": "RepoPromptTests.AgentToolTrackingControllerTests"
+    },
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 0.0,
+      "median_seconds": 0.0,
+      "method": "testStopWaitsForCapturedObserverToEnterMailboxAndDrain",
+      "observations": 3,
+      "observed_p95_seconds": 0.0,
+      "suite": "RepoPromptTests.AgentToolTrackingControllerTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 0,
+    "median_seconds": 0.7158529758453369,
+    "noise_classification": "stable",
+    "observed_p95_seconds": 0.7746050357818604,
+    "raw_execution_seconds": [
+      0.7746050357818604,
+      0.7119002342224121,
+      0.7158529758453369
+    ],
+    "relative_mad": 0.005521722694883106,
+    "valid_samples": 3
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T17:45:34+00:00"
+}

@@ -1,11 +1,11 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class UnifiedDiffGeneratorRecoveryTests: XCTestCase {
     func testGeneratedDiffHeadersNormalizeAbsolutePathsWithSpacesAndSummarizeCreatesDeletes() async throws {
         let createDiff = try await UnifiedDiffGenerator.build(
             oldLines: nil,
-            newLines: ["struct Created {}"],
+            newLines: [SwiftFixtureSource.emptyStruct("Created", trailingNewline: false)],
             filePath: "Repo Root/Sources/New File.swift"
         )
         XCTAssertEqual(createDiff, "--- /dev/null\n+++ b/Repo Root/Sources/New File.swift\n")

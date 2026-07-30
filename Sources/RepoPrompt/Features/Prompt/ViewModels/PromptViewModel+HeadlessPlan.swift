@@ -14,6 +14,9 @@ enum HeadlessMode {
 /// A frozen snapshot of tab state for headless generation.
 /// Used when running plan/chat via AIQueriesService without activating the tab.
 struct HeadlessContextSnapshot {
+    /// Exact workspace authority for inactive/background generation.
+    let workspaceID: UUID?
+
     /// The compose tab this snapshot came from
     let tabID: UUID
 
@@ -26,16 +29,28 @@ struct HeadlessContextSnapshot {
     /// Frozen logical-to-physical workspace projection for this request.
     let lookupContext: WorkspaceLookupContext?
 
+    /// Frozen artifact authority, comparison intent, and logical checkout labels.
+    let reviewGitContext: FrozenPromptGitReviewContext
+
+    /// Exact final Context Builder review authority. Nil for every general prompt route.
+    let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
+
     init(
+        workspaceID: UUID? = nil,
         tabID: UUID,
         promptText: String,
         selection: StoredSelection,
-        lookupContext: WorkspaceLookupContext? = nil
+        lookupContext: WorkspaceLookupContext? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
     ) {
+        self.workspaceID = workspaceID
         self.tabID = tabID
         self.promptText = promptText
         self.selection = selection
         self.lookupContext = lookupContext
+        self.reviewGitContext = reviewGitContext
+        self.finalReviewAuthorization = finalReviewAuthorization
     }
 }
 
@@ -56,9 +71,8 @@ extension PromptViewModel {
         from snapshot: HeadlessContextSnapshot,
         model: AIModel,
         mode: HeadlessMode = .plan,
-        gitScopeOverride: GitInclusion? = nil,
-        gitBaseOverride: String? = nil
-    ) async -> AIMessage {
+        gitScopeOverride: GitInclusion? = nil
+    ) async throws -> AIMessage {
         let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
         let headlessConfig = PromptContextResolved(
             includeFiles: true,
@@ -70,35 +84,6 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
-        let preAssembly = await preAssemblePromptContext(
-            cfg: headlessConfig,
-            selection: snapshot.selection,
-            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
-            gitBaseOverride: gitBaseOverride
-        )
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
-
-        // 2. Generate file contents. Preserve legacy formatting unless an authoritative
-        // Agent Mode lookup context requires physical paths to be projected logically.
-        let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
-            { entry in preAssembly.displayPath(for: entry) }
-        } else {
-            nil
-        }
-        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-            codeEntries,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            displayPathResolver: displayPathResolver
-        )
-        let fileBlocks = partitionedBlocks.contentBlocks
-
-        // 3. Combine the frozen file tree with only the canonical codemap partition.
-        let fileTree = PromptPackagingService.combinedFileMapContent(
-            fileTreeContent: preAssembly.fileTreeContent,
-            codemapBlocks: partitionedBlocks.codemapBlocks
-        ) ?? ""
-
         // 4. System prompt based on mode
         let systemPrompt: String = {
             switch mode {
@@ -124,20 +109,44 @@ extension PromptViewModel {
         // 5. Single-user conversation
         let conversation = [ConversationEntry(role: .user, content: snapshot.promptText)]
 
-        let gitDiff = preAssembly.gitDiff
-
-        // 6. Assemble AIMessage (no warning, no meta prompts)
-        return PromptPackagingService.buildAIMessage(
-            systemPrompt: systemPrompt,
-            metaInstructions: [],
-            fileTree: fileTree,
-            fileContents: fileBlocks,
-            gitDiff: gitDiff,
-            conversation: conversation,
-            temperature: setModelTemperature ? modelTemperature : nil,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
+        return try await withPreassembledPromptContext(
+            cfg: headlessConfig,
+            selection: snapshot.selection,
+            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
+            reviewGitContext: snapshot.reviewGitContext,
+            sourceTabID: snapshot.tabID,
+            finalReviewAuthorization: snapshot.finalReviewAuthorization
+        ) { preAssembly in
+            let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
+                preAssembly.entries
+            )
+            let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
+                { entry in preAssembly.displayPath(for: entry) }
+            } else {
+                nil
+            }
+            let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
+                codeEntries,
+                filePathDisplay: self.filePathDisplayOption,
+                codemapPresentation: preAssembly.codemapPresentation,
+                displayPathResolver: displayPathResolver
+            )
+            let fileTree = PromptPackagingService.combinedFileMapContent(
+                fileTreeContent: preAssembly.fileTreeContent,
+                codemapBlocks: partitionedBlocks.codemapBlocks
+            ) ?? ""
+            return PromptPackagingService.buildAIMessage(
+                systemPrompt: systemPrompt,
+                metaInstructions: [],
+                fileTree: fileTree,
+                fileContents: partitionedBlocks.contentBlocks,
+                gitDiff: preAssembly.gitDiff,
+                conversation: conversation,
+                temperature: self.setModelTemperature ? self.modelTemperature : nil,
+                promptSectionsOrder: self.promptSectionsOrder,
+                disabledPromptSections: self.disabledPromptSections,
+                duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
+            )
+        }
     }
 }

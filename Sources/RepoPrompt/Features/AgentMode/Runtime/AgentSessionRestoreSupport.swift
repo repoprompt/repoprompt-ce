@@ -21,6 +21,35 @@ enum AgentSessionRestoreSupport {
         return lhs.id.uuidString < rhs.id.uuidString
     }
 
+    static func sidebarSortDates(
+        from sessionIndex: [UUID: AgentSessionIndexEntry]
+    ) -> [UUID: Date] {
+        var sortDates: [UUID: Date] = [:]
+        let entriesWithSortDates = sessionIndex.values.lazy.filter { $0.lastUserMessageAt != nil }
+        for (tabID, entry) in preferredEntriesByTabID(from: entriesWithSortDates) {
+            if let date = entry.lastUserMessageAt {
+                sortDates[tabID] = date
+            }
+        }
+        return sortDates
+    }
+
+    static func preferredEntriesByTabID(
+        from entries: some Sequence<AgentSessionIndexEntry>
+    ) -> [UUID: AgentSessionIndexEntry] {
+        var preferredEntryByTabID: [UUID: AgentSessionIndexEntry] = [:]
+        for entry in entries {
+            if let existing = preferredEntryByTabID[entry.tabID] {
+                if shouldPreferSidebarEntry(entry, over: existing) {
+                    preferredEntryByTabID[entry.tabID] = entry
+                }
+            } else {
+                preferredEntryByTabID[entry.tabID] = entry
+            }
+        }
+        return preferredEntryByTabID
+    }
+
     static func sidebarActivityDate(for entry: AgentSessionIndexEntry) -> Date {
         sidebarActivityDate(lastUserMessageAt: entry.lastUserMessageAt, savedAt: entry.savedAt)
     }

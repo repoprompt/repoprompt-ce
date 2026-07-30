@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final actor ClaudeNativeProcessSessionController {
@@ -233,6 +234,80 @@ final actor ClaudeNativeProcessSessionController {
         process != nil
     }
 
+    deinit {
+        performSynchronousDeinitCleanup()
+    }
+
+    /// Last-resort process cleanup for controller deallocation.
+    ///
+    /// Normal owners must call async `shutdown()`, which can reap the process and
+    /// clear expected PID registrations. `deinit` cannot await that path, so this
+    /// method releases file-handle callbacks, closes stdin, sends SIGTERM to the
+    /// child process family, schedules group-aware termination/reaping, and schedules
+    /// expected-PID cleanup on the MCP actor.
+    ///
+    /// The non-blocking `waitpid(WNOHANG)` here will usually return before the
+    /// child exits, leaving a zombie. A detached `Task` is scheduled to reap the
+    /// process asynchronously via `ProcessTermination.terminateAndReap`, which
+    /// sends a follow-up SIGTERM (harmless if the child already exited) and
+    /// waits for exit so the zombie is collected.
+    private func performSynchronousDeinitCleanup() {
+        closeOutputChannelsAndInput()
+
+        if let process {
+            let pid = process.pid
+            let processGroupID = process.processGroupID
+            ProcessTermination.signalProcessGroupOrPID(
+                pid: pid,
+                processGroupID: processGroupID,
+                signal: SIGTERM
+            )
+            var status: Int32 = 0
+            _ = Darwin.waitpid(pid, &status, WNOHANG)
+            // Schedule an async reap so the child is collected even if the
+            // non-blocking waitpid above did not reap it. The detached task is
+            // cancellation-shielded by design — the actor is already gone.
+            Task.detached(priority: .utility) {
+                _ = await ProcessTermination.terminateAndReap(pid: pid, processGroupID: processGroupID)
+            }
+        }
+
+        scheduleExpectedAgentPIDDeinitClearIfNeeded()
+    }
+
+    private func closeOutputChannelsAndInput() {
+        stdoutChunkChannel?.finish()
+        stderrChunkChannel?.finish()
+        stdoutConsumerTask?.cancel()
+        stderrConsumerTask?.cancel()
+
+        stdoutChunkChannel = nil
+        stderrChunkChannel = nil
+        stdoutConsumerTask = nil
+        stderrConsumerTask = nil
+
+        if let process {
+            process.stdout.readabilityHandler = nil
+            process.stderr.readabilityHandler = nil
+            process.stdin?.closeFile()
+        }
+    }
+
+    /// Clears MCP expected-agent PID registration when async `shutdown()` did not run.
+    private func scheduleExpectedAgentPIDDeinitClearIfNeeded() {
+        guard config.toolContext == .agentRun,
+              let registeredExpectedAgentPID,
+              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+        else {
+            return
+        }
+        let pid = registeredExpectedAgentPID
+        let runID = runID
+        Task {
+            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+        }
+    }
+
     var hasTurnInFlight: Bool {
         pendingTurnIDHead < pendingTurnIDBuffer.count
     }
@@ -450,23 +525,13 @@ final actor ClaudeNativeProcessSessionController {
         clearTurnIDQueue()
         cancelAuthoritativeLifecycleState()
 
-        // Tear down chunk channels and consumer tasks before process cleanup.
-        stdoutChunkChannel?.finish()
-        stderrChunkChannel?.finish()
-        stdoutConsumerTask?.cancel()
-        stderrConsumerTask?.cancel()
-        stdoutChunkChannel = nil
-        stderrChunkChannel = nil
-        stdoutConsumerTask = nil
-        stderrConsumerTask = nil
+        closeOutputChannelsAndInput()
 
         if let process {
-            process.stdout.readabilityHandler = nil
-            process.stderr.readabilityHandler = nil
-            process.stdin?.closeFile()
             let pid = process.pid
             _ = await ProcessTermination.terminateAndReap(
                 pid: pid,
+                processGroupID: process.processGroupID,
                 logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
             )
         }
@@ -567,6 +632,7 @@ final actor ClaudeNativeProcessSessionController {
             process = nil
             _ = await ProcessTermination.terminateAndReap(
                 pid: spawned.pid,
+                processGroupID: spawned.processGroupID,
                 logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
             )
             throw ControllerError.initializationFailed("Failed to start Claude process readers: \(error.localizedDescription)")
@@ -1893,6 +1959,15 @@ final actor ClaudeNativeProcessSessionController {
         return (stream, continuation)
     }
 
+    /// Non-empty system-prompt suffix that makes the CLI emit its interactive `You are Claude Code…`
+    /// identity preamble instead of the Agent SDK `You are a Claude agent…` form. z.ai (GLM)
+    /// selectively rejects the Agent SDK self-identification under peak load with a misleading 529
+    /// `overloaded` that exhausts the CLI's retry budget and fails the run; the interactive form is
+    /// never shed. Empty/whitespace-only values are ignored by the CLI, so this must be a real token,
+    /// and it deliberately avoids the trigger words ("Claude"/"Anthropic"/"agent"/"SDK") so it cannot
+    /// reintroduce the shedding. See https://github.com/repoprompt/repoprompt-ce/issues/295.
+    private static let glmZAIAppendSystemPrompt = "Running within RepoPrompt CE."
+
     private func buildArguments(
         existingSessionID: String?,
         model: String?
@@ -1905,6 +1980,12 @@ final actor ClaudeNativeProcessSessionController {
         ]
 
         args.append(contentsOf: ["--permission-prompt-tool", "stdio"])
+
+        // GLM/z.ai sheds requests carrying the Agent SDK identity preamble under load (see #295).
+        // Any non-empty --append-system-prompt flips the CLI onto the never-shed "Claude Code" preamble.
+        if config.runtimeVariant == .glm {
+            args.append(contentsOf: ["--append-system-prompt", Self.glmZAIAppendSystemPrompt])
+        }
 
         if let existingSessionID, !existingSessionID.isEmpty {
             args.append(contentsOf: ["--resume", existingSessionID])

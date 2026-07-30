@@ -973,7 +973,7 @@ enum AgentModelCatalog {
         }
     }
 
-    private static let claudeMenuEffortOrder: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .max, .xhigh]
+    private static let claudeMenuEffortOrder: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .xhigh, .max]
 
     private static func supportedClaudeEfforts(forBaseModelRaw baseModelRaw: String, agentKind: AgentProviderKind?) -> [ClaudeCodeEffortLevel] {
         claudeMenuEffortOrder.filter {
@@ -1813,7 +1813,7 @@ enum AgentModelCatalog {
         switch kind {
         case .explore:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexLow.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolLow.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: ClaudeModelSpecifier.encodedRaw(baseModelRaw: AgentModel.claudeSonnet.rawValue, effort: .high)),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeHaiku.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeHaiku.rawValue),
@@ -1825,7 +1825,7 @@ enum AgentModelCatalog {
             ]
         case .engineer:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexLow.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
@@ -1834,7 +1834,7 @@ enum AgentModelCatalog {
             ]
         case .pair:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexHigh.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolHigh.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeOpus.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
@@ -1848,7 +1848,7 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt55CodexMedium.rawValue)
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue)
             ]
         }
     }

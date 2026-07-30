@@ -238,32 +238,12 @@ final class AgentModeProviderBindingService {
         preferences.setPermissionLevel(id)
     }
 
-    func setCodexBashToolEnabled(_ enabled: Bool) {
-        preferences.setCodexBashToolEnabled(enabled)
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) {
+        preferences.applyCodexToolSettingMutation(mutation)
     }
 
-    func setCodexSearchToolEnabled(_ enabled: Bool) {
-        preferences.setCodexSearchToolEnabled(enabled)
-    }
-
-    func setCodexGoalSupportEnabled(_ enabled: Bool) {
-        preferences.setCodexGoalSupportEnabled(enabled)
-    }
-
-    func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
-        preferences.setCodexMCPServerEnabled(normalizedName: normalizedName, enabled: enabled)
-    }
-
-    func setClaudeBashToolEnabled(_ enabled: Bool) {
-        preferences.setClaudeBashToolEnabled(enabled)
-    }
-
-    func setClaudeMCPStrictModeEnabled(_ enabled: Bool) {
-        preferences.setClaudeMCPStrictModeEnabled(enabled)
-    }
-
-    func setClaudeToolSearchEnabled(_ enabled: Bool) {
-        preferences.setClaudeToolSearchEnabled(enabled)
+    func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) {
+        preferences.applyClaudeToolSettingMutation(mutation)
     }
 
     func setClaudeEffortLevel(_ level: ClaudeCodeEffortLevel) {
@@ -294,10 +274,6 @@ final class AgentModeProviderBindingService {
             agentKind: agentKind,
             defaults: preferences.defaults
         )
-    }
-
-    func setClaudeAgentModePromptDelivery(_ delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery) {
-        preferences.setClaudeAgentModePromptDelivery(delivery)
     }
 
     func bumpRevision(for providerID: AgentProviderBindingID) {

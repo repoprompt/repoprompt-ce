@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class AgentSelectedFilePreviewLifecycleTests: XCTestCase {
@@ -228,7 +228,6 @@ final class AgentSelectedFilePreviewLifecycleTests: XCTestCase {
         return AgentContextExportRow(
             id: resolvedID,
             kind: kind,
-            physicalPath: "/tmp/RepoPromptTests/\(resolvedRelativePath)",
             rootID: rootID,
             relativePath: resolvedRelativePath,
             displayPath: resolvedRelativePath,

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 extension FileSystemService {
@@ -48,8 +49,8 @@ extension FileSystemService {
             let childRel = relFolder.isEmpty ? name : "\(relFolder)/\(name)"
             let isDirEntry = entry.isDir
 
-            // Skip directory symlinks if configured
-            if entry.isSym, skipSymlinks, isDirEntry {
+            // Skip all symlinks if configured
+            if entry.isSym, skipSymlinks {
                 continue
             }
 
@@ -92,38 +93,63 @@ extension FileSystemService {
             }
         #endif
 
+        let originalVisitedInventory = visitedInventory.captureState()
+        let originalPathComponentsCache = pathCompsCache
+
+        var missingFolderDeltas: [FileSystemDelta] = []
+        var existingFolders: [String] = []
+        existingFolders.reserveCapacity(cappedFolders.count)
+        for folder in cappedFolders {
+            if let deltas = removeSubtreeIfFolderMissing(folder) {
+                missingFolderDeltas.append(contentsOf: deltas)
+            } else {
+                existingFolders.append(folder)
+            }
+        }
+
+        guard !existingFolders.isEmpty else {
+            return FolderScanBatchResult(deltas: missingFolderDeltas, scannedFolders: scannedFolders)
+        }
+
         // In test mode, use the same cap but scan serially to avoid SpyFS thread-safety issues.
         #if DEBUG
             if isTestMode {
-                var deltas: [FileSystemDelta] = []
-                for folder in cappedFolders {
-                    let folderDeltas = try await scanOneLevelAndDiff(folder)
-                    deltas.append(contentsOf: folderDeltas)
+                return try await withScanStateRestore(
+                    inventory: originalVisitedInventory,
+                    pathCompsCache: originalPathComponentsCache
+                ) {
+                    var deltas: [FileSystemDelta] = []
+                    for folder in existingFolders {
+                        let folderDeltas = try await scanOneLevelAndDiff(folder)
+                        deltas.append(contentsOf: folderDeltas)
+                    }
+                    return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
                 }
-                return FolderScanBatchResult(deltas: deltas, scannedFolders: scannedFolders)
             }
         #endif
 
         // For small sets, just use serial scanning
-        if cappedFolders.count <= 2 {
-            var deltas: [FileSystemDelta] = []
-            for folder in cappedFolders {
-                let folderDeltas = try await scanOneLevelAndDiff(folder)
-                deltas.append(contentsOf: folderDeltas)
+        if existingFolders.count <= 2 {
+            return try await withScanStateRestore(
+                inventory: originalVisitedInventory,
+                pathCompsCache: originalPathComponentsCache
+            ) {
+                var deltas: [FileSystemDelta] = []
+                for folder in existingFolders {
+                    let folderDeltas = try await scanOneLevelAndDiff(folder)
+                    deltas.append(contentsOf: folderDeltas)
+                }
+                return FolderScanBatchResult(deltas: missingFolderDeltas + deltas, scannedFolders: scannedFolders)
             }
-            return FolderScanBatchResult(deltas: deltas, scannedFolders: scannedFolders)
         }
 
         // Use parallel scanning for larger sets with BOUNDED CONCURRENCY
         var aggregatedDeltas = [FileSystemDelta]()
-        let originalVisitedPaths = visitedPaths
-        let originalVisitedItems = visitedItems
-        let originalPathCompsCache = pathCompsCache
 
         // Use configured parallelism cap (prevents CPU saturation)
-        let maxParallel = min(cappedFolders.count, maxParallelScansPerActor)
+        let maxParallel = min(existingFolders.count, maxParallelScansPerActor)
 
-        let targetParents = scannedFolders
+        let targetParents = Set(existingFolders)
         var preservedChildrenByFolder: [String: Set<String>] = [:]
         preservedChildrenByFolder.reserveCapacity(targetParents.count)
         for path in visitedPaths {
@@ -133,7 +159,7 @@ extension FileSystemService {
             }
         }
 
-        var folderIterator = cappedFolders.makeIterator()
+        var folderIterator = existingFolders.makeIterator()
         var inFlight = 0
 
         // Capture ignoreRules before entering the task group to avoid actor isolation issues
@@ -230,16 +256,40 @@ extension FileSystemService {
                 }
             }
         } catch {
-            visitedPaths = originalVisitedPaths
-            visitedItems = originalVisitedItems
-            pathCompsCache = originalPathCompsCache
+            restoreScanState(inventory: originalVisitedInventory, pathCompsCache: originalPathComponentsCache)
             throw error
         }
 
-        return FolderScanBatchResult(deltas: aggregatedDeltas, scannedFolders: scannedFolders)
+        return FolderScanBatchResult(deltas: missingFolderDeltas + aggregatedDeltas, scannedFolders: scannedFolders)
+    }
+
+    private func withScanStateRestore<T>(
+        inventory: FileSystemVisitedInventory.State,
+        pathCompsCache: PathComponentsCache,
+        operation: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await operation()
+        } catch {
+            restoreScanState(inventory: inventory, pathCompsCache: pathCompsCache)
+            throw error
+        }
+    }
+
+    private func restoreScanState(inventory: FileSystemVisitedInventory.State, pathCompsCache: PathComponentsCache) {
+        visitedInventory.restore(inventory)
+        self.pathCompsCache = pathCompsCache
     }
 
     // MARK: - Single-level scanning & removal
+
+    private func removeSubtreeIfFolderMissing(_ folderRelPath: String) -> [FileSystemDelta]? {
+        let absFolder = fullPath(forRelativePath: folderRelPath)
+        var isDir: ObjCBool = false
+        let folderExists = fm.fileExists(atPath: absFolder, isDirectory: &isDir)
+        guard !folderExists || !isDir.boolValue else { return nil }
+        return removeSubtree(for: folderRelPath)
+    }
 
     func scanOneLevelAndDiff(_ folderRelPath: String) async throws -> [FileSystemDelta] {
         #if DEBUG
@@ -256,19 +306,16 @@ extension FileSystemService {
                 )
             }
         #endif
-        let fm = fm // Cache for multiple calls in this method
         let absFolder = fullPath(forRelativePath: folderRelPath)
-        var isDir: ObjCBool = false
-        let folderExists = fm.fileExists(atPath: absFolder, isDirectory: &isDir)
 
         // 1) If missing or not a directory => remove entire subtree
-        if !folderExists || !isDir.boolValue {
-            return removeSubtree(for: folderRelPath)
+        if let missingDeltas = removeSubtreeIfFolderMissing(folderRelPath) {
+            return missingDeltas
         }
 
         // 2) Single-level listing using POSIX directory scanning
         #if DEBUG
-            let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: self.fm)
+            let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: fm)
         #else
             let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder)
         #endif
@@ -298,7 +345,7 @@ extension FileSystemService {
             let childRel = folderRelPath.isEmpty ? name : "\(folderRelPath)/\(name)"
             let comps = pathCompsCache.components(for: childRel)
             let isDirEntry = entry.isDir
-            if entry.isSym, skipSymlinks, isDirEntry {
+            if entry.isSym, skipSymlinks {
                 continue
             }
             var ignoredAsDir = false
@@ -337,7 +384,7 @@ extension FileSystemService {
         mergeIgnoreCache(deltaCache)
 
         let actualSet = Set(actualChildren)
-        let oldSet = visitedPaths.filter { parentDirectory(of: $0) == folderRelPath }
+        let oldSet = Set(visitedPaths.filter { parentDirectory(of: $0) == folderRelPath })
 
         let newItems = actualSet.subtracting(oldSet)
         let removedItems = oldSet.subtracting(actualSet)
@@ -399,43 +446,43 @@ extension FileSystemService {
             skipSymlinks: skipSymlinks,
             baseRelativePath: ""
         )
-        let previousItems = visitedItems
         var reconciledItems = actualItems
         for relativePath in explicitlyManagedIgnoredFilePaths
-            where previousItems[relativePath] == false && actualItems[relativePath] == nil
+            where visitedItems[relativePath] == false && actualItems[relativePath] == nil
         {
             let eligibility = await catalogRegularFileEligibility(relativePath: relativePath)
             if case .ineligible(.ignored) = eligibility {
                 reconciledItems[relativePath] = false
             }
         }
-        let previousPaths = Set(previousItems.keys)
-        let actualPaths = Set(reconciledItems.keys)
-        let typeChangedPaths = Set(previousPaths.intersection(actualPaths).filter {
-            previousItems[$0] != reconciledItems[$0]
-        })
-
-        let removedPaths = previousPaths.subtracting(actualPaths).union(typeChangedPaths)
-            .sorted { lhs, rhs in
-                let lhsDepth = lhs.split(separator: "/").count
-                let rhsDepth = rhs.split(separator: "/").count
-                return lhsDepth == rhsDepth ? lhs > rhs : lhsDepth > rhsDepth
+        var remainingItems = reconciledItems
+        var removedItems: [(path: String, wasDirectory: Bool)] = []
+        var retainedFiles: [String] = []
+        for previous in visitedItems {
+            if let currentType = reconciledItems[previous.key], currentType == previous.value {
+                remainingItems.removeValue(forKey: previous.key)
+                if !currentType { retainedFiles.append(previous.key) }
+            } else {
+                removedItems.append((previous.key, previous.value))
             }
-        let addedPaths = actualPaths.subtracting(previousPaths).union(typeChangedPaths)
-        let addedFolders = addedPaths.filter { reconciledItems[$0] == true }.sorted { lhs, rhs in
+        }
+        removedItems.sort { lhs, rhs in
+            let lhsDepth = lhs.path.split(separator: "/").count
+            let rhsDepth = rhs.path.split(separator: "/").count
+            return lhsDepth == rhsDepth ? lhs.path > rhs.path : lhsDepth > rhsDepth
+        }
+        let addedFolders = remainingItems.keys.filter { remainingItems[$0] == true }.sorted { lhs, rhs in
             let lhsDepth = lhs.split(separator: "/").count
             let rhsDepth = rhs.split(separator: "/").count
             return lhsDepth == rhsDepth ? lhs < rhs : lhsDepth < rhsDepth
         }
-        let addedFiles = addedPaths.filter { reconciledItems[$0] == false }.sorted()
-        let retainedFiles = actualPaths.intersection(previousPaths).subtracting(typeChangedPaths)
-            .filter { reconciledItems[$0] == false }
-            .sorted()
+        let addedFiles = remainingItems.keys.filter { remainingItems[$0] == false }.sorted()
+        retainedFiles.sort()
 
         var deltas: [FileSystemDelta] = []
-        deltas.reserveCapacity(removedPaths.count + addedPaths.count + retainedFiles.count)
-        for relativePath in removedPaths {
-            deltas.append(previousItems[relativePath] == true ? .folderRemoved(relativePath) : .fileRemoved(relativePath))
+        deltas.reserveCapacity(removedItems.count + remainingItems.count + retainedFiles.count)
+        for removed in removedItems {
+            deltas.append(removed.wasDirectory ? .folderRemoved(removed.path) : .fileRemoved(removed.path))
         }
         deltas.append(contentsOf: addedFolders.map(FileSystemDelta.folderAdded))
         deltas.append(contentsOf: addedFiles.map(FileSystemDelta.fileAdded))
@@ -444,8 +491,7 @@ extension FileSystemService {
             deltas.append(.fileModified(relativePath, modificationDate))
         }
 
-        visitedPaths = actualPaths
-        visitedItems = reconciledItems
+        visitedInventory.installOrdinary(paths: Set(reconciledItems.keys), items: reconciledItems)
         pathCompsCache.removeAll()
         return deltas
     }
@@ -501,6 +547,94 @@ extension FileSystemService {
             }
         }
         return deltas
+    }
+
+    /// Produces a standalone, exact namespace manifest through the same streaming
+    /// crawler used by ordinary root loading. This does not publish or seed a root.
+    func workspaceRootNamespaceManifest(
+        in store: WorkspaceRootNamespaceManifestStore,
+        resourcePolicy: WorkspaceRootNamespaceManifestResourcePolicy = .default,
+        chunkSize: Int = 200
+    ) async throws -> WorkspaceRootNamespaceManifestLease {
+        guard pendingIgnoreRulesRebuildCount == 0 else {
+            throw WorkspaceRootNamespaceManifestError.corrupt("workspace ignore rules rebuild pending during enumeration")
+        }
+        let initialRootIdentity = try WorkspaceRootNamespaceRootIdentity(rootURL: rootURL)
+        let initialCatalogPolicyIdentity = catalogPolicyIdentity
+        let initialIgnoreRulesRevision = ignoreRulesRevision
+        let writer = try store.makeWriter(
+            identity: WorkspaceRootNamespaceManifestIdentity(
+                root: initialRootIdentity,
+                catalogPolicy: initialCatalogPolicyIdentity
+            ),
+            resourcePolicy: resourcePolicy
+        )
+
+        do {
+            let stream = loadContentsInChunks(of: rootURL, chunkSize: chunkSize)
+            for try await event in stream {
+                try Task.checkCancellation()
+                switch event {
+                case let .preparedItems(chunk):
+                    var records: [WorkspaceRootNamespaceRecord] = []
+                    records.reserveCapacity(chunk.folders.count + chunk.files.count)
+                    for folder in chunk.folders {
+                        records.append(Self.workspaceRootNamespaceRecord(for: folder))
+                    }
+                    for file in chunk.files {
+                        records.append(Self.workspaceRootNamespaceRecord(for: file))
+                    }
+                    try await writer.append(contentsOf: records)
+
+                case let .items(items):
+                    var records: [WorkspaceRootNamespaceRecord] = []
+                    records.reserveCapacity(items.count)
+                    for (item, _) in items {
+                        let relativePath = item.relativePath(rootPath: rootURL.path)
+                        records.append(WorkspaceRootNamespaceRecord(
+                            relativePath: relativePath,
+                            kind: item is Folder ? .directory : .file,
+                            isSymbolicLink: false
+                        ))
+                    }
+                    try await writer.append(contentsOf: records)
+
+                case .totalFileCount:
+                    continue
+                }
+            }
+
+            try Task.checkCancellation()
+            #if DEBUG
+                if let handler = workspaceRootNamespaceEnumerationWillFinishHandler {
+                    await handler()
+                }
+            #endif
+            let lease = try await writer.finish()
+            let finalRootIdentity = try WorkspaceRootNamespaceRootIdentity(rootURL: rootURL)
+            guard finalRootIdentity == initialRootIdentity else {
+                throw WorkspaceRootNamespaceManifestError.corrupt("workspace root changed during enumeration")
+            }
+            guard pendingIgnoreRulesRebuildCount == 0,
+                  catalogPolicyIdentity == initialCatalogPolicyIdentity,
+                  ignoreRulesRevision == initialIgnoreRulesRevision
+            else {
+                throw WorkspaceRootNamespaceManifestError.corrupt("workspace ignore policy changed or rebuild pending during enumeration")
+            }
+            return lease
+        } catch {
+            await writer.cancel()
+            throw error
+        }
+    }
+
+    static func workspaceRootNamespaceRecord(for item: FSItemDTO) -> WorkspaceRootNamespaceRecord {
+        WorkspaceRootNamespaceRecord(
+            relativePathBytes: item.relativePathBytes,
+            kind: item.isDirectory ? .directory : .file,
+            isSymbolicLink: item.isSymbolicLink,
+            fileSystemMode: item.fileSystemMode
+        )
     }
 
     public func loadContentsInChunks(
@@ -628,6 +762,7 @@ extension FileSystemService {
     struct DirectoryContext {
         let absPath: String
         let relPath: String
+        let relPathBytes: Data
         let hierarchy: Int
         let rules: IgnoreRulesSnapshot
         let chain: DirChain?
@@ -646,14 +781,13 @@ extension FileSystemService {
         scanResult: DirectoryScanResult,
         skipSymlinks: Bool,
         enableHierarchicalIgnores: Bool,
-        respectGitignore: Bool,
         respectRepoIgnore: Bool,
         respectCursorignore: Bool,
         trackCycles: Bool
     ) async throws -> DirectoryChunkResult {
         let effectiveRulesSnapshot: IgnoreRulesSnapshot
         if enableHierarchicalIgnores {
-            let hasGitignore = scanResult.hasGitignore && respectGitignore
+            let hasGitignore = scanResult.hasGitignore
             let hasRepoIgnore = scanResult.hasRepoIgnore && respectRepoIgnore
             let hasCursorignore = scanResult.hasCursorignore && respectCursorignore
             if hasGitignore || hasRepoIgnore || hasCursorignore {
@@ -691,6 +825,10 @@ extension FileSystemService {
             if name == ".git" { continue }
             if Self.isRepoPromptTempFilename(name) { continue }
             let relativePath = context.relPath.isEmpty ? name : "\(context.relPath)/\(name)"
+            let relativePathBytes = Self.joinRelativePathBytes(
+                base: context.relPathBytes,
+                child: entry.nameBytes
+            )
             guard !relativePath.isEmpty else { continue }
             let hierarchy = context.hierarchy + 1
             let comps = componentsCache.components(for: relativePath)
@@ -724,14 +862,17 @@ extension FileSystemService {
                 continue
             }
 
-            if isDirEntry {
-                if entry.isSym, skipSymlinks { continue }
+            if entry.isSym, skipSymlinks { continue }
 
+            if isDirEntry {
                 folders.append(
                     FSItemDTO(
                         relativePath: relativePath,
+                        relativePathBytes: relativePathBytes,
                         isDirectory: true,
-                        hierarchy: hierarchy
+                        hierarchy: hierarchy,
+                        isSymbolicLink: entry.isSym,
+                        fileSystemMode: entry.fileSystemMode
                     )
                 )
 
@@ -747,6 +888,7 @@ extension FileSystemService {
                         DirectoryContext(
                             absPath: absolutePath,
                             relPath: relativePath,
+                            relPathBytes: relativePathBytes,
                             hierarchy: hierarchy,
                             rules: effectiveRulesSnapshot,
                             chain: childChain
@@ -757,6 +899,7 @@ extension FileSystemService {
                         DirectoryContext(
                             absPath: absolutePath,
                             relPath: relativePath,
+                            relPathBytes: relativePathBytes,
                             hierarchy: hierarchy,
                             rules: effectiveRulesSnapshot,
                             chain: nil
@@ -767,8 +910,11 @@ extension FileSystemService {
                 files.append(
                     FSItemDTO(
                         relativePath: relativePath,
+                        relativePathBytes: relativePathBytes,
                         isDirectory: false,
-                        hierarchy: hierarchy
+                        hierarchy: hierarchy,
+                        isSymbolicLink: entry.isSym,
+                        fileSystemMode: entry.fileSystemMode
                     )
                 )
             }
@@ -792,6 +938,14 @@ extension FileSystemService {
             return root + relative
         }
         return root + "/" + relative
+    }
+
+    static func joinRelativePathBytes(base: Data, child: Data) -> Data {
+        guard !base.isEmpty else { return child }
+        var result = base
+        result.append(UInt8(ascii: "/"))
+        result.append(child)
+        return result
     }
 
     func walkPosixRecursivelyEmitChunks(
@@ -825,6 +979,7 @@ extension FileSystemService {
             DirectoryContext(
                 absPath: rootFullPath,
                 relPath: "",
+                relPathBytes: Data(),
                 hierarchy: -1,
                 rules: parentRules.snapshot(),
                 chain: rootChain
@@ -861,7 +1016,6 @@ extension FileSystemService {
             directories.removeFirst(batch.count)
 
             let enableHierarchicalIgnores = enableHierarchicalIgnores
-            let respectGitignore = respectGitignore
             let respectRepoIgnore = respectRepoIgnore
             let respectCursorignore = respectCursorignore
 
@@ -874,7 +1028,6 @@ extension FileSystemService {
                             isVirtualFS,
                             skipSymlinks,
                             enableHierarchicalIgnores,
-                            respectGitignore,
                             respectRepoIgnore,
                             respectCursorignore
                         ] in
@@ -884,7 +1037,6 @@ extension FileSystemService {
                                 isVirtualFS: isVirtualFS,
                                 skipSymlinks: skipSymlinks,
                                 enableHierarchicalIgnores: enableHierarchicalIgnores,
-                                respectGitignore: respectGitignore,
                                 respectRepoIgnore: respectRepoIgnore,
                                 respectCursorignore: respectCursorignore
                             )
@@ -895,7 +1047,6 @@ extension FileSystemService {
                             context,
                             skipSymlinks,
                             enableHierarchicalIgnores,
-                            respectGitignore,
                             respectRepoIgnore,
                             respectCursorignore
                         ] in
@@ -904,7 +1055,6 @@ extension FileSystemService {
                                 context: context,
                                 skipSymlinks: skipSymlinks,
                                 enableHierarchicalIgnores: enableHierarchicalIgnores,
-                                respectGitignore: respectGitignore,
                                 respectRepoIgnore: respectRepoIgnore,
                                 respectCursorignore: respectCursorignore
                             )
@@ -970,7 +1120,7 @@ extension FileSystemService {
                     _ = fs.fileExists(atPath: url.path, isDirectory: &isDirFlag)
 
                     let isSym = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
-                    if skipSymlinks && isDirFlag.boolValue && isSym {
+                    if skipSymlinks && isSym {
                         continue
                     }
 
@@ -1003,7 +1153,6 @@ extension FileSystemService {
             isVirtualFS: Bool,
             skipSymlinks: Bool,
             enableHierarchicalIgnores: Bool,
-            respectGitignore: Bool,
             respectRepoIgnore: Bool,
             respectCursorignore: Bool
         ) async throws -> DirectoryChunkResult {
@@ -1023,7 +1172,6 @@ extension FileSystemService {
                 scanResult: scanResult,
                 skipSymlinks: skipSymlinks,
                 enableHierarchicalIgnores: enableHierarchicalIgnores,
-                respectGitignore: respectGitignore,
                 respectRepoIgnore: respectRepoIgnore,
                 respectCursorignore: respectCursorignore,
                 trackCycles: trackCycles
@@ -1035,7 +1183,6 @@ extension FileSystemService {
             context: DirectoryContext,
             skipSymlinks: Bool,
             enableHierarchicalIgnores: Bool,
-            respectGitignore: Bool,
             respectRepoIgnore: Bool,
             respectCursorignore: Bool
         ) async throws -> DirectoryChunkResult {
@@ -1048,7 +1195,6 @@ extension FileSystemService {
                 scanResult: scanResult,
                 skipSymlinks: skipSymlinks,
                 enableHierarchicalIgnores: enableHierarchicalIgnores,
-                respectGitignore: respectGitignore,
                 respectRepoIgnore: respectRepoIgnore,
                 respectCursorignore: respectCursorignore,
                 trackCycles: trackCycles
@@ -1138,7 +1284,6 @@ extension FileSystemService {
             }
         #endif
         let enableHierarchicalIgnores = enableHierarchicalIgnores
-        let respectGitignore = respectGitignore
         let respectRepoIgnore = respectRepoIgnore
         let respectCursorignore = respectCursorignore
 
@@ -1150,6 +1295,7 @@ extension FileSystemService {
             DirectoryContext(
                 absPath: rootPath,
                 relPath: baseRelativePath,
+                relPathBytes: Data(baseRelativePath.utf8),
                 hierarchy: -1,
                 rules: parentRulesSnapshot,
                 chain: rootChain
@@ -1167,7 +1313,6 @@ extension FileSystemService {
                     isVirtualFS: isVirtualFS,
                     skipSymlinks: skipSymlinks,
                     enableHierarchicalIgnores: enableHierarchicalIgnores,
-                    respectGitignore: respectGitignore,
                     respectRepoIgnore: respectRepoIgnore,
                     respectCursorignore: respectCursorignore
                 )
@@ -1177,7 +1322,6 @@ extension FileSystemService {
                     context: context,
                     skipSymlinks: skipSymlinks,
                     enableHierarchicalIgnores: enableHierarchicalIgnores,
-                    respectGitignore: respectGitignore,
                     respectRepoIgnore: respectRepoIgnore,
                     respectCursorignore: respectCursorignore
                 )

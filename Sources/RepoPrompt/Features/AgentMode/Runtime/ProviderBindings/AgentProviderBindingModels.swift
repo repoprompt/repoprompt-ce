@@ -189,6 +189,21 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     }
 }
 
+enum CodexToolSettingMutation: Equatable {
+    case bashTool(enabled: Bool)
+    case searchTool(enabled: Bool)
+    case goalSupport(enabled: Bool)
+    case reasoningSummaries(enabled: Bool)
+    case mcpServer(normalizedName: String, enabled: Bool)
+}
+
+enum ClaudeToolSettingMutation: Equatable {
+    case bashTool(enabled: Bool)
+    case mcpStrictMode(enabled: Bool)
+    case toolSearch(enabled: Bool)
+    case agentModePromptDelivery(delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery)
+}
+
 /// Persisted Codex tool preference snapshot for editing/display.
 ///
 /// Permission profiles are applied through `AgentProviderRuntimePermissionBinding`; these
@@ -198,6 +213,9 @@ struct CodexToolSettingsBinding: Equatable {
     let bashToolEnabled: Bool
     let searchToolEnabled: Bool
     let goalSupportEnabled: Bool
+    /// Controls Codex Agent Mode app-server reasoning summary config only; this is not a
+    /// general model reasoning-effort preference.
+    let reasoningSummariesEnabled: Bool
     let mcpServerEntries: [MCPIntegrationHelper.CodexServerEntry]
     /// Keys are lowercased/trimmed toggle keys derived from each entry's normalized name,
     /// matching the current AgentInputBar lookup convention.

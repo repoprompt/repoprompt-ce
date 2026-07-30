@@ -18,6 +18,10 @@ fail() {
     exit 1
 }
 
+sentry_linking_enabled() {
+    [[ "${REPOPROMPT_ENABLE_SENTRY:-}" == "1" ]]
+}
+
 run() {
     printf '+ '
     printf '%q ' "$@"
@@ -74,6 +78,11 @@ esac
 run mkdir -p "$SCRATCH_ROOT"
 printf 'RepoPrompt CE universal public SwiftPM scratch\n' > "$SCRATCH_ROOT/$SCRATCH_SENTINEL_NAME"
 
+SWIFT_BUILD_ARGS=(-c release)
+if sentry_linking_enabled; then
+    SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)
+fi
+
 ARM64_BIN_DIR=""
 X86_64_BIN_DIR=""
 for arch in arm64 x86_64; do
@@ -83,18 +92,18 @@ for arch in arm64 x86_64; do
         REPOPROMPT_SWIFTPM_SCRATCH_PATH="$scratch" \
         "$KEYBOARD_SHORTCUTS_PATCH_HELPER" "$ROOT_DIR"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build \
-        -c release \
+        "${SWIFT_BUILD_ARGS[@]}" \
         --arch "$arch" \
         --scratch-path "$scratch" \
         --product RepoPrompt
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build \
-        -c release \
+        "${SWIFT_BUILD_ARGS[@]}" \
         --arch "$arch" \
         --scratch-path "$scratch" \
         --product repoprompt-mcp
-    printf '+ %q ' "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c release --arch "$arch" --scratch-path "$scratch" --show-bin-path
+    printf '+ %q ' "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$scratch" --show-bin-path
     printf '\n'
-    bin_dir="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c release --arch "$arch" --scratch-path "$scratch" --show-bin-path)"
+    bin_dir="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$scratch" --show-bin-path)"
     if [[ "$arch" == "arm64" ]]; then
         ARM64_BIN_DIR="$bin_dir"
     else

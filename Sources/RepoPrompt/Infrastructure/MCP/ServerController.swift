@@ -201,7 +201,9 @@ final actor ServerController: ObservableObject {
     }
 
     deinit {
-        // No cleanup needed - callbacks are weak self
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
     }
 
     // MARK: – Allow-list helpers –

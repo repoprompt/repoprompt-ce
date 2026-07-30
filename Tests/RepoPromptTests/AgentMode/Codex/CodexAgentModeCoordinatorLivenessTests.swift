@@ -1,9 +1,120 @@
+import Combine
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
+    func testThreadSnapshotParsesAuthoritativeActiveCommandItem() throws {
+        let itemID = UUID().uuidString
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [[
+                        "id": "turn",
+                        "status": "inProgress",
+                        "itemsView": "full",
+                        "items": [[
+                            "id": itemID,
+                            "type": "commandExecution",
+                            "status": "inProgress",
+                            "processId": "97027"
+                        ]]
+                    ]]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+        let item = try XCTUnwrap(snapshot.activeToolItems.first)
+        XCTAssertEqual(item.turnID, "turn")
+        XCTAssertEqual(item.itemID, itemID)
+        XCTAssertEqual(item.invocationID, UUID(uuidString: itemID))
+        XCTAssertEqual(item.kind, .commandExecution)
+        XCTAssertEqual(item.processID, "97027")
+        XCTAssertEqual(item.status, .inProgress)
+    }
+
+    func testThreadSnapshotPreservesToolIdentityAcrossMultipleActiveTurns() {
+        let firstItemID = UUID().uuidString
+        let secondItemID = UUID().uuidString
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [
+                        [
+                            "id": "turn-a",
+                            "status": "inProgress",
+                            "itemsView": "full",
+                            "items": [[
+                                "id": firstItemID,
+                                "type": "commandExecution",
+                                "status": "inProgress",
+                                "processId": "process-a"
+                            ]]
+                        ],
+                        [
+                            "id": "turn-b",
+                            "status": "inProgress",
+                            "itemsView": "full",
+                            "items": [[
+                                "id": secondItemID,
+                                "type": "commandExecution",
+                                "status": "inProgress",
+                                "processId": "process-b"
+                            ]]
+                        ]
+                    ]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertEqual(snapshot.activeTurnIDs, ["turn-a", "turn-b"])
+        XCTAssertEqual(snapshot.activeToolItems.map(\.turnID), ["turn-a", "turn-b"])
+        XCTAssertEqual(snapshot.activeToolItems.map(\.processID), ["process-a", "process-b"])
+    }
+
+    func testThreadSnapshotWithIncompleteActiveTurnItemsFailsClosed() {
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [
+                        [
+                            "id": "turn-a",
+                            "status": "inProgress",
+                            "itemsView": "full",
+                            "items": []
+                        ],
+                        [
+                            "id": "turn-b",
+                            "status": "inProgress",
+                            "itemsView": "summary",
+                            "items": [[
+                                "id": UUID().uuidString,
+                                "type": "commandExecution",
+                                "status": "inProgress",
+                                "processId": "process-b"
+                            ]]
+                        ]
+                    ]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+
+        XCTAssertFalse(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertEqual(snapshot.activeTurnIDs, ["turn-a", "turn-b"])
+    }
+
     func testActiveThreadSnapshotCountsAsWatchdogLivenessAndReconcilesWaitingFlags() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: ["waiting_for_user_input"]))
         let viewModel = makeViewModel(controller: controller)
@@ -20,6 +131,1026 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertFalse(session.items.contains { item in
             item.kind == .error && item.text.contains("Repo Prompt thinks Codex has stalled")
         })
+    }
+
+    func testRepeatedIdenticalActiveSnapshotReattachesWithoutModelInputOrInterrupt() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            viewModel.test_codexCoordinator.test_codexActiveReattachReconciliationIsComplete(
+                session: session
+            )
+        }
+
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertFalse(controller.startOrResumeObservedCancellationSync())
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["partial answer"])
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNil(session.lastTerminalCommitRevision)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
+    func testCompletionDuringActiveReattachReconciliationIsBufferedAndReplayed() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            postReattachSnapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        defer { snapshotGate.release() }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+                && viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+                    session: session
+                )
+        }
+
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+
+        snapshotGate.release()
+        try await waitUntil {
+            session.runState == .completed
+        }
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["partial answer"])
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testCompletionDuringActiveReattachReconciliationReplaysWhenSnapshotIsIdle() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            postReattachSnapshotStatus: .idle,
+            postReattachActiveTurnIDs: [],
+            postReattachSnapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        defer { snapshotGate.release() }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+                && viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+                    session: session
+                )
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        snapshotGate.release()
+        try await waitUntil {
+            session.runState == .completed
+        }
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testCompletionDuringActiveReattachReconciliationReplaysWhenSnapshotFails() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            failsPostReattachSnapshotRead: true,
+            postReattachSnapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        defer { snapshotGate.release() }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+                && viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+                    session: session
+                )
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        snapshotGate.release()
+        try await waitUntil {
+            session.runState == .completed
+        }
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testChangingActiveSnapshotsRemainValidProgress() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: ["phase-a"]),
+            snapshotSequence: [
+                .active(activeFlags: ["phase-a"]),
+                .active(activeFlags: ["phase-b"])
+            ]
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("progress"),
+            session: session
+        )
+        // Model a suite-loaded watchdog whose first probe begins after the recovery deadline.
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= 3
+        }
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
+    func testActiveToIdleProbeTransitionDoesNotCountAsProgress() async {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            snapshotSequence: [
+                .active(activeFlags: []),
+                .idle,
+                .idle
+            ]
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+        XCTAssertEqual(session.codexWatchdogState.lastAmbiguousProbeKind, "active")
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastAmbiguousProbeKind, "no-active-turn")
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertEqual(session.runState, .running)
+    }
+
+    func testProviderProgressDuringSnapshotProbeSupersedesStaleTerminalization() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            snapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        let recoveryTask = Task {
+            await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+        }
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("fresh provider progress"),
+            session: session
+        )
+        snapshotGate.release()
+
+        let attemptedTerminalSettlement = await recoveryTask.value
+        XCTAssertFalse(attemptedTerminalSettlement)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.codexController)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
+    func testPriorAttemptSuspendedSnapshotProbeCannotSettleSuccessorWithAliasedGeneration() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            snapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let runID = UUID()
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: runID)
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+        let attemptA = try XCTUnwrap(session.activeRunOwnership)
+        let aliasedProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        let recoveryTask = Task {
+            await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+        }
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+        }
+
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: attemptA, source: "test.watchdog.attemptA.terminal"))
+        let attemptB = session.beginRunAttempt(source: "test.watchdog.attemptB")
+        session.runID = runID
+        session.runState = .running
+        session.codexController = controller
+        session.codexWatchdogState = .init()
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, aliasedProgressGeneration)
+        session.codexAuthoritativeActiveTurn = .init(
+            threadID: "fake",
+            turnID: "turn-b",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: attemptB.attemptID
+        )
+        session.codexRoutingObservedTurnID = "turn-b"
+
+        snapshotGate.release()
+
+        let attemptedTerminalSettlement = await recoveryTask.value
+        XCTAssertFalse(attemptedTerminalSettlement)
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertEqual(session.activeRunAttemptID, attemptB.attemptID)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.codexController)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
+    func testAlternatingStableSnapshotAndProbeFailureRemainsRunning() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            failsEveryEvenSnapshotRead: true
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= 4
+        }
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["partial answer"])
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNil(session.lastTerminalCommitRevision)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+        XCTAssertEqual(session.runState, .completed)
+    }
+
+    func testPersistentProbeFailureRecoversOnceThenFailsClearly() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            alwaysFailsSnapshotRead: true
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil(timeout: 15) {
+            session.runState == .failed
+        }
+
+        XCTAssertGreaterThanOrEqual(controller.readSnapshotCountSync(), 5)
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testContinuedActiveSilenceAfterReattachDoesNotLoopOrTerminalize() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            controller.shutdownCountSync() == 1
+        }
+        let snapshotCountAfterReattach = controller.readSnapshotCountSync()
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= snapshotCountAfterReattach + 4
+        }
+
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
+    func testSilentCommandWithoutRunIDSurvivesRecoveryWindowAndLaterCompletes() async throws {
+        let invocationID = UUID()
+        let toolItem = makeCommandToolItem(
+            itemID: UUID(),
+            processID: "97027",
+            status: .inProgress
+        )
+        let unrelatedToolItem = makeCommandToolItem(
+            itemID: UUID(),
+            processID: "unrelated-process",
+            status: .inProgress
+        )
+        XCTAssertNotEqual(invocationID, toolItem.invocationID)
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [toolItem, unrelatedToolItem],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"sleep 420"}"#
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .commandExecutionRunning(.init(
+                invocationID: invocationID,
+                processID: "97027",
+                appendedOutput: nil
+            )),
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= 5
+        }
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().allSatisfy(\.self))
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"sleep 420"}"#,
+                resultJSON: #"{"status":"completed","processId":"97027","exitCode":0}"#,
+                isError: false
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
+    func testSilentCompositeWaitCorrelatesToAuthoritativeCommandAndLaterCompletes() async throws {
+        let itemID = "call_composite_wait_1"
+        let eventParser = CodexNativeSessionController(
+            client: CodexAppServerClient(),
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePaths: .uniform(nil)
+        )
+        let started = try XCTUnwrap(eventParser.test_parseToolLifecycleEvent(
+            method: "item/started",
+            params: [
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": [
+                    "type": "dynamicToolCall",
+                    "id": itemID,
+                    "name": "wait",
+                    "arguments": ["cell_id": "1", "yield_time_ms": 320_000]
+                ]
+            ]
+        ))
+        let invocationID = try XCTUnwrap(started.invocationID)
+        XCTAssertEqual(started.kind, "call")
+        XCTAssertEqual(started.name, "wait")
+
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
+            [
+                "thread": [
+                    "id": "thread",
+                    "status": ["type": "active", "activeFlags": []],
+                    "turns": [[
+                        "id": "turn",
+                        "status": "inProgress",
+                        "itemsView": "full",
+                        "items": [[
+                            "id": itemID,
+                            "type": "commandExecution",
+                            "status": "inProgress",
+                            "processId": "cell:1"
+                        ]]
+                    ]]
+                ]
+            ],
+            fallbackEffort: nil
+        )
+        let toolItem = try XCTUnwrap(snapshot.activeToolItems.first)
+        XCTAssertEqual(toolItem.itemID, itemID)
+        XCTAssertEqual(toolItem.invocationID, invocationID)
+        XCTAssertEqual(toolItem.kind, .commandExecution)
+
+        let controller = LivenessFakeCodexController(
+            snapshot: snapshot.runtimeStatus,
+            activeTurnIDs: snapshot.activeTurnIDs,
+            activeToolItems: snapshot.activeToolItems,
+            hasAuthoritativeActiveTurnItems: snapshot.hasAuthoritativeActiveTurnItems
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        let argsJSON = try XCTUnwrap(started.argsJSON)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: started.name, invocationID: invocationID, argsJSON: argsJSON),
+            session: session
+        )
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.keys.first?.invocationID, invocationID)
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
+        try await waitUntil {
+            controller.readSnapshotCountSync() >= 5
+        }
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().allSatisfy(\.self))
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        let completed = try XCTUnwrap(eventParser.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: [
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": [
+                    "type": "dynamicToolCall",
+                    "id": itemID,
+                    "name": "wait",
+                    "arguments": ["cell_id": "1", "yield_time_ms": 320_000],
+                    "result": ["status": "completed", "cell_id": "1"]
+                ]
+            ]
+        ))
+        XCTAssertEqual(completed.kind, "result")
+        XCTAssertEqual(completed.invocationID, invocationID)
+        try await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: completed.name,
+                invocationID: completed.invocationID,
+                argsJSON: completed.argsJSON,
+                resultJSON: XCTUnwrap(completed.resultJSON),
+                isError: completed.isError
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertEqual(session.items.first(where: { $0.toolInvocationID == invocationID })?.kind, .toolResult)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
+    func testTerminalCommandSnapshotWithoutRunIDClearsStaleSpanAndFailsBoundedly() async throws {
+        let invocationID = UUID()
+        let toolItem = makeCommandToolItem(
+            itemID: UUID(),
+            processID: "97027",
+            status: .terminal
+        )
+        XCTAssertNotEqual(invocationID, toolItem.invocationID)
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [toolItem],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"sleep 420"}"#
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .commandExecutionRunning(.init(
+                invocationID: invocationID,
+                processID: "97027",
+                appendedOutput: nil
+            )),
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-1)
+
+        try await waitUntil {
+            session.runState == .failed
+        }
+
+        XCTAssertGreaterThan(controller.readSnapshotCountSync(), 0)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testTerminalTurnFinalizesPersistedRunningCompositeExecResult() async throws {
+        let invocationID = UUID()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let argsJSON = #"{"cmd":"sleep 420"}"#
+        let runningResultJSON = #"{"type":"commandExecution","status":"running","processId":"cell:1"}"#
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "exec", invocationID: invocationID, argsJSON: argsJSON),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "exec",
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                resultJSON: runningResultJSON,
+                isError: false
+            ),
+            session: session
+        )
+
+        let persistedRunningItem = try XCTUnwrap(session.items.first(where: { $0.toolInvocationID == invocationID }))
+        XCTAssertEqual(persistedRunningItem.kind, .toolResult)
+        XCTAssertEqual(persistedRunningItem.toolName, "exec")
+        XCTAssertTrue(BashToolResultParser.parseLivenessMetadata(raw: persistedRunningItem.toolResultJSON).isRunning)
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertTrue(session.codexNativeToolLiveness.inFlight.isEmpty)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let finalizedItem = try XCTUnwrap(session.items.first(where: { $0.id == persistedRunningItem.id }))
+        let resultData = try XCTUnwrap(finalizedItem.toolResultJSON?.data(using: .utf8))
+        let resultObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: resultData) as? [String: Any]
+        )
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(finalizedItem.toolName, "exec")
+        XCTAssertEqual(finalizedItem.toolInvocationID, invocationID)
+        XCTAssertEqual(resultObject["type"] as? String, "commandExecution")
+        XCTAssertEqual(resultObject["status"] as? String, "completed")
+        XCTAssertEqual(resultObject["exitCode"] as? Int, 0)
+        XCTAssertFalse(BashToolResultParser.parseLivenessMetadata(raw: finalizedItem.toolResultJSON).isRunning)
+        XCTAssertEqual(finalizedItem.toolIsError, false)
+    }
+
+    func testUnrelatedInProgressCommandDoesNotCorroborateLocalSpan() async {
+        let localInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [makeCommandToolItem(
+                itemID: UUID(),
+                processID: "snapshot-process",
+                status: .inProgress
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: localInvocationID,
+            processID: "local-process",
+            viewModel: viewModel,
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(session.bashLiveExecutionByKey.values.filter(\.isRunning).count, 1)
+    }
+
+    func testNamelessMCPItemDoesNotCorroborateNamedLocalSpan() async {
+        let invocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [.init(
+                turnID: "turn",
+                itemID: invocationID.uuidString,
+                invocationID: invocationID,
+                kind: .mcpToolCall,
+                toolName: nil,
+                processID: nil,
+                status: .inProgress
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "lookup", invocationID: invocationID, argsJSON: "{}"),
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+    }
+
+    func testUnrelatedTerminalCommandDoesNotFinalizeOrClearLocalSpan() async {
+        let localInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [makeCommandToolItem(
+                itemID: UUID(),
+                processID: "snapshot-process",
+                status: .terminal
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: localInvocationID,
+            processID: "local-process",
+            viewModel: viewModel,
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        let liveState = session.bashLiveExecutionByKey.values.first
+        XCTAssertEqual(liveState?.invocationID, localInvocationID)
+        XCTAssertEqual(liveState?.isRunning, true)
+    }
+
+    func testTerminalSnapshotAmongMultipleCommandsOnlyClearsExactIdentity() async {
+        let completedInvocationID = UUID()
+        let runningInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [
+                makeCommandToolItem(
+                    itemID: completedInvocationID,
+                    processID: "completed-process",
+                    status: .terminal
+                ),
+                makeCommandToolItem(
+                    itemID: UUID(),
+                    processID: "unrelated-process",
+                    status: .terminal
+                )
+            ],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: completedInvocationID,
+            processID: "completed-process",
+            command: "sleep 1",
+            viewModel: viewModel,
+            session: session
+        )
+        await openRunningCommand(
+            invocationID: runningInvocationID,
+            processID: "running-process",
+            command: "sleep 420",
+            viewModel: viewModel,
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.keys.first?.invocationID, runningInvocationID)
+        let runningStates = session.bashLiveExecutionByKey.values.filter(\.isRunning)
+        XCTAssertEqual(runningStates.count, 1)
+        XCTAssertEqual(runningStates.first?.invocationID, runningInvocationID)
+    }
+
+    func testSnapshotItemFromAnotherActiveTurnCannotAffectCurrentTurnSpan() async {
+        let invocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeTurnIDs: ["turn", "other-turn"],
+            activeToolItems: [makeCommandToolItem(
+                turnID: "other-turn",
+                itemID: invocationID,
+                processID: "97027",
+                status: .terminal
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: invocationID,
+            processID: "97027",
+            viewModel: viewModel,
+            session: session
+        )
+        session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-20)
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+        XCTAssertEqual(session.bashLiveExecutionByKey.values.first?.isRunning, true)
+    }
+
+    func testDuplicateSnapshotProcessHandlesFailClosed() async {
+        let localInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [
+                makeCommandToolItem(
+                    itemID: UUID(),
+                    processID: "shared-process",
+                    status: .inProgress
+                ),
+                makeCommandToolItem(
+                    itemID: UUID(),
+                    processID: "shared-process",
+                    status: .inProgress
+                )
+            ],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: localInvocationID,
+            processID: "shared-process",
+            viewModel: viewModel,
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 1)
+    }
+
+    func testDuplicateLocalProcessHandlesFailClosed() async {
+        let firstInvocationID = UUID()
+        let secondInvocationID = UUID()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            activeToolItems: [makeCommandToolItem(
+                itemID: UUID(),
+                processID: "shared-process",
+                status: .inProgress
+            )],
+            hasAuthoritativeActiveTurnItems: true
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller, runID: nil)
+        await openRunningCommand(
+            invocationID: firstInvocationID,
+            processID: "shared-process",
+            command: "sleep 1",
+            viewModel: viewModel,
+            session: session
+        )
+        await openRunningCommand(
+            invocationID: secondInvocationID,
+            processID: "shared-process",
+            viewModel: viewModel,
+            session: session
+        )
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(session.codexNativeToolLiveness.inFlight.count, 2)
+        XCTAssertEqual(session.bashLiveExecutionByKey.values.filter(\.isRunning).count, 2)
+    }
+
+    func testTurnStartSilenceRemainsRunningWithoutSpeculativeRedispatch() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            startUserTurnDelayNanos: 40_000_000
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogRecoveryThreshold: 30
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexAnonymousActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+
+        let sendTask = Task {
+            await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+                session: session,
+                text: "hello",
+                attachments: []
+            )
+        }
+        try await waitUntil {
+            controller.startUserTurnCountSync() == 1
+        }
+
+        let outcome = await sendTask.value
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 1)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
     }
 
     func testStructuredLivenessAdvancesLifecycleWithoutTranscriptRows() async {
@@ -123,26 +1254,545 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.items, baselineItems)
     }
 
-    func testStructuredNonRetryingErrorUsesTerminalCommit() async {
+    func testStructuredFailedCompletionUsesOneTerminalCommitAndPreservesTail() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
-            .errorNotification(.init(
-                message: "fatal provider error",
-                willRetry: false,
-                threadID: "fake",
-                turnID: "turn"
-            )),
+            .assistantDelta("assistant tail"),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(
+                turnID: "turn",
+                status: .failed,
+                failure: .init(message: "authoritative provider error")
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(
+                turnID: "turn",
+                status: .failed,
+                failure: .init(message: "duplicate provider error")
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .error("Codex transport closed unexpectedly."),
             session: session
         )
 
         XCTAssertEqual(session.runState, .failed)
         XCTAssertNil(session.activeRunOwnership)
-        XCTAssertNotNil(session.lastTerminalCommitRevision)
-        XCTAssertEqual(session.items.last?.kind, .error)
-        XCTAssertEqual(session.items.last?.text, "fatal provider error")
+        let revision = session.lastTerminalCommitRevision
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision?.providerDrainGeneration, session.providerTerminalDrainGeneration)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .assistant || $0.kind == .error }.map(\.kind),
+            [.assistant, .error]
+        )
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .error }.map(\.text),
+            ["authoritative provider error"]
+        )
+    }
+
+    func testTurnCompletionCoalescesBufferedAssistantTailBeforeTerminalSeal() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
+        session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
+        let commandInvocationID = UUID()
+        session.appendItem(.toolResult(
+            name: "bash",
+            invocationID: commandInvocationID,
+            argsJSON: "{}",
+            resultJSON: #"{"status":"completed"}"#,
+            isError: false,
+            sequenceIndex: session.nextSequenceIndex
+        ))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        let streamingPrefix = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(streamingPrefix.kind, .assistant)
+        XCTAssertEqual(streamingPrefix.text, "answer")
+        XCTAssertTrue(streamingPrefix.isStreaming)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("."),
+            session: session
+        )
+        XCTAssertEqual(session.pendingAssistantDelta, ".")
+        XCTAssertNotNil(session.assistantDeltaFlushTask)
+        session.pendingCommandRunningByKey["terminal-test"] = .init(
+            invocationID: commandInvocationID,
+            processID: nil,
+            appendedOutput: nil,
+            sealsAssistantBoundary: false
+        )
+        session.pendingCommandRunningFlushTask = Task {}
+        XCTAssertFalse(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["answer."])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNil(session.assistantDeltaFlushTask)
+        XCTAssertTrue(session.pendingCommandRunningByKey.isEmpty)
+        XCTAssertNil(session.pendingCommandRunningFlushTask)
+        XCTAssertTrue(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(revision.terminalState, .completed)
+        XCTAssertEqual(revision.sourceItemsRevision, session.sourceItemsRevision)
+        XCTAssertEqual(revision.assistantDeltaFlushGeneration, session.assistantDeltaFlushGeneration)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
+    }
+
+    func testCanonicalAssistantCompletionReconcilesNoDeltaExactPrefixUTF8DuplicateAndEmpty() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        let noDeltaScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-no-delta"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: noDeltaScope, text: "no delta")),
+            session: session
+        )
+
+        let exactScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-exact"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "exact", scope: exactScope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: exactScope, text: "exact")),
+            session: session
+        )
+
+        let prefixScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-prefix"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "answer", scope: prefixScope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: prefixScope, text: "answer.")),
+            session: session
+        )
+
+        let utf8Scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-utf8"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "👨", scope: utf8Scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        let utf8Completion = CodexNativeSessionController.AssistantCompletionPayload(
+            scope: utf8Scope,
+            text: "👨‍👩‍👧"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(utf8Completion),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(utf8Completion),
+            session: session
+        )
+
+        let removedScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-empty"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "remove me", scope: removedScope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: removedScope, text: "")),
+            session: session
+        )
+
+        let assistants = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistants.map(\.text), ["no delta", "exact", "answer.", "👨‍👩‍👧"])
+        XCTAssertTrue(assistants.allSatisfy { !$0.isStreaming })
+        XCTAssertNil(session.codexAssistantRowIDByScope[removedScope])
+    }
+
+    func testCanonicalAssistantCompletionFlushesEarlierPendingScopeFirst() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let firstScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-first"
+        )
+        let secondScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-second"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "first", scope: firstScope),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: secondScope, text: "second")),
+            session: session
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["first", "second"])
+        XCTAssertTrue(assistantItems.allSatisfy { !$0.isStreaming })
+    }
+
+    func testCanonicalAssistantNonPrefixCompletionReplacesMappedRowAcrossToolBoundary() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-before-tool"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "draft response", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        let originalRowID = try XCTUnwrap(session.items.last?.id)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "lookup", invocationID: UUID(), argsJSON: "{}"),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: scope, text: "final response")),
+            session: session
+        )
+
+        XCTAssertEqual(session.items.count, 2)
+        XCTAssertEqual(session.items[0].id, originalRowID)
+        XCTAssertEqual(session.items[0].kind, .assistant)
+        XCTAssertEqual(session.items[0].text, "final response")
+        XCTAssertFalse(session.items[0].isStreaming)
+        XCTAssertEqual(session.items[1].kind, .toolCall)
+    }
+
+    func testCanonicalMCPResultOnlyDoesNotOverwriteDifferentInvocation() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let firstInvocationID = UUID()
+        let resultOnlyInvocationID = UUID()
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(
+                name: "lookup",
+                invocationID: firstInvocationID,
+                argsJSON: #"{"query":"first"}"#
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "lookup",
+                invocationID: resultOnlyInvocationID,
+                argsJSON: #"{"query":"second"}"#,
+                resultJSON: #"{"content":"second result"}"#,
+                isError: false
+            ),
+            session: session
+        )
+
+        let toolItems = session.items.filter { $0.kind == .toolCall || $0.kind == .toolResult }
+        XCTAssertEqual(toolItems.map(\.kind), [.toolCall, .toolResult])
+        XCTAssertEqual(toolItems.map(\.toolInvocationID), [firstInvocationID, resultOnlyInvocationID])
+    }
+
+    func testMismatchedBashMirrorInvocationStillReconcilesRunningRow() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let startedInvocationID = UUID()
+        let completedInvocationID = UUID()
+        let argsJSON = #"{"command":"printf probe"}"#
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "bash", invocationID: startedInvocationID, argsJSON: argsJSON),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: startedInvocationID,
+                argsJSON: argsJSON,
+                resultJSON: #"{"type":"commandExecution","status":"inProgress","processId":"probe-1","delta":"running"}"#,
+                isError: false
+            ),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: completedInvocationID,
+                argsJSON: argsJSON,
+                resultJSON: #"{"type":"commandExecution","status":"completed","processId":"probe-1","aggregatedOutput":"done"}"#,
+                isError: false
+            ),
+            session: session
+        )
+
+        let toolItems = session.items.filter { $0.kind == .toolCall || $0.kind == .toolResult }
+        XCTAssertEqual(toolItems.count, 1)
+        XCTAssertEqual(toolItems.first?.toolInvocationID, completedInvocationID)
+    }
+
+    func testReasoningSealsEarlierPendingAssistantBeforeMaterializing() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let assistantScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-before-reasoning"
+        )
+        let reasoningScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "reasoning-after-assistant"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "assistant first", scope: assistantScope),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningDelta(.init(
+                text: "draft reasoning",
+                kind: .summary,
+                itemID: reasoningScope.itemID,
+                groupID: "summary:\(reasoningScope.itemID):0",
+                index: 0,
+                scope: reasoningScope
+            )),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningCompleted(.init(
+                scope: reasoningScope,
+                summary: ["final reasoning"],
+                content: []
+            )),
+            session: session
+        )
+
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .assistant || $0.kind == .thinking }.map(\.kind),
+            [.assistant, .thinking]
+        )
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .assistant || $0.kind == .thinking }.map(\.text),
+            ["assistant first", "final reasoning"]
+        )
+    }
+
+    func testCanonicalReasoningCompletionMaterializesReplacesAndRemovesSegments() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "reasoning-item"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningDelta(.init(
+                text: "Draft summary",
+                kind: .summary,
+                itemID: scope.itemID,
+                groupID: "summary:\(scope.itemID):0",
+                index: 0,
+                scope: scope
+            )),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningDelta(.init(
+                text: "orphan body",
+                kind: .text,
+                itemID: scope.itemID,
+                groupID: "text:\(scope.itemID):1",
+                index: 1,
+                scope: scope
+            )),
+            session: session
+        )
+        XCTAssertEqual(session.items.count(where: { $0.kind == .thinking }), 2)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningCompleted(.init(
+                scope: scope,
+                summary: ["Final summary"],
+                content: ["Final body"]
+            )),
+            session: session
+        )
+
+        var thinkingItems = session.items.filter { $0.kind == .thinking }
+        XCTAssertEqual(thinkingItems.map(\.text), ["Final summary\n\nFinal body"])
+        XCTAssertEqual(thinkingItems.map(\.isStreaming), [false])
+        XCTAssertEqual(Set(session.codexReasoningSegmentsByKey.keys), ["reasoning:reasoning-item:0"])
+
+        let noDeltaScope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "reasoning-no-delta"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningCompleted(.init(
+                scope: noDeltaScope,
+                summary: ["First", "Second"],
+                content: ["Body one", "Body two"]
+            )),
+            session: session
+        )
+
+        thinkingItems = session.items.filter { $0.kind == .thinking }
+        XCTAssertEqual(
+            thinkingItems.map(\.text),
+            ["Final summary\n\nFinal body", "First\n\nBody one", "Second\n\nBody two"]
+        )
+        XCTAssertTrue(thinkingItems.allSatisfy { !$0.isStreaming })
+    }
+
+    func testCanonicalReasoningCompletionInsertsMissingLowerIndexBeforeStreamedRow() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "reasoning-partial"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningDelta(.init(
+                text: "Second draft",
+                kind: .summary,
+                itemID: scope.itemID,
+                groupID: "summary:\(scope.itemID):1",
+                index: 1,
+                scope: scope
+            )),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "lookup", invocationID: UUID(), argsJSON: "{}"),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .reasoningCompleted(.init(
+                scope: scope,
+                summary: ["First", "Second"],
+                content: []
+            )),
+            session: session
+        )
+
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .thinking }.map(\.text),
+            ["First", "Second"]
+        )
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .thinking || $0.kind == .toolCall }.map(\.kind),
+            [.thinking, .thinking, .toolCall]
+        )
+    }
+
+    func testCancellationClearsCanonicalAssistantAndReasoningReconciliationState() {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-item"
+        )
+        let rowID = UUID()
+        session.pendingCodexAssistantScope = scope
+        session.codexAssistantRowIDByScope[scope] = rowID
+        session.activeReasoningItemID = rowID
+        session.reasoningItemIDsByGroupID["reasoning-group"] = rowID
+        session.codexReasoningSegmentsByKey["reasoning:reasoning-item:0"] = .init(
+            summaryMarkdown: "draft",
+            transcriptItemID: rowID
+        )
+
+        viewModel.test_codexCoordinator.drainCodexTerminalBuffersForCancellation(session)
+
+        XCTAssertNil(session.pendingCodexAssistantScope)
+        XCTAssertTrue(session.codexAssistantRowIDByScope.isEmpty)
+        XCTAssertNil(session.activeReasoningItemID)
+        XCTAssertTrue(session.reasoningItemIDsByGroupID.isEmpty)
+        XCTAssertTrue(session.codexReasoningSegmentsByKey.isEmpty)
+    }
+
+    func testTurnCompletionClearsEmptyScheduledAssistantFlushBeforeBarrier() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
+        session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
+
+        viewModel.test_codexCoordinator.test_enqueueAssistantDelta("answer", session: session)
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        viewModel.test_codexCoordinator.test_enqueueAssistantDelta("", session: session)
+
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNotNil(session.assistantDeltaFlushTask)
+        XCTAssertFalse(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["answer"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNil(session.assistantDeltaFlushTask)
+        XCTAssertTrue(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
     }
 
     func testStaleStructuredScopeIsIgnored() async {
@@ -191,25 +1841,117 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.items, baselineItems)
     }
 
-    func testWatchdogPauseRemainsRunningAndDoesNotAppendTranscriptFailure() async throws {
-        let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
+    func testRepeatedNoActiveSnapshotReattachesAndReconcilesMissedCompletion() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            latestTurnStatus: .completed
+        )
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
-        let baselineItems = session.items
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
         viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
 
-        try await waitUntil {
-            session.codexWatchdogState.isPausedAfterWarning
+        try await waitUntil(timeout: 10) {
+            session.runState == .completed
         }
 
-        XCTAssertEqual(session.runState, .running)
-        XCTAssertEqual(session.items.count, baselineItems.count + 1)
-        XCTAssertEqual(session.items.last?.kind, .assistant)
-        XCTAssertEqual(session.items.last?.text, "progress")
+        XCTAssertGreaterThanOrEqual(controller.readSnapshotCountSync(), 3)
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.items.contains {
+            $0.kind == .system && $0.text.contains("confirmed that Codex completed the turn")
+        })
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["progress"])
         XCTAssertFalse(session.items.contains { $0.kind == .error })
-        XCTAssertEqual(session.runningStatusText, "Repo Prompt thinks Codex has stalled or timed out. You can stop and resume.")
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testRepeatedNoActiveSnapshotReattachesAndReconcilesFailure() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            latestTurnStatus: .failed
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil(timeout: 10) {
+            session.runState == .failed
+        }
+
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.items.filter { $0.kind == .error }.map(\.text), [
+            "Codex's last turn failed while Repo Prompt was reconnecting."
+        ])
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testRepeatedNoActiveSnapshotWithoutTerminalStatusReturnsControlWithoutModelInput() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil(timeout: 10) {
+            session.runState == .cancelled
+        }
+
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.items.contains {
+            $0.kind == .system && $0.text.contains("Send a message to continue")
+        })
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testWatchdogFlushesCachedExplicitErrorWhenProbeFindsNoActiveTurn() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            pendingTurnFailure: .init(message: "explicit watchdog error")
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("progress"),
+            session: session
+        )
+
+        try await waitUntil {
+            session.runState == .failed
+        }
+
+        XCTAssertEqual(session.items.filter { $0.kind == .error }.map(\.text), [
+            "explicit watchdog error"
+        ])
+        let remainingFailure = await controller.pendingTurnFailure(turnID: "turn")
+        XCTAssertNil(remainingFailure)
+        XCTAssertNotEqual(
+            session.runningStatusText,
+            "Repo Prompt thinks Codex has stalled or timed out. You can stop and resume."
+        )
     }
 
     func testPendingRequestUserInputSuppressesWatchdogAndPreservesQueue() async throws {
@@ -411,18 +2153,25 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
     func testActiveCodexNativeSendUsesRealAgentRunDrainBeforeSending() async throws {
         try await AgentRunWaitDrainTestHarness.withHarness { harness in
-            let waitTask = harness.startWait()
-            try await harness.waitUntilBlocked()
+            let steeringMarker = "<<rpce-steering-provenance-same-parent>>"
+            let parentWaitTask = harness.startWait()
+            let externalWaitTask = harness.startExternalWait()
+            try await harness.waitUntilBothBlocked()
 
             let ordering = CodexDrainSendOrderingRecorder()
             let controller = LivenessFakeCodexController(
                 snapshot: .active(activeFlags: []),
                 onSendUserTurn: { ordering.recordSend() }
             )
-            let viewModel = makeViewModel(controller: controller) { runID, source in
+            let viewModel = makeViewModel(controller: controller) { runID, runAttemptID, source, steeringMessage in
                 XCTAssertEqual(runID, harness.parentRunID)
+                XCTAssertNotNil(runAttemptID)
                 XCTAssertEqual(source, "codex-native-active-send")
-                let drained = await harness.drain(source: source)
+                XCTAssertEqual(steeringMessage, steeringMarker)
+                let drained = await harness.drain(
+                    source: source,
+                    steeringMessage: steeringMessage
+                )
                 ordering.recordDrainCompletion(
                     succeeded: drained,
                     activeScopeCount: harness.activeScopeCount()
@@ -436,13 +2185,40 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             )
             session.codexRoutingObservedTurnID = "routing-hint-only"
 
+            let fallbackContext = AgentModeViewModel.TabSession.CodexFallbackSubmissionContext(
+                queueID: UUID(),
+                providerText: steeringMarker,
+                images: [],
+                taggedFileAttachments: [],
+                draftText: steeringMarker,
+                optimisticUserItemID: nil,
+                origin: .manual,
+                dispatchTicket: nil
+            )
             let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
                 session: session,
-                text: "hello",
-                attachments: []
+                text: fallbackContext.providerText,
+                attachments: [],
+                fallbackContext: fallbackContext
             )
-            let interruptedValue = try await waitTask.value
-            let interruptedObject = try XCTUnwrap(interruptedValue.objectValue)
+            let parentWaitValue = try await parentWaitTask.value
+            let externalWaitValue = try await externalWaitTask.value
+            let parentWaitObject = try XCTUnwrap(parentWaitValue.objectValue)
+            let externalWaitObject = try XCTUnwrap(externalWaitValue.objectValue)
+            let parentFormattedBlocks = ToolOutputFormatter.formatAgentRun(
+                args: ["op": .string("wait")],
+                value: parentWaitValue
+            )
+            let externalFormattedBlocks = ToolOutputFormatter.formatAgentRun(
+                args: ["op": .string("wait")],
+                value: externalWaitValue
+            )
+            guard case let .text(parentFormattedWait, _, _)? = parentFormattedBlocks.first,
+                  case let .text(externalFormattedWait, _, _)? = externalFormattedBlocks.first
+            else {
+                return XCTFail("Expected formatted agent_run.wait text")
+            }
+            let providerInput = try XCTUnwrap(controller.steeredUserTurnTextsSync().first)
             let completions = await harness.completionRecorder.completions()
             let registrationRemainsActive = await AgentRunSessionStore.hasActiveRegistration(
                 sessionID: harness.fixture.sessionID
@@ -451,9 +2227,25 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
             XCTAssertEqual(outcome, .sent)
             XCTAssertEqual(
-                interruptedObject["wait"]?.objectValue?["result"]?.stringValue,
+                parentWaitObject["wait"]?.objectValue?["result"]?.stringValue,
                 "interrupted_by_steering"
             )
+            XCTAssertNil(
+                parentWaitObject["wait"]?.objectValue?["steering_message"]
+            )
+            XCTAssertEqual(
+                externalWaitObject["wait"]?.objectValue?["result"]?.stringValue,
+                "interrupted_by_steering"
+            )
+            XCTAssertEqual(
+                externalWaitObject["wait"]?.objectValue?["steering_message"]?.stringValue,
+                steeringMarker,
+                "A different supervisor must retain the exact steering payload"
+            )
+            XCTAssertEqual(parentFormattedWait.components(separatedBy: steeringMarker).count - 1, 0)
+            XCTAssertEqual(externalFormattedWait.components(separatedBy: steeringMarker).count - 1, 1)
+            XCTAssertEqual(providerInput, steeringMarker)
+            XCTAssertEqual(controller.steeredUserTurnTextsSync(), [steeringMarker])
             XCTAssertEqual(controller.startUserTurnCountSync(), 0)
             XCTAssertEqual(controller.steerUserTurnIDsSync(), ["turn"])
             XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
@@ -461,15 +2253,26 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             XCTAssertEqual(orderingSnapshot.activeScopeCountAtDrainCompletion, 0)
             XCTAssertTrue(orderingSnapshot.sendObservedAfterDrain)
             XCTAssertEqual(harness.activeScopeCount(), 0)
-            XCTAssertEqual(completions.count, 1)
-            XCTAssertEqual(completions.first?.result, "interrupted_by_steering")
+            XCTAssertEqual(harness.externalActiveScopeCount(), 0)
+            XCTAssertEqual(completions.count, 2)
+            XCTAssertTrue(completions.allSatisfy { $0.result == "interrupted_by_steering" })
             XCTAssertTrue(registrationRemainsActive)
+
+            let sameParentVisibleMarkerCount =
+                parentFormattedWait.components(separatedBy: steeringMarker).count - 1
+                    + providerInput.components(separatedBy: steeringMarker).count - 1
+            // The provider input remains authoritative; only the same-parent wait projection omits the duplicate.
+            XCTAssertEqual(
+                sameParentVisibleMarkerCount,
+                1,
+                "The same parent provider conversation must see one logical steering instruction exactly once"
+            )
         }
     }
 
-    func testActiveCodexNativeSendFailsWithoutSendingWhenAgentRunDrainFails() async {
+    func testActiveCodexNativeSendRejectsBeforeDispatchWhenAgentRunDrainFails() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
-        let viewModel = makeViewModel(controller: controller) { _, _ in false }
+        let viewModel = makeViewModel(controller: controller) { _, _, _, _ in false }
         let session = preparedCodexSession(in: viewModel, controller: controller)
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
@@ -478,10 +2281,482 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             attachments: []
         )
 
-        guard case let .failed(message) = outcome else {
-            return XCTFail("Expected failed outcome, got \(outcome)")
+        guard case let .preDispatchRejected(message) = outcome else {
+            return XCTFail("Expected pre-dispatch rejection, got \(outcome)")
         }
         XCTAssertTrue(message.contains("agent_run.wait"))
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == message })
+        XCTAssertEqual(session.runState, .running)
+    }
+
+    func testActiveCodexNativeSendRejectsBeforeDispatchWhenActiveRunChangesDuringDrain() async {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _, _, _ in
+            await drainGate.wait()
+            return true
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let capturedRunID = session.runID
+
+        let sendTask = Task {
+            await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+                session: session,
+                text: "hello",
+                attachments: []
+            )
+        }
+        await drainGate.waitUntilWaiting()
+        session.runID = UUID()
+        drainGate.release()
+
+        let outcome = await sendTask.value
+        guard case let .preDispatchRejected(message) = outcome else {
+            return XCTFail("Expected pre-dispatch rejection, got \(outcome)")
+        }
+        XCTAssertTrue(message.contains("active run changed"))
+        XCTAssertNotEqual(session.runID, capturedRunID)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+    }
+
+    func testComposerActiveSendDrainRejectionRemovesOnlyOptimisticBubbleAndRestoresFullComposerState() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _, _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let existingUserItem = AgentChatItem.user(
+            "existing confirmed user item",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingUserItem)
+        let inFlightAssistantItem = AgentChatItem.assistant(
+            "in-flight assistant progress",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(inFlightAssistantItem)
+        let inFlightAnchor = AgentModeViewModel.TabSession.AgentTurnRuntimeAnchor(
+            userItemID: existingUserItem.id,
+            userSequenceIndex: existingUserItem.sequenceIndex,
+            startedAt: Date(timeIntervalSinceNow: -240)
+        )
+        session.pendingTurnRuntimeAnchors = [inFlightAnchor]
+        let runStartedAtBeforeSubmit = Date(timeIntervalSinceNow: -120)
+        session.activeAgentRunStartedAt = runStartedAtBeforeSubmit
+
+        let image = AgentImageAttachment(
+            source: .localFile(path: "/tmp/rejected-composer-image.png"),
+            title: "rejected-composer-image.png"
+        )
+        session.pendingImageAttachments = [image]
+        let taggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/File.swift",
+            displayName: "File.swift"
+        )
+        session.pendingTaggedFileAttachments = [taggedFile]
+        let workflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Test Workflow",
+            template: "Wrapped: $ARGUMENTS"
+        )
+        session.selectedWorkflow = workflow
+
+        let rawDraft = "\n  restore this draft  \n"
+        let providerText = rawDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        viewModel.storeDraftText(for: session.tabID, rawDraft)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rawDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+
+        let result = await viewModel.executeComposerSubmitAttempt(text: providerText, claim: claim)
+
+        XCTAssertEqual(result, .submitted)
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "")
+        XCTAssertTrue(session.pendingImageAttachments.isEmpty)
+        XCTAssertTrue(session.pendingTaggedFileAttachments.isEmpty)
+        XCTAssertNil(session.selectedWorkflow)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.text),
+            [existingUserItem.text, providerText]
+        )
+        // While the send is in flight, the optimistic submission has staged its
+        // turn-runtime bookkeeping: prior in-flight anchor consumed into a
+        // footer, new anchor pending, elapsed timer restarted.
+        XCTAssertEqual(session.pendingTurnRuntimeAnchors.count, 1)
+        XCTAssertNotEqual(session.pendingTurnRuntimeAnchors.first?.userItemID, existingUserItem.id)
+        XCTAssertNotNil(session.agentMessageRuntimeFootersByItemID[inFlightAssistantItem.id])
+        XCTAssertNotEqual(session.activeAgentRunStartedAt, runStartedAtBeforeSubmit)
+
+        // Simulate newer runtime activity winning the same footer while the
+        // pre-dispatch drain remains suspended.
+        let newerFooter = AgentMessageRuntimeFooter(
+            itemID: inFlightAssistantItem.id,
+            anchorDate: inFlightAnchor.startedAt,
+            completedDate: Date(),
+            statusText: "Newer runtime footer"
+        )
+        session.agentMessageRuntimeFootersByItemID[inFlightAssistantItem.id] = newerFooter
+
+        drainGate.release()
+        try await waitUntil {
+            viewModel.draftRestorationEvent?.text == rawDraft
+                && session.items.contains { $0.kind == .error && $0.text.contains("agent_run.wait") }
+        }
+
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.id),
+            [existingUserItem.id]
+        )
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), rawDraft)
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .replaceAlways)
+        XCTAssertEqual(session.pendingImageAttachments, [image])
+        XCTAssertEqual(session.pendingTaggedFileAttachments, [taggedFile])
+        XCTAssertEqual(session.selectedWorkflow, workflow)
+        XCTAssertEqual(viewModel.selectedWorkflow, workflow)
+        // The newer footer remains authoritative, and its already-accounted
+        // anchor is not reinserted for a second attribution.
+        XCTAssertTrue(session.pendingTurnRuntimeAnchors.isEmpty)
+        XCTAssertEqual(
+            session.agentMessageRuntimeFootersByItemID[inFlightAssistantItem.id],
+            newerFooter
+        )
+        XCTAssertEqual(session.activeAgentRunStartedAt, runStartedAtBeforeSubmit)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+    }
+
+    func testComposerActiveSendDrainRejectionDoesNotOverwriteNewerComposerChoices() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _, _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let rejectedTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/File.swift",
+            displayName: "File.swift"
+        )
+        session.pendingTaggedFileAttachments = [rejectedTaggedFile]
+        let rejectedWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Rejected Workflow"
+        )
+        session.selectedWorkflow = rejectedWorkflow
+
+        let rawDraft = "rejected draft"
+        viewModel.storeDraftText(for: session.tabID, rawDraft)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rawDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+        let result = await viewModel.executeComposerSubmitAttempt(text: rawDraft, claim: claim)
+        XCTAssertEqual(result, .submitted)
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+
+        // While the rejected submission is still in flight, the user makes
+        // newer composer choices; the restoration must not displace them.
+        let newerWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Newer Workflow"
+        )
+        viewModel.selectWorkflow(newerWorkflow)
+        viewModel.selectWorkflow(nil)
+        let newerTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/Other.swift",
+            displayName: "Other.swift"
+        )
+        session.pendingTaggedFileAttachments = [newerTaggedFile]
+        viewModel.storeDraftText(for: session.tabID, "newer typing")
+
+        drainGate.release()
+        try await waitUntil {
+            viewModel.draftRestorationEvent != nil
+                && session.items.contains { $0.kind == .error && $0.text.contains("agent_run.wait") }
+        }
+
+        XCTAssertNil(session.selectedWorkflow)
+        XCTAssertNil(viewModel.selectedWorkflow)
+        XCTAssertEqual(
+            session.pendingTaggedFileAttachments,
+            [rejectedTaggedFile, newerTaggedFile]
+        )
+        XCTAssertEqual(
+            viewModel.retrieveDraftText(for: session.tabID),
+            "rejected draft\nnewer typing"
+        )
+        let restorationEvent = try XCTUnwrap(viewModel.draftRestorationEvent)
+        XCTAssertEqual(restorationEvent.strategy, .replaceAlways)
+        let restorationOperation = try XCTUnwrap(restorationEvent.operation)
+        XCTAssertEqual(
+            AgentComposerDraftRestorationReducer.apply(
+                restorationOperation,
+                to: "newer typing after model composition",
+                lastAppliedRestorationEventID: restorationOperation.previousRestorationEventID
+            ),
+            "rejected draft\nnewer typing after model composition"
+        )
+
+        let unappliedEarlierEventID = UUID()
+        let coalescedOperation = AgentComposerDraftRestorationOperation(
+            rejectedDraftText: "second rejected draft",
+            draftTextBeforeRestoration: "first rejected draft",
+            composedDraftText: "second rejected draft\nfirst rejected draft",
+            previousRestorationEventID: unappliedEarlierEventID
+        )
+        XCTAssertEqual(
+            AgentComposerDraftRestorationReducer.apply(
+                coalescedOperation,
+                to: "typing before either event rendered",
+                lastAppliedRestorationEventID: nil
+            ),
+            "second rejected draft\nfirst rejected draft\ntyping before either event rendered"
+        )
+    }
+
+    func testComposerTabSessionReplacementBeforeDispatchRestoresIntoAuthoritativeSession() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let sourceSession = preparedCodexSession(in: viewModel, controller: controller)
+        sourceSession.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(sourceSession.tabID)
+        defer {
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let blockingTicket = sourceSession.codexDispatchSerialGate.issueTicket()
+        let rejectedImage = AgentImageAttachment(
+            source: .localFile(path: "/tmp/rejected-session-image.png"),
+            title: "rejected-session-image.png"
+        )
+        let rejectedTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/Rejected.swift",
+            displayName: "Rejected.swift"
+        )
+        let rejectedWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Rejected Workflow"
+        )
+        sourceSession.pendingImageAttachments = [rejectedImage]
+        sourceSession.pendingTaggedFileAttachments = [rejectedTaggedFile]
+        sourceSession.selectedWorkflow = rejectedWorkflow
+        sourceSession.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+
+        let rejectedDraft = "rejected draft"
+        viewModel.storeDraftText(for: sourceSession.tabID, rejectedDraft)
+        let target = try XCTUnwrap(
+            viewModel.makeComposerSubmitTarget(tabID: sourceSession.tabID, session: sourceSession)
+        )
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: rejectedDraft
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch viewModel.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected composer submit claim, got \(rejection)")
+        }
+
+        let result = await viewModel.executeComposerSubmitAttempt(text: rejectedDraft, claim: claim)
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(sourceSession.items.count(where: { $0.kind == .user }), 1)
+        XCTAssertEqual(sourceSession.pendingTurnRuntimeAnchors.count, 1)
+        XCTAssertNotNil(sourceSession.pendingCodexComputerUseActivation)
+
+        let replacementSession = AgentModeViewModel.TabSession(tabID: sourceSession.tabID)
+        replacementSession.selectedAgent = .codexExec
+        viewModel.test_installLiveSession(replacementSession)
+        let newerImage = AgentImageAttachment(
+            source: .localFile(path: "/tmp/newer-session-image.png"),
+            title: "newer-session-image.png"
+        )
+        let newerTaggedFile = AgentTaggedFileAttachment(
+            relativePath: "Sources/Feature/Newer.swift",
+            displayName: "Newer.swift"
+        )
+        let newerWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Newer Workflow"
+        )
+        replacementSession.pendingImageAttachments = [newerImage]
+        replacementSession.pendingTaggedFileAttachments = [newerTaggedFile]
+        viewModel.storeDraftText(for: replacementSession.tabID, "newer typing")
+        viewModel.selectWorkflow(newerWorkflow)
+
+        let restoration = expectation(description: "composer restored into replacement session")
+        var cancellable: AnyCancellable?
+        cancellable = viewModel.$draftRestorationEvent
+            .compactMap(\.self)
+            .filter { $0.tabID == replacementSession.tabID }
+            .sink { _ in restoration.fulfill() }
+        sourceSession.codexDispatchSerialGate.finish(blockingTicket)
+        await fulfillment(of: [restoration], timeout: 2)
+        withExtendedLifetime(cancellable) {}
+
+        XCTAssertTrue(sourceSession.items.filter { $0.kind == .user }.isEmpty)
+        XCTAssertTrue(sourceSession.pendingTurnRuntimeAnchors.isEmpty)
+        XCTAssertNil(sourceSession.pendingCodexComputerUseActivation)
+        XCTAssertTrue(replacementSession.items.filter { $0.kind == .user }.isEmpty)
+        XCTAssertEqual(
+            replacementSession.pendingImageAttachments,
+            [rejectedImage, newerImage]
+        )
+        XCTAssertEqual(
+            replacementSession.pendingTaggedFileAttachments,
+            [rejectedTaggedFile, newerTaggedFile]
+        )
+        XCTAssertEqual(replacementSession.selectedWorkflow, newerWorkflow)
+        XCTAssertEqual(viewModel.selectedWorkflow, newerWorkflow)
+        XCTAssertEqual(
+            viewModel.retrieveDraftText(for: replacementSession.tabID),
+            "rejected draft\nnewer typing"
+        )
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .replaceAlways)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertTrue(sourceSession.codexFallbackQueue.isEmpty)
+        XCTAssertTrue(replacementSession.codexFallbackQueue.isEmpty)
+    }
+
+    func testBackToBackComposerActiveSendDrainRejectionsRestoreEachDraftExactlyOnce() async throws {
+        let drainGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _, _, _ in
+            await drainGate.wait()
+            return false
+        }
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        defer {
+            drainGate.release()
+            viewModel.test_setCurrentTabIDOverride(nil)
+        }
+
+        let existingUserItem = AgentChatItem.user(
+            "existing confirmed user item",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingUserItem)
+        let existingAssistantItem = AgentChatItem.assistant(
+            "existing assistant progress",
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(existingAssistantItem)
+        let originalAnchor = AgentModeViewModel.TabSession.AgentTurnRuntimeAnchor(
+            userItemID: existingUserItem.id,
+            userSequenceIndex: existingUserItem.sequenceIndex,
+            startedAt: Date(timeIntervalSinceNow: -240)
+        )
+        session.pendingTurnRuntimeAnchors = [originalAnchor]
+        let originalRunStartedAt = Date(timeIntervalSinceNow: -120)
+        session.activeAgentRunStartedAt = originalRunStartedAt
+
+        func submitDraft(_ draft: String) async throws {
+            viewModel.storeDraftText(for: session.tabID, draft)
+            let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(),
+                target: target,
+                inputRevision: 1,
+                noticeRevision: 0,
+                rawDraftSnapshot: draft
+            )
+            let claim: AgentModeViewModel.AgentComposerSubmitClaim
+            switch viewModel.claimComposerSubmitAttempt(attempt) {
+            case let .claimed(acceptedClaim):
+                claim = acceptedClaim
+            case let .rejected(rejection):
+                return XCTFail("Expected composer submit claim, got \(rejection)")
+            }
+            let result = await viewModel.executeComposerSubmitAttempt(text: draft, claim: claim)
+            XCTAssertEqual(result, .submitted)
+        }
+
+        try await submitDraft("repeated rejected draft")
+        try await submitDraft("repeated rejected draft")
+        try await waitUntil {
+            drainGate.isWaitingSync()
+        }
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "")
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.text),
+            [existingUserItem.text, "repeated rejected draft", "repeated rejected draft"]
+        )
+
+        let expectedComposedDraft = "repeated rejected draft\nrepeated rejected draft"
+        drainGate.release()
+        try await waitUntil {
+            session.items.count(where: { $0.kind == .error && $0.text.contains("agent_run.wait") }) == 2
+                && viewModel.retrieveDraftText(for: session.tabID) == expectedComposedDraft
+        }
+
+        // Each rejected draft is restored exactly once, both optimistic
+        // bubbles are removed, and no undelivered-turn anchors remain.
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), expectedComposedDraft)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .user }.map(\.id),
+            [existingUserItem.id]
+        )
+        XCTAssertEqual(session.pendingTurnRuntimeAnchors, [originalAnchor])
+        XCTAssertTrue(session.agentMessageRuntimeFootersByItemID.isEmpty)
+        XCTAssertEqual(session.activeAgentRunStartedAt, originalRunStartedAt)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
         XCTAssertEqual(controller.startUserTurnCountSync(), 0)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertEqual(session.runState, .running)
@@ -613,16 +2888,57 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    private func makeCommandToolItem(
+        turnID: String = "turn",
+        itemID: UUID,
+        processID: String?,
+        status: CodexNativeSessionController.ThreadSnapshot.ToolItemObservation.Status
+    ) -> CodexNativeSessionController.ThreadSnapshot.ToolItemObservation {
+        .init(
+            turnID: turnID,
+            itemID: itemID.uuidString,
+            invocationID: itemID,
+            kind: .commandExecution,
+            toolName: nil,
+            processID: processID,
+            status: status
+        )
+    }
+
+    private func openRunningCommand(
+        invocationID: UUID,
+        processID: String,
+        command: String = "sleep 420",
+        viewModel: AgentModeViewModel,
+        session: AgentModeViewModel.TabSession
+    ) async {
+        let argsJSON = #"{"command":"\#(command)"}"#
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "bash", invocationID: invocationID, argsJSON: argsJSON),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .commandExecutionRunning(.init(
+                invocationID: invocationID,
+                processID: processID,
+                appendedOutput: nil
+            )),
+            session: session
+        )
+    }
+
     private func makeViewModel(
         controller: LivenessFakeCodexController,
-        drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil
+        drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil,
+        watchdogProbeThreshold: TimeInterval = 0.02,
+        watchdogRecoveryThreshold: TimeInterval = 0.06
     ) -> AgentModeViewModel {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller },
             testCodexActiveAgentRunWaitDrain: drain,
             testCodexStallWatchdogPollIntervalNanos: 10_000_000,
-            testCodexStallWatchdogProbeThreshold: 0.02,
-            testCodexStallWatchdogRecoveryThreshold: 0.02
+            testCodexStallWatchdogProbeThreshold: watchdogProbeThreshold,
+            testCodexStallWatchdogRecoveryThreshold: watchdogRecoveryThreshold
         )
         viewModel.test_initializeRunService()
         return viewModel
@@ -631,7 +2947,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     private func preparedCodexSession(
         in viewModel: AgentModeViewModel,
         controller: LivenessFakeCodexController,
-        runID: UUID = UUID()
+        runID: UUID? = UUID()
     ) -> AgentModeViewModel.TabSession {
         let session = viewModel.session(for: UUID())
         session.selectedAgent = .codexExec
@@ -639,6 +2955,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexLiveness")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "fake"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "fake",
@@ -650,7 +2969,11 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             runAttemptID: session.activeRunAttemptID!
         )
         session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
         return session
     }
 
@@ -726,28 +3049,154 @@ private final class CodexDrainSendOrderingRecorder: @unchecked Sendable {
     }
 }
 
+private enum LivenessSnapshotError: Error {
+    case probeFailed
+}
+
+private final class LivenessSnapshotReadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var waitingObservers: [CheckedContinuation<Void, Never>] = []
+    private var started = false
+    private var released = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let shouldResumeImmediately: Bool
+            let observersToResume: [CheckedContinuation<Void, Never>]
+            lock.lock()
+            started = true
+            if released {
+                shouldResumeImmediately = true
+                observersToResume = []
+            } else {
+                shouldResumeImmediately = false
+                self.continuation = continuation
+                observersToResume = waitingObservers
+                waitingObservers.removeAll()
+            }
+            lock.unlock()
+
+            observersToResume.forEach { $0.resume() }
+            if shouldResumeImmediately {
+                continuation.resume()
+            }
+        }
+    }
+
+    func waitUntilWaiting() async {
+        let shouldReturnImmediately: Bool = lock.withLock {
+            if started, !released, continuation != nil {
+                true
+            } else {
+                false
+            }
+        }
+        if shouldReturnImmediately { return }
+        await withCheckedContinuation { observer in
+            let shouldResumeImmediately: Bool = lock.withLock {
+                if started, !released, continuation != nil {
+                    return true
+                } else {
+                    waitingObservers.append(observer)
+                    return false
+                }
+            }
+            if shouldResumeImmediately {
+                observer.resume()
+            }
+        }
+    }
+
+    func isWaitingSync() -> Bool {
+        lock.lock()
+        let isWaiting = started && !released && continuation != nil
+        lock.unlock()
+        return isWaiting
+    }
+
+    func release() {
+        let continuationToResume: CheckedContinuation<Void, Never>?
+        lock.lock()
+        released = true
+        continuationToResume = continuation
+        continuation = nil
+        lock.unlock()
+
+        continuationToResume?.resume()
+    }
+}
+
 private final class LivenessFakeCodexController: CodexSessionControlling {
     private var readSnapshotCount = 0
+    private var readSnapshotIncludeTurnsValues: [Bool] = []
+    private var startOrResumeCount = 0
+    private var startOrResumeObservedCancellation = false
     private var startUserTurnCount = 0
+    private var startedUserTurnTexts: [String] = []
     private var steerUserTurnIDs: [String] = []
-    private let snapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus
+    private var steeredUserTurnTexts: [String] = []
+    private var interruptedTurnIDs: [String] = []
+    private var shutdownCount = 0
+    private let snapshotStatuses: [CodexNativeSessionController.ThreadSnapshot.RuntimeStatus]
     private let snapshotActiveTurnIDs: [String]
+    private let snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus?
+    private let activeToolItems: [CodexNativeSessionController.ThreadSnapshot.ToolItemObservation]
+    private let hasAuthoritativeActiveTurnItems: Bool
     private let onSendUserTurn: (() -> Void)?
     private let steerError: Error?
     private let steerDelayNanos: UInt64
+    private let startUserTurnDelayNanos: UInt64
+    private let alwaysFailsSnapshotRead: Bool
+    private let failsEveryEvenSnapshotRead: Bool
+    private let failsPostReattachSnapshotRead: Bool
+    private let postReattachSnapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus?
+    private let postReattachActiveTurnIDs: [String]?
+    private let snapshotReadGate: LivenessSnapshotReadGate?
+    private let postReattachSnapshotReadGate: LivenessSnapshotReadGate?
+    private var pendingTurnFailure: CodexNativeSessionController.TurnFailure?
 
     init(
         snapshot: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus,
         activeTurnIDs: [String] = ["turn"],
+        snapshotSequence: [CodexNativeSessionController.ThreadSnapshot.RuntimeStatus]? = nil,
+        latestTurnStatus: CodexNativeSessionController.TurnStatus? = nil,
+        activeToolItems: [CodexNativeSessionController.ThreadSnapshot.ToolItemObservation] = [],
+        hasAuthoritativeActiveTurnItems: Bool = false,
         onSendUserTurn: (() -> Void)? = nil,
         steerError: Error? = nil,
-        steerDelayNanos: UInt64 = 0
+        steerDelayNanos: UInt64 = 0,
+        startUserTurnDelayNanos: UInt64 = 0,
+        alwaysFailsSnapshotRead: Bool = false,
+        failsEveryEvenSnapshotRead: Bool = false,
+        failsPostReattachSnapshotRead: Bool = false,
+        postReattachSnapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus? = nil,
+        postReattachActiveTurnIDs: [String]? = nil,
+        snapshotReadGate: LivenessSnapshotReadGate? = nil,
+        postReattachSnapshotReadGate: LivenessSnapshotReadGate? = nil,
+        pendingTurnFailure: CodexNativeSessionController.TurnFailure? = nil
     ) {
-        snapshotStatus = snapshot
+        snapshotStatuses = if let snapshotSequence, !snapshotSequence.isEmpty {
+            snapshotSequence
+        } else {
+            [snapshot]
+        }
         snapshotActiveTurnIDs = activeTurnIDs
+        snapshotLatestTurnStatus = latestTurnStatus
+        self.activeToolItems = activeToolItems
+        self.hasAuthoritativeActiveTurnItems = hasAuthoritativeActiveTurnItems
         self.onSendUserTurn = onSendUserTurn
         self.steerError = steerError
         self.steerDelayNanos = steerDelayNanos
+        self.startUserTurnDelayNanos = startUserTurnDelayNanos
+        self.alwaysFailsSnapshotRead = alwaysFailsSnapshotRead
+        self.failsEveryEvenSnapshotRead = failsEveryEvenSnapshotRead
+        self.failsPostReattachSnapshotRead = failsPostReattachSnapshotRead
+        self.postReattachSnapshotStatus = postReattachSnapshotStatus
+        self.postReattachActiveTurnIDs = postReattachActiveTurnIDs
+        self.snapshotReadGate = snapshotReadGate
+        self.postReattachSnapshotReadGate = postReattachSnapshotReadGate
+        self.pendingTurnFailure = pendingTurnFailure
     }
 
     var hasActiveThread: Bool {
@@ -764,40 +3213,100 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         readSnapshotCount
     }
 
+    func readSnapshotIncludeTurnsValuesSync() -> [Bool] {
+        readSnapshotIncludeTurnsValues
+    }
+
+    func startOrResumeCountSync() -> Int {
+        startOrResumeCount
+    }
+
+    func startOrResumeObservedCancellationSync() -> Bool {
+        startOrResumeObservedCancellation
+    }
+
     func startUserTurnCountSync() -> Int {
         startUserTurnCount
+    }
+
+    func startedUserTurnTextsSync() -> [String] {
+        startedUserTurnTexts
     }
 
     func steerUserTurnIDsSync() -> [String] {
         steerUserTurnIDs
     }
 
+    func steeredUserTurnTextsSync() -> [String] {
+        steeredUserTurnTexts
+    }
+
+    func interruptedTurnIDsSync() -> [String] {
+        interruptedTurnIDs
+    }
+
+    func shutdownCountSync() -> Int {
+        shutdownCount
+    }
+
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
-        CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil)
+        startOrResumeCount += 1
+        startOrResumeObservedCancellation = startOrResumeObservedCancellation || Task.isCancelled
+        return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?) async throws -> CodexNativeSessionController.SessionRef {
-        CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+        startOrResumeCount += 1
+        startOrResumeObservedCancellation = startOrResumeObservedCancellation || Task.isCancelled
+        return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexNativeSessionController.SessionRef {
-        CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+        startOrResumeCount += 1
+        startOrResumeObservedCancellation = startOrResumeObservedCancellation || Task.isCancelled
+        return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
 
     func readThreadSnapshot(
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        let snapshotIndex = readSnapshotCount % snapshotStatuses.count
         readSnapshotCount += 1
+        readSnapshotIncludeTurnsValues.append(includeTurns)
+        let isPostReattachSnapshot = includeTurns && startOrResumeCount > 0
+        if isPostReattachSnapshot, let postReattachSnapshotReadGate {
+            await postReattachSnapshotReadGate.wait()
+        } else if let snapshotReadGate {
+            await snapshotReadGate.wait()
+        }
+        if alwaysFailsSnapshotRead
+            || (failsEveryEvenSnapshotRead && readSnapshotCount.isMultiple(of: 2))
+            || (failsPostReattachSnapshotRead && isPostReattachSnapshot)
+        {
+            throw LivenessSnapshotError.probeFailed
+        }
+        let runtimeStatus = if isPostReattachSnapshot {
+            postReattachSnapshotStatus ?? snapshotStatuses[snapshotIndex]
+        } else {
+            snapshotStatuses[snapshotIndex]
+        }
+        let activeTurnIDs = if isPostReattachSnapshot {
+            postReattachActiveTurnIDs ?? snapshotActiveTurnIDs
+        } else {
+            snapshotActiveTurnIDs
+        }
         return CodexNativeSessionController.ThreadSnapshot(
             conversationID: "fake",
             rolloutPath: nil,
             model: nil,
             reasoningEffort: nil,
-            runtimeStatus: snapshotStatus,
-            currentTurnID: snapshotActiveTurnIDs.first,
-            activeTurnIDs: snapshotActiveTurnIDs,
-            latestTurnStatus: nil
+            runtimeStatus: runtimeStatus,
+            currentTurnID: activeTurnIDs.first,
+            activeTurnIDs: activeTurnIDs,
+            latestTurnStatus: includeTurns ? snapshotLatestTurnStatus : nil,
+            activeToolItems: includeTurns ? activeToolItems : [],
+            hasAuthoritativeActiveTurnItems: includeTurns && hasAuthoritativeActiveTurnItems
         )
     }
 
@@ -816,7 +3325,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     }
 
     func startUserTurn(
-        text _: String,
+        text: String,
         images _: [AgentImageAttachment],
         model _: String?,
         reasoningEffort _: String?,
@@ -824,16 +3333,21 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     ) async throws -> CodexTurnStartReceipt {
         recordSendUserTurn()
         startUserTurnCount += 1
+        startedUserTurnTexts.append(text)
+        if startUserTurnDelayNanos > 0 {
+            try await Task.sleep(nanoseconds: startUserTurnDelayNanos)
+        }
         return CodexTurnStartReceipt(provisionalSubmissionID: "liveness-submission-\(startUserTurnCount)")
     }
 
     func steerUserTurn(
-        text _: String,
+        text: String,
         images _: [AgentImageAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         recordSendUserTurn()
         steerUserTurnIDs.append(expectedTurnID)
+        steeredUserTurnTexts.append(text)
         if let steerError {
             throw steerError
         }
@@ -844,7 +3358,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     }
 
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
-        CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+        interruptedTurnIDs.append(expectedTurnID)
+        return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
     private func recordSendUserTurn() {
@@ -868,7 +3383,25 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         false
     }
 
+    func pendingTurnFailure(
+        turnID _: String?
+    ) async -> CodexNativeSessionController.TurnFailure? {
+        pendingTurnFailure
+    }
+
+    func acknowledgePendingTurnFailure(
+        turnID _: String?,
+        failure: CodexNativeSessionController.TurnFailure
+    ) async {
+        if pendingTurnFailure == failure {
+            pendingTurnFailure = nil
+        }
+    }
+
     func cancelCurrentTurn() async {}
-    func shutdown() async {}
+    func shutdown() async {
+        shutdownCount += 1
+    }
+
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
 }

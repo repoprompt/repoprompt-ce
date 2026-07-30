@@ -1,4 +1,5 @@
-@testable import RepoPrompt
+import Combine
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -123,6 +124,86 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertTrue(viewModel.rootShellProjections[1].isSystemRoot)
     }
 
+    func testRootShellProjectionPublisherIgnoresUnrelatedPublishedChanges() {
+        let viewModel = WorkspaceFilesViewModel()
+        var changeCount = 0
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink { changeCount += 1 }
+            .store(in: &cancellables)
+
+        viewModel.currentSortMethod = .dateNewest
+        viewModel.codemapAutoEnabled = false
+
+        XCTAssertEqual(changeCount, 0)
+    }
+
+    func testRootShellProjectionBatchPublishesOneFinalNotification() {
+        let viewModel = WorkspaceFilesViewModel()
+        var changeCount = 0
+        var snapshots: [[UUID]] = []
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink {
+                changeCount += 1
+                snapshots.append(viewModel.visibleRootShellProjections.map(\.id))
+            }
+            .store(in: &cancellables)
+        let rootA = makeRoot(name: "A", path: "/tmp/A")
+        let rootB = makeRoot(name: "B", path: "/tmp/B")
+
+        viewModel.beginRootShellProjectionChangeBatch()
+        viewModel.addRootFolder(rootA)
+        viewModel.addRootFolder(rootB)
+        XCTAssertEqual(changeCount, 0)
+        _ = viewModel.reorderRootFolders(to: ["/tmp/B", "/tmp/A"])
+
+        viewModel.endRootShellProjectionChangeBatch()
+
+        XCTAssertEqual(changeCount, 1)
+        XCTAssertEqual(snapshots, [[rootB.id, rootA.id]])
+    }
+
+    func testValidatedSessionSelectorFiltersSafelyWithoutDuplicateIDTrapOrRoleLeakage() {
+        let viewModel = WorkspaceFilesViewModel()
+        let root = makeRoot(name: "Visible", path: "/tmp/validated-ui-root")
+        let file = FileViewModel(
+            file: File(
+                name: "Visible.swift",
+                path: "/tmp/validated-ui-root/Visible.swift",
+                modificationDate: Date(timeIntervalSince1970: 1)
+            ),
+            rootPath: root.fullPath,
+            rootIdentifier: root.id,
+            rootFolderPath: root.fullPath,
+            fileSystemService: nil
+        )
+        root.addChildrenBatch([.file(file)])
+        viewModel.registerRootFolderForTesting(root)
+
+        let firstRef = WorkspaceRootRef(id: root.id, name: "First", fullPath: root.fullPath)
+        let secondRef = WorkspaceRootRef(id: root.id, name: "Second", fullPath: root.fullPath)
+        let validScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+            canonicalRoots: [firstRef, secondRef],
+            physicalRoots: []
+        )
+        let conflictingPathScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+            canonicalRoots: [
+                firstRef,
+                WorkspaceRootRef(id: root.id, name: "Other", fullPath: "/tmp/other-root")
+            ],
+            physicalRoots: []
+        )
+        let conflictingRoleScope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+            canonicalRoots: [firstRef],
+            physicalRoots: [firstRef]
+        )
+
+        XCTAssertEqual(viewModel.getAllFileViewModels(in: validScope).map(\.id), [file.id])
+        XCTAssertTrue(viewModel.getAllFileViewModels(in: conflictingPathScope).isEmpty)
+        XCTAssertTrue(viewModel.getAllFileViewModels(in: conflictingRoleScope).isEmpty)
+    }
+
     func testDefaultWorkspaceAndWindowRootsUseCESupportRoot() {
         let workspaceRoot = WorkspaceStoragePaths.defaultRoot.path
         XCTAssertTrue(workspaceRoot.contains("/Application Support/RepoPrompt CE/Workspaces"), workspaceRoot)
@@ -169,6 +250,32 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertFalse(encoded.contains("workingFilePaths"), encoded)
         XCTAssertFalse(encoded.contains("contextBuilderState"), encoded)
         XCTAssertFalse(encoded.contains("discoveryInstructions"), encoded)
+    }
+
+    func testLoadFolderPublishesRootShellProjectionWhenReorderIsNoOp() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptRootSyncTests")
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        try "hello".write(to: tempRoot.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        let viewModel = WorkspaceFilesViewModel()
+        let workspace = WorkspaceModel(name: "Load Folder", repoPaths: [tempRoot.path])
+        var changeCount = 0
+        var snapshots: [[UUID]] = []
+        var cancellables = Set<AnyCancellable>()
+        viewModel.rootShellProjectionsChangedPublisher
+            .sink {
+                changeCount += 1
+                snapshots.append(viewModel.visibleRootShellProjections.map(\.id))
+            }
+            .store(in: &cancellables)
+
+        try await viewModel.loadFolder(at: tempRoot, for: workspace)
+
+        XCTAssertEqual(changeCount, 1)
+        XCTAssertEqual(snapshots, [viewModel.visibleRootShellProjections.map(\.id)])
+        XCTAssertEqual(viewModel.visibleRootShellProjections.map(\.fullPath), [tempRoot.path])
     }
 
     func testWorkspaceFolderLoadConcurrencyLimitIsBounded() {

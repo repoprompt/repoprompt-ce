@@ -171,7 +171,7 @@ struct AgentModeDetailWithSidebarView: View {
             .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
                 syncContextBuilderQuestionPresentation()
             }
-            .onReceive(promptManager.fileManager.$selectedFiles.map(\.count).removeDuplicates()) { _ in
+            .onReceive(promptManager.fileManager.$selectionStateRevision.removeDuplicates()) { _ in
                 syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
             }
             .onReceive(selectionCoordinator.changes) { change in
@@ -216,7 +216,7 @@ struct AgentModeDetailWithSidebarView: View {
             .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
                 syncContextBuilderQuestionPresentation()
             }
-            .onReceive(promptManager.fileManager.$selectedFiles.map(\.count).removeDuplicates()) { _ in
+            .onReceive(promptManager.fileManager.$selectionStateRevision.removeDuplicates()) { _ in
                 syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
             }
             .onReceive(selectionCoordinator.changes) { change in
@@ -245,7 +245,7 @@ struct AgentModeDetailWithSidebarView: View {
         guard let targetTabID = runtimeMetricsTargetTabID,
               let snapshot = selectionCoordinator.selectionSnapshot(for: targetTabID, flushPendingUIIfActive: true)
         else {
-            agentModeVM.syncRuntimeMetricsUIState(liveSelectedFileCount: nil)
+            agentModeVM.syncRuntimeMetricsUIState(liveSelectedFileCount: nil, liveSelectionSummary: nil)
             return
         }
         syncRuntimeMetricsSelectionCount(selection: snapshot.selection)
@@ -262,8 +262,10 @@ struct AgentModeDetailWithSidebarView: View {
     }
 
     private func syncRuntimeMetricsSelectionCount(selection: StoredSelection) {
+        let summary = AgentContextExportResolver.selectionSummary(for: selection)
         agentModeVM.syncRuntimeMetricsUIState(
-            liveSelectedFileCount: AgentContextExportResolver.explicitSelectionFileCount(selection)
+            liveSelectedFileCount: summary.totalExplicitFileCount,
+            liveSelectionSummary: summary
         )
     }
 }

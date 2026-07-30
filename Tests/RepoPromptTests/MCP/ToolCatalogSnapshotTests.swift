@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import MCP
 import Ontology
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -40,6 +40,25 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         }
 
         XCTAssertEqual(signatures, Self.expectedSignatures)
+    }
+
+    func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
+        let schema = try XCTUnwrap(Value(agentRun.inputSchema).objectValue)
+        let properties = try Self.schemaProperties(for: agentRun)
+        let response = try XCTUnwrap(properties["response"]?.objectValue)
+        let responseDescription = try XCTUnwrap(response["description"]?.stringValue)
+        let required = try XCTUnwrap(schema["required"]?.arrayValue?.compactMap(\.stringValue))
+
+        XCTAssertEqual(response["type"]?.stringValue, "string")
+        XCTAssertTrue(responseDescription.contains("top-level scalar string"), responseDescription)
+        XCTAssertTrue(responseDescription.contains("response=\"accept\""), responseDescription)
+        XCTAssertTrue(responseDescription.contains("decision and nested response objects are unsupported"), responseDescription)
+        XCTAssertNil(properties["decision"])
+        XCTAssertEqual(required, ["op"])
+        XCTAssertTrue(agentRun.description.contains("response=\"accept\""), agentRun.description)
     }
 
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
@@ -303,6 +322,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             XCTAssertNotNil(agentRunProperties[field], "agent_run schema should advertise property \(field)")
             XCTAssertNotNil(agentExploreProperties[field], "agent_explore schema should advertise property \(field)")
         }
+        #if DEBUG
+            XCTAssertNotNil(agentRunProperties["_worktree_startup_benchmark_token"])
+            XCTAssertNil(agentExploreProperties["_worktree_startup_benchmark_token"])
+        #endif
 
         let exploreOpEnum = agentExploreProperties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
         XCTAssertEqual(exploreOpEnum, ["start", "poll", "wait", "cancel"])
@@ -365,6 +388,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         ) async throws {
             let fixture = try BootstrapSocketNamespaceFixture.make()
             let manager = ServerNetworkManager.shared
+            await manager.debugResumeAllLifecycleFenceCheckpoints()
+            await manager.stop()
             let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
             let defaultSocketURL = await manager.debugResolvedBootstrapSocketURL()
             XCTAssertEqual(defaultSocketURL, productionSocketURL)
@@ -454,7 +479,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     #endif
 
     private static func schemaProperties(
-        for tool: RepoPrompt.Tool,
+        for tool: RepoPromptApp.Tool,
         label: String = "",
         file: StaticString = #filePath,
         line: UInt = #line
@@ -464,32 +489,33 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     }
 
     private static let expectedSignatures: [String] = [
-        "0|manage_selection|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=586c45be3d3a4ade60e29ccbbdce01b050be03860a67eee41a3eac95d441d7d9|schema=4b7a043e8e48130ee84cc6bbf7b9fd597b495aef238d44f17df6600088a2bb6f",
-        "1|file_actions|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=81230c22d826458cae079855b133d59da34c4a66ae4a68252727e564931335b8|schema=d4ed12eee8ed779610016aa46a6f3686ed7635436517c0de0a16efc8b0d0d1fe",
-        "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=616a8669bc14e69afaad4cfec4e4da2b1f5dcb7142030fb615857175b2146cb4|schema=f9bbf57f060e5cf70b8104a4b800100459376fb4438bfa80ef8f388aedf7c913",
+        "0|manage_selection|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b2facb46e2b8f9d4cfb00551bdfa19454b7f3eecd81bac510f4fed12f99452c3|schema=4b7a043e8e48130ee84cc6bbf7b9fd597b495aef238d44f17df6600088a2bb6f",
+        "1|file_actions|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=81230c22d826458cae079855b133d59da34c4a66ae4a68252727e564931335b8|schema=4fd6a59a00940e13efc05b74c81372928d3ad3de0e028c8b34586e2168d16103",
+        "2|get_code_structure|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=22f87c78aabfda053a0a62d731743d8ba06db649f6f2497820aea0e2a97fa769|schema=3e87702a79eee436137bef3cf5fec4ee42ab5d252bd69d4eaa7a82ca62ad736a",
         "3|get_file_tree|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=9bf648121646b463554d58373f61c2dcede04640482994e0cf1533d21ae77093|schema=91972027e030989cf242fed03377bdc5056c6317cc77d351d3fa5348dd1767a0",
         "4|read_file|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f5ccd98a8fc0956c4ebcff540ffc8c0eaf0aaeb654b2f8edc0495c059fcf2807|schema=d023edb446167481751886bebeac7dc8896e2b3f57c12b18591761f846618bb1",
         "5|file_search|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=f2c9e16ca780c4e94f795b6c9489658856052e6d159aa467a64c906ee48a3fe4|schema=08904f5e241c06414ff476b80b81338a5798961a69d93227d7ed098694546b99",
         "6|workspace_context|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fb968e72d430d354b03a0dfdb5251d95bbdea2a38cddcd58fe402f6bcb4f1035|schema=d41b9e8db1ccb1ce385d2d20619485a211bda4a8474270ef0c08fc77647e8376",
         "7|prompt|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d|schema=8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1",
-        "8|apply_edits|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=d33efa75e3e29e1e4e1cfe90d0e9d621337c397e5329aee02f4a261726d790fa|schema=2eabab77e3cdea6af1e1a509d77b9e8a3211049c1ccd11ec9b64f79149abdbbb",
+        "8|apply_edits|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=d33efa75e3e29e1e4e1cfe90d0e9d621337c397e5329aee02f4a261726d790fa|schema=e1ad464843910182006a484b0545305f8d53821a795cd8e116c07a01eededed8",
         "9|oracle_utils|enabled=true|ann=title=nil,readOnly=nil,destructive=nil,idempotent=nil,openWorld=nil|desc=af161abbd2edf82b9cf502e1cf794bc48366b816b3ddc0ec2034b154ecc35c3a|schema=7d3c55c22f02f8825008521e4c20cd304a7c12f3679743b34f5a2bf315d19d7b",
         "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=7a4771154006b3dcf158003d04b2b78da91fe4cc63d1acb5942f64f8a3e04e98|schema=03968f76ace268ccd7128c088ecc2544ca5ec77f47100d03e38a29a155cf81eb",
         "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4608413a45189586669c6cc3339af4d467939a2477036545ef5d879b676b51fb|schema=6f940dcd0a0d39789189120217abdb60cd0f520b85f862beb81349f98bc1b19c",
         "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=5acbb74a0fcf76bd3717faac8fc355f582f13523685d3bfebf11fda7241958b1|schema=50db94327abe785e20d3628135efa29cf184d18272d5af5b94a43d7246a4a201",
-        "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=60cfcfd61921d3e828c0f49551672db392b928456b3c375e9e3cc819ee126e2b|schema=ebc134daddcab2321f0b9c20c76d0dd660eab1c0b78a54bfb8c83817da24ba77",
+        "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=1a9ff83872cf8842146dd84563dd880f7d9b8f6190cc6e9204a0ea82fc8feca6|schema=51bd804997d6acfaa17d529867f6188b969282a4db95956e859a74ab07de626a",
         "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
-        "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",
-        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=52ef9e56d0aa35f1523bb6700ce9ced3512749401b4ea409d0de8cf3d007855b|schema=e2b5bce34fa512aca293fffec7eaa46a9639feb4e840546c12d3554b8a2d514b",
-        "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=03e16bee789cb9343f6b1b16cb4d472aedd3d811a43f6f95ad8ea5e8f69dc28d|schema=f5bc6b05cf0683ef3acb7a82ee4a14b75fadf26f32c56b0314be1424688a2ba5",
+        "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=d367738ad179d8f6b39b98f73082d594f53c42d771c4f2e512790593c5b3f9f4",
+        "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=2b5e211868964f961f2d369c2aa54da7035a92a83e900770ad433e4ceb00fd96|schema=0b4f819f3aa6624df0f54fdaba6f8717ac64667d07a0528240d26905ba480520",
+        "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=80d302d4391d6136f8acfbe8fc0bafe394c5110c5e63aefcf8f4c59fcbdbf95f|schema=83f34927eacac4dc6352db72eae312ac3a5477b2f70c9031f09a2101dc8f2e97",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
-        "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef"
+        "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
+        "23|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fdc6ec2292ef0962b5fcfadf8691d905849a28474a832042789f14c444f6b0b6|schema=584dfe4f4200b3c795505461c3889c23d455a3af97c761e3bb5dd40ae46a8d71"
     ]
 
-    private static func signatures(for tools: [RepoPrompt.Tool]) throws -> [String] {
+    private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {
         try tools.enumerated().map { index, tool in
             let schemaValue = try Value(tool.inputSchema)
             let schemaDigest = try digest(canonicalJSONString(schemaValue))

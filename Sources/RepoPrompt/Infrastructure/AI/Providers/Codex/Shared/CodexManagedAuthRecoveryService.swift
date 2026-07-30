@@ -1,6 +1,7 @@
 import Foundation
 
 protocol CodexManagedAuthRPCClient: Sendable {
+    func updateDefaultRequestTimeout(_ timeout: TimeInterval?) async
     func startIfNeeded() async throws
     func stop() async
     func request(
@@ -109,6 +110,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 Task { await client.stop() }
             }
             do {
+                await client.updateDefaultRequestTimeout(refreshRequestTimeout)
                 try await client.startIfNeeded()
                 let result = try await client.request(
                     method: "account/read",
@@ -155,6 +157,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 Task { await client.stop() }
             }
             do {
+                await client.updateDefaultRequestTimeout(refreshRequestTimeout)
                 try await client.startIfNeeded()
                 let notifications = await client.subscribeNotifications()
                 var state = LoginNotificationState()

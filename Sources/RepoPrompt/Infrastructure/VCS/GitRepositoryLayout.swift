@@ -1,5 +1,11 @@
 import Foundation
 
+enum GitRepositoryKind: Equatable {
+    case nonGit
+    case bare
+    case worktree
+}
+
 // MARK: - Git Repository Layout
 
 /// Describes the layout of a Git repository, including worktree configurations.

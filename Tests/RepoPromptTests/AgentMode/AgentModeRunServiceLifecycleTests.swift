@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 private let lifecycleAwaitTimeoutSeconds: TimeInterval = 5
 
@@ -384,6 +384,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
             XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
             XCTAssertTrue(recorder.contains("delivered"))
+            XCTAssertEqual(recorder.events.count(where: { $0 == "claude:send" }), 1)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "delivered" }), 1)
             assertOrderedEvents(["idle", "claude:interrupt:interrupt", "claude:send", "delivered"], in: recorder)
         }
 
@@ -456,6 +458,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
                 XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
                 XCTAssertTrue(recorder.contains("delivered"))
+                XCTAssertEqual(recorder.events.count(where: { $0 == "acp:session/prompt" }), 2)
+                XCTAssertEqual(recorder.events.count(where: { $0 == "delivered" }), 1)
                 assertOrderedEvents(["idle", "acp:session/cancel", "acp:session/prompt", "delivered"], in: recorder, afterFirstMatchOf: "acp:session/prompt")
             }
         }
@@ -642,6 +646,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let processID = try XCTUnwrap(pid_t(processIDText))
         XCTAssertTrue(Self.processIsRunning(processID))
 
+        harness.host.test_installLiveSession(session)
         await cleanupRegisteredRuntime()
 
         try await waitUntil("OpenCode process should exit during lifecycle cleanup") {
@@ -650,6 +655,48 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(Self.processIsRunning(processID))
         let remainsReusable = await controller.hasReusableSession
         XCTAssertFalse(remainsReusable)
+    }
+
+    func testWindowCloseShutsDownRetainedACPController() async throws {
+        let fixture = try await makeRetainedACPFixture(processIDFileName: "window-close-acp-process-id.txt")
+        fixture.host.test_installLiveSession(fixture.session)
+        XCTAssertTrue(Self.processIsRunning(fixture.processID))
+
+        await fixture.host.prepareForWindowClose()
+
+        XCTAssertNil(fixture.session.acpController)
+        try await waitUntilProcessExits(fixture.processID, "Window close should terminate retained ACP process")
+        XCTAssertFalse(Self.processIsRunning(fixture.processID))
+        let remainsReusable = await fixture.controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testComposeTabRemovalShutsDownRetainedACPControllerBeforeRemovingSession() async throws {
+        let rows: [(PromptViewModel.ComposeTabRemovalReason, String)] = [
+            (.close, "close"),
+            (.stash, "stash"),
+            (.deleteStashed, "delete-stashed")
+        ]
+
+        for (reason, name) in rows {
+            let fixture = try await makeRetainedACPFixture(processIDFileName: "compose-\(name)-acp-process-id.txt")
+            fixture.host.test_installLiveSession(fixture.session)
+            XCTAssertTrue(Self.processIsRunning(fixture.processID), name)
+
+            await fixture.host.handleComposeTabsWillClose([fixture.session.tabID], reason: reason)
+
+            XCTAssertNil(fixture.session.acpController, name)
+            XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)
+            try await waitUntilProcessExits(
+                fixture.processID,
+                "Compose tab \(name) should terminate retained ACP process"
+            )
+            XCTAssertFalse(Self.processIsRunning(fixture.processID), name)
+            let remainsReusable = await fixture.controller.hasReusableSession
+            XCTAssertFalse(remainsReusable, name)
+            acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+        }
     }
 
     func testTerminalBarrierRejectsStaleOwnership() async {
@@ -758,6 +805,81 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             in: recorder,
             prefixMatches: true
         )
+    }
+
+    func testCodexCancellationCoalescesBufferedAssistantTailBeforeTerminalSeal() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        var publishedRevision: AgentRunTerminalCommitRevision?
+        let harness = makeHarness(
+            recorder: recorder,
+            codexController: controller,
+            publishTerminalCommit: { _, revision in
+                publishedRevision = revision
+                recorder.record("commit:\(revision.commitID.uuidString)")
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.codexBufferedCancellation")
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
+        session.codexController = controller
+        session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
+        let commandInvocationID = UUID()
+        session.appendItem(.toolResult(
+            name: "bash",
+            invocationID: commandInvocationID,
+            argsJSON: "{}",
+            resultJSON: #"{"status":"completed"}"#,
+            isError: false,
+            sequenceIndex: session.nextSequenceIndex
+        ))
+
+        harness.host.test_codexCoordinator.test_enqueueAssistantDelta("answer", session: session)
+        harness.host.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        let streamingPrefix = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(streamingPrefix.kind, .assistant)
+        XCTAssertEqual(streamingPrefix.text, "answer")
+        XCTAssertTrue(streamingPrefix.isStreaming)
+
+        harness.host.test_codexCoordinator.test_enqueueAssistantDelta(".", session: session)
+        XCTAssertEqual(session.pendingAssistantDelta, ".")
+        XCTAssertNotNil(session.assistantDeltaFlushTask)
+        session.pendingCommandRunningByKey["terminal-test"] = .init(
+            invocationID: commandInvocationID,
+            processID: nil,
+            appendedOutput: nil,
+            sealsAssistantBoundary: false
+        )
+        session.pendingCommandRunningFlushTask = Task {}
+        XCTAssertFalse(harness.host.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["answer."])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNil(session.assistantDeltaFlushTask)
+        XCTAssertTrue(session.pendingCommandRunningByKey.isEmpty)
+        XCTAssertNil(session.pendingCommandRunningFlushTask)
+        XCTAssertTrue(harness.host.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        let revision = try XCTUnwrap(publishedRevision)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertEqual(revision.terminalState, .cancelled)
+        XCTAssertEqual(revision.sourceItemsRevision, session.sourceItemsRevision)
+        XCTAssertEqual(revision.assistantDeltaFlushGeneration, session.assistantDeltaFlushGeneration)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
+        XCTAssertEqual(session.lastTerminalCommitRevision, revision)
     }
 
     func testDuplicateTerminalBarrierInvocationRetriesUnresolvedPublicationWithoutRecommitting() async throws {
@@ -1451,6 +1573,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             providerRuntimePermissionResolver: { [bindingService = host.providerBindingService] agent, profile in
                 bindingService.runtimePermission(for: agent, profile: profile)
             },
+            bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: cancelMCPTools,
             awaitNoActiveMCPTools: idleWaiter,
             activeAgentRunWaitQuery: { _ in false },
@@ -1535,6 +1658,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             prependPendingHandoffIfNeeded: { text, _ in text },
             recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
             signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+        )
+    }
+
+    private struct RetainedACPFixture {
+        let host: AgentModeViewModel
+        let session: AgentModeViewModel.TabSession
+        let controller: ACPAgentSessionController
+        let processID: pid_t
+    }
+
+    private func makeRetainedACPFixture(processIDFileName: String) async throws -> RetainedACPFixture {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent(processIDFileName)
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let request = makeACPRunRequest(workspacePath: workspace.path)
+        let controller = try makeACPController(provider: provider, request: request, recorder: recorder)
+        try await withLifecycleTimeout("ACP bootstrap") {
+            _ = try await controller.bootstrap()
+        }
+        try await waitUntil("ACP process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+        let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.acpController = controller
+        return RetainedACPFixture(
+            host: harness.host,
+            session: session,
+            controller: controller,
+            processID: processID
         )
     }
 
@@ -1848,6 +2014,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 if await gate.resume(with: .failure(error)), cancelOperationOnTimeout {
                     operationTask.cancel()
                 }
+            }
+        }
+    }
+
+    private func waitUntilProcessExits(_ processID: pid_t, _ message: String) async throws {
+        try await withLifecycleTimeout(message, cancelOperationOnTimeout: false) {
+            while Self.processIsRunning(processID) {
+                try await Task.sleep(nanoseconds: 10_000_000)
             }
         }
     }

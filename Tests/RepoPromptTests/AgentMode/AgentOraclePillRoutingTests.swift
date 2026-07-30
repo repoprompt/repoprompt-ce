@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -102,6 +102,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             messages: [StoredMessage(isUser: false, rawText: "newer", sequenceIndex: 0)]
         )
         fixture.oracleViewModel.sessions = [exact, newer]
+        let didLoadExactSessionMessages = await fixture.oracleViewModel.ensureSessionMessagesLoaded(exact.id)
+        XCTAssertTrue(didLoadExactSessionMessages)
 
         XCTAssertEqual(
             AgentOraclePillLogic.latestSession(
@@ -125,6 +127,56 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
         XCTAssertEqual(byShortID?.id, exact.id)
         XCTAssertEqual(fixture.oracleViewModel.messagesSnapshot(for: exact.id).count, 1)
+    }
+
+    func testLatestStreamingSessionDoesNotFallbackToStaleCompletedSession() {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let olderStreaming = ChatSession(
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: "Older Streaming",
+            savedAt: Date(timeIntervalSince1970: 100)
+        )
+        let staleCompleted = ChatSession(
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: "Stale Completed",
+            savedAt: Date(timeIntervalSince1970: 300)
+        )
+        let newerStreaming = ChatSession(
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: "Newer Streaming",
+            savedAt: Date(timeIntervalSince1970: 200)
+        )
+        let sessions = [olderStreaming, staleCompleted, newerStreaming]
+
+        XCTAssertEqual(
+            AgentOraclePillLogic.latestSession(
+                in: sessions,
+                streamingSessionIDs: [olderStreaming.id, newerStreaming.id]
+            )?.id,
+            newerStreaming.id
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.latestStreamingSession(
+                in: sessions,
+                streamingSessionIDs: [olderStreaming.id, newerStreaming.id]
+            )?.id,
+            newerStreaming.id
+        )
+        XCTAssertNil(AgentOraclePillLogic.latestStreamingSession(
+            in: sessions,
+            streamingSessionIDs: []
+        ))
+        XCTAssertEqual(
+            AgentOraclePillLogic.latestSession(
+                in: sessions,
+                streamingSessionIDs: []
+            )?.id,
+            staleCompleted.id
+        )
     }
 
     func testExactPersistedResolutionHydratesAndRegistersUUIDAndShortID() async throws {
@@ -364,6 +416,9 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         if let index = composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
             composition.workspaceManager.workspaces[index] = workspace
         }
+        composition.workspaceManager.activeWorkspace = workspace
+        composition.promptManager.loadComposeTabsFromWorkspace(workspace)
+        await composition.oracleViewModel.loadSessionsFromWorkspace()
         composition.oracleViewModel.sessions = []
 
         return Fixture(

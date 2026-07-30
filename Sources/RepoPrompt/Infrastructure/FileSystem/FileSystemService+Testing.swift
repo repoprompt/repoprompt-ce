@@ -124,7 +124,8 @@ import Foundation
 
         /// Test-only method to get current state
         func getTestState() -> (visitedPaths: Set<String>, visitedItems: [String: Bool]) {
-            (visitedPaths, visitedItems)
+            let state = visitedInventory.materializedStateForTesting()
+            return (state.paths, state.items)
         }
 
         /// Test-only method to get event ID coalescing state

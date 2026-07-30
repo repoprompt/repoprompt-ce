@@ -19,16 +19,6 @@ struct AgentStatusPillsRow: View {
         #endif
         HStack(spacing: 12) {
             HStack(spacing: 6) {
-                AgentWorkflowPill(
-                    statusPillsUI: statusPillsUI,
-                    windowID: windowID,
-                    selectWorkflow: { agentModeVM.selectWorkflow($0) }
-                )
-
-                if let stagedSlashCommand = snapshot.stagedSlashCommand {
-                    AgentStagedSlashCommandPill(staged: stagedSlashCommand)
-                }
-
                 if let executionLocation = snapshot.executionLocation {
                     AgentExecutionLocationPill(
                         props: executionLocation,
@@ -41,6 +31,21 @@ struct AgentStatusPillsRow: View {
                             )
                         }
                     )
+                }
+
+                AgentWorkflowPill(
+                    statusPillsUI: statusPillsUI,
+                    windowID: windowID,
+                    selectWorkflow: { agentModeVM.selectWorkflow($0) }
+                )
+
+                AgentInterviewPill(
+                    isOn: snapshot.interviewFirst,
+                    onToggle: { agentModeVM.toggleInterviewFirst() }
+                )
+
+                if let stagedSlashCommand = snapshot.stagedSlashCommand {
+                    AgentStagedSlashCommandPill(staged: stagedSlashCommand)
                 }
             }
 

@@ -377,7 +377,7 @@ extension AgentSessionDataService {
             )
         }
 
-        var preferredEntry: AgentSessionIndexEntry?
+        var preferredEntries: [AgentSessionIndexEntry] = []
         for record in records {
             recordsScanned += 1
             guard record.composeTabID == tabID,
@@ -388,15 +388,10 @@ extension AgentSessionDataService {
             else {
                 continue
             }
-            if let existing = preferredEntry {
-                if AgentSessionRestoreSupport.shouldPreferSidebarEntry(entry, over: existing) {
-                    preferredEntry = entry
-                }
-            } else {
-                preferredEntry = entry
-            }
+            preferredEntries.append(entry)
         }
 
+        let preferredEntry = AgentSessionRestoreSupport.preferredEntriesByTabID(from: preferredEntries)[tabID]
         guard let preferredEntry else {
             return PrioritizedSidebarProjection(
                 result: AgentSessionSidebarBuildResult(
@@ -470,6 +465,7 @@ extension AgentSessionDataService {
         #endif
 
         let explicitlyBoundTabIDs = Set(preferredEntryByTabID.keys)
+        var fallbackPreferredCandidates: [AgentSessionIndexEntry] = []
         for record in sortedRecords {
             guard let tabID = record.composeTabID,
                   request.validTabIDs.contains(tabID)
@@ -492,13 +488,10 @@ extension AgentSessionDataService {
                 entriesBySessionID[entry.id] = entry
             }
             guard !explicitlyBoundTabIDs.contains(tabID) else { continue }
-            if let existing = preferredEntryByTabID[tabID] {
-                if AgentSessionRestoreSupport.shouldPreferSidebarEntry(entry, over: existing) {
-                    preferredEntryByTabID[tabID] = entry
-                }
-            } else {
-                preferredEntryByTabID[tabID] = entry
-            }
+            fallbackPreferredCandidates.append(entry)
+        }
+        for (tabID, entry) in AgentSessionRestoreSupport.preferredEntriesByTabID(from: fallbackPreferredCandidates) {
+            preferredEntryByTabID[tabID] = entry
         }
         #if DEBUG
             let preferredDurationMS = preferredStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }

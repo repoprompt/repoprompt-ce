@@ -56,6 +56,12 @@ import RepoPromptShared
             lock.unlock()
             callbacks.forEach { $0() }
         }
+
+        func pendingCount(_ kind: Kind) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return pendingCallbacks[kind]?.count ?? 0
+        }
     }
 
     struct UnixSocketMCPTransportCleanupSnapshot {
@@ -64,6 +70,7 @@ import RepoPromptShared
         let earlyReaderCancellationCount: Int
         let readerIsRetained: Bool
         let terminalCallbackCount: Int
+        let pendingTerminalCallbackCount: Int
         let cancellationCallbackCount: Int
         let finalizationCount: Int
         let descriptorCloseCount: Int
@@ -155,12 +162,6 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
 /// Tracks request/response publication at the socket boundary so lifecycle cleanup can
 /// wait for completed writes rather than closing after a handler merely returns.
 final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
-    struct Snapshot {
-        let pendingRequestCount: Int
-        let waiterCount: Int
-        let isTerminal: Bool
-    }
-
     private let lock = NSLock()
     private var pendingRequestIDs: Set<JSONRPCBridgeID> = []
     private var waiters: [CheckedContinuation<Bool, Never>] = []
@@ -261,10 +262,10 @@ final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
         continuations.forEach { $0.resume(returning: false) }
     }
 
-    func snapshot() -> Snapshot {
+    func snapshot() -> MCPResponseDeliverySnapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(
+        return MCPResponseDeliverySnapshot(
             pendingRequestCount: pendingRequestIDs.count,
             waiterCount: waiters.count,
             isTerminal: isTerminal
@@ -730,6 +731,10 @@ public actor UnixSocketMCPTransport: Transport {
         return Date().timeIntervalSince(lastActivityTime)
     }
 
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot {
+        responseDeliveryGate.snapshot()
+    }
+
     func waitUntilResponseDeliveryDrained() async -> Bool {
         await responseDeliveryGate.waitUntilDrained()
     }
@@ -953,6 +958,10 @@ public actor UnixSocketMCPTransport: Transport {
         errno == ECONNRESET ? .peer : .transport
     }
 
+    private nonisolated static func isPeerWriteHangupErrno(_ errno: Int32) -> Bool {
+        errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN
+    }
+
     #if DEBUG
         private struct DebugExistingFDConnectFailure: Swift.Error {}
 
@@ -999,6 +1008,7 @@ public actor UnixSocketMCPTransport: Transport {
                 earlyReaderCancellationCount: earlyReaderCancellations.count,
                 readerIsRetained: debugLastReader != nil,
                 terminalCallbackCount: debugTerminalCallbackCount,
+                pendingTerminalCallbackCount: callbackGate.pendingCount(.terminal),
                 cancellationCallbackCount: debugCancellationCallbackCount,
                 finalizationCount: debugReaderFinalizationCount,
                 descriptorCloseCount: debugDescriptorCloseCount,
@@ -1092,7 +1102,7 @@ public actor UnixSocketMCPTransport: Transport {
                         bytesRemaining: remaining.count
                     )
                     continue
-                } else if err == EPIPE || err == ECONNRESET {
+                } else if Self.isPeerWriteHangupErrno(err) {
                     closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer, errno: err)
                     throw MCPError.connectionClosed
                 } else {

@@ -10,7 +10,6 @@ struct WorkspaceCheckoutRefreshResult: Equatable {
     let requestedRootPath: String
     let refreshedRootIDs: [UUID]
     let refreshedRootPaths: [String]
-    let removedStaleCodemapFileIDs: [UUID]
     /// Generation from rebuilding the shared visible search index. Nil is expected for
     /// session-worktree-only refreshes; scoped session search reads the fresh store catalog directly.
     let searchIndexedGeneration: UInt64?
@@ -22,7 +21,7 @@ struct WorkspaceCheckoutRefreshResult: Equatable {
     }
 }
 
-/// Coordinates workspace catalog/search/path/codemap freshness after an in-app checkout mutation.
+/// Coordinates workspace catalog, search, path, and codemap authority after an in-app checkout mutation.
 ///
 /// This intentionally lives in the workspace layer. Git status code mutates Git and refreshes branch
 /// summaries; Agent Mode only asks for this seam after a successful in-app checkout switch.
@@ -42,7 +41,6 @@ struct WorkspaceCheckoutRefreshService {
                 requestedRootPath: standardizedRootPath,
                 refreshedRootIDs: [],
                 refreshedRootPaths: [],
-                removedStaleCodemapFileIDs: [],
                 searchIndexedGeneration: nil,
                 searchIndexRefreshBehavior: .noLoadedRoot,
                 pathLookupGeneration: nil
@@ -51,16 +49,13 @@ struct WorkspaceCheckoutRefreshService {
 
         let rootScope = await narrowRootScope(for: loadedRoots)
         let loadedRootIDs = loadedRoots.map(\.id)
+        await store.fenceCodemapAuthorityForCheckoutMutation(rootIDs: loadedRootIDs)
         _ = await store.awaitAppliedIngress(rootScope: rootScope)
         for rootID in loadedRootIDs {
             await store.reconcileLoadedRootCatalogWithDisk(rootID: rootID)
         }
-        await store.cancelCodemapScansForCheckoutMutation(rootIDs: loadedRootIDs)
-        let removedStaleCodemapFileIDs = await store.invalidateCodemapSnapshotsForCheckoutMutation(rootIDs: loadedRootIDs)
-
         async let warmedGeneration = store.warmPathLookupIndexes(rootScope: rootScope)
         async let indexedResult = rebuildSharedVisibleSearchIndexIfNeeded(affectedRoots: loadedRoots)
-        requestCodemapRescansInBackground(rootIDs: loadedRootIDs)
 
         let searchIndexResult = await indexedResult
         let pathLookupGeneration = await warmedGeneration
@@ -68,7 +63,6 @@ struct WorkspaceCheckoutRefreshService {
             requestedRootPath: standardizedRootPath,
             refreshedRootIDs: loadedRoots.map(\.id),
             refreshedRootPaths: loadedRoots.map(\.standardizedFullPath),
-            removedStaleCodemapFileIDs: removedStaleCodemapFileIDs,
             searchIndexedGeneration: searchIndexResult.generation,
             searchIndexRefreshBehavior: searchIndexResult.behavior,
             pathLookupGeneration: pathLookupGeneration
@@ -84,15 +78,6 @@ struct WorkspaceCheckoutRefreshService {
         let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
         let generation = await searchService.rebuildIndex(from: snapshot)
         return (generation, .rebuiltSharedVisibleWorkspace)
-    }
-
-    private func requestCodemapRescansInBackground(rootIDs: [UUID]) {
-        let store = store
-        Task.detached(priority: .utility) {
-            for rootID in rootIDs {
-                try? await store.requestCodemapScans(inRoot: rootID)
-            }
-        }
     }
 
     private func narrowRootScope(for targetRoots: [WorkspaceRootRecord]) async -> WorkspaceLookupRootScope {

@@ -75,117 +75,137 @@ enum StoreBackedWorkspaceSearch {
         store: WorkspaceFileContextStore,
         workspaceManager: WorkspaceManagerViewModel?
     ) async throws -> SearchResults {
-        try Task.checkCancellation()
-        try await ensureRootScopeAvailable(rootScope, store: store)
-        let readinessTicket = try await acquireSearchReadiness(
-            store: store,
-            workspaceManager: workspaceManager
-        )
-        try await ensureRootScopeAvailable(
-            rootScope,
-            store: store,
-            readinessTicket: readinessTicket,
-            workspaceManager: workspaceManager
-        )
-        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-
-        let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
-        let admissionClass = broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths)
-        return try await store.withStoreBackedSearchAccess(
-            searchMode: effectiveMode,
-            admissionClass: admissionClass
-        ) { fileSearchActor in
-            if admissionClass != nil {
-                try await ensureRootScopeAvailable(
-                    rootScope,
-                    store: store,
-                    readinessTicket: readinessTicket,
-                    workspaceManager: workspaceManager
-                )
-            }
-            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-
-            var parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
-                await parseSearchScopePaths(
-                    rawPaths,
-                    caseInsensitive: caseInsensitive,
-                    rootScope: rootScope,
-                    store: store
-                )
-            } else {
-                nil
-            }
-            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-            let freshnessRootRefs: [WorkspaceRootRef] = if let parsedSearchScope {
-                parsedSearchScope.freshnessRootRefs
-            } else {
-                await store.rootRefs(scope: rootScope)
-            }
-            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+        try await FileSystemService.withContentReadForegroundActivity(kind: .storeBackedSearch) {
             #if DEBUG
-                let freshnessWaitTimeout = freshnessWaitTimeoutOverrideForTesting
-                    ?? MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
-            #else
-                let freshnessWaitTimeout = MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+                let diagnosticCollector = WorkspaceFileSearchDebugContext.collector
+                let diagnosticSearchStart = WorkspaceFileSearchDebugTiming.now()
+                defer {
+                    if Task.isCancelled {
+                        diagnosticCollector?.finish(status: .cancelled)
+                    }
+                }
             #endif
-            let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
-            let appliedIngressSamples: [WorkspaceIngressBarrierSample]
-            do {
-                appliedIngressSamples = try await awaitAppliedIngress(
-                    rootRefs: freshnessRootRefs,
-                    store: store,
-                    timeout: freshnessWaitTimeout
-                )
-                try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-            } catch {
-                EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
-                throw error
-            }
-            EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
             try Task.checkCancellation()
-            let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(
-                rootRefs: freshnessRootRefs,
-                appliedIngressSamples: appliedIngressSamples
+            try await ensureRootScopeAvailable(rootScope, store: store)
+            let readinessTicket = try await acquireSearchReadiness(
+                store: store,
+                workspaceManager: workspaceManager
+            )
+            try await ensureRootScopeAvailable(
+                rootScope,
+                store: store,
+                readinessTicket: readinessTicket,
+                workspaceManager: workspaceManager
             )
             try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-            try Task.checkCancellation()
-            if let parsed = parsedSearchScope {
-                // Exact paths can change kind or disappear while the freshness barrier applies
-                // pending ingress. Refresh only their root-local catalog records; wildcard,
-                // unresolved, and ambiguous clauses retain their initial conservative semantics.
-                parsedSearchScope = await refreshExactSearchScopeClauses(
-                    parsed,
-                    store: store
+
+            let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
+            let admissionClass = broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths)
+            return try await store.withStoreBackedSearchAccess(
+                searchMode: effectiveMode,
+                admissionClass: admissionClass
+            ) { fileSearchActor in
+                if admissionClass != nil {
+                    try await ensureRootScopeAvailable(
+                        rootScope,
+                        store: store,
+                        readinessTicket: readinessTicket,
+                        workspaceManager: workspaceManager
+                    )
+                }
+                try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+
+                var parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
+                    await parseSearchScopePaths(
+                        rawPaths,
+                        caseInsensitive: caseInsensitive,
+                        rootScope: rootScope,
+                        store: store
+                    )
+                } else {
+                    nil
+                }
+                try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+                let freshnessRootRefs: [WorkspaceRootRef] = if let parsedSearchScope {
+                    parsedSearchScope.freshnessRootRefs
+                } else {
+                    await store.rootRefs(scope: rootScope)
+                }
+                try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+                #if DEBUG
+                    let freshnessWaitTimeout = freshnessWaitTimeoutOverrideForTesting
+                        ?? MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+                #else
+                    let freshnessWaitTimeout = MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+                #endif
+                let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
+                let appliedIngressSamples: [WorkspaceIngressBarrierSample]
+                do {
+                    appliedIngressSamples = try await awaitAppliedIngress(
+                        rootRefs: freshnessRootRefs,
+                        store: store,
+                        timeout: freshnessWaitTimeout
+                    )
+                    try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+                } catch {
+                    EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
+                    throw error
+                }
+                EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
+                try Task.checkCancellation()
+                let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(
+                    rootRefs: freshnessRootRefs,
+                    appliedIngressSamples: appliedIngressSamples
                 )
                 try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-            }
-            try Task.checkCancellation()
+                try Task.checkCancellation()
+                if let parsed = parsedSearchScope {
+                    // Exact paths can change kind or disappear while the freshness barrier applies
+                    // pending ingress. Refresh only their root-local catalog records; wildcard,
+                    // unresolved, and ambiguous clauses retain their initial conservative semantics.
+                    parsedSearchScope = await refreshExactSearchScopeClauses(
+                        parsed,
+                        store: store
+                    )
+                    try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+                }
+                try Task.checkCancellation()
+                #if DEBUG
+                    let diagnosticPreambleEnd = WorkspaceFileSearchDebugTiming.now()
+                    diagnosticCollector?.recordReadinessFreshnessPreamble(
+                        nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: diagnosticSearchStart,
+                            through: diagnosticPreambleEnd
+                        )
+                    )
+                #endif
 
-            return try await performSearch(
-                pattern: pattern,
-                mode: mode,
-                effectiveMode: effectiveMode,
-                isRegex: isRegex,
-                caseInsensitive: caseInsensitive,
-                maxPaths: maxPaths,
-                maxMatches: maxMatches,
-                paths: paths,
-                includeExtensions: includeExtensions,
-                excludePatterns: excludePatterns,
-                contextLines: contextLines,
-                wholeWord: wholeWord,
-                countOnly: countOnly,
-                fuzzySpaceMatching: fuzzySpaceMatching,
-                allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
-                contentFreshnessPolicy: contentFreshnessPolicy,
-                freshnessQualifiedRootIDs: Set(freshnessRootRefs.map(\.id)),
-                parsedSearchScope: parsedSearchScope,
-                rootScope: rootScope,
-                store: store,
-                fileSearchActor: fileSearchActor,
-                workspaceManager: workspaceManager,
-                readinessTicket: readinessTicket
-            )
+                return try await performSearch(
+                    pattern: pattern,
+                    mode: mode,
+                    effectiveMode: effectiveMode,
+                    isRegex: isRegex,
+                    caseInsensitive: caseInsensitive,
+                    maxPaths: maxPaths,
+                    maxMatches: maxMatches,
+                    paths: paths,
+                    includeExtensions: includeExtensions,
+                    excludePatterns: excludePatterns,
+                    contextLines: contextLines,
+                    wholeWord: wholeWord,
+                    countOnly: countOnly,
+                    fuzzySpaceMatching: fuzzySpaceMatching,
+                    allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
+                    contentFreshnessPolicy: contentFreshnessPolicy,
+                    freshnessQualifiedRootIDs: Set(freshnessRootRefs.map(\.id)),
+                    parsedSearchScope: parsedSearchScope,
+                    rootScope: rootScope,
+                    store: store,
+                    fileSearchActor: fileSearchActor,
+                    workspaceManager: workspaceManager,
+                    readinessTicket: readinessTicket
+                )
+            }
         }
     }
 
@@ -273,7 +293,28 @@ enum StoreBackedWorkspaceSearch {
         }
 
         try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-        let catalogAccess = await store.searchCatalogAccess(rootScope: rootScope)
+        #if DEBUG
+            let diagnosticCatalogStart = WorkspaceFileSearchDebugTiming.now()
+        #endif
+        let catalogRequirement: WorkspaceSearchCatalogAccessRequirement = switch mode {
+        case .path:
+            .recordsOnly
+        case .auto, .content, .both:
+            .recordsAndPathIndexes
+        }
+        let catalogAccess = await store.searchCatalogAccess(
+            rootScope: rootScope,
+            requirement: catalogRequirement
+        )
+        #if DEBUG
+            let diagnosticCatalogEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.collector?.recordFirstCatalogAccess(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: diagnosticCatalogStart,
+                    through: diagnosticCatalogEnd
+                )
+            )
+        #endif
         try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         let snapshot: WorkspaceSearchCatalogSnapshot
         switch catalogAccess {
@@ -367,8 +408,15 @@ enum StoreBackedWorkspaceSearch {
         let aliasByRootPath = pathSearchAliasByRootPath(roots: visibleRootRecords)
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
+        #if DEBUG
+            var diagnosticActorStart: UInt64?
+        #endif
         do {
             try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+            #if DEBUG
+                WorkspaceFileSearchDebugContext.collector?.setRequestedPathLimit(max(0, maxPaths))
+                diagnosticActorStart = WorkspaceFileSearchDebugTiming.now()
+            #endif
             results = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.Search.actorSearchCall,
                 EditFlowPerf.Dimensions(
@@ -405,8 +453,30 @@ enum StoreBackedWorkspaceSearch {
                     aliasByRootPath: aliasByRootPath
                 )
             }
+            #if DEBUG
+                if let diagnosticActorStart {
+                    let diagnosticActorEnd = WorkspaceFileSearchDebugTiming.now()
+                    WorkspaceFileSearchDebugContext.collector?.recordFileSearchActor(
+                        nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: diagnosticActorStart,
+                            through: diagnosticActorEnd
+                        )
+                    )
+                }
+            #endif
             try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         } catch {
+            #if DEBUG
+                if let diagnosticActorStart {
+                    let diagnosticActorEnd = WorkspaceFileSearchDebugTiming.now()
+                    WorkspaceFileSearchDebugContext.collector?.recordFileSearchActor(
+                        nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: diagnosticActorStart,
+                            through: diagnosticActorEnd
+                        )
+                    )
+                }
+            #endif
             entryPerfStatus = "error"
             throw error
         }
@@ -414,6 +484,9 @@ enum StoreBackedWorkspaceSearch {
         if wasAutoCorrected == true {
             results.warningMessage = searchAutoCorrectionWarning(isRegex: isRegex)
         }
+        #if DEBUG
+            WorkspaceFileSearchDebugContext.collector?.finish(status: .completed)
+        #endif
         return results
     }
 

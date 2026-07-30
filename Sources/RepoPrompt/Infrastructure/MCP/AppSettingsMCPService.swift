@@ -49,7 +49,6 @@ final class AppSettingsMCPService: Service {
                 - `{"op":"get","keys":["ui.appearance_mode","ui.show_tooltips"]}`
                 - `{"op":"get","group":"file_system"}`
                 - `{"op":"set","key":"models.planning_model","value":null}`
-                - `{"op":"set","key":"file_system.respect_gitignore","value":false}`
                 - `{"op":"set","key":"file_system.global_ignore_defaults","value":"**/node_modules/\\n"}`
                 - `{"op":"options","key":"models.planning_model","agent":"codexExec"}`
 
@@ -97,6 +96,12 @@ final class AppSettingsMCPService: Service {
             return try await options(args)
         }
     }
+
+    #if DEBUG
+        func handleForTesting(_ args: [String: Value]) async throws -> Value {
+            try await handle(args)
+        }
+    #endif
 
     private func list(_ args: [String: Value]) async throws -> Value {
         let group = try parseOptionalString(args["group"], parameter: "group")
@@ -171,7 +176,7 @@ final class AppSettingsMCPService: Service {
         let definition = try AppSettingsMCPRegistry.definition(forKey: key)
         let normalizedValue = try definition.validate(rawValue)
 
-        let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool) in
+        let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool, persistenceBlockReason: GlobalSettingsPersistenceBlockReason?) in
             let oldValue = definition.read(store)
             let changed = !Self.valuesEqual(oldValue, normalizedValue)
             if changed {
@@ -180,10 +185,10 @@ final class AppSettingsMCPService: Service {
             }
             let newValue = definition.read(store)
             definition.afterSet?(store, newValue, changed, notificationCenter)
-            return (oldValue, newValue, changed, changed)
+            return (oldValue, newValue, changed, changed, store.persistenceBlockReason)
         }
 
-        return .object([
+        var response: [String: Value] = [
             "op": .string("set"),
             "status": .string("ok"),
             "key": .string(definition.key),
@@ -191,7 +196,13 @@ final class AppSettingsMCPService: Service {
             "new_value": result.newValue,
             "changed": .bool(result.changed),
             "applied": .bool(result.applied)
-        ])
+        ]
+        if let reason = result.persistenceBlockReason {
+            response["persistence_blocked"] = .bool(true)
+            response["persistence_block_reason"] = .string(Self.persistenceBlockReasonCode(reason))
+            response["persistence_warning"] = .string(Self.persistenceBlockWarning(reason))
+        }
+        return .object(response)
     }
 
     private func options(_ args: [String: Value]) async throws -> Value {
@@ -290,6 +301,36 @@ final class AppSettingsMCPService: Service {
 
     private static func valuesEqual(_ lhs: Value, _ rhs: Value) -> Bool {
         ToolOutputFormatter.rawJSONString(lhs) == ToolOutputFormatter.rawJSONString(rhs)
+    }
+
+    private static func persistenceBlockReasonCode(_ reason: GlobalSettingsPersistenceBlockReason) -> String {
+        switch reason {
+        case .unsupportedFutureSchema:
+            "unsupported_future_schema"
+        case .incompatibleSchema:
+            "incompatible_schema"
+        case .corruptUnrecoverable:
+            "corrupt_unrecoverable"
+        case .saveFailed:
+            "save_failed"
+        case .automaticSchemaNormalizationFailed:
+            "automatic_schema_normalization_failed"
+        }
+    }
+
+    private static func persistenceBlockWarning(_ reason: GlobalSettingsPersistenceBlockReason) -> String {
+        switch reason {
+        case let .unsupportedFutureSchema(onDiskVersion, supportedVersion):
+            "Setting was applied in memory, but globalSettings.json is schema v\(onDiskVersion), newer than this RepoPrompt build supports (v\(supportedVersion)); it will not persist until the settings file is recovered."
+        case .incompatibleSchema:
+            "Setting was applied in memory, but globalSettings.json was written by a different or unrecognized RepoPrompt settings schema; it will not persist until the settings file is imported or recovered."
+        case .corruptUnrecoverable:
+            "Setting was applied in memory, but globalSettings.json is unreadable and could not be backed up; it will not persist until the settings file is recovered."
+        case .saveFailed:
+            "Setting was applied in memory, but RepoPrompt could not write globalSettings.json; it will not persist until saving succeeds."
+        case .automaticSchemaNormalizationFailed:
+            "Setting was applied in memory, but RepoPrompt could not safely back up and normalize the existing globalSettings.json schema header; the original file is preserved and the setting will not persist until explicit recovery."
+        }
     }
 
     private func parseOptionalString(_ value: Value?, parameter: String) throws -> String? {
@@ -640,16 +681,10 @@ private enum AppSettingsMCPRegistry {
             read: { stringOrNull($0.preferredComposeModelRaw()) },
             write: { try $0.setPreferredComposeModelRaw(
                 optionalString(from: $1),
-                reason: "app_settings.models.preferred_compose_model"
+                reason: "app_settings.models.preferred_compose_model",
+                honorSync: true
             ) },
-            afterWrite: { store, value, notificationCenter in
-                postModelRawDidWrite(
-                    store: store,
-                    siblingKey: "models.planning_model",
-                    valueJustWritten: value,
-                    notificationCenter: notificationCenter
-                )
-            },
+            afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
         optionalModelRawSetting(
@@ -660,16 +695,10 @@ private enum AppSettingsMCPRegistry {
             read: { stringOrNull($0.planningModelRaw()) },
             write: { try $0.setPlanningModelRaw(
                 optionalString(from: $1),
-                reason: "app_settings.models.planning_model"
+                reason: "app_settings.models.planning_model",
+                honorSync: true
             ) },
-            afterWrite: { store, value, notificationCenter in
-                postModelRawDidWrite(
-                    store: store,
-                    siblingKey: "models.preferred_compose_model",
-                    valueJustWritten: value,
-                    notificationCenter: notificationCenter
-                )
-            },
+            afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
         boolSetting(
@@ -681,8 +710,7 @@ private enum AppSettingsMCPRegistry {
             write: {
                 try $0.setSyncChatModelWithOracle(
                     requiredBool(from: $1),
-                    reason: "app_settings.models.sync_chat_model_with_oracle",
-                    snapOnEnableToPlanning: true
+                    reason: "app_settings.models.sync_chat_model_with_oracle"
                 )
             },
             afterWrite: postRecommendationsDidApply
@@ -798,17 +826,32 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.codexGoalSupportEnabled()) },
             write: { try $0.setCodexGoalSupportEnabled(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "agent_mode.codex_reasoning_summaries_enabled",
+            group: "agent_mode",
+            label: "Codex Reasoning Summaries",
+            description: "Whether Codex Agent Mode app-server threads request Codex model reasoning summaries. Defaults off; when disabled RepoPrompt sends model_reasoning_summary=none in Codex thread/start and thread/resume config. Does not affect Chat/Oracle model preferences, reasoning effort selection, or non-Agent Mode Codex runs.",
+            read: { .bool($0.codexReasoningSummariesEnabled()) },
+            write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
+        ),
+        stringEnumSetting(
+            key: "agent_mode.provider_conversation_cleanup_action",
+            group: "agent_mode",
+            label: "Provider Conversation Cleanup",
+            description: "Controls best-effort provider-side Agent Mode conversation cleanup when deleting supported sessions. Archive is safer and is the default; delete asks supported providers to remove the conversation.",
+            allowedValues: ProviderConversationCleanupAction.allCases.map(\.rawValue),
+            read: { .string($0.providerConversationCleanupAction().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let action = ProviderConversationCleanupAction(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid provider cleanup action '\(raw)'.")
+                }
+                store.setProviderConversationCleanupAction(action)
+            }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.
-        boolSetting(
-            key: "file_system.respect_gitignore",
-            group: "file_system",
-            description: "Whether RepoPrompt honors .gitignore files while scanning workspace folders.",
-            read: { .bool($0.respectGitignore()) },
-            write: { try $0.setRespectGitignore(requiredBool(from: $1)) },
-            afterWrite: fileSystemPreferencesDidChangeHook(key: "file_system.respect_gitignore")
-        ),
         boolSetting(
             key: "file_system.respect_repo_ignore",
             group: "file_system",
@@ -896,6 +939,19 @@ private enum AppSettingsMCPRegistry {
                 description: "DEBUG-only toggle for mirroring Agent Mode performance diagnostics to OSLog. Writes UserDefaults key 'emitAgentModePerfDiagnosticsToOSLog'.",
                 read: { .bool($0.agentModePerfDiagnosticsOSLogEnabled()) },
                 write: { try $0.setAgentModePerfDiagnosticsOSLogEnabled(requiredBool(from: $1)) }
+            ),
+            boolSetting(
+                key: "agent_mode.worktree_startup_benchmark_diagnostics_enabled",
+                group: "agent_mode",
+                label: "Worktree Startup Benchmark Diagnostics",
+                description: "DEBUG-only opt-in gate for the scoped worktree startup benchmark diagnostics surface. This setting alone does not alter startup routing.",
+                read: { .bool($0.worktreeStartupBenchmarkDiagnosticsEnabled()) },
+                write: { try $0.setWorktreeStartupBenchmarkDiagnosticsEnabled(requiredBool(from: $1)) },
+                afterWrite: { store, _, _ in
+                    WorktreeStartupBenchmarkDiagnostics.setGateEnabled(
+                        store.worktreeStartupBenchmarkDiagnosticsEnabled()
+                    )
+                }
             )
         ]
     #else
@@ -1263,61 +1319,6 @@ private enum AppSettingsMCPRegistry {
         { store, _, notificationCenter in
             store.postFileSystemPreferencesDidChange(key: key, notificationCenter: notificationCenter)
         }
-    }
-
-    /// Post-write hook for `models.planning_model` / `models.preferred_compose_model`.
-    ///
-    /// When `GlobalSettingsStore.syncChatModelWithOracle()` is true, mirrors the
-    /// freshly-written value to the sibling model-raw key via the direct store setter
-    /// (which does NOT re-enter `afterWrite`), then posts `.recommendationsDidApply`
-    /// exactly once so UI layers (`AgentModelsSettingsViewModel`,
-    /// `ContextBuilderAgentViewModel`, `PromptViewModel`, `RecommendationWizardViewModel`,
-    /// `MCPServerToggleView`, `MCPSettingsView`) rebuild their derived state.
-    ///
-    /// Mirror-skip cases:
-    /// - sync disabled
-    /// - sibling already holds the same value (avoids spurious disk writes and
-    ///   ensures a single notification fires per MCP write)
-    /// A null write (clear) is mirrored as a null on the sibling to keep behavior
-    /// symmetric with the toggle-driven UI path.
-    @MainActor
-    private static func postModelRawDidWrite(
-        store: GlobalSettingsStore,
-        siblingKey: String,
-        valueJustWritten: Value,
-        notificationCenter: NotificationCenter
-    ) {
-        if store.syncChatModelWithOracle() {
-            let newValue: String? = switch valueJustWritten {
-            case let .string(raw):
-                raw
-            case .null:
-                nil
-            default:
-                nil
-            }
-
-            let siblingCurrent: String? = switch siblingKey {
-            case "models.planning_model":
-                store.planningModelRaw()
-            case "models.preferred_compose_model":
-                store.preferredComposeModelRaw()
-            default:
-                nil
-            }
-
-            if siblingCurrent != newValue {
-                switch siblingKey {
-                case "models.planning_model":
-                    store.setPlanningModelRaw(newValue, reason: "app_settings.models.sync_sibling")
-                case "models.preferred_compose_model":
-                    store.setPreferredComposeModelRaw(newValue, reason: "app_settings.models.sync_sibling")
-                default:
-                    break
-                }
-            }
-        }
-        notificationCenter.post(name: .recommendationsDidApply, object: nil)
     }
 
     // MARK: - Candidate Providers

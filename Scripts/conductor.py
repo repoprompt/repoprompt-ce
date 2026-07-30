@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import dataclasses
 import errno
 import fcntl
@@ -35,10 +36,11 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 11
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
+BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
@@ -67,15 +69,21 @@ APP_STOP_QUIET_SECONDS = 1.0
 APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS = 12.0
 APP_STOP_CONFIRM_TIMEOUT_SECONDS = 8.0
 APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
+GLOBAL_HEAVY_SLOT_POLL_SECONDS = 0.2
+MACHINE_LOCK_POLL_SECONDS = 0.2
+MAX_GLOBAL_HEAVY_SLOTS = 64
+DEBUG_APP_PROVENANCE_RELATIVE_PATH = "Contents/Resources/RepoPromptDebugProvenance.json"
 
 SHORT_TIMEOUT_SECONDS = 5 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
+RELEASE_ARTIFACT_TIMEOUT_SECONDS = 4 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
 IMPLEMENTED_OPERATIONS = {
     "doctor",
     "guardrails",
+    "codex-schema-check",
     "format",
     "format-check",
     "lint",
@@ -120,6 +128,7 @@ Job commands:
 Operation commands:
   ./conductor doctor
   ./conductor guardrails
+  ./conductor codex-schema-check      # validate bounded RPCE assumptions against generated Codex schemas
   ./conductor format                 # mutates first-party Swift files
   ./conductor format-check           # non-mutating SwiftFormat check
   ./conductor lint                   # non-mutating format-check + SwiftLint strict
@@ -129,17 +138,20 @@ Operation commands:
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
   ./conductor build
   ./conductor package debug|release
-  ./conductor test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
-  ./conductor provider-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor provider-test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
-  ./conductor run [-- <app args...>]                  # FIFO coordinated run
+  ./conductor run [-- <app args...>]                  # build/package, then FIFO coordinated launch
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
+  ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
-  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
+  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
+    --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
+  ./conductor diagnostics build-cache [--limit <n>]
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
@@ -164,6 +176,8 @@ Output:
 State paths:
   state dir default: ~/Library/Application Support/RepoPrompt CE/Conductor/<repo-root-hash>/
   socket default:    /tmp/conductor-<uid>/<repo-root-hash16>.sock (directory mode 0700)
+  machine locks:     /tmp/repoprompt-ce-dev-locks-<uid>/ (directory mode 0700; independent of socket overrides)
+  heavy slots:       REPOPROMPT_DEV_HEAVY_SLOTS=N (default 1)
   overrides: REPOPROMPT_DEV_DAEMON_STATE_DIR, REPOPROMPT_DEV_DAEMON_SOCKET (socket parent must be owned 0700)
 
 Protocol version: {PROTOCOL_VERSION}
@@ -375,6 +389,173 @@ def ensure_state_dirs(paths: Paths) -> None:
     ensure_private_dir(paths.state_dir)
     ensure_private_dir(paths.jobs_dir)
     ensure_private_dir(paths.socket_path.parent)
+    ensure_private_dir(machine_lock_dir())
+
+
+def machine_lock_dir() -> Path:
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path("/tmp") / f"repoprompt-ce-dev-locks-{uid}"
+
+
+def configured_global_heavy_slots(env: Optional[Dict[str, str]] = None) -> int:
+    raw = (env or os.environ).get("REPOPROMPT_DEV_HEAVY_SLOTS")
+    if raw is None or raw == "":
+        return 1
+    try:
+        slots = int(raw)
+    except ValueError as exc:
+        raise ConductorError("REPOPROMPT_DEV_HEAVY_SLOTS must be a positive integer") from exc
+    if slots < 1 or slots > MAX_GLOBAL_HEAVY_SLOTS:
+        raise ConductorError(f"REPOPROMPT_DEV_HEAVY_SLOTS must be between 1 and {MAX_GLOBAL_HEAVY_SLOTS}")
+    return slots
+
+
+def global_heavy_slot_paths(env: Optional[Dict[str, str]] = None) -> List[Path]:
+    root = machine_lock_dir()
+    return [root / f"global-heavy-{index}.lock" for index in range(configured_global_heavy_slots(env))]
+
+
+def live_app_lock_path() -> Path:
+    return machine_lock_dir() / "live-app.lock"
+
+
+def repo_worktree_name(repo_root: Path) -> str:
+    return repo_root.name or str(repo_root)
+
+
+def display_lock_metadata(
+    *,
+    lock_kind: str,
+    ticket: Optional[str],
+    operation: str,
+    operation_label: str,
+    repo_root: Path,
+    repo_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    acquired_at = now()
+    return {
+        "version": 1,
+        "displayOnly": True,
+        "kind": lock_kind,
+        "ticket": ticket,
+        "operation": operation,
+        "operationLabel": operation_label,
+        "repoRoot": str(repo_root),
+        "repoHash": repo_hash,
+        "worktree": repo_worktree_name(repo_root),
+        "pid": os.getpid(),
+        "acquiredAt": acquired_at,
+        "acquiredAtISO": iso_timestamp(acquired_at),
+    }
+
+
+def write_display_lock_metadata(lock_file: Any, metadata: Dict[str, Any]) -> None:
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(json.dumps(metadata, indent=2, sort_keys=True))
+        lock_file.write("\n")
+        lock_file.flush()
+    except OSError:
+        pass
+
+
+def read_display_lock_metadata(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        payload = json.loads(raw) if raw.strip() else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def format_display_lock_holder(metadata: Optional[Dict[str, Any]]) -> str:
+    if not metadata:
+        return "holder unknown"
+    label = metadata.get("operationLabel") or metadata.get("operation") or "unknown operation"
+    ticket = metadata.get("ticket") or "no-ticket"
+    repo = metadata.get("repoRoot") or "unknown repo"
+    worktree = metadata.get("worktree") or Path(str(repo)).name
+    acquired_at = metadata.get("acquiredAt")
+    held_for = "unknown duration"
+    if isinstance(acquired_at, (int, float)):
+        held_for = format_duration(now() - float(acquired_at))
+    return f"holder {label} ticket={ticket} repo={repo} worktree={worktree} held={held_for}"
+
+
+@contextlib.contextmanager
+def machine_exclusive_lock(lock_path: Path, metadata: Dict[str, Any], wait_label: str):
+    ensure_private_dir(lock_path.parent)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    did_log_wait = False
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if not did_log_wait:
+                holder = format_display_lock_holder(read_display_lock_metadata(lock_path))
+                print(f"waiting for {wait_label}: {lock_path} ({holder})", flush=True)
+                did_log_wait = True
+            time.sleep(MACHINE_LOCK_POLL_SECONDS)
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            lock_file.close()
+            raise
+    write_display_lock_metadata(lock_file, metadata)
+    try:
+        yield lock_file
+    finally:
+        with contextlib.suppress(OSError):
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.flush()
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            lock_file.close()
+
+
+@contextlib.contextmanager
+def machine_heavy_slot(metadata: Dict[str, Any], env: Optional[Dict[str, str]], wait_label: str):
+    ensure_private_dir(machine_lock_dir())
+    lock_files = [(path, path.open("a+", encoding="utf-8")) for path in global_heavy_slot_paths(env)]
+    did_log_wait = False
+    selected_file: Optional[Any] = None
+    try:
+        while True:
+            for lock_path, lock_file in lock_files:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    selected_file = lock_file
+                    write_display_lock_metadata(lock_file, metadata)
+                    print(f"acquired {wait_label}: {lock_path}", flush=True)
+                    yield lock_file
+                    return
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.EINTR:
+                        continue
+                    raise
+            if not did_log_wait:
+                holders = "; ".join(format_display_lock_holder(read_display_lock_metadata(path)) for path, _ in lock_files)
+                paths = ",".join(str(path) for path, _ in lock_files)
+                print(f"waiting for {wait_label} ({len(lock_files)} configured): {paths}; {holders}", flush=True)
+                did_log_wait = True
+            time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
+    finally:
+        for _path, lock_file in lock_files:
+            if lock_file is selected_file:
+                with contextlib.suppress(OSError):
+                    lock_file.seek(0)
+                    lock_file.truncate()
+                    lock_file.flush()
+                with contextlib.suppress(OSError):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                lock_file.close()
 
 
 def read_pid(path: Path) -> Optional[int]:
@@ -627,7 +808,7 @@ class OutputSummarizer:
     TIMEOUT_RE = re.compile(r"(timed out after|terminating process (?:group|tree)|killing process (?:group|tree)|canceled)", re.IGNORECASE)
     PHASE_RE = re.compile(r"^(==>|\$ |\+ )")
     ARTIFACT_RE = re.compile(
-        r"^(Created:|APP_BUNDLE=|COMPAT_APP_BUNDLE=|CLI_PATH=|Output written to:|Agent Mode diagnostics enabled|Resolved rpce-cli-debug:)"
+        r"^(Created:|APP_BUNDLE=|COMPAT_APP_BUNDLE=|CLI_PATH=|Output written to:|Agent Mode diagnostics enabled|Resolved rpce-cli-debug:|Build cache diagnostics|Current \.build:|Managed worktree container:|Worktree \.build total:|Top \.build directories:|\s+[0-9.]+ [KMGT]?i?B\s+)"
     )
     APP_LIFECYCLE_RE = re.compile(
         r"(Stopping existing RepoPrompt|Waiting for existing RepoPrompt|Launching .*RepoPrompt\.app|Confirming launched RepoPrompt|Observed launched RepoPrompt|Guarding against a delayed RepoPrompt|Delayed launch guard confirmed|RepoPrompt(?: CE debug app)? stop confirmed|RepoPrompt was (not running|already stopped))"
@@ -858,13 +1039,13 @@ class OutputSummarizer:
 
 
 def operation_display_name(operation: str, args: Dict[str, Any]) -> str:
-    if operation == "app" and args.get("subcommand") in {"status", "stop", "relaunch"}:
+    if operation == "app" and args.get("subcommand") in {"status", "stop", "launch-existing", "relaunch"}:
         return f"app {args['subcommand']}"
     return operation
 
 
 def latest_lifecycle_intent(operation: str, args: Dict[str, Any]) -> Optional[str]:
-    if operation == "app" and args.get("subcommand") in {"stop", "relaunch"}:
+    if operation == "app" and args.get("subcommand") in {"stop", "launch-existing", "relaunch"}:
         return operation_display_name(operation, args)
     return None
 
@@ -872,9 +1053,49 @@ def latest_lifecycle_intent(operation: str, args: Dict[str, Any]) -> Optional[st
 def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
     return (
         operation == "run"
-        or (operation == "app" and args.get("subcommand") == "relaunch")
+        or (operation == "app" and args.get("subcommand") in {"launch-existing", "relaunch"})
         or (operation == "smoke" and bool(args.get("launch") or args.get("packagedApp")))
     )
+
+
+def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
+    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
+        return True
+    if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
+        return True
+    if operation == "release" and args.get("subcommand") in {"artifact", "package", "local-install"}:
+        return True
+    return False
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "n/a"
+    seconds = max(0.0, float(seconds))
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remainder:.0f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {remainder:.0f}s"
+
+
+def format_bytes(byte_count: Optional[int]) -> str:
+    if byte_count is None:
+        return "n/a"
+    value = float(max(0, int(byte_count)))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} B"
+    return f"{value:.1f} {unit}"
 
 
 @dataclasses.dataclass
@@ -899,6 +1120,10 @@ class Job:
     process_pgid: Optional[int] = None
     process_start: Optional[str] = None
     tracked_processes: Dict[int, str] = dataclasses.field(default_factory=dict, repr=False)
+    process_group_identity_confirmed: bool = False
+    global_heavy_slot_wait_seconds: Optional[float] = None
+    global_heavy_slot_path: Optional[str] = None
+    global_heavy_slot_holder: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
     result_summary: Optional[str] = None
@@ -954,6 +1179,9 @@ class Job:
             "logPath": str(self.log_path),
             "processPID": self.process_pid,
             "processPGID": self.process_pgid,
+            "globalHeavySlotWaitSeconds": self.global_heavy_slot_wait_seconds,
+            "globalHeavySlotPath": self.global_heavy_slot_path,
+            "globalHeavySlotHolder": self.global_heavy_slot_holder,
             "exitCode": self.exit_code,
             "error": self.error,
             "resultSummary": self.result_summary,
@@ -1017,6 +1245,8 @@ class OperationRegistry:
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
+        "REPOPROMPT_CODEX_ARCH",
+        "REPOPROMPT_CODEX_CACHE_ROOT",
     ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",
@@ -1025,7 +1255,43 @@ class OperationRegistry:
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_CACHE",
     ]
-    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
+    TEST_ENV_KEYS = [
+        "RPCE_ENABLE_BENCHMARK_TESTS",
+        "RPCE_RUN_CODEMAP_E2E",
+        "RPCE_RUN_SCALE_TESTS",
+        "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK",
+        "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE",
+        "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE",
+        "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH",
+        "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH",
+        "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES",
+        "RP_SWIFT_CODEMAP_REFERENCE_MODE",
+        "RP_SWIFT_CODEMAP_REFERENCE_PATH",
+    ]
+    CONDUCTOR_ENV_KEYS = [
+        "REPOPROMPT_DEV_HEAVY_SLOTS",
+    ]
+    TELEMETRY_ENV_KEYS = [
+        "REPOPROMPT_ENABLE_SENTRY",
+        "REPOPROMPT_SENTRY_DSN",
+        "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS",
+        "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
+        "REPOPROMPT_SENTRY_ORG",
+        "REPOPROMPT_SENTRY_PROJECT",
+        "REPOPROMPT_SENTRY_UPLOAD_WAIT",
+        "SENTRY_URL",
+    ]
+    PASSTHROUGH_ENV_KEYS = sorted(
+        set(
+            SIGNING_ENV_KEYS
+            + DEBUG_ENV_KEYS
+            + BUILD_ENV_KEYS
+            + STYLE_ENV_KEYS
+            + TEST_ENV_KEYS
+            + CONDUCTOR_ENV_KEYS
+            + TELEMETRY_ENV_KEYS
+        )
+    )
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
@@ -1083,7 +1349,9 @@ class OperationRegistry:
         if operation == "doctor":
             return [script("doctor.sh")], lanes, cwd, env, effective_timeout
         if operation == "guardrails":
-            return [script("source_layout_guardrails.sh")], lanes, cwd, env, effective_timeout
+            return [script("guardrails.sh")], lanes, cwd, env, effective_timeout
+        if operation == "codex-schema-check":
+            return [sys.executable, script("check_codex_app_server_schema.py")], lanes, cwd, env, effective_timeout
         if operation == "format":
             return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
         if operation == "format-check":
@@ -1110,6 +1378,8 @@ class OperationRegistry:
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
             argv = ["swift", "test"]
+            if args.get("testProduct"):
+                argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
                 argv.append("list")
             elif args.get("filter"):
@@ -1117,6 +1387,8 @@ class OperationRegistry:
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
+            if args.get("testProduct"):
+                argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
                 argv.append("list")
             elif args.get("filter"):
@@ -1127,7 +1399,7 @@ class OperationRegistry:
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
-            return [script("run.sh"), *[str(arg) for arg in args.get("appArgs") or []]], ["build", "debugArtifact", "liveApp"], cwd, env, effective_timeout
+            return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
             if subcommand == "stop":
@@ -1135,21 +1407,25 @@ class OperationRegistry:
                 return self._internal_argv("app_stop", internal_args), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "status":
                 return self._internal_argv("app_status", {}), lanes, cwd, env, effective_timeout
+            if subcommand == "launch-existing":
+                return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
-                if args.get("guardDelayedLaunch"):
-                    env["REPOPROMPT_GUARD_DELAYED_LAUNCH"] = "1"
-                return [script("run.sh"), *[str(arg) for arg in args.get("appArgs") or []]], ["build", "debugArtifact", "liveApp"], cwd, env, effective_timeout
+                return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
             if args.get("launch"):
-                lanes = ["build", "debugArtifact", "liveApp"]
+                lanes = ["liveApp"]
             elif args.get("packagedApp"):
                 lanes = ["liveApp"]
             smoke_args = dict(args)
             smoke_args["operationTimeout"] = effective_timeout
             return self._internal_argv("smoke", smoke_args), lanes, cwd, env, effective_timeout
         if operation == "diagnostics":
-            return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
+            subcommand = args.get("subcommand")
+            if subcommand == "agent-mode-on":
+                return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
+            if subcommand == "build-cache":
+                return self._internal_argv("diagnostics_build_cache", dict(args)), lanes, cwd, env, effective_timeout
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
@@ -1175,6 +1451,8 @@ class OperationRegistry:
             raise ConductorError("test list mode cannot be combined with a filter")
         if list_mode and (raw_seconds is not None or wake_probe):
             raise ConductorError("test list mode cannot be combined with XCTest stall diagnostics")
+        if list_mode and args.get("testProduct"):
+            raise ConductorError("test list mode cannot be combined with --test-product")
         if raw_seconds is None:
             if wake_probe:
                 raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
@@ -1227,11 +1505,20 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
-        if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
+        if operation in {
+            "doctor",
+            "guardrails",
+            "codex-schema-check",
+            "debug-cli-status",
+            "format-tools-status",
+            "check-format-tools",
+        }:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
-        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"artifact", "package", "local-install"}):
+        if operation == "release" and args.get("subcommand") == "artifact":
+            return RELEASE_ARTIFACT_TIMEOUT_SECONDS
+        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"package", "local-install"}):
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
@@ -1265,6 +1552,9 @@ class DaemonState:
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
 
+    def _global_heavy_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
+        return global_heavy_slot_paths(env)
+
     def status_payload(self) -> Dict[str, Any]:
         with self.lock:
             active_by_lane = {
@@ -1282,6 +1572,9 @@ class DaemonState:
                 "repoHash": self.paths.repo_hash,
                 "socketPath": str(self.paths.socket_path),
                 "stateDir": str(self.paths.state_dir),
+                "globalHeavySlotPaths": [str(path) for path in self._global_heavy_slot_paths()],
+                "globalHeavySlotCount": configured_global_heavy_slots(),
+                "liveAppLockPath": str(live_app_lock_path()),
                 "activeJobsByLane": active_by_lane,
                 "runningJobs": running_jobs,
                 "queuedJobs": queued_jobs,
@@ -1342,7 +1635,7 @@ class DaemonState:
             raise ConductorError("request args must be an object")
         args = dict(raw_args)
         operation = str(request.get("operation") or "")
-        if operation == "app" and args.get("subcommand") in {"stop", "relaunch"}:
+        if operation == "app" and args.get("subcommand") in {"stop", "launch-existing", "relaunch"}:
             # Derived exclusively by supersession below, never accepted from a client.
             args.pop("guardDelayedLaunch", None)
         normalized_request = dict(request)
@@ -1632,11 +1925,107 @@ class DaemonState:
         if to_start:
             self.condition.notify_all()
 
+    def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
+        wait_start = now()
+        with self.condition:
+            job = self.jobs.get(ticket)
+            env = dict(job.env) if job else {}
+        lock_paths = self._global_heavy_slot_paths(env)
+        ensure_private_dir(machine_lock_dir())
+        lock_files = [(path, path.open("a+", encoding="utf-8")) for path in lock_paths]
+        did_log_wait = False
+        selected_path: Optional[Path] = None
+        selected_file: Optional[Any] = None
+        try:
+            while True:
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if not job or job.state != "running":
+                        return None
+                    if job.cancel_requested:
+                        job.state = "canceled"
+                        job.exit_code = 130
+                        job.result_summary = "canceled before global heavy slot"
+                        job.finished_at = now()
+                        self._append_system_line_locked(job, "job canceled before global heavy slot\n")
+                        self.condition.notify_all()
+                        return None
+                for lock_path, lock_file in lock_files:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        selected_path = lock_path
+                        selected_file = lock_file
+                        break
+                    except BlockingIOError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno == errno.EINTR:
+                            continue
+                        raise
+                if selected_file is not None and selected_path is not None:
+                    break
+                holders = [format_display_lock_holder(read_display_lock_metadata(path)) for path, _file in lock_files]
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if job and job.state == "running":
+                        job.global_heavy_slot_path = ",".join(str(path) for path, _file in lock_files)
+                        job.global_heavy_slot_holder = "; ".join(holders)
+                        if not did_log_wait:
+                            self._append_system_line_locked(
+                                job,
+                                f"waiting for global heavy slot ({len(lock_files)} configured): {job.global_heavy_slot_path}; {job.global_heavy_slot_holder}\n",
+                            )
+                            self.condition.notify_all()
+                            did_log_wait = True
+                time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
+            waited = now() - wait_start
+            with self.condition:
+                job = self.jobs.get(ticket)
+                if job and job.state == "running":
+                    metadata = display_lock_metadata(
+                        lock_kind="global-heavy",
+                        ticket=job.ticket,
+                        operation=job.operation,
+                        operation_label=operation_display_name(job.operation, job.args),
+                        repo_root=self.paths.repo_root,
+                        repo_hash=self.paths.repo_hash,
+                    )
+                    write_display_lock_metadata(selected_file, metadata)
+                    job.global_heavy_slot_wait_seconds = waited
+                    job.global_heavy_slot_path = str(selected_path)
+                    job.global_heavy_slot_holder = None
+                    self._append_system_line_locked(
+                        job,
+                        f"acquired global heavy slot {selected_path} after {format_duration(waited)}\n",
+                    )
+                    self.condition.notify_all()
+            return selected_file
+        finally:
+            for _path, lock_file in lock_files:
+                if lock_file is selected_file:
+                    continue
+                with contextlib.suppress(OSError):
+                    lock_file.close()
+
+    @staticmethod
+    def _release_global_heavy_slot(lock_file: Optional[Any]) -> None:
+        if lock_file is None:
+            return
+        with contextlib.suppress(OSError):
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.flush()
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            lock_file.close()
+
     def _run_job(self, ticket: str) -> None:
         job: Optional[Job] = None
         process: Optional[subprocess.Popen[bytes]] = None
         output_transport: Optional[ProcessOutputTransport] = None
         watchdog: Optional[threading.Thread] = None
+        global_heavy_slot: Optional[Any] = None
         try:
             with self.lock:
                 job = self.jobs[ticket]
@@ -1655,6 +2044,11 @@ class DaemonState:
                     self._append_system_line_locked(job, "job canceled before process start\n")
                     return
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
+            env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
+            if operation_requires_global_heavy_slot(job.operation, job.args):
+                global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
+                if global_heavy_slot is None:
+                    return
             start_line = f"$ {format_argv(argv)}\n"
             with job.log_path.open("ab") as log_file:
                 with self.lock:
@@ -1795,6 +2189,7 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
+            self._release_global_heavy_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
             refresh_after_release = False
@@ -2324,6 +2719,24 @@ class DaemonState:
         verified, _depths = self._refresh_process_tree_locked(job)
         return bool(verified)
 
+    def _process_group_id_alive_locked(self, job: Job) -> bool:
+        if not job.process_group_identity_confirmed:
+            return False
+        try:
+            pgid = int(job.process_pgid) if job.process_pgid is not None else 0
+        except (TypeError, ValueError):
+            return False
+        if pgid <= 0:
+            return False
+        with contextlib.suppress(OSError):
+            if pgid == os.getpgrp():
+                return False
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
     def _wait_for_process_tree_exit_locked(
         self,
         job: Job,
@@ -2333,16 +2746,59 @@ class DaemonState:
         while now() < deadline:
             verified, depths = self._refresh_process_tree_locked(job)
             if not verified:
-                return False
+                if not self._process_group_id_alive_locked(job):
+                    return False
+                self._signal_process_group_id_locked(job, signal_for_new)
+                self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
+                continue
             self._signal_verified_processes_locked(job, signal_for_new, verified, depths)
             self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
-        return self._process_tree_alive_locked(job)
+        return self._process_tree_alive_locked(job) or self._process_group_id_alive_locked(job)
+
+    def _signal_process_group_id_locked(self, job: Job, sig: signal.Signals) -> bool:
+        try:
+            pgid = int(job.process_pgid) if job.process_pgid is not None else 0
+        except (TypeError, ValueError):
+            return False
+        if pgid <= 0:
+            return False
+        with contextlib.suppress(OSError):
+            if pgid == os.getpgrp():
+                return False
+
+        # Once a start-token-verified job process is observed in the job PGID, keep
+        # trusting that PGID for this job's short TERM -> KILL cleanup window. This
+        # lets escalation reach same-PGID descendants that reparent after the root
+        # exits and are no longer discoverable by PPID tree walking.
+        group_identity_confirmed = job.process_group_identity_confirmed
+        if not group_identity_confirmed:
+            verified, _depths = self._refresh_process_tree_locked(job)
+            for pid, (_ppid, _start_token) in verified.items():
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    if os.getpgid(pid) == pgid:
+                        group_identity_confirmed = True
+                        break
+            if group_identity_confirmed:
+                job.process_group_identity_confirmed = True
+
+        if not group_identity_confirmed:
+            return False
+
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
 
     def _terminate_process_group_locked(self, job: Job, reason: str) -> None:
+        if self._signal_process_group_id_locked(job, signal.SIGTERM):
+            self._append_system_line_locked(job, f"terminating process group: {reason}\n")
         self._append_system_line_locked(job, f"terminating process tree: {reason}\n")
         self._signal_process_tree_locked(job, signal.SIGTERM)
 
     def _kill_process_group_locked(self, job: Job, reason: str) -> None:
+        if self._signal_process_group_id_locked(job, signal.SIGKILL):
+            self._append_system_line_locked(job, f"killing process group: {reason}\n")
         self._append_system_line_locked(job, f"killing process tree: {reason}\n")
         self._signal_process_tree_locked(job, signal.SIGKILL)
 
@@ -2703,7 +3159,14 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
     if active:
         print("active lanes:")
         for lane, job in active.items():
-            print(f"  {lane}: {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} [{job.get('state')}]")
+            run_for = None
+            if job.get("startedAt"):
+                run_for = max(0.0, now() - float(job.get("startedAt")))
+            timing = f" run={format_duration(run_for)}" if run_for is not None else ""
+            global_wait = job.get("globalHeavySlotWaitSeconds")
+            if global_wait is not None:
+                timing += f" global-wait={format_duration(float(global_wait))}"
+            print(f"  {lane}: {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} [{job.get('state')}]{timing}")
     else:
         print("active lanes: none")
     print(f"queued:   {payload.get('queueDepth', 0)}")
@@ -2711,7 +3174,11 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
     if shorthand and payload.get("queuedJobs"):
         print("queued jobs:")
         for job in payload.get("queuedJobs") or []:
-            print(f"  {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} lanes={','.join(job.get('lanes') or [])}")
+            queued_for = None
+            if job.get("createdAt"):
+                queued_for = max(0.0, now() - float(job.get("createdAt")))
+            timing = f" queued={format_duration(queued_for)}" if queued_for is not None else ""
+            print(f"  {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} lanes={','.join(job.get('lanes') or [])}{timing}")
 
 
 def render_superseded_jobs(payload: Dict[str, Any]) -> None:
@@ -2808,6 +3275,15 @@ def print_job_result_header(payload: Dict[str, Any], summary: Optional[Dict[str,
     if payload.get("exitCode") is not None:
         print(f"Exit:     {payload.get('exitCode')}")
     print(f"Log:      {payload.get('logPath')}")
+    timing_parts: List[str] = []
+    if payload.get("queueWaitSeconds") is not None:
+        timing_parts.append(f"queue={format_duration(float(payload.get('queueWaitSeconds')))}")
+    if payload.get("executionSeconds") is not None:
+        timing_parts.append(f"exec={format_duration(float(payload.get('executionSeconds')))}")
+    if payload.get("globalHeavySlotWaitSeconds") is not None:
+        timing_parts.append(f"global-wait={format_duration(float(payload.get('globalHeavySlotWaitSeconds')))}")
+    if timing_parts:
+        print(f"Timing:   {', '.join(timing_parts)}")
     if payload.get("error"):
         print(f"Error:    {payload.get('error')}")
 
@@ -2923,6 +3399,19 @@ def render_job(job: Dict[str, Any], output_mode: str = "summary", include_tail: 
     print(f"operation: {job.get('operationLabel') or job.get('operation')}")
     print(f"state:     {job.get('state')}")
     print(f"lanes:     {', '.join(job.get('lanes') or []) or 'none'}")
+    timing_parts: List[str] = []
+    if job.get("createdAt"):
+        timing_parts.append(f"queued={format_duration(max(0.0, now() - float(job.get('createdAt'))))}")
+    if job.get("startedAt"):
+        timing_parts.append(f"running={format_duration(max(0.0, now() - float(job.get('startedAt'))))}")
+    if job.get("globalHeavySlotWaitSeconds") is not None:
+        timing_parts.append(f"global-wait={format_duration(float(job.get('globalHeavySlotWaitSeconds')))}")
+    if timing_parts:
+        print(f"timing:    {', '.join(timing_parts)}")
+    if job.get("globalHeavySlotPath") and job.get("state") == "running":
+        print(f"heavy:     {job.get('globalHeavySlotPath')}")
+    if job.get("globalHeavySlotHolder") and job.get("state") == "running":
+        print(f"holder:    {job.get('globalHeavySlotHolder')}")
     print(f"log:       {job.get('logPath')}")
     if job.get("startedAtISO"):
         print(f"started:   {job.get('startedAtISO')}")
@@ -3379,49 +3868,147 @@ def find_debug_app_pids() -> List[str]:
     return [str(pid) for pid in matching_processes(debug_app_executable_path())]
 
 
+def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
+    try:
+        wait_seconds = max(0.0, float(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT", "3")))
+    except ValueError:
+        wait_seconds = 3.0
+    try:
+        cycles = max(1, int(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES", "3")))
+    except ValueError:
+        cycles = 3
+    return cycles * (wait_seconds + 60.0) + 60.0
+
+
 def terminate_debug_app_processes() -> List[str]:
     return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
 
 
-def operation_app_status(repo_root: Path) -> int:
-    bundle = debug_app_bundle_path()
-    print("RepoPrompt CE debug app status")
-    print(f"  Debug app bundle: {bundle}")
-    print("  Running matching debug app PIDs: ", end="")
+def debug_app_provenance_path(bundle: Path) -> Path:
+    return bundle / DEBUG_APP_PROVENANCE_RELATIVE_PATH
+
+
+def read_debug_app_provenance(bundle: Path) -> Optional[Dict[str, Any]]:
+    path = debug_app_provenance_path(bundle)
     try:
-        pids = find_debug_app_pids()
-    except ProcessIdentityError as exc:
-        print("unknown")
-        print(f"ERROR: could not safely identify the debug app process: {exc}")
-        return 1
-    print(", ".join(pids) if pids else "none")
-    print(f"  Bundle exists: {'yes' if bundle.exists() else 'no'}")
-    if bundle.exists():
-        # Keep the signing/storage probes aligned with Scripts/run.sh launch diagnostics.
-        codesign = subprocess.run(["codesign", "-dv", str(bundle)], text=True, capture_output=True)
-        details = (codesign.stdout or "") + (codesign.stderr or "")
-        team = "<missing>"
-        authorities: List[str] = []
-        for line in details.splitlines():
-            if line.startswith("TeamIdentifier="):
-                team = line.split("=", 1)[1] or "<missing>"
-            elif line.startswith("Authority="):
-                authorities.append(line.split("=", 1)[1])
-        print(f"  Signing team: {team}")
-        print(f"  Signing authorities: {', '.join(authorities) if authorities else '<none/ad-hoc>'}")
-        plist = bundle / "Contents" / "Info.plist"
-        marker = subprocess.run(
-            ["plutil", "-extract", "RepoPromptDebugSecureStorageBackend", "raw", "-o", "-", str(plist)],
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def git_metadata_value(repo_root: Path, args: Sequence[str]) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
             text=True,
             capture_output=True,
+            timeout=2.0,
         )
-        print(f"  Debug secure storage marker: {marker.stdout.strip() if marker.returncode == 0 and marker.stdout.strip() else '<missing>'}")
-    status_script = repo_root / "Scripts" / "install_debug_cli.sh"
-    code, _stdout, _stderr = run_operation_command("debug CLI status", [str(status_script), "status"], repo_root, allow_exit_codes={0, 1})
-    return 0 if code in {0, 1} else code
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
 
 
-def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
+def current_repo_commit(repo_root: Path) -> Optional[str]:
+    return git_metadata_value(repo_root, ["rev-parse", "HEAD"])
+
+
+def provenance_report_lines(repo_root: Path, bundle: Path) -> List[str]:
+    provenance = read_debug_app_provenance(bundle)
+    if not provenance:
+        return ["  Bundle provenance: <missing>"]
+    lines = ["  Bundle provenance:"]
+    repo = str(provenance.get("repoRoot") or "<unknown>")
+    worktree = str(provenance.get("worktreePath") or repo)
+    branch = str(provenance.get("branch") or "<unknown>")
+    commit = str(provenance.get("commit") or "<unknown>")
+    dirty = provenance.get("dirty")
+    built_at = str(provenance.get("buildTimeISO") or "<unknown>")
+    lines.append(f"    repo: {repo}")
+    lines.append(f"    worktree: {worktree}")
+    lines.append(f"    branch: {branch}")
+    lines.append(f"    commit: {commit[:12] if commit != '<unknown>' else commit}")
+    lines.append(f"    dirty at build: {dirty if isinstance(dirty, bool) else '<unknown>'}")
+    lines.append(f"    built: {built_at}")
+    flags: List[str] = []
+    try:
+        current_root = str(repo_root.resolve())
+        built_root = str(Path(repo).resolve(strict=False))
+        if built_root != current_root:
+            flags.append("foreign worktree")
+    except OSError:
+        flags.append("foreign worktree unknown")
+    current_commit = current_repo_commit(repo_root)
+    if current_commit and commit not in {"<unknown>", current_commit}:
+        flags.append("stale commit")
+    if flags:
+        lines.append(f"    WARNING: {'; '.join(flags)}")
+    return lines
+
+
+def print_debug_app_provenance(repo_root: Path, bundle: Path) -> None:
+    for line in provenance_report_lines(repo_root, bundle):
+        print(line, flush=True)
+
+
+def report_launch_bundle_details(repo_root: Path, bundle: Path) -> int:
+    print(f"Launch app path: {bundle}", flush=True)
+    print_debug_app_provenance(repo_root, bundle)
+    codesign = subprocess.run(["codesign", "-dv", str(bundle)], text=True, capture_output=True)
+    details = (codesign.stdout or "") + (codesign.stderr or "")
+    team = "<missing>"
+    authorities: List[str] = []
+    for line in details.splitlines():
+        if line.startswith("TeamIdentifier="):
+            team = line.split("=", 1)[1] or "<missing>"
+        elif line.startswith("Authority="):
+            authorities.append(line.split("=", 1)[1])
+    marker = subprocess.run(
+        ["plutil", "-extract", "RepoPromptDebugSecureStorageBackend", "raw", "-o", "-", str(bundle / "Contents" / "Info.plist")],
+        text=True,
+        capture_output=True,
+    )
+    storage = marker.stdout.strip() if marker.returncode == 0 and marker.stdout.strip() else "<missing>"
+    print(f"Launch app team: {team}", flush=True)
+    print(f"Launch app signing authorities: {', '.join(authorities) if authorities else '<none/ad-hoc>'}", flush=True)
+    print(f"Launch app debug secure storage marker: {storage}", flush=True)
+    if storage != "keychain":
+        print("WARNING: Debug secure storage is in-memory this run; secrets and permission changes won't persist.", flush=True)
+    elif not team or team in {"<missing>", "not set"}:
+        print("WARNING: Launching a keychain-marked debug app without a team identifier; runtime will fall back to in-memory secure storage.", flush=True)
+    return 0
+
+
+def wait_for_no_debug_app_process(timeout: float = 5.0) -> bool:
+    deadline = now() + timeout
+    while now() <= deadline:
+        pids = find_debug_app_pids()
+        if not pids:
+            return True
+        time.sleep(APP_STOP_POLL_SECONDS)
+    return False
+
+
+def wait_for_debug_app_process(timeout: float = STARTUP_TIMEOUT_SECONDS) -> List[str]:
+    deadline = now() + timeout
+    while now() <= deadline:
+        pids = find_debug_app_pids()
+        if pids:
+            return pids
+        time.sleep(APP_STOP_POLL_SECONDS)
+    return []
+
+
+def guard_delayed_debug_app_launch() -> int:
+    print("Guarding against a delayed RepoPrompt CE debug app launch from superseded app work.", flush=True)
+    return _operation_app_stop_unlocked(Path.cwd(), {"guardDelayedLaunch": True})
+
+
+def _operation_app_stop_unlocked(_repo_root: Path, args: Dict[str, Any]) -> int:
     guard_delayed_launch = bool(args.get("guardDelayedLaunch"))
     required_quiet = APP_STOP_DELAYED_LAUNCH_GUARD_SECONDS if guard_delayed_launch else APP_STOP_QUIET_SECONDS
     confirmation_timeout = APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS if guard_delayed_launch else APP_STOP_CONFIRM_TIMEOUT_SECONDS
@@ -3458,6 +4045,223 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
             print("ERROR: timed out confirming that RepoPrompt remained stopped.", flush=True)
             return 1
         time.sleep(APP_STOP_POLL_SECONDS)
+
+
+def staged_debug_app_parent(live_bundle: Optional[Path] = None) -> Path:
+    bundle = live_bundle or debug_app_bundle_path()
+    token = f"{int(now() * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    return bundle.parent / ".staging" / token
+
+
+def cleanup_staged_debug_bundle(staged_bundle: Optional[Path]) -> None:
+    if staged_bundle is None:
+        return
+    parent = staged_bundle.parent
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(parent)
+
+
+def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tuple[int, Optional[Path]]:
+    live_bundle = debug_app_bundle_path()
+    staging_parent = staged_debug_app_parent(live_bundle)
+    staged_bundle = staging_parent / live_bundle.name
+    metadata = display_lock_metadata(
+        lock_kind="global-heavy",
+        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        operation=operation_label,
+        operation_label=operation_label,
+        repo_root=repo_root,
+        repo_hash=None,
+    )
+    env = os.environ.copy()
+    env["REPOPROMPT_DEBUG_APP_BUNDLE"] = str(staged_bundle)
+    try:
+        with machine_heavy_slot(metadata, env, "global heavy slot for debug package"):
+            code, _stdout, _stderr = run_operation_command(
+                "package staged debug app",
+                [str(repo_root / "Scripts" / "package_app.sh"), "debug"],
+                repo_root,
+                env=env,
+            )
+        if code != 0:
+            cleanup_staged_debug_bundle(staged_bundle)
+            return code, None
+        executable = staged_bundle / "Contents" / "MacOS" / "RepoPrompt"
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            print(f"ERROR: staged debug app is not launchable: {staged_bundle}", flush=True)
+            cleanup_staged_debug_bundle(staged_bundle)
+            return 1, None
+        print(f"Staged debug app bundle: {staged_bundle}", flush=True)
+        return 0, staged_bundle
+    except BaseException:
+        cleanup_staged_debug_bundle(staged_bundle)
+        raise
+
+
+def swap_staged_debug_bundle_into_place(staged_bundle: Path, live_bundle: Path) -> bool:
+    if not live_bundle.exists():
+        staged_bundle.rename(live_bundle)
+        return True
+    if sys.platform != "darwin":
+        return False
+    try:
+        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
+    except AttributeError:
+        return False
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+    rename_swap = 0x00000002
+    result = renamex_np(os.fsencode(staged_bundle), os.fsencode(live_bundle), rename_swap)
+    if result == 0:
+        return True
+    return False
+
+
+def activate_staged_debug_bundle(staged_bundle: Path, live_bundle: Optional[Path] = None) -> None:
+    live = live_bundle or debug_app_bundle_path()
+    if not staged_bundle.exists():
+        raise ConductorError(f"staged debug app bundle is missing: {staged_bundle}")
+    executable = staged_bundle / "Contents" / "MacOS" / "RepoPrompt"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ConductorError(f"staged debug app bundle is not launchable: {staged_bundle}")
+    live.parent.mkdir(parents=True, exist_ok=True)
+    backup = live.parent / f".{live.name}.previous.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    moved_existing = False
+    try:
+        if not swap_staged_debug_bundle_into_place(staged_bundle, live):
+            if live.exists():
+                live.rename(backup)
+                moved_existing = True
+            staged_bundle.rename(live)
+    except BaseException:
+        if moved_existing and not live.exists() and backup.exists():
+            with contextlib.suppress(OSError):
+                backup.rename(live)
+        raise
+    finally:
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        staging_parent = staged_bundle.parent
+        if staging_parent.exists():
+            shutil.rmtree(staging_parent, ignore_errors=True)
+    print(f"Activated staged debug app bundle: {live}", flush=True)
+
+
+def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
+    bundle = debug_app_bundle_path()
+    staged_value = args.get("stagedBundle")
+    staged_bundle = Path(str(staged_value)) if staged_value else None
+    activated = False
+    executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
+    if staged_bundle is None and (not bundle.exists() or not executable.is_file() or not os.access(executable, os.X_OK)):
+        print(f"ERROR: existing debug app bundle is not launchable: {bundle}", flush=True)
+        print("Build it first with './conductor build' or './conductor run'.", flush=True)
+        return 1
+    metadata = display_lock_metadata(
+        lock_kind="live-app",
+        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        operation="app launch-existing" if staged_bundle is None else "app activate-staged-and-launch",
+        operation_label="app launch-existing" if staged_bundle is None else "app activate staged and launch",
+        repo_root=repo_root,
+        repo_hash=None,
+    )
+    try:
+        with machine_exclusive_lock(live_app_lock_path(), metadata, "live-app lock"):
+            if staged_bundle is None:
+                report_launch_bundle_details(repo_root, bundle)
+            print("Stopping existing RepoPrompt CE debug app instance", flush=True)
+            stop_code = _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": bool(args.get("guardDelayedLaunch"))})
+            if stop_code != 0:
+                return stop_code
+            if staged_bundle is not None:
+                activate_staged_debug_bundle(staged_bundle, bundle)
+                activated = True
+                report_launch_bundle_details(repo_root, bundle)
+            app_args = [str(arg) for arg in args.get("appArgs") or []]
+            argv = ["open", "-n", str(bundle)]
+            if app_args:
+                argv.extend(["--args", *app_args])
+            code, _stdout, _stderr = run_operation_command("launch existing debug app", argv, repo_root)
+            if code != 0:
+                return code
+            try:
+                launched_pids = wait_for_debug_app_process()
+            except ProcessIdentityError as exc:
+                print(f"ERROR: could not safely identify the launched RepoPrompt CE debug app process: {exc}", flush=True)
+                return 1
+            if not launched_pids:
+                print("ERROR: launch request returned, but no matching RepoPrompt CE debug app process appeared within 10 seconds.", flush=True)
+                _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": True})
+                return 1
+            print(f"Observed launched RepoPrompt CE debug PID(s): {', '.join(launched_pids)}", flush=True)
+        return 0
+    finally:
+        if staged_bundle is not None and not activated:
+            cleanup_staged_debug_bundle(staged_bundle)
+
+
+def operation_debug_app_build_then_launch(repo_root: Path, args: Dict[str, Any]) -> int:
+    package_code, staged_bundle = package_debug_app_under_heavy(repo_root, "debug app build/package")
+    if package_code != 0 or staged_bundle is None:
+        print("Package failed; no live bundle or stop/launch lifecycle action was performed.", flush=True)
+        return package_code or 1
+    launch_args = dict(args)
+    launch_args.setdefault("appArgs", [])
+    launch_args["stagedBundle"] = str(staged_bundle)
+    return operation_app_launch_existing(repo_root, launch_args)
+
+
+def operation_app_status(repo_root: Path) -> int:
+    bundle = debug_app_bundle_path()
+    print("RepoPrompt CE debug app status")
+    print(f"  Debug app bundle: {bundle}")
+    print("  Running matching debug app PIDs: ", end="")
+    try:
+        pids = find_debug_app_pids()
+    except ProcessIdentityError as exc:
+        print("unknown")
+        print(f"ERROR: could not safely identify the debug app process: {exc}")
+        return 1
+    print(", ".join(pids) if pids else "none")
+    print(f"  Bundle exists: {'yes' if bundle.exists() else 'no'}")
+    if bundle.exists():
+        # Keep the signing/storage probes aligned with Scripts/run.sh launch diagnostics.
+        codesign = subprocess.run(["codesign", "-dv", str(bundle)], text=True, capture_output=True)
+        details = (codesign.stdout or "") + (codesign.stderr or "")
+        team = "<missing>"
+        authorities: List[str] = []
+        for line in details.splitlines():
+            if line.startswith("TeamIdentifier="):
+                team = line.split("=", 1)[1] or "<missing>"
+            elif line.startswith("Authority="):
+                authorities.append(line.split("=", 1)[1])
+        print(f"  Signing team: {team}")
+        print(f"  Signing authorities: {', '.join(authorities) if authorities else '<none/ad-hoc>'}")
+        plist = bundle / "Contents" / "Info.plist"
+        marker = subprocess.run(
+            ["plutil", "-extract", "RepoPromptDebugSecureStorageBackend", "raw", "-o", "-", str(plist)],
+            text=True,
+            capture_output=True,
+        )
+        print(f"  Debug secure storage marker: {marker.stdout.strip() if marker.returncode == 0 and marker.stdout.strip() else '<missing>'}")
+        for line in provenance_report_lines(repo_root, bundle):
+            print(line)
+    status_script = repo_root / "Scripts" / "install_debug_cli.sh"
+    code, _stdout, _stderr = run_operation_command("debug CLI status", [str(status_script), "status"], repo_root, allow_exit_codes={0, 1})
+    return 0 if code in {0, 1} else code
+
+
+def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
+    metadata = display_lock_metadata(
+        lock_kind="live-app",
+        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        operation="app stop",
+        operation_label="app stop",
+        repo_root=repo_root,
+        repo_hash=None,
+    )
+    with machine_exclusive_lock(live_app_lock_path(), metadata, "live-app lock"):
+        return _operation_app_stop_unlocked(repo_root, args)
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
@@ -3500,7 +4304,7 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
 
     launched = bool(args.get("launch"))
     if launched:
-        code, _stdout, _stderr = run_operation_command("launch debug app", [str(repo_root / "Scripts" / "run.sh")], repo_root, env=env)
+        code = operation_debug_app_build_then_launch(repo_root, {"appArgs": []})
         if code != 0:
             return code
 
@@ -3548,6 +4352,25 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
                 print(f"FAILED stage '{name}' with status {code}", flush=True)
             return code
 
+    if args.get("executionLocationUI"):
+        debug_pids = find_debug_app_pids()
+        if len(debug_pids) != 1:
+            print(
+                "ERROR: execution-location UI smoke requires exactly one running RepoPrompt debug app "
+                f"matching {debug_app_executable_path()}; found {len(debug_pids)}.",
+                flush=True,
+            )
+            return 1
+        code, _stdout, _stderr = run_operation_command(
+            "execution location UI smoke",
+            [str(repo_root / "Scripts" / "smoke_agent_execution_location_popover.sh"), debug_pids[0]],
+            repo_root,
+            env=env,
+            timeout=execution_location_ui_smoke_timeout(env),
+        )
+        if code != 0:
+            return code
+
     if args.get("agentRun"):
         agent_timeout = float(args.get("agentTimeout") or SMOKE_AGENT_WAIT_SECONDS)
         start_payload = {
@@ -3587,6 +4410,119 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
     return 0
 
 
+def directory_size_bytes(path: Path) -> Optional[int]:
+    try:
+        if not path.exists():
+            return None
+        if path.is_symlink():
+            path = path.resolve(strict=True)
+    except OSError:
+        return None
+
+    # Prefer the platform disk-usage tool for explicit cache diagnostics. It is
+    # read-only and much faster than Python-level recursive stat walks for large
+    # SwiftPM scratch directories. Fall back to a Python walk for small tests or
+    # unusual environments where `du` is unavailable.
+    try:
+        result = subprocess.run(
+            ["du", "-sk", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode == 0:
+            first = result.stdout.strip().split()[0]
+            return int(first) * 1024
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        stat_result = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    else:
+                        total += stat_result.st_size
+        except NotADirectoryError:
+            try:
+                total += current.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+        except OSError:
+            continue
+    return total
+
+
+def latest_mtime(path: Path) -> Optional[float]:
+    try:
+        return path.stat(follow_symlinks=False).st_mtime
+    except OSError:
+        return None
+
+
+def managed_worktree_container(repo_root: Path) -> Optional[Path]:
+    parent = repo_root.parent
+    try:
+        if parent.parent.name == ".repoprompt-worktrees":
+            return parent
+    except IndexError:
+        return None
+    return None
+
+
+def operation_diagnostics_build_cache(repo_root: Path, args: Dict[str, Any]) -> int:
+    limit = int(args.get("limit") or BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
+    limit = max(1, min(limit, 100))
+    current_build = repo_root / ".build"
+
+    print("Build cache diagnostics", flush=True)
+    if current_build.exists():
+        symlink_note = ""
+        if current_build.is_symlink():
+            with contextlib.suppress(OSError):
+                symlink_note = f" -> {current_build.resolve(strict=True)}"
+        print(f"Current .build: {format_bytes(directory_size_bytes(current_build))}{symlink_note}", flush=True)
+    else:
+        print("Current .build: missing", flush=True)
+
+    container = managed_worktree_container(repo_root)
+    if container is None or not container.exists():
+        print("Managed worktree container: not detected", flush=True)
+        return 0
+
+    rows: List[Tuple[int, Optional[float], str]] = []
+    for child in sorted(container.iterdir(), key=lambda item: item.name):
+        if not child.is_dir():
+            continue
+        build_dir = child / ".build"
+        size = directory_size_bytes(build_dir)
+        if size is None:
+            continue
+        rows.append((size, latest_mtime(build_dir), child.name))
+
+    total = sum(size for size, _mtime, _name in rows)
+    print(f"Managed worktree container: {container}", flush=True)
+    print(f"Worktree .build total: {format_bytes(total)} across {len(rows)} build director{'y' if len(rows) == 1 else 'ies'}", flush=True)
+    if not rows:
+        return 0
+
+    print("Top .build directories:", flush=True)
+    for size, mtime, name in sorted(rows, key=lambda row: row[0], reverse=True)[:limit]:
+        mtime_text = "unknown" if mtime is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        print(f"  {format_bytes(size):>9}  {name}  modified={mtime_text}", flush=True)
+    return 0
+
+
 def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -> int:
     cli = require_debug_cli()
     if not cli:
@@ -3622,10 +4558,16 @@ def run_operation_runner(payload_json: str) -> int:
         return operation_app_stop(repo_root, args)
     if kind == "app_status":
         return operation_app_status(repo_root)
+    if kind == "app_launch_existing":
+        return operation_app_launch_existing(repo_root, args)
+    if kind == "debug_app_build_then_launch":
+        return operation_debug_app_build_then_launch(repo_root, args)
     if kind == "smoke":
         return operation_smoke(repo_root, args)
     if kind == "diagnostics_agent_mode_on":
         return operation_diagnostics_agent_mode_on(repo_root, args)
+    if kind == "diagnostics_build_cache":
+        return operation_diagnostics_build_cache(repo_root, args)
     if kind == "release_preflight_missing":
         return operation_release_preflight_missing(repo_root)
     print(f"unknown internal operation runner kind: {kind}", file=sys.stderr)
@@ -3693,6 +4635,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     if operation in {
         "doctor",
         "guardrails",
+        "codex-schema-check",
         "build",
         "install-debug-cli",
         "debug-cli-status",
@@ -3719,6 +4662,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--list", action="store_true")
         mode.add_argument("--filter")
+        parser.add_argument("--test-product")
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
         ns = parser.parse_args(rest)
@@ -3730,10 +4674,14 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
         if ns.list and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
             raise ConductorError("--list cannot be combined with XCTest stall diagnostics")
+        if ns.list and ns.test_product:
+            raise ConductorError("--list cannot be combined with --test-product")
         if ns.list:
             args["list"] = True
         if ns.filter:
             args["filter"] = ns.filter
+        if ns.test_product:
+            args["testProduct"] = ns.test_product
         if ns.xctest_stall_seconds is not None:
             args["xctestStallSeconds"] = ns.xctest_stall_seconds
         if ns.xctest_stall_wake_probe:
@@ -3742,15 +4690,15 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         app_args = rest[1:] if rest and rest[0] == "--" else rest
         args["appArgs"] = app_args
     elif operation == "app":
-        if not rest or rest[0] not in {"status", "stop", "relaunch"}:
-            raise ConductorError("usage: ./conductor app status|stop|relaunch [-- <app args...>]")
+        if not rest or rest[0] not in {"status", "stop", "launch-existing", "relaunch"}:
+            raise ConductorError("usage: ./conductor app status|stop|launch-existing|relaunch [-- <app args...>]")
         args["subcommand"] = rest[0]
         trailing = rest[1:]
         if args["subcommand"] in {"status", "stop"} and trailing:
             raise ConductorError(f"app {args['subcommand']} does not accept application arguments")
-        if args["subcommand"] == "relaunch":
+        if args["subcommand"] in {"launch-existing", "relaunch"}:
             if trailing and trailing[0] != "--":
-                raise ConductorError("app relaunch application arguments must follow '--'")
+                raise ConductorError(f"app {args['subcommand']} application arguments must follow '--'")
             args["appArgs"] = trailing[1:] if trailing else []
     elif operation == "smoke":
         parser = argparse.ArgumentParser(prog="conductor smoke")
@@ -3762,6 +4710,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("--window-id", type=int, default=1)
         parser.add_argument("--agent-run", action="store_true")
         parser.add_argument("--agent-timeout", type=float, default=SMOKE_AGENT_WAIT_SECONDS)
+        parser.add_argument("--execution-location-ui", action="store_true")
         ns = parser.parse_args(rest)
         if ns.agent_timeout < 0:
             raise ConductorError("--agent-timeout must be non-negative")
@@ -3769,6 +4718,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--artifact-manifest requires --packaged-app")
         if ns.packaged_app and ns.agent_run:
             raise ConductorError("--agent-run is not supported with --packaged-app")
+        if ns.packaged_app and ns.execution_location_ui:
+            raise ConductorError("--execution-location-ui is not supported with --packaged-app")
         args.update(
             {
                 "launch": ns.launch,
@@ -3778,15 +4729,28 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
                 "windowId": ns.window_id,
                 "agentRun": ns.agent_run,
                 "agentTimeout": ns.agent_timeout,
+                "executionLocationUI": ns.execution_location_ui,
             }
         )
     elif operation == "diagnostics":
         parser = argparse.ArgumentParser(prog="conductor diagnostics")
-        parser.add_argument("subcommand", choices=["agent-mode-on"])
-        parser.add_argument("--log-file", default="/tmp/repoprompt-ce-claude-raw-events")
-        parser.add_argument("--window-id", type=int, default=1)
+        subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+        agent_mode = subparsers.add_parser("agent-mode-on")
+        agent_mode.add_argument("--log-file", default="/tmp/repoprompt-ce-claude-raw-events")
+        agent_mode.add_argument("--window-id", type=int, default=1)
+
+        build_cache = subparsers.add_parser("build-cache")
+        build_cache.add_argument("--limit", type=int, default=BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
+
         ns = parser.parse_args(rest)
-        args.update({"subcommand": ns.subcommand, "logFile": ns.log_file, "windowId": ns.window_id})
+        args["subcommand"] = ns.subcommand
+        if ns.subcommand == "agent-mode-on":
+            args.update({"logFile": ns.log_file, "windowId": ns.window_id})
+        elif ns.subcommand == "build-cache":
+            if ns.limit <= 0:
+                raise ConductorError("diagnostics build-cache --limit must be greater than zero")
+            args["limit"] = ns.limit
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
         parser.add_argument("subcommand", choices=["preflight", "artifact", "package", "local-install"])
@@ -3800,19 +4764,21 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
 
 def main(argv: List[str]) -> int:
     repo_root = resolve_repo_root()
-    paths = compute_paths(repo_root)
-    ensure_state_dirs(paths)
 
+    if argv and argv[0] == "__operation_runner":
+        if len(argv) != 2:
+            raise ConductorError("__operation_runner requires one JSON payload argument")
+        return run_operation_runner(argv[1])
     if argv and argv[0] == "__daemon":
         parser = argparse.ArgumentParser(prog="conductor.py __daemon")
         parser.add_argument("--repo-root", required=True)
         ns = parser.parse_args(argv[1:])
         daemon_paths = compute_paths(Path(ns.repo_root))
+        ensure_state_dirs(daemon_paths)
         return run_daemon(daemon_paths)
-    if argv and argv[0] == "__operation_runner":
-        if len(argv) != 2:
-            raise ConductorError("__operation_runner requires one JSON payload argument")
-        return run_operation_runner(argv[1])
+
+    paths = compute_paths(repo_root)
+    ensure_state_dirs(paths)
 
     if not argv or argv[0] in {"-h", "--help"}:
         print(HELP)

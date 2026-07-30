@@ -1,11 +1,43 @@
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
+    func testSharedServerLeaseCancellationRemovesQueuedWaiter() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let queuedWaiter = Task {
+                    try await MCPSharedServerTestLease.shared.withLease { _ in
+                        XCTFail("Cancelled lease waiter should not acquire the shared server lease.")
+                    }
+                }
+
+                let queued = await waitForSharedServerLeaseWaiterCount(1, timeout: .seconds(2))
+                XCTAssertTrue(queued)
+                queuedWaiter.cancel()
+
+                do {
+                    try await queuedWaiter.value
+                    XCTFail("Expected cancelled lease waiter to throw CancellationError.")
+                } catch is CancellationError {
+                    // Expected cancellation path.
+                }
+
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                XCTAssertEqual(waiterCount, 0)
+            }
+
+            try await withSharedServerLeaseTimeout(timeout: .seconds(2)) {
+                try await MCPSharedServerTestLease.shared.withLease { _ in }
+            }
+        #else
+            throw XCTSkip("Shared MCP server lease cancellation regression requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -104,6 +136,52 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         enum ReadSelectionShape {
             case partial
             case full
+        }
+
+        func waitForSharedServerLeaseWaiterCount(
+            _ expectedCount: Int,
+            timeout: Duration
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now + timeout
+            while clock.now < deadline {
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                if waiterCount == expectedCount { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return false
+        }
+
+        func withSharedServerLeaseTimeout<T>(
+            timeout: Duration,
+            operation: @escaping @Sendable () async throws -> T
+        ) async throws -> T {
+            let timeoutInterval = {
+                let components = timeout.components
+                return TimeInterval(components.seconds)
+                    + (TimeInterval(components.attoseconds) / 1e18)
+            }()
+            return try await withThrowingTaskGroup(of: T.self) { group in
+                group.addTask {
+                    try await operation()
+                }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw AsyncTestConditionTimeout(
+                        description: "shared MCP server lease re-acquisition",
+                        timeout: timeoutInterval
+                    )
+                }
+                guard let result = try await group.next() else {
+                    group.cancelAll()
+                    throw AsyncTestConditionTimeout(
+                        description: "shared MCP server lease re-acquisition (empty task group)",
+                        timeout: timeoutInterval
+                    )
+                }
+                group.cancelAll()
+                return result
+            }
         }
 
         func runReadSelectionPersistenceCheckpoint(
@@ -1316,6 +1394,45 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
     }
 
+    /// Opt-in steady-state readiness for tests that inject a synthetic Context Builder provider.
+    ///
+    /// Workspace IDs in these fixtures are freshly generated, and the settings store has no API
+    /// to remove a workspace profile. Keeping the seed workspace-scoped therefore bounds retained
+    /// test settings to an unreachable unique ID without mutating the global Agent Models profile.
+    @MainActor
+    enum ContextBuilderTestReadinessSupport {
+        static func seedCanonicalProviderReadiness(
+            apiSettingsViewModel: APISettingsViewModel,
+            workspaceID: UUID,
+            agent: AgentProviderKind = .claudeCode,
+            modelRaw: String = AgentModel.claudeSonnet.rawValue
+        ) {
+            switch agent {
+            case .claudeCode:
+                apiSettingsViewModel.isClaudeCodeConnected = true
+            case .codexExec:
+                apiSettingsViewModel.isCodexConnected = true
+            default:
+                preconditionFailure("Unsupported synthetic Context Builder test provider: \(agent.rawValue)")
+            }
+            apiSettingsViewModel.test_completeContextBuilderProviderValidation(
+                verifiedProviders: [agent]
+            )
+
+            let settings = GlobalSettingsStore.shared
+            var profile = settings.effectiveAgentModelsProfile(workspaceID: workspaceID)
+            profile.contextBuilderAgentRaw = agent.rawValue
+            profile = profile.replacingContextBuilderModel(
+                modelRaw,
+                for: agent.rawValue
+            )
+            settings.setWorkspaceAgentModelsProfile(
+                workspaceID: workspaceID,
+                profile: profile
+            )
+        }
+    }
+
     @MainActor
     final class PersistentMCPTestFixture {
         static let sharedSearchToken = "distinct_mcp_connection_shared_search_token"
@@ -1521,11 +1638,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     runID: nil
                 )
             }
+            await contextB.window.tearDown()
+            await contextA.window.tearDown()
             await contextA.window.mcpServer.shutdownListener()
             ServiceRegistry.unregister(contextB.catalogService)
             ServiceRegistry.unregister(contextA.catalogService)
-            await contextB.window.workspaceFilesViewModel.cancelAllScans()
-            await contextA.window.workspaceFilesViewModel.cancelAllScans()
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
             contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
@@ -1770,7 +1887,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 connectionID: connectionID,
                 connection: manager,
                 clientName: clientName,
-                sessionToken: sessionToken
+                sessionToken: sessionToken,
+                bootstrapPeerPID: Int(getpid())
             )
             let startTask = Task {
                 try await manager.start { clientInfo in
@@ -1859,8 +1977,15 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private let stateLock = NSLock()
         private var fd: Int32
         private var nextRequestID = 1
+        private struct InterceptingResponse {
+            let continuation: CheckedContinuation<String, Error>
+            var task: Task<Void, Never>?
+        }
+
         private var pending: [Int: CheckedContinuation<String, Error>] = [:]
+        private var timeoutTasks: [Int: Task<Void, Never>] = [:]
         private var responseInterceptors: [Int: @Sendable (String) async throws -> String] = [:]
+        private var interceptingResponses: [Int: InterceptingResponse] = [:]
         private var notifications: [String] = []
         private var isClosed = false
 
@@ -1906,17 +2031,30 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 try await withCheckedThrowingContinuation { continuation in
                     var registered = false
                     do {
-                        try register(continuation, for: id)
-                        registered = true
-                        try sendJSON([
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "method": method,
-                            "params": params
-                        ])
-                        Task { [weak self] in
-                            try? await Task.sleep(for: .seconds(timeoutSeconds))
-                            self?.failPending(id: id, error: ClientError.timedOut(id))
+                        let timeoutTask = Task { [weak self] in
+                            do {
+                                try await Task.sleep(for: .seconds(timeoutSeconds))
+                                guard !Task.isCancelled else { return }
+                                self?.failRequest(id: id, error: ClientError.timedOut(id))
+                            } catch is CancellationError {
+                                return
+                            } catch {
+                                return
+                            }
+                        }
+                        do {
+                            try register(continuation, timeoutTask: timeoutTask, for: id)
+                            registered = true
+                            try Task.checkCancellation()
+                            try sendJSON([
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": method,
+                                "params": params
+                            ])
+                        } catch {
+                            timeoutTask.cancel()
+                            throw error
                         }
                     } catch {
                         if registered {
@@ -1929,7 +2067,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     }
                 }
             } onCancel: {
-                self.failPending(id: id, error: CancellationError())
+                self.failRequest(id: id, error: CancellationError())
             }
             return PersistentMCPTestRPCResponse(id: id, rawJSON: rawJSON)
         }
@@ -1941,11 +2079,16 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             }
         }
 
-        private func register(_ continuation: CheckedContinuation<String, Error>, for id: Int) throws {
+        private func register(
+            _ continuation: CheckedContinuation<String, Error>,
+            timeoutTask: Task<Void, Never>,
+            for id: Int
+        ) throws {
             try withStateLock {
                 guard !isClosed, fd >= 0 else { throw ClientError.closed }
                 guard pending[id] == nil else { throw ClientError.duplicateRequestID(id) }
                 pending[id] = continuation
+                timeoutTasks[id] = timeoutTask
             }
         }
 
@@ -1977,7 +2120,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 guard activeFD >= 0 else { return }
                 var descriptor = pollfd(fd: activeFD, events: Int16(POLLIN), revents: 0)
                 let pollResult = Darwin.poll(&descriptor, 1, 100)
-                if pollResult == 0 { continue }
+                if pollResult == 0 {
+                    if withStateLock({ isClosed }) { return }
+                    continue
+                }
                 if pollResult < 0 {
                     if errno == EINTR { continue }
                     if withStateLock({ isClosed }) { return }
@@ -1990,6 +2136,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     close(with: ClientError.closed)
                     return
                 }
+                if withStateLock({ isClosed }) { return }
                 var bytes = [UInt8](repeating: 0, count: 4096)
                 let readCount = bytes.withUnsafeMutableBytes { storage in
                     Darwin.read(activeFD, storage.baseAddress, storage.count)
@@ -2029,14 +2176,21 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                         continuation.resume(returning: rawJSON)
                         return true
                     }
-                    Task { [weak self] in
+                    guard pendingResponse.isIntercepting else {
+                        continuation.resume(throwing: ClientError.closed)
+                        return false
+                    }
+                    let task = Task { [weak self] in
                         do {
-                            try await continuation.resume(returning: interceptor(rawJSON))
+                            let intercepted = try await interceptor(rawJSON)
+                            _ = self?.completeIntercepting(id: id, returning: intercepted)
                         } catch {
-                            continuation.resume(throwing: error)
-                            self?.close(with: error)
+                            if self?.failIntercepting(id: id, error: error) == true {
+                                self?.close(with: error)
+                            }
                         }
                     }
+                    installInterceptingTask(id: id, task: task)
                     return true
                 }
                 guard object["method"] as? String != nil,
@@ -2053,21 +2207,60 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         private func takePending(id: Int) -> CheckedContinuation<String, Error>? {
-            withStateLock {
+            let snapshot = withStateLock {
+                let continuation = pending.removeValue(forKey: id)
                 responseInterceptors.removeValue(forKey: id)
-                return pending.removeValue(forKey: id)
+                let timeoutTask = continuation == nil ? nil : timeoutTasks.removeValue(forKey: id)
+                return (continuation, timeoutTask)
             }
+            snapshot.1?.cancel()
+            return snapshot.0
+        }
+
+        private func installInterceptingTask(id: Int, task: Task<Void, Never>) {
+            let shouldCancelTask = withStateLock {
+                guard var response = interceptingResponses[id] else { return true }
+                response.task = task
+                interceptingResponses[id] = response
+                return false
+            }
+            if shouldCancelTask { task.cancel() }
+        }
+
+        private func takeIntercepting(
+            id: Int,
+            cancelInterceptorTask: Bool
+        ) -> InterceptingResponse? {
+            let snapshot = withStateLock {
+                let response = interceptingResponses.removeValue(forKey: id)
+                let timeoutTask = response == nil ? nil : timeoutTasks.removeValue(forKey: id)
+                let interceptorTask = cancelInterceptorTask ? response?.task : nil
+                return (response, timeoutTask, interceptorTask)
+            }
+            snapshot.1?.cancel()
+            snapshot.2?.cancel()
+            return snapshot.0
         }
 
         private func takePendingResponse(
             id: Int
         ) -> (
             continuation: CheckedContinuation<String, Error>?,
-            interceptor: (@Sendable (String) async throws -> String)?
+            interceptor: (@Sendable (String) async throws -> String)?,
+            isIntercepting: Bool
         ) {
-            withStateLock {
-                (pending.removeValue(forKey: id), responseInterceptors.removeValue(forKey: id))
+            let snapshot = withStateLock {
+                let continuation = pending.removeValue(forKey: id)
+                let interceptor = responseInterceptors.removeValue(forKey: id)
+                let isIntercepting = continuation != nil && interceptor != nil && !isClosed
+                if isIntercepting, let continuation {
+                    interceptingResponses[id] = InterceptingResponse(continuation: continuation)
+                }
+                let timeoutTask = isIntercepting ? nil : timeoutTasks.removeValue(forKey: id)
+                return (continuation, interceptor, isIntercepting, timeoutTask)
             }
+            snapshot.3?.cancel()
+            return (snapshot.0, snapshot.1, snapshot.2)
         }
 
         @discardableResult
@@ -2077,19 +2270,55 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             return true
         }
 
+        @discardableResult
+        private func completeIntercepting(id: Int, returning rawJSON: String) -> Bool {
+            guard let response = takeIntercepting(id: id, cancelInterceptorTask: false) else { return false }
+            response.continuation.resume(returning: rawJSON)
+            return true
+        }
+
+        @discardableResult
+        private func failIntercepting(id: Int, error: Error) -> Bool {
+            guard let response = takeIntercepting(id: id, cancelInterceptorTask: true) else { return false }
+            response.continuation.resume(throwing: error)
+            return true
+        }
+
+        @discardableResult
+        private func failRequest(id: Int, error: Error) -> Bool {
+            if failPending(id: id, error: error) { return true }
+            return failIntercepting(id: id, error: error)
+        }
+
         private func close(with error: Error) {
-            let snapshot: (Int32, [CheckedContinuation<String, Error>]) = withStateLock {
-                guard !isClosed else { return (-1, []) }
+            let snapshot: (
+                activeFD: Int32,
+                pendingContinuations: [CheckedContinuation<String, Error>],
+                interceptingContinuations: [CheckedContinuation<String, Error>],
+                tasks: [Task<Void, Never>]
+            ) = withStateLock {
+                guard !isClosed else { return (-1, [], [], []) }
                 isClosed = true
                 let activeFD = fd
                 fd = -1
-                let continuations = Array(pending.values)
+                let pendingContinuations = Array(pending.values)
+                let intercepting = Array(interceptingResponses.values)
+                let interceptorTasks = intercepting.compactMap { response -> Task<Void, Never>? in
+                    response.task
+                }
+                let tasks = Array(timeoutTasks.values) + interceptorTasks
                 pending.removeAll()
+                timeoutTasks.removeAll()
                 responseInterceptors.removeAll()
-                return (activeFD, continuations)
+                interceptingResponses.removeAll()
+                let interceptingContinuations = intercepting.map { response -> CheckedContinuation<String, Error> in
+                    response.continuation
+                }
+                return (activeFD, pendingContinuations, interceptingContinuations, tasks)
             }
-            if snapshot.0 >= 0 { Darwin.close(snapshot.0) }
-            for continuation in snapshot.1 {
+            if snapshot.activeFD >= 0 { Darwin.close(snapshot.activeFD) }
+            snapshot.tasks.forEach { $0.cancel() }
+            for continuation in snapshot.pendingContinuations + snapshot.interceptingContinuations {
                 continuation.resume(throwing: error)
             }
         }

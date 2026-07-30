@@ -813,7 +813,6 @@ actor BootstrapSocketServer {
             )
         )
         bootstrapSocketServerLog("BootstrapSocketServer: handler returned accepted=\(admission.accepted) for '\(request.clientName ?? "unknown")'")
-
         guard isActiveHandshake(handshakeSocket, generation: generation) else {
             await abortAcceptedAdmissionIfNeeded(admission)
             return

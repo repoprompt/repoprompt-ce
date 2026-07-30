@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class OpenCodeACPLaunchResolverTests: XCTestCase {
@@ -74,6 +74,42 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
 
         XCTAssertEqual(support, .supported)
         XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
+    }
+
+    func testUnsupportedBareCommandReportsCheckedCandidatesAndReasons() async throws {
+        let fakeHome = try makeTemporaryDirectory()
+        let pathDirectory = try makeTemporaryDirectory()
+        let hintDirectory = try makeTemporaryDirectory()
+        let nonExecutable = hintDirectory.appendingPathComponent("opencode")
+        try "not executable\n".write(to: nonExecutable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nonExecutable.path)
+        let environment = [
+            "HOME": fakeHome.path,
+            "PATH": pathDirectory.path,
+            "SHELL": "/bin/false"
+        ]
+        let resolver = OpenCodeACPLaunchResolver(launchEnvironmentProvider: { _ in
+            ACPLaunchEnvironment(environment: environment, shellEnvironmentSource: .enrichedFallback)
+        })
+        let config = OpenCodeAgentConfig(
+            commandName: "opencode",
+            additionalPathHints: [hintDirectory.path],
+            includeRepoPromptMCPServer: false,
+            includeManagedConfigOverlay: false
+        )
+
+        let support = try await resolver.probeSupport(for: config)
+
+        guard case let .unsupported(reason) = support else {
+            return XCTFail("Expected unsupported result with diagnostic reason")
+        }
+        XCTAssertTrue(reason.contains("Tried:"), reason)
+        XCTAssertTrue(reason.contains(hintDirectory.appendingPathComponent("opencode").path), reason)
+        XCTAssertTrue(reason.contains("not executable"), reason)
+        XCTAssertTrue(reason.contains(pathDirectory.appendingPathComponent("opencode").path), reason)
+        XCTAssertTrue(reason.contains("missing"), reason)
+        XCTAssertTrue(reason.contains("fallback PATH"), reason)
+        XCTAssertTrue(reason.contains("PATH may not match Terminal"), reason)
     }
 
     func testOpenCodeHomeBinHintDoesNotLeakIntoNativeDefaultsOrOtherProviders() {
@@ -238,13 +274,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
     }
 
     private func makeTemporaryDirectory() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenCodeACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: directory)
-        }
-        return directory
+        try makeTestDirectory(name: "OpenCodeACPLaunchResolverTests")
     }
 
     @discardableResult

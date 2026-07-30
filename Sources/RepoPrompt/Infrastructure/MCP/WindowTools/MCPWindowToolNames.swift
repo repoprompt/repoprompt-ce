@@ -29,6 +29,8 @@ enum MCPWindowToolName {
     static let agentRun = "agent_run"
     static let agentManage = "agent_manage"
 
+    static let history = "history"
+
     static let shareThoughts = "share_thoughts"
     static let setStatus = "set_status"
     static let waitForNextInstruction = "wait_for_next_user_instruction"

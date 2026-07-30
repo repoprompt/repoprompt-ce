@@ -1,0 +1,135 @@
+{
+  "artifact": "docs/test-suite-optimizer/artifacts/wave1-after-worktree-exact-20260702.json",
+  "command": [
+    "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+    "test",
+    "--filter",
+    "RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections",
+    "--json"
+  ],
+  "filter": "RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections",
+  "git": {
+    "commit": "4423bf1dbe103a11fc2a83a4c1e0fbdea098101e",
+    "working_tree": ""
+  },
+  "inventory": null,
+  "label": "wave1-after-worktree-exact-20260702",
+  "primary_metric_eligible": false,
+  "samples": [
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 12.347614049911499,
+      "exit_code": 0,
+      "index": 1,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/e3011e17-9599-4746-848b-6e5ded54ef37.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0035681724548339844,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 12.178713083267212,
+      "exit_code": 0,
+      "index": 2,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/126cd5f1-b908-435a-96f3-4e8e03505a0d.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004561901092529297,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    },
+    {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--filter",
+        "RepoPromptTests.WorktreeAPISmokeHarnessTests/testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections",
+        "--json"
+      ],
+      "diagnostic_paths": [],
+      "execution_seconds": 9.713245868682861,
+      "exit_code": 0,
+      "index": 3,
+      "invalid_reasons": [],
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/ec391bce-748a-40de-b86e-c014799b0126.log",
+      "measurement_invalid": false,
+      "parsed_test_case_timings": 1,
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.003498077392578125,
+      "source_changed": false,
+      "source_guard_kind": "content",
+      "state": "completed",
+      "target": "root",
+      "timed_out": false,
+      "valid": true
+    }
+  ],
+  "scope": "filtered",
+  "slowest_suites": [
+    {
+      "failure_or_skip_count": 0,
+      "max_method_seconds": 11.563,
+      "median_aggregate_seconds": 11.341,
+      "method_count": 1,
+      "suite": "RepoPromptTests.WorktreeAPISmokeHarnessTests"
+    }
+  ],
+  "slowest_tests": [
+    {
+      "failure_or_skip_count": 0,
+      "max_seconds": 11.563,
+      "median_seconds": 11.341,
+      "method": "testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections",
+      "observations": 3,
+      "observed_p95_seconds": 11.563,
+      "suite": "RepoPromptTests.WorktreeAPISmokeHarnessTests"
+    }
+  ],
+  "source_guard": {
+    "kind": "content"
+  },
+  "summary": {
+    "attempts": 3,
+    "invalid_samples": 0,
+    "median_seconds": 12.178713083267212,
+    "noise_classification": "stable",
+    "observed_p95_seconds": 12.347614049911499,
+    "raw_execution_seconds": [
+      12.347614049911499,
+      12.178713083267212,
+      9.713245868682861
+    ],
+    "relative_mad": 0.013868539761918396,
+    "valid_samples": 3
+  },
+  "target": "root",
+  "timestamp": "2026-07-02T16:14:56+00:00"
+}

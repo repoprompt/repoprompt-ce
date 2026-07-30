@@ -73,6 +73,22 @@ public enum MCPRunPurpose: String, Sendable, Codable {
     case unknown // No policy or unspecified
 }
 
+/// Dispatcher-validated provenance for a one-shot hidden `_windowID` tool argument.
+/// This value is request-scoped only and must never be synthesized from sticky,
+/// persisted, or automatically selected window affinity.
+struct MCPExplicitWindowRoutingHint: @unchecked Sendable, Equatable {
+    enum Provenance: Equatable {
+        case hiddenWindowArgument
+    }
+
+    let connectionID: UUID
+    let toolName: String
+    let windowID: Int
+    let windowStateIdentity: ObjectIdentifier
+    let serverViewModelIdentity: ObjectIdentifier
+    let provenance: Provenance
+}
+
 /// ---------------------------------------------------------------------
 /// Shared constants & logger for the connection-layer (ported from iMCP)
 /// ---------------------------------------------------------------------
@@ -134,6 +150,122 @@ private actor MCPConnectionStopRace {
     }
 }
 
+struct MCPResponseDeliverySnapshot: Equatable {
+    let pendingRequestCount: Int
+    let waiterCount: Int
+    let isTerminal: Bool
+
+    var acceptedRequestsFullyResponded: Bool {
+        pendingRequestCount == 0
+    }
+}
+
+enum MCPProgressDeliveryResult: Equatable {
+    case delivered
+    case failed
+    case connectionTerminal
+}
+
+/// Request-scoped standard MCP progress state. Progress is advisory: one delivery
+/// may be in flight and one latest-wins update may be pending. Finalization stops
+/// admission and discards the pending update without waiting for transport I/O;
+/// the already in-flight notification may therefore trail the final result.
+actor MCPRequestProgressState {
+    private struct PendingDelivery {
+        let connection: any MCPServerConnection
+        let message: String?
+    }
+
+    private let token: ProgressToken
+    private var sequence: Double = 0
+    private var acceptsProgress = true
+    private var pendingDelivery: PendingDelivery?
+    private var deliveryWorker: Task<Void, Never>?
+    #if DEBUG
+        private var quiescenceContinuations: [CheckedContinuation<Void, Never>] = []
+    #endif
+
+    init(token: ProgressToken) {
+        self.token = token
+    }
+
+    /// Enqueues without waiting for transport delivery. While a notification is
+    /// in flight, repeated emissions coalesce into the single latest pending value.
+    func send(
+        through connection: any MCPServerConnection,
+        message: String?
+    ) {
+        guard acceptsProgress else { return }
+        pendingDelivery = PendingDelivery(connection: connection, message: message)
+        guard deliveryWorker == nil else { return }
+
+        deliveryWorker = Task { [weak self] in
+            await self?.deliverBurst()
+        }
+    }
+
+    /// Final results take priority over advisory progress. This cooperatively
+    /// prevents new sends and drops the one bounded pending update, but does not
+    /// cancel or await a socket write that is already in flight.
+    func invalidate() {
+        acceptsProgress = false
+        pendingDelivery = nil
+    }
+
+    private func deliverBurst() async {
+        // Re-evaluate admission after every suspended transport send so
+        // finalization can stop the burst before another delivery is dequeued.
+        while acceptsProgress, let delivery = pendingDelivery {
+            pendingDelivery = nil
+            sequence += 1
+            let progress = sequence
+
+            let result = await delivery.connection.deliverMCPProgress(
+                token: token,
+                progress: progress,
+                message: delivery.message
+            )
+            if result == .connectionTerminal {
+                acceptsProgress = false
+                pendingDelivery = nil
+                break
+            }
+        }
+
+        deliveryWorker = nil
+        #if DEBUG
+            let continuations = quiescenceContinuations
+            quiescenceContinuations = []
+            continuations.forEach { $0.resume() }
+        #endif
+    }
+
+    #if DEBUG
+        struct Snapshot: Equatable {
+            let acceptsProgress: Bool
+            let pendingDeliveryCount: Int
+            let workerActive: Bool
+            let assignedSequence: Double
+        }
+
+        func snapshot() -> Snapshot {
+            Snapshot(
+                acceptsProgress: acceptsProgress,
+                pendingDeliveryCount: pendingDelivery == nil ? 0 : 1,
+                workerActive: deliveryWorker != nil,
+                assignedSequence: sequence
+            )
+        }
+
+        func waitUntilQuiescent() async {
+            guard deliveryWorker != nil else { return }
+            await withCheckedContinuation { continuation in
+                quiescenceContinuations.append(continuation)
+            }
+        }
+    #endif
+}
+
 protocol MCPServerConnection: Actor {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
@@ -145,6 +277,7 @@ protocol MCPServerConnection: Actor {
     func isViableForRetention() -> Bool
     func secondsSinceLastActivity() async -> TimeInterval
     func transportIngressSnapshot() async -> MCPTransportIngressSnapshot?
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot?
     func waitUntilResponseDeliveryDrained() async -> Bool
     /// Whether this is a legacy filesystem-backed connection (deprecated)
     nonisolated var isFilesystemBacked: Bool { get }
@@ -166,11 +299,47 @@ protocol MCPServerConnection: Actor {
     ///   - stage: Current stage name
     ///   - message: Human-readable message
     func sendProgress(tool: String, kind: RepoPromptProgressKind, stage: String, message: String) async
+
+    /// Sends a standard MCP `notifications/progress` message associated with the
+    /// caller-provided request token.
+    func sendMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async
+
+    /// Reports whether advisory delivery reached a terminal connection state.
+    /// Request progress uses this to discard its bounded pending update instead
+    /// of attempting more writes after the connection has closed.
+    func deliverMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async -> MCPProgressDeliveryResult
 }
 
 extension MCPServerConnection {
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        nil
+    }
+
     func waitUntilResponseDeliveryDrained() async -> Bool {
         true
+    }
+
+    func sendMCPProgress(
+        token _: ProgressToken,
+        progress _: Double,
+        message _: String?
+    ) async {}
+
+    func deliverMCPProgress(
+        token: ProgressToken,
+        progress: Double,
+        message: String?
+    ) async -> MCPProgressDeliveryResult {
+        await sendMCPProgress(token: token, progress: progress, message: message)
+        return isViableForRetention() ? .delivered : .connectionTerminal
     }
 }
 
@@ -350,6 +519,11 @@ enum MCPConnectionCallLane: String, CaseIterable {
     case smallRead = "small_read"
     case gitRead = "git_read"
     case fileSearch = "file_search"
+}
+
+enum MCPRunRouteAuthorityDecision: Equatable {
+    case committed
+    case revocationFenced
 }
 
 /// Manages all MCP connections using the bootstrap UNIX-domain socket.
@@ -866,11 +1040,13 @@ actor ServerNetworkManager {
         private let debugRestartStatusLimit = 50
         private var debugResolvedToolOperationOverrides: [String: @Sendable () async throws -> Value] = [:]
         private var debugExecutionWatchdogAbortTargets: [UUID: any MCPServerConnection] = [:]
+        private var debugTerminalRecordDirectoryURLForTesting: URL?
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:]
     private var connectionsBeingRemoved: Set<UUID> = []
     private var executionWatchdogTerminalConnections: Set<UUID> = []
+    private var transportTerminalConnections: Set<UUID> = []
     private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var bootstrapPeerPIDByConnectionID: [UUID: Int] = [:]
@@ -901,13 +1077,22 @@ actor ServerNetworkManager {
         return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
     }
 
-    static func executionContractToolErrorResult(rawJSON: Bool, code: String, message: String) -> CallTool.Result {
+    static func executionContractToolErrorResult(
+        rawJSON: Bool,
+        code: String,
+        message: String,
+        metadata: [String: Value] = [:]
+    ) -> CallTool.Result {
         guard rawJSON else { return CallTool.Result.err("\(code): \(message)") }
-        let value: Value = .object([
+        var object: [String: Value] = [
             "is_error": .bool(true),
             "code": .string(code),
             "error": .string(message)
-        ])
+        ]
+        for (key, value) in metadata {
+            object[key] = value
+        }
+        let value: Value = .object(object)
         return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
     }
 
@@ -998,6 +1183,8 @@ actor ServerNetworkManager {
         let reason: String?
         let createdAt: Date
         let ttl: TimeInterval
+        /// Run-owned policies are consumed or explicitly revoked at settlement, never by age alone.
+        let prunesOnlyAfterSettlement: Bool
         // Tab context for Context Builder agents
         let tabID: UUID?
         let runID: UUID?
@@ -1068,12 +1255,21 @@ actor ServerNetworkManager {
 
     private var pendingPoliciesByClient: [String: [ClientConnectionPolicy]] = [:]
     #if DEBUG
+        private var debugShouldSuspendNextPendingPolicyObservation = false
+        private var debugPendingPolicyObservationIsSuspended = false
+        private var debugPendingPolicyObservationResumeWaiters: [CheckedContinuation<Void, Never>] = []
         private var debugShouldSuspendNextPendingPolicyRouteInstallation = false
         private var debugPendingPolicyRouteInstallationIsSuspended = false
         private var debugPendingPolicyRouteInstallationResumeWaiters: [CheckedContinuation<Void, Never>] = []
         private var debugShouldSuspendNextPendingPolicyCommit = false
         private var debugPendingPolicyCommitIsSuspended = false
         private var debugPendingPolicyCommitResumeWaiters: [CheckedContinuation<Void, Never>] = []
+        private var debugShouldSuspendNextConfirmOrFence = false
+        private var debugConfirmOrFenceIsSuspended = false
+        private var debugConfirmOrFenceResumeWaiters: [CheckedContinuation<Void, Never>] = []
+        private var debugShouldSuspendNextConfirmOrFenceBeforeRevocation = false
+        private var debugConfirmOrFenceBeforeRevocationIsSuspended = false
+        private var debugConfirmOrFenceBeforeRevocationResumeWaiters: [CheckedContinuation<Void, Never>] = []
         private var debugPendingPolicyReplacementSchedules: [(existing: UUID, replacement: UUID, runID: UUID)] = []
     #endif
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
@@ -1083,6 +1279,8 @@ actor ServerNetworkManager {
     private var windowIDByRunID: [UUID: Int] = [:]
     private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:]
     private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:]
+    private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:]
+    private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:]
 
     // 🆕 Per-connection → windowID routing map
     private var connectionWindowMap: [UUID: Int] = [:]
@@ -1461,6 +1659,7 @@ actor ServerNetworkManager {
     private nonisolated let smallReadAdmissionController = MCPToolResourceAdmissionController(
         limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
     )
+    private nonisolated let codeStructureSettlementRegistry = MCPCodeStructureSettlementRegistry()
     private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
@@ -2024,11 +2223,40 @@ actor ServerNetworkManager {
     @TaskLocal
     static var currentConnectionID: UUID?
     @TaskLocal
+    static var currentProgressState: MCPRequestProgressState?
+    @TaskLocal
     static var currentTabContextHint: MCPServerViewModel.TabContextHint?
     @TaskLocal
     static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
+    @TaskLocal
+    static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+
+    nonisolated static func explicitWindowRoutingHint(
+        connectionID: UUID,
+        toolName: String,
+        explicitWindowID: Int?,
+        authorization: ToolDispatchAuthorization?
+    ) -> MCPExplicitWindowRoutingHint? {
+        guard let explicitWindowID,
+              let authorization,
+              authorization.connectionID == connectionID,
+              let windowIdentity = authorization.windowIdentity,
+              windowIdentity.windowID == explicitWindowID
+        else {
+            return nil
+        }
+        return MCPExplicitWindowRoutingHint(
+            connectionID: connectionID,
+            toolName: toolName,
+            windowID: explicitWindowID,
+            windowStateIdentity: windowIdentity.windowStateIdentity,
+            serverViewModelIdentity: windowIdentity.serverViewModelIdentity,
+            provenance: .hiddenWindowArgument
+        )
+    }
 
     // ------------------------------------------------------------------
+
     // MARK: Tool ownership tracking helpers
 
     /// ------------------------------------------------------------------
@@ -2316,6 +2544,7 @@ actor ServerNetworkManager {
     }
 
     // ------------------------------------------------------------------
+
     // MARK: Window-selection helpers (called from WindowRoutingService)
 
     /// ------------------------------------------------------------------
@@ -2606,19 +2835,27 @@ actor ServerNetworkManager {
     nonisolated static func withConnectionID<T>(
         _ connectionID: UUID?,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        progressState: MCPRequestProgressState? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
-        #if DEBUG || EDIT_FLOW_PERF
-            let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
-            guard let effectiveLifecycleCorrelation else {
+        // Nested window-tool dispatches re-establish the connection TaskLocal.
+        // Preserve an already-authorized request progress state unless the caller
+        // supplies a new one for a new top-level request.
+        let effectiveProgressState = progressState
+            ?? (connectionID == currentConnectionID ? currentProgressState : nil)
+        return try await $currentProgressState.withValue(effectiveProgressState) {
+            #if DEBUG || EDIT_FLOW_PERF
+                let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
+                guard let effectiveLifecycleCorrelation else {
+                    return try await $currentConnectionID.withValue(connectionID, operation: operation)
+                }
+                return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
+                    try await $currentConnectionID.withValue(connectionID, operation: operation)
+                }
+            #else
                 return try await $currentConnectionID.withValue(connectionID, operation: operation)
-            }
-            return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
-                try await $currentConnectionID.withValue(connectionID, operation: operation)
-            }
-        #else
-            return try await $currentConnectionID.withValue(connectionID, operation: operation)
-        #endif
+            #endif
+        }
     }
 
     func clientIdentifier(forConnection id: UUID) -> String? {
@@ -2697,6 +2934,279 @@ actor ServerNetworkManager {
         runIDByConnectionID[connectionID] = resolved.runID
         windowIDByRunID[resolved.runID] = resolved.windowID
         return resolved.runID
+    }
+
+    /// Rechecks committed route authority after a waiter deadline.
+    ///
+    /// The MainActor forward mapping deterministically identifies the candidate connection.
+    /// Actor-owned application, policy identity, expected window/tab, and connection liveness
+    /// are then sampled on both sides of a second MainActor mapping validation.
+    func isRunRouteAuthoritativelyCommitted(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) async -> Bool {
+        let connectionID = await MainActor.run { () -> UUID? in
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  let connectionID = window.mcpServer.connectionIDByRunID[runID],
+                  window.mcpServer.hasCurrentRunRouteMapping(
+                      runID: runID,
+                      connectionID: connectionID,
+                      expectedTabID: tabID
+                  )
+            else { return nil }
+            return connectionID
+        }
+        guard let connectionID,
+              let actorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              )
+        else { return false }
+
+        let mappingIsStillCurrent = await MainActor.run {
+            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+                return false
+            }
+            return window.mcpServer.hasCurrentRunRouteMapping(
+                runID: runID,
+                connectionID: connectionID,
+                expectedTabID: tabID
+            )
+        }
+        guard mappingIsStillCurrent,
+              let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              ),
+              revalidatedActorSnapshot == actorSnapshot
+        else { return false }
+        return true
+    }
+
+    /// Rechecks committed route authority and, if it is absent, fences this run against
+    /// any in-flight policy application before returning. The final actor-side route
+    /// sample and fence installation share one actor turn; MainActor mapping checks are
+    /// generation/identity sampled rather than treated as an atomic cross-actor section.
+    func confirmCommittedRunRouteOrFenceRevocation(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) async -> MCPRunRouteAuthorityDecision {
+        if await isRunRouteAuthoritativelyCommitted(
+            runID: runID,
+            windowID: windowID,
+            tabID: tabID
+        ) {
+            #if DEBUG
+                debugRecordRunRoutingEvent(
+                    runID: runID,
+                    event: "route_authority_decision",
+                    fields: ["decision": "committed"]
+                )
+            #endif
+            return .committed
+        }
+
+        #if DEBUG
+            await debugSuspendConfirmOrFenceIfNeeded()
+        #endif
+
+        let connectionID = await MainActor.run { () -> UUID? in
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  let connectionID = window.mcpServer.connectionIDByRunID[runID],
+                  window.mcpServer.hasCurrentRunRouteMapping(
+                      runID: runID,
+                      connectionID: connectionID,
+                      expectedTabID: tabID
+                  )
+            else { return nil }
+            return connectionID
+        }
+
+        if let connectionID,
+           let actorSnapshot = authoritativeRunRouteActorSnapshot(
+               runID: runID,
+               connectionID: connectionID,
+               windowID: windowID,
+               tabID: tabID
+           )
+        {
+            let mappingIsStillCurrent = await MainActor.run {
+                guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+                    return false
+                }
+                return window.mcpServer.hasCurrentRunRouteMapping(
+                    runID: runID,
+                    connectionID: connectionID,
+                    expectedTabID: tabID
+                )
+            }
+            if mappingIsStillCurrent,
+               let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
+                   runID: runID,
+                   connectionID: connectionID,
+                   windowID: windowID,
+                   tabID: tabID
+               ),
+               revalidatedActorSnapshot == actorSnapshot
+            {
+                #if DEBUG
+                    debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "route_authority_decision",
+                        connectionID: connectionID,
+                        fields: ["decision": "committed"]
+                    )
+                #endif
+                return .committed
+            }
+        }
+
+        #if DEBUG
+            await debugSuspendConfirmOrFenceBeforeRevocationIfNeeded()
+        #endif
+
+        // The MainActor sample above may have returned just before a policy application
+        // completed its actor-owned commit tail. Probe that completed candidate before
+        // fencing; because it has no pending application, one bounded full double-sample
+        // retry is sufficient and no newer commit can begin ahead of this fence turn.
+        if lateCommittedRunRouteCandidate(
+            runID: runID,
+            windowID: windowID,
+            tabID: tabID
+        ) != nil,
+            await isRunRouteAuthoritativelyCommitted(
+                runID: runID,
+                windowID: windowID,
+                tabID: tabID
+            )
+        {
+            #if DEBUG
+                debugRecordRunRoutingEvent(
+                    runID: runID,
+                    event: "route_authority_decision",
+                    fields: ["decision": "committed_after_late_candidate"]
+                )
+            #endif
+            return .committed
+        }
+
+        // This synchronous fence is the ownership boundary for a racing policy commit.
+        // A commit that already landed is observed above; one still in flight loses its
+        // application ID/generation check before it can publish routing readiness.
+        let hasLiveRunAuthority = runRoutingAuthorityGenerationByRunID[runID] != nil
+            || pendingPolicyApplicationIDByRunID[runID] != nil
+            || runPolicyStateByRunID[runID] != nil
+        pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
+        if hasLiveRunAuthority {
+            runRoutingAuthorityGenerationByRunID[runID, default: 0] &+= 1
+            revocationFenceGenerationByRunID[runID] = runRoutingAuthorityGenerationByRunID[runID]
+        }
+        #if DEBUG
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "route_authority_decision",
+                fields: ["decision": "revocation_fenced"]
+            )
+        #endif
+        return .revocationFenced
+    }
+
+    private func lateCommittedRunRouteCandidate(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) -> UUID? {
+        guard pendingPolicyApplicationIDByRunID[runID] == nil,
+              admittedPolicyRunIDs.contains(runID),
+              runPolicyStateByRunID[runID]?.windowID == windowID,
+              runPolicyStateByRunID[runID]?.tabID == tabID,
+              windowIDByRunID[runID] == windowID
+        else { return nil }
+        // A reconnect/handover can leave a displaced connection's actor-side mapping
+        // behind until its removal completes, so several connections may map to this
+        // run at once. Sampling one arbitrary mapping could observe only a stale
+        // (terminal or lifecycle-superseded) connection and miss the committed route;
+        // consider every matching connection until one holds a valid authoritative
+        // snapshot.
+        for (candidateConnectionID, mappedRunID) in runIDByConnectionID where mappedRunID == runID {
+            guard authoritativeRunRouteActorSnapshot(
+                runID: runID,
+                connectionID: candidateConnectionID,
+                windowID: windowID,
+                tabID: tabID
+            ) != nil else { continue }
+            return candidateConnectionID
+        }
+        return nil
+    }
+
+    private struct AuthoritativeRunRouteActorSnapshot: Equatable {
+        let pendingRunApplicationID: UUID?
+        let pendingConnectionApplicationID: UUID?
+        let mappedRunID: UUID?
+        let runWindowID: Int?
+        let connectionWindowID: Int?
+        let policyWindowID: Int?
+        let policyTabID: UUID?
+        let isRunAdmitted: Bool
+        let connectionLifecycleGeneration: UInt64?
+        let connectionIdentity: ObjectIdentifier?
+        let connectionIsBeingRemoved: Bool
+        let lifecycleIsCurrent: Bool
+        let executionWatchdogIsTerminal: Bool
+        let transportIsTerminal: Bool
+        let routeIsRevocationFenced: Bool
+    }
+
+    private func authoritativeRunRouteActorSnapshot(
+        runID: UUID,
+        connectionID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) -> AuthoritativeRunRouteActorSnapshot? {
+        let connection = connections[connectionID]
+        let snapshot = AuthoritativeRunRouteActorSnapshot(
+            pendingRunApplicationID: pendingPolicyApplicationIDByRunID[runID],
+            pendingConnectionApplicationID: pendingPolicyApplicationIDByConnectionID[connectionID],
+            mappedRunID: runIDByConnectionID[connectionID],
+            runWindowID: windowIDByRunID[runID],
+            connectionWindowID: connectionWindowMap[connectionID],
+            policyWindowID: runPolicyStateByRunID[runID]?.windowID,
+            policyTabID: runPolicyStateByRunID[runID]?.tabID,
+            isRunAdmitted: admittedPolicyRunIDs.contains(runID),
+            connectionLifecycleGeneration: connectionLifecycleGenerationByID[connectionID],
+            connectionIdentity: connection.map { ObjectIdentifier($0 as AnyObject) },
+            connectionIsBeingRemoved: connectionsBeingRemoved.contains(connectionID),
+            lifecycleIsCurrent: connectionLifecycleGenerationByID[connectionID].map(isCurrentLifecycle) ?? false,
+            executionWatchdogIsTerminal: executionWatchdogTerminalConnections.contains(connectionID),
+            transportIsTerminal: transportTerminalConnections.contains(connectionID),
+            routeIsRevocationFenced: revocationFenceGenerationByRunID[runID].map {
+                $0 == runRoutingAuthorityGenerationByRunID[runID]
+            } ?? false
+        )
+        guard snapshot.pendingRunApplicationID == nil,
+              snapshot.pendingConnectionApplicationID == nil,
+              snapshot.mappedRunID == runID,
+              snapshot.runWindowID == windowID,
+              snapshot.connectionWindowID == windowID,
+              snapshot.policyWindowID == windowID,
+              snapshot.policyTabID == tabID,
+              snapshot.isRunAdmitted,
+              snapshot.connectionLifecycleGeneration != nil,
+              snapshot.connectionIdentity != nil,
+              !snapshot.connectionIsBeingRemoved,
+              snapshot.lifecycleIsCurrent,
+              !snapshot.executionWatchdogIsTerminal,
+              !snapshot.transportIsTerminal,
+              !snapshot.routeIsRevocationFenced
+        else { return nil }
+        return snapshot
     }
 
     func toolTrackingRunIDForCompletion(
@@ -3256,6 +3766,8 @@ actor ServerNetworkManager {
         admittedPolicyRunIDs.remove(runID)
         windowIDByRunID.removeValue(forKey: runID)
         pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
+        runRoutingAuthorityGenerationByRunID.removeValue(forKey: runID)
+        revocationFenceGenerationByRunID.removeValue(forKey: runID)
         clearLiveRunAffinity(for: runID)
         let connectionIDsForRun = runIDByConnectionID.compactMap { connectionID, mappedRunID in
             mappedRunID == runID ? connectionID : nil
@@ -3304,6 +3816,36 @@ actor ServerNetworkManager {
         toolEventObservers[runID, default: [:]][token] = observer
         connectionLog("Registered tool event observer for runID: \(runID) token: \(token)")
         return token
+    }
+
+    /// Unregister one tool event observer for a specific run.
+    ///
+    /// Owner-scoped teardown should use this token-specific path so another
+    /// observer registered for the same run remains active. If the observer was
+    /// already captured by a run-wide unregister, wait for that cleanup barrier
+    /// instead of returning before its in-flight delivery drains.
+    func unregisterToolEventObserver(for runID: UUID, token: UUID) async {
+        let removedObserver: ToolEventObserver?
+        if var observers = toolEventObservers[runID] {
+            removedObserver = observers.removeValue(forKey: token)
+            if observers.isEmpty {
+                toolEventObservers.removeValue(forKey: runID)
+            } else {
+                toolEventObservers[runID] = observers
+            }
+        } else {
+            removedObserver = nil
+        }
+
+        if let removedObserver {
+            await removedObserver.deliveryBarrier.waitUntilIdle()
+            connectionLog("Unregistered tool event observer for runID: \(runID) token: \(token)")
+            return
+        }
+
+        if let unregistration = toolObserverUnregistrationsByRunID[runID] {
+            await unregistration.task.value
+        }
     }
 
     /// Unregister all tool event observers for a specific run
@@ -3729,7 +4271,9 @@ actor ServerNetworkManager {
         let now = Date()
         var removedCount = 0
         for (clientID, policies) in pendingPoliciesByClient {
-            let filtered = policies.filter { now.timeIntervalSince($0.createdAt) < $0.ttl }
+            let filtered = policies.filter {
+                $0.prunesOnlyAfterSettlement || now.timeIntervalSince($0.createdAt) < $0.ttl
+            }
             if filtered.isEmpty {
                 pendingPoliciesByClient.removeValue(forKey: clientID)
                 removedCount += policies.count
@@ -5160,9 +5704,12 @@ actor ServerNetworkManager {
         capabilityTokenByConnection.removeAll()
         connectionIDBySessionToken.removeAll()
         sessionTokenBindingGeneration.removeAll()
+        transportTerminalConnections.removeAll()
+        signalRoutingOwnershipLossBeforeReset()
         resetInMemoryRoutingCachesForRestart()
         for (connectionID, _) in connectionsToStop {
             terminalRecordClaimsByConnectionID.removeValue(forKey: connectionID)
+            transportTerminalConnections.remove(connectionID)
         }
 
         for (_, limiters) in limitersToStop {
@@ -5214,6 +5761,16 @@ actor ServerNetworkManager {
         emitDashboardUpdate()
     }
 
+    /// Resolve parked indefinite routing waits before their policy/PID ownership is erased.
+    private func signalRoutingOwnershipLossBeforeReset() {
+        let pendingRunIDs = pendingPoliciesByClient.values
+            .flatMap { $0.compactMap(\.runID) }
+        let ownedRunIDs = Set(pendingRunIDs).union(runPolicyStateByRunID.keys)
+        for runID in ownedRunIDs {
+            MCPRoutingWaiter.signalFailed(runID)
+        }
+    }
+
     private func resetInMemoryRoutingCachesForRestart() {
         connectionWindowMap.removeAll()
         runIDByConnectionID.removeAll()
@@ -5231,6 +5788,8 @@ actor ServerNetworkManager {
         windowIDByRunID.removeAll()
         pendingPolicyApplicationIDByConnectionID.removeAll()
         pendingPolicyApplicationIDByRunID.removeAll()
+        runRoutingAuthorityGenerationByRunID.removeAll()
+        revocationFenceGenerationByRunID.removeAll()
         activeConnectionsByClient.removeAll()
         clientIDByConnection.removeAll()
         capabilityTokenByConnection.removeAll()
@@ -5273,7 +5832,7 @@ actor ServerNetworkManager {
                 markSessionKilled: true,
                 markClientUserKilled: true
             )
-        case .runCompleted, .runCancelled, .serverShutdown, .approvalDenied:
+        case .runCompleted, .runCancelled, .serverShutdown, .approvalDenied, .toolExecutionWatchdog:
             // Expected terminations - kill signal but no client cooldown
             TerminationSemantics(
                 writeKillSignal: true,
@@ -5558,6 +6117,8 @@ actor ServerNetworkManager {
         connectionID: UUID,
         context: MCPConnectionCloseContext
     ) {
+        guard connections[connectionID] != nil || connectionsBeingRemoved.contains(connectionID) else { return }
+        transportTerminalConnections.insert(connectionID)
         guard let peerPID = bootstrapPeerPIDByConnectionID[connectionID] else { return }
 
         let candidate = MCPTerminalRecord(
@@ -5570,15 +6131,30 @@ actor ServerNetworkManager {
             appConnectionID: connectionID,
             connectionGeneration: connectionLifecycleGenerationByID[connectionID],
             errno: context.errno,
-            errorDescription: context.errorDescription
+            errorDescription: context.errorDescription,
+            toolName: context.toolExecution?.toolName,
+            invocationID: context.toolExecution?.invocationID,
+            elapsedMilliseconds: context.toolExecution?.elapsedMilliseconds,
+            handlerPhase: context.toolExecution?.handlerPhase,
+            handlerPhaseAgeMilliseconds: context.toolExecution?.handlerPhaseAgeMilliseconds,
+            executionDeadlineMilliseconds: context.toolExecution?.executionDeadlineMilliseconds,
+            cleanupGraceMilliseconds: context.toolExecution?.cleanupGraceMilliseconds
         )
         var claim = terminalRecordClaimsByConnectionID[connectionID] ?? MCPFirstTerminalRecordClaim()
+        // First terminal cause wins, including a generic peer/transport cause that
+        // races ahead of watchdog attribution. Durable records are never enriched later.
         guard let record = claim.claim(candidate) else { return }
         terminalRecordClaimsByConnectionID[connectionID] = claim
 
+        #if DEBUG
+            let terminalRecordDirectoryURL = debugTerminalRecordDirectoryURLForTesting
+                ?? MCPFilesystemConstants.eventsDirectoryURL()
+        #else
+            let terminalRecordDirectoryURL = MCPFilesystemConstants.eventsDirectoryURL()
+        #endif
         if MCPTerminalRecordStore.writeBestEffort(
             record,
-            to: MCPFilesystemConstants.eventsDirectoryURL()
+            to: terminalRecordDirectoryURL
         ) != nil {
             claim.markPersisted()
             terminalRecordClaimsByConnectionID[connectionID] = claim
@@ -5722,7 +6298,9 @@ actor ServerNetworkManager {
         invocationID: UUID,
         elapsedMilliseconds: Double,
         handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
-        handlerPhaseAgeMilliseconds: Double?
+        handlerPhaseAgeMilliseconds: Double?,
+        executionDeadlineMilliseconds: Double?,
+        cleanupGraceMilliseconds: Double?
     ) async {
         guard executionWatchdogTerminalConnections.insert(id).inserted else { return }
         let activeToolExecutionScopeCount = activeToolScopeIDs(ownedBy: id).values.reduce(0) { $0 + $1.count }
@@ -5744,7 +6322,16 @@ actor ServerNetworkManager {
         let closeContext = MCPConnectionCloseContext(
             reason: "tool_execution_watchdog",
             initiator: .app,
-            errorDescription: "Unresponsive tool execution exceeded the watchdog deadline"
+            errorDescription: "Unresponsive tool execution exceeded the watchdog deadline",
+            toolExecution: MCPTerminalToolExecutionContext(
+                toolName: toolName,
+                invocationID: invocationID,
+                elapsedMilliseconds: elapsedMilliseconds,
+                handlerPhase: handlerPhase?.phase.rawValue,
+                handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds,
+                executionDeadlineMilliseconds: executionDeadlineMilliseconds,
+                cleanupGraceMilliseconds: cleanupGraceMilliseconds
+            )
         )
         persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
 
@@ -5798,7 +6385,8 @@ actor ServerNetworkManager {
         assignedWindowID: Int?,
         contextBuilderRunID: UUID?,
         detachContextBuilderRunID: UUID?,
-        closeContext: MCPConnectionCloseContext
+        closeContext: MCPConnectionCloseContext,
+        responseDeliverySnapshot: MCPResponseDeliverySnapshot?
     ) async -> Bool {
         let windows = WindowStatesManager.shared.allWindows
         let targets: [WindowState]
@@ -5821,7 +6409,7 @@ actor ServerNetworkManager {
         var didDetachContextBuilderContext = false
         if let detachContextBuilderRunID {
             for state in targets {
-                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForPeerEOF(
+                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForDiscoveryTeardown(
                     connectionID: connectionID,
                     runID: detachContextBuilderRunID
                 ) || didDetachContextBuilderContext
@@ -5836,15 +6424,26 @@ actor ServerNetworkManager {
             )
         }
         if let contextBuilderRunID {
+            let isOrderlyPeerEOF = closeContext.reason == MCPTransportTerminalCause.peerEOF.rawValue
+                && closeContext.initiator == .peer
             for state in targets {
                 let wasDetached = state.mcpServer.isDetachedContextBuilderConnection(
                     connectionID: connectionID,
                     runID: contextBuilderRunID
                 )
+                let outcome: MCPServerViewModel.ContextBuilderTeardownPublicationOutcome = if wasDetached {
+                    if isOrderlyPeerEOF {
+                        .peerEOFDetached
+                    } else if responseDeliverySnapshot?.acceptedRequestsFullyResponded == true {
+                        .detachedAfterResponseDeliveryDrained(reason: closeContext.reason)
+                    } else {
+                        .detachedWithoutOrderlyPeerEOF(reason: closeContext.reason)
+                    }
+                } else {
+                    .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason)
+                }
                 state.mcpServer.contextBuilderTeardownPublicationCoordinator.publish(
-                    wasDetached
-                        ? .peerEOFDetached
-                        : .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason),
+                    outcome,
                     runID: contextBuilderRunID,
                     connectionID: connectionID
                 )
@@ -5911,17 +6510,15 @@ actor ServerNetworkManager {
         persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
 
         // Capture run ownership before any suspension or connection-dictionary cleanup.
-        // Only orderly peer EOF from a discover-run child may transfer final context ownership.
+        // A discovery child can finish successfully and then disappear through several
+        // transport shapes (server terminate, write hangup/stall, read error, TTL, etc.).
+        // Preserve its final tab context for commit whenever the connection still has
+        // authoritative discover-run ownership; cancellation/staleness is enforced later
+        // by the commit path's isStillCurrent checks.
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
-        let detachContextBuilderRunID: UUID? = if context.reason == MCPTransportTerminalCause.peerEOF.rawValue,
-                                                  context.initiator == .peer,
-                                                  cleanupRunPurpose == .discoverRun
-        {
-            cleanupRunID
-        } else {
-            nil
-        }
+        let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
+        let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
 
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
@@ -5976,13 +6573,16 @@ actor ServerNetworkManager {
             connectionLog("Cancelled \(cancelledToolCount) active tool execution(s) owned by disconnected connection \(id)")
         }
 
+        let finalResponseDeliverySnapshot =
+            await connections[id]?.responseDeliverySnapshot() ?? responseDeliverySnapshot
         let didDetachContextBuilderContext = await Self.finishReadFileAutoSelectionAndRemoveTabContext(
             connectionID: id,
             clientName: cleanupClientName,
             assignedWindowID: assignedWindowID,
             contextBuilderRunID: cleanupRunPurpose == .discoverRun ? cleanupRunID : nil,
             detachContextBuilderRunID: detachContextBuilderRunID,
-            closeContext: context
+            closeContext: context,
+            responseDeliverySnapshot: finalResponseDeliverySnapshot
         )
         #if DEBUG
             if cleanupRunPurpose == .discoverRun, let cleanupRunID {
@@ -6036,6 +6636,7 @@ actor ServerNetworkManager {
         // connection cannot remain discoverable while an active owner ignores cancellation.
         unbindSessionToken(sessionToken, forConnectionID: id)
         terminalRecordClaimsByConnectionID.removeValue(forKey: id)
+        transportTerminalConnections.remove(id)
 
         if let limiters {
             let results = await limiters.waitUntilIdle(
@@ -6057,10 +6658,11 @@ actor ServerNetworkManager {
         return true
     }
 
-    /// Reads the cached TCP client name from all CLI instance cache files.
-    /// (Legacy TCP transport has been removed; this helper now returns nil.)
-    /// - Parameter remotePort: The remote port from the incoming connection for precise matching
-    /// - Returns: Always nil now that TCP transport and cache files are deprecated
+    // Reads the cached TCP client name from all CLI instance cache files.
+    // (Legacy TCP transport has been removed; this helper now returns nil.)
+    // - Parameter remotePort: The remote port from the incoming connection for precise matching
+    // - Returns: Always nil now that TCP transport and cache files are deprecated
+
     // MARK: - Identity Failure Recording & Escalation
 
     /// Transport type for identity failure tracking
@@ -6607,7 +7209,8 @@ actor ServerNetworkManager {
         purpose: MCPRunPurpose = .unknown,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        requiresExpectedAgentPID: Bool = false
+        requiresExpectedAgentPID: Bool = false,
+        prunesOnlyAfterSettlement: Bool = false
     ) async {
         let storageKey = Self.clientStorageKey(clientName)
         pruneExpiredPolicies(for: clientName)
@@ -6620,6 +7223,7 @@ actor ServerNetworkManager {
             reason: reason,
             createdAt: Date(),
             ttl: ttl,
+            prunesOnlyAfterSettlement: prunesOnlyAfterSettlement,
             tabID: tabID,
             runID: runID,
             additionalTools: additionalTools,
@@ -6635,6 +7239,8 @@ actor ServerNetworkManager {
             "Installing connection policy for client \(clientName) window=\(windowID) grants=\(grantDescription) restricted=\(restrictedDescription) oneShot=\(oneShot) ttl=\(ttl) reason=\(reason ?? "-") role=\(taskLabelKind?.rawValue ?? "-")"
         )
         if let runID {
+            runRoutingAuthorityGenerationByRunID[runID, default: 0] &+= 1
+            revocationFenceGenerationByRunID.removeValue(forKey: runID)
             seedRunPolicyState(
                 runID: runID,
                 windowID: windowID,
@@ -6769,6 +7375,22 @@ actor ServerNetworkManager {
     }
 
     #if DEBUG
+        func debugSuspendNextPendingPolicyObservation() {
+            debugShouldSuspendNextPendingPolicyObservation = true
+        }
+
+        func debugIsPendingPolicyObservationSuspended() -> Bool {
+            debugPendingPolicyObservationIsSuspended
+        }
+
+        func debugResumePendingPolicyObservation() {
+            debugShouldSuspendNextPendingPolicyObservation = false
+            debugPendingPolicyObservationIsSuspended = false
+            let waiters = debugPendingPolicyObservationResumeWaiters
+            debugPendingPolicyObservationResumeWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
         func debugSuspendNextPendingPolicyRouteInstallation() {
             debugShouldSuspendNextPendingPolicyRouteInstallation = true
         }
@@ -6811,6 +7433,48 @@ actor ServerNetworkManager {
             waiters.forEach { $0.resume() }
         }
 
+        func debugSuspendNextConfirmOrFence() {
+            debugShouldSuspendNextConfirmOrFence = true
+        }
+
+        func debugIsConfirmOrFenceSuspended() -> Bool {
+            debugConfirmOrFenceIsSuspended
+        }
+
+        func debugResumeConfirmOrFence() {
+            debugShouldSuspendNextConfirmOrFence = false
+            debugConfirmOrFenceIsSuspended = false
+            let waiters = debugConfirmOrFenceResumeWaiters
+            debugConfirmOrFenceResumeWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
+        func debugSuspendNextConfirmOrFenceBeforeRevocation() {
+            debugShouldSuspendNextConfirmOrFenceBeforeRevocation = true
+        }
+
+        func debugIsConfirmOrFenceBeforeRevocationSuspended() -> Bool {
+            debugConfirmOrFenceBeforeRevocationIsSuspended
+        }
+
+        func debugResumeConfirmOrFenceBeforeRevocation() {
+            debugShouldSuspendNextConfirmOrFenceBeforeRevocation = false
+            debugConfirmOrFenceBeforeRevocationIsSuspended = false
+            let waiters = debugConfirmOrFenceBeforeRevocationResumeWaiters
+            debugConfirmOrFenceBeforeRevocationResumeWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
+        private func debugSuspendPendingPolicyObservationIfNeeded() async {
+            guard debugShouldSuspendNextPendingPolicyObservation else { return }
+            debugShouldSuspendNextPendingPolicyObservation = false
+            debugPendingPolicyObservationIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugPendingPolicyObservationResumeWaiters.append(continuation)
+            }
+            debugPendingPolicyObservationIsSuspended = false
+        }
+
         private func debugSuspendPendingPolicyRouteInstallationIfNeeded() async {
             guard debugShouldSuspendNextPendingPolicyRouteInstallation else { return }
             debugShouldSuspendNextPendingPolicyRouteInstallation = false
@@ -6829,6 +7493,26 @@ actor ServerNetworkManager {
                 debugPendingPolicyCommitResumeWaiters.append(continuation)
             }
             debugPendingPolicyCommitIsSuspended = false
+        }
+
+        private func debugSuspendConfirmOrFenceIfNeeded() async {
+            guard debugShouldSuspendNextConfirmOrFence else { return }
+            debugShouldSuspendNextConfirmOrFence = false
+            debugConfirmOrFenceIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugConfirmOrFenceResumeWaiters.append(continuation)
+            }
+            debugConfirmOrFenceIsSuspended = false
+        }
+
+        private func debugSuspendConfirmOrFenceBeforeRevocationIfNeeded() async {
+            guard debugShouldSuspendNextConfirmOrFenceBeforeRevocation else { return }
+            debugShouldSuspendNextConfirmOrFenceBeforeRevocation = false
+            debugConfirmOrFenceBeforeRevocationIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugConfirmOrFenceBeforeRevocationResumeWaiters.append(continuation)
+            }
+            debugConfirmOrFenceBeforeRevocationIsSuspended = false
         }
 
         func debugPendingPolicyReplacementScheduleCount(
@@ -8683,7 +9367,8 @@ actor ServerNetworkManager {
                 connectionID: UUID,
                 connection: any MCPServerConnection,
                 clientName: String,
-                sessionToken: String
+                sessionToken: String,
+                bootstrapPeerPID: Int? = nil
             ) {
                 if !isRunningState {
                     lifecycleGeneration &+= 1
@@ -8692,6 +9377,9 @@ actor ServerNetworkManager {
                 debugExecutionWatchdogAbortTargets[connectionID] = connection
                 connections[connectionID] = connection
                 connectionLifecycleGenerationByID[connectionID] = lifecycleGeneration
+                if let bootstrapPeerPID {
+                    bootstrapPeerPIDByConnectionID[connectionID] = bootstrapPeerPID
+                }
                 pendingConnections[connectionID] = clientName
                 bindSessionToken(sessionToken, to: connectionID)
                 if callLimiters[connectionID] == nil {
@@ -8703,6 +9391,10 @@ actor ServerNetworkManager {
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                     )
                 }
+            }
+
+            func debugSetTerminalRecordDirectoryURLForTesting(_ directoryURL: URL?) {
+                debugTerminalRecordDirectoryURLForTesting = directoryURL
             }
 
             func debugSetToolExecutionWatchdogEnvironment(_ environment: MCPToolExecutionWatchdogEnvironment) {
@@ -8738,6 +9430,16 @@ actor ServerNetworkManager {
 
             func debugIsExecutionWatchdogTerminal(connectionID: UUID) -> Bool {
                 executionWatchdogTerminalConnections.contains(connectionID)
+            }
+
+            func debugCodeStructureSettlementSnapshot(
+                windowID: Int
+            ) -> MCPCodeStructureSettlementRegistry.Snapshot {
+                codeStructureSettlementRegistry.snapshot(windowID: windowID)
+            }
+
+            func debugAwaitCodeStructureSettlementDrain(windowID: Int) async {
+                await codeStructureSettlementRegistry.awaitDrained(windowID: windowID)
             }
         #endif
 
@@ -8929,6 +9631,17 @@ actor ServerNetworkManager {
         func debugClearActiveToolOwner(windowID: Int) {
             removeActiveToolScopesForWindow(windowID)
         }
+
+        func debugPublishTransportTerminalForTesting(connectionID: UUID) {
+            persistAcceptedSocketTerminalRecord(
+                connectionID: connectionID,
+                context: MCPConnectionCloseContext(reason: "test_transport_terminal", initiator: .peer)
+            )
+        }
+
+        func debugIsTransportTerminalForTesting(connectionID: UUID) -> Bool {
+            transportTerminalConnections.contains(connectionID)
+        }
     #endif
 
     func clearClientConnectionPolicy(
@@ -9066,14 +9779,33 @@ actor ServerNetworkManager {
         stage: String,
         message: String
     ) async {
-        guard supportsControlNotifications(connectionID: connectionID) else { return }
+        let standardProgressState = Self.currentConnectionID == connectionID
+            ? Self.currentProgressState
+            : nil
+        let supportsRepoPromptControl = supportsControlNotifications(connectionID: connectionID)
+        guard standardProgressState != nil || supportsRepoPromptControl else { return }
         #if DEBUG
             let clientName = clientIdentifier(forConnection: connectionID) ?? "unknown"
             connectionLog("progress client=\(clientName) connection=\(connectionID) tool=\(tool) kind=\(kind.rawValue) stage=\(stage) message=\(message)")
         #endif
-        if let mgr = connections[connectionID] {
+        guard let mgr = connections[connectionID] else { return }
+        if let standardProgressState {
+            await standardProgressState.send(
+                through: mgr,
+                message: "\(tool) [\(stage)]: \(message)"
+            )
+        } else if supportsRepoPromptControl {
             await mgr.sendProgress(tool: tool, kind: kind, stage: stage, message: message)
         }
+    }
+
+    /// Returns true when the current request can observe either standard MCP
+    /// progress or the RepoPrompt CLI compatibility notification.
+    func supportsProgressNotifications(connectionID: UUID) -> Bool {
+        if Self.currentConnectionID == connectionID, Self.currentProgressState != nil {
+            return true
+        }
+        return supportsControlNotifications(connectionID: connectionID)
     }
 
     /// RepoPrompt control notifications are only supported by the bundled CLI.
@@ -9087,7 +9819,9 @@ actor ServerNetworkManager {
         let now = Date()
         for key in keys {
             guard var queue = pendingPoliciesByClient[key], !queue.isEmpty else { continue }
-            queue.removeAll { now.timeIntervalSince($0.createdAt) > $0.ttl }
+            queue.removeAll {
+                !$0.prunesOnlyAfterSettlement && now.timeIntervalSince($0.createdAt) > $0.ttl
+            }
             if queue.isEmpty {
                 pendingPoliciesByClient.removeValue(forKey: key)
             } else {
@@ -9511,6 +10245,31 @@ actor ServerNetworkManager {
             return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
         }
 
+        // This is the authoritative child-observation boundary: the connection has
+        // matched and reserved the exact run-owned name/PID policy and passed existing
+        // run-affinity checks, but run-route installation has not started. Observation
+        // remains sticky if a later route installation is rolled back.
+        if requireRunRouting, let runID = policy.runID {
+            #if DEBUG
+                await debugSuspendPendingPolicyObservationIfNeeded()
+            #endif
+            let wasFirstObservation = await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+            #if DEBUG
+                if wasFirstObservation {
+                    debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "connection_observed",
+                        connectionID: connectionID,
+                        fields: [
+                            "client_name": clientName,
+                            "window_id": String(policy.windowID),
+                            "one_shot": String(policy.oneShot)
+                        ]
+                    )
+                }
+            #endif
+        }
+
         let restorePoint = PendingPolicyRestorePoint(
             restrictedTools: restrictedToolsByConnection[connectionID],
             additionalTools: additionalToolsByConnection[connectionID],
@@ -9524,6 +10283,9 @@ actor ServerNetworkManager {
             runWindowID: policy.runID.flatMap { windowIDByRunID[$0] }
         )
         let pendingPolicyApplicationID = UUID()
+        let routingAuthorityGeneration = policy.runID.map {
+            runRoutingAuthorityGenerationByRunID[$0, default: 0]
+        }
         pendingPolicyApplicationIDByConnectionID[connectionID] = pendingPolicyApplicationID
         if let runID = policy.runID {
             pendingPolicyApplicationIDByRunID[runID] = pendingPolicyApplicationID
@@ -9555,7 +10317,8 @@ actor ServerNetworkManager {
         guard isPendingPolicyApplicationOwner(
             pendingPolicyApplicationID,
             connectionID: connectionID,
-            runID: policy.runID
+            runID: policy.runID,
+            routingAuthorityGeneration: routingAuthorityGeneration
         ),
             isPendingPolicyApplicationCurrent(
                 connectionID: connectionID,
@@ -9653,7 +10416,8 @@ actor ServerNetworkManager {
                   isPendingPolicyApplicationOwner(
                       pendingPolicyApplicationID,
                       connectionID: connectionID,
-                      runID: policy.runID
+                      runID: policy.runID,
+                      routingAuthorityGeneration: routingAuthorityGeneration
                   ),
                   isPendingPolicyApplicationCurrent(
                       connectionID: connectionID,
@@ -9780,10 +10544,18 @@ actor ServerNetworkManager {
     private func isPendingPolicyApplicationOwner(
         _ applicationID: UUID,
         connectionID: UUID,
-        runID: UUID?
+        runID: UUID?,
+        routingAuthorityGeneration: UInt64? = nil
     ) -> Bool {
         guard pendingPolicyApplicationIDByConnectionID[connectionID] == applicationID else { return false }
-        return runID.map { pendingPolicyApplicationIDByRunID[$0] == applicationID } ?? true
+        guard let runID else { return true }
+        guard pendingPolicyApplicationIDByRunID[runID] == applicationID else { return false }
+        if let routingAuthorityGeneration {
+            guard runRoutingAuthorityGenerationByRunID[runID] == routingAuthorityGeneration,
+                  revocationFenceGenerationByRunID[runID] != routingAuthorityGeneration
+            else { return false }
+        }
+        return true
     }
 
     private func isPendingPolicyApplicationCurrent(
@@ -10389,6 +11161,20 @@ actor ServerNetworkManager {
                 EditFlowPerf.Dimensions(toolName: toolName)
             )
             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.total, totalState) }
+            // Release-safe bounded concurrency evidence (counts/latency aggregates only;
+            // never arguments, paths, or result bodies). No admission behavior change.
+            let evidenceClock = ContinuousClock()
+            let evidenceArrival = evidenceClock.now
+            let evidenceClass = MCPToolConcurrencyEvidenceClass(
+                admissionClass: MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName)
+            )
+            defer {
+                MCPToolConcurrencyEvidenceRecorder.shared.recordCallCompleted(
+                    classKey: evidenceClass,
+                    canonicalToolName: toolName,
+                    totalMilliseconds: evidenceArrival.duration(to: evidenceClock.now).mcpMilliseconds
+                )
+            }
             let preLimiterEnvelopeState = EditFlowPerf.begin(
                 EditFlowPerf.Stage.MCPToolCall.preLimiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
@@ -10432,8 +11218,8 @@ actor ServerNetworkManager {
             // Do not repeat it on each tools/call; it can re-enter routing notifications
             // while the call is waiting for a response.
 
-            var dispatchTabContextHint: MCPServerViewModel.TabContextHint? = nil
-            var preResolvedWindowID: Int? = nil
+            var dispatchTabContextHint: MCPServerViewModel.TabContextHint?
+            var preResolvedWindowID: Int?
             do {
                 let logicalContextState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPToolCall.logicalContextResolution,
@@ -10579,6 +11365,13 @@ actor ServerNetworkManager {
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
+            let capturedProgressState = params._meta?.progressToken.map {
+                MCPRequestProgressState(token: $0)
+            }
+            func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
+                await capturedProgressState?.invalidate()
+                return result
+            }
 
             // Snapshot routing state before entering the per-connection limiter.
             // Keep the snapshot local to this call so app-wide tools do not share
@@ -10609,10 +11402,16 @@ actor ServerNetworkManager {
             // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
             // enforced below by explicit window/app/repository resource ownership.
             guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
-                return Self.executionContractToolErrorResult(
-                    rawJSON: capturedRawJSON,
-                    code: "tool_execution_admission_unclassified",
-                    message: "No static admission classification exists for tool '\(toolName)'."
+                MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                    classKey: .unclassified,
+                    reason: .unclassifiedTool
+                )
+                return await finalizeToolResult(
+                    Self.executionContractToolErrorResult(
+                        rawJSON: capturedRawJSON,
+                        code: "tool_execution_admission_unclassified",
+                        message: "No static admission classification exists for tool '\(toolName)'."
+                    )
                 )
             }
             let callLane = admissionClass.connectionLane
@@ -10626,14 +11425,18 @@ actor ServerNetworkManager {
             endPreLimiterEnvelopeIfNeeded()
             guard let limiterResolution else {
                 connectionLog("tools/call \(toolName): rejected because connection limiter is unavailable")
-                return Self.executionContractToolErrorResult(
-                    rawJSON: capturedRawJSON,
-                    code: "tool_execution_connection_terminal",
-                    message: "The MCP connection is closing."
+                return await finalizeToolResult(
+                    Self.executionContractToolErrorResult(
+                        rawJSON: capturedRawJSON,
+                        code: "tool_execution_connection_terminal",
+                        message: "The MCP connection is closing."
+                    )
                 )
             }
             connectionLog("tools/call \(toolName): entering limiter lane=\(callLane.rawValue)")
-            return await EditFlowPerf.measure(
+            let evidenceLaneWaitStart = evidenceClock.now
+            MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitBegan(classKey: evidenceClass)
+            let result = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
@@ -10654,13 +11457,23 @@ actor ServerNetworkManager {
                     toolName: toolName,
                     lifecycleCorrelation: lifecycleCorrelation,
                     cancellationResult: {
-                        Self.executionContractToolErrorResult(
+                        MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitAbandoned(classKey: evidenceClass)
+                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                            classKey: evidenceClass,
+                            reason: .laneWaitCancelled
+                        )
+                        return Self.executionContractToolErrorResult(
                             rawJSON: capturedRawJSON,
                             code: "tool_execution_connection_terminal",
                             message: "The MCP connection is closing."
                         )
                     }
                 ) {
+                    MCPToolConcurrencyEvidenceRecorder.shared.recordLaneAdmitted(
+                        classKey: evidenceClass,
+                        waitMilliseconds: evidenceLaneWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                    )
+                    defer { MCPToolConcurrencyEvidenceRecorder.shared.recordLanePermitReleased(classKey: evidenceClass) }
                     guard !Task.isCancelled,
                           await !(self.executionWatchdogTerminalConnections.contains(connectionID))
                     else {
@@ -10681,7 +11494,11 @@ actor ServerNetworkManager {
                         EditFlowPerf.Dimensions(toolName: toolName)
                     ) {
                         // Wrap entire call so inner services can query current routing hints.
-                        await Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation) {
+                        await Self.withConnectionID(
+                            connectionID,
+                            lifecycleCorrelation: lifecycleCorrelation,
+                            progressState: capturedProgressState
+                        ) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
@@ -10817,7 +11634,10 @@ actor ServerNetworkManager {
                                     } else {
                                         connectedDuringSingleWindow = windowCount == 1
                                     }
-                                    if !bypassWindowRouting && chosenID == nil && (!multiWindowModeEffective || connectedDuringSingleWindow) {
+                                    let shouldAutoRouteToActiveWindow = !bypassWindowRouting
+                                        && chosenID == nil
+                                        && (!multiWindowModeEffective || connectedDuringSingleWindow)
+                                    if shouldAutoRouteToActiveWindow {
                                         // Find the window with active MCP tools
                                         let activeWindowID = await WindowStatesManager.shared.firstMCPEnabledWindow()?.windowID
                                         if let activeID = activeWindowID {
@@ -10874,8 +11694,17 @@ actor ServerNetworkManager {
                                         )
                                     }
                                     do {
+                                        let evidenceLeaseWaitStart = evidenceClock.now
                                         mutationAdmissionLease = try await self.mutationAdmissionController.acquire(mutationResource)
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
+                                            classKey: evidenceClass,
+                                            milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                                        )
                                     } catch {
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                                            classKey: evidenceClass,
+                                            reason: .leaseWaitTermination(for: error)
+                                        )
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_connection_terminal",
@@ -10897,8 +11726,17 @@ actor ServerNetworkManager {
                                         )
                                     }
                                     do {
+                                        let evidenceLeaseWaitStart = evidenceClock.now
                                         smallReadAdmissionLease = try await self.smallReadAdmissionController.acquire(.window(chosenID))
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
+                                            classKey: evidenceClass,
+                                            milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                                        )
                                     } catch {
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                                            classKey: evidenceClass,
+                                            reason: .leaseWaitTermination(for: error)
+                                        )
                                         return Self.executionContractToolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             code: "tool_execution_connection_terminal",
@@ -11110,10 +11948,10 @@ actor ServerNetworkManager {
                                     arguments: capturedArguments
                                 )
                                 let executionWatchdogEnvironment = await self.toolExecutionWatchdogEnvironment
-                                let executionTraceOrigin = await executionWatchdogEnvironment.now()
+                                let executionTraceOrigin = executionWatchdogEnvironment.now()
                                 let handlerPhaseRecorder = MCPToolExecutionHandlerPhaseRecorder(
                                     origin: executionTraceOrigin,
-                                    now: { await executionWatchdogEnvironment.now() }
+                                    now: { executionWatchdogEnvironment.now() }
                                 )
 
                                 @Sendable func dispatchResolvedProvider(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
@@ -11137,14 +11975,48 @@ actor ServerNetworkManager {
                                         throw MCPToolExecutionDispatchError.missingContract(toolName: toolName)
                                     }
 
+                                    let settlementAdmission: (
+                                        cleanupDisposition: MCPToolExecutionCleanupDisposition?,
+                                        slot: MCPCodeStructureSettlementRegistry.Slot?
+                                    )
+                                    if contract.cleanupDisposition == .detachAndSettle,
+                                       toolName != MCPWindowToolName.fileActions
+                                    {
+                                        guard let windowID = Self.currentToolDispatchAuthorization?.windowIdentity?.windowID else {
+                                            throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
+                                        }
+                                        switch self.codeStructureSettlementRegistry.admit(
+                                            windowID: windowID,
+                                            connectionID: connectionID,
+                                            invocationID: invocationID
+                                        ) {
+                                        case let .admitted(slot):
+                                            settlementAdmission = (.detachAndSettle, slot)
+                                        case let .busy(reason):
+                                            throw MCPToolExecutionDispatchError.structureSettlementBusy(
+                                                windowID: windowID,
+                                                reason: reason
+                                            )
+                                        }
+                                    } else {
+                                        settlementAdmission = (contract.cleanupDisposition, nil)
+                                    }
+
+                                    defer {
+                                        _ = settlementAdmission.slot?.closeBeforeExecutionExit()
+                                    }
+
                                     @Sendable func emitExecutionTrace(
                                         _ phase: MCPToolExecutionTraceEvent.Phase,
+                                        resolvedCleanupDisposition: MCPToolExecutionCleanupDisposition? = nil,
                                         cancellationRequested: Bool? = nil,
                                         cancellationOutcome: String? = nil,
+                                        cancellationOrigin: MCPToolExecutionCancellationOrigin? = nil,
+                                        settlement: String? = nil,
                                         graceOutcome: String? = nil,
                                         escalationReason: String? = nil
                                     ) async {
-                                        let now = await executionWatchdogEnvironment.now()
+                                        let now = executionWatchdogEnvironment.now()
                                         let handlerPhase = handlerPhaseRecorder.snapshot()
                                         let handlerPhaseAgeMilliseconds = handlerPhase.map {
                                             max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)
@@ -11157,10 +12029,13 @@ actor ServerNetworkManager {
                                             contractKind: contract.kind,
                                             executionDeadlineSeconds: contract.deadline?.mcpSeconds,
                                             cleanupGraceSeconds: contract.cancellationGrace?.mcpSeconds,
+                                            cleanupDisposition: resolvedCleanupDisposition ?? settlementAdmission.cleanupDisposition,
                                             phase: phase,
                                             elapsedMilliseconds: max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             cancellationRequested: cancellationRequested,
                                             cancellationOutcome: cancellationOutcome,
+                                            cancellationOrigin: cancellationOrigin,
+                                            settlement: settlement,
                                             graceOutcome: graceOutcome,
                                             escalationReason: escalationReason,
                                             handlerPhase: handlerPhase,
@@ -11191,114 +12066,186 @@ actor ServerNetworkManager {
                                     )
 
                                     let tracedOperation: @Sendable () async throws -> Value = {
-                                        do {
-                                            guard await self.isCurrentConnectionCallLimiterResolution(
-                                                limiterResolution,
-                                                connectionID: connectionID
-                                            ) else {
+                                        guard await self.isCurrentConnectionCallLimiterResolution(
+                                            limiterResolution,
+                                            connectionID: connectionID
+                                        ) else {
+                                            throw ToolDispatchAdmissionError.connectionTerminal
+                                        }
+                                        if let authorization = Self.currentToolDispatchAuthorization {
+                                            guard await self.isCurrentToolDispatchAuthorization(authorization) else {
                                                 throw ToolDispatchAdmissionError.connectionTerminal
                                             }
-                                            if let authorization = Self.currentToolDispatchAuthorization {
-                                                guard await self.isCurrentToolDispatchAuthorization(authorization) else {
-                                                    throw ToolDispatchAdmissionError.connectionTerminal
-                                                }
-                                                if let windowIdentity = authorization.windowIdentity,
-                                                   await !(self.isCurrentWindowToolDispatchIdentity(windowIdentity))
-                                                {
-                                                    throw ToolDispatchAdmissionError.windowTerminal
-                                                }
+                                            if let windowIdentity = authorization.windowIdentity,
+                                               await !(self.isCurrentWindowToolDispatchIdentity(windowIdentity))
+                                            {
+                                                throw ToolDispatchAdmissionError.windowTerminal
                                             }
-                                            let value = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
-                                                try await EditFlowPerf.measure(
-                                                    EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                                    EditFlowPerf.Dimensions(toolName: toolName),
-                                                    operation: operation
-                                                )
-                                            }
-                                            await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
-                                            EditFlowPerf.lifecycleEvent(
-                                                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
-                                                correlation: lifecycleCorrelation,
-                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
+                                        }
+                                        return try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
+                                            try await EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                EditFlowPerf.Dimensions(toolName: toolName),
+                                                operation: operation
                                             )
-                                            EditFlowPerf.lifecycleEvent(
-                                                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
-                                                correlation: lifecycleCorrelation,
-                                                EditFlowPerf.Dimensions(
-                                                    toolName: toolName,
-                                                    outcome: "provider_completed",
-                                                    windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
-                                                    runID: observerRunIDForCallbacksFinal?.uuidString,
-                                                    providerActive: false,
-                                                    networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
-                                                    permitActive: true,
-                                                    publicationPending: true,
-                                                    terminalBarrier: false
-                                                )
-                                            )
-                                            return value
-                                        } catch {
-                                            let outcome = MCPToolExecutionCancelledError.matches(error) ? "cancelled" : "error"
-                                            await emitExecutionTrace(.handlerCompleted, cancellationOutcome: outcome)
-                                            EditFlowPerf.lifecycleEvent(
-                                                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
-                                                correlation: lifecycleCorrelation,
-                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
-                                            )
-                                            EditFlowPerf.lifecycleEvent(
-                                                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
-                                                correlation: lifecycleCorrelation,
-                                                EditFlowPerf.Dimensions(
-                                                    toolName: toolName,
-                                                    outcome: outcome,
-                                                    windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
-                                                    runID: observerRunIDForCallbacksFinal?.uuidString,
-                                                    providerActive: false,
-                                                    networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
-                                                    permitActive: true,
-                                                    publicationPending: true,
-                                                    terminalBarrier: false
-                                                )
-                                            )
-                                            throw error
                                         }
                                     }
 
+                                    @Sendable func recordSynchronousSettlement(
+                                        _ providerSettlement: MCPToolExecutionSettlement
+                                    ) async {
+                                        let outcome = providerSettlement.rawValue
+                                        await emitExecutionTrace(.handlerCompleted, cancellationOutcome: outcome)
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
+                                        )
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: providerSettlement == .success ? "provider_completed" : outcome,
+                                                windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
+                                                runID: observerRunIDForCallbacksFinal?.uuidString,
+                                                providerActive: false,
+                                                networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                                permitActive: true,
+                                                publicationPending: true,
+                                                terminalBarrier: false
+                                            )
+                                        )
+                                    }
+
+                                    @Sendable func recordDetachedSettlement(
+                                        _ providerSettlement: MCPToolExecutionSettlement
+                                    ) async {
+                                        await emitExecutionTrace(
+                                            .detachedSettled,
+                                            cancellationRequested: true,
+                                            cancellationOutcome: providerSettlement.rawValue,
+                                            cancellationOrigin: .watchdogDeadline,
+                                            settlement: "detached",
+                                            graceOutcome: "expired"
+                                        )
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: "detached_settled_\(providerSettlement.rawValue)"
+                                            )
+                                        )
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: "detached_settled",
+                                                windowID: settlementAdmission.slot?.windowID,
+                                                runID: observerRunIDForCallbacksFinal?.uuidString,
+                                                providerActive: false,
+                                                networkScopeActive: false,
+                                                permitActive: false,
+                                                publicationPending: false,
+                                                terminalBarrier: false
+                                            )
+                                        )
+                                    }
+
+                                    @Sendable func recordAbandonedSettlement(
+                                        _ providerSettlement: MCPToolExecutionSettlement
+                                    ) async {
+                                        await emitExecutionTrace(
+                                            .handlerCompleted,
+                                            cancellationRequested: true,
+                                            cancellationOutcome: providerSettlement.rawValue,
+                                            cancellationOrigin: .requestCancellation
+                                        )
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: "request_cancelled_settled_\(providerSettlement.rawValue)"
+                                            )
+                                        )
+                                    }
+
+                                    @Sendable func recordForceDisconnectedSettlement(
+                                        _ providerSettlement: MCPToolExecutionSettlement
+                                    ) async {
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: "force_disconnected_settled_\(providerSettlement.rawValue)"
+                                            )
+                                        )
+                                    }
+
                                     switch contract {
-                                    case let .bounded(deadline, cancellationGrace):
+                                    case let .bounded(deadline, cancellationGrace, _):
                                         do {
                                             return try await MCPToolExecutionWatchdog.execute(
                                                 deadline: deadline,
                                                 cancellationGrace: cancellationGrace,
+                                                cleanupDisposition: settlementAdmission.cleanupDisposition ?? .forceDisconnect,
+                                                settlementSlot: settlementAdmission.slot,
                                                 environment: executionWatchdogEnvironment,
                                                 onEvent: { event in
                                                     switch event {
                                                     case .deadlineExpired:
                                                         await emitExecutionTrace(.deadlineExpired)
-                                                    case .cancellationRequested:
-                                                        await emitExecutionTrace(.cancellationRequested, cancellationRequested: true)
-                                                    case let .settledDuringGrace(settlement):
+                                                    case let .cancellationRequested(origin):
+                                                        await emitExecutionTrace(
+                                                            .cancellationRequested,
+                                                            cancellationRequested: true,
+                                                            cancellationOrigin: origin
+                                                        )
+                                                    case let .settledDuringGrace(settlement, cancellationRequested):
                                                         await emitExecutionTrace(
                                                             .settledDuringGrace,
-                                                            cancellationRequested: true,
+                                                            cancellationRequested: cancellationRequested,
                                                             cancellationOutcome: settlement.rawValue,
-                                                            graceOutcome: "settled"
+                                                            cancellationOrigin: cancellationRequested ? .watchdogDeadline : nil,
+                                                            graceOutcome: cancellationRequested ? "settled" : "late_completion"
                                                         )
-                                                    case .cleanupGraceExpired:
+                                                    case let .cleanupGraceExpired(resolvedDisposition):
                                                         await emitExecutionTrace(
                                                             .cleanupGraceExpired,
+                                                            resolvedCleanupDisposition: resolvedDisposition,
                                                             cancellationRequested: true,
+                                                            cancellationOrigin: .watchdogDeadline,
                                                             graceOutcome: "expired",
                                                             escalationReason: "handler_ignored_cancellation"
                                                         )
+                                                    case .detachedForSettlement:
+                                                        await emitExecutionTrace(
+                                                            .detachedForSettlement,
+                                                            resolvedCleanupDisposition: .detachAndSettle,
+                                                            cancellationRequested: true,
+                                                            cancellationOrigin: .watchdogDeadline,
+                                                            settlement: "detached",
+                                                            graceOutcome: "expired",
+                                                            escalationReason: "detach_disposition_handler_ignored_cancellation"
+                                                        )
                                                     }
                                                 },
+                                                onSynchronousSettlement: recordSynchronousSettlement,
+                                                onDetachedSettlement: recordDetachedSettlement,
+                                                onAbandonedSettlement: recordAbandonedSettlement,
+                                                onForceDisconnectedSettlement: recordForceDisconnectedSettlement,
                                                 operation: tracedOperation
                                             )
                                         } catch MCPToolExecutionWatchdogError.cleanupUnresponsive {
                                             await emitExecutionTrace(
                                                 .connectionForceDisconnectRequested,
+                                                resolvedCleanupDisposition: .forceDisconnect,
                                                 cancellationRequested: true,
+                                                cancellationOrigin: .watchdogDeadline,
                                                 graceOutcome: "expired",
                                                 escalationReason: "handler_ignored_cancellation"
                                             )
@@ -11308,7 +12255,17 @@ actor ServerNetworkManager {
                                          .lifecycleManagedCancellable,
                                          .interactiveCancellable,
                                          .workspaceLifecycleCancellable:
-                                        return try await tracedOperation()
+                                        do {
+                                            let value = try await tracedOperation()
+                                            await recordSynchronousSettlement(.success)
+                                            return value
+                                        } catch {
+                                            let providerSettlement: MCPToolExecutionSettlement = MCPToolExecutionCancelledError.matches(error)
+                                                ? .cancellation
+                                                : .error
+                                            await recordSynchronousSettlement(providerSettlement)
+                                            throw error
+                                        }
                                     }
                                 }
 
@@ -11351,6 +12308,7 @@ actor ServerNetworkManager {
                                     let message: String
                                     let outcome: String
                                     let shouldForceDisconnect: Bool
+                                    let errorMetadata: [String: Value]
                                     let selectedDeadlineDescription: String = {
                                         guard let seconds = selectedExecutionContract?.deadline?.mcpSeconds else {
                                             return "declared"
@@ -11367,36 +12325,89 @@ actor ServerNetworkManager {
                                         message = "The MCP connection is closing."
                                         outcome = "connectionTerminal"
                                         shouldForceDisconnect = false
+                                        errorMetadata = [:]
                                     case ToolDispatchAdmissionError.windowTerminal:
                                         code = "tool_execution_window_terminal"
                                         message = "The selected window is closing or no longer owns this tool catalog."
                                         outcome = "windowTerminal"
                                         shouldForceDisconnect = false
+                                        errorMetadata = [:]
                                     case let MCPToolExecutionDispatchError.missingContract(missingToolName):
                                         code = "tool_execution_contract_missing"
                                         message = "No declared execution contract exists for MCP tool '\(missingToolName)'."
                                         outcome = "executionContractMissing"
                                         shouldForceDisconnect = false
+                                        errorMetadata = [:]
+                                    case let MCPToolExecutionDispatchError.structureSettlementBusy(windowID, reason):
+                                        code = "tool_execution_structure_settlement_busy"
+                                        let abandoned = reason == .abandoned
+                                        message = abandoned
+                                            ? "A prior canceled MCP operation for window \(windowID) is still settling. Retry after it drains."
+                                            : "A prior timed-out MCP operation for window \(windowID) is still settling. Retry after it drains."
+                                        outcome = "executionStructureSettlementBusy"
+                                        shouldForceDisconnect = false
+                                        errorMetadata = [
+                                            "retryable": .bool(true),
+                                            "retry_after_ms": .int(250),
+                                            "busy_reason": .string(
+                                                abandoned
+                                                    ? "abandoned_settlement_in_progress"
+                                                    : "detached_settlement_in_progress"
+                                            ),
+                                            "settlement": .string("busy")
+                                        ]
+                                    case MCPToolExecutionDispatchError.structureSettlementWindowUnresolved:
+                                        code = "tool_execution_structure_settlement_window_unresolved"
+                                        message = "\(toolName) requires a resolved window before its settlement policy can be selected."
+                                        outcome = "executionStructureSettlementWindowUnresolved"
+                                        shouldForceDisconnect = false
+                                        errorMetadata = ["retryable": .bool(false)]
                                     case let MCPToolExecutionWatchdogError.executionTimedOut(settlement):
                                         code = "tool_execution_timeout"
                                         message = "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract and settled as \(settlement.rawValue) during cancellation grace."
                                         outcome = "executionTimeout"
                                         shouldForceDisconnect = false
+                                        errorMetadata = [
+                                            "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
+                                            "settlement": .string(settlement.rawValue)
+                                        ]
+                                    case MCPToolExecutionWatchdogError.executionDetached:
+                                        let mutationOutcomeMayStillReconcile = toolName == MCPWindowToolName.fileActions
+                                        code = "tool_execution_timeout"
+                                        message = mutationOutcomeMayStillReconcile
+                                            ? "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the mutation provider during grace, so it was detached for eventual reconciliation. Inspect the filesystem before issuing another mutation."
+                                            : "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
+                                        outcome = "executionDetached"
+                                        shouldForceDisconnect = false
+                                        errorMetadata = [
+                                            "retryable": .bool(!mutationOutcomeMayStillReconcile),
+                                            "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
+                                            "settlement": .string("detached")
+                                        ]
                                     case MCPToolExecutionWatchdogError.cleanupUnresponsive:
                                         code = "tool_execution_cleanup_unresponsive"
                                         message = "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract and did not stop during cancellation grace. The MCP connection was force-disconnected."
                                         outcome = "executionCleanupUnresponsive"
                                         shouldForceDisconnect = true
+                                        errorMetadata = [
+                                            "retryable": .bool(false),
+                                            "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
+                                            "settlement": .string("force_disconnect")
+                                        ]
                                     default:
                                         return nil
                                     }
 
                                     log.error("MCP execution contract failure tool=\(toolName) context=\(context) code=\(code)")
-                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object([
+                                    var errorJSONObject: [String: Value] = [
                                         "code": .string(code),
                                         "error": .string(message),
                                         "tool": .string(toolName)
-                                    ]))
+                                    ]
+                                    for (key, value) in errorMetadata {
+                                        errorJSONObject[key] = value
+                                    }
+                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object(errorJSONObject))
                                     if let runID = await self.toolTrackingRunIDForCompletion(
                                         callTimeRunID: observerRunIDForCallbacksFinal,
                                         connectionID: connectionID,
@@ -11417,10 +12428,11 @@ actor ServerNetworkManager {
                                     let result = Self.executionContractToolErrorResult(
                                         rawJSON: capturedRawJSON,
                                         code: code,
-                                        message: message
+                                        message: message,
+                                        metadata: errorMetadata
                                     )
                                     if shouldForceDisconnect {
-                                        let abortNow = await executionWatchdogEnvironment.now()
+                                        let abortNow = executionWatchdogEnvironment.now()
                                         let handlerPhase = handlerPhaseRecorder.snapshot()
                                         let handlerPhaseAgeMilliseconds = handlerPhase.map {
                                             max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds - $0.elapsedMilliseconds)
@@ -11431,7 +12443,9 @@ actor ServerNetworkManager {
                                             invocationID: invocationID,
                                             elapsedMilliseconds: max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             handlerPhase: handlerPhase,
-                                            handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds
+                                            handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds,
+                                            executionDeadlineMilliseconds: selectedExecutionContract?.deadline?.mcpMilliseconds,
+                                            cleanupGraceMilliseconds: selectedExecutionContract?.cancellationGrace?.mcpMilliseconds
                                         )
                                         // The transport is already severed. Deliberately skip handlerResult so
                                         // execution-completion tracing cannot be mistaken for response delivery.
@@ -11550,6 +12564,12 @@ actor ServerNetworkManager {
                                             resolution: limiterResolution,
                                             windowIdentity: windowDispatchIdentity
                                         )
+                                        let explicitWindowRoutingHint = Self.explicitWindowRoutingHint(
+                                            connectionID: connectionID,
+                                            toolName: toolName,
+                                            explicitWindowID: capturedWindowID,
+                                            authorization: dispatchAuthorization
+                                        )
                                         do {
                                             return try await self.withWindowToolOwnership(
                                                 windowID: ownershipWindowID,
@@ -11560,11 +12580,13 @@ actor ServerNetworkManager {
                                                 recordScope: shouldTrackToolOwnership
                                             ) {
                                                 try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
-                                                    let value = try await EditFlowPerf.measure(
-                                                        EditFlowPerf.Stage.MCPToolCall.dispatch,
-                                                        EditFlowPerf.Dimensions(toolName: toolName)
-                                                    ) {
-                                                        try await dispatchResolvedProvider(resolvedOperation)
+                                                    let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
+                                                        try await EditFlowPerf.measure(
+                                                            EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                                            EditFlowPerf.Dimensions(toolName: toolName)
+                                                        ) {
+                                                            try await dispatchResolvedProvider(resolvedOperation)
+                                                        }
                                                     }
                                                     releaseResourceAdmissionLeases(outcome: "provider_success")
                                                     let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -11861,6 +12883,7 @@ actor ServerNetworkManager {
                     } // PermitBodyEnvelope wrapper
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
+            return await finalizeToolResult(result)
         }
     }
 
@@ -11910,7 +12933,7 @@ actor ServerNetworkManager {
             let pendingName = pendingConnections[id]
             let clientName = admittedName ?? pendingName ?? "Connecting..."
 
-            if admittedName == nil && pendingName == nil {
+            if admittedName == nil, pendingName == nil {
                 log.warning("Dashboard: Connection \(id) has no client name (admitted=nil, pending=nil)")
             }
 

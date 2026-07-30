@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 
@@ -13,7 +13,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let ownership = session.beginRunAttempt(source: "test")
         var capturedRecord: ContextBuilderRunRecord?
 
-        let waiter = Task<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error> { @MainActor in
+        let waiter = Task<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error> { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
                 capturedRecord = ContextBuilderRunRecord(
                     runID: UUID(),
@@ -30,10 +30,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
         await Task.yield()
         let record = try XCTUnwrap(capturedRecord)
-        XCTAssertTrue(record.canAcceptCancellation)
+        XCTAssertEqual(record.cancellationState, .none)
         XCTAssertTrue(record.claimFinalContextCommit())
         XCTAssertTrue(record.finalContextCommitClaimed)
-        XCTAssertFalse(record.canAcceptCancellation)
+        XCTAssertEqual(record.cancellationState, .none)
         XCTAssertFalse(record.claimFinalContextCommit())
         XCTAssertTrue(record.claimTerminal(.completed))
         XCTAssertFalse(record.claimTerminal(.cancelled))
@@ -41,19 +41,326 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let continuation = try XCTUnwrap(record.takeContinuation())
         XCTAssertNil(record.takeContinuation())
         continuation.resume(
-            returning: ContextBuilderAgentViewModel.ContextBuilderRunSnapshot(
+            returning: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion(
                 runID: record.runID,
                 tabID: tabID,
-                finalState: nil,
-                runState: .completed,
+                identity: nil,
+                agentKind: nil,
+                modelRaw: nil,
+                terminalDisposition: .completed,
                 agentOutput: "done",
-                usedAgentOutputAsPrompt: false
+                usedAgentOutputAsPrompt: false,
+                committedTab: nil
             )
         )
 
         let snapshot = try await waiter.value
         XCTAssertEqual(snapshot.runID, record.runID)
         XCTAssertEqual(snapshot.agentOutput, "done")
+    }
+
+    func testRouteSettlementCoordinatorClaimsFirstSettlement() async {
+        let routeFirst = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 5,
+            maxBufferedEventCount: 5
+        )
+        XCTAssertTrue(routeFirst.settle(.routed))
+        XCTAssertFalse(routeFirst.settle(.failedWithoutRoute("provider failed")))
+        let routeFirstSettlement = await routeFirst.waitForSettlement()
+        XCTAssertEqual(routeFirstSettlement, .routed)
+
+        let terminalFirst = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 5,
+            maxBufferedEventCount: 5
+        )
+        XCTAssertTrue(terminalFirst.settle(.failedWithoutRoute("provider failed")))
+        XCTAssertFalse(terminalFirst.settle(.routed))
+        let terminalFirstSettlement = await terminalFirst.waitForSettlement()
+        XCTAssertEqual(terminalFirstSettlement, .failedWithoutRoute("provider failed"))
+    }
+
+    func testRouteSettlementCoordinatorBoundsBufferedPayloadsAndEvents() {
+        let payloadBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 28,
+            maxBufferedEventCount: 10
+        )
+        payloadBounded.appendWhilePending(AIStreamResult(type: "content", text: "1234"))
+        payloadBounded.appendWhilePending(AIStreamResult(type: "lifecycle", text: "retrying"))
+        payloadBounded.appendWhilePending(AIStreamResult(type: "content", text: "6789"))
+        let payloadResult = payloadBounded.drainBufferedEvents()
+        XCTAssertEqual(payloadResult.events.map(\.type), ["lifecycle", "content"])
+        XCTAssertEqual(payloadResult.events.map(\.text), ["retrying", "6789"])
+        XCTAssertEqual(payloadResult.droppedTextCharacterCount, 11)
+        XCTAssertEqual(payloadResult.droppedNonterminalEventCount, 1)
+
+        let redundantProgressBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 100,
+            maxBufferedEventCount: 3
+        )
+        for index in 0 ..< 20 {
+            redundantProgressBounded.appendWhilePending(
+                AIStreamResult(type: "lifecycle", text: "retry-\(index)")
+            )
+            redundantProgressBounded.appendWhilePending(AIStreamResult(type: "content", text: ""))
+        }
+        redundantProgressBounded.appendWhilePending(AIStreamResult(type: "tool_call", text: "call"))
+        redundantProgressBounded.appendWhilePending(AIStreamResult(type: "error", text: "provider warning"))
+        redundantProgressBounded.appendWhilePending(AIStreamResult(type: "tool_result", text: "result"))
+        let redundantProgressResult = redundantProgressBounded.drainBufferedEvents()
+        XCTAssertEqual(redundantProgressResult.events.map(\.type), ["tool_call", "error", "tool_result"])
+        XCTAssertEqual(redundantProgressResult.droppedNonterminalEventCount, 40)
+
+        let protectedEventBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 1000,
+            maxBufferedEventCount: 3
+        )
+        let protectedEvents = [
+            AIStreamResult(type: "tool_call", text: "call-0"),
+            AIStreamResult(type: "error", text: "warning-1"),
+            AIStreamResult(type: "tool_result", text: "result-2"),
+            AIStreamResult(type: "tool_call", text: "call-3"),
+            AIStreamResult(type: "error", text: "warning-4")
+        ]
+        for event in protectedEvents {
+            protectedEventBounded.appendWhilePending(event)
+        }
+        let protectedEventResult = protectedEventBounded.drainBufferedEvents()
+        XCTAssertEqual(protectedEventResult.events.map(\.text), ["result-2", "call-3", "warning-4"])
+        XCTAssertEqual(protectedEventResult.droppedNonterminalEventCount, 2)
+        XCTAssertEqual(protectedEventResult.droppedTextCharacterCount, 29)
+
+        let oversizedPayloadBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 8,
+            maxBufferedEventCount: 3
+        )
+        oversizedPayloadBounded.appendWhilePending(
+            AIStreamResult(type: "tool_call", text: nil, toolArgs: String(repeating: "x", count: 20))
+        )
+        let oversizedPayloadResult = oversizedPayloadBounded.drainBufferedEvents()
+        XCTAssertTrue(oversizedPayloadResult.events.isEmpty)
+        XCTAssertEqual(oversizedPayloadResult.droppedTextCharacterCount, 29)
+        XCTAssertEqual(oversizedPayloadResult.droppedNonterminalEventCount, 1)
+
+        let oversizedType = String(repeating: "t", count: 20)
+        let zeroLimitTypeBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 0,
+            maxBufferedEventCount: 3
+        )
+        zeroLimitTypeBounded.appendWhilePending(AIStreamResult(type: oversizedType, text: nil))
+        let zeroLimitTypeResult = zeroLimitTypeBounded.drainBufferedEvents()
+        XCTAssertTrue(zeroLimitTypeResult.events.isEmpty)
+        XCTAssertEqual(zeroLimitTypeResult.droppedTextCharacterCount, oversizedType.count)
+        XCTAssertEqual(zeroLimitTypeResult.droppedNonterminalEventCount, 1)
+    }
+
+    func testCancellationDuringFinalCommitDefersUntilSafeBoundary() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        let record = makeRecord(
+            tabID: tabID,
+            session: session,
+            ownership: session.beginRunAttempt(source: "deferred-cancel")
+        )
+        let settlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .snapshot,
+            saveHistory: true
+        )
+
+        XCTAssertTrue(record.claimFinalContextCommit())
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .deferredUntilFinalContextCommitCompletes
+        )
+        XCTAssertEqual(record.cancellationState, .deferredUntilFinalContextCommitCompletes)
+        XCTAssertEqual(record.deferredCancellationSettlementPolicy, settlementPolicy)
+        XCTAssertTrue(record.hasDeferredCancellationPending)
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .alreadyRequested
+        )
+
+        XCTAssertEqual(record.consumeDeferredCancellationAtSafeBoundary(), settlementPolicy)
+        XCTAssertEqual(record.cancellationState, .applied)
+        XCTAssertNil(record.consumeDeferredCancellationAtSafeBoundary())
+        XCTAssertTrue(record.claimTerminal(.cancelled))
+        XCTAssertFalse(record.claimTerminal(.completed))
+    }
+
+    func testDeferredWorkspaceCancellationPreservesErrorPolicyAfterCommitBoundaryCheck() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        let record = makeRecord(
+            tabID: tabID,
+            session: session,
+            ownership: session.beginRunAttempt(source: "workspace-cancel")
+        )
+        let workspaceCancellationPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .cancellationError,
+            saveHistory: false
+        )
+
+        XCTAssertTrue(record.claimFinalContextCommit())
+        XCTAssertNil(record.consumeDeferredCancellationAtSafeBoundary())
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: workspaceCancellationPolicy),
+            .deferredUntilFinalContextCommitCompletes
+        )
+        XCTAssertEqual(
+            record.consumeDeferredCancellationAtSafeBoundary(),
+            workspaceCancellationPolicy
+        )
+        XCTAssertTrue(record.claimTerminal(.cancelled))
+        XCTAssertFalse(record.claimTerminal(.completed))
+    }
+
+    func testCancelCommitRaceResolvesExactlyOnceForEitherOrdering() {
+        let settlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .snapshot,
+            saveHistory: true
+        )
+        let cancelFirstTabID = UUID()
+        let cancelFirstSession = ContextBuilderAgentViewModel.TabSession(tabID: cancelFirstTabID)
+        let cancelFirst = makeRecord(
+            tabID: cancelFirstTabID,
+            session: cancelFirstSession,
+            ownership: cancelFirstSession.beginRunAttempt(source: "cancel-first")
+        )
+
+        XCTAssertEqual(
+            cancelFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .settleImmediately
+        )
+        XCTAssertFalse(cancelFirst.claimFinalContextCommit())
+        XCTAssertTrue(cancelFirst.claimTerminal(.cancelled))
+        XCTAssertFalse(cancelFirst.claimTerminal(.completed))
+        XCTAssertEqual(
+            cancelFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .terminal
+        )
+
+        let commitFirstTabID = UUID()
+        let commitFirstSession = ContextBuilderAgentViewModel.TabSession(tabID: commitFirstTabID)
+        let commitFirst = makeRecord(
+            tabID: commitFirstTabID,
+            session: commitFirstSession,
+            ownership: commitFirstSession.beginRunAttempt(source: "commit-first")
+        )
+
+        XCTAssertTrue(commitFirst.claimFinalContextCommit())
+        XCTAssertEqual(
+            commitFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .deferredUntilFinalContextCommitCompletes
+        )
+        XCTAssertEqual(
+            commitFirst.consumeDeferredCancellationAtSafeBoundary(),
+            settlementPolicy
+        )
+        XCTAssertTrue(commitFirst.claimTerminal(.cancelled))
+        XCTAssertFalse(commitFirst.claimTerminal(.completed))
+        XCTAssertEqual(
+            commitFirst.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .terminal
+        )
+    }
+
+    func testPreCommitCancellationRemainsImmediate() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        let record = makeRecord(
+            tabID: tabID,
+            session: session,
+            ownership: session.beginRunAttempt(source: "pre-commit-cancel")
+        )
+        let settlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
+            waiterResolution: .cancellationError,
+            saveHistory: false
+        )
+
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .settleImmediately
+        )
+        XCTAssertEqual(record.cancellationState, .requested)
+        XCTAssertNil(record.deferredCancellationSettlementPolicy)
+        XCTAssertFalse(record.hasDeferredCancellationPending)
+        XCTAssertFalse(record.claimFinalContextCommit())
+        XCTAssertTrue(record.claimTerminal(.cancelled))
+        XCTAssertEqual(
+            record.requestCancellation(deferredSettlementPolicy: settlementPolicy),
+            .terminal
+        )
+    }
+
+    func testTerminalCommitCapturesPromptFallbackBeforeContextCleanup() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        WindowStatesManager.shared.registerWindowState(window)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        await window.workspaceManager.awaitInitialized()
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderPromptFallbackTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Context Builder prompt fallback test",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "ContextBuilderRunLifecycleTests.promptFallback"
+        )
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let tabID = try XCTUnwrap(
+            window.workspaceManager.activeWorkspace?.activeComposeTabID
+                ?? window.workspaceManager.activeWorkspace?.composeTabs.first?.id
+        )
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        var tab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+        tab.promptText = ""
+        tab.contextOverrides.useOverridePrompt = true
+        tab.contextOverrides.overridePromptText = "stale override"
+        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID))
+
+        let connectionID = UUID()
+        let runID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "context-builder-prompt-fallback-test",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID,
+            runID: runID
+        )
+
+        let result = await window.mcpServer.commitContextBuilderTabContext(
+            connectionID: connectionID,
+            expectedRunID: runID,
+            isStillCurrent: { true },
+            promptFallback: "Discovery response"
+        )
+        let committed = try XCTUnwrap(result.committedTab)
+        XCTAssertEqual(result.outcome, .committed)
+        XCTAssertTrue(committed.usedAgentOutputAsPrompt)
+        XCTAssertEqual(committed.tab.promptText, "Discovery response")
+        XCTAssertFalse(committed.tab.contextOverrides.useOverridePrompt)
+        XCTAssertEqual(committed.tab.contextOverrides.overridePromptText, "")
+
+        let stored = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+        XCTAssertEqual(stored.promptText, committed.tab.promptText)
+        XCTAssertEqual(stored.contextOverrides, committed.tab.contextOverrides)
+        XCTAssertEqual(
+            window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: tabID
+            ),
+            committed.selectionRevision
+        )
     }
 
     func testSuccessfulCommitPrecedesChildTerminationAndCleanupWaitsForJoin() async {
@@ -207,7 +514,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let liveDrainFailure = await ContextBuilderResponseDeliveryDrainResolver.resolve(
             initiallyDetached: false,
             awaitDrain: { false },
-            isAuthoritativePeerEOFDetached: { false },
+            isAuthoritativeDetached: { false },
             awaitTeardownPublication: {
                 didAwaitNegativeTeardownResolution = true
                 return .resolvedWithoutPeerEOFDetachment(reason: "read_error")
@@ -216,6 +523,56 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertTrue(didAwaitNegativeTeardownResolution)
         XCTAssertEqual(liveDrainFailure, .failed)
         XCTAssertFalse(liveDrainFailure.succeeded)
+
+        var didAttemptInitialDrain = false
+        let initiallyDetachedPeerEOF = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                didAttemptInitialDrain = true
+                return false
+            },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: { .peerEOFDetached }
+        )
+        XCTAssertFalse(didAttemptInitialDrain)
+        XCTAssertEqual(initiallyDetachedPeerEOF, .peerEOFDetached)
+        XCTAssertTrue(initiallyDetachedPeerEOF.succeeded)
+
+        let initiallyDetachedAfterDrainedClose = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                XCTFail("Already-detached contexts must resolve from the teardown publication")
+                return false
+            },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: {
+                .detachedAfterResponseDeliveryDrained(reason: "read_error")
+            }
+        )
+        XCTAssertEqual(initiallyDetachedAfterDrainedClose, .detachedAfterResponseDeliveryDrained)
+        XCTAssertTrue(initiallyDetachedAfterDrainedClose.succeeded)
+        XCTAssertTrue(initiallyDetachedAfterDrainedClose.transportAlreadyClosed)
+
+        let initiallyDetachedFailure = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                XCTFail("Already-detached contexts must resolve from the teardown publication")
+                return true
+            },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: { .detachedWithoutOrderlyPeerEOF(reason: "read_error") }
+        )
+        XCTAssertEqual(initiallyDetachedFailure, .failed)
+        XCTAssertFalse(initiallyDetachedFailure.succeeded)
+
+        let failureDetachedDuringDrain = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: false,
+            awaitDrain: { false },
+            isAuthoritativeDetached: { true },
+            awaitTeardownPublication: { .detachedWithoutOrderlyPeerEOF(reason: "write_hangup") }
+        )
+        XCTAssertEqual(failureDetachedDuringDrain, .failed)
+        XCTAssertFalse(failureDetachedDuringDrain.succeeded)
     }
 
     func testRealConnectionCleanupCannotEraseContextBeforeCommit() async throws {
@@ -249,6 +606,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             let clientName = "context-builder-cleanup-commit-test"
             let expectedPrompt = "context retained after peer EOF cleanup"
+            var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            tab.promptText = expectedPrompt
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: activeWorkspace.id))
+            window.workspaceManager.promptViewModel.promptText = expectedPrompt
 
             let connectionID = UUID()
             let runID = UUID()
@@ -302,7 +663,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 expectedRunID: runID,
                 isStillCurrent: { true }
             )
-            XCTAssertEqual(commitOutcome, .committed)
+            XCTAssertEqual(commitOutcome.outcome, .committed)
+            XCTAssertEqual(commitOutcome.committedTab?.nestedRunID, runID)
+            XCTAssertEqual(commitOutcome.committedTab?.identity.workspaceID, activeWorkspace.id)
+            XCTAssertEqual(commitOutcome.committedTab?.identity.tabID, tabID)
+            XCTAssertEqual(commitOutcome.committedTab?.tab.promptText, expectedPrompt)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, expectedPrompt)
             XCTAssertFalse(
                 window.mcpServer.isDetachedContextBuilderConnection(
@@ -317,13 +682,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 isStillCurrent: { true }
             )
             XCTAssertEqual(
-                secondCommitOutcome,
+                secondCommitOutcome.outcome,
                 .missingFinalContext(runID: runID, connectionID: connectionID)
             )
 
-            // Begin finalization while the connection is live, then complete peer-EOF
-            // teardown while response delivery is draining. The failed drain is accepted
-            // only after the same authoritative context has been detached.
+            // Begin finalization while the connection is live, then complete a non-orderly
+            // teardown after every accepted request has a delivered response. The failed live
+            // drain is accepted from the final delivery snapshot taken after awaited cleanup.
             let transitioningConnectionID = UUID()
             let transitioningRunID = UUID()
             let transitioningPrompt = "context detached during response drain"
@@ -341,7 +706,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             transitioningContext.promptText = transitioningPrompt
             window.mcpServer.tabContextByConnectionID[transitioningConnectionID] = transitioningContext
 
-            let transitioningConnection = ContextBuilderCleanupTestConnection()
+            let transitioningConnection = ContextBuilderCleanupTestConnection(
+                pendingRequestCount: 1,
+                subsequentPendingRequestCount: 0
+            )
             await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
                 connectionID: transitioningConnectionID,
                 connection: transitioningConnection,
@@ -370,7 +738,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                                 XCTAssertEqual(drainedID, transitioningConnectionID)
                                 return false
                             },
-                            isAuthoritativePeerEOFDetached: {
+                            isAuthoritativeDetached: {
                                 window.mcpServer.isDetachedContextBuilderConnection(
                                     connectionID: drainedID,
                                     runID: transitioningRunID
@@ -396,7 +764,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                             isStillCurrent: { true },
                             deferRunMappingCleanupUntilCaller: true
                         )
-                        return outcome == .committed
+                        return outcome.outcome == .committed
                     },
                     beforeTerminationRequest: {},
                     requestTermination: { requestedID in
@@ -434,7 +802,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             await ServerNetworkManager.shared.removeConnection(
                 transitioningConnectionID,
                 context: MCPConnectionCloseContext(
-                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    reason: MCPTransportTerminalCause.readError.rawValue,
                     initiator: .peer
                 )
             )
@@ -449,7 +817,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
             let didFinalizeTransition = await transitioningFinalization.value
             XCTAssertTrue(didFinalizeTransition)
-            XCTAssertEqual(transitioningDrainOutcome, .peerEOFDetached)
+            XCTAssertEqual(transitioningDrainOutcome, .detachedAfterResponseDeliveryDrained)
             XCTAssertEqual(transitioningCommitCount, 1)
             XCTAssertEqual(transitioningTerminationCount, 0)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
@@ -465,7 +833,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 isStillCurrent: { true }
             )
             XCTAssertEqual(
-                transitioningSecondCommit,
+                transitioningSecondCommit.outcome,
                 .missingFinalContext(
                     runID: transitioningRunID,
                     connectionID: transitioningConnectionID
@@ -473,6 +841,107 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             let transitioningConnectionTerminationCount = await transitioningConnection.terminationCount()
             XCTAssertEqual(transitioningConnectionTerminationCount, 0)
+
+            // Non-orderly transport failures with an accepted response still pending detach
+            // the final context so a later safe path can inspect/discard it, but they must not
+            // satisfy response drain or commit partial context through successful finalization.
+            let failureConnectionID = UUID()
+            let failureRunID = UUID()
+            let failurePrompt = "must not auto-commit after read error"
+            try window.mcpServer.bindTabForConnection(
+                connectionID: failureConnectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID,
+                runID: failureRunID
+            )
+            var failureContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[failureConnectionID])
+            failureContext.promptText = failurePrompt
+            window.mcpServer.tabContextByConnectionID[failureConnectionID] = failureContext
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: failureConnectionID,
+                connection: ContextBuilderCleanupTestConnection(pendingRequestCount: 1),
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                connectionID: failureConnectionID,
+                runID: failureRunID,
+                purpose: .discoverRun,
+                windowID: window.windowID
+            )
+
+            let failureWaitStarted = LifecycleTestGate()
+            var failureDrainOutcome: ContextBuilderResponseDeliveryDrainOutcome = .drained
+            var failureCommitCount = 0
+            var failureTerminationCount = 0
+            let failureFinalization = Task { @MainActor in
+                await ContextBuilderChildConnectionFinalizer.finalize(
+                    connectionIDs: [failureConnectionID],
+                    awaitResponseDeliveryDrain: { drainedID in
+                        failureDrainOutcome = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+                            initiallyDetached: false,
+                            awaitDrain: {
+                                XCTAssertEqual(drainedID, failureConnectionID)
+                                return false
+                            },
+                            isAuthoritativeDetached: {
+                                window.mcpServer.isDetachedContextBuilderConnection(
+                                    connectionID: drainedID,
+                                    runID: failureRunID
+                                )
+                            },
+                            awaitTeardownPublication: {
+                                await failureWaitStarted.arrive()
+                                return await window.mcpServer.contextBuilderTeardownPublicationCoordinator.wait(
+                                    runID: failureRunID,
+                                    connectionID: drainedID,
+                                    timeoutSeconds: 1
+                                )
+                            }
+                        )
+                        return failureDrainOutcome.succeeded
+                    },
+                    commitContext: { _ in
+                        failureCommitCount += 1
+                        return true
+                    },
+                    beforeTerminationRequest: {},
+                    requestTermination: { _ in
+                        failureTerminationCount += 1
+                        return Task {}
+                    },
+                    beforeTerminationJoin: {},
+                    cleanupMapping: { _ in }
+                )
+            }
+
+            await failureWaitStarted.waitUntilArrived()
+            await ServerNetworkManager.shared.removeConnection(
+                failureConnectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.readError.rawValue,
+                    initiator: .peer
+                )
+            )
+            let didFinalizeFailure = await failureFinalization.value
+            XCTAssertFalse(didFinalizeFailure)
+            XCTAssertEqual(failureDrainOutcome, .failed)
+            XCTAssertEqual(failureCommitCount, 0)
+            XCTAssertEqual(failureTerminationCount, 0)
+            XCTAssertTrue(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: failureConnectionID,
+                    runID: failureRunID
+                )
+            )
+            XCTAssertEqual(
+                window.mcpServer.contextBuilderFinalContextConnectionID(runID: failureRunID),
+                failureConnectionID
+            )
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
+            window.mcpServer.discardDetachedContextBuilderTabContext(runID: failureRunID)
 
             // The negative twin uses the same production peer-EOF teardown, then models
             // explicit cancellation before commit. Detached ownership is discarded and
@@ -519,7 +988,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 expectedRunID: cancelledRunID,
                 isStillCurrent: { false }
             )
-            XCTAssertEqual(cancelledOutcome, .staleOrNoLongerCurrent)
+            XCTAssertEqual(cancelledOutcome.outcome, .staleOrNoLongerCurrent)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
             XCTAssertFalse(
                 window.mcpServer.isDetachedContextBuilderConnection(
@@ -528,6 +997,88 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 )
             )
 
+            func seedDiscoveryConnection(
+                connectionID: UUID,
+                runID: UUID,
+                purpose: MCPRunPurpose,
+                prompt: String? = nil,
+                authoritative: Bool = true
+            ) async throws {
+                try window.mcpServer.bindTabForConnection(
+                    connectionID: connectionID,
+                    clientName: clientName,
+                    tabID: tabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: window.windowID,
+                    runID: runID
+                )
+                if let prompt {
+                    var context = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+                    context.promptText = prompt
+                    window.mcpServer.tabContextByConnectionID[connectionID] = context
+                }
+                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: ContextBuilderCleanupTestConnection(),
+                    clientName: clientName,
+                    sessionToken: UUID().uuidString
+                )
+                await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                    connectionID: connectionID,
+                    runID: runID,
+                    purpose: purpose,
+                    windowID: window.windowID
+                )
+                if !authoritative {
+                    window.mcpServer.connectionIDByRunID[runID] = UUID()
+                }
+            }
+
+            func assertDiscoveryCloseDetachesAndCommits(
+                closeContext: MCPConnectionCloseContext,
+                prompt: String
+            ) async throws {
+                let detachedConnectionID = UUID()
+                let detachedRunID = UUID()
+                try await seedDiscoveryConnection(
+                    connectionID: detachedConnectionID,
+                    runID: detachedRunID,
+                    purpose: .discoverRun,
+                    prompt: prompt
+                )
+
+                await ServerNetworkManager.shared.removeConnection(
+                    detachedConnectionID,
+                    context: closeContext
+                )
+
+                XCTAssertNil(window.mcpServer.tabContextByConnectionID[detachedConnectionID])
+                XCTAssertTrue(
+                    window.mcpServer.isDetachedContextBuilderConnection(
+                        connectionID: detachedConnectionID,
+                        runID: detachedRunID
+                    )
+                )
+                XCTAssertEqual(
+                    window.mcpServer.contextBuilderFinalContextConnectionID(runID: detachedRunID),
+                    detachedConnectionID
+                )
+                let commitOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                    connectionID: detachedConnectionID,
+                    expectedRunID: detachedRunID,
+                    isStillCurrent: { true }
+                )
+                XCTAssertEqual(commitOutcome.outcome, .committed)
+                XCTAssertEqual(commitOutcome.committedTab?.nestedRunID, detachedRunID)
+                XCTAssertEqual(commitOutcome.committedTab?.tab.promptText, prompt)
+                XCTAssertFalse(
+                    window.mcpServer.isDetachedContextBuilderConnection(
+                        connectionID: detachedConnectionID,
+                        runID: detachedRunID
+                    )
+                )
+            }
+
             func assertDoesNotDetach(
                 closeContext: MCPConnectionCloseContext,
                 purpose: MCPRunPurpose,
@@ -535,29 +1086,12 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             ) async throws {
                 let excludedConnectionID = UUID()
                 let excludedRunID = UUID()
-                try window.mcpServer.bindTabForConnection(
-                    connectionID: excludedConnectionID,
-                    clientName: clientName,
-                    tabID: tabID,
-                    workspaceID: activeWorkspace.id,
-                    windowID: window.windowID,
-                    runID: excludedRunID
-                )
-                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
-                    connectionID: excludedConnectionID,
-                    connection: ContextBuilderCleanupTestConnection(),
-                    clientName: clientName,
-                    sessionToken: UUID().uuidString
-                )
-                await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                try await seedDiscoveryConnection(
                     connectionID: excludedConnectionID,
                     runID: excludedRunID,
                     purpose: purpose,
-                    windowID: window.windowID
+                    authoritative: authoritative
                 )
-                if !authoritative {
-                    window.mcpServer.connectionIDByRunID[excludedRunID] = UUID()
-                }
 
                 await ServerNetworkManager.shared.removeConnection(
                     excludedConnectionID,
@@ -578,7 +1112,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                     isStillCurrent: { true }
                 )
                 XCTAssertEqual(
-                    excludedCommitOutcome,
+                    excludedCommitOutcome.outcome,
                     .missingFinalContext(
                         runID: excludedRunID,
                         connectionID: excludedConnectionID
@@ -592,26 +1126,40 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 )
             }
 
-            try await assertDoesNotDetach(
+            try await assertDiscoveryCloseDetachesAndCommits(
                 closeContext: MCPConnectionCloseContext(
                     reason: "server_shutdown",
                     initiator: .app
                 ),
-                purpose: .discoverRun
+                prompt: "context retained after app/server shutdown"
             )
-            try await assertDoesNotDetach(
+            try await assertDiscoveryCloseDetachesAndCommits(
                 closeContext: MCPConnectionCloseContext(
                     reason: TerminationReason.runCancelled.rawValue,
                     initiator: .app
                 ),
-                purpose: .discoverRun
+                prompt: "context retained after app cancellation close"
             )
-            try await assertDoesNotDetach(
+            try await assertDiscoveryCloseDetachesAndCommits(
                 closeContext: MCPConnectionCloseContext(
                     reason: MCPTransportTerminalCause.readError.rawValue,
                     initiator: .peer
                 ),
-                purpose: .discoverRun
+                prompt: "context retained after read error"
+            )
+            try await assertDiscoveryCloseDetachesAndCommits(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.writeHangup.rawValue,
+                    initiator: .app
+                ),
+                prompt: "context retained after write hangup"
+            )
+            try await assertDiscoveryCloseDetachesAndCommits(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.writeStall.rawValue,
+                    initiator: .app
+                ),
+                prompt: "context retained after write stall"
             )
             try await assertDoesNotDetach(
                 closeContext: MCPConnectionCloseContext(
@@ -629,10 +1177,15 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 authoritative: false
             )
 
-            let missingOutcome = MCPServerViewModel.ContextBuilderTabContextCommitOutcome
-                .missingFinalContext(runID: cancelledRunID, connectionID: cancelledConnectionID)
+            let missingResult = MCPServerViewModel.ContextBuilderTabContextCommitResult(
+                outcome: .missingFinalContext(
+                    runID: cancelledRunID,
+                    connectionID: cancelledConnectionID
+                ),
+                committedTab: nil
+            )
             guard case let .failed(message) = ContextBuilderAgentViewModel.terminalOutcome(
-                forContextCommitOutcome: missingOutcome
+                forContextCommitResult: missingResult
             ) else {
                 return XCTFail("Missing final ownership must be classified as failed")
             }
@@ -711,7 +1264,93 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertTrue(registry.acceptsEvents(from: second, currentSession: session))
     }
 
+    func testStaleRunRetirementStillDisposesProviderAndCancelsExecution() async throws {
+        #if DEBUG
+            let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let composition = WindowStateCompositionFactory.make(
+                windowID: -176,
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService()
+            )
+            GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
+            await composition.workspaceManager.awaitInitialized()
+            defer {
+                Task {
+                    await composition.mcpServer.stopServer()
+                    await composition.mcpServer.shutdownListener()
+                }
+            }
+
+            let tabID = UUID()
+            let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+            let ownership = session.beginRunAttempt(source: "stale-retirement-test")
+            let record = ContextBuilderRunRecord(
+                runID: UUID(),
+                tabID: tabID,
+                session: session,
+                ownership: ownership,
+                origin: .mcp(controlToken: UUID()),
+                agentKind: .claudeCode,
+                modelRaw: AgentModel.defaultModel.rawValue
+            )
+            let providerDisposeFinished = expectation(description: "stale provider disposed")
+            let provider = ControllableLifecycleTestProvider(
+                eventTexts: [],
+                blocksDisposal: false,
+                disposeFinishedExpectation: providerDisposeFinished
+            )
+            XCTAssertTrue(record.installProvider(provider))
+
+            let executionCancelled = LifecycleTestGate()
+            let executionTask = Task<Void, Never> {
+                await withTaskCancellationHandler {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(10))
+                    }
+                } onCancel: {
+                    Task { await executionCancelled.arrive() }
+                }
+            }
+            record.executionTask = executionTask
+
+            composition.contextBuilderAgentViewModel.retireStaleRunRecordForTesting(
+                record,
+                waiterResolution: .snapshot,
+                cancelExecution: true
+            )
+
+            await executionCancelled.waitUntilArrived()
+            await executionTask.value
+            await fulfillment(of: [providerDisposeFinished], timeout: 1)
+            for _ in 0 ..< 100 where record.teardownFinishedAt == nil {
+                await Task.yield()
+            }
+
+            let disposeCallCount = await provider.disposeCallCount()
+            XCTAssertEqual(disposeCallCount, 1)
+            XCTAssertTrue(record.providerDisposalFinished)
+            XCTAssertTrue(record.executionTaskFinished)
+            XCTAssertNotNil(record.teardownFinishedAt)
+            XCTAssertTrue(record.isTerminal)
+        #else
+            throw XCTSkip("Stale run retirement test uses DEBUG-only test hook.")
+        #endif
+    }
+
     func testProductionMCPCancellationResumesBeforeTeardownAndRejectsLateProviderEvent() async throws {
+        let configRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderStaleRunLeaseTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: configRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: configRoot) }
+        let configService = MCPConfigExportService(
+            configDirectoryURL: configRoot,
+            renderServerConfig: { "{\"mcpServers\":{}}" }
+        )
+        let firstConfigLease = try await configService.prepareLaunchConfig()
+        let firstConfigURL = firstConfigLease.url
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstConfigURL.path))
+
         let firstStreamStarted = expectation(description: "first provider stream started")
         let firstEventAccepted = expectation(description: "first provider event accepted")
         let firstDisposeStarted = expectation(description: "first provider disposal started")
@@ -719,6 +1358,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let firstTeardownCompleted = expectation(description: "first run teardown completed")
         let successorStreamStarted = expectation(description: "successor provider stream started")
         let successorEventAccepted = expectation(description: "successor provider event accepted")
+        let successorRouteSettled = expectation(description: "successor route settled and replay completed")
         let lateEventParked = expectation(description: "late provider event parked before processing")
         let lateEventRejected = expectation(description: "late provider event rejected")
         let firstProvider = ControllableLifecycleTestProvider(
@@ -726,7 +1366,8 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             blocksDisposal: true,
             streamStartedExpectation: firstStreamStarted,
             disposeStartedExpectation: firstDisposeStarted,
-            disposeFinishedExpectation: firstDisposeFinished
+            disposeFinishedExpectation: firstDisposeFinished,
+            configLease: firstConfigLease
         )
         let successorProvider = ControllableLifecycleTestProvider(
             eventTexts: ["successor-event"],
@@ -771,6 +1412,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
 
             let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: composition.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
@@ -845,8 +1490,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             firstRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
 
+            // Replace the tab session to model a superseding owner while the original
+            // provider stream remains parked. Cancellation by run ID must eagerly retire
+            // the registered stale record instead of waiting for another provider event.
+            viewModel.replaceSessionForTesting(tabID: tabID)
             try await viewModel.cancelMCPContextBuilderRun(runID: XCTUnwrap(firstRunID))
             await fulfillment(of: [firstWaiterFinished, firstDisposeStarted], timeout: 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: firstConfigURL.path))
 
             let firstWaiterWasCancelled = await firstWaiter.value
             let firstCompletionCount = await firstWaiterCompletion.value()
@@ -866,7 +1516,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 do {
                     _ = try await viewModel.runContextBuilderForMCP(
                         tabID: tabID,
-                        mcpControlToken: successorToken
+                        mcpControlToken: successorToken,
+                        progressReporter: { phase in
+                            guard phase == .providerStreamActive else { return }
+                            successorRouteSettled.fulfill()
+                        }
                     )
                     wasCancelled = false
                 } catch is CancellationError {
@@ -879,7 +1533,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 return wasCancelled
             }
 
-            await fulfillment(of: [successorStreamStarted, successorEventAccepted], timeout: 2)
+            await fulfillment(
+                of: [successorStreamStarted, successorEventAccepted, successorRouteSettled],
+                timeout: 2
+            )
             let successorRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
             XCTAssertNotEqual(successorRunID, firstRunID)
             XCTAssertTrue(try viewModel.isRunTeardownPendingForTesting(runID: XCTUnwrap(firstRunID)))
@@ -977,6 +1634,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 let tabID = try XCTUnwrap(
                     activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
                 )
+                ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                    apiSettingsViewModel: composition.apiSettingsViewModel,
+                    workspaceID: activeWorkspace.id,
+                    agent: .codexExec,
+                    modelRaw: AgentModel.gpt55CodexLow.rawValue
+                )
+
                 let viewModel = composition.contextBuilderAgentViewModel
                 let savedAgent = viewModel.selectedAgent
                 let savedModelRaw = viewModel.selectedModelRaw
@@ -1272,6 +1936,7 @@ private final class ControllableLifecycleTestProvider: HeadlessAgentProvider {
     private let streamStartedExpectation: XCTestExpectation?
     private let disposeStartedExpectation: XCTestExpectation?
     private let disposeFinishedExpectation: XCTestExpectation?
+    private let configLease: MCPConfigLease?
     private let disposeGate = LifecycleTestGate()
     private let state = LifecycleTestProviderState()
     private var streamContinuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation?
@@ -1281,13 +1946,15 @@ private final class ControllableLifecycleTestProvider: HeadlessAgentProvider {
         blocksDisposal: Bool,
         streamStartedExpectation: XCTestExpectation? = nil,
         disposeStartedExpectation: XCTestExpectation? = nil,
-        disposeFinishedExpectation: XCTestExpectation? = nil
+        disposeFinishedExpectation: XCTestExpectation? = nil,
+        configLease: MCPConfigLease? = nil
     ) {
         self.eventTexts = eventTexts
         self.blocksDisposal = blocksDisposal
         self.streamStartedExpectation = streamStartedExpectation
         self.disposeStartedExpectation = disposeStartedExpectation
         self.disposeFinishedExpectation = disposeFinishedExpectation
+        self.configLease = configLease
     }
 
     func streamAgentMessage(
@@ -1311,6 +1978,7 @@ private final class ControllableLifecycleTestProvider: HeadlessAgentProvider {
 
     func dispose() async {
         await state.recordDisposeCall()
+        configLease?.release()
         disposeStartedExpectation?.fulfill()
         if blocksDisposal {
             await disposeGate.arriveAndWait()
@@ -1617,6 +2285,22 @@ private actor CodexShapedBlockedRoutingTestState {
 private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
     private var terminations = 0
     private var stops = 0
+    private var deliverySnapshots: [MCPResponseDeliverySnapshot] = []
+
+    init(
+        pendingRequestCount: Int? = nil,
+        subsequentPendingRequestCount: Int? = nil
+    ) {
+        deliverySnapshots = [pendingRequestCount, subsequentPendingRequestCount].compactMap { count in
+            count.map {
+                MCPResponseDeliverySnapshot(
+                    pendingRequestCount: $0,
+                    waiterCount: 0,
+                    isTerminal: true
+                )
+            }
+        }
+    }
 
     nonisolated var isFilesystemBacked: Bool {
         false
@@ -1660,6 +2344,11 @@ private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
 
     func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
         nil
+    }
+
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        guard deliverySnapshots.count > 1 else { return deliverySnapshots.first }
+        return deliverySnapshots.removeFirst()
     }
 
     func terminate(reason _: TerminationReason, message _: String?) async {

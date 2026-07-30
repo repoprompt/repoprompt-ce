@@ -1,5 +1,6 @@
+import Combine
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -77,6 +78,269 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows[1].gitContext, contextB)
         XCTAssertEqual(rows[1].gitContext?.breadcrumbText, "Repo / B / feature/b")
         XCTAssertTrue(rows[1].gitContext?.isMain == true)
+    }
+
+    func testWorkspaceManagerChangesDoNotRefreshRootRows() async {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        var projections = [rootA]
+        let rootChanges = PassthroughSubject<Void, Never>()
+        let manager = makeWorkspaceManager()
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { projections },
+            rootChanges: rootChanges.eraseToAnyPublisher(),
+            workspaceManager: manager,
+            windowID: -1
+        )
+        XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
+
+        projections = [rootB]
+        let metadataWorkspace = WorkspaceModel(name: "Manager Metadata Only", repoPaths: [])
+        manager.workspaces = [metadataWorkspace]
+        manager.activeWorkspace = metadataWorkspace
+        await waitUntil { store.workspaceLabel.hasPrefix("Manager Metadata") }
+
+        XCTAssertEqual(store.rootRows.map(\.id), [rootA.id])
+
+        rootChanges.send(())
+        await waitUntil { store.rootRows.map(\.id) == [rootB.id] }
+
+        XCTAssertEqual(store.rootRows.map(\.id), [rootB.id])
+    }
+
+    func testPresentationMapsEveryGraphNativeAvailabilityState() {
+        let expected: [(WorkspaceCodemapRootAvailability, AgentWorkspaceCodemapPresentation.State)] = [
+            (.notInitialized, .notInitialized),
+            (.indexing, .indexing),
+            (.ready, .ready),
+            (.updating, .updating),
+            (.reconciling, .reconciling),
+            (.unavailable, .unavailable),
+            (.revoked, .revoked)
+        ]
+
+        for (availability, state) in expected {
+            XCTAssertEqual(
+                AgentWorkspaceCodemapPresentation.make(snapshot(availability: availability)).state,
+                state
+            )
+        }
+    }
+
+    func testSuspensionOverridesAvailabilityWithoutDestroyingGraphObservability() {
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot(
+            availability: .updating,
+            suspended: true,
+            updatesPending: true,
+            graphRevision: 9
+        ))
+
+        XCTAssertEqual(presentation.state, .paused)
+        XCTAssertTrue(presentation.updatesPending)
+        XCTAssertEqual(presentation.graphRevision, 9)
+        XCTAssertTrue(presentation.canToggle)
+    }
+
+    func testCoverageAndPendingUpdatesDriveProgressAndStatus() throws {
+        let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let watermark = WorkspaceCodemapGraphIndexCatalogToken(
+            rootEpoch: rootEpoch,
+            topologyGeneration: 1,
+            appliedIndexGeneration: 1,
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            graphIndexInvalidationGeneration: 1
+        )
+        func coverage(isCatalogSealed: Bool) throws -> WorkspaceCodemapGraphCatalogCoverage {
+            try WorkspaceCodemapGraphCatalogCoverage.validated(
+                rootEpoch: rootEpoch,
+                catalogWatermark: watermark,
+                enumerationState: .partial,
+                isCatalogSealed: isCatalogSealed,
+                supportedCount: 10,
+                classifiedCount: 6,
+                pendingCount: 4,
+                contributedCount: 6,
+                emptyCount: 0,
+                terminalArtifactCount: 0,
+                terminalExcludedCount: 0
+            ).get()
+        }
+        let preSeal = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .updating,
+            coverage: coverage(isCatalogSealed: false),
+            updatesPending: true,
+            graphRevision: 12
+        ))
+        let sealed = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .updating,
+            coverage: coverage(isCatalogSealed: true),
+            updatesPending: true,
+            graphRevision: 13
+        ))
+
+        XCTAssertEqual(preSeal.state, .updating)
+        XCTAssertFalse(preSeal.isCatalogSealed)
+        XCTAssertEqual(preSeal.classifiedCount, 6)
+        XCTAssertNil(preSeal.supportedCount)
+        XCTAssertEqual(preSeal.pendingCount, 4)
+        XCTAssertNil(preSeal.percentageText)
+        XCTAssertEqual(preSeal.statusText, "Updating 6 files…")
+
+        XCTAssertTrue(sealed.isCatalogSealed)
+        XCTAssertEqual(sealed.supportedCount, 10)
+        XCTAssertEqual(sealed.percentageText, "60%")
+        XCTAssertEqual(sealed.statusText, "Updating 60%")
+
+        let preSealSummary = AgentWorkspaceCodemapSummary.make([sealed, preSeal])
+        XCTAssertEqual(preSealSummary.state, .indexing)
+        XCTAssertEqual(preSealSummary.classifiedCount, 12)
+        XCTAssertNil(preSealSummary.supportedCount)
+        XCTAssertNil(preSealSummary.progressFraction)
+        XCTAssertEqual(preSealSummary.label, "Code Map")
+        XCTAssertTrue(preSealSummary.showsIndeterminateProgress)
+        XCTAssertEqual(preSealSummary.detailText, "Updating — discovering files…")
+        XCTAssertEqual(
+            preSealSummary.preSealProgressText,
+            "12 files indexed so far while repository catalogs are discovered."
+        )
+        XCTAssertEqual(
+            preSealSummary.accessibilityValue,
+            "Updating — discovering files… 12 files indexed so far while repository catalogs are discovered."
+        )
+
+        let sealedSummary = AgentWorkspaceCodemapSummary.make([sealed, sealed])
+        XCTAssertEqual(sealedSummary.supportedCount, 20)
+        XCTAssertEqual(sealedSummary.progressPercentage, 60)
+        XCTAssertFalse(sealedSummary.showsIndeterminateProgress)
+        XCTAssertEqual(sealedSummary.accessibilityValue, "12 of 20 files indexed, 60 percent")
+
+        let pausedPreSeal = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .updating,
+            suspended: true,
+            coverage: coverage(isCatalogSealed: false)
+        ))
+        let excludedUnavailable = try AgentWorkspaceCodemapPresentation.make(snapshot(
+            rootEpoch: rootEpoch,
+            availability: .unavailable,
+            coverage: coverage(isCatalogSealed: false)
+        ))
+        let excludedSummary = AgentWorkspaceCodemapSummary.make([
+            sealed,
+            pausedPreSeal,
+            excludedUnavailable
+        ])
+        XCTAssertEqual(excludedSummary.supportedCount, 10)
+        XCTAssertEqual(excludedSummary.progressPercentage, 60)
+        XCTAssertEqual(excludedSummary.pausedRootCount, 1)
+
+        let overflow = AgentWorkspaceCodemapPresentation(
+            state: .indexing,
+            isCatalogSealed: true,
+            classifiedCount: .max,
+            supportedCount: .max,
+            pendingCount: 0,
+            updatesPending: false,
+            graphRevision: nil
+        )
+        let overflowSummary = AgentWorkspaceCodemapSummary.make([overflow, sealed])
+        XCTAssertNil(overflowSummary.classifiedCount)
+        XCTAssertNil(overflowSummary.supportedCount)
+        XCTAssertNil(overflowSummary.progressFraction)
+
+        let preparing = AgentWorkspaceCodemapPresentation.make(snapshot(availability: .indexing))
+        XCTAssertEqual(preparing.statusText, "Indexing — discovering files…")
+        let preparingSummary = AgentWorkspaceCodemapSummary.make([preparing])
+        XCTAssertTrue(preparingSummary.showsIndeterminateProgress)
+        XCTAssertEqual(preparingSummary.detailText, "Indexing — discovering files…")
+        XCTAssertEqual(preparingSummary.preSealProgressText, "Discovering repository catalogs…")
+
+        let singleFile = AgentWorkspaceCodemapPresentation(
+            state: .indexing,
+            isCatalogSealed: false,
+            classifiedCount: 1,
+            supportedCount: nil,
+            pendingCount: 0,
+            updatesPending: false,
+            graphRevision: nil
+        )
+        XCTAssertEqual(singleFile.statusText, "Indexing 1 file…")
+        XCTAssertEqual(
+            AgentWorkspaceCodemapSummary.make([singleFile]).preSealProgressText,
+            "1 file indexed so far while repository catalogs are discovered."
+        )
+
+        let ready = AgentWorkspaceCodemapPresentation(
+            state: .ready,
+            isCatalogSealed: true,
+            classifiedCount: 10,
+            supportedCount: 10,
+            pendingCount: 0,
+            updatesPending: false,
+            graphRevision: 14
+        )
+        let mixedSummary = AgentWorkspaceCodemapSummary.make([ready, pausedPreSeal])
+        XCTAssertEqual(mixedSummary.state, .mixed)
+        XCTAssertNil(mixedSummary.progressFraction)
+    }
+
+    func testCodemapStatusNotificationsCoalesceRootRowResnapshots() async {
+        let root = makeProjection(name: "A", path: "/tmp/A")
+        let manager = makeWorkspaceManager()
+        let codemapChanges = PassthroughSubject<Void, Never>()
+        var lookupCount = 0
+        let status = snapshot(availability: .indexing)
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [root] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapStatusLookup: { _ in
+                lookupCount += 1
+                return status
+            },
+            codemapStatusChanges: codemapChanges.eraseToAnyPublisher(),
+            workspaceManager: manager,
+            windowID: -1
+        )
+        XCTAssertEqual(lookupCount, 1)
+
+        codemapChanges.send(())
+        codemapChanges.send(())
+        await waitUntil { lookupCount >= 2 }
+
+        XCTAssertEqual(lookupCount, 2)
+        XCTAssertEqual(store.rootRows.first?.codemap.state, .indexing)
+    }
+
+    func testCodemapToggleResnapshotsAuthoritativeStateBeforeClearingPending() async {
+        let root = makeProjection(name: "A", path: "/tmp/A")
+        let manager = makeWorkspaceManager()
+        var status = snapshot(availability: .ready, suspended: true)
+        var actions: [(UUID, Bool)] = []
+        let store = AgentWorkspaceRootsSidebarStore(
+            rootProjections: { [root] },
+            rootChanges: Empty<Void, Never>().eraseToAnyPublisher(),
+            codemapStatusLookup: { _ in status },
+            setCodemapSuspended: { rootID, suspended in
+                actions.append((rootID, suspended))
+                status = self.snapshot(availability: .ready, suspended: suspended)
+            },
+            workspaceManager: manager,
+            windowID: -1
+        )
+
+        await store.toggleCodemapGeneration(rowID: root.id)
+        XCTAssertEqual(actions.map(\.0), [root.id])
+        XCTAssertEqual(actions.map(\.1), [false])
+        XCTAssertFalse(store.rootRows[0].codemap.isPaused)
+
+        await store.toggleCodemapGeneration(rowID: root.id)
+
+        XCTAssertEqual(actions.map(\.1), [false, true])
+        XCTAssertTrue(store.rootRows[0].codemap.isPaused)
+        XCTAssertTrue(store.codemapActionRootIDs.isEmpty)
     }
 
     // MARK: - Root context actions
@@ -184,6 +448,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(enriched.canMoveUp, base.canMoveUp)
         XCTAssertEqual(enriched.canMoveDown, base.canMoveDown)
         XCTAssertEqual(enriched.gitContext, base.gitContext)
+        XCTAssertEqual(enriched.codemap, base.codemap)
     }
 
     func testWithWorktreePreservesGitContext() {
@@ -310,6 +575,110 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertNil(indicator.missingWorktreePath)
     }
 
+    func testWorktreeDisplayLabelHumanizesAppManagedAgentNames() {
+        let cases: [(raw: String, expected: String)] = [
+            ("rp-agent-1a98df1a-agent", "1a98df1a"),
+            ("rp-agent-1a98df1a-fix-login", "fix-login"),
+            ("rp-agent-1a98df1a-fix-login-abcdef12", "fix-login"),
+            ("rp-agent-1a98df1a-fix-login-abcdef12-2", "fix-login"),
+            ("rp/agent/1a98df1a-fix-login", "fix-login"),
+            ("team-feature-worktree", "team-feature-worktree")
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                GitWorktreeDisplayLabelHumanizer.displayLabel(for: testCase.raw),
+                testCase.expected,
+                testCase.raw
+            )
+        }
+    }
+
+    func testIndicatorHumanizesMachineFallbackWhileKeepingRawNameAccessible() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(
+                visualLabel: nil,
+                visualColorHex: nil,
+                worktreeName: "rp-agent-1a98df1a-agent",
+                branch: nil
+            ),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#112233"),
+            isAvailable: true
+        )
+
+        XCTAssertEqual(indicator.label, "1a98df1a")
+        XCTAssertEqual(indicator.rawLabel, "rp-agent-1a98df1a-agent")
+        XCTAssertEqual(indicator.capsuleText, "WT 1a98df1a")
+        XCTAssertTrue(indicator.tooltipText.contains("rp-agent-1a98df1a-agent"))
+        XCTAssertTrue(indicator.accessibilityText.contains("rp-agent-1a98df1a-agent"))
+    }
+
+    func testWorktreeVisualIdentitySeedPrefersMeaningfulSessionNameThenHumanizedWorktreeFallback() {
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: "  Implement login polish for sidebar  ",
+                worktreeName: "rp-agent-1a98df1a-agent",
+                branch: nil,
+                isMain: false
+            ),
+            "Implement login polish"
+        )
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: "New Chat",
+                worktreeName: "rp-agent-1a98df1a-fix-login-abcdef12-3",
+                branch: nil,
+                isMain: false
+            ),
+            "fix-login"
+        )
+        XCTAssertEqual(
+            GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
+                sessionName: nil,
+                worktreeName: nil,
+                branch: "rp/agent/1a98df1a-agent",
+                isMain: false
+            ),
+            "1a98df1a"
+        )
+    }
+
+    private func snapshot(
+        rootEpoch: WorkspaceCodemapRootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID()),
+        availability: WorkspaceCodemapRootAvailability,
+        suspended: Bool = false,
+        coverage: WorkspaceCodemapGraphCatalogCoverage? = nil,
+        updatesPending: Bool = false,
+        graphRevision: UInt64? = nil
+    ) -> WorkspaceCodemapRootStatusSnapshot {
+        WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: rootEpoch,
+            availability: availability,
+            isGenerationSuspended: suspended,
+            coverage: coverage,
+            graphRevision: graphRevision,
+            appliedGeneration: .init(rawValue: 3),
+            observedGeneration: .init(rawValue: updatesPending ? 4 : 3),
+            updatesPending: updatesPending,
+            reconciliationAttempt: availability == .reconciling ? 2 : nil,
+            reconciliationDeadlineUptimeNanoseconds: availability == .reconciling ? 50000 : nil,
+            commitCadence: WorkspaceCodemapGraphCommitCadence(
+                successfulCommitCount: 7,
+                resyncCommitCount: 1,
+                lastCommittedUptimeNanoseconds: 40000,
+                lastCommitIntervalMilliseconds: 25
+            ),
+            diagnostics: WorkspaceCodemapGraphRootDiagnostics(
+                rejectedApplyCount: 0,
+                fencedFileCount: 0,
+                activeApply: false,
+                safetyCounter: 8,
+                revocationReason: availability == .revoked ? .rootUnloaded : nil
+            ),
+            unavailableReason: availability == .unavailable ? .graphUnavailable : nil
+        )
+    }
+
     private func makeSummary(
         visualLabel: String? = "feature-x",
         visualColorHex: String? = "#123456",
@@ -361,6 +730,41 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
             isAvailable: true
         )
+    }
+
+    private func makeWorkspaceManager() -> WorkspaceManagerViewModel {
+        let fileManager = WorkspaceFilesViewModel()
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: WindowSettingsManager(windowID: -1)
+        )
+        return WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTFail("Timed out waiting for condition")
     }
 
     private func makeProjection(

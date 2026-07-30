@@ -54,8 +54,8 @@ if app_root_entries != {"Contents"}:
 for bundle_name in required_bundles:
     bundle = app / "Contents" / "Resources" / bundle_name
     require_real_directory(bundle)
-    require_regular_file(bundle / "Info.plist")
-    require_regular_file(bundle / "en.lproj" / "Localizable.strings")
+    require_regular_file(bundle / "Contents" / "Info.plist")
+    require_regular_file(bundle / "Contents" / "Resources" / "en.lproj" / "Localizable.strings")
 
 executable = app / "Contents" / "MacOS" / "RepoPrompt"
 require_regular_file(executable)

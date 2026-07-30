@@ -40,19 +40,94 @@ struct WorkspaceSliceSelectionMutationResult: Equatable {
     let mutated: Bool
 }
 
+enum WorkspacePreResolvedFullFileMutationMode {
+    case add
+    case remove
+}
+
+struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
+    static let `default` = Self()
+
+    let maximumReadinessRounds: Int
+    let initialBackoffMilliseconds: Int
+    let maximumBackoffMilliseconds: Int
+    let maximumTotalWait: Duration
+    let maximumCandidateDemandCount: Int
+
+    init(
+        maximumReadinessRounds: Int = 6,
+        initialBackoffMilliseconds: Int = 50,
+        maximumBackoffMilliseconds: Int = 400,
+        maximumTotalWait: Duration = .seconds(2),
+        maximumCandidateDemandCount: Int = 1024
+    ) {
+        precondition(maximumReadinessRounds > 0)
+        precondition(initialBackoffMilliseconds > 0)
+        precondition(maximumBackoffMilliseconds >= initialBackoffMilliseconds)
+        precondition(maximumCandidateDemandCount > 0)
+        self.maximumReadinessRounds = maximumReadinessRounds
+        self.initialBackoffMilliseconds = initialBackoffMilliseconds
+        self.maximumBackoffMilliseconds = maximumBackoffMilliseconds
+        self.maximumTotalWait = maximumTotalWait
+        self.maximumCandidateDemandCount = maximumCandidateDemandCount
+    }
+
+    func candidateDemandLimitIssue(
+        attemptedCount: Int
+    ) -> WorkspaceCodemapAutomaticSelectionIssue? {
+        guard attemptedCount > maximumCandidateDemandCount else { return nil }
+        return .budget(.targetDemandLimit(
+            attempted: attemptedCount,
+            limit: maximumCandidateDemandCount
+        ))
+    }
+}
+
+struct WorkspaceCodemapAutomaticSelectionWaiter {
+    let sleep: @Sendable (Duration) async throws -> Void
+
+    static let production = Self { duration in
+        try await Task.sleep(for: duration)
+    }
+}
+
+private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
+    private var retainedTargetTickets = Set<WorkspaceCodemapArtifactDemandTicket>()
+
+    func record(_ ownedResult: WorkspaceCodemapArtifactDemandOwnedResult) {
+        switch ownedResult.ownership {
+        case let .created(ticket), let .joined(ticket):
+            retainedTargetTickets.insert(ticket)
+        case .notAcquired:
+            break
+        }
+    }
+
+    func drainRetainedTickets() -> [WorkspaceCodemapArtifactDemandTicket] {
+        defer { retainedTargetTickets.removeAll() }
+        return Array(retainedTargetTickets)
+    }
+}
+
 struct WorkspaceSelectionMutationService {
     let store: WorkspaceFileContextStore
     let codemapsGloballyDisabled: Bool
     let codemapsGloballyDisabledMessage: String
+    let automaticSelectionPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
+    let automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
 
     init(
         store: WorkspaceFileContextStore,
         codemapsGloballyDisabled: Bool = false,
-        codemapsGloballyDisabledMessage: String = "Code maps are disabled for this tool."
+        codemapsGloballyDisabledMessage: String = "Code maps are disabled for this tool.",
+        automaticSelectionPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .default,
+        automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production
     ) {
         self.store = store
         self.codemapsGloballyDisabled = codemapsGloballyDisabled
         self.codemapsGloballyDisabledMessage = codemapsGloballyDisabledMessage
+        self.automaticSelectionPolicy = automaticSelectionPolicy
+        self.automaticSelectionWaiter = automaticSelectionWaiter
     }
 
     func buildSelection(
@@ -63,35 +138,38 @@ struct WorkspaceSelectionMutationService {
         existing: StoredSelection,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceBuildSelectionResult {
-        if mode == "codemap_only", codemapsGloballyDisabled {
+        if mode == "codemap_only" {
+            let resolution = await resolveCodemapOnlyCandidates(
+                paths: paths,
+                rawPaths: paths,
+                expandFolders: true,
+                rootScope: rootScope
+            )
             return WorkspaceBuildSelectionResult(
-                selection: existing,
-                invalidPaths: sliceErrors + [codemapsGloballyDisabledMessage],
-                codemapUnavailable: []
+                selection: StoredSelection(
+                    manualCodemapPaths: resolution.candidates.map(\.standardizedFullPath),
+                    codemapAutoEnabled: false
+                ),
+                invalidPaths: sliceErrors + resolution.invalidPaths,
+                codemapUnavailable: resolution.codemapUnavailable
             )
         }
 
         var invalid = sliceErrors
-        var codemapUnavailable: [String] = []
+        let codemapUnavailable: [String] = []
         var selectedPaths: [String] = []
-        var codemapPaths: [String] = []
         var seenSelected = Set<String>()
-        var seenCodemap = Set<String>()
         var slicesByPath: [String: [LineRange]] = [:]
 
-        if mode == "codemap_only" {
-            let resolution = await resolveCodemapOnlyCandidates(paths: paths, rawPaths: paths, expandFolders: true, rootScope: rootScope)
-            invalid.append(contentsOf: resolution.invalidPaths)
-            codemapUnavailable.append(contentsOf: resolution.codemapUnavailable)
-            for file in resolution.candidates where seenCodemap.insert(file.standardizedFullPath).inserted {
-                codemapPaths.append(file.standardizedFullPath)
-            }
-        } else {
-            let resolution = await resolveSelectionCandidates(paths: paths, rawPaths: paths, expandFolders: true, rootScope: rootScope)
-            invalid.append(contentsOf: resolution.invalidPaths)
-            for file in resolution.candidates where seenSelected.insert(file.standardizedFullPath).inserted {
-                selectedPaths.append(file.standardizedFullPath)
-            }
+        let resolution = await resolveSelectionCandidates(
+            paths: paths,
+            rawPaths: paths,
+            expandFolders: true,
+            rootScope: rootScope
+        )
+        invalid.append(contentsOf: resolution.invalidPaths)
+        for file in resolution.candidates where seenSelected.insert(file.standardizedFullPath).inserted {
+            selectedPaths.append(file.standardizedFullPath)
         }
 
         let slicePaths = sliceInputs.map(\.path)
@@ -113,30 +191,11 @@ struct WorkspaceSelectionMutationService {
         }
         slicesByPath = normalizeSlices(slicesByPath)
 
-        var finalCodemapPaths = existing.autoCodemapPaths
-        if !selectedPaths.isEmpty {
-            let selectedSet = Set(selectedPaths)
-            finalCodemapPaths.removeAll { selectedSet.contains($0) }
-        }
-
-        let autoEnabled = mode == "codemap_only" ? false : existing.codemapAutoEnabled
-        let initialCodemapPaths: [String] = if mode == "codemap_only" {
-            codemapPaths
-        } else if autoEnabled {
-            []
-        } else {
-            finalCodemapPaths
-        }
-
-        var selection = StoredSelection(
+        let selection = StoredSelection(
             selectedPaths: selectedPaths,
-            autoCodemapPaths: initialCodemapPaths,
             slices: slicesByPath,
-            codemapAutoEnabled: autoEnabled
+            codemapAutoEnabled: existing.codemapAutoEnabled
         )
-        if selection.codemapAutoEnabled {
-            selection = await recomputeAutoCodemaps(selection, rootScope: rootScope)
-        }
         return WorkspaceBuildSelectionResult(selection: selection, invalidPaths: invalid, codemapUnavailable: codemapUnavailable)
     }
 
@@ -146,6 +205,7 @@ struct WorkspaceSelectionMutationService {
         sliceErrors: [String] = [],
         mode: String,
         existing: StoredSelection,
+        hasFullFileArtifactInputs: Bool = false,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceBuildSelectionResult {
         if mode == "codemap_only", !sliceInputs.isEmpty {
@@ -187,7 +247,7 @@ struct WorkspaceSelectionMutationService {
             }
         }
 
-        let isSliceScopedSet = mode == "slices" || (paths.isEmpty && !sliceInputs.isEmpty)
+        let isSliceScopedSet = mode == "slices" || (!hasFullFileArtifactInputs && paths.isEmpty && !sliceInputs.isEmpty)
         guard isSliceScopedSet else {
             let replacementSeed = StoredSelection(
                 codemapAutoEnabled: existing.codemapAutoEnabled
@@ -212,6 +272,40 @@ struct WorkspaceSelectionMutationService {
             selection: sliceResult.selection,
             invalidPaths: sliceErrors + sliceResult.invalidPaths,
             codemapUnavailable: []
+        )
+    }
+
+    /// Applies already-authorized exact identities without path lookup, folder expansion, or
+    /// codemap discovery. Git artifact policy remains owned by the MCP boundary.
+    func mutatePreResolvedFullFilePaths(
+        base: StoredSelection,
+        absolutePaths: [String],
+        mode: WorkspacePreResolvedFullFileMutationMode
+    ) -> StoredSelection {
+        var selected = StoredSelectionPathNormalization.standardizedPaths(base.selectedPaths)
+        var slices = StoredSelectionPathNormalization.standardizedSlices(base.slices)
+        var selectedSet = Set(selected)
+
+        let identities = absolutePaths.compactMap(StoredSelectionPathNormalization.standardizedPath)
+        for identity in identities {
+            switch mode {
+            case .add:
+                if selectedSet.insert(identity).inserted {
+                    selected.append(identity)
+                }
+                slices.removeValue(forKey: identity)
+            case .remove:
+                selected.removeAll { $0 == identity }
+                selectedSet.remove(identity)
+                slices.removeValue(forKey: identity)
+            }
+        }
+
+        return StoredSelection(
+            selectedPaths: selected,
+            manualCodemapPaths: base.manualCodemapPaths.filter { !selectedSet.contains($0) },
+            slices: slices,
+            codemapAutoEnabled: base.codemapAutoEnabled
         )
     }
 
@@ -242,11 +336,9 @@ struct WorkspaceSelectionMutationService {
         var resolved: [String: String] = [:]
         let originalSlices = StoredSelectionPathNormalization.standardizedSlices(base.slices)
         let baseSelectedPaths = StoredSelectionPathNormalization.standardizedPaths(base.selectedPaths)
-        let baseCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(base.autoCodemapPaths)
         var slices = originalSlices
         var selectedPaths = baseSelectedPaths
         var selectedSet = Set(selectedPaths)
-        var codemapPaths = baseCodemapPaths
 
         func resolveEntry(_ entry: WorkspaceSelectionSliceInput, at index: Int) -> WorkspaceFileRecord? {
             let input = trimmedInputs[index]
@@ -309,15 +401,19 @@ struct WorkspaceSelectionMutationService {
         for (full, ranges) in slices where !ranges.isEmpty {
             if selectedSet.insert(full).inserted { selectedPaths.append(full) }
         }
-        let selectedStd = Set(selectedPaths)
-        codemapPaths.removeAll { selectedStd.contains($0) }
-
-        var nextSelection = StoredSelection(selectedPaths: selectedPaths, autoCodemapPaths: codemapPaths, slices: slices, codemapAutoEnabled: base.codemapAutoEnabled)
-        let mutated = slices != originalSlices || selectedPaths != baseSelectedPaths || codemapPaths != baseCodemapPaths
-        if mutated, nextSelection.codemapAutoEnabled {
-            nextSelection = await recomputeAutoCodemaps(nextSelection, rootScope: rootScope)
-        }
-        return WorkspaceSliceSelectionMutationResult(selection: nextSelection, invalidPaths: invalid, resolvedMap: resolved, mutated: mutated)
+        let nextSelection = StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: base.manualCodemapPaths.filter { !selectedSet.contains($0) },
+            slices: slices,
+            codemapAutoEnabled: base.codemapAutoEnabled
+        )
+        let mutated = nextSelection != base
+        return WorkspaceSliceSelectionMutationResult(
+            selection: nextSelection,
+            invalidPaths: invalid,
+            resolvedMap: resolved,
+            mutated: mutated
+        )
     }
 
     func addPaths(
@@ -327,81 +423,76 @@ struct WorkspaceSelectionMutationService {
         mode: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceAddSelectionResult {
-        let codemapOnly = mode == "codemap_only"
-        if codemapOnly, codemapsGloballyDisabled {
-            return WorkspaceAddSelectionResult(selection: existing, invalidPaths: [codemapsGloballyDisabledMessage], resolvedMap: [:], mutated: false, codemapUnavailable: [])
+        if mode == "codemap_only" {
+            let resolution = await resolveCodemapOnlyCandidates(
+                paths: paths,
+                rawPaths: rawPaths,
+                expandFolders: true,
+                rootScope: rootScope
+            )
+            guard !resolution.candidates.isEmpty else {
+                return WorkspaceAddSelectionResult(
+                    selection: existing,
+                    invalidPaths: resolution.invalidPaths,
+                    resolvedMap: resolution.resolvedMap,
+                    mutated: false,
+                    codemapUnavailable: resolution.codemapUnavailable
+                )
+            }
+            var selectedPaths = StoredSelectionPathNormalization.standardizedPaths(existing.selectedPaths)
+            var slices = StoredSelectionPathNormalization.standardizedSlices(existing.slices)
+            var manualPaths = StoredSelectionPathNormalization.standardizedPaths(existing.manualCodemapPaths)
+            var manualSet = Set(manualPaths)
+            for file in resolution.candidates {
+                let path = file.standardizedFullPath
+                selectedPaths.removeAll { $0 == path }
+                slices.removeValue(forKey: path)
+                if manualSet.insert(path).inserted { manualPaths.append(path) }
+            }
+            let selection = StoredSelection(
+                selectedPaths: selectedPaths,
+                manualCodemapPaths: manualPaths,
+                slices: slices,
+                codemapAutoEnabled: false
+            )
+            return WorkspaceAddSelectionResult(
+                selection: selection,
+                invalidPaths: resolution.invalidPaths,
+                resolvedMap: resolution.resolvedMap,
+                mutated: selection != existing,
+                codemapUnavailable: resolution.codemapUnavailable
+            )
         }
         let candidateResolutionTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.candidateResolutionTotal)
-        let resolution: (files: [WorkspaceFileRecord], invalid: [String], resolvedMap: [String: String], unavailable: [String])
-        if codemapOnly {
-            let value = await resolveCodemapOnlyCandidates(paths: paths, rawPaths: rawPaths, expandFolders: true, rootScope: rootScope)
-            resolution = (value.candidates, value.invalidPaths, value.resolvedMap, value.codemapUnavailable)
-        } else {
-            let value = await resolveSelectionCandidates(paths: paths, rawPaths: rawPaths, expandFolders: true, rootScope: rootScope)
-            resolution = (value.candidates, value.invalidPaths, value.resolvedMap, [])
-        }
+        let resolution = await resolveSelectionCandidates(
+            paths: paths,
+            rawPaths: rawPaths,
+            expandFolders: true,
+            rootScope: rootScope
+        )
         EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.candidateResolutionTotal, candidateResolutionTotal)
 
         let structuralMerge = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.structuralMerge)
         var selectedPaths = existing.selectedPaths
-        var codemapPaths = existing.autoCodemapPaths
-        var slices = existing.slices
+        let slices = existing.slices
         var selectedSet = Set(selectedPaths)
-        var codemapSet = Set(codemapPaths)
-        var mutated = false
-
-        for file in resolution.files {
-            let path = file.standardizedFullPath
-            if codemapOnly {
-                if selectedSet.contains(path) {
-                    selectedPaths.removeAll { $0 == path }
-                    selectedSet.remove(path)
-                    mutated = true
-                }
-                if !codemapSet.contains(path) {
-                    codemapPaths.append(path)
-                    codemapSet.insert(path)
-                    mutated = true
-                }
-                if removeSliceEntries(for: file, in: &slices) { mutated = true }
-            } else {
-                if !selectedSet.contains(path) {
-                    selectedPaths.append(path)
-                    selectedSet.insert(path)
-                    mutated = true
-                }
-                if codemapSet.contains(path) {
-                    codemapPaths.removeAll { $0 == path }
-                    codemapSet.remove(path)
-                    mutated = true
-                }
-            }
+        for file in resolution.candidates where selectedSet.insert(file.standardizedFullPath).inserted {
+            selectedPaths.append(file.standardizedFullPath)
         }
-
-        var selection = StoredSelection(
+        let selection = StoredSelection(
             selectedPaths: selectedPaths,
-            autoCodemapPaths: codemapPaths,
+            manualCodemapPaths: existing.manualCodemapPaths.filter { !selectedSet.contains($0) },
             slices: slices,
-            codemapAutoEnabled: codemapOnly ? false : existing.codemapAutoEnabled
+            codemapAutoEnabled: existing.codemapAutoEnabled
         )
         EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.structuralMerge, structuralMerge)
-        let autoCodemapRecomputeTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.autoCodemapRecomputeTotal)
-        if selection.codemapAutoEnabled {
-            selection = await recomputeAutoCodemaps(selection, rootScope: rootScope)
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.ReadFile.AutoSelect.autoCodemapRecomputeTotal,
-                autoCodemapRecomputeTotal,
-                EditFlowPerf.Dimensions(outcome: "attempted")
-            )
-        } else {
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.ReadFile.AutoSelect.autoCodemapRecomputeTotal,
-                autoCodemapRecomputeTotal,
-                EditFlowPerf.Dimensions(outcome: "skipped")
-            )
-        }
-        mutated = selection != existing
-        return WorkspaceAddSelectionResult(selection: selection, invalidPaths: resolution.invalid, resolvedMap: resolution.resolvedMap, mutated: mutated, codemapUnavailable: resolution.unavailable)
+        return WorkspaceAddSelectionResult(
+            selection: selection,
+            invalidPaths: resolution.invalidPaths,
+            resolvedMap: resolution.resolvedMap,
+            mutated: selection != existing,
+            codemapUnavailable: []
+        )
     }
 
     func removePaths(
@@ -411,40 +502,47 @@ struct WorkspaceSelectionMutationService {
         mode: String = "full",
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceRemoveSelectionResult {
-        let resolution = await resolveSelectionCandidates(paths: paths, rawPaths: rawPaths, expandFolders: true, allowEmptyFolderExpansion: true, rootScope: rootScope)
-        let codemapOnly = mode == "codemap_only"
-        var selectedPaths = existing.selectedPaths
-        var codemapPaths = existing.autoCodemapPaths
-        var slices = existing.slices
-        var selectedSet = Set(selectedPaths)
-        var codemapSet = Set(codemapPaths)
-        var mutated = false
-
-        for file in resolution.candidates {
-            let path = file.standardizedFullPath
-            if !codemapOnly, selectedSet.contains(path) {
-                selectedPaths.removeAll { $0 == path }
-                selectedSet.remove(path)
-                mutated = true
-            }
-            if codemapSet.contains(path) {
-                codemapPaths.removeAll { $0 == path }
-                codemapSet.remove(path)
-                mutated = true
-            }
-            if !codemapOnly, removeSliceEntries(for: file, in: &slices) { mutated = true }
+        if mode == "codemap_only" {
+            let resolution = await resolveSelectionCandidates(
+                paths: paths,
+                rawPaths: rawPaths,
+                expandFolders: true,
+                allowEmptyFolderExpansion: true,
+                rootScope: rootScope
+            )
+            let removedPaths = Set(resolution.candidates.map(\.standardizedFullPath))
+            let selection = StoredSelection(
+                selectedPaths: existing.selectedPaths,
+                manualCodemapPaths: existing.manualCodemapPaths.filter { !removedPaths.contains($0) },
+                slices: existing.slices,
+                codemapAutoEnabled: existing.codemapAutoEnabled
+            )
+            return WorkspaceRemoveSelectionResult(
+                selection: selection,
+                invalidPaths: resolution.invalidPaths,
+                resolvedMap: resolution.resolvedMap,
+                mutated: selection != existing
+            )
         }
-
-        let disableAuto = codemapOnly && mutated
-        var selection = StoredSelection(
-            selectedPaths: selectedPaths,
-            autoCodemapPaths: codemapPaths,
-            slices: slices,
-            codemapAutoEnabled: disableAuto ? false : existing.codemapAutoEnabled
+        let resolution = await resolveSelectionCandidates(
+            paths: paths,
+            rawPaths: rawPaths,
+            expandFolders: true,
+            allowEmptyFolderExpansion: true,
+            rootScope: rootScope
         )
-        if selection.codemapAutoEnabled, !disableAuto {
-            selection = await recomputeAutoCodemaps(selection, rootScope: rootScope)
+        var selectedPaths = existing.selectedPaths
+        var slices = existing.slices
+        for file in resolution.candidates {
+            selectedPaths.removeAll { $0 == file.standardizedFullPath }
+            _ = removeSliceEntries(for: file, in: &slices)
         }
+        let selection = StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: existing.manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: existing.codemapAutoEnabled
+        )
         return WorkspaceRemoveSelectionResult(
             selection: selection,
             invalidPaths: resolution.invalidPaths,
@@ -461,10 +559,9 @@ struct WorkspaceSelectionMutationService {
     ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool) {
         let resolution = await resolveSelectionCandidates(paths: paths, rawPaths: rawPaths, expandFolders: false, rootScope: rootScope)
         var selectedPaths = existing.selectedPaths
-        var codemapPaths = existing.autoCodemapPaths
+        var manualCodemapPaths = existing.manualCodemapPaths
         var slices = existing.slices
         var selectedSet = Set(selectedPaths)
-        var codemapSet = Set(codemapPaths)
         var mutated = false
 
         for file in resolution.candidates {
@@ -474,15 +571,17 @@ struct WorkspaceSelectionMutationService {
                 selectedSet.insert(path)
                 mutated = true
             }
-            if codemapSet.contains(path) {
-                codemapPaths.removeAll { $0 == path }
-                codemapSet.remove(path)
-                mutated = true
-            }
+            manualCodemapPaths.removeAll { $0 == path }
             if removeSliceEntries(for: file, in: &slices) { mutated = true }
         }
 
-        return (StoredSelection(selectedPaths: selectedPaths, autoCodemapPaths: codemapPaths, slices: slices, codemapAutoEnabled: false), resolution.invalidPaths, mutated)
+        let selection = StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: existing.codemapAutoEnabled
+        )
+        return (selection, resolution.invalidPaths, selection != existing || mutated)
     }
 
     func demotePaths(
@@ -491,39 +590,42 @@ struct WorkspaceSelectionMutationService {
         rawPaths: [String],
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceDemoteSelectionResult {
-        if codemapsGloballyDisabled {
-            return WorkspaceDemoteSelectionResult(selection: existing, invalidPaths: [codemapsGloballyDisabledMessage], codemapUnavailable: [], mutated: false)
+        let resolution = await resolveCodemapOnlyCandidates(
+            paths: paths,
+            rawPaths: rawPaths,
+            expandFolders: false,
+            rootScope: rootScope
+        )
+        guard !resolution.candidates.isEmpty else {
+            return WorkspaceDemoteSelectionResult(
+                selection: existing,
+                invalidPaths: resolution.invalidPaths,
+                codemapUnavailable: resolution.codemapUnavailable,
+                mutated: false
+            )
         }
-        let resolution = await resolveSelectionCandidates(paths: paths, rawPaths: rawPaths, expandFolders: false, rootScope: rootScope)
         var selectedPaths = existing.selectedPaths
-        var codemapPaths = existing.autoCodemapPaths
         var slices = existing.slices
-        var selectedSet = Set(selectedPaths)
-        var codemapSet = Set(codemapPaths)
-        var unavailable: [String] = []
-        var mutated = false
-
+        var manualCodemapPaths = existing.manualCodemapPaths
+        var manualSet = Set(manualCodemapPaths)
         for file in resolution.candidates {
             let path = file.standardizedFullPath
-            guard supportsCodemap(file) else {
-                await unavailable.append("codemap unavailable: \(displayPath(for: file, rootScope: rootScope))")
-                continue
-            }
-            if selectedSet.contains(path) {
-                selectedPaths.removeAll { $0 == path }
-                selectedSet.remove(path)
-                mutated = true
-            }
-            if removeSliceEntries(for: file, in: &slices) { mutated = true }
-            if !codemapSet.contains(path) {
-                codemapPaths.append(path)
-                codemapSet.insert(path)
-                mutated = true
-            }
+            selectedPaths.removeAll { $0 == path }
+            _ = removeSliceEntries(for: file, in: &slices)
+            if manualSet.insert(path).inserted { manualCodemapPaths.append(path) }
         }
-
-        let selection = StoredSelection(selectedPaths: selectedPaths, autoCodemapPaths: codemapPaths, slices: slices, codemapAutoEnabled: false)
-        return WorkspaceDemoteSelectionResult(selection: selection, invalidPaths: resolution.invalidPaths, codemapUnavailable: unavailable, mutated: mutated)
+        let selection = StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: false
+        )
+        return WorkspaceDemoteSelectionResult(
+            selection: selection,
+            invalidPaths: resolution.invalidPaths,
+            codemapUnavailable: resolution.codemapUnavailable,
+            mutated: selection != existing
+        )
     }
 
     func resolveSelectionCandidates(
@@ -656,35 +758,297 @@ struct WorkspaceSelectionMutationService {
         return WorkspaceCodemapOnlyCandidates(candidates: candidates, resolvedMap: resolvedMap, invalidPaths: invalid, codemapUnavailable: unavailable)
     }
 
-    func recomputeAutoCodemaps(
-        _ base: StoredSelection,
+    /// Resolves graph-inferred codemap targets without folding them into `StoredSelection`.
+    /// Source lookup and root-scope validation happen before exact root-qualified identities
+    /// cross into the graph query.
+    func resolveAutomaticCodemapSelection(
+        for selection: StoredSelection,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> StoredSelection {
-        guard base.codemapAutoEnabled else { return base }
-        guard !codemapsGloballyDisabled else {
-            return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
+    ) async throws -> WorkspaceCodemapAutomaticSelectionResult? {
+        guard selection.codemapAutoEnabled, !codemapsGloballyDisabled else { return nil }
+
+        let selectedPaths = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
+        var inScopePaths: [String] = []
+        inScopePaths.reserveCapacity(selectedPaths.count)
+        for path in selectedPaths {
+            guard await store.exactPathResolutionIssue(
+                for: path,
+                kind: .file,
+                rootScope: rootScope
+            ) == nil else { continue }
+            inScopePaths.append(path)
         }
-        let selectedFileLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.selectedFileLookup)
-        let resolved = await store.lookupFiles(atPaths: base.selectedPaths, rootScope: rootScope)
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.selectedFileLookup, selectedFileLookup)
-        let selected = base.selectedPaths.compactMap { resolved[$0] }
-        guard !selected.isEmpty else {
-            return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
+        guard !inScopePaths.isEmpty else {
+            return WorkspaceCodemapAutomaticSelectionResult(roots: [])
         }
-        let codemapAPILoad = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad)
-        let aggregate = await store.codemapFileAPIAggregate(rootScope: rootScope)
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad, codemapAPILoad)
-        guard !aggregate.orderedFileAPIs.isEmpty else {
-            return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
-        }
-        let referencedPathResolution = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.referencedPathResolution)
-        let referenced = CodeMapExtractor.resolveReferencedFilePaths(
-            from: selected,
-            among: aggregate.orderedFileAPIs,
-            firstFileAPIByStandardizedNestedPath: aggregate.firstFileAPIByStandardizedNestedPath
+        let lookup = await store.lookupFiles(atPaths: inScopePaths, rootScope: rootScope)
+        return try await resolveAutomaticCodemapSelection(
+            sourceFileIDs: inScopePaths.compactMap { lookup[$0]?.id },
+            rootScope: rootScope
         )
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.referencedPathResolution, referencedPathResolution)
-        return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: referenced, slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
+    }
+
+    func resolveAutomaticCodemapSelection(
+        sourceFileIDs: [UUID],
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: sourceFileIDs,
+            rootScope: rootScope
+        )
+        guard !identities.isEmpty else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .unavailable([.emptySources])
+            )
+        }
+        let sourceLimit = await store.automaticCodemapSelectionSourceLimit()
+        guard identities.count <= sourceLimit else {
+            let issue = WorkspaceCodemapAutomaticSelectionIssue.budget(.sourceLimit(
+                attempted: identities.count,
+                limit: sourceLimit
+            ))
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .unavailable([issue])
+            )
+        }
+
+        let ownership = WorkspaceCodemapAutomaticSelectionDemandOwnership()
+        do {
+            var result = try await store.resolveAutomaticCodemapSelection(
+                sources: identities,
+                rootScope: rootScope
+            )
+            guard let receipt = result.receipt, !result.targets.isEmpty else { return result }
+
+            let initialRevalidation = await store.revalidateAutomaticCodemapSelection(
+                receipt,
+                rootScope: rootScope
+            )
+            let initiallyValid = Set(initialRevalidation.validTargets)
+            if let issue = automaticSelectionPolicy.candidateDemandLimitIssue(
+                attemptedCount: initiallyValid.count
+            ) {
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .unavailable([issue])
+                )
+            }
+            var resultsByTarget: [WorkspaceCodemapAutomaticSelectionTarget: WorkspaceCodemapArtifactDemandResult] = [:]
+            var ticketsByTarget: [WorkspaceCodemapAutomaticSelectionTarget: WorkspaceCodemapArtifactDemandTicket] = [:]
+            let rootReceiptByEpoch = Dictionary(uniqueKeysWithValues: receipt.roots.map { ($0.rootEpoch, $0) })
+            for target in result.targets where initiallyValid.contains(target) {
+                try Task.checkCancellation()
+                guard let rootReceipt = rootReceiptByEpoch[target.rootEpoch],
+                      let owned = await store.requestAutomaticCodemapTargetWithOwnership(
+                          target: target,
+                          rootReceipt: rootReceipt,
+                          rootScope: rootScope,
+                          priority: .background
+                      )
+                else {
+                    resultsByTarget[target] = .unavailable(.staleCurrentness)
+                    continue
+                }
+                await ownership.record(owned)
+                switch owned.ownership {
+                case let .created(ticket), let .joined(ticket):
+                    ticketsByTarget[target] = ticket
+                case .notAcquired:
+                    break
+                }
+                resultsByTarget[target] = owned.result
+            }
+
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: automaticSelectionPolicy.maximumTotalWait)
+            for round in 0 ..< automaticSelectionPolicy.maximumReadinessRounds {
+                try Task.checkCancellation()
+                var waiting = false
+                var retryAfter: [Int] = []
+                for (target, current) in resultsByTarget {
+                    let refreshed: WorkspaceCodemapArtifactDemandResult = switch current {
+                    case let .pending(ticket):
+                        await store.codemapArtifactDemandStatus(ticket)
+                    case .ready, .unavailable:
+                        current
+                    }
+                    resultsByTarget[target] = refreshed
+                    switch refreshed {
+                    case .pending:
+                        waiting = true
+                    case let .unavailable(.busy(milliseconds)):
+                        waiting = true
+                        if let milliseconds { retryAfter.append(milliseconds) }
+                    case .ready, .unavailable:
+                        break
+                    }
+                }
+                guard waiting,
+                      round + 1 < automaticSelectionPolicy.maximumReadinessRounds,
+                      clock.now < deadline
+                else { break }
+                try await waitForAutomaticSelectionReadiness(
+                    round: round,
+                    suggestedMilliseconds: retryAfter,
+                    clock: clock,
+                    deadline: deadline
+                )
+                for (target, current) in resultsByTarget {
+                    guard case .unavailable(.busy) = current,
+                          let rootReceipt = rootReceiptByEpoch[target.rootEpoch]
+                    else { continue }
+                    if let priorTicket = ticketsByTarget.removeValue(forKey: target) {
+                        _ = await store.cancelCodemapArtifactDemand(priorTicket)
+                    }
+                    if let owned = await store.requestAutomaticCodemapTargetWithOwnership(
+                        target: target,
+                        rootReceipt: rootReceipt,
+                        rootScope: rootScope,
+                        priority: .background
+                    ) {
+                        await ownership.record(owned)
+                        switch owned.ownership {
+                        case let .created(ticket), let .joined(ticket):
+                            ticketsByTarget[target] = ticket
+                        case .notAcquired:
+                            break
+                        }
+                        resultsByTarget[target] = owned.result
+                    }
+                }
+            }
+
+            let finalRevalidation = await store.revalidateAutomaticCodemapSelection(
+                receipt,
+                rootScope: rootScope
+            )
+            let finallyValid = Set(finalRevalidation.validTargets)
+            let readyTargets = Set(resultsByTarget.compactMap { target, demand -> WorkspaceCodemapAutomaticSelectionTarget? in
+                guard finallyValid.contains(target), case .ready = demand else { return nil }
+                return target
+            })
+            let invalidIssuesByRoot = Dictionary(grouping: finalRevalidation.issues) { issue -> WorkspaceCodemapRootEpoch? in
+                switch issue {
+                case let .rootEpochChanged(rootEpoch), let .graphNotInitialized(rootEpoch),
+                     let .updatesPending(rootEpoch), let .reconciling(rootEpoch),
+                     let .graphUnavailable(rootEpoch), let .graphRevoked(rootEpoch, _),
+                     let .receiptInvalid(rootEpoch, _):
+                    rootEpoch
+                case let .targetNotCataloged(rootEpoch, _), let .targetGenerationChanged(rootEpoch, _),
+                     let .targetLogicalPathUnavailable(rootEpoch, _), let .targetDemandPending(rootEpoch, _),
+                     let .targetDemandUnavailable(rootEpoch, _, _):
+                    rootEpoch
+                case let .sourceOutsideRootScope(source), let .sourceNotCataloged(source),
+                     let .sourcePending(source), let .sourceNotIndexed(source),
+                     let .sourceExcluded(source), let .sourceFenced(source),
+                     let .sourceGenerationChanged(source, _):
+                    source.rootEpoch
+                case .emptySources, .rootScopeChanged, .budget:
+                    nil
+                }
+            }
+
+            let roots = result.roots.map { root -> WorkspaceCodemapAutomaticSelectionRootResult in
+                var issues = root.issues + (invalidIssuesByRoot[root.rootEpoch] ?? [])
+                for target in root.targets {
+                    guard let demand = resultsByTarget[target] else { continue }
+                    switch demand {
+                    case .ready:
+                        break
+                    case .pending:
+                        issues.append(.targetDemandPending(
+                            rootEpoch: target.rootEpoch,
+                            fileID: target.fileID
+                        ))
+                    case let .unavailable(reason):
+                        issues.append(.targetDemandUnavailable(
+                            rootEpoch: target.rootEpoch,
+                            fileID: target.fileID,
+                            reason: reason
+                        ))
+                    }
+                }
+                issues = issues.reduce(into: []) { unique, issue in
+                    if !unique.contains(issue) { unique.append(issue) }
+                }.sorted(by: automaticSelectionIssuePrecedes)
+                let targets = root.targets.filter { readyTargets.contains($0) }
+                let hasPendingDemand = issues.contains { issue in
+                    if case .targetDemandPending = issue { return true }
+                    return false
+                }
+                let status: WorkspaceCodemapAutomaticSelectionStatus = if !targets.isEmpty {
+                    issues.isEmpty ? .ok : .partial
+                } else if hasPendingDemand || root.status == .pending {
+                    .pending
+                } else {
+                    .unavailable
+                }
+                let rootReceipt = root.receipt.map {
+                    WorkspaceCodemapAutomaticSelectionRootReceipt(
+                        rootEpoch: $0.rootEpoch,
+                        graphReceipt: $0.graphReceipt,
+                        sources: $0.sources,
+                        targets: $0.targets.filter { readyTargets.contains($0) }
+                    )
+                }
+                return WorkspaceCodemapAutomaticSelectionRootResult(
+                    rootEpoch: root.rootEpoch,
+                    status: status,
+                    targets: targets,
+                    sources: root.sources,
+                    issues: issues,
+                    coverage: root.coverage,
+                    graphTargetCount: root.graphTargetCount,
+                    graphResolutionCount: root.graphResolutionCount,
+                    graphReferenceFailureCount: root.graphReferenceFailureCount,
+                    graphByteCount: root.graphByteCount,
+                    receipt: rootReceipt
+                )
+            }
+            let receiptRoots = roots.compactMap { root -> WorkspaceCodemapAutomaticSelectionRootReceipt? in
+                guard !root.targets.isEmpty else { return nil }
+                return root.receipt
+            }
+            let finalReceipt = receiptRoots.isEmpty ? nil : WorkspaceCodemapAutomaticSelectionReceipt(
+                rootScope: receipt.rootScope,
+                rootScopeEpochs: receipt.rootScopeEpochs,
+                roots: receiptRoots
+            )
+            result = WorkspaceCodemapAutomaticSelectionResult(roots: roots, receipt: finalReceipt)
+            await releaseAutomaticSelectionOwnership(ownership)
+            return result
+        } catch {
+            await releaseAutomaticSelectionOwnership(ownership)
+            throw error
+        }
+    }
+
+    private func waitForAutomaticSelectionReadiness(
+        round: Int,
+        suggestedMilliseconds: [Int],
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async throws {
+        let shift = min(round, 20)
+        let exponential = automaticSelectionPolicy.initialBackoffMilliseconds << shift
+        let bounded = min(automaticSelectionPolicy.maximumBackoffMilliseconds, exponential)
+        let suggested = suggestedMilliseconds.max() ?? 0
+        let milliseconds = max(bounded, suggested)
+        let proposed = Duration.milliseconds(milliseconds)
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { return }
+        try await automaticSelectionWaiter.sleep(min(proposed, remaining))
+    }
+
+    private func releaseAutomaticSelectionOwnership(
+        _ ownership: WorkspaceCodemapAutomaticSelectionDemandOwnership
+    ) async {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(1))
+        for ticket in await ownership.drainRetainedTickets() {
+            _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
+        }
     }
 
     private func orderedInputs(_ paths: [String]) -> [String] {
@@ -717,13 +1081,18 @@ struct WorkspaceSelectionMutationService {
         return normalized
     }
 
-    private func removeSliceEntries(for file: WorkspaceFileRecord, in slices: inout [String: [LineRange]]) -> Bool {
+    private func removeSliceEntries(
+        for file: WorkspaceFileRecord,
+        in slices: inout [String: [LineRange]]
+    ) -> Bool {
         var mutated = false
         let variants = [file.standardizedFullPath, file.fullPath, file.relativePath]
         for key in variants where slices.removeValue(forKey: key) != nil {
             mutated = true
         }
-        let matchingKeys = slices.keys.filter { StoredSelectionPathNormalization.standardizedPath($0) == file.standardizedFullPath }
+        let matchingKeys = slices.keys.filter {
+            StoredSelectionPathNormalization.standardizedPath($0) == file.standardizedFullPath
+        }
         for key in matchingKeys {
             slices.removeValue(forKey: key)
             mutated = true
@@ -737,9 +1106,18 @@ struct WorkspaceSelectionMutationService {
         return SyntaxManager.supportsCodeMap(fileExtension: ext)
     }
 
-    private func displayPath(for file: WorkspaceFileRecord, rootScope: WorkspaceLookupRootScope) async -> String {
+    private func displayPath(
+        for file: WorkspaceFileRecord,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> String {
         let roots = await store.rootRefs(scope: rootScope)
-        guard let root = roots.first(where: { $0.id == file.rootID }) else { return file.standardizedFullPath }
-        return ClientPathFormatter.displayPath(root: root, relativePath: file.standardizedRelativePath, visibleRoots: roots)
+        guard let root = roots.first(where: { $0.id == file.rootID }) else {
+            return file.standardizedFullPath
+        }
+        return ClientPathFormatter.displayPath(
+            root: root,
+            relativePath: file.standardizedRelativePath,
+            visibleRoots: roots
+        )
     }
 }

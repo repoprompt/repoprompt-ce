@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class CodexFallbackFIFOTests: XCTestCase {
@@ -227,6 +227,70 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 && session.codexFallbackDispatchInFlight?.id == queueID
         }
         XCTAssertNil(session.codexAuthoritativeActiveTurn)
+    }
+
+    func testDurablyQueuedMCPFallbackInterruptsWaiterOnlyAfterQueueAck() async throws {
+        let steerGate = FallbackStartGate()
+        let controller = FallbackFIFOController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            steerResults: [
+                .failure(CodexTurnSteerError.noActiveTurn(
+                    requestFailure(message: "no active turn to steer")
+                ))
+            ],
+            steerGate: steerGate
+        )
+        let (viewModel, session, sessionID) = try await makeMCPRunningSession(controller: controller)
+        let context = try XCTUnwrap(session.mcpControlContext)
+        defer {
+            Task {
+                await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+            }
+        }
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: context.registration,
+            epoch: context.currentEpoch
+        )
+        let wait = Task.detached {
+            await AgentRunSessionStore.waitUntilInteresting(cursor: cursor, timeoutSeconds: 5)
+        }
+
+        let dispatch = Task {
+            try await viewModel.mcpDispatchInstruction(
+                sessionID: sessionID,
+                text: "start after idle",
+                allowStartingRun: false
+            )
+        }
+        guard await steerGate.waitUntilWaiting() else {
+            dispatch.cancel()
+            return XCTFail("Codex steer did not reach the gated provider path")
+        }
+        let prematureDisposition = await AgentRunSessionStore.waitUntilInteresting(
+            cursor: cursor,
+            timeoutSeconds: 0.05
+        )
+        assertDidNotReleaseAsSteering(prematureDisposition, sessionID: sessionID)
+        XCTAssertTrue(
+            session.codexFallbackQueue.isEmpty,
+            "The fallback should not be visible before the provider failure is converted into a durable queue entry."
+        )
+
+        await steerGate.release()
+        let delivery = try await dispatch.value
+        XCTAssertEqual(delivery, .queuedFollowUp)
+        let attemptID = try XCTUnwrap(session.codexSteerAckTracker.test_latestAttemptID)
+        let terminalState = await session.codexSteerAckTracker.awaitTerminalState(attemptID: attemptID)
+        guard case .durablyQueued = terminalState else {
+            return XCTFail("Expected durable queue acknowledgement for MCP fallback, got \(terminalState)")
+        }
+        let disposition = await wait.value
+        assertAcceptedDispatchReleasedWaiter(
+            disposition,
+            sessionID: sessionID,
+            expectedSteeringMessage: "start after idle"
+        )
     }
 
     func testNoActiveFallbackRetriesTransientSnapshotFailure() async throws {
@@ -781,6 +845,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             fallbackContext: context
         )
         XCTAssertEqual(session.codexFallbackQueue.count, 1)
+        session.deferredActiveAgentRunTimerRollback = .init(
+            originalStartedAt: Date(timeIntervalSinceNow: -60)
+        )
 
         viewModel.clearChat(tabID: session.tabID)
 
@@ -792,6 +859,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
         XCTAssertNil(session.codexFallbackDispatchInFlight)
         XCTAssertTrue(session.items.isEmpty)
+        XCTAssertNil(session.deferredActiveAgentRunTimerRollback)
         XCTAssertNil(viewModel.draftRestorationEvent)
     }
 
@@ -809,6 +877,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
@@ -820,7 +891,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runAttemptID: session.activeRunAttemptID!
         )
         session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
         return (viewModel, session)
     }
 
@@ -850,6 +925,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback.mcp")
         session.codexController = controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(nil)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = .init(
             threadID: "thread",
@@ -861,7 +939,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runAttemptID: session.activeRunAttemptID!
         )
         session.codexRoutingObservedTurnID = "turn"
-        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false,
+            goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+        )
         return (viewModel, session, sessionID)
     }
 
@@ -873,7 +955,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: "/tmp/workspace",
+            workspacePaths: .uniform("/tmp/workspace"),
             requestExecutor: { method, params, timeout in
                 try recorder.handle(method: method, params: params, timeout: timeout)
             }
@@ -918,6 +1000,52 @@ final class CodexFallbackFIFOTests: XCTestCase {
         .init(method: "turn/steer", code: -32602, message: message, data: data)
     }
 
+    private func assertAcceptedDispatchReleasedWaiter(
+        _ disposition: AgentRunSessionStore.WaitDisposition,
+        sessionID: UUID,
+        expectedSteeringMessage: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        switch disposition {
+        case let .noteworthySnapshot(wake):
+            XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+            XCTAssertEqual(wake.steeringMessage, expectedSteeringMessage, file: file, line: line)
+        case let .snapshotReady(snapshot):
+            XCTAssertEqual(snapshot.sessionID, sessionID, file: file, line: line)
+        default:
+            XCTFail("Expected accepted dispatch to release waiter, got \(disposition)", file: file, line: line)
+        }
+    }
+
+    private func assertDidNotReleaseAsSteering(
+        _ disposition: AgentRunSessionStore.WaitDisposition,
+        sessionID: UUID,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        if case let .noteworthySnapshot(wake) = disposition,
+           wake.reason == .steeringRequested
+        {
+            XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+            XCTFail("Codex fallback must not release waiters as steeringRequested before durable queue ack", file: file, line: line)
+        }
+    }
+
+    private func assertSteeringRequested(
+        _ disposition: AgentRunSessionStore.WaitDisposition,
+        sessionID: UUID,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .noteworthySnapshot(wake) = disposition else {
+            return XCTFail("Expected steering wake, got \(disposition)", file: file, line: line)
+        }
+        XCTAssertEqual(wake.reason, .steeringRequested, file: file, line: line)
+        XCTAssertEqual(wake.snapshot.sessionID, sessionID, file: file, line: line)
+    }
+
     private func waitUntil(
         timeout: TimeInterval = 2,
         _ predicate: @escaping () -> Bool
@@ -937,6 +1065,7 @@ private final class FallbackFIFOController: CodexSessionControlling {
     private var snapshotResults: [Result<CodexNativeSessionController.ThreadSnapshot, Error>]
     private var steerResults: [Result<CodexTurnSteerReceipt, Error>]
     private let startGate: FallbackStartGate?
+    private let steerGate: FallbackStartGate?
 
     private(set) var steerTurnIDs: [String] = []
     private(set) var startCount = 0
@@ -947,13 +1076,15 @@ private final class FallbackFIFOController: CodexSessionControlling {
         activeTurnIDs: [String] = ["turn"],
         snapshotResults: [Result<CodexNativeSessionController.ThreadSnapshot, Error>] = [],
         steerResults: [Result<CodexTurnSteerReceipt, Error>],
-        startGate: FallbackStartGate? = nil
+        startGate: FallbackStartGate? = nil,
+        steerGate: FallbackStartGate? = nil
     ) {
         self.snapshot = snapshot
         self.activeTurnIDs = activeTurnIDs
         self.snapshotResults = snapshotResults
         self.steerResults = steerResults
         self.startGate = startGate
+        self.steerGate = steerGate
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -1042,6 +1173,7 @@ private final class FallbackFIFOController: CodexSessionControlling {
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         steerTurnIDs.append(expectedTurnID)
+        await steerGate?.wait()
         guard !steerResults.isEmpty else {
             return .init(acceptedTurnID: expectedTurnID)
         }
@@ -1125,10 +1257,21 @@ private final class MismatchRetryNativeControllerRecorder: @unchecked Sendable {
 private actor FallbackStartGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private var released = false
+    private var waiting = false
 
     func wait() async {
         guard !released else { return }
+        waiting = true
         await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilWaiting(timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if waiting { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return waiting
     }
 
     func release() {

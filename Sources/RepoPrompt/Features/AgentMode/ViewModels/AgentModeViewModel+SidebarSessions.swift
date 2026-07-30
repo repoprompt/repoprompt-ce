@@ -27,6 +27,13 @@ extension AgentModeViewModel {
         let dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
     }
 
+    struct ArchivedHUDSessionDescriptor {
+        let stashedTab: StashedTab
+        let entry: AgentSessionIndexEntry?
+        let dateInfo: SidebarSessionDateInfo
+        let searchFields: AgentSessionSearchFields
+    }
+
     private struct ArchivedSidebarSessionLookup {
         let entriesByExplicitSessionID: [UUID: AgentSessionIndexEntry]
         let entriesByTabID: [UUID: [AgentSessionIndexEntry]]
@@ -70,6 +77,30 @@ extension AgentModeViewModel {
         )
     }
 
+    private func archivedSidebarEntry(
+        for stashedTab: StashedTab,
+        lookup: ArchivedSidebarSessionLookup
+    ) -> AgentSessionIndexEntry? {
+        lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID)
+            ?? preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup)
+    }
+
+    private func archivedSidebarSearchFields(
+        for stashedTab: StashedTab,
+        entry: AgentSessionIndexEntry?
+    ) -> AgentSessionSearchFields {
+        AgentModeSidebarSessionBuilder.searchFields(
+            title: AgentSessionRestoreSupport.normalizedSessionTitle(entry?.name ?? stashedTab.tab.name),
+            entry: entry,
+            runState: entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
+            isMCPControlled: entry?.isMCPOriginated == true,
+            worktree: nil,
+            mergeAttention: nil,
+            sessionID: stashedTab.tab.activeAgentSessionID ?? entry?.id,
+            tabID: stashedTab.tab.id
+        )
+    }
+
     private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
         let frozenOrder = ownerValidatedSidebarRestoreFrozenOrderByTabID
         guard !ownerValidatedSessionListCacheReady, !frozenOrder.isEmpty else { return false }
@@ -110,6 +141,31 @@ extension AgentModeViewModel {
 
     func archivedSessionDateInfo(for stashedTab: StashedTab) -> SidebarSessionDateInfo {
         archivedSessionDateInfo(for: stashedTab, lookup: archivedSidebarSessionLookup())
+    }
+
+    func archivedHUDSessionDescriptors(_ stashedTabs: [StashedTab]) -> [ArchivedHUDSessionDescriptor] {
+        let lookup = archivedSidebarSessionLookup()
+        let filteredTabs = filteredArchivedSessionTabs(
+            stashedTabs,
+            searchText: nil,
+            lookup: lookup
+        )
+        let dateInfoByID = archivedSessionDateInfoByID(for: filteredTabs, lookup: lookup)
+        let sortedTabs = sortedFilteredArchivedSessionTabs(
+            filteredTabs,
+            diagnosticInputStashedCount: stashedTabs.count,
+            diagnosticSearchActive: false,
+            dateInfoByID: dateInfoByID
+        )
+        return sortedTabs.map { stashedTab in
+            let entry = archivedSidebarEntry(for: stashedTab, lookup: lookup)
+            return ArchivedHUDSessionDescriptor(
+                stashedTab: stashedTab,
+                entry: entry,
+                dateInfo: dateInfoByID[stashedTab.id] ?? archivedSessionDateInfo(for: stashedTab, lookup: lookup),
+                searchFields: archivedSidebarSearchFields(for: stashedTab, entry: entry)
+            )
+        }
     }
 
     private func archivedSessionDateInfo(
@@ -178,11 +234,15 @@ extension AgentModeViewModel {
             let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let trimmedSearch = searchText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let query = AgentSessionSearchQuery.parse(trimmedSearch)
         let filteredTabs = stashedTabs.filter { stashed in
-            guard trimmedSearch.isEmpty || stashed.tab.name.localizedCaseInsensitiveContains(trimmedSearch) else {
-                return false
-            }
-            return shouldShowArchivedSession(for: stashed, lookup: lookup)
+            guard shouldShowArchivedSession(for: stashed, lookup: lookup) else { return false }
+            guard !query.isEmpty else { return true }
+            let entry = archivedSidebarEntry(for: stashed, lookup: lookup)
+            return AgentSessionSearchMatcher.matches(
+                query: query,
+                fields: archivedSidebarSearchFields(for: stashed, entry: entry)
+            )
         }
         #if DEBUG
             AgentModePerfDiagnostics.durationEvent(
@@ -349,20 +409,54 @@ extension AgentModeViewModel {
 
     func collapsibleSidebarThreadKeys(
         for tabs: [ComposeTabState],
-        currentTabID: UUID?,
+        currentTabID _: UUID?,
         searchText: String,
-        diagnosticSource: String? = nil
+        diagnosticSource _: String? = nil
     ) -> [AgentSidebarThreadKey] {
+        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let rows = sidebarSessions(for: tabs)
+        guard !rows.isEmpty else { return [] }
+        return rows.indices.compactMap { index in
+            let nextIndex = rows.index(after: index)
+            guard nextIndex < rows.endIndex,
+                  rows[nextIndex].depth > rows[index].depth
+            else { return nil }
+            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
+        }
+    }
+
+    func displaySidebarSessions(
+        for tabs: [ComposeTabState],
+        currentTabID: UUID?,
+        searchText: String? = nil,
+        diagnosticSource: String? = nil
+    ) -> [SidebarSession] {
         filteredSidebarSessions(
             for: tabs,
             currentTabID: currentTabID,
-            searchText: searchText,
+            searchText: searchText ?? sessionSidebarSearchText,
             diagnosticSource: diagnosticSource
         )
-        .compactMap { row in
-            guard row.depth == 0, row.hasThreadChildren, let key = row.threadKey else { return nil }
-            return key
+    }
+
+    func defaultCollapsedSidebarThreadKeys(
+        for tabs: [ComposeTabState],
+        searchText: String
+    ) -> [AgentSidebarThreadKey] {
+        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let rows = sidebarSessions(for: tabs)
+        return rows.indices.compactMap { index -> AgentSidebarThreadKey? in
+            let nextIndex = rows.index(after: index)
+            guard rows[index].depth > 0,
+                  nextIndex < rows.endIndex,
+                  rows[nextIndex].depth > rows[index].depth
+            else { return nil }
+            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
         }
+    }
+
+    func seedDefaultCollapsedSidebarThreads(_ eligibleKeys: [AgentSidebarThreadKey]) {
+        ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
     }
 
     func filteredSidebarSessions(
@@ -396,12 +490,16 @@ extension AgentModeViewModel {
                 uniquingKeysWith: { _, new in new }
             )
 
-            // Collect direct matches
+            let query = AgentSessionSearchQuery.parse(searchTrimmed)
+
+            // Collect direct matches and include their ancestor chain so matching
+            // child sessions remain visible in threaded context. Do not inject
+            // the active session unless it is an actual match; otherwise sidebar
+            // search presents false positives for arbitrary queries.
             var matchedIDs = Set<UUID>()
             for session in sortedSessions {
-                if session.title.localizedCaseInsensitiveContains(searchTrimmed) {
+                if AgentSessionSearchMatcher.matches(query: query, fields: session.searchFields) {
                     matchedIDs.insert(session.id)
-                    // Include ancestor chain
                     var cursor = session.parentSessionID
                     var visitedSessionIDs: Set<UUID> = []
                     while let pid = cursor,
@@ -411,22 +509,6 @@ extension AgentModeViewModel {
                         matchedIDs.insert(parent.id)
                         cursor = parent.parentSessionID
                     }
-                }
-            }
-
-            // Include active session's ancestor chain
-            if let activeTabID = currentTabID,
-               let activeSession = sortedSessions.first(where: { $0.tabID == activeTabID })
-            {
-                matchedIDs.insert(activeSession.id)
-                var cursor = activeSession.parentSessionID
-                var visitedSessionIDs: Set<UUID> = []
-                while let pid = cursor,
-                      visitedSessionIDs.insert(pid).inserted,
-                      let parent = sessionByID[pid]
-                {
-                    matchedIDs.insert(parent.id)
-                    cursor = parent.parentSessionID
                 }
             }
 
@@ -617,7 +699,8 @@ extension AgentModeViewModel {
             isThreadCollapsed: isThreadCollapsed,
             hiddenThreadDescendantCount: hiddenThreadDescendantCount,
             hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
-            threadActivityDate: threadActivityDate
+            threadActivityDate: threadActivityDate,
+            searchFields: row.searchFields
         )
     }
 
@@ -763,6 +846,47 @@ extension AgentModeViewModel {
         )
         guard index < pagedSessions.count else { return nil }
         return pagedSessions[index].tabID
+    }
+
+    func adjacentParentSidebarSessionTabID(
+        from activeTabID: UUID?,
+        forward: Bool,
+        in tabs: [ComposeTabState]
+    ) -> UUID? {
+        Self.adjacentParentSidebarSessionTabID(
+            from: activeTabID,
+            forward: forward,
+            rows: sidebarSessions(for: tabs)
+        )
+    }
+
+    static func adjacentParentSidebarSessionTabID(
+        from activeTabID: UUID?,
+        forward: Bool,
+        rows: [SidebarSession]
+    ) -> UUID? {
+        let rootIndices = rows.indices.filter { rows[$0].depth == 0 }
+        guard !rootIndices.isEmpty else { return nil }
+        guard rootIndices.count > 1 else {
+            let rootIndex = rootIndices[0]
+            let rootTabID = rows[rootIndex].tabID
+            guard let activeTabID,
+                  let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
+            else {
+                return rootTabID
+            }
+            return activeIndex == rootIndex ? nil : rootTabID
+        }
+        guard let activeTabID,
+              let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
+        else {
+            return rows[forward ? rootIndices[0] : rootIndices[rootIndices.count - 1]].tabID
+        }
+
+        let currentRootOrdinal = rootIndices.lastIndex(where: { $0 <= activeIndex }) ?? 0
+        let offset = forward ? 1 : -1
+        let nextRootOrdinal = (currentRootOrdinal + offset + rootIndices.count) % rootIndices.count
+        return rows[rootIndices[nextRootOrdinal]].tabID
     }
 
     /// Deterministic ordering for the Agent Mode tab sidebar fallback.

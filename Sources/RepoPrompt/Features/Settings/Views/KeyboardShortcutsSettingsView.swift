@@ -18,7 +18,9 @@ enum KeyboardShortcutCatalog {
             blurb: "Agent shortcuts apply when a real workspace is open. New chat matches the titlebar New Session button.",
             bindings: [
                 .init(id: "agent-new", title: "New Agent chat", detail: nil, name: .agentNewChat),
-                .init(id: "toggle-sidebar", title: "Toggle session sidebar", detail: "Show or hide the Agent sessions list.", name: .toggleNavigationSidebar)
+                .init(id: "toggle-sidebar", title: "Toggle session sidebar", detail: "Show or hide the Agent sessions list.", name: .toggleNavigationSidebar),
+                .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
+                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD)
             ]
         ),
         KeyboardShortcutCatalogSection(
@@ -74,7 +76,9 @@ enum KeyboardShortcutCatalog {
             .init(id: "compose-new", title: "New Agent session tab", detail: nil, name: .newComposeTab),
             .init(id: "compose-close", title: "Close active Agent session tab", detail: nil, name: .closeComposeTab),
             .init(id: "compose-next", title: "Next Agent session tab", detail: nil, name: .nextComposeTab),
-            .init(id: "compose-prev", title: "Previous Agent session tab", detail: nil, name: .previousComposeTab)
+            .init(id: "compose-prev", title: "Previous Agent session tab", detail: nil, name: .previousComposeTab),
+            .init(id: "compose-parent-next", title: "Next parent Agent session", detail: "Cycle root sidebar rows only; child sessions stay grouped under their parent.", name: .nextParentAgentSession),
+            .init(id: "compose-parent-prev", title: "Previous parent Agent session", detail: "Cycle root sidebar rows only; child sessions stay grouped under their parent.", name: .previousParentAgentSession)
         ]
         let tabNames: [KeyboardShortcuts.Name] = [
             .switchToComposeTab1, .switchToComposeTab2, .switchToComposeTab3, .switchToComposeTab4, .switchToComposeTab5,

@@ -88,9 +88,13 @@ enum AgentSupportDirectoryCatalog {
     ) -> Bool {
         let normalizedDirectory = normalizedPath(for: directoryPath)
         guard normalizedDirectory.hasPrefix("/") else { return false }
-        for candidate in containmentCandidates(for: absolutePath, fileManager: fileManager) {
-            if candidate == normalizedDirectory || candidate.hasPrefix(normalizedDirectory + "/") {
-                return true
+        let directoryCandidates = containmentCandidates(for: normalizedDirectory, fileManager: fileManager)
+        let pathCandidates = containmentCandidates(for: absolutePath, fileManager: fileManager)
+        for directoryCandidate in directoryCandidates {
+            for pathCandidate in pathCandidates {
+                if pathCandidate == directoryCandidate || pathCandidate.hasPrefix(directoryCandidate + "/") {
+                    return true
+                }
             }
         }
         return false

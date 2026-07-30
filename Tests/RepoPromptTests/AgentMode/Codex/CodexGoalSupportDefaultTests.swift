@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@_spi(TestSupport) @testable import RepoPrompt
+@_spi(TestSupport) @testable import RepoPromptApp
 
 @MainActor
 final class CodexGoalSupportDefaultTests: XCTestCase {
@@ -36,6 +36,27 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         XCTAssertTrue(CodexGoalSupport.isEnabled(defaults: defaults))
     }
 
+    func testMissingUserDefaultsReasoningSummariesKeyDefaultsDisabled() throws {
+        let defaults = try makeIsolatedDefaults()
+
+        XCTAssertNil(defaults.object(forKey: CodexReasoningSummaries.defaultsKey))
+        XCTAssertFalse(CodexReasoningSummaries.isEnabled(defaults: defaults))
+    }
+
+    func testExplicitUserDefaultsReasoningSummariesTrueEnablesSummaries() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: CodexReasoningSummaries.defaultsKey)
+
+        XCTAssertTrue(CodexReasoningSummaries.isEnabled(defaults: defaults))
+    }
+
+    func testExplicitUserDefaultsReasoningSummariesFalseDisablesSummaries() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(false, forKey: CodexReasoningSummaries.defaultsKey)
+
+        XCTAssertFalse(CodexReasoningSummaries.isEnabled(defaults: defaults))
+    }
+
     func testMissingGlobalSettingsGoalScalarDefaultsEnabled() throws {
         let store = try makeStore(document: GlobalSettingsDocument(
             scalarPreferences: GlobalScalarPreferences(agentMode: .init())
@@ -59,6 +80,71 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         ))
 
         XCTAssertTrue(store.codexGoalSupportEnabled())
+    }
+
+    func testMissingGlobalSettingsReasoningSummariesScalarDefaultsDisabled() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+
+        XCTAssertFalse(store.codexReasoningSummariesEnabled())
+    }
+
+    func testExplicitGlobalSettingsReasoningSummariesTrueEnablesSummaries() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexReasoningSummariesEnabled: true))
+        ))
+
+        XCTAssertTrue(store.codexReasoningSummariesEnabled())
+    }
+
+    func testExplicitGlobalSettingsReasoningSummariesFalseDisablesSummaries() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexReasoningSummariesEnabled: false))
+        ))
+
+        XCTAssertFalse(store.codexReasoningSummariesEnabled())
+    }
+
+    func testProviderConversationCleanupActionDefaultsArchiveAndPersistsDelete() throws {
+        let defaultStore = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+        XCTAssertEqual(defaultStore.providerConversationCleanupAction(), .archive)
+
+        let deleteStore = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(providerConversationCleanupAction: "delete"))
+        ))
+        XCTAssertEqual(deleteStore.providerConversationCleanupAction(), .delete)
+    }
+
+    func testProviderConversationCleanupHandleFallsBackToProviderSessionID() throws {
+        let result = AIStreamResult(
+            type: "message_stop",
+            text: nil,
+            providerSessionID: " claude-session-1 "
+        )
+
+        let handle = try XCTUnwrap(AIQueriesService.cleanupHandle(for: result, model: .claudeCodeSonnet))
+        XCTAssertEqual(handle.provider, "claudeCode")
+        XCTAssertEqual(handle.sessionID, "claude-session-1")
+        XCTAssertNil(handle.conversationID)
+    }
+
+    func testProviderConversationCleanupHandlePrefersExplicitHandle() throws {
+        let explicit = ProviderConversationCleanupHandle(
+            provider: "custom-provider",
+            conversationID: "conversation-1"
+        )
+        let result = AIStreamResult(
+            type: "message_stop",
+            text: nil,
+            providerSessionID: "session-ignored",
+            cleanupHandle: explicit
+        )
+
+        let handle = try XCTUnwrap(AIQueriesService.cleanupHandle(for: result, model: .claudeCodeSonnet))
+        XCTAssertEqual(handle, explicit)
     }
 
     private func makeIsolatedDefaults() throws -> UserDefaults {

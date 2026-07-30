@@ -24,7 +24,7 @@ final class AppDeepLinkRouter {
         case let .route(.legacyURL(legacyURL)):
             routeLegacyURL(legacyURL, preferredWindow: preferredLegacyWindow)
         case let .route(.agentSession(route)):
-            await routeAgentSession(route)
+            await routeAgentSession(route, sourceURL: url)
         case .invalidScopedRoute:
             NSApp.activate(ignoringOtherApps: true)
         case .unsupported:
@@ -51,7 +51,11 @@ final class AppDeepLinkRouter {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        await routeAgentSession(route)
+        _ = await self.route(agentSession: route)
+    }
+
+    func route(agentSession route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
+        await routeAgentSession(route, sourceURL: nil)
     }
 
     private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) {
@@ -77,16 +81,27 @@ final class AppDeepLinkRouter {
         }
     }
 
-    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute) async {
-        NSApp.activate(ignoringOtherApps: true)
+    @discardableResult
+    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, sourceURL: URL?) async -> AgentSessionRouteResult {
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        if let app = NSApp {
+            app.activate(ignoringOtherApps: true)
+        }
+        guard !liveWindows.isEmpty else {
+            if let sourceURL {
+                windowStatesManager.pendingURLs.append(sourceURL)
+            }
+            return .workspaceUnavailable
+        }
         var attemptedWindowIDs = Set<Int>()
+        var latestResult: AgentSessionRouteResult = .workspaceUnavailable
 
         for candidate in Self.agentSessionPreferredExistingWindows(for: route, in: liveWindows) {
             attemptedWindowIDs.insert(candidate.windowID)
             let result = await routeAgentSession(route, on: candidate)
+            latestResult = result
             if result == .routed || !Self.shouldTryNextAgentSessionWindow(after: result) {
-                return
+                return result
             }
         }
 
@@ -94,10 +109,12 @@ final class AppDeepLinkRouter {
             where !attemptedWindowIDs.contains(candidate.windowID)
         {
             let result = await routeAgentSession(route, on: candidate)
+            latestResult = result
             if result == .routed || !Self.shouldTryNextAgentSessionWindow(after: result) {
-                return
+                return result
             }
         }
+        return latestResult
     }
 
     private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, on targetWindow: WindowState) async -> AgentSessionRouteResult {

@@ -1,0 +1,43 @@
+{
+  "counts": {
+    "provider": 7,
+    "root": 2835,
+    "total": 2842
+  },
+  "git": {
+    "commit": "e92a73ad4d8216830d7afbcfbf8c9cb0362c1044",
+    "working_tree": " M Tests/RepoPromptTests/MCP/MCPCodeStructureWorktreeTests.swift\n M Tests/RepoPromptTests/WorkspaceContext/WorkspaceCodemapBindingEngineTests.swift\n?? prompt-exports/oracle-plan-2026-07-02-084717-counter-flakes-53b15-68c4.md"
+  },
+  "ledger": "/var/folders/8b/tgpwpwcx4pv57dhcxyd8m0_c0000gn/T/tmp.ftHFhDjmWF/generated-ledger.tsv",
+  "list_runs": {
+    "provider": {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "provider-test",
+        "--list",
+        "--json"
+      ],
+      "execution_seconds": 0.536146879196167,
+      "exit_code": 0,
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/dfb4f9ca-48d9-4fba-9f7a-3bd3dd5bc552.log",
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.0007638931274414062,
+      "state": "completed"
+    },
+    "root": {
+      "command": [
+        "/Users/pvncher/Documents/Git/repoprompt-ce-release/conductor",
+        "test",
+        "--list",
+        "--json"
+      ],
+      "execution_seconds": 0.7358438968658447,
+      "exit_code": 0,
+      "log_path": "/Users/pvncher/Library/Application Support/RepoPrompt CE/Conductor/6eb29133d54d75306f7c1d83cf6ce787643dd42843b1af4ff800cdd8d9846ccb/jobs/3d0846b5-4748-4b5d-a909-f8057786cc31.log",
+      "process_exit_code": 0,
+      "queue_wait_seconds": 0.004240751266479492,
+      "state": "completed"
+    }
+  },
+  "timestamp": "2026-07-02T12:55:42+00:00"
+}

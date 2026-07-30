@@ -5,6 +5,7 @@ import MCP
 /// Tool observers are registered by runID (not connectionID) to survive connection handovers.
 actor AgentToolTracker {
     private var trackedRunID: UUID?
+    private var observerToken: UUID?
     private var hasUnregistered = false
 
     /// Registers an enhanced tool event observer that receives args on call and result on completion.
@@ -22,8 +23,9 @@ actor AgentToolTracker {
             onCalled: onCalled,
             onCompleted: onCompleted
         )
-        await manager.registerToolEventObserver(for: runID, observer: observer)
+        let token = await manager.registerToolEventObserver(for: runID, observer: observer)
         trackedRunID = runID
+        observerToken = token
         hasUnregistered = false
     }
 
@@ -86,9 +88,16 @@ actor AgentToolTracker {
     /// Unregister exactly once to avoid double-cleanup races
     private func unregisterObserverOnce(for runID: UUID, manager: ServerNetworkManager) async {
         guard !hasUnregistered, trackedRunID == runID else { return }
+        let token = observerToken
         hasUnregistered = true
         trackedRunID = nil
-        await manager.unregisterToolObservers(for: runID)
+        observerToken = nil
+
+        if let token {
+            await manager.unregisterToolEventObserver(for: runID, token: token)
+        } else {
+            await manager.unregisterToolObservers(for: runID)
+        }
     }
 
     /// Detaches the observer if one was registered.

@@ -72,6 +72,9 @@ jobs:
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          # Link the Sentry SDK into the official release binary. The protected DSN is
+          # injected later in the signing job, so the secret-free stage stays inert.
+          REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/release.sh stage-publish
 
       - name: Upload staged release source
@@ -181,6 +184,27 @@ jobs:
           echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
           echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
 
+      - name: Install Sentry CLI when symbol upload is configured
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]] && ! command -v sentry-cli >/dev/null 2>&1; then
+            brew install getsentry/tools/sentry-cli
+          fi
+
+      - name: Prepare Sentry symbol upload token file
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
+            umask 077
+            SENTRY_TOKEN_FILE="$RUNNER_TEMP/repoprompt-release-secrets/sentry-auth-token"
+            printf '%s' "$SENTRY_AUTH_TOKEN" > "$SENTRY_TOKEN_FILE"
+            echo "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE=$SENTRY_TOKEN_FILE" >> "$GITHUB_ENV"
+          fi
+
       - name: Sign, notarize, and create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -192,9 +216,16 @@ jobs:
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_REQUIRE_HEAD_MATCH: 0
+          REPOPROMPT_ENABLE_SENTRY: "1"
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+          # Protected release environment secret. sign_staged_release.sh bakes it
+          # into the signed bundle's Info.plist as RepoPromptSentryDSN. Optional: if
+          # unset, telemetry stays off (fail-safe).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
         run: ./trusted-control-plane/Scripts/release.sh publish-staged
 
       - name: Remove ephemeral keychain
@@ -273,6 +304,9 @@ jobs:
           echo "ARTIFACT_MANIFEST_PATH=${artifact_manifests[0]}" >> "$GITHUB_ENV"
 
       - name: Execute signed helper and packaged roundtrip without inherited secrets
+        env:
+          REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"
+          REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"
         run: |
           env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -289,6 +323,8 @@ jobs:
             TMPDIR="$RUNNER_TEMP" \
             USER="$USER" \
             LOGNAME="$LOGNAME" \
+            REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT" \
+            REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT" \
             ./trusted-control-plane/Scripts/smoke_packaged_mcp_roundtrip.sh \
             "extracted/RepoPrompt CE.app" \
             "Signed draft packaged app" \

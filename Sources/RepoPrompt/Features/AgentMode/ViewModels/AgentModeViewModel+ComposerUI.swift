@@ -57,6 +57,10 @@ extension AgentModeViewModel {
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
         let resolvedSession = session ?? self.session(for: tabID)
+        let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
+        if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
+            return nil
+        }
         guard !resolvedSession.isComposerSubmissionInFlight,
               !resolvedSession.isPreparingInitialWorktree,
               !resolvedSession.isChangingExecutionLocation
@@ -80,7 +84,6 @@ extension AgentModeViewModel {
         let expectedRunID = resolvedSession.runID
         let expectedRunAttemptID = resolvedSession.activeRunAttemptID
         guard !expectedRunState.isActive || expectedRunID != nil else { return nil }
-        let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         return AgentComposerSubmitTarget(
             tabID: tabID,
             route: route,

@@ -188,13 +188,8 @@ struct CodeStructureResultCard: View {
     let item: AgentChatItem
     @State private var isExpanded = false
 
-    private var dto: ToolResultDTOs.SelectedCodeStructureDTO? {
-        ToolJSON.decode(ToolResultDTOs.SelectedCodeStructureDTO.self, from: item.toolResultJSON)
-    }
-
-    private var totalOmitted: Int {
-        guard let dto else { return 0 }
-        return dto.omittedTotal ?? ((dto.omittedCount ?? 0) + (dto.tokenBudgetOmittedCount ?? 0))
+    private var dto: ToolResultDTOs.CodeStructureReplyDTO? {
+        ToolJSON.decode(ToolResultDTOs.CodeStructureReplyDTO.self, from: item.toolResultJSON)
     }
 
     private var headerStatusText: String? {
@@ -205,11 +200,13 @@ struct CodeStructureResultCard: View {
         if let stored = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON) {
             return stored.detailText
         }
-        guard let unmapped = dto?.unmappedPaths, !unmapped.isEmpty else { return nil }
-        let visible = unmapped.prefix(2).map { shortenPath($0) }
-        var parts = visible
-        if unmapped.count > visible.count {
-            parts.append("(+\(unmapped.count - visible.count) more)")
+        guard let dto else { return nil }
+        let messages = (dto.issues + dto.roots.flatMap(\.issues)).map(\.message)
+        guard !messages.isEmpty else { return nil }
+        let visible = messages.prefix(2)
+        var parts = Array(visible)
+        if messages.count > visible.count {
+            parts.append("(+\(messages.count - visible.count) more)")
         }
         return parts.joined(separator: " • ")
     }
@@ -219,20 +216,16 @@ struct CodeStructureResultCard: View {
             return stored.subtitle ?? ""
         }
         if let dto {
-            var parts = ["\(dto.fileCount) files"]
-            if totalOmitted > 0 {
-                parts.append("\(totalOmitted) omitted")
-            }
-            if let unmapped = dto.unmappedPaths?.count, unmapped > 0 {
-                parts.append("\(unmapped) unmapped")
-            }
-            return parts.joined(separator: " • ")
+            return "\(dto.summary.nodes) nodes • \(dto.roots.count) roots • \(dto.status.rawValue)"
         }
-        if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) {
-            if args.scope == "selected" { return "selected" }
-            if let count = args.paths?.count, count > 0 {
-                return "\(count) path\(count == 1 ? "" : "s")"
-            }
+        if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON),
+           let count = args.paths?.count,
+           count > 0
+        {
+            return "\(count) path\(count == 1 ? "" : "s")"
+        }
+        if ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: item.toolArgsJSON) != nil {
+            return "selection"
         }
         return ""
     }
@@ -243,9 +236,11 @@ struct CodeStructureResultCard: View {
             return storedStatus
         }
         if let dto {
-            if totalOmitted > 0 { return .warning }
-            if dto.fileCount > 0 { return .success }
-            return .neutral
+            return switch dto.status {
+            case .ok: .success
+            case .partial, .pending: .warning
+            case .unavailable: .failure
+            }
         }
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }

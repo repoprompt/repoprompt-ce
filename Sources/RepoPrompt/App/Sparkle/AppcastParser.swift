@@ -11,6 +11,7 @@ import Foundation
 struct AppcastVersion {
     let version: String
     let buildNumber: String?
+    let title: String?
     let date: Date?
     let description: String?
     let releaseNotesURL: String?
@@ -26,6 +27,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
     private var currentElement: String = ""
     private var currentVersion: String?
     private var currentBuildNumber: String?
+    private var currentTitle: String?
     private var currentDate: Date?
     private var currentReleaseNotesURL: String?
     private var currentDownloadURL: String?
@@ -53,8 +55,17 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         parser.shouldProcessNamespaces = false // Keep prefixes like "sparkle:"
         parser.parse()
 
-        // Return the version with highest version number
-        return versions.max { !isVersion($0.version, newerThan: $1.version) }
+        // Return the update with the highest numeric Sparkle build when present,
+        // falling back to marketing-version comparison for legacy appcasts.
+        return versions.max { lhs, rhs in
+            if let lhsBuild = lhs.buildNumber.flatMap(SparkleBuildVersion.init),
+               let rhsBuild = rhs.buildNumber.flatMap(SparkleBuildVersion.init)
+            {
+                return lhsBuild < rhsBuild
+            }
+            if isVersion(lhs.version, newerThan: rhs.version) { return false }
+            return isVersion(rhs.version, newerThan: lhs.version)
+        }
     }
 
     // MARK: - Private Helpers
@@ -62,6 +73,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
     private func resetCurrentItem() {
         currentVersion = nil
         currentBuildNumber = nil
+        currentTitle = nil
         currentDate = nil
         currentReleaseNotesURL = nil
         currentDownloadURL = nil
@@ -98,6 +110,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             // Reset item-specific state but keep inItem = true
             currentVersion = nil
             currentBuildNumber = nil
+            currentTitle = nil
             currentDate = nil
             currentReleaseNotesURL = nil
             currentDownloadURL = nil
@@ -127,6 +140,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
                 let appcastVersion = AppcastVersion(
                     version: version,
                     buildNumber: currentBuildNumber,
+                    title: currentTitle,
                     date: currentDate,
                     description: nil,
                     releaseNotesURL: currentReleaseNotesURL,
@@ -149,6 +163,11 @@ final class AppcastParser: NSObject, XMLParserDelegate {
                 if currentVersion == nil {
                     currentVersion = trimmedText
                 }
+            }
+
+        case "title":
+            if inItem, !trimmedText.isEmpty {
+                currentTitle = trimmedText
             }
 
         case "pubDate":

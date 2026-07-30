@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -21,6 +21,23 @@ final class AgentModeSubmitWaitWakeTests: XCTestCase {
         XCTAssertTrue(AgentModeViewModel.test_shouldWakeParentAgentRunWaitersForActiveSubmit(
             selectedAgent: .claudeCode,
             codexCompactionInFlight: false
+        ))
+
+        let acceptedRunID = UUID()
+        XCTAssertEqual(
+            AgentModeViewModel.test_validatedSteeringOriginRunID(
+                capturedRunID: acceptedRunID,
+                currentRunID: acceptedRunID
+            ),
+            acceptedRunID
+        )
+        XCTAssertNil(AgentModeViewModel.test_validatedSteeringOriginRunID(
+            capturedRunID: acceptedRunID,
+            currentRunID: UUID()
+        ))
+        XCTAssertNil(AgentModeViewModel.test_validatedSteeringOriginRunID(
+            capturedRunID: nil,
+            currentRunID: acceptedRunID
         ))
     }
 

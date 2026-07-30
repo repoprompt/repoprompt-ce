@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,7 @@ def parse_iso_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError(f"Timestamp must include a timezone: {value!r}")
-    return parsed.astimezone(UTC)
+    return parsed.astimezone(timezone.utc)
 
 
 def validity_state(not_before: datetime, not_after: datetime, now: datetime) -> str:
@@ -114,7 +114,7 @@ def collect_inventory(fixture: dict[str, Any], *, now: datetime) -> dict[str, An
         "source": "offline-fixture",
         "capture_label": str(fixture.get("capture_label", "unspecified")),
         "certificate_name": certificate_name,
-        "evaluated_at": now.astimezone(UTC).isoformat(),
+        "evaluated_at": now.astimezone(timezone.utc).isoformat(),
         "summary": {
             "exact_name_certificate_count": len(exact_certificates),
             "private_key_backed_identity_count": sum(bool(certificate["private_key_backed"]) for certificate in exact_certificates),
@@ -140,7 +140,7 @@ def main() -> int:
 
     fixture = json.loads(Path(arguments.fixture).read_text(encoding="utf-8"))
     evaluation_value = arguments.at or fixture.get("evaluated_at")
-    now = parse_iso_datetime(str(evaluation_value)) if evaluation_value else datetime.now(UTC)
+    now = parse_iso_datetime(str(evaluation_value)) if evaluation_value else datetime.now(timezone.utc)
     inventory = collect_inventory(fixture, now=now)
     rendered = json.dumps(inventory, indent=2, sort_keys=True) + "\n"
     if arguments.output:

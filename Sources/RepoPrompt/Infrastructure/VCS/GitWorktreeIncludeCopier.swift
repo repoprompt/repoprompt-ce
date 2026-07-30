@@ -27,6 +27,7 @@ enum GitWorktreeIncludeCopier {
         let rules = GitignoreCompiler.compile(content: content, directoryPath: "")
         var copiedCount = 0
         var matchedCount = 0
+        var copiedRelativePaths: [String] = []
         var skippedSummaries: [String] = []
         var errorSummaries: [String] = []
         let appManagedContainerComponents = appManagedContainer.flatMap {
@@ -92,6 +93,7 @@ enum GitWorktreeIncludeCopier {
                 )
                 try fileManager.copyItem(at: sourceURL, to: destinationURL)
                 copiedCount += 1
+                copiedRelativePaths.append(pathComponents.joined(separator: "/"))
             } catch {
                 errorSummaries.append("failed to copy \(relativePath): \(error.localizedDescription)")
             }
@@ -103,6 +105,7 @@ enum GitWorktreeIncludeCopier {
         return GitWorktreeIncludeCopyResult(
             copiedCount: copiedCount,
             matchedCount: matchedCount,
+            copiedRelativePaths: copiedRelativePaths.sorted(),
             skippedSummaries: skippedSummaries,
             errorSummaries: errorSummaries
         )

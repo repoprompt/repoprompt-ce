@@ -4,6 +4,16 @@ struct GitDiffPrimaryArtifacts: Equatable {
     let map: String
     let allPatch: String?
 
+    init(map: String, allPatch: String?) {
+        self.map = map
+        self.allPatch = allPatch
+    }
+
+    init(publishedArtifacts: GitDiffPublishedArtifactSet) {
+        map = publishedArtifacts.map.clientAlias ?? publishedArtifacts.map.absolutePath
+        allPatch = publishedArtifacts.allPatch.map { $0.clientAlias ?? $0.absolutePath }
+    }
+
     var selectionCandidates: [String] {
         var paths = [map]
         if let allPatch {

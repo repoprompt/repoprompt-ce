@@ -1,7 +1,7 @@
 import CoreServices
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -114,6 +114,45 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+
+        // Create a real linked worktree, then delete its checkout directory. Git keeps the admin
+        // record under .git/worktrees/<name> but now reports the worktree prunable ("gitdir file
+        // points to a non-existent location"). The tool must not list a stale worktree, otherwise
+        // a model could select it and bind a session to an empty/partial tree.
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/stale-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let createdWorktree = try Self.worktreeObject(createValue, key: "created_worktree")
+        let stalePath = try XCTUnwrap(createdWorktree["path"]?.stringValue)
+        let staleID = try XCTUnwrap(createdWorktree["worktree_id"]?.stringValue)
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: stalePath))
+
+        let listValue = try await manageWorktree(["op": .string("list")])
+        let listObject = try XCTUnwrap(listValue.objectValue)
+        let listed = listObject["worktrees"]?.arrayValue ?? []
+        let listedIDs = listed.compactMap { $0.objectValue?["worktree_id"]?.stringValue }
+        let listedPaths = listed.compactMap { $0.objectValue?["path"]?.stringValue }
+
+        XCTAssertFalse(listedIDs.contains(staleID), "stale worktree id should be omitted: \(listedIDs)")
+        XCTAssertFalse(listedPaths.contains(stalePath), "stale worktree path should be omitted: \(listedPaths)")
+        XCTAssertFalse(listed.isEmpty, "the main worktree should still be listed")
+
+        let warning = listObject["warning"]?.stringValue ?? ""
+        XCTAssertTrue(
+            warning.lowercased().contains("prunable") || warning.lowercased().contains("stale"),
+            "expected an omitted-prunable warning, got: \(warning)"
+        )
+    }
+
     func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
@@ -134,7 +173,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
         let worktreeOnlyFile = URL(fileURLWithPath: worktreePath)
             .appendingPathComponent("WorktreeOnly.swift")
-        try "struct WorktreeOnly {}\n".write(to: worktreeOnlyFile, atomically: true, encoding: .utf8)
+        try SwiftFixtureSource.emptyStruct("WorktreeOnly").write(to: worktreeOnlyFile, atomically: true, encoding: .utf8)
 
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
@@ -260,12 +299,13 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         }
 
         let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
-        XCTAssertEqual(try Self.selectionPaths(setValue), [logicalPath])
+        let outputPath = "\(fixture.repo.lastPathComponent)/WorktreeOnly.swift"
+        XCTAssertEqual(try Self.selectionPaths(setValue), [outputPath])
+        let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         #if DEBUG
-            let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
-                workspaceID: workspaceID,
-                tabID: tabID
-            )
             XCTAssertGreaterThan(canonicalSelectionRevision, staleSelectionRevision)
             XCTAssertEqual(
                 window.mcpServer.debugSelectionRevisionForBoundConnection(setterConnectionID),
@@ -287,7 +327,22 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         // Reproduce the app-only race absent from direct provider tests: a debounced file-tree
         // publisher captured the empty logical-base UI before MCP persistence and fires later.
         window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        try await Task.sleep(for: .milliseconds(250))
+        let staleUIPublishSelectionRevision = await Self.drainMainActorAndReadSelectionRevision(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertEqual(staleUIPublishSelectionRevision, canonicalSelectionRevision)
+        #if DEBUG
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(setterConnectionID),
+                canonicalSelectionRevision
+            )
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(staleConnectionID),
+                staleSelectionRevision
+            )
+        #endif
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
@@ -296,11 +351,19 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         // Exec-mode CLI disconnect is asynchronous. Exercise the stale cleanup ordering where
         // an older bound snapshot commits after the setter has persisted newer canonical state.
+        let selectionRevisionBeforeStaleCleanup = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         let staleCleanup = Task { @MainActor in
             await window.mcpServer.commitAndClearTabContext(connectionID: staleConnectionID)
         }
         let staleCommitSucceeded = await staleCleanup.value
         XCTAssertTrue(staleCommitSucceeded)
+        XCTAssertEqual(
+            window.workspaceManager.selectionRevisionForMCP(workspaceID: workspaceID, tabID: tabID),
+            selectionRevisionBeforeStaleCleanup
+        )
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         window.mcpServer.removeTabContext(
@@ -324,7 +387,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 "path_display": .string("full")
             ])
         }
-        XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
+        XCTAssertEqual(try Self.selectionPaths(getValue), [outputPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         window.mcpServer.removeTabContext(
@@ -360,7 +423,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 "path_display": .string("full")
             ])
         }
-        XCTAssertEqual(try Self.selectionPaths(readSelection), [logicalPath])
+        XCTAssertEqual(try Self.selectionPaths(readSelection), [outputPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
@@ -375,8 +438,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         await ServerNetworkManager.shared.setRunPurpose(.unknown, for: readConnectionID)
 
+        let selectionRevisionBeforeFinalStalePublish = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        try await Task.sleep(for: .milliseconds(250))
+        let selectionRevisionAfterFinalStalePublish = await Self.drainMainActorAndReadSelectionRevision(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertEqual(selectionRevisionAfterFinalStalePublish, selectionRevisionBeforeFinalStalePublish)
 
         let finalConnectionID = UUID()
         try window.mcpServer.bindTabForConnection(
@@ -400,7 +472,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 "path_display": .string("full")
             ])
         }
-        XCTAssertEqual(try Self.selectionPaths(finalSelection), [logicalPath])
+        XCTAssertEqual(try Self.selectionPaths(finalSelection), [outputPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
@@ -413,9 +485,18 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             selectedPaths: [fixture.trackedFile.path],
             codemapAutoEnabled: false
         )
+        let selectionRevisionBeforeManualUIPublish = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
         await window.workspaceFilesViewModel.applyStoredSelection(manualUISelection)
         window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        try await Task.sleep(for: .milliseconds(250))
+        let selectionRevisionAfterManualUIPublish = await Self.drainMainActorAndReadSelectionRevision(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertGreaterThan(selectionRevisionAfterManualUIPublish, selectionRevisionBeforeManualUIPublish)
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection, manualUISelection)
         XCTAssertEqual(
             window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection,
@@ -440,6 +521,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
             var targetTab = try await Self.createBackgroundTab(in: window, name: "Bound Export Target")
             let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: window.apiSettingsViewModel,
+                workspaceID: workspaceID
+            )
             XCTAssertNotEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, targetTab.id)
             targetTab.promptText = "Generate the deterministic worktree export."
             window.workspaceManager.updateComposeTab(targetTab, markDirty: false)
@@ -649,7 +734,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             worktreeID: worktreeID
         )
         let formattedTree = try Self.onlyText(ToolOutputFormatter.formatFileTree(value: treeValue))
-        XCTAssertTrue(formattedTree.contains(logicalRootPath), formattedTree)
+        XCTAssertFalse(formattedTree.contains(logicalRootPath), formattedTree)
         XCTAssertFalse(formattedTree.contains(effectiveRootPath), formattedTree)
         XCTAssertTrue(formattedTree.contains("session-bound worktree"), formattedTree)
 
@@ -661,7 +746,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             worktreeID: worktreeID
         )
         let formattedRead = try Self.onlyText(ToolOutputFormatter.formatReadFile(args: ["path": .string("Tracked.txt")], value: readValue))
-        XCTAssertTrue(formattedRead.contains(logicalRootPath), formattedRead)
+        XCTAssertFalse(formattedRead.contains(logicalRootPath), formattedRead)
         XCTAssertFalse(formattedRead.contains(effectiveRootPath), formattedRead)
         XCTAssertTrue(formattedRead.contains("session-bound worktree"), formattedRead)
 
@@ -673,7 +758,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             worktreeID: worktreeID
         )
         let formattedSearch = try Self.onlyText(ToolOutputFormatter.formatSearch(value: searchValue))
-        XCTAssertTrue(formattedSearch.contains(logicalRootPath), formattedSearch)
+        XCTAssertFalse(formattedSearch.contains(logicalRootPath), formattedSearch)
         XCTAssertFalse(formattedSearch.contains(effectiveRootPath), formattedSearch)
         XCTAssertTrue(formattedSearch.contains("session-bound worktree"), formattedSearch)
     }
@@ -716,19 +801,29 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertEqual(try String(contentsOfFile: readPath, encoding: .utf8), "worktree-edited\n")
     }
 
+    private static func drainMainActorAndReadSelectionRevision(
+        window: WindowState,
+        workspaceID: UUID,
+        tabID: UUID
+    ) async -> UInt64 {
+        for _ in 0 ..< 3 {
+            await Task.yield()
+        }
+        return window.workspaceManager.selectionRevisionForMCP(workspaceID: workspaceID, tabID: tabID)
+    }
+
     private static func makeAgentRunService(window: WindowState, targetTabID: UUID) -> AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
                 MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "worktree-api-smoke", windowID: window.windowID)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in targetTabID },
-            resolveSpawnSourceTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
-            bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _ in
+            startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Smoke start target did not resolve a session ID.")
                 }
@@ -755,6 +850,35 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 return AgentExternalMCPRunStarter.StartOutcome(snapshot: snapshot, delivery: .startedRun)
             }
         )
+        service.resolveOracleReviewLaunchSource = { _, targetWindow in
+            let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+            let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                route: .explicitTabContext,
+                windowID: targetWindow.windowID,
+                workspaceID: workspace.id,
+                tabID: targetTabID,
+                selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                    workspaceID: workspace.id,
+                    tabID: targetTabID
+                ),
+                promptText: "",
+                selection: StoredSelection(),
+                sourceAgentSessionID: nil,
+                routedRunID: nil
+            )
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: snapshot,
+                source: .unavailable(.init(
+                    delegationID: UUID(),
+                    sourceTabID: targetTabID,
+                    workspaceID: workspace.id,
+                    sourceAgentSessionID: nil,
+                    sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Synthetic smoke-service fixture")
+                ))
+            )
+        }
+        return service
     }
 
     private static func makeWindow(
@@ -798,7 +922,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return try XCTUnwrap(tab)
     }
 
-    private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPrompt.Tool {
+    private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPromptApp.Tool {
         let tools = await window.mcpServer.windowMCPTools
         return try XCTUnwrap(tools.first { $0.name == name })
     }
@@ -867,8 +991,12 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let scope = try XCTUnwrap(object["worktree_scope"]?.objectValue)
         let mappings = try XCTUnwrap(scope["root_mappings"]?.arrayValue)
         let first = try XCTUnwrap(mappings.first?.objectValue)
-        XCTAssertEqual(first["logical_root_path"]?.stringValue, logicalRootPath)
-        XCTAssertEqual(first["effective_root_path"]?.stringValue, effectiveRootPath)
+        XCTAssertEqual(
+            first["logical_root_path"]?.stringValue,
+            URL(fileURLWithPath: logicalRootPath).lastPathComponent
+        )
+        XCTAssertEqual(first["effective_root_path"]?.stringValue, "session-bound")
+        XCTAssertNotEqual(first["logical_root_path"]?.stringValue, effectiveRootPath)
         XCTAssertEqual(first["worktree_id"]?.stringValue, worktreeID)
     }
 

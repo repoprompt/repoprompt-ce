@@ -12,9 +12,8 @@ struct AgentExploreMCPToolService {
     let requireTargetWindow: () throws -> WindowState
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
-    let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
-    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> UUID? = { _, _, _ in nil }
+    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
     var vcsService: VCSService = .shared
@@ -120,9 +119,8 @@ struct AgentExploreMCPToolService {
             captureRequestMetadata: captureRequestMetadata,
             requireTargetWindow: requireTargetWindow,
             resolveRequestedTabID: { _ in nil },
-            resolveSpawnSourceTabID: resolveSpawnSourceTabID,
+            resolveSpawnParentSourceTabID: resolveSpawnSourceTabID,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID,
-            bindCurrentRequestToTab: bindCurrentRequestToTab,
             withHeartbeat: withHeartbeat,
             beginAgentRunWait: beginAgentRunWait,
             endAgentRunWait: endAgentRunWait,
@@ -208,7 +206,8 @@ struct AgentExploreMCPToolService {
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: nil,
             defaultTaskLabel: .explore,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
         return ExploreStartContext(
             metadata: metadata,
@@ -302,12 +301,13 @@ struct AgentExploreMCPToolService {
             target,
             message,
             context.metadata,
-            bindCurrentRequestToTab,
             context.agentModeVM,
             context.selection.agentRaw,
             context.selection.modelRaw,
             nil,
             .explore,
+            nil,
+            nil,
             nil
         )
     }

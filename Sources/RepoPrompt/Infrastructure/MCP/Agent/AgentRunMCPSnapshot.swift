@@ -2,6 +2,8 @@ import Foundation
 import MCP
 
 struct AgentRunMCPSnapshot: Equatable {
+    static let startupPendingStatusText = "Queued to start"
+
     enum Status: String, Equatable {
         case running
         case waitingForInput = "waiting_for_input"
@@ -364,6 +366,10 @@ struct AgentRunMCPSnapshot: Equatable {
         interaction != nil || status == .waitingForInput || status.isTerminal
     }
 
+    var isStartupPendingForMCPWait: Bool {
+        status == .running && runID == nil && statusText == Self.startupPendingStatusText
+    }
+
     func asObject() -> [String: Value] {
         var obj: [String: Value] = [
             "session_id": .string(sessionID.uuidString),
@@ -427,6 +433,13 @@ struct AgentRunMCPSnapshot: Equatable {
     }
 
     static func expired(sessionID: UUID) -> AgentRunMCPSnapshot {
+        expired(
+            sessionID: sessionID,
+            statusText: "This session control handle is no longer available. Start a new run or use a more recent session ID."
+        )
+    }
+
+    static func expired(sessionID: UUID, statusText: String) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot(
             sessionID: sessionID,
             tabID: nil,
@@ -436,7 +449,7 @@ struct AgentRunMCPSnapshot: Equatable {
             modelRaw: nil,
             reasoningEffortRaw: nil,
             status: .expired,
-            statusText: "This session control handle is no longer available. Start a new run or use a more recent session ID.",
+            statusText: statusText,
             latestAssistantPreview: nil,
             interaction: nil,
             transcriptItemCount: 0,
