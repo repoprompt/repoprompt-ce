@@ -134,65 +134,161 @@ extension FileSystemService {
     private struct DecodedDirentName {
         let name: String
         let bytes: Data
-        let length: Int
+        let nullTerminatedName: [CChar]
+        let dType: UInt8
     }
+
+    private struct DirentRecordLayout {
+        let recordLengthOffset: Int
+        let nameLengthOffset: Int
+        let typeOffset: Int
+        let nameOffset: Int
+        let nameCapacity: Int
+        let minimumRecordLength: Int
+        let fullStructSize: Int
+
+        static let current: Self = {
+            let recordLengthOffset = MemoryLayout<dirent>.offset(of: \dirent.d_reclen)!
+            let nameLengthOffset = MemoryLayout<dirent>.offset(of: \dirent.d_namlen)!
+            let typeOffset = MemoryLayout<dirent>.offset(of: \dirent.d_type)!
+            let nameOffset = MemoryLayout<dirent>.offset(of: \dirent.d_name)!
+            let nameCapacity = MemoryLayout.size(ofValue: dirent().d_name)
+            let scalarFieldsEnd = max(
+                recordLengthOffset + MemoryLayout<UInt16>.size,
+                nameLengthOffset + MemoryLayout<UInt16>.size,
+                typeOffset + MemoryLayout<UInt8>.size
+            )
+            return Self(
+                recordLengthOffset: recordLengthOffset,
+                nameLengthOffset: nameLengthOffset,
+                typeOffset: typeOffset,
+                nameOffset: nameOffset,
+                nameCapacity: nameCapacity,
+                minimumRecordLength: max(scalarFieldsEnd, nameOffset + 1),
+                fullStructSize: MemoryLayout<dirent>.size
+            )
+        }()
+    }
+
+    #if DEBUG
+        struct DirentRecordLayoutForTesting {
+            let recordLengthOffset: Int
+            let nameLengthOffset: Int
+            let typeOffset: Int
+            let nameOffset: Int
+            let nameCapacity: Int
+            let minimumRecordLength: Int
+            let fullStructSize: Int
+        }
+
+        static var direntRecordLayoutForTesting: DirentRecordLayoutForTesting {
+            let layout = DirentRecordLayout.current
+            return DirentRecordLayoutForTesting(
+                recordLengthOffset: layout.recordLengthOffset,
+                nameLengthOffset: layout.nameLengthOffset,
+                typeOffset: layout.typeOffset,
+                nameOffset: layout.nameOffset,
+                nameCapacity: layout.nameCapacity,
+                minimumRecordLength: layout.minimumRecordLength,
+                fullStructSize: layout.fullStructSize
+            )
+        }
+
+        static func decodeDirentRecordForTesting(_ bytes: [UInt8]) -> (name: String, bytes: Data, dType: UInt8)? {
+            bytes.withUnsafeBytes { record in
+                guard let decoded = decodeDirentRecord(record) else { return nil }
+                return (decoded.name, decoded.bytes, decoded.dType)
+            }
+        }
+
+        static func decodeDirentPointerForTesting(
+            _ entryPtr: UnsafePointer<dirent>
+        ) -> (name: String, bytes: Data, dType: UInt8)? {
+            guard let decoded = decodeDirentName(entryPtr) else { return nil }
+            return (decoded.name, decoded.bytes, decoded.dType)
+        }
+    #endif
 
     @inline(__always)
     static func isRepoPromptTempFilename(_ name: String) -> Bool {
         name.hasPrefix(".repoprompt.tmp.")
     }
 
-    private static func decodeDirentName(_ entry: dirent) -> DecodedDirentName? {
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
-            let buffer = rawBuffer.bindMemory(to: UInt8.self)
-            let maxCount = buffer.count
-            guard maxCount > 0 else { return nil }
-
-            let nameLen = Int(entry.d_namlen)
-            var length = 0
-            if nameLen > 0 {
-                length = min(nameLen, maxCount)
-                if length > 0, buffer[length - 1] == 0 {
-                    length -= 1
-                }
-            } else {
-                var nulIndex: Int? = nil
-                var i = 0
-                while i < maxCount {
-                    if buffer[i] == 0 {
-                        nulIndex = i
-                        break
-                    }
-                    i += 1
-                }
-                guard let foundIndex = nulIndex else { return nil }
-                length = foundIndex
-            }
-
-            guard length > 0 else { return nil }
-
-            let bytes = Data(buffer.prefix(length))
-            let name = String(decoding: bytes, as: UTF8.self)
-            return DecodedDirentName(name: name, bytes: bytes, length: length)
+    /// Decodes only the variable-length record returned by `readdir`/`scandir`.
+    /// Reading `entryPtr.pointee` would copy the full imported `dirent`, even when
+    /// the OS-owned record ends much earlier in the directory buffer.
+    private static func decodeDirentName(_ entryPtr: UnsafePointer<dirent>) -> DecodedDirentName? {
+        let layout = DirentRecordLayout.current
+        let rawPointer = UnsafeRawPointer(entryPtr)
+        let recordLength = Int(rawPointer.loadUnaligned(
+            fromByteOffset: layout.recordLengthOffset,
+            as: UInt16.self
+        ))
+        guard recordLength >= layout.minimumRecordLength,
+              recordLength <= layout.fullStructSize
+        else {
+            return nil
         }
+
+        return decodeDirentRecord(UnsafeRawBufferPointer(start: rawPointer, count: recordLength))
+    }
+
+    private static func decodeDirentRecord(_ record: UnsafeRawBufferPointer) -> DecodedDirentName? {
+        let layout = DirentRecordLayout.current
+        guard record.count >= layout.minimumRecordLength,
+              record.count <= layout.fullStructSize,
+              Int(record.loadUnaligned(
+                  fromByteOffset: layout.recordLengthOffset,
+                  as: UInt16.self
+              )) == record.count
+        else {
+            return nil
+        }
+
+        let availableNameBytes = min(record.count - layout.nameOffset, layout.nameCapacity)
+        let declaredNameLength = Int(record.loadUnaligned(
+            fromByteOffset: layout.nameLengthOffset,
+            as: UInt16.self
+        ))
+        let length: Int
+        if declaredNameLength > 0 {
+            guard declaredNameLength < availableNameBytes,
+                  record[layout.nameOffset + declaredNameLength] == 0
+            else {
+                return nil
+            }
+            length = declaredNameLength
+        } else {
+            var nulIndex: Int?
+            for index in 0 ..< availableNameBytes where record[layout.nameOffset + index] == 0 {
+                nulIndex = index
+                break
+            }
+            guard let nulIndex else { return nil }
+            length = nulIndex
+        }
+        guard length > 0, let recordBaseAddress = record.baseAddress else { return nil }
+
+        let namePointer = recordBaseAddress.advanced(by: layout.nameOffset)
+        let bytes = Data(bytes: namePointer, count: length)
+        var nullTerminatedName = bytes.map { CChar(bitPattern: $0) }
+        nullTerminatedName.append(0)
+        return DecodedDirentName(
+            name: String(decoding: bytes, as: UTF8.self),
+            bytes: bytes,
+            nullTerminatedName: nullTerminatedName,
+            dType: record.loadUnaligned(fromByteOffset: layout.typeOffset, as: UInt8.self)
+        )
     }
 
     private static func descriptorRelativeMode(
         dir: UnsafeMutablePointer<DIR>,
-        entry: dirent,
-        nameLength: Int
+        name: [CChar]
     ) -> UInt16 {
         let fd = dirfd(dir)
         guard fd >= 0 else { return 0 }
-        var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
-            let buffer = rawBuffer.bindMemory(to: UInt8.self)
-            for index in 0 ..< min(nameLength, buffer.count) {
-                nameBuffer[index] = CChar(bitPattern: buffer[index])
-            }
-        }
         var status = stat()
-        let result = nameBuffer.withUnsafeBufferPointer { buffer -> Int32 in
+        let result = name.withUnsafeBufferPointer { buffer -> Int32 in
             guard let base = buffer.baseAddress else { return -1 }
             return fstatat(fd, base, &status, AT_SYMLINK_NOFOLLOW)
         }
@@ -201,25 +297,13 @@ extension FileSystemService {
 
     private static func fileTypeFallback(
         dir: UnsafeMutablePointer<DIR>,
-        entry: dirent,
-        nameLength: Int
+        name: [CChar]
     ) -> (isDir: Bool, isSym: Bool) {
         let fd = dirfd(dir)
         guard fd >= 0 else { return (false, false) }
 
-        var nameBuffer = [CChar](repeating: 0, count: nameLength + 1)
-        withUnsafeBytes(of: entry.d_name) { rawBuffer in
-            let buffer = rawBuffer.bindMemory(to: UInt8.self)
-            let count = min(nameLength, buffer.count)
-            if count > 0 {
-                for i in 0 ..< count {
-                    nameBuffer[i] = CChar(bitPattern: buffer[i])
-                }
-            }
-        }
-
         var st = stat()
-        let noFollowResult = nameBuffer.withUnsafeBufferPointer { buffer -> Int32 in
+        let noFollowResult = name.withUnsafeBufferPointer { buffer -> Int32 in
             guard let base = buffer.baseAddress else { return -1 }
             return fstatat(fd, base, &st, AT_SYMLINK_NOFOLLOW)
         }
@@ -229,7 +313,7 @@ extension FileSystemService {
         let isSym = (noFollowType == S_IFLNK)
 
         if isSym {
-            let followResult = nameBuffer.withUnsafeBufferPointer { buffer -> Int32 in
+            let followResult = name.withUnsafeBufferPointer { buffer -> Int32 in
                 guard let base = buffer.baseAddress else { return -1 }
                 return fstatat(fd, base, &st, 0)
             }
@@ -272,9 +356,8 @@ extension FileSystemService {
                 break // Exit loop on error or end of directory
             }
 
-            // Safely copy the dirent structure
-            let dirent = direntPtr.pointee
-            guard let decoded = decodeDirentName(dirent) else {
+            // Decode and copy the needed bytes before the next readdir call invalidates the record.
+            guard let decoded = decodeDirentName(direntPtr) else {
                 continue
             }
             let fileName = decoded.name
@@ -295,8 +378,8 @@ extension FileSystemService {
                 hasCursorignore = true
             }
 
-            // Determine file type from d_type
-            let dType = dirent.d_type
+            // d_type was decoded without a full struct copy
+            let dType = decoded.dType
             var isDir = false
             var isSym = false
 
@@ -306,16 +389,14 @@ extension FileSystemService {
             case DT_LNK:
                 let fallback = fileTypeFallback(
                     dir: dir,
-                    entry: dirent,
-                    nameLength: decoded.length
+                    name: decoded.nullTerminatedName
                 )
                 isDir = fallback.isDir
                 isSym = true
             case DT_UNKNOWN:
                 let fallback = fileTypeFallback(
                     dir: dir,
-                    entry: dirent,
-                    nameLength: decoded.length
+                    name: decoded.nullTerminatedName
                 )
                 isDir = fallback.isDir
                 isSym = fallback.isSym
@@ -331,8 +412,7 @@ extension FileSystemService {
                 isSym: isSym,
                 fileSystemMode: descriptorRelativeMode(
                     dir: dir,
-                    entry: dirent,
-                    nameLength: decoded.length
+                    name: decoded.nullTerminatedName
                 )
             ))
         }
@@ -370,11 +450,11 @@ extension FileSystemService {
         entries.reserveCapacity(Int(count))
 
         for i in 0 ..< count {
-            // Copy dirent into local var so the pointer remains valid for the entire iteration
-            let localDirent = namelist![Int(i)]!.pointee
+            // Each scandir record remains owned by this loop until the deferred free.
+            let entryPtr = namelist![Int(i)]!
 
             // Safely convert d_name -> Swift String
-            guard let decoded = decodeDirentName(localDirent) else {
+            guard let decoded = decodeDirentName(entryPtr) else {
                 continue
             }
             let rawName = decoded.name
@@ -387,7 +467,7 @@ extension FileSystemService {
                 continue
             }
 
-            let dType = localDirent.d_type // This is a UInt8
+            let dType = decoded.dType
             var isDir = false
             var isSym = false
 

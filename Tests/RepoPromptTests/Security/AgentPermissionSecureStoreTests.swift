@@ -317,7 +317,7 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
 
         secureStrings.failSaveKeys = [key]
         XCTAssertFalse(store.updateCodexPermissions { document in
-            document.approvalPolicyRaw = CodexAgentToolPreferences.ApprovalPolicy.onFailure.persistedValue
+            document.approvalPolicyRaw = CodexAgentToolPreferences.ApprovalPolicy.onRequest.persistedValue
         })
 
         let effective = store.codexPermissions()

@@ -3,6 +3,7 @@
     import Darwin
     import Foundation
     @testable import RepoPromptApp
+    @testable import RepoPromptCodeMapCore
 
     enum WorkspaceCodeMapPhase4BenchmarkMetric: String, CaseIterable {
         case canonicalBatchClassification

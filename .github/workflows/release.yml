@@ -226,7 +226,6 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
-          REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production
         run: ./trusted-control-plane/Scripts/release.sh publish-staged
 
       - name: Remove ephemeral keychain

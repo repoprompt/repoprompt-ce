@@ -14,11 +14,31 @@ struct MarkdownRenderSignature: Equatable {
     let fontSize: CGFloat
     let forceTextColor: Color?
     let useMonospaced: Bool
+    let bareURLLinkificationPolicy: BareURLLinkificationPolicy
+    let suppressBareLinksTouchingEndBoundary: Bool
+
+    init(
+        text: String,
+        fontSize: CGFloat,
+        forceTextColor: Color?,
+        useMonospaced: Bool,
+        bareURLLinkificationPolicy: BareURLLinkificationPolicy,
+        suppressBareLinksTouchingEndBoundary: Bool = false
+    ) {
+        self.text = text
+        self.fontSize = fontSize
+        self.forceTextColor = forceTextColor
+        self.useMonospaced = useMonospaced
+        self.bareURLLinkificationPolicy = bareURLLinkificationPolicy
+        self.suppressBareLinksTouchingEndBoundary = suppressBareLinksTouchingEndBoundary
+    }
 
     func hasSameRenderingConfiguration(as other: Self) -> Bool {
         fontSize == other.fontSize &&
             forceTextColor == other.forceTextColor &&
-            useMonospaced == other.useMonospaced
+            useMonospaced == other.useMonospaced &&
+            bareURLLinkificationPolicy == other.bareURLLinkificationPolicy &&
+            suppressBareLinksTouchingEndBoundary == other.suppressBareLinksTouchingEndBoundary
     }
 
     func isAppendOnlyRelative(to other: Self) -> Bool {
@@ -354,6 +374,8 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
     let allowInteraction: Bool
     let forceTextColor: Color?
     let useMonospaced: Bool
+    let bareURLLinkificationPolicy: BareURLLinkificationPolicy
+    let suppressBareLinksTouchingEndBoundary: Bool
     let initialBoundary: MarkdownStreamingFreezeBoundary
 
     @State private var frozenBoundaryUTF16Offset: Int?
@@ -369,6 +391,8 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                             allowInteraction: allowInteraction,
                             forceTextColor: forceTextColor,
                             useMonospaced: useMonospaced,
+                            bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                            suppressBareLinksTouchingEndBoundary: false,
                             renderCadence: .immediate,
                             allowsStreamingSegmentation: false
                         )
@@ -379,6 +403,8 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                         allowInteraction: allowInteraction,
                         forceTextColor: forceTextColor,
                         useMonospaced: useMonospaced,
+                        bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                        suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary,
                         renderCadence: .streamingCoalesced,
                         allowsStreamingSegmentation: false
                     )
@@ -390,6 +416,8 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                     allowInteraction: allowInteraction,
                     forceTextColor: forceTextColor,
                     useMonospaced: useMonospaced,
+                    bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                    suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary,
                     renderCadence: .streamingCoalesced,
                     allowsStreamingSegmentation: false
                 )
@@ -405,6 +433,8 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
             lhs.allowInteraction == rhs.allowInteraction &&
             lhs.forceTextColor == rhs.forceTextColor &&
             lhs.useMonospaced == rhs.useMonospaced &&
+            lhs.bareURLLinkificationPolicy == rhs.bareURLLinkificationPolicy &&
+            lhs.suppressBareLinksTouchingEndBoundary == rhs.suppressBareLinksTouchingEndBoundary &&
             lhs.initialBoundary == rhs.initialBoundary
     }
 
@@ -431,6 +461,8 @@ struct MarkdownTextView: View, Equatable {
     let allowInteraction: Bool
     let forceTextColor: Color?
     let useMonospaced: Bool
+    let bareURLLinkificationPolicy: BareURLLinkificationPolicy
+    let suppressBareLinksTouchingEndBoundary: Bool
     let renderCadence: MarkdownRenderCadence
     private let allowsStreamingSegmentation: Bool
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
@@ -452,6 +484,8 @@ struct MarkdownTextView: View, Equatable {
         allowInteraction: Bool = true,
         forceTextColor: Color? = nil,
         useMonospaced: Bool = false,
+        bareURLLinkificationPolicy: BareURLLinkificationPolicy = .disabled,
+        suppressBareLinksTouchingEndBoundary: Bool = false,
         renderCadence: MarkdownRenderCadence = .immediate,
         allowsStreamingSegmentation: Bool = true
     ) {
@@ -460,6 +494,8 @@ struct MarkdownTextView: View, Equatable {
         self.allowInteraction = allowInteraction
         self.forceTextColor = forceTextColor
         self.useMonospaced = useMonospaced
+        self.bareURLLinkificationPolicy = bareURLLinkificationPolicy
+        self.suppressBareLinksTouchingEndBoundary = suppressBareLinksTouchingEndBoundary
         self.renderCadence = renderCadence
         self.allowsStreamingSegmentation = allowsStreamingSegmentation
     }
@@ -470,6 +506,8 @@ struct MarkdownTextView: View, Equatable {
             lhs.allowInteraction == rhs.allowInteraction &&
             lhs.forceTextColor == rhs.forceTextColor &&
             lhs.useMonospaced == rhs.useMonospaced &&
+            lhs.bareURLLinkificationPolicy == rhs.bareURLLinkificationPolicy &&
+            lhs.suppressBareLinksTouchingEndBoundary == rhs.suppressBareLinksTouchingEndBoundary &&
             lhs.renderCadence == rhs.renderCadence &&
             lhs.allowsStreamingSegmentation == rhs.allowsStreamingSegmentation &&
             lhs.fontScale.preset.scaleFactor == rhs.fontScale.preset.scaleFactor
@@ -504,6 +542,8 @@ struct MarkdownTextView: View, Equatable {
                 allowInteraction: allowInteraction,
                 forceTextColor: forceTextColor,
                 useMonospaced: useMonospaced,
+                bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary,
                 initialBoundary: segmentedBoundary
             )
         } else {
@@ -526,7 +566,9 @@ struct MarkdownTextView: View, Equatable {
                 text: text,
                 fontSize: CGFloat(fontPreset.rawValue),
                 forceTextColor: forceTextColor,
-                useMonospaced: useMonospaced
+                useMonospaced: useMonospaced,
+                bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary
             ),
             cadence: renderCadence
         )
@@ -645,9 +687,15 @@ struct MarkdownTextView: View, Equatable {
         compiler.fontSize = signature.fontSize
         compiler.forceTextColor = signature.forceTextColor
         compiler.useMonospaced = signature.useMonospaced
+        compiler.bareURLLinkificationPolicy = signature.bareURLLinkificationPolicy
+        compiler.suppressBareLinksTouchingEndBoundary = signature.suppressBareLinksTouchingEndBoundary
         var compiled = compiler.attributedString(from: document)
         if let forceTextColor = signature.forceTextColor {
-            compiled = applyTextColor(compiled, color: forceTextColor)
+            compiled = applyTextColor(
+                compiled,
+                color: forceTextColor,
+                preserveLinkColor: true
+            )
         }
 
         guard !Task.isCancelled else { return }
@@ -661,10 +709,13 @@ struct MarkdownTextView: View, Equatable {
         compileTask = nil
     }
 
-    private func applyTextColor(_ attributedString: NSAttributedString, color: Color) -> NSAttributedString {
+    private func applyTextColor(
+        _ attributedString: NSAttributedString,
+        color: Color,
+        preserveLinkColor: Bool
+    ) -> NSAttributedString {
         let mutable = attributedString.mutableCopy() as! NSMutableAttributedString
-        let fullRange = NSRange(location: 0, length: mutable.length)
-        mutable.addAttribute(.foregroundColor, value: NSColor(color), range: fullRange)
+        mutable.applyForegroundColor(NSColor(color), preservingLinkRanges: preserveLinkColor)
         return mutable
     }
 }

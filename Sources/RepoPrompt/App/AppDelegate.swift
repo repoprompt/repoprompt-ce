@@ -28,6 +28,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     let sparkleManager: SparkleUpdaterManager
     private let sparkleFeedDelegate: SparkleUpdateFeedDelegate
+    private let sparkleVersionDisplay: SparkleVersionDisplay
 
     /// NEW: weak reference injected by `RepoPromptApp`
     weak var windowStatesManager: WindowStatesManager?
@@ -49,10 +50,12 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Initialize Sparkle updater
         let feedDelegate = SparkleUpdateFeedDelegate()
         sparkleFeedDelegate = feedDelegate
+        let versionDisplay = SparkleVersionDisplay()
+        sparkleVersionDisplay = versionDisplay
         let updaterController = SPUStandardUpdaterController(
             startingUpdater: false,
             updaterDelegate: feedDelegate,
-            userDriverDelegate: nil
+            userDriverDelegate: versionDisplay
         )
         sparkleManager = SparkleUpdaterManager(updaterController: updaterController)
         SparkleUpdaterManager.shared = sparkleManager

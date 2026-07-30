@@ -317,7 +317,7 @@ struct AgentModeSessionsListView: View {
             let snapshotStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let sidebarSnapshot = sidebarUI.snapshot
-        let filteredSessions = agentModeVM.filteredSidebarSessions(
+        let filteredSessions = agentModeVM.displaySidebarSessions(
             for: promptManager.currentComposeTabs,
             currentTabID: currentTabID,
             searchText: sidebarSnapshot.searchText,
@@ -375,6 +375,10 @@ struct AgentModeSessionsListView: View {
             let _ = Self.recordBodyMetric()
         #endif
         let snapshot = sidebarListSnapshot
+        let defaultCollapseSeedKeys = agentModeVM.defaultCollapsedSidebarThreadKeys(
+            for: promptManager.currentComposeTabs,
+            searchText: sidebarUI.snapshot.searchText
+        )
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
         let firstActiveSectionID = activeSections.first?.id
         ScrollView {
@@ -404,8 +408,7 @@ struct AgentModeSessionsListView: View {
                                 hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
                                 onToggleThreadCollapse: session.hasThreadChildren
                                     ? {
-                                        guard let key = session.threadKey else { return }
-                                        agentModeVM.toggleSidebarThreadCollapse(key)
+                                        agentModeVM.requestSidebarThreadDisclosureToggle(for: session)
                                     }
                                     : nil,
                                 onSelect: {
@@ -531,6 +534,9 @@ struct AgentModeSessionsListView: View {
                 }
             }
             .padding(.horizontal, listHorizontalPadding)
+        }
+        .task(id: defaultCollapseSeedKeys) {
+            agentModeVM.seedDefaultCollapsedSidebarThreads(defaultCollapseSeedKeys)
         }
     }
 

@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class CodeMapRootManifestStoreTests: XCTestCase {
@@ -412,6 +413,10 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         let accounting = try await store.accounting()
         XCTAssertEqual(accounting.manifestCount, 0)
         XCTAssertEqual(accounting.quarantineCount, 4)
+        let decodeFailures = await store.decodeFailureAccounting()
+        XCTAssertEqual(decodeFailures.totalCount, 3)
+        XCTAssertEqual(decodeFailures.counts[.checksumMismatch], 2)
+        XCTAssertEqual(decodeFailures.counts[.invalidEnvelope], 1)
     }
 
     func testSymlinkHardlinkWrongModeAndRootReplacementFailClosed() async throws {
@@ -1027,7 +1032,13 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 currentAuthority: fixture.authority
             )
         }
-        XCTAssertEqual(results.count(where: { if case .hit = $0 { true } else { false } }), 2)
+        XCTAssertEqual(results.count(where: {
+            if case .hit = $0 {
+                true
+            } else {
+                false
+            }
+        }), 2)
         XCTAssertEqual(results.count(where: { $0 == .miss }), 1)
 
         await XCTAssertThrowsManifestQuota {
@@ -1122,6 +1133,431 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         XCTAssertEqual(maintenance.accounting.quarantineCount, 2)
     }
 
+    func testSemanticNoOpBelowAccessRefreshThresholdDoesNotRewriteOrScan() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x97,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("BelowThreshold", trailingNewline: false)
+        )
+        let unrelated = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-unrelated",
+            worktreeByte: 0x9B,
+            prefix: "",
+            path: "Sources/Unrelated.swift",
+            text: SwiftFixtureSource.emptyStruct("UnrelatedBelowThreshold", trailingNewline: false)
+        )
+        let publications = ManifestPublicationCounter()
+        let scanRecorder = ManifestScanInspectionRecorder()
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 10,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 10,
+            maximumStoreByteCount: 640 * 1024,
+            maximumQuarantineCount: 10,
+            maintenanceEntryLimit: 64,
+            minimumAccessRefreshIntervalSeconds: 60
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { publications.increment() },
+                onManifestScanInspection: { scanRecorder.record($0) }
+            ),
+            accessEpochSeconds: { 0 }
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 100
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: unrelated.namespace,
+            authority: unrelated.authority,
+            records: [unrelated.record],
+            lastAccessEpochSeconds: 100
+        )
+        let baselineAccounting = try await store.accounting()
+        XCTAssertTrue(scanRecorder.inspectedDigests.contains(unrelated.namespace.storageDigestHex))
+        scanRecorder.reset()
+
+        let result = try await store.updateCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 159
+        )
+
+        XCTAssertEqual(result, .unchanged(manifestGeneration: 1))
+        XCTAssertEqual(publications.value, 2)
+        XCTAssertEqual(scanRecorder.inspectedDigests, [])
+        let persisted = try decodeManifest(fixture.namespace, from: store)
+        XCTAssertEqual(persisted.lastAccessEpochSeconds, 100)
+        XCTAssertEqual(persisted.manifestGeneration, 1)
+        let finalAccounting = try await store.accounting()
+        XCTAssertEqual(finalAccounting, baselineAccounting)
+    }
+
+    func testAccessRefreshAtThresholdPublishesWithoutGlobalScanOrStoreGrowth() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x98,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("ExactThreshold", trailingNewline: false)
+        )
+        let unrelated = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-unrelated",
+            worktreeByte: 0x9C,
+            prefix: "",
+            path: "Sources/Unrelated.swift",
+            text: SwiftFixtureSource.emptyStruct("UnrelatedExactThreshold", trailingNewline: false)
+        )
+        let publications = ManifestPublicationCounter()
+        let scanRecorder = ManifestScanInspectionRecorder()
+        let clock = ManifestAccessClock(160)
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 10,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 10,
+            maximumStoreByteCount: 640 * 1024,
+            maximumQuarantineCount: 10,
+            maintenanceEntryLimit: 64,
+            minimumAccessRefreshIntervalSeconds: 60
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { publications.increment() },
+                onManifestScanInspection: { scanRecorder.record($0) }
+            ),
+            accessEpochSeconds: { clock.value }
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 100
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: unrelated.namespace,
+            authority: unrelated.authority,
+            records: [unrelated.record],
+            lastAccessEpochSeconds: 100
+        )
+        let baselineAccounting = try await store.accounting()
+        XCTAssertTrue(scanRecorder.inspectedDigests.contains(unrelated.namespace.storageDigestHex))
+        scanRecorder.reset()
+
+        guard case let .hit(loaded) = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("threshold access refresh lost the current manifest")
+        }
+        XCTAssertEqual(loaded.lastAccessEpochSeconds, 100)
+        await store.waitForPendingAccessRefreshesForTesting()
+
+        XCTAssertEqual(publications.value, 3)
+        XCTAssertEqual(scanRecorder.inspectedDigests, [])
+        let persisted = try decodeManifest(fixture.namespace, from: store)
+        XCTAssertEqual(persisted.lastAccessEpochSeconds, 160)
+        XCTAssertEqual(persisted.manifestGeneration, 1)
+        let finalAccounting = try await store.accounting()
+        XCTAssertEqual(finalAccounting, baselineAccounting)
+    }
+
+    func testAccessRefreshSkippingGlobalReconciliationRejectsTargetShardDisplacement() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x9D,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("DisplacedRefreshShard", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 10,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 10,
+            maximumStoreByteCount: 640 * 1024,
+            maximumQuarantineCount: 10,
+            maintenanceEntryLimit: 64,
+            minimumAccessRefreshIntervalSeconds: 60
+        )
+        let baseline = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        _ = try await baseline.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 100
+        )
+        let replacement = ManifestShardReplacementHook(root: root, namespace: fixture.namespace)
+        let scanRecorder = ManifestScanInspectionRecorder()
+        let refreshingStore = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { replacement.replaceOnce() },
+                onManifestScanInspection: { scanRecorder.record($0) }
+            ),
+            accessEpochSeconds: { 160 }
+        )
+
+        guard case let .hit(loaded) = try await refreshingStore.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("scheduled access refresh lost the admitted manifest")
+        }
+        XCTAssertEqual(loaded.lastAccessEpochSeconds, 100)
+        await refreshingStore.waitForPendingAccessRefreshesForTesting()
+
+        XCTAssertNil(replacement.failure)
+        XCTAssertEqual(scanRecorder.inspectedDigests, [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: baseline.manifestURL(for: fixture.namespace).path))
+        let freshStore = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        let result = try await freshStore.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        )
+        XCTAssertEqual(result, .miss)
+    }
+
+    func testAccessRefreshSkippingGlobalReconciliationRejectsPublishedTargetFileDisplacement() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x9E,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("DisplacedRefreshTarget", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 10,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 10,
+            maximumStoreByteCount: 640 * 1024,
+            maximumQuarantineCount: 10,
+            maintenanceEntryLimit: 64,
+            minimumAccessRefreshIntervalSeconds: 60
+        )
+        let baseline = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        _ = try await baseline.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 100
+        )
+        let targetURL = baseline.manifestURL(for: fixture.namespace)
+        let replacement = try ManifestTargetFileReplacementHook(
+            targetURL: targetURL,
+            replacementData: Data(contentsOf: targetURL)
+        )
+        let scanRecorder = ManifestScanInspectionRecorder()
+        let refreshingStore = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { replacement.replaceOnce() },
+                onManifestScanInspection: { scanRecorder.record($0) }
+            ),
+            accessEpochSeconds: { 160 }
+        )
+
+        guard case let .hit(loaded) = try await refreshingStore.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("scheduled access refresh lost the admitted manifest")
+        }
+        XCTAssertEqual(loaded.lastAccessEpochSeconds, 100)
+        await refreshingStore.waitForPendingAccessRefreshesForTesting()
+
+        XCTAssertNil(replacement.failure)
+        XCTAssertEqual(scanRecorder.inspectedDigests, [])
+        let persisted = try decodeManifest(fixture.namespace, from: baseline)
+        XCTAssertEqual(persisted.lastAccessEpochSeconds, 100)
+        XCTAssertEqual(persisted.manifestGeneration, 1)
+        XCTAssertEqual(persisted.records, [fixture.record])
+    }
+
+    func testRecordMutationBelowAccessRefreshThresholdStillRewrites() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x99,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("MutationBaseline", trailingNewline: false)
+        )
+        let addedRecord = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            path: "Sources/Added.swift",
+            text: SwiftFixtureSource.emptyStruct("MutationAdded", trailingNewline: false),
+            bindingGeneration: 1
+        )
+        let publications = ManifestPublicationCounter()
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 10,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 10,
+            maximumStoreByteCount: 640 * 1024,
+            maximumQuarantineCount: 10,
+            maintenanceEntryLimit: 64,
+            minimumAccessRefreshIntervalSeconds: 60
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { publications.increment() }
+            ),
+            accessEpochSeconds: { 0 }
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 100
+        )
+
+        let result = try await store.updateCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record, addedRecord],
+            lastAccessEpochSeconds: 120
+        )
+
+        XCTAssertEqual(result, .replaced(manifestGeneration: 2))
+        XCTAssertEqual(publications.value, 2)
+        let persisted = try decodeManifest(fixture.namespace, from: store)
+        XCTAssertEqual(persisted.lastAccessEpochSeconds, 120)
+        XCTAssertEqual(persisted.manifestGeneration, 2)
+        XCTAssertEqual(persisted.records, [addedRecord, fixture.record])
+
+        #if DEBUG
+            let debugMetrics = await store.debugPublicationMetrics(namespace: fixture.namespace)
+            XCTAssertEqual(debugMetrics.attemptCount, 2)
+            XCTAssertEqual(debugMetrics.successfulAttemptCount, 2)
+            XCTAssertEqual(debugMetrics.publicationCount, 2)
+            XCTAssertEqual(debugMetrics.inputSnapshotRecordVolume, 1)
+            XCTAssertEqual(debugMetrics.mutationCountVolume, 3)
+            XCTAssertEqual(debugMetrics.snapshotRecordVolume, 3)
+            XCTAssertGreaterThan(debugMetrics.inputSnapshotByteVolume, 0)
+            XCTAssertEqual(debugMetrics.decodedByteVolume, debugMetrics.inputSnapshotByteVolume)
+            XCTAssertGreaterThan(debugMetrics.snapshotByteVolume, debugMetrics.inputSnapshotByteVolume)
+            let lastAttempt = try XCTUnwrap(debugMetrics.lastAttempt)
+            XCTAssertTrue(lastAttempt.succeeded)
+            XCTAssertTrue(lastAttempt.published)
+            XCTAssertEqual(lastAttempt.inputSnapshotRecordCount, 1)
+            XCTAssertEqual(lastAttempt.mutationCount, 2)
+            XCTAssertEqual(lastAttempt.outputSnapshotRecordCount, 2)
+            XCTAssertGreaterThan(lastAttempt.outputSnapshotEncodedByteCount, 0)
+            XCTAssertGreaterThanOrEqual(
+                lastAttempt.totalDurationNanoseconds,
+                lastAttempt.atomicReplaceDurationNanoseconds
+            )
+            XCTAssertGreaterThanOrEqual(
+                lastAttempt.totalDurationNanoseconds,
+                lastAttempt.manifestDirectorySyncDurationNanoseconds
+            )
+        #endif
+    }
+
+    func testAuthorityMutationBelowAccessRefreshThresholdStillRewrites() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0x9A,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("AuthorityMutation", trailingNewline: false)
+        )
+        let newerAuthority = try authorityLike(
+            fixture.authority,
+            generation: fixture.authority.authorityGeneration + 1,
+            index: "index-2"
+        )
+        let publications = ManifestPublicationCounter()
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 10,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 10,
+            maximumStoreByteCount: 640 * 1024,
+            maximumQuarantineCount: 10,
+            maintenanceEntryLimit: 64,
+            minimumAccessRefreshIntervalSeconds: 60
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { publications.increment() }
+            ),
+            accessEpochSeconds: { 0 }
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [],
+            lastAccessEpochSeconds: 100
+        )
+
+        let result = try await store.updateCurrentManifest(
+            namespace: fixture.namespace,
+            authority: newerAuthority,
+            records: [],
+            lastAccessEpochSeconds: 120
+        )
+
+        XCTAssertEqual(result, .replaced(manifestGeneration: 2))
+        XCTAssertEqual(publications.value, 2)
+        let persisted = try decodeManifest(fixture.namespace, from: store)
+        XCTAssertEqual(persisted.authority, newerAuthority)
+        XCTAssertEqual(persisted.lastAccessEpochSeconds, 120)
+        XCTAssertEqual(persisted.manifestGeneration, 2)
+        XCTAssertTrue(persisted.records.isEmpty)
+    }
+
     func testConcurrentLoadsPersistMonotonicCoalescedAccessEpoch() async throws {
         let root = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1135,7 +1571,17 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             path: "Sources/App.swift",
             text: SwiftFixtureSource.emptyStruct("ConcurrentTouch", trailingNewline: false)
         )
+        let unrelated = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-unrelated",
+            worktreeByte: 0x94,
+            prefix: "",
+            path: "Sources/Unrelated.swift",
+            text: SwiftFixtureSource.emptyStruct("UnrelatedTouch", trailingNewline: false)
+        )
         let clock = ManifestAccessClock(500)
+        let scanRecorder = ManifestScanInspectionRecorder()
         let policy = CodeMapRootManifestStorePolicy(
             maximumRecordCountPerManifest: 10,
             maximumManifestByteCount: 64 * 1024,
@@ -1148,6 +1594,9 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         let store = try CodeMapRootManifestStore(
             rootURL: root,
             policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                onManifestScanInspection: { scanRecorder.record($0) }
+            ),
             accessEpochSeconds: { clock.value }
         )
         _ = try await store.replaceCurrentManifest(
@@ -1156,6 +1605,14 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             records: [fixture.record],
             lastAccessEpochSeconds: 100
         )
+        _ = try await store.replaceCurrentManifest(
+            namespace: unrelated.namespace,
+            authority: unrelated.authority,
+            records: [unrelated.record],
+            lastAccessEpochSeconds: 100
+        )
+        XCTAssertTrue(scanRecorder.inspectedDigests.contains(unrelated.namespace.storageDigestHex))
+        scanRecorder.reset()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 32 {
@@ -1171,6 +1628,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             try await group.waitForAll()
         }
         await store.waitForPendingAccessRefreshesForTesting()
+        XCTAssertEqual(scanRecorder.inspectedDigests, [])
         let touched = try decodeManifest(fixture.namespace, from: store)
         XCTAssertEqual(touched.lastAccessEpochSeconds, 500)
         XCTAssertEqual(touched.manifestGeneration, 1)
@@ -1183,6 +1641,806 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         )
         XCTAssertEqual(unchanged, .unchanged(manifestGeneration: 1))
         XCTAssertEqual(try decodeManifest(fixture.namespace, from: store).lastAccessEpochSeconds, 500)
+    }
+
+    func testOrdinaryPublicationUsesAtMostTwoBoundedStoreScans() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = ManifestStoreWorkCounter()
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                scanStarted: { work.recordScan() }
+            )
+        )
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xD1,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("SingleScan", trailingNewline: false)
+        )
+
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+
+        XCTAssertLessThanOrEqual(work.scanCount, 2)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("single-scan publication must remain readable")
+        }
+        let populatedCacheCount = await store.decodedManifestCacheEntryCountForTesting()
+        XCTAssertEqual(populatedCacheCount, 1)
+        let removed = try await store.removeNamespace(fixture.namespace)
+        XCTAssertTrue(removed)
+        let removedCacheCount = await store.decodedManifestCacheEntryCountForTesting()
+        XCTAssertEqual(removedCacheCount, 0)
+    }
+
+    func testEvictingPublicationUsesAtMostThreeBoundedStoreScans() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = ManifestStoreWorkCounter()
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 1,
+            maximumStoreByteCount: 64 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 32
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(scanStarted: { work.recordScan() })
+        )
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let first = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-first",
+            worktreeByte: 0xD8,
+            prefix: "",
+            path: "Sources/First.swift",
+            text: SwiftFixtureSource.emptyStruct("First", trailingNewline: false)
+        )
+        let second = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-second",
+            worktreeByte: 0xD9,
+            prefix: "",
+            path: "Sources/Second.swift",
+            text: SwiftFixtureSource.emptyStruct("Second", trailingNewline: false)
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: first.namespace,
+            authority: first.authority,
+            records: [first.record],
+            lastAccessEpochSeconds: 1
+        )
+        work.reset()
+
+        _ = try await store.replaceCurrentManifest(
+            namespace: second.namespace,
+            authority: second.authority,
+            records: [second.record],
+            lastAccessEpochSeconds: 2
+        )
+
+        XCTAssertLessThanOrEqual(work.scanCount, 3)
+        let evicted = try await store.loadCurrentManifest(
+            namespace: first.namespace,
+            currentAuthority: first.authority
+        )
+        XCTAssertEqual(evicted, .miss)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: second.namespace,
+            currentAuthority: second.authority
+        ) else {
+            return XCTFail("new publication must survive quota eviction")
+        }
+    }
+
+    func testNearCapacityPublicationKeepsScanCountAndElapsedTimeBounded() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let policy = CodeMapRootManifestStorePolicy.default
+        let namespaceScope = "\(#function)-shared"
+        let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        for index in 0 ..< 255 {
+            let fixture = try await makeFixture(
+                root: root,
+                artifactStore: artifactStore,
+                namespaceScope: namespaceScope,
+                worktreeByte: UInt8(index),
+                prefix: "",
+                path: "Sources/Resident.swift",
+                text: "struct NearCapacityResident\(index) {}"
+            )
+            let snapshot = try CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 1,
+                lastAccessEpochSeconds: UInt64(index),
+                records: [fixture.record]
+            )
+            let insertion = try ManifestEntryInsertionHook(
+                url: locator.manifestURL(for: fixture.namespace),
+                data: CodeMapRootManifestCodec.encode(snapshot: snapshot)
+            )
+            insertion.insertOnce()
+            XCTAssertNil(insertion.failure, "resident fixture index \(index)")
+        }
+        let target = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: namespaceScope,
+            worktreeByte: 0xFF,
+            prefix: "",
+            path: "Sources/Target.swift",
+            text: SwiftFixtureSource.emptyStruct("NearCapacityTarget", trailingNewline: false)
+        )
+        let work = ManifestStoreWorkCounter()
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(scanStarted: { work.recordScan() })
+        )
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        _ = try await store.replaceCurrentManifest(
+            namespace: target.namespace,
+            authority: target.authority,
+            records: [target.record],
+            lastAccessEpochSeconds: 100
+        )
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertEqual(work.scanCount, 2, "target publication scan count")
+        XCTAssertLessThan(elapsed, .seconds(15), "target publication elapsed time")
+        let accounting = try await store.accounting()
+        XCTAssertEqual(accounting.manifestCount, 256, "target publication manifest count")
+        XCTAssertFalse(accounting.hasMore, "target publication accounting must be complete")
+    }
+
+    func testDecodedManifestCacheHonorsEncodedByteBudget() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        var fixtures: [ManifestFixture] = []
+        for (index, byte) in [UInt8(0xE8), 0xE9].enumerated() {
+            try await fixtures.append(makeFixture(
+                root: root,
+                artifactStore: artifactStore,
+                namespaceScope: "\(#function)-\(index)",
+                worktreeByte: byte,
+                prefix: "",
+                path: "Sources/App.swift",
+                text: "struct CacheBudget\(index) {}"
+            ))
+        }
+        let snapshots = try fixtures.enumerated().map { index, fixture in
+            try CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 1,
+                lastAccessEpochSeconds: UInt64(index + 1),
+                records: [fixture.record]
+            )
+        }
+        let encodedSizes = try snapshots.map { try CodeMapRootManifestCodec.encode(snapshot: $0).count }
+        let cacheBudget = try UInt64(XCTUnwrap(encodedSizes.max()))
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 4,
+            maximumStoreByteCount: 256 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 32,
+            maximumDecodedManifestCacheByteCount: cacheBudget
+        )
+        let store = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+
+        for fixture in fixtures {
+            _ = try await store.replaceCurrentManifest(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                records: [fixture.record],
+                lastAccessEpochSeconds: 1
+            )
+            let cachedBytes = await store.decodedManifestCacheByteCountForTesting()
+            XCTAssertLessThanOrEqual(cachedBytes, cacheBudget)
+        }
+
+        let cachedCount = await store.decodedManifestCacheEntryCountForTesting()
+        let cachedBytes = await store.decodedManifestCacheByteCountForTesting()
+        XCTAssertEqual(cachedCount, 1)
+        XCTAssertLessThanOrEqual(cachedBytes, cacheBudget)
+    }
+
+    func testPostRenameMutationIsReconciledWithoutReportingDurableCommitAsFailure() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let target = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-target",
+            worktreeByte: 0xD6,
+            prefix: "",
+            path: "Sources/Target.swift",
+            text: SwiftFixtureSource.emptyStruct("PostRenameTarget", trailingNewline: false)
+        )
+        let intruder = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-intruder",
+            worktreeByte: 0xD7,
+            prefix: "",
+            path: "Sources/Intruder.swift",
+            text: SwiftFixtureSource.emptyStruct("PostRenameIntruder", trailingNewline: false)
+        )
+        let intruderSnapshot = try CodeMapRootManifestSnapshot(
+            namespace: intruder.namespace,
+            authority: intruder.authority,
+            manifestGeneration: 1,
+            lastAccessEpochSeconds: 0,
+            records: [intruder.record]
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 1,
+            maximumStoreByteCount: 64 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 32
+        )
+        let locator = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            accessEpochSeconds: { 0 }
+        )
+        let insertion = try ManifestEntryInsertionHook(
+            url: locator.manifestURL(for: intruder.namespace),
+            data: CodeMapRootManifestCodec.encode(snapshot: intruderSnapshot)
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { insertion.insertOnce() }
+            ),
+            accessEpochSeconds: { 0 }
+        )
+
+        let result = try await store.replaceCurrentManifest(
+            namespace: target.namespace,
+            authority: target.authority,
+            records: [target.record],
+            lastAccessEpochSeconds: 10
+        )
+
+        XCTAssertNil(insertion.failure)
+        XCTAssertEqual(result, .inserted(manifestGeneration: 1))
+        let accounting = try await store.accounting()
+        XCTAssertEqual(accounting.manifestCount, 1)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: target.namespace,
+            currentAuthority: target.authority
+        ) else {
+            return XCTFail("durably committed protected target must survive post-rename reconciliation")
+        }
+        let intruderResult = try await store.loadCurrentManifest(
+            namespace: intruder.namespace,
+            currentAuthority: intruder.authority
+        )
+        XCTAssertEqual(intruderResult, .miss)
+    }
+
+    func testDurableCommitSchedulesBoundedFollowUpMaintenance() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xDA,
+            prefix: "",
+            path: "Sources/Target.swift",
+            text: SwiftFixtureSource.emptyStruct("MaintenanceRetryTarget", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 1,
+            maximumStoreByteCount: 64 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 2
+        )
+        let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        let insertion = ManifestTemporaryBurstInsertionHook(
+            manifestURL: locator.manifestURL(for: fixture.namespace),
+            count: 7
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { insertion.insertOnce() },
+                committedMaintenanceRetrySleep: { _ in }
+            )
+        )
+
+        let result = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+        await store.waitForCommittedMaintenanceRetryForTesting()
+
+        XCTAssertEqual(result, .inserted(manifestGeneration: 1))
+        XCTAssertNil(insertion.failure)
+        let retryState = await store.committedMaintenanceRetryStateForTesting()
+        XCTAssertEqual(retryState.pendingCount, 0)
+        XCTAssertEqual(retryState.attempt, 0)
+        XCTAssertFalse(retryState.isScheduled)
+        let accounting = try await store.accounting()
+        XCTAssertEqual(accounting.temporaryCount, 0)
+        XCTAssertFalse(accounting.hasMore)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("durable target must remain readable after follow-up maintenance")
+        }
+    }
+
+    func testCommittedMaintenanceRetryPreservesProtectedPublicationUnderQuotaPressure() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let target = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-target",
+            worktreeByte: 0xDC,
+            prefix: "",
+            path: "Sources/Target.swift",
+            text: SwiftFixtureSource.emptyStruct("ProtectedRetryTarget", trailingNewline: false)
+        )
+        let intruder = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-intruder",
+            worktreeByte: 0xDD,
+            prefix: "",
+            path: "Sources/Intruder.swift",
+            text: SwiftFixtureSource.emptyStruct("RetryQuotaIntruder", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 1,
+            maximumStoreByteCount: 64 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 2
+        )
+        let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        let intruderSnapshot = try CodeMapRootManifestSnapshot(
+            namespace: intruder.namespace,
+            authority: intruder.authority,
+            manifestGeneration: 1,
+            lastAccessEpochSeconds: 100,
+            records: [intruder.record]
+        )
+        let insertion = try ManifestEntryInsertionHook(
+            url: locator.manifestURL(for: intruder.namespace),
+            data: CodeMapRootManifestCodec.encode(snapshot: intruderSnapshot)
+        )
+        let temporaryBurst = ManifestTemporaryBurstInsertionHook(
+            manifestURL: locator.manifestURL(for: target.namespace),
+            count: 3
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: {
+                    insertion.insertOnce()
+                    temporaryBurst.insertOnce()
+                },
+                committedMaintenanceRetrySleep: { _ in }
+            )
+        )
+
+        let result = try await store.replaceCurrentManifest(
+            namespace: target.namespace,
+            authority: target.authority,
+            records: [target.record],
+            lastAccessEpochSeconds: 1
+        )
+        await store.waitForCommittedMaintenanceRetryForTesting()
+
+        XCTAssertEqual(result, .inserted(manifestGeneration: 1))
+        XCTAssertNil(insertion.failure)
+        XCTAssertNil(temporaryBurst.failure)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: target.namespace,
+            currentAuthority: target.authority
+        ) else {
+            return XCTFail("follow-up maintenance must preserve the exact durable publication")
+        }
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: intruder.namespace,
+            currentAuthority: intruder.authority
+        ) else {
+            return XCTFail("bounded retry pressure should remain observable in this fixture")
+        }
+        let retryState = await store.committedMaintenanceRetryStateForTesting()
+        XCTAssertEqual(retryState.pendingCount, 1)
+        XCTAssertEqual(retryState.attempt, 3)
+        XCTAssertFalse(retryState.isScheduled)
+    }
+
+    func testCommittedMaintenanceRetryStopsAfterBoundedAttempts() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xDB,
+            prefix: "",
+            path: "Sources/Target.swift",
+            text: SwiftFixtureSource.emptyStruct("BoundedMaintenanceRetry", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 1,
+            maximumStoreByteCount: 64 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 2
+        )
+        let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        let insertion = ManifestTemporaryBurstInsertionHook(
+            manifestURL: locator.manifestURL(for: fixture.namespace),
+            count: 40
+        )
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { insertion.insertOnce() },
+                committedMaintenanceRetrySleep: { _ in }
+            )
+        )
+
+        let result = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+        await store.waitForCommittedMaintenanceRetryForTesting()
+
+        XCTAssertEqual(result, .inserted(manifestGeneration: 1))
+        XCTAssertNil(insertion.failure)
+        let retryState = await store.committedMaintenanceRetryStateForTesting()
+        XCTAssertEqual(retryState.pendingCount, 1)
+        XCTAssertEqual(retryState.attempt, 3)
+        XCTAssertFalse(retryState.isScheduled)
+        let productionStatus = await store.maintenanceStatus()
+        XCTAssertTrue(productionStatus.hasPendingCommittedWork)
+        XCTAssertEqual(productionStatus.attempt, 3)
+        XCTAssertFalse(productionStatus.isScheduled)
+        XCTAssertTrue(productionStatus.isExhausted)
+        let accounting = try await store.accounting(maximumEntries: 2)
+        XCTAssertTrue(accounting.hasMore)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("retry exhaustion must not invalidate the durable target")
+        }
+    }
+
+    func testPublicMaintainHonorsPendingCommittedTargetProtection() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let target = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-target",
+            worktreeByte: 0xDE,
+            prefix: "",
+            path: "Sources/Target.swift",
+            text: SwiftFixtureSource.emptyStruct("MaintainedTarget", trailingNewline: false)
+        )
+        let intruder = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-intruder",
+            worktreeByte: 0xDF,
+            prefix: "",
+            path: "Sources/Intruder.swift",
+            text: SwiftFixtureSource.emptyStruct("MaintenanceIntruder", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 1,
+            maximumStoreByteCount: 64 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 4
+        )
+        let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        let intruderSnapshot = try CodeMapRootManifestSnapshot(
+            namespace: intruder.namespace,
+            authority: intruder.authority,
+            manifestGeneration: 1,
+            lastAccessEpochSeconds: 100,
+            records: [intruder.record]
+        )
+        let insertion = try ManifestEntryInsertionHook(
+            url: locator.manifestURL(for: intruder.namespace),
+            data: CodeMapRootManifestCodec.encode(snapshot: intruderSnapshot)
+        )
+        let temporaryBurst = ManifestTemporaryBurstInsertionHook(
+            manifestURL: locator.manifestURL(for: target.namespace),
+            count: 7
+        )
+        let retryGate = ManifestAccessRefreshGate()
+        defer { retryGate.release() }
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: {
+                    insertion.insertOnce()
+                    temporaryBurst.insertOnce()
+                },
+                committedMaintenanceRetrySleep: { _ in await retryGate.block() }
+            )
+        )
+
+        let publication = try await store.replaceCurrentManifest(
+            namespace: target.namespace,
+            authority: target.authority,
+            records: [target.record],
+            lastAccessEpochSeconds: 1
+        )
+        await retryGate.waitUntilBlocked()
+        let maintenance = try await store.maintain()
+
+        XCTAssertEqual(publication, .inserted(manifestGeneration: 1))
+        XCTAssertFalse(maintenance.accounting.hasMore)
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: target.namespace,
+            currentAuthority: target.authority
+        ) else {
+            return XCTFail("public maintenance must preserve pending exact committed protection")
+        }
+        let intruderResult = try await store.loadCurrentManifest(
+            namespace: intruder.namespace,
+            currentAuthority: intruder.authority
+        )
+        XCTAssertEqual(intruderResult, .miss)
+        let retryState = await store.committedMaintenanceRetryStateForTesting()
+        XCTAssertEqual(retryState.pendingCount, 0)
+        XCTAssertEqual(retryState.attempt, 0)
+        XCTAssertFalse(retryState.isScheduled)
+    }
+
+    func testLaterCleanPublicationClearsObsoleteCommittedMaintenanceDebt() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let first = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-first",
+            worktreeByte: 0xE0,
+            prefix: "",
+            path: "Sources/First.swift",
+            text: SwiftFixtureSource.emptyStruct("FirstCleanPublication", trailingNewline: false)
+        )
+        let second = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-second",
+            worktreeByte: 0xE1,
+            prefix: "",
+            path: "Sources/Second.swift",
+            text: SwiftFixtureSource.emptyStruct("SecondCleanPublication", trailingNewline: false)
+        )
+        let policy = CodeMapRootManifestStorePolicy(
+            maximumRecordCountPerManifest: 4,
+            maximumManifestByteCount: 64 * 1024,
+            maximumManifestCount: 2,
+            maximumStoreByteCount: 128 * 1024,
+            maximumQuarantineCount: 4,
+            maintenanceEntryLimit: 4
+        )
+        let locator = try CodeMapRootManifestStore(rootURL: root, policy: policy)
+        let temporaryBurst = ManifestTemporaryBurstInsertionHook(
+            manifestURL: locator.manifestURL(for: first.namespace),
+            count: 7
+        )
+        let retryGate = ManifestAccessRefreshGate()
+        defer { retryGate.release() }
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                afterPublishRename: { temporaryBurst.insertOnce() },
+                committedMaintenanceRetrySleep: { _ in await retryGate.block() }
+            )
+        )
+
+        _ = try await store.replaceCurrentManifest(
+            namespace: first.namespace,
+            authority: first.authority,
+            records: [first.record],
+            lastAccessEpochSeconds: 1
+        )
+        await retryGate.waitUntilBlocked()
+        try temporaryBurst.removeInsertedFiles()
+        let publication = try await store.replaceCurrentManifest(
+            namespace: second.namespace,
+            authority: second.authority,
+            records: [second.record],
+            lastAccessEpochSeconds: 2
+        )
+
+        XCTAssertEqual(publication, .inserted(manifestGeneration: 1))
+        let retryState = await store.committedMaintenanceRetryStateForTesting()
+        XCTAssertEqual(retryState.pendingCount, 0)
+        XCTAssertEqual(retryState.attempt, 0)
+        XCTAssertFalse(retryState.isScheduled)
+        for fixture in [first, second] {
+            guard case .hit = try await store.loadCurrentManifest(
+                namespace: fixture.namespace,
+                currentAuthority: fixture.authority
+            ) else {
+                return XCTFail("authoritative clean publication must preserve both manifests")
+            }
+        }
+    }
+
+    func testCoalescedAccessRefreshesAvoidStoreWideReconciliation() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let writer = try CodeMapRootManifestStore(rootURL: root, accessEpochSeconds: { 0 })
+        var fixtures: [ManifestFixture] = []
+        for (index, byte) in [UInt8(0xD2), 0xD3, 0xD4].enumerated() {
+            let fixture = try await makeFixture(
+                root: root,
+                artifactStore: artifactStore,
+                namespaceScope: "\(#function)-\(index)",
+                worktreeByte: byte,
+                prefix: "",
+                path: "Sources/App.swift",
+                text: "struct BatchedAccess\(index) {}"
+            )
+            fixtures.append(fixture)
+            _ = try await writer.replaceCurrentManifest(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                records: [fixture.record],
+                lastAccessEpochSeconds: 1
+            )
+        }
+
+        let gate = ManifestAccessRefreshGate()
+        let work = ManifestStoreWorkCounter()
+        let touching = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                beforeMaintenanceLock: { await gate.block() },
+                scanStarted: { work.recordScan() }
+            ),
+            accessEpochSeconds: { 500 }
+        )
+        guard case .hit = try await touching.loadCurrentManifest(
+            namespace: fixtures[0].namespace,
+            currentAuthority: fixtures[0].authority
+        ) else {
+            return XCTFail("expected first access-refresh source hit")
+        }
+        await gate.waitUntilBlocked()
+        for fixture in fixtures.dropFirst() {
+            guard case .hit = try await touching.loadCurrentManifest(
+                namespace: fixture.namespace,
+                currentAuthority: fixture.authority
+            ) else {
+                return XCTFail("expected coalesced access-refresh source hit")
+            }
+        }
+        work.reset()
+        await gate.release()
+        await touching.waitForPendingAccessRefreshesForTesting()
+
+        XCTAssertEqual(work.scanCount, 0)
+        for fixture in fixtures {
+            let touched = try decodeManifest(fixture.namespace, from: touching)
+            XCTAssertEqual(touched.lastAccessEpochSeconds, 500)
+            XCTAssertEqual(touched.manifestGeneration, 1)
+            XCTAssertEqual(touched.records, [fixture.record])
+        }
+    }
+
+    func testInPlaceChildMutationInvalidatesDecodedManifestCache() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = ManifestStoreWorkCounter()
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                scanStarted: { work.recordScan() }
+            )
+        )
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xD5,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("CachedOriginal", trailingNewline: false)
+        )
+        let added = try await makeRecord(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            path: "Sources/Added.swift",
+            text: SwiftFixtureSource.emptyStruct("CachedAdded", trailingNewline: false),
+            bindingGeneration: 2
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+        _ = try await store.accounting()
+
+        let externallyMutated = try CodeMapRootManifestSnapshot(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            manifestGeneration: 2,
+            lastAccessEpochSeconds: 1,
+            records: [added, fixture.record].sorted {
+                $0.repositoryRelativePath.utf8.lexicographicallyPrecedes($1.repositoryRelativePath.utf8)
+            }
+        )
+        let encoded = try CodeMapRootManifestCodec.encode(snapshot: externallyMutated)
+        try overwriteFileInPlace(at: store.manifestURL(for: fixture.namespace), data: encoded)
+        work.reset()
+
+        let accounting = try await store.accounting()
+        XCTAssertEqual(accounting.recordCount, 2)
+        XCTAssertLessThanOrEqual(work.scanCount, 1)
     }
 
     func testLogicalAccessEvictionKeepsHotOldManifestOverColdNewManifest() async throws {
@@ -1532,7 +2790,9 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             currentAuthority: resident.authority
         )
         XCTAssertEqual(residentResult, .miss)
+        await strict.waitForPendingAccessRefreshesForTesting()
 
+        await strict.waitForPendingAccessRefreshesForTesting()
         _ = try await permissive.replaceCurrentManifest(
             namespace: resident.namespace,
             authority: resident.authority,
@@ -2026,13 +3286,277 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         hostile.append(("artifact key pipeline mismatch", checksummedManifest(keyMismatch)))
 
         for (label, data) in hostile {
+            let expectedFailure: CodeMapRootManifestDecodeFailure? = switch label {
+            case "invalid contribution tag", "terminal outcome with contribution":
+                .contributionValidation
+            case "duplicate path", "out-of-order path":
+                .orderingValidation
+            case "record authority mismatch":
+                .authorityValidation
+            default:
+                nil
+            }
             XCTAssertThrowsError(
                 try CodeMapRootManifestCodec.decodeStored(
                     data,
                     filenameDigest: fixture.namespace.storageDigestHex
                 ),
                 label
+            ) { error in
+                if let expectedFailure {
+                    XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, expectedFailure, label)
+                }
+            }
+        }
+    }
+
+    func testRepeatedSemanticQuarantineDelaysAndEventuallyRepairsTheFailingAuthority() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xA9,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("RepeatedSemanticFailure", trailingNewline: false)
+        )
+        let clock = ManifestAccessClock(100)
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                waitForRegenerationBackpressure: { seconds in clock.advance(by: seconds) }
+            ),
+            accessEpochSeconds: { clock.value }
+        )
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+
+        func replaceWithInvalidContributionTag() throws {
+            var data = try Data(contentsOf: store.manifestURL(for: fixture.namespace))
+            let offsets = try manifestCodecOffsets(in: data)
+            data[offsets.records[0].contributionTagOffset] = 0xFF
+            try replaceFile(
+                at: store.manifestURL(for: fixture.namespace),
+                data: checksummedManifest(data)
             )
+        }
+
+        try replaceWithInvalidContributionTag()
+        let firstFailure = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        )
+        XCTAssertEqual(firstFailure, .miss)
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 2
+        )
+
+        try replaceWithInvalidContributionTag()
+        let secondFailure = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        )
+        XCTAssertEqual(secondFailure, .miss)
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 3
+        )
+
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("the blocked durability write should repair after its delay")
+        }
+        let accounting = await store.decodeFailureAccounting()
+        XCTAssertEqual(accounting.counts[.contributionValidation], 2)
+        XCTAssertEqual(accounting.regenerationBackpressureCount, 1)
+        XCTAssertEqual(clock.value, 130)
+    }
+
+    func testMaintenanceRepeatedSemanticQuarantineDelaysAndBackpressuresRepair() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xA8,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("MaintenanceSemanticFailure", trailingNewline: false)
+        )
+        let clock = ManifestAccessClock(100)
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                waitForRegenerationBackpressure: { seconds in clock.advance(by: seconds) }
+            ),
+            accessEpochSeconds: { clock.value }
+        )
+
+        func replaceWithInvalidContributionTag() throws {
+            var data = try Data(contentsOf: store.manifestURL(for: fixture.namespace))
+            let offsets = try manifestCodecOffsets(in: data)
+            data[offsets.records[0].contributionTagOffset] = 0xFF
+            try replaceFile(
+                at: store.manifestURL(for: fixture.namespace),
+                data: checksummedManifest(data)
+            )
+        }
+
+        func maintainUntilQuarantined() async throws -> CodeMapRootManifestMaintenanceResult {
+            for _ in 0 ..< 10 {
+                let result = try await store.maintain()
+                if result.quarantinedCorruptCount > 0 {
+                    return result
+                }
+            }
+            return try await store.maintain()
+        }
+
+        // First valid publication.
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 1
+        )
+
+        // Corrupt the manifest; maintenance scan discovers the semantic failure.
+        try replaceWithInvalidContributionTag()
+        let firstResult = try await maintainUntilQuarantined()
+        XCTAssertEqual(firstResult.quarantinedCorruptCount, 1)
+
+        // Re-publish without a delay; the first scan-discovered failure has not
+        // crossed the regeneration threshold.
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 2
+        )
+
+        // Corrupt and scan again; repeated scan-discovered semantic corruption
+        // now triggers a regeneration backoff.
+        try replaceWithInvalidContributionTag()
+        let secondResult = try await maintainUntilQuarantined()
+        XCTAssertEqual(secondResult.quarantinedCorruptCount, 1)
+
+        // The repair write should be blocked for the base backoff, then succeed.
+        _ = try await store.replaceCurrentManifest(
+            namespace: fixture.namespace,
+            authority: fixture.authority,
+            records: [fixture.record],
+            lastAccessEpochSeconds: 3
+        )
+
+        guard case .hit = try await store.loadCurrentManifest(
+            namespace: fixture.namespace,
+            currentAuthority: fixture.authority
+        ) else {
+            return XCTFail("the repair write should be observable after its backoff")
+        }
+        let accounting = await store.decodeFailureAccounting()
+        XCTAssertEqual(accounting.counts[.contributionValidation], 2)
+        XCTAssertEqual(accounting.regenerationBackpressureCount, 1)
+        XCTAssertEqual(clock.value, 130)
+    }
+
+    func testStoredManifestDecodeFailureAttributesValidatedFrameStage() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xA7,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("DecodeAttribution", trailingNewline: false)
+        )
+        let encoded = try CodeMapRootManifestCodec.encode(
+            snapshot: CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 1,
+                lastAccessEpochSeconds: 1,
+                records: [fixture.record]
+            )
+        )
+        let offsets = try manifestCodecOffsets(in: encoded)
+
+        var checksumMismatch = encoded
+        checksumMismatch[checksumMismatch.index(before: checksumMismatch.endIndex)] ^= 0xFF
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksumMismatch,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .checksumMismatch)
+        }
+
+        var unsupportedCodec = encoded
+        writeUInt32(99, at: CodeMapRootManifestCodec.magic.count, in: &unsupportedCodec)
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksummedManifest(unsupportedCodec),
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .unsupportedCodecVersion)
+        }
+
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            encoded,
+            filenameDigest: String(repeating: "0", count: 64)
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .namespaceDigestMismatch)
+        }
+
+        var invalidRecord = encoded
+        invalidRecord.replaceSubrange(
+            offsets.records[0].pathDataRange,
+            with: Data("Sources/../x.swif".utf8)
+        )
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksummedManifest(invalidRecord),
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .recordValidation)
+        }
+
+        var trailingPayload = Data(encoded.dropLast(32))
+        trailingPayload.append(0)
+        trailingPayload.append(Data(SHA256.hash(data: trailingPayload)))
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            trailingPayload,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .trailingPayload)
+        }
+
+        let differentNamespace = try namespaceLike(
+            fixture.namespace,
+            worktreeIdentity: worktreeIdentity(0xA8)
+        )
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decode(
+            encoded,
+            expectedNamespace: differentNamespace,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .expectedNamespaceMismatch)
         }
     }
 
@@ -2559,6 +4083,24 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         XCTAssertEqual(rename(replacement.path, url.path), 0)
     }
 
+    private func overwriteFileInPlace(at url: URL, data: Data) throws {
+        let descriptor = open(url.path, O_WRONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw CodeMapRootManifestStoreError.ioFailure(operation: "test-open", code: errno) }
+        defer { Darwin.close(descriptor) }
+        XCTAssertEqual(ftruncate(descriptor, 0), 0)
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let written = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                guard written > 0 else {
+                    throw CodeMapRootManifestStoreError.ioFailure(operation: "test-write", code: errno)
+                }
+                offset += written
+            }
+        }
+        XCTAssertEqual(fsync(descriptor), 0)
+    }
+
     private func decodeManifest(
         _ namespace: CodeMapRootManifestNamespace,
         from store: CodeMapRootManifestStore
@@ -2697,11 +4239,103 @@ private final class ManifestEntryInsertionHook: @unchecked Sendable {
     }
 }
 
+private final class ManifestPublicationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.withLock { count }
+    }
+
+    func increment() {
+        lock.withLock {
+            count += 1
+        }
+    }
+}
+
+private final class ManifestTemporaryBurstInsertionHook: @unchecked Sendable {
+    private let manifestURL: URL
+    private let count: Int
+    private let lock = NSLock()
+    private var inserted = false
+    private var storedFailure: Error?
+
+    init(manifestURL: URL, count: Int) {
+        self.manifestURL = manifestURL
+        self.count = count
+    }
+
+    var failure: Error? {
+        lock.withLock { storedFailure }
+    }
+
+    func insertOnce() {
+        lock.withLock {
+            guard !inserted else { return }
+            inserted = true
+            do {
+                let parent = manifestURL.deletingLastPathComponent()
+                for index in 0 ..< count {
+                    let temporary = parent.appendingPathComponent(".tmp.injected.\(index)")
+                    try Data("temporary-\(index)".utf8).write(to: temporary, options: .withoutOverwriting)
+                    guard chmod(temporary.path, 0o600) == 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                }
+            } catch {
+                storedFailure = error
+            }
+        }
+    }
+
+    func removeInsertedFiles() throws {
+        try lock.withLock {
+            let parent = manifestURL.deletingLastPathComponent()
+            for index in 0 ..< count {
+                let temporary = parent.appendingPathComponent(".tmp.injected.\(index)")
+                if FileManager.default.fileExists(atPath: temporary.path) {
+                    try FileManager.default.removeItem(at: temporary)
+                }
+            }
+        }
+    }
+}
+
+private final class ManifestScanInspectionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var digests: [String] = []
+
+    var inspectedDigests: [String] {
+        lock.withLock { digests }
+    }
+
+    func record(_ digest: String) {
+        lock.withLock { digests.append(digest) }
+    }
+
+    func reset() {
+        lock.withLock { digests.removeAll(keepingCapacity: true) }
+    }
+}
+
 private final class ManifestAccessClock: @unchecked Sendable {
-    let value: UInt64
+    private let lock = NSLock()
+    private var storedValue: UInt64
 
     init(_ value: UInt64) {
-        self.value = value
+        storedValue = value
+    }
+
+    var value: UInt64 {
+        lock.withLock { storedValue }
+    }
+
+    func advance(by amount: UInt64) {
+        lock.withLock {
+            let (sum, overflow) = storedValue.addingReportingOverflow(amount)
+            storedValue = overflow ? .max : sum
+        }
     }
 }
 
@@ -2758,6 +4392,23 @@ private final class ManifestLockedMergeGate: @unchecked Sendable {
             guard condition.wait(until: deadline) else { return predicate() }
         }
         return true
+    }
+}
+
+private final class ManifestStoreWorkCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var scans = 0
+
+    var scanCount: Int {
+        lock.withLock { scans }
+    }
+
+    func recordScan() {
+        lock.withLock { scans += 1 }
+    }
+
+    func reset() {
+        lock.withLock { scans = 0 }
     }
 }
 
@@ -2888,7 +4539,9 @@ private actor ManifestLockReplacementGate {
             replacementWaiters.removeAll()
             waiters.forEach { $0.resume() }
         }
-        if released { return }
+        if released {
+            return
+        }
         await withCheckedContinuation { continuation in
             if released {
                 continuation.resume()
@@ -2899,7 +4552,9 @@ private actor ManifestLockReplacementGate {
     }
 
     func waitUntilReplaced() async {
-        if replaced { return }
+        if replaced {
+            return
+        }
         await withCheckedContinuation { replacementWaiters.append($0) }
     }
 
@@ -2972,6 +4627,44 @@ private final class ManifestShardReplacementHook: @unchecked Sendable {
             .appendingPathComponent("v1", isDirectory: true)
             .appendingPathComponent("quarantine", isDirectory: true)
         return try FileManager.default.contentsOfDirectory(atPath: quarantine.path).count
+    }
+}
+
+private final class ManifestTargetFileReplacementHook: @unchecked Sendable {
+    private let targetURL: URL
+    private let replacementData: Data
+    private let lock = NSLock()
+    private var replaced = false
+    private var storedFailure: Error?
+
+    init(targetURL: URL, replacementData: Data) {
+        self.targetURL = targetURL
+        self.replacementData = replacementData
+    }
+
+    var failure: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedFailure
+    }
+
+    func replaceOnce() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !replaced else { return }
+        replaced = true
+        do {
+            let replacement = targetURL.deletingLastPathComponent()
+                .appendingPathComponent(".replacement-\(UUID().uuidString)")
+            try replacementData.write(to: replacement, options: .withoutOverwriting)
+            guard chmod(replacement.path, 0o600) == 0,
+                  rename(replacement.path, targetURL.path) == 0
+            else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch {
+            storedFailure = error
+        }
     }
 }
 

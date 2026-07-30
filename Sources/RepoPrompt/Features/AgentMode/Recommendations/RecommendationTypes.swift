@@ -236,6 +236,11 @@ struct RecommendationSet {
         chatModel != nil || contextBuilder != nil || mcpPresetExposure != nil || mcpAgentDefaults != nil
     }
 
+    /// Returns true when applying this set may mutate the targeted Agent Models profile.
+    var hasAgentModelsRecommendations: Bool {
+        chatModel != nil || contextBuilder != nil || mcpAgentDefaults != nil
+    }
+
     /// Number of recommendations that need action (not already satisfied and not muted).
     var actionableUnsatisfiedCount: Int {
         var count = 0
@@ -258,6 +263,37 @@ struct RecommendationSet {
         if let mcp = mcpPresetExposure, mcp.isMuted, !mcp.alreadySatisfied { return true }
         if let agentDefaults = mcpAgentDefaults, agentDefaults.isMuted, !agentDefaults.alreadySatisfied { return true }
         return false
+    }
+}
+
+/// Posts one canonical recommendation-apply notification per unique durable scope.
+/// Agent Models writes use the captured operation scope, while MCP preset exposure is global.
+enum RecommendationApplyNotification {
+    static func post(
+        sourceWorkspaceID: UUID,
+        agentModelsScope: AgentModelsEditingScope?,
+        includesPresetExposure: Bool,
+        object: Any? = nil,
+        notificationCenter: NotificationCenter = .default
+    ) {
+        var affectedScopes: [AgentModelsEditingScope] = []
+        if let agentModelsScope {
+            affectedScopes.append(agentModelsScope)
+        }
+        if includesPresetExposure, !affectedScopes.contains(.global) {
+            affectedScopes.append(.global)
+        }
+
+        for scope in affectedScopes {
+            notificationCenter.post(
+                name: .recommendationsDidApply,
+                object: object,
+                userInfo: AgentModelsSettingsNotification.userInfo(
+                    scope: scope,
+                    sourceWorkspaceID: sourceWorkspaceID
+                )
+            )
+        }
     }
 }
 
@@ -361,8 +397,10 @@ enum BestPracticeProfiles {
 
     // MARK: Model Strength Summary
 
+    static let claudeCodeOpusRecommendationLabel = "Claude Opus via Claude Code's stable Opus alias (Opus 5 on the Anthropic API)"
+
     static let claudeStrengths = """
-    Claude Opus 4.6 remains great for editing-heavy work and careful file modifications. \
+    \(claudeCodeOpusRecommendationLabel) remains great for editing-heavy work and careful file modifications. \
     GPT-5.6 Sol Low via Codex CLI is now our default recommendation for explore, discovery, and lightweight agentic work.
     """
 

@@ -29,6 +29,13 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
     public let connectionGeneration: UInt64?
     public let errno: Int32?
     public let errorDescription: String?
+    public let toolName: String?
+    public let invocationID: UUID?
+    public let elapsedMilliseconds: Double?
+    public let handlerPhase: String?
+    public let handlerPhaseAgeMilliseconds: Double?
+    public let executionDeadlineMilliseconds: Double?
+    public let cleanupGraceMilliseconds: Double?
     public let bridgeActiveRequestCount: Int?
     public let bridgeResponseInDeliveryCount: Int?
     public let bridgeCancellationTombstoneCount: Int?
@@ -55,7 +62,14 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
         bridgeCancellationTombstoneCount: Int? = nil,
         bridgeRecentCompletionCount: Int? = nil,
         bridgePendingTransactionCount: Int? = nil,
-        bridgeHasForwardedProtocolFrame: Bool? = nil
+        bridgeHasForwardedProtocolFrame: Bool? = nil,
+        toolName: String? = nil,
+        invocationID: UUID? = nil,
+        elapsedMilliseconds: Double? = nil,
+        handlerPhase: String? = nil,
+        handlerPhaseAgeMilliseconds: Double? = nil,
+        executionDeadlineMilliseconds: Double? = nil,
+        cleanupGraceMilliseconds: Double? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -78,12 +92,63 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
             maximumLength: 2048,
             sensitiveValues: [sessionToken]
         )
+        self.toolName = Self.privacySafeText(
+            toolName,
+            maximumLength: 256,
+            sensitiveValues: [sessionToken]
+        )
+        self.invocationID = invocationID
+        self.elapsedMilliseconds = Self.nonNegativeFinite(elapsedMilliseconds)
+        self.handlerPhase = Self.privacySafeText(
+            handlerPhase,
+            maximumLength: 256,
+            sensitiveValues: [sessionToken]
+        )
+        self.handlerPhaseAgeMilliseconds = Self.nonNegativeFinite(handlerPhaseAgeMilliseconds)
+        self.executionDeadlineMilliseconds = Self.nonNegativeFinite(executionDeadlineMilliseconds)
+        self.cleanupGraceMilliseconds = Self.nonNegativeFinite(cleanupGraceMilliseconds)
         self.bridgeActiveRequestCount = bridgeActiveRequestCount
         self.bridgeResponseInDeliveryCount = bridgeResponseInDeliveryCount
         self.bridgeCancellationTombstoneCount = bridgeCancellationTombstoneCount
         self.bridgeRecentCompletionCount = bridgeRecentCompletionCount
         self.bridgePendingTransactionCount = bridgePendingTransactionCount
         self.bridgeHasForwardedProtocolFrame = bridgeHasForwardedProtocolFrame
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        // Preserve the legacy camel-case wire contract. Only the appended watchdog
+        // attribution fields use the operational snake-case key convention.
+        case id
+        case timestamp
+        case monotonicUptime
+        case layer
+        case initiator
+        case reason
+        case sessionFingerprint
+        case localPID
+        case peerPID
+        case appConnectionID
+        case connectionGeneration
+        case errno
+        case errorDescription
+        case bridgeActiveRequestCount
+        case bridgeResponseInDeliveryCount
+        case bridgeCancellationTombstoneCount
+        case bridgeRecentCompletionCount
+        case bridgePendingTransactionCount
+        case bridgeHasForwardedProtocolFrame
+        case toolName = "tool_name"
+        case invocationID = "invocation_id"
+        case elapsedMilliseconds = "elapsed_ms"
+        case handlerPhase = "handler_phase"
+        case handlerPhaseAgeMilliseconds = "handler_phase_age_ms"
+        case executionDeadlineMilliseconds = "execution_deadline_ms"
+        case cleanupGraceMilliseconds = "cleanup_grace_ms"
+    }
+
+    private static func nonNegativeFinite(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else { return nil }
+        return max(0, value)
     }
 
     private static func privacySafeText(

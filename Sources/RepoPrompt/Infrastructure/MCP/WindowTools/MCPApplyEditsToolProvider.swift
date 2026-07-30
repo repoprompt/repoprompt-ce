@@ -47,6 +47,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             inputSchema: .object(
                 properties: [
                     "path": .string(description: "File path"),
+                    "operation_id": .string(description: "Optional caller-stable correlation ID echoed in applied mutation replies; this does not provide deduplication or replay safety"),
                     "rewrite": .string(description: "Replace the entire file content with this string"),
                     "search": .string(description: "Text to find"),
                     "replace": .string(description: "Replacement text"),
@@ -82,8 +83,21 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 try ApplyEditsRequestBuilder().buildFromNormalizedPayload(args)
             }
             requestPath = request.path
+            let suppliedOperationID = args["operation_id"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
             let metadata = await dependencies.captureRequestMetadata()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let (resolvedContext, lookupContext) = try await dependencies.resolveMutationFileToolContext(
+                metadata,
+                MCPWindowToolName.applyEdits
+            )
+            if !resolvedContext.usesActiveTabCompatibility,
+               let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
+                   for: resolvedContext.snapshot
+               )
+            {
+                return Self.retryableFailureSummary(request: request, failure: failure)
+            }
             if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
                 for: lookupContext,
                 store: dependencies.promptVM.workspaceFileContextStore
@@ -92,18 +106,21 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             }
             let effectivePath = lookupContext.translateInputPath(request.path)
             let displayPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: effectivePath, display: .relative) ?? request.path
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
-                userPath: effectivePath,
-                fallbackScope: lookupContext.rootScope
-            )
+            do {
+                _ = try await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                    userPath: effectivePath,
+                    fallbackScope: lookupContext.rootScope,
+                    timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
+                )
+            } catch is WorkspaceAppliedIngressWaitError {
+                return Self.retryableFailureSummary(
+                    request: request,
+                    failure: .workspaceFreshnessUnavailable()
+                )
+            }
             if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
-            let resolvedContext = try dependencies.resolveTabContextSnapshot(
-                metadata,
-                MCPWindowToolName.applyEdits,
-                MCPServerViewModel.TabContextResolutionPolicy.allowLegacyImplicitRouting
-            )
             let store = await MainActor.run { dependencies.promptVM.workspaceFileContextStore }
             let host = WorkspaceFileEditHost(
                 store: store,
@@ -189,12 +206,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                             overwrite: preview.exists
                         )
                     }
-                    await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
-                        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
-                            userPath: effectivePath,
-                            fallbackScope: lookupContext.rootScope
-                        )
-                    }
+                    let freshness = await postMutationFreshness(
+                        userPath: effectivePath,
+                        rootScope: lookupContext.rootScope
+                    )
                     let persistedResult = previewResult.withFileMetadata(created: !preview.exists, overwritten: false)
                     #if DEBUG
                         MCPApplyEditsRebaseProbeRecorder.recordApplyEditsOutcome(
@@ -211,7 +226,9 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         from: persistedResult,
                         path: displayPath,
                         reviewStatus: "accepted",
-                        requiresUserApproval: true
+                        requiresUserApproval: true,
+                        operationID: operationID,
+                        freshness: freshness
                     )
                 case let .reject(reason):
                     return editSummary(
@@ -247,14 +264,14 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
 
             let effectiveRequest = ApplyEditsRequest(path: effectivePath, mode: request.mode, verbose: request.verbose)
             let result = try await service.run(effectiveRequest)
+            let freshness: String?
             if result.editsApplied > 0 {
-                await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
-                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
-                        userPath: effectivePath,
-                        fallbackScope: lookupContext.rootScope
-                    )
-                }
+                freshness = await postMutationFreshness(
+                    userPath: effectivePath,
+                    rootScope: lookupContext.rootScope
+                )
             } else {
+                freshness = nil
                 EditFlowPerf.event(
                     EditFlowPerf.Stage.ApplyEdits.flushDeltas,
                     EditFlowPerf.Dimensions(outcome: "skipped", appliedCount: result.editsApplied)
@@ -271,7 +288,12 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                     outcome: "success"
                 )
             #endif
-            return editSummary(from: result, path: displayPath)
+            return editSummary(
+                from: result,
+                path: displayPath,
+                operationID: result.editsApplied > 0 ? operationID : nil,
+                freshness: freshness
+            )
         } catch let error as FileManagerError {
             throw await dependencies.mapFileManagerErrorToMCP(error, MCPWindowToolName.applyEdits, requestPath)
         } catch let error as ApplyEditsError {
@@ -280,6 +302,24 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             throw error
         } catch {
             throw MCPError.internalError(error.localizedDescription)
+        }
+    }
+
+    private func postMutationFreshness(
+        userPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> String {
+        await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
+            do {
+                _ = try await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                    userPath: userPath,
+                    fallbackScope: rootScope,
+                    timeout: .seconds(2)
+                )
+                return "fresh"
+            } catch {
+                return "pending"
+            }
         }
     }
 
@@ -353,7 +393,9 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
         noteOverride: String? = nil,
         reviewStatus: String? = nil,
         rejectionReason: String? = nil,
-        requiresUserApproval: Bool? = nil
+        requiresUserApproval: Bool? = nil,
+        operationID: String? = nil,
+        freshness: String? = nil
     ) -> EditSummary {
         let lineStats = result.toolCardLineStats()
         return EditSummary(
@@ -372,7 +414,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             fileOverwritten: result.fileOverwritten ? true : nil,
             reviewStatus: reviewStatus,
             rejectionReason: rejectionReason,
-            requiresUserApproval: requiresUserApproval
+            requiresUserApproval: requiresUserApproval,
+            operationID: operationID,
+            mutationState: operationID == nil ? nil : "applied",
+            freshness: freshness
         )
     }
 

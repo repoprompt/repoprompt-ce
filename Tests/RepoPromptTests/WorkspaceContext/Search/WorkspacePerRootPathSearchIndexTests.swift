@@ -401,10 +401,16 @@ import XCTest
                 snapshot: XCTUnwrap(retainedSnapshot)
             )
             XCTAssertTrue(oldIndex.search("Added", limit: 100).isEmpty)
+            XCTAssertEqual(oldIndex.overlayHistoryMetricsForTesting.totalPayloadCount, 0)
             XCTAssertEqual(retainedIndex.search("Added", limit: 100).count, 16)
-            XCTAssertEqual(retainedIndex.overlaySegmentCountForTesting, 16)
+            XCTAssertEqual(retainedIndex.overlayHistoryMetricsForTesting.recentPayloadCount, 16)
+            XCTAssertEqual(retainedIndex.overlayHistoryMetricsForTesting.compactedPageCount, 0)
+            XCTAssertTrue(retainedIndex.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
             XCTAssertEqual(currentIndex.search("Added", limit: 100).count, patchCount)
-            XCTAssertLessThanOrEqual(currentIndex.overlaySegmentCountForTesting, 16)
+            XCTAssertEqual(currentIndex.overlayHistoryMetricsForTesting.recentPayloadCount, 6)
+            XCTAssertEqual(currentIndex.overlayHistoryMetricsForTesting.compactedPageCount, 2)
+            XCTAssertEqual(currentIndex.overlayHistoryMetricsForTesting.totalPayloadCount, patchCount)
+            XCTAssertTrue(currentIndex.overlayHistoryMetricsForTesting.isWithinStructuralBounds)
 
             let diagnostics = try await shardDiagnostics(
                 rootID: root.id,
