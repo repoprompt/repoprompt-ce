@@ -510,7 +510,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             )
             let gate = PreAssemblyContentReadGate()
             let task = Task {
-                try await PromptContextPreAssemblyService.withResolved(request) { _ in
+                try await PromptContextPreAssemblyService.withResolved(
+                    request,
+                    codemapPresentation: .empty
+                ) { _ in
                     await gate.markStartedAndWaitForRelease()
                     try Task.checkCancellation()
                     return "must-not-publish"
@@ -1324,8 +1327,18 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 
     private final class PreAssemblyContentReadGate: @unchecked Sendable {
         private let condition = AsyncTestCondition(PreAssemblyContentReadGateState())
+        private let claimLock = NSLock()
+        private var claimed = false
 
         func markStartedAndWaitForRelease() async {
+            claimLock.lock()
+            guard !claimed else {
+                claimLock.unlock()
+                return
+            }
+            claimed = true
+            claimLock.unlock()
+
             condition.update { $0.started = true }
             do {
                 try await condition.waitUntil(

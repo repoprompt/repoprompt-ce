@@ -1543,7 +1543,7 @@ struct CLIProvidersSettingsView: View {
                         Spacer()
 
                         Button(action: { signOutFromCodex() }) {
-                            Text("Sign Out")
+                            Text("Disconnect from RepoPrompt")
                                 .foregroundColor(.secondary)
                         }
                         .buttonStyle(CustomButtonStyle())
@@ -2065,7 +2065,7 @@ struct CLIProvidersSettingsView: View {
         Task {
             await viewModel.resetCodexConnectionForSignOut(windowID: windowID)
             await MainActor.run {
-                alertMessage = "Signed out from Codex CLI"
+                alertMessage = "Disconnected Codex CLI from RepoPrompt"
                 showAlert = true
                 onAPIKeyUpdated?()
             }
