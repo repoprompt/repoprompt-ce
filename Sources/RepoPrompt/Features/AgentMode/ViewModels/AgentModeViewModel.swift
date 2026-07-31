@@ -567,7 +567,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
-    let attachmentWorkspaceDirectoryProvider: () -> URL?
+    let attachmentWorkspaceStorageProvider: () throws -> WorkspacePersistentStorage
     private let workspacePathProvider: () -> String?
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
@@ -1449,11 +1449,11 @@ final class AgentModeViewModel: ObservableObject {
         let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
             Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
         workspacePathProvider = codexWorkspacePathProvider
-        attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
-            guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
-                return nil
+        attachmentWorkspaceStorageProvider = { [weak workspaceManager] in
+            guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
+                throw AgentAttachmentStorageError.noActiveWorkspace
             }
-            return FileManager.default.temporaryDirectory
+            return try workspaceManager.featureArtifactStorage(for: workspace)
         }
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
@@ -1610,7 +1610,6 @@ final class AgentModeViewModel: ObservableObject {
         init(
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
-            testWorkspaceDirectory: URL? = nil,
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
             shouldManageCodexTooling: Bool = false,
@@ -1675,11 +1674,8 @@ final class AgentModeViewModel: ObservableObject {
             mcpServer = testMCPServer
             self.applyEditsApprovalStore = applyEditsApprovalStore
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
-            attachmentWorkspaceDirectoryProvider = {
-                if let testWorkspaceDirectory {
-                    return testWorkspaceDirectory
-                }
-                return FileManager.default.temporaryDirectory
+            attachmentWorkspaceStorageProvider = {
+                throw AgentAttachmentStorageError.noActiveWorkspace
             }
             let codexWorkspacePathProvider = { testWorkspacePath }
             let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =

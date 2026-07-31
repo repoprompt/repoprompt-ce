@@ -563,11 +563,31 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     }
 }
 
+enum WorkspacePersistenceDisposition: Equatable {
+    case persistent
+    case skipEphemeral
+}
+
+enum WorkspacePersistenceError: LocalizedError, Equatable {
+    case ephemeralWorkspace
+
+    var errorDescription: String? {
+        switch self {
+        case .ephemeralWorkspace:
+            "Temporary workspaces are memory-only and cannot be persisted."
+        }
+    }
+}
+
 extension WorkspaceModel {
     /// Indicates whether this workspace should not be persisted to disk
     var isEphemeral: Bool {
         get { ephemeralFlag ?? false }
         set { ephemeralFlag = newValue }
+    }
+
+    var persistenceDisposition: WorkspacePersistenceDisposition {
+        isEphemeral ? .skipEphemeral : .persistent
     }
 
     @discardableResult

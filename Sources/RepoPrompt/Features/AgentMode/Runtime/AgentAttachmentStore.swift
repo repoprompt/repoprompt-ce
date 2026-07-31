@@ -34,7 +34,8 @@ struct AgentAttachmentStore {
             .standardizedFileURL
     }
 
-    func importImageFile(sourceURL: URL, workspaceDirectory: URL) throws -> ImportResult {
+    func importImageFile(sourceURL: URL, storage: WorkspacePersistentStorage) throws -> ImportResult {
+        try storage.validateAuthorization()
         let sourceURL = sourceURL.standardizedFileURL
         guard sourceURL.isFileURL else {
             throw Error.invalidSourceURL
@@ -43,7 +44,7 @@ struct AgentAttachmentStore {
             throw Error.sourceIsNotImage
         }
 
-        let storageRoot = Self.managedStorageRootURL(for: workspaceDirectory)
+        let storageRoot = Self.managedStorageRootURL(for: storage.workspaceDirectory)
         try fileManager.createDirectory(at: storageRoot, withIntermediateDirectories: true)
 
         let fileExtension = normalizedFileExtension(for: sourceURL)
@@ -64,9 +65,10 @@ struct AgentAttachmentStore {
         return ImportResult(attachment: attachment, fileURL: destinationURL)
     }
 
-    func clearConsumedLocalFiles(_ attachments: [AgentImageAttachment], workspaceDirectory: URL) {
+    func clearConsumedLocalFiles(_ attachments: [AgentImageAttachment], storage: WorkspacePersistentStorage) {
+        guard (try? storage.validateAuthorization()) != nil else { return }
         guard !attachments.isEmpty else { return }
-        let storageRoot = Self.managedStorageRootURL(for: workspaceDirectory)
+        let storageRoot = Self.managedStorageRootURL(for: storage.workspaceDirectory)
         let storagePrefix = storageRoot.path + "/"
         var localFilesToRemove: Set<URL> = []
 
