@@ -175,6 +175,11 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        #if DEBUG
+            GitWorktreeRetirementDebugLaunchActivation.installIfRequested(
+                environment: ProcessInfo.processInfo.environment
+            )
+        #endif
         RepoPromptSwiftUIApp.main()
     }
 }

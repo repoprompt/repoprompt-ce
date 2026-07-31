@@ -1,83 +1,99 @@
-import CryptoKit
 import Foundation
+#if DEBUG
+    import CryptoKit
+#endif
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin
 #else
     import Glibc
 #endif
 
-/// Trusted operator policy validation is a composition-root capability. MCP request JSON cannot
-/// construct or install an activation: the caller must already hold a product-owned authority.
-protocol GitWorktreeRetirementOperatorPolicyAuthority: Sendable {
-    func validateRetirementPolicyReceipt(
-        _ receipt: Data,
-        policyVersion: Int
-    ) throws -> GitWorktreeRetirementPolicyValidation
-}
+#if DEBUG
+    /// Trusted operator policy validation is a composition-root capability. MCP request JSON cannot
+    /// construct or install an activation: the caller must already hold a product-owned authority.
+    protocol GitWorktreeRetirementOperatorPolicyAuthority: Sendable {
+        func validateRetirementPolicyReceipt(
+            _ receipt: Data,
+            policyVersion: Int
+        ) throws -> GitWorktreeRetirementPolicyValidation
+    }
 
-struct GitWorktreeRetirementPolicyValidation: Equatable {
-    let authorityID: String
-    let receiptID: String
-    let approvedAt: Date
-}
+    struct GitWorktreeRetirementPolicyValidation: Equatable {
+        let authorityID: String
+        let receiptID: String
+        let approvedAt: Date
+    }
+
+    enum GitWorktreeRetirementActivationInstallationError: Error, Equatable {
+        case invalidReceipt
+        case alreadyInstalled
+    }
+#endif
 
 /// Retirement is advertised before activation so clients can discover the future contract.
-/// Production activation is process-local, versioned, and requires a receipt validated by a
-/// trusted operator-policy authority supplied by the app composition root. Absence is fail-closed.
+/// Release builds are permanently fail-closed. Debug builds require the composition root to
+/// install one validated, process-local policy receipt before any server startup can expose it.
 enum GitWorktreeRetirementActivation {
     static let requiredPolicyVersion = 1
 
-    private struct InstalledActivation {
-        let policyVersion: Int
-        let receiptDigest: String
-        let validation: GitWorktreeRetirementPolicyValidation
-    }
-
-    private static let lock = NSLock()
-    private static var installed: InstalledActivation?
     #if DEBUG
+        private struct InstalledActivation {
+            let policyVersion: Int
+            let receiptDigest: String
+            let validation: GitWorktreeRetirementPolicyValidation
+        }
+
+        private static let lock = NSLock()
+        private static var installed: InstalledActivation?
         private static var testingOverride = false
     #endif
 
     static var isEnabled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
         #if DEBUG
+            lock.lock()
+            defer { lock.unlock() }
             if testingOverride { return true }
+            guard let installed else { return false }
+            return installed.policyVersion == requiredPolicyVersion
+                && !installed.receiptDigest.isEmpty
+                && !installed.validation.authorityID.isEmpty
+                && !installed.validation.receiptID.isEmpty
+        #else
+            return false
         #endif
-        guard let installed else { return false }
-        return installed.policyVersion == requiredPolicyVersion
-            && !installed.receiptDigest.isEmpty
-            && !installed.validation.authorityID.isEmpty
-            && !installed.validation.receiptID.isEmpty
     }
 
-    static func install(
-        policyVersion: Int,
-        receipt: Data,
-        authority: any GitWorktreeRetirementOperatorPolicyAuthority
-    ) throws {
-        guard policyVersion == requiredPolicyVersion, !receipt.isEmpty else {
-            throw GitWorktreeRetirementError.activationRequired
+    #if DEBUG
+        static func install(
+            policyVersion: Int,
+            receipt: Data,
+            authority: any GitWorktreeRetirementOperatorPolicyAuthority
+        ) throws {
+            guard policyVersion == requiredPolicyVersion, !receipt.isEmpty else {
+                throw GitWorktreeRetirementActivationInstallationError.invalidReceipt
+            }
+            let validation = try authority.validateRetirementPolicyReceipt(
+                receipt,
+                policyVersion: policyVersion
+            )
+            guard !validation.authorityID.isEmpty, !validation.receiptID.isEmpty else {
+                throw GitWorktreeRetirementActivationInstallationError.invalidReceipt
+            }
+            let receiptDigest = SHA256.hash(data: receipt)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            lock.lock()
+            defer { lock.unlock() }
+            guard installed == nil else {
+                throw GitWorktreeRetirementActivationInstallationError.alreadyInstalled
+            }
+            installed = InstalledActivation(
+                policyVersion: policyVersion,
+                receiptDigest: receiptDigest,
+                validation: validation
+            )
         }
-        let validation = try authority.validateRetirementPolicyReceipt(
-            receipt,
-            policyVersion: policyVersion
-        )
-        guard !validation.authorityID.isEmpty, !validation.receiptID.isEmpty else {
-            throw GitWorktreeRetirementError.activationRequired
-        }
-        let receiptDigest = SHA256.hash(data: receipt)
-            .map { String(format: "%02x", $0) }
-            .joined()
-        lock.lock()
-        installed = InstalledActivation(
-            policyVersion: policyVersion,
-            receiptDigest: receiptDigest,
-            validation: validation
-        )
-        lock.unlock()
-    }
+    #endif
 
     static func requireEnabled() throws {
         guard isEnabled else { throw GitWorktreeRetirementError.activationRequired }
@@ -87,6 +103,13 @@ enum GitWorktreeRetirementActivation {
         static func setEnabledForTesting(_ enabled: Bool) {
             lock.lock()
             testingOverride = enabled
+            lock.unlock()
+        }
+
+        static func resetForTesting() {
+            lock.lock()
+            installed = nil
+            testingOverride = false
             lock.unlock()
         }
     #endif

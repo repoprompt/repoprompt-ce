@@ -83,11 +83,21 @@ Use narrow patterns for the files agents actually need. A good `.worktreeinclude
 ## Permanently retiring an app-managed worktree
 
 Worktree retirement is a separate, irreversible operator flow. It is advertised in
-`manage_worktree`, but remains default-off until RepoPrompt app startup installs a
-validated version-1 retirement-policy receipt. Ordinary MCP clients cannot activate it.
-Production dispatch also requires the dedicated `manage_worktree.retire` action grant.
-RepoPrompt installs that grant in Agent Mode connection policy; the grant does not bypass
-the activation receipt or the two-stage authorization.
+`manage_worktree`, but remains default-off. A DEBUG app can activate the flow only when
+its launch environment contains this exact policy receipt:
+
+```text
+REPOPROMPT_DEBUG_WORKTREE_RETIREMENT_POLICY_RECEIPT=repoprompt-ce.authoritative-worktree-retirement.debug.v1
+```
+
+The DEBUG composition root validates and installs that receipt exactly once, before MCP
+server startup. Missing, empty, or different values fail closed. Release builds compile
+out the environment key, validator, and installation API, so they have no activation path.
+
+Ordinary MCP clients cannot activate retirement. Dispatch also requires the dedicated
+`manage_worktree.retire` action grant. RepoPrompt installs that grant only in Agent Mode
+connection policy; plain CLI callers do not receive it. The grant does not bypass the
+DEBUG receipt, release separation, or the two-stage authorization.
 
 The first call does not delete anything. It closes generation-aware RepoPrompt admission,
 drains app-owned sessions, bindings, workspace roots, watchers, mutation leases, and Git
