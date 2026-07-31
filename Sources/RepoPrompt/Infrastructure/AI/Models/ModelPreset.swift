@@ -347,6 +347,11 @@ class ModelPresetsManager: ObservableObject {
         loadPresets()
     }
 
+    /// Reloads presets from Application Support JSON after an external importer mutates the preset file.
+    func reloadFromDisk() {
+        loadPresets()
+    }
+
     /// Loads presets from Application Support JSON.
     private func loadPresets() {
         presets = presetFileStore.loadModelPresets().modelPresets

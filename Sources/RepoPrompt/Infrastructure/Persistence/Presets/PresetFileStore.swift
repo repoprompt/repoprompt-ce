@@ -91,24 +91,30 @@ final class PresetFileStore {
     }
 
     func saveWorkflowPresets(_ document: WorkflowPresetDocument) {
-        guard !preservingUnsupportedFutureWorkflowDocument else { return }
-        guard !preservingUnbackedCorruptWorkflowDocument else { return }
-        if let version = unsupportedFutureSchemaVersionOnDisk(at: workflowFileURL) {
-            preservingUnsupportedFutureWorkflowDocument = true
-            print("⚠️ Workflow presets JSON schema v\(version) is newer than supported v\(Self.currentSchemaVersion); preserving file and skipping save.")
-            return
-        }
-
-        var documentToWrite = document
-        documentToWrite.schemaVersion = Self.currentSchemaVersion
-        documentToWrite.updatedAt = now()
         do {
-            try ensurePresetDirectoryExists(for: workflowFileURL)
-            let data = try Self.fileEncoder.encode(documentToWrite)
-            try data.write(to: workflowFileURL, options: .atomic)
+            try saveWorkflowPresetsThrowing(document)
         } catch {
             print("⚠️ Failed to save workflow presets JSON at \(workflowFileURL.path): \(error)")
         }
+    }
+
+    func saveWorkflowPresetsThrowing(_ document: WorkflowPresetDocument) throws {
+        guard !preservingUnsupportedFutureWorkflowDocument else {
+            throw PresetFileStoreError.unsupportedFutureSchemaPreserved
+        }
+        guard !preservingUnbackedCorruptWorkflowDocument else {
+            throw PresetFileStoreError.unbackedCorruptDocumentPreserved
+        }
+        if let version = unsupportedFutureSchemaVersionOnDisk(at: workflowFileURL) {
+            preservingUnsupportedFutureWorkflowDocument = true
+            throw PresetFileStoreError.unsupportedFutureSchema(version)
+        }
+        var documentToWrite = document
+        documentToWrite.schemaVersion = Self.currentSchemaVersion
+        documentToWrite.updatedAt = now()
+        try ensurePresetDirectoryExists(for: workflowFileURL)
+        let data = try Self.fileEncoder.encode(documentToWrite)
+        try data.write(to: workflowFileURL, options: .atomic)
     }
 
     func loadWorkflowDocument() throws -> WorkflowPresetDocument {
@@ -152,24 +158,30 @@ final class PresetFileStore {
     }
 
     func saveModelPresets(_ document: ModelPresetDocument) {
-        guard !preservingUnsupportedFutureModelDocument else { return }
-        guard !preservingUnbackedCorruptModelDocument else { return }
-        if let version = unsupportedFutureSchemaVersionOnDisk(at: modelFileURL) {
-            preservingUnsupportedFutureModelDocument = true
-            print("⚠️ Model presets JSON schema v\(version) is newer than supported v\(Self.currentSchemaVersion); preserving file and skipping save.")
-            return
-        }
-
-        var documentToWrite = document
-        documentToWrite.schemaVersion = Self.currentSchemaVersion
-        documentToWrite.updatedAt = now()
         do {
-            try ensurePresetDirectoryExists(for: modelFileURL)
-            let data = try Self.fileEncoder.encode(documentToWrite)
-            try data.write(to: modelFileURL, options: .atomic)
+            try saveModelPresetsThrowing(document)
         } catch {
             print("⚠️ Failed to save model presets JSON at \(modelFileURL.path): \(error)")
         }
+    }
+
+    func saveModelPresetsThrowing(_ document: ModelPresetDocument) throws {
+        guard !preservingUnsupportedFutureModelDocument else {
+            throw PresetFileStoreError.unsupportedFutureSchemaPreserved
+        }
+        guard !preservingUnbackedCorruptModelDocument else {
+            throw PresetFileStoreError.unbackedCorruptDocumentPreserved
+        }
+        if let version = unsupportedFutureSchemaVersionOnDisk(at: modelFileURL) {
+            preservingUnsupportedFutureModelDocument = true
+            throw PresetFileStoreError.unsupportedFutureSchema(version)
+        }
+        var documentToWrite = document
+        documentToWrite.schemaVersion = Self.currentSchemaVersion
+        documentToWrite.updatedAt = now()
+        try ensurePresetDirectoryExists(for: modelFileURL)
+        let data = try Self.fileEncoder.encode(documentToWrite)
+        try data.write(to: modelFileURL, options: .atomic)
     }
 
     func loadModelDocument() throws -> ModelPresetDocument {
@@ -243,8 +255,21 @@ final class PresetFileStore {
         let schemaVersion: Int
     }
 
-    enum PresetFileStoreError: Error, Equatable {
+    enum PresetFileStoreError: Error, Equatable, LocalizedError {
         case unsupportedFutureSchema(Int)
+        case unsupportedFutureSchemaPreserved
+        case unbackedCorruptDocumentPreserved
+
+        var errorDescription: String? {
+            switch self {
+            case let .unsupportedFutureSchema(version):
+                "Preset schema v\(version) is newer than supported v\(PresetFileStore.currentSchemaVersion)."
+            case .unsupportedFutureSchemaPreserved:
+                "Preset file uses a newer unsupported schema and was preserved."
+            case .unbackedCorruptDocumentPreserved:
+                "Preset file is corrupt and could not be backed up for safe replacement."
+            }
+        }
     }
 
     private static let fileEncoder: JSONEncoder = {
