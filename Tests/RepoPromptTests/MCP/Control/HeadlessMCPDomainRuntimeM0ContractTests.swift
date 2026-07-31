@@ -22,8 +22,8 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(actionFixtures.keys).union(actionlessFixtures.keys), Set(allTools))
         XCTAssertTrue(Set(actionFixtures.keys).isDisjoint(with: actionlessFixtures.keys))
         XCTAssertTrue(actionFixtures.values.allSatisfy { !$0.isEmpty })
-        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 86)
-        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 86)
+        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 87)
+        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 87)
         XCTAssertEqual(actionlessFixtures.count, try integer(catalog, key: "actionless_tool_count"))
 
         let actionEvidence = try dictionary(catalog, key: "action_execution_evidence")
@@ -102,6 +102,21 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
 
         let policy = try dictionary(manifest, key: "policy")
+        let actionContracts = try dictionary(policy, key: "action_contracts")
+        let retirementContract = try dictionary(actionContracts, key: "manage_worktree.retire")
+        let liveRetirementContract = try XCTUnwrap(MCPToolActionContractCatalog.contract(
+            toolName: MCPWindowToolName.manageWorktree,
+            arguments: ["op": .string("retire")]
+        ))
+        XCTAssertEqual(liveRetirementContract.capability.rawValue, try string(retirementContract, key: "capability"))
+        XCTAssertEqual(liveRetirementContract.admissionClass.rawValue, try string(retirementContract, key: "admission"))
+        XCTAssertEqual(liveRetirementContract.approval.rawValue, try string(retirementContract, key: "approval"))
+        XCTAssertEqual(liveRetirementContract.requiresActivationGate, true)
+        XCTAssertEqual(retirementContract["activation_gate_default"] as? Bool, false)
+        XCTAssertEqual(
+            try string(retirementContract, key: "dispatch_grant"),
+            MCPToolActionContractCatalog.irreversibleRetirementDispatchGrant
+        )
         let admissionFixture = try stringArrays(policy, key: "admission")
         let actualAdmission = Dictionary(grouping: MCPToolAdmissionPolicy.classifications) { $0.value.rawValue }
             .mapValues { Set($0.map(\.key)) }

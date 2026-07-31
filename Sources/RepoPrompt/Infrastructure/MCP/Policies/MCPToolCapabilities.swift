@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 
 /// Capability-level grouping for MCP tool policy decisions.
 /// Policies should express intent in terms of capabilities and derive tool names from this map.
@@ -125,5 +126,87 @@ enum MCPToolCapabilities {
         Set(capabilityToTools.compactMap { capability, tools in
             tools.contains(toolName) ? capability : nil
         })
+    }
+}
+
+enum MCPToolActionCapability: String, Hashable {
+    case worktreeManage = "worktree_manage"
+    case irreversibleWorktreeRetirement = "irreversible_worktree_retirement"
+}
+
+enum MCPToolActionApprovalContract: String, Equatable {
+    case ordinary
+    case explicitTwoStage = "explicit_two_stage"
+}
+
+struct MCPToolActionContract: Equatable {
+    let capability: MCPToolActionCapability
+    let admissionClass: MCPToolAdmissionClass
+    let approval: MCPToolActionApprovalContract
+    let requiresActivationGate: Bool
+}
+
+enum MCPToolActionContractCatalog {
+    static let irreversibleRetirementDispatchGrant = "manage_worktree.retire"
+
+    static func contract(toolName: String, arguments: [String: Value]) -> MCPToolActionContract? {
+        guard toolName == MCPWindowToolName.manageWorktree else { return nil }
+        let operation = arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if operation == "retire" {
+            return MCPToolActionContract(
+                capability: .irreversibleWorktreeRetirement,
+                admissionClass: .exclusive,
+                approval: .explicitTwoStage,
+                requiresActivationGate: true
+            )
+        }
+        return MCPToolActionContract(
+            capability: .worktreeManage,
+            admissionClass: .exclusive,
+            approval: .ordinary,
+            requiresActivationGate: false
+        )
+    }
+
+    static func isAuthorized(
+        toolName: String,
+        arguments: [String: Value],
+        grantedCapabilities: Set<MCPToolActionCapability>,
+        activationEnabled: Bool
+    ) -> Bool {
+        guard let contract = contract(toolName: toolName, arguments: arguments),
+              grantedCapabilities.contains(contract.capability)
+        else { return false }
+        return !contract.requiresActivationGate || activationEnabled
+    }
+
+    static func requireRuntimeAuthorization(
+        toolName: String,
+        arguments: [String: Value]
+    ) throws {
+        guard let contract = contract(toolName: toolName, arguments: arguments) else {
+            throw MCPError.invalidParams("No action-level safety contract exists for this operation.")
+        }
+        guard contract.capability == .irreversibleWorktreeRetirement,
+              contract.approval == .explicitTwoStage,
+              contract.admissionClass == .exclusive
+        else { return }
+        try GitWorktreeRetirementActivation.requireEnabled()
+    }
+
+    static func dispatchAuthorizationError(
+        toolName: String,
+        arguments: [String: Value],
+        additionalGrants: Set<String>
+    ) -> String? {
+        guard let contract = contract(toolName: toolName, arguments: arguments),
+              contract.capability == .irreversibleWorktreeRetirement
+        else { return nil }
+        guard additionalGrants.contains(irreversibleRetirementDispatchGrant) else {
+            return "Action 'manage_worktree.retire' requires the dedicated irreversible retirement grant."
+        }
+        return nil
     }
 }

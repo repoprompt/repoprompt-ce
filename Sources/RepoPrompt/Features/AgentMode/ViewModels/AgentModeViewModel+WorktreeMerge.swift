@@ -762,6 +762,21 @@ extension AgentModeViewModel {
     }
 
     private func persistWorktreeMergeOperationsChange(in session: TabSession) {
+        do {
+            try replaceRetirementMergeLeases(
+                for: session,
+                operations: session.worktreeMergeOperations
+            )
+        } catch {
+            session.worktreeMergeOperations.removeAll {
+                GitWorktreeRetirementAuthority.operational.isRetiring(worktreeID: $0.source.worktreeID)
+                    || GitWorktreeRetirementAuthority.operational.isRetiring(worktreeID: $0.target.worktreeID)
+            }
+            try? replaceRetirementMergeLeases(
+                for: session,
+                operations: session.worktreeMergeOperations
+            )
+        }
         session.isDirty = true
         updateWorktreeMergeSummariesInIndex(for: session)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)

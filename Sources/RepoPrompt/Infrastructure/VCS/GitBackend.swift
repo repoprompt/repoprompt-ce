@@ -148,6 +148,35 @@ actor GitBackend: VCSBackend {
         )
     }
 
+    func inspectRetirementTarget(
+        descriptor: GitWorktreeDescriptor,
+        generation: UInt64,
+        permit: GitWorktreeRetirementPermit? = nil
+    ) async throws -> GitWorktreeRetirementTarget {
+        try await gitService.inspectRetirementTarget(
+            descriptor: descriptor,
+            generation: generation,
+            retirementPermit: permit
+        )
+    }
+
+    func listWorktreesForRetirement(
+        at repoURL: URL,
+        permit: GitWorktreeRetirementPermit
+    ) async throws -> [GitWorktreeDescriptor] {
+        try await gitService.listWorktrees(at: repoURL, retirementPermit: permit)
+    }
+
+    func retireWorktree(
+        authorization: GitWorktreeRetirementAuthorization,
+        at repoURL: URL
+    ) async throws -> GitWorktreeRetirementEvidence {
+        try await gitService.retireWorktree(
+            authorization: authorization,
+            at: repoURL
+        )
+    }
+
     // MARK: - Worktree Merge Operations
 
     func inspectWorktreeMerge(_ request: GitWorktreeMergeInspectRequest) async throws -> GitWorktreeMergeInspection {

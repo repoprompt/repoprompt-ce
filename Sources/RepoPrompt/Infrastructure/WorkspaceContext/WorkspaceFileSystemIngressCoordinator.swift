@@ -18,6 +18,13 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         let appliedWatcherWatermark: FileSystemWatcherIngressMailbox.Watermark
     }
 
+    struct RetirementDrainSnapshot: Equatable {
+        let queuedPublicationCount: Int
+        let applyingPublicationCount: Int
+        let outstandingPublicationCount: Int
+        let waiterCount: Int
+    }
+
     enum TerminationOutcome: String, Equatable {
         case graceful
         case forced
@@ -391,6 +398,26 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
             guard let state = rootStatesByID[rootID] else { return }
             count += state.pendingQueueCount + state.applyingCount
         }
+    }
+
+    func retirementDrainSnapshot(rootIDs: Set<UUID>) -> RetirementDrainSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        var queued = 0
+        var applying = 0
+        var waiters = 0
+        for rootID in rootIDs {
+            guard let state = rootStatesByID[rootID] else { continue }
+            queued += state.pendingQueueCount
+            applying += state.applyingCount
+            waiters += waiterCount(rootID: rootID, stateIdentity: state.identity)
+        }
+        return RetirementDrainSnapshot(
+            queuedPublicationCount: queued,
+            applyingPublicationCount: applying,
+            outstandingPublicationCount: queued + applying,
+            waiterCount: waiters
+        )
     }
 
     #if DEBUG

@@ -1901,7 +1901,12 @@ final class AgentModeViewModel: ObservableObject {
         for session: TabSession,
         fallbackWorkspacePath: String?
     ) throws -> String? {
-        try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+        for binding in session.worktreeBindings {
+            guard session.worktreeRetirementBindingLeases[binding.worktreeID] != nil else {
+                throw GitWorktreeRetirementError.bindingRejected(binding.worktreeID)
+            }
+        }
+        return try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
             bindings: session.worktreeBindings,
             fallbackWorkspacePath: fallbackWorkspacePath
         )
@@ -1936,7 +1941,12 @@ final class AgentModeViewModel: ObservableObject {
         for session: TabSession,
         fallbackWorkspacePath: String?
     ) throws -> CodexRuntimeWorkspacePaths {
-        try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
+        for binding in session.worktreeBindings {
+            guard session.worktreeRetirementBindingLeases[binding.worktreeID] != nil else {
+                throw GitWorktreeRetirementError.bindingRejected(binding.worktreeID)
+            }
+        }
+        return try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
             bindings: session.worktreeBindings,
             fallbackWorkspacePath: fallbackWorkspacePath
         )
@@ -3344,6 +3354,12 @@ final class AgentModeViewModel: ObservableObject {
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
         session.parentSessionID = nil
+        session.worktreeRetirementBindingLeases.values.forEach { $0.release() }
+        session.worktreeRetirementBindingLeases.removeAll()
+        session.worktreeRetirementProviderLeases.values.forEach { $0.release() }
+        session.worktreeRetirementProviderLeases.removeAll()
+        session.worktreeRetirementMergeLeases.values.forEach { $0.release() }
+        session.worktreeRetirementMergeLeases.removeAll()
         session.worktreeBindings = []
         session.worktreeMergeOperations = []
         sessionIndexStore.removeSortDate(forTabID: session.tabID)
@@ -4136,8 +4152,24 @@ final class AgentModeViewModel: ObservableObject {
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.isMCPOriginated = agentSession.isMCPOriginated
-        session.worktreeBindings = agentSession.worktreeBindings
-        session.worktreeMergeOperations = agentSession.worktreeMergeOperations
+        do {
+            try replaceRetirementBindingLeases(
+                for: session,
+                bindings: agentSession.worktreeBindings
+            )
+            try replaceRetirementMergeLeases(
+                for: session,
+                operations: agentSession.worktreeMergeOperations
+            )
+            session.worktreeBindings = agentSession.worktreeBindings
+            session.worktreeMergeOperations = agentSession.worktreeMergeOperations
+        } catch {
+            try? replaceRetirementBindingLeases(for: session, bindings: [])
+            try? replaceRetirementMergeLeases(for: session, operations: [])
+            session.worktreeBindings = []
+            session.worktreeMergeOperations = []
+            return false
+        }
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
         session.lastActivityAt = agentSession.savedAt
         session.lastUserMessageAt = payload.lastUserMessageAt
@@ -5523,7 +5555,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if targetSession.worktreeBindings.isEmpty {
-            _ = commitWorktreeBindings(expectedBindings, to: targetSession)
+            _ = try commitWorktreeBindings(expectedBindings, to: targetSession)
         } else if targetSession.worktreeBindings != expectedBindings {
             throw MCPError.invalidParams(
                 "agent_run.start child worktree bindings conflict with the routed source session."
@@ -5583,7 +5615,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if targetSession.worktreeBindings.isEmpty {
-            _ = commitWorktreeBindings(expectedBindings, to: targetSession)
+            _ = try commitWorktreeBindings(expectedBindings, to: targetSession)
         } else if targetSession.worktreeBindings != expectedBindings {
             throw MCPError.invalidParams(
                 "agent_run.start target worktree bindings conflict with the explicit-tab source session."
@@ -5683,6 +5715,14 @@ final class AgentModeViewModel: ObservableObject {
         else {
             return false
         }
+        do {
+            try replaceRetirementBindingLeases(
+                for: session,
+                bindings: parentSession.worktreeBindings
+            )
+        } catch {
+            return false
+        }
         session.worktreeBindings = parentSession.worktreeBindings
         session.isDirty = true
         updateWorktreeBindingSummariesInIndex(for: session)
@@ -5754,10 +5794,16 @@ final class AgentModeViewModel: ObservableObject {
     @discardableResult
     private func commitWorktreeBindings(
         _ bindings: [AgentSessionWorktreeBinding],
-        to session: TabSession
-    ) -> [AgentSessionWorktreeBinding] {
+        to session: TabSession,
+        retirementPermit: GitWorktreeRetirementPermit? = nil
+    ) throws -> [AgentSessionWorktreeBinding] {
         let previous = session.worktreeBindings
         guard previous != bindings else { return previous }
+        try replaceRetirementBindingLeases(
+            for: session,
+            bindings: bindings,
+            permit: retirementPermit
+        )
         session.worktreeBindings = bindings
         session.isDirty = true
         updateWorktreeBindingSummariesInIndex(for: session)
@@ -5766,6 +5812,86 @@ final class AgentModeViewModel: ObservableObject {
         syncStatusPillsUIState()
         scheduleSave(for: session.tabID)
         return previous
+    }
+
+    private func replaceRetirementBindingLeases(
+        for session: TabSession,
+        bindings: [AgentSessionWorktreeBinding],
+        permit: GitWorktreeRetirementPermit? = nil
+    ) throws {
+        var nextLeases: [String: GitWorktreeRetirementAdmissionLease] = [:]
+        do {
+            for binding in bindings {
+                if let existing = session.worktreeRetirementBindingLeases[binding.worktreeID] {
+                    nextLeases[binding.worktreeID] = existing
+                } else {
+                    nextLeases[binding.worktreeID] = try GitWorktreeRetirementAuthority.operational.acquireBindingLease(
+                        worktreeID: binding.worktreeID,
+                        repositoryID: binding.repositoryID,
+                        canonicalPath: binding.worktreeRootPath,
+                        permit: permit
+                    )
+                }
+            }
+        } catch {
+            for (worktreeID, lease) in nextLeases
+                where session.worktreeRetirementBindingLeases[worktreeID] == nil
+            {
+                lease.release()
+            }
+            throw error
+        }
+        let removedLeases = session.worktreeRetirementBindingLeases.compactMap { worktreeID, lease in
+            nextLeases[worktreeID] == nil ? lease : nil
+        }
+        let desiredWorktreeIDs = Set(bindings.map(\.worktreeID))
+        let removedProviderLeases = session.worktreeRetirementProviderLeases.compactMap { worktreeID, lease in
+            desiredWorktreeIDs.contains(worktreeID) ? nil : lease
+        }
+        session.worktreeRetirementProviderLeases = session.worktreeRetirementProviderLeases.filter {
+            desiredWorktreeIDs.contains($0.key)
+        }
+        session.worktreeRetirementBindingLeases = nextLeases
+        removedLeases.forEach { $0.release() }
+        removedProviderLeases.forEach { $0.release() }
+    }
+
+    func replaceRetirementMergeLeases(
+        for session: TabSession,
+        operations: [AgentSessionWorktreeMergeOperation],
+        permit: GitWorktreeRetirementPermit? = nil
+    ) throws {
+        let endpoints = Dictionary(
+            operations.flatMap { [$0.source, $0.target] }.map { ($0.worktreeID, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        var nextLeases: [String: GitWorktreeRetirementAdmissionLease] = [:]
+        do {
+            for (worktreeID, endpoint) in endpoints {
+                if let existing = session.worktreeRetirementMergeLeases[worktreeID] {
+                    nextLeases[worktreeID] = existing
+                } else {
+                    nextLeases[worktreeID] = try GitWorktreeRetirementAuthority.operational.acquireBindingLease(
+                        worktreeID: endpoint.worktreeID,
+                        repositoryID: endpoint.repositoryID,
+                        canonicalPath: endpoint.path,
+                        permit: permit
+                    )
+                }
+            }
+        } catch {
+            for (worktreeID, lease) in nextLeases
+                where session.worktreeRetirementMergeLeases[worktreeID] == nil
+            {
+                lease.release()
+            }
+            throw error
+        }
+        let removedLeases = session.worktreeRetirementMergeLeases.compactMap { worktreeID, lease in
+            nextLeases[worktreeID] == nil ? lease : nil
+        }
+        session.worktreeRetirementMergeLeases = nextLeases
+        removedLeases.forEach { $0.release() }
     }
 
     private enum ExecutionLocationTransitionError: LocalizedError {
@@ -5879,17 +6005,101 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// Stop and detach every live RepoPrompt session in this window that owns the target.
+    /// Terminal teardown is awaited before binding projection ownership is released.
+    func drainLiveSessionsForWorktreeRetirement(
+        worktreeID: String,
+        permit: GitWorktreeRetirementPermit
+    ) async throws -> [UUID] {
+        let affected = sessions.values.filter { session in
+            session.worktreeBindings.contains(where: { $0.worktreeID == worktreeID })
+                || session.worktreeMergeOperations.contains {
+                    $0.source.worktreeID == worktreeID || $0.target.worktreeID == worktreeID
+                }
+        }
+        var drainedSessionIDs: [UUID] = []
+        for session in affected {
+            guard let sessionID = session.activeAgentSessionID else {
+                throw MCPError.internalError("A live tab owning the retiring worktree has no persisted Agent session ID.")
+            }
+            if session.runState.isActive {
+                cancelPendingInstruction(for: session)
+                await runService.cancelRun(
+                    tabID: session.tabID,
+                    session: session,
+                    intent: .executionLocationChange,
+                    completion: .terminalTeardownCompleted
+                )
+            }
+            cancelPendingWorktreeMergeReview(
+                for: session,
+                reason: "Worktree retirement drained this merge operation."
+            )
+            let mergeOperationCount = session.worktreeMergeOperations.count
+            session.worktreeMergeOperations.removeAll {
+                $0.source.worktreeID == worktreeID || $0.target.worktreeID == worktreeID
+            }
+            let removedMergeOperation = mergeOperationCount != session.worktreeMergeOperations.count
+            if removedMergeOperation {
+                try replaceRetirementMergeLeases(
+                    for: session,
+                    operations: session.worktreeMergeOperations,
+                    permit: permit
+                )
+                session.isDirty = true
+                updateWorktreeMergeSummariesInIndex(for: session)
+            }
+            let remaining = session.worktreeBindings.filter { $0.worktreeID != worktreeID }
+            _ = try await transitionWorktreeBindings(
+                remaining,
+                forSessionID: sessionID,
+                intent: .externalManagement,
+                retirementPermit: permit
+            )
+            guard !session.worktreeBindings.contains(where: { $0.worktreeID == worktreeID }) else {
+                throw MCPError.internalError("RepoPrompt retained a worktree binding after retirement drain.")
+            }
+            if removedMergeOperation {
+                scheduleSave(for: session.tabID)
+            }
+            drainedSessionIDs.append(sessionID)
+        }
+        return drainedSessionIDs
+    }
+
     @discardableResult
     func transitionWorktreeBindings(
         _ desiredBindings: [AgentSessionWorktreeBinding],
         forSessionID sessionID: UUID,
         intent: WorktreeBindingTransitionIntent,
         startupContext: WorktreeStartupContext? = nil,
-        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
+        retirementPermit: GitWorktreeRetirementPermit? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        let transitionBindings = Dictionary(
+            (session.worktreeBindings + desiredBindings).map { ($0.worktreeID, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        ).values
+        var transitionLeases: [GitWorktreeRetirementAdmissionLease] = []
+        do {
+            for binding in transitionBindings {
+                try transitionLeases.append(
+                    GitWorktreeRetirementAuthority.operational.acquireBindingLease(
+                        worktreeID: binding.worktreeID,
+                        repositoryID: binding.repositoryID,
+                        canonicalPath: binding.worktreeRootPath,
+                        permit: retirementPermit
+                    )
+                )
+            }
+        } catch {
+            transitionLeases.forEach { $0.release() }
+            throw error
+        }
+        defer { transitionLeases.forEach { $0.release() } }
         guard !session.worktreeBindingTransitionInProgress else {
             throw ExecutionLocationTransitionError.stale
         }
@@ -5990,7 +6200,11 @@ final class AgentModeViewModel: ObservableObject {
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
-            _ = commitWorktreeBindings(desiredBindings, to: session)
+            _ = try commitWorktreeBindings(
+                desiredBindings,
+                to: session,
+                retirementPermit: retirementPermit
+            )
             return session.worktreeBindings
         } catch {
             if !ownershipCommitted, let materializer, let preparation {

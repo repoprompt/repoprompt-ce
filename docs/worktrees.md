@@ -79,3 +79,37 @@ For example, if the destination file already exists, the worktree still exists a
 RepoPrompt does not add a hidden file-count or size limit to `.worktreeinclude` copying. If you write a broad pattern such as `**` or `local-cache/**`, RepoPrompt may copy a lot of local data into every new app-managed worktree.
 
 Use narrow patterns for the files agents actually need. A good `.worktreeinclude` is usually a short list of local setup files, not a second copy of your whole ignored cache directory.
+
+## Permanently retiring an app-managed worktree
+
+Worktree retirement is a separate, irreversible operator flow. It is advertised in
+`manage_worktree`, but remains default-off until RepoPrompt app startup installs a
+validated version-1 retirement-policy receipt. Ordinary MCP clients cannot activate it.
+Production dispatch also requires the dedicated `manage_worktree.retire` action grant.
+RepoPrompt installs that grant in Agent Mode connection policy; the grant does not bypass
+the activation receipt or the two-stage authorization.
+
+The first call does not delete anything. It closes generation-aware RepoPrompt admission,
+drains app-owned sessions, bindings, workspace roots, watchers, mutation leases, and Git
+processes, then seals the target and returns a short-lived, single-use
+`authorization_token`.
+
+Apply the sealed authorization with a second `manage_worktree` call:
+`{"op":"retire","authorization_token":"<authorization-token>"}`. RepoPrompt re-attests
+physical directory identities and the exact content manifest under its serialized executor
+before deleting the worktree. Caller booleans never replace the sealed token.
+
+### Evidence and failure behavior
+
+- Successful apply records permanent evidence, including the single-use authorization
+  digest, generation, manifest digest, Git removal result, and postconditions.
+- Repeating the token call after completion returns the same evidence instead of deleting
+  again.
+- A failed or expired sealed operation becomes `blocked_residue`. That worktree identity
+  cannot be silently retried or reused; inspect the returned evidence and resolve it
+  explicitly.
+- The machine-readable authority scope is exactly `repoprompt_control_plane`.
+- That scope covers RepoPrompt-controlled sessions, bindings, writers, watchers, and Git
+  operations. It does **not** cover arbitrary external processes, external open handles, or
+  same-user filesystem writes outside RepoPrompt's control. Stop or inspect such external
+  actors before approving apply.

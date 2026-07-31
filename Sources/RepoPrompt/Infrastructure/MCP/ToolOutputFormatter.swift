@@ -4464,6 +4464,34 @@ extension ToolOutputFormatter {
             if let worktree = dto.worktree ?? dto.worktrees?.first {
                 appendManageWorktreeNextSteps(&out, op: dto.op.lowercased(), worktree: worktree, binding: dto.binding)
             }
+        case "retire":
+            if let retirement = dto.retirement {
+                out.append("")
+                out.append("### Retirement")
+                out.append("- **State**: `\(retirement.state)`")
+                out.append("- **Worktree ID**: `\(retirement.worktreeID)`")
+                out.append("- **Path**: `\(retirement.path)`")
+                if !retirement.drainedSessionIDs.isEmpty {
+                    out.append("- **Drained sessions**: \(retirement.drainedSessionIDs.count)")
+                }
+                if let token = retirement.authorizationToken {
+                    out.append("- **Single-use authorization**: `\(token)`")
+                    out.append("- **Next**: apply `manage_worktree {\"op\":\"retire\",\"authorization_token\":\"\(token)\"}` through an authorized MCP connection.")
+                }
+                if retirement.gitAbsent == true, retirement.pathAbsent == true {
+                    out.append("- **Postconditions**: Git entry absent; path absent")
+                }
+                if let evidence = retirement.evidence {
+                    if let evidenceID = evidence.evidenceID {
+                        out.append("- **Evidence ID**: `\(evidenceID)`")
+                    }
+                    out.append("- **Generation**: \(evidence.generation)")
+                    out.append("- **Target digest**: `\(evidence.targetDigest)`")
+                    out.append("- **Manifest digest**: `\(evidence.manifestDigest)`")
+                    out.append("- **Authorization digest**: `\(evidence.consumedAuthorizationDigest)`")
+                }
+                out.append("- **Authority boundary**: \(retirement.authorityBoundary)")
+            }
         case "unbind":
             let removed = dto.bindings ?? dto.binding.map { [$0] } ?? []
             out.append("")

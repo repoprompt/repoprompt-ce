@@ -1320,7 +1320,11 @@ struct AgentManageMCPToolService {
         let url = try resolveSafeOutputURL(rawPath, paramName: "output_path")
         let data = Data(payload.utf8)
         let bytes = data.count
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [url.path]
+        )
         try await Task.detached(priority: .utility) {
+            defer { retirementLease.release() }
             let fileManager = FileManager.default
             var isDirectory: ObjCBool = false
             if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {

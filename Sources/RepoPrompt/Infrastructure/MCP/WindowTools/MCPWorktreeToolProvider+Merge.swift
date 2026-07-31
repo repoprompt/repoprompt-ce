@@ -21,7 +21,7 @@ extension MCPWorktreeToolProvider {
             return try await executeContinue(args: args, session: session)
         case .abort:
             return try await executeAbort(args: args, session: session)
-        case .list, .show, .create, .bind, .select, .unbind:
+        case .list, .show, .create, .bind, .select, .unbind, .retire:
             throw MCPError.invalidParams("Invalid merge op: \(op.rawValue)")
         }
     }

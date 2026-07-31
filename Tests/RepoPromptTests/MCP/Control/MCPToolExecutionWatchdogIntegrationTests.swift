@@ -2562,6 +2562,85 @@ import XCTest
             }
         }
 
+        func testAgentModePolicyCarriesRetirementGrantThroughLiveDispatch() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let manager = fixture.networkManager
+                var endpoints: [PersistentMCPTestEndpoint] = []
+                GitWorktreeRetirementActivation.setEnabledForTesting(false)
+                defer { GitWorktreeRetirementActivation.setEnabledForTesting(false) }
+
+                do {
+                    let deniedClient = "retirement-dispatch-denied-\(UUID().uuidString)"
+                    await manager.installClientConnectionPolicy(
+                        for: deniedClient,
+                        windowID: fixture.contextA.window.windowID,
+                        restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                        tabID: fixture.contextA.tabID,
+                        runID: UUID(),
+                        additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec)
+                            .subtracting([MCPToolActionContractCatalog.irreversibleRetirementDispatchGrant]),
+                        purpose: .agentModeRun
+                    )
+                    let deniedEndpoint = try await PersistentMCPTestEndpoint.make(
+                        label: "retirement-dispatch-denied",
+                        networkManager: manager,
+                        clientName: deniedClient,
+                        requiredToolNames: [MCPWindowToolName.manageWorktree]
+                    )
+                    endpoints.append(deniedEndpoint)
+                    let deniedResponse = try await deniedEndpoint.callTool(
+                        name: MCPWindowToolName.manageWorktree,
+                        arguments: ["op": "retire", "worktree_id": "wt_missing"]
+                    )
+                    let deniedText = try Self.toolResultText(deniedResponse)
+                    XCTAssertTrue(deniedText.contains("dedicated irreversible retirement grant"), deniedText)
+
+                    let allowedClient = "retirement-dispatch-allowed-\(UUID().uuidString)"
+                    let liveAgentModeGrants = AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec)
+                    XCTAssertTrue(
+                        liveAgentModeGrants.contains(
+                            MCPToolActionContractCatalog.irreversibleRetirementDispatchGrant
+                        )
+                    )
+                    await manager.installClientConnectionPolicy(
+                        for: allowedClient,
+                        windowID: fixture.contextA.window.windowID,
+                        restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                        tabID: fixture.contextA.tabID,
+                        runID: UUID(),
+                        additionalTools: liveAgentModeGrants,
+                        purpose: .agentModeRun
+                    )
+                    let allowedEndpoint = try await PersistentMCPTestEndpoint.make(
+                        label: "retirement-dispatch-allowed",
+                        networkManager: manager,
+                        clientName: allowedClient,
+                        requiredToolNames: [MCPWindowToolName.manageWorktree]
+                    )
+                    endpoints.append(allowedEndpoint)
+                    let allowedResponse = try await allowedEndpoint.callTool(
+                        name: MCPWindowToolName.manageWorktree,
+                        arguments: ["op": "retire", "worktree_id": "wt_missing"]
+                    )
+                    let allowedText = try Self.toolResultText(allowedResponse)
+                    XCTAssertFalse(allowedText.contains("dedicated irreversible retirement grant"), allowedText)
+                    XCTAssertTrue(allowedText.lowercased().contains("activation"), allowedText)
+
+                    for endpoint in endpoints {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
+                    await fixture.cleanup()
+                } catch {
+                    for endpoint in endpoints {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private static func waitUntil(
             timeout: Duration = .seconds(10),
             condition: () async -> Bool

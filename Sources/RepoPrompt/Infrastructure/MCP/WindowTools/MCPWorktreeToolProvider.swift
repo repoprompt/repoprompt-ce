@@ -34,7 +34,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             description: """
             Manage Git worktrees, per-agent-session worktree bindings, and session-bound worktree merges.
 
-            **Management ops**: list | show | create | bind | select | unbind
+            **Management ops**: list | show | create | bind | select | unbind | retire
             **Merge ops**: preview | apply | status | continue | abort
 
             **Selectors**:
@@ -49,6 +49,14 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             - Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.
             - `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.
             - `create` can also bind with `bind=true`; `unbind` removes the selected root binding, or all bindings with `all=true`.
+
+            **Retirement safety**:
+            - `retire` is advertised but default-off. It fails closed until RepoPrompt's explicit irreversible-retirement policy gate is activated.
+            - `retire` is two-stage and only accepts RepoPrompt app-managed linked worktrees.
+            - Any staged, unstaged, untracked, or ignored content rejects retirement. There is no force override.
+            - First call with a worktree selector closes generation-aware RepoPrompt admission, drains app-owned live sessions, mutation leases, workspace ownership/watchers, and Git processes, then returns a short-lived single-use `authorization_token`.
+            - Second call with that token re-attests directory identities plus exact content manifest under the serialized executor, durably consumes the token, removes the worktree, and records permanent evidence.
+            - The fence covers RepoPrompt-controlled bindings, sessions, writers, watchers, and Git operations only. It does not claim authority over arbitrary external processes, open handles, or same-user filesystem writes.
 
             **Merge safety**:
             - `preview` is non-mutating and publishes bounded artifacts by default.
@@ -68,7 +76,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             annotations: .repoPromptLocalDestructive,
             inputSchema: .object(
                 properties: [
-                    "op": .string(description: "Operation", enum: ["list", "show", "create", "bind", "select", "unbind", "preview", "apply", "status", "continue", "abort"]),
+                    "op": .string(description: "Operation", enum: ["list", "show", "create", "bind", "select", "unbind", "retire", "preview", "apply", "status", "continue", "abort"]),
                     "repo_root": .string(description: "Optional loaded root path/name or repo/worktree specifier. Defaults to the first loaded Git repo."),
                     "repo_key": .string(description: "Optional repository key alternative to repo_root."),
                     "worktree": .string(description: "Worktree selector: @current, @main, @branch:<name>, branch/name/path, or @id:<worktree_id>."),
@@ -88,6 +96,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
                     "icon_name": .string(description: "Create/bind: SF Symbol name for future UI display."),
                     "marker_style": .string(description: "Create/bind: visual marker style", enum: ["dot", "ring", "capsule"]),
                     "all": .boolean(description: "Unbind: remove all worktree bindings for the session."),
+                    "authorization_token": .string(description: "Retire apply: single-use token returned by the prepare call."),
                     "operation_id": .string(description: "Merge apply/status/continue/abort: operation ID returned by preview."),
                     "target": .string(description: "Merge preview: target worktree selector. Defaults to @main."),
                     "target_worktree_id": .string(description: "Merge preview: target worktree ID alternative to target."),
@@ -110,16 +119,16 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     // MARK: - Execution
 
     enum Operation: String {
-        case list, show, create, bind, select, unbind
+        case list, show, create, bind, select, unbind, retire
         case preview, apply, status, `continue`, abort
     }
 
     private func executeManageWorktree(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         guard let opRaw = trimmedString(args["op"])?.lowercased() else {
-            throw MCPError.invalidParams("op is required. Valid ops: list, show, create, bind, select, unbind, preview, apply, status, continue, abort")
+            throw MCPError.invalidParams("op is required. Valid ops: list, show, create, bind, select, unbind, retire, preview, apply, status, continue, abort")
         }
         guard let op = Operation(rawValue: opRaw) else {
-            throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: list, show, create, bind, select, unbind, preview, apply, status, continue, abort")
+            throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: list, show, create, bind, select, unbind, retire, preview, apply, status, continue, abort")
         }
 
         try validateArguments(args, for: op)
@@ -136,6 +145,8 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             return try await executeBind(op: op, args: args)
         case .unbind:
             return try await executeUnbind(args: args)
+        case .retire:
+            return try await executeRetire(args: args)
         case .preview, .apply, .status, .continue, .abort:
             return try await executeMerge(op: op, args: args)
         }
@@ -325,6 +336,218 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             bindings: removed.map(bindingDTO),
             warning: removed.isEmpty ? "No matching worktree binding was present for session \(sessionID.uuidString)." : nil
         )
+    }
+
+    private func executeRetire(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        try MCPToolActionContractCatalog.requireRuntimeAuthorization(
+            toolName: MCPWindowToolName.manageWorktree,
+            arguments: args
+        )
+        let authority = GitWorktreeRetirementAuthority.operational
+
+        if let token = trimmedString(args["authorization_token"]) {
+            if let evidence = try authority.evidence(token: token) {
+                try validateRetirementApplySelectors(args: args, evidence: evidence)
+                return retirementReply(evidence: evidence)
+            }
+            let authorization: GitWorktreeRetirementAuthorization
+            do {
+                authorization = try authority.authorization(token: token)
+            } catch {
+                if let evidence = try authority.evidence(token: token) {
+                    try validateRetirementApplySelectors(args: args, evidence: evidence)
+                    return retirementReply(evidence: evidence)
+                }
+                throw MCPError.invalidParams(error.localizedDescription)
+            }
+            try validateRetirementApplySelectors(args: args, authorization: authorization)
+            do {
+                let evidence = try await vcsService.retireGitWorktree(
+                    authorization: authorization,
+                    at: URL(fileURLWithPath: authorization.target.repositoryRoot)
+                )
+                return retirementReply(evidence: evidence)
+            } catch {
+                if let evidence = try authority.evidence(token: token) {
+                    try validateRetirementApplySelectors(args: args, evidence: evidence)
+                    return retirementReply(evidence: evidence)
+                }
+                throw MCPError.internalError(error.localizedDescription)
+            }
+        }
+
+        if let worktreeID = trimmedString(args["worktree_id"]),
+           let evidence = try authority.evidence(worktreeID: worktreeID)
+        {
+            try validateRetirementApplySelectors(args: args, evidence: evidence)
+            return retirementReply(evidence: evidence)
+        }
+
+        let context = try await resolveRepositoryContext(args: args)
+        let worktree = try await resolveWorktree(
+            args: args,
+            repo: context.repo,
+            allRepos: context.allRepos,
+            requireExplicit: true
+        )
+        guard !worktree.isMain else { throw MCPError.invalidParams(GitWorktreeRetirementError.mainWorktree.localizedDescription) }
+        guard let mainRootPath = worktree.repository.mainWorktreeRoot else {
+            throw MCPError.invalidParams("Cannot prove the repository's main worktree root; retirement refused.")
+        }
+        let appManagedContainer = GitWorktreeDefaultPathPlanner.defaultContainer(
+            forMainWorktreeRoot: URL(fileURLWithPath: mainRootPath)
+        ).standardizedFileURL.path
+        guard GitWorktreeRetirementAuthority.workspacePath(
+            worktree.path,
+            isEqualOrDescendantOf: appManagedContainer
+        ) else {
+            throw MCPError.invalidParams(GitWorktreeRetirementError.nonAppManagedPath(worktree.path).localizedDescription)
+        }
+        let preflight = try await vcsService.inspectGitWorktreeRetirementTarget(
+            descriptor: worktree,
+            generation: 0
+        )
+        let preparation: GitWorktreeRetirementPreparation
+        do {
+            preparation = try authority.begin(preflight.candidate)
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        var sealedTarget: GitWorktreeRetirementTarget?
+        var drainEvidence: GitWorktreeRetirementDrainEvidence?
+        do {
+            let activeAdmissionsBefore = try authority.activeAdmissionCount(for: preparation)
+            let permit = try authority.permit(for: preparation)
+            var drained: [(window: WindowState, sessionID: UUID)] = []
+            var drainedSessionIDs = Set<UUID>()
+            for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+                let sessionIDs = try await window.agentModeViewModel.drainLiveSessionsForWorktreeRetirement(
+                    worktreeID: worktree.worktreeID,
+                    permit: permit
+                )
+                drained += sessionIDs.map { (window, $0) }
+                drainedSessionIDs.formUnion(sessionIDs)
+            }
+            var workspaceClaimsRemaining = 0
+            var watchersRemaining = 0
+            var publicationsRemaining = 0
+            for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+                let snapshot = try await window.workspaceFileContextStore
+                    .drainWorkspaceRootsForWorktreeRetirement(
+                        expectedPhysicalPaths: [preflight.canonicalPath]
+                    )
+                workspaceClaimsRemaining += snapshot.loadFlightsRemaining
+                    + snapshot.loadedRootsRemaining
+                    + snapshot.unloadingRootsRemaining
+            }
+            try await authority.awaitZeroAdmissions(for: preparation)
+            let stillBound = WindowStatesManager.shared.allWindows.contains { window in
+                window.agentModeViewModel.sessions.values.contains { session in
+                    session.worktreeBindings.contains(where: { $0.worktreeID == worktree.worktreeID })
+                }
+            }
+            guard !stillBound else {
+                throw MCPError.internalError("RepoPrompt still owns a live binding after retirement drain.")
+            }
+            for entry in drained {
+                let snapshot = try await entry.window.workspaceFileContextStore.awaitSessionWorktreeRetirementDrain(
+                    ownerID: entry.sessionID,
+                    expectedPhysicalPaths: [worktree.path]
+                )
+                workspaceClaimsRemaining += snapshot.workspaceClaimCount
+                watchersRemaining += snapshot.watcherAttachmentCount
+                publicationsRemaining += snapshot.pendingPublicationCount
+            }
+            for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+                let snapshot = try await window.workspaceFileContextStore
+                    .drainWorkspaceRootsForWorktreeRetirement(
+                        expectedPhysicalPaths: [preflight.canonicalPath]
+                    )
+                workspaceClaimsRemaining += snapshot.loadFlightsRemaining
+                    + snapshot.loadedRootsRemaining
+                    + snapshot.unloadingRootsRemaining
+            }
+            try await authority.awaitZeroAdmissions(for: preparation)
+            let currentWorktrees = try await vcsService.listGitWorktreesForRetirement(
+                at: context.repo.rootURL,
+                permit: permit
+            )
+            guard let current = currentWorktrees.first(where: {
+                $0.repository.repositoryID == worktree.repository.repositoryID
+                    && $0.worktreeID == worktree.worktreeID
+            }) else { throw GitWorktreeRetirementError.targetChanged }
+            let target = try await vcsService.inspectGitWorktreeRetirementTarget(
+                descriptor: current,
+                generation: preparation.generation,
+                permit: permit
+            )
+            guard target.candidate == preflight.candidate,
+                  target.branch == preflight.branch,
+                  target.registeredHead == preflight.registeredHead,
+                  target.liveHead == preflight.liveHead,
+                  target.contentManifestDigest == preflight.contentManifestDigest
+            else { throw GitWorktreeRetirementError.targetChanged }
+            sealedTarget = target
+            let drain = try GitWorktreeRetirementDrainEvidence(
+                drainedSessionIDs: drainedSessionIDs.map(\.uuidString).sorted(),
+                activeAdmissionsBefore: activeAdmissionsBefore,
+                activeAdmissionsAfter: authority.activeAdmissionCount(for: preparation),
+                liveBindingsRemaining: stillBound ? 1 : 0,
+                workspaceClaimsRemaining: workspaceClaimsRemaining,
+                watchersRemaining: watchersRemaining,
+                pendingPublicationsRemaining: publicationsRemaining
+            )
+            drainEvidence = drain
+            let authorization = try authority.authorizeAfterDrain(
+                preparation,
+                target: target,
+                drain: drain
+            )
+            return try await ToolResultDTOs.ManageWorktreeReplyDTO(
+                op: "retire",
+                repository: repositoryDTO(from: worktree.repository, fallback: context.repo),
+                worktree: worktreeDTO(worktree, includeStatus: false, persistVisuals: false),
+                retirement: .init(
+                    state: "authorized",
+                    authorizationToken: authorization.token,
+                    worktreeID: worktree.worktreeID,
+                    path: worktree.path,
+                    drainedSessionIDs: drain.drainedSessionIDs,
+                    gitAbsent: nil,
+                    pathAbsent: nil,
+                    authorityBoundary: GitWorktreeRetirementAuthority.authorityScope,
+                    evidence: retirementEvidenceDTO(
+                        state: "authorized",
+                        target: target,
+                        drain: drain,
+                        authorizationDigest: authorization.tokenDigest
+                    )
+                ),
+                warning: "Authorization expires in 60 seconds and is single-use. Failure or expiry creates permanent blocked_residue evidence; the worktree ID/path cannot be reused."
+            )
+        } catch {
+            if Self.isRetryableRetirementDrainFailure(error) {
+                do {
+                    try authority.cancelPreparationForRetry(preparation)
+                } catch {
+                    throw MCPError.internalError(error.localizedDescription)
+                }
+                throw MCPError.internalError(
+                    "Retirement drain did not reach a stable pre-authorization cut. Admission was safely reopened without permanent residue; retry retirement after the active workspace operation settles."
+                )
+            }
+            do {
+                let evidence = try authority.blockPreparation(
+                    preparation,
+                    target: sealedTarget,
+                    drain: drainEvidence,
+                    reason: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                )
+                return retirementReply(evidence: evidence)
+            } catch {
+                throw MCPError.internalError(error.localizedDescription)
+            }
+        }
     }
 
     // MARK: - Binding
@@ -697,6 +920,8 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "include_status", "label", "color", "icon_name", "marker_style"]
         case .unbind:
             ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "all"]
+        case .retire:
+            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "authorization_token"]
         case .preview:
             ["op", "session_id", "repo_root", "target", "target_worktree_id", "include_graph", "graph_limit", "context_lines", "detect_renames", "publish_artifacts"]
         case .apply:
@@ -783,6 +1008,188 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         }
         guard !parts.isEmpty else { return nil }
         return parts.joined(separator: "\n")
+    }
+
+    private static func isRetryableRetirementDrainFailure(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if case .drainTimedOut = error as? GitWorktreeRetirementError { return true }
+        if case .timedOut = error as? WorkspaceFileContextStore.SessionWorktreeRetirementDrainError {
+            return true
+        }
+        if case .timedOut = error as? WorkspaceFileContextStore.WorktreeRetirementWorkspaceDrainError {
+            return true
+        }
+        return false
+    }
+
+    private func validateRetirementApplySelectors(
+        args: [String: Value],
+        authorization: GitWorktreeRetirementAuthorization
+    ) throws {
+        try validateRetirementApplySelectors(
+            args: args,
+            repositoryRoot: authorization.target.repositoryRoot,
+            worktreeID: authorization.target.worktreeID,
+            path: authorization.target.path
+        )
+    }
+
+    private func validateRetirementApplySelectors(
+        args: [String: Value],
+        evidence: GitWorktreeRetirementEvidence
+    ) throws {
+        try validateRetirementApplySelectors(
+            args: args,
+            repositoryRoot: evidence.repositoryRoot,
+            worktreeID: evidence.worktreeID,
+            path: evidence.registeredPath
+        )
+    }
+
+    private func validateRetirementApplySelectors(
+        args: [String: Value],
+        repositoryRoot: String?,
+        worktreeID: String,
+        path: String
+    ) throws {
+        if let suppliedID = trimmedString(args["worktree_id"]), suppliedID != worktreeID {
+            throw MCPError.invalidParams("worktree_id does not match the sealed retirement target.")
+        }
+        if let selector = trimmedString(args["worktree"]) {
+            let accepted = [worktreeID, "@id:\(worktreeID)"].contains(selector)
+                || GitWorktreeRetirementAuthority.canonicalWorkspacePath(selector)
+                == GitWorktreeRetirementAuthority.canonicalWorkspacePath(path)
+            guard accepted else {
+                throw MCPError.invalidParams("worktree selector does not match the sealed retirement target.")
+            }
+        }
+        if trimmedString(args["repo_key"]) != nil {
+            throw MCPError.invalidParams("repo_key is not accepted during retirement apply/readback; the token seals repository identity.")
+        }
+        if let repoRoot = trimmedString(args["repo_root"]) {
+            guard let repositoryRoot,
+                  GitWorktreeRetirementAuthority.canonicalWorkspacePath(repoRoot)
+                  == GitWorktreeRetirementAuthority.canonicalWorkspacePath(repositoryRoot)
+            else {
+                throw MCPError.invalidParams("repo_root does not match the repository sealed by the retirement authorization.")
+            }
+        }
+    }
+
+    private func retirementReply(
+        evidence: GitWorktreeRetirementEvidence
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            repository: .init(
+                repositoryID: evidence.repositoryID,
+                repoKey: evidence.repositoryID,
+                displayName: URL(fileURLWithPath: evidence.registeredPath).deletingLastPathComponent().lastPathComponent,
+                rootPath: evidence.repositoryRoot,
+                commonGitDir: nil,
+                mainWorktreeRoot: evidence.repositoryRoot
+            ),
+            retirement: .init(
+                state: evidence.state.rawValue,
+                authorizationToken: nil,
+                worktreeID: evidence.worktreeID,
+                path: evidence.registeredPath,
+                drainedSessionIDs: evidence.drain?.drainedSessionIDs ?? [],
+                gitAbsent: evidence.postconditions.gitRegistrationAbsent,
+                pathAbsent: evidence.postconditions.pathAbsent,
+                authorityBoundary: evidence.authorityScope,
+                evidence: retirementEvidenceDTO(evidence)
+            ),
+            warning: evidence.reason
+        )
+    }
+
+    private func retirementEvidenceDTO(
+        state: String,
+        target: GitWorktreeRetirementTarget,
+        drain: GitWorktreeRetirementDrainEvidence,
+        authorizationDigest: String
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO.RetirementEvidenceDTO {
+        .init(
+            evidenceID: nil,
+            state: state,
+            reason: nil,
+            authorityScope: GitWorktreeRetirementAuthority.authorityScope,
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "development",
+            operationVersion: GitWorktreeRetirementAuthority.operationVersion,
+            generation: target.generation,
+            repositoryID: target.repositoryID,
+            repositoryRoot: target.repositoryRoot,
+            worktreeID: target.worktreeID,
+            targetDigest: target.targetDigest,
+            manifestDigest: target.contentManifestDigest,
+            consumedAuthorizationDigest: authorizationDigest,
+            drain: retirementDrainDTO(drain),
+            mutation: .init(
+                serializedExecutor: false,
+                authorizationConsumedAt: nil,
+                gitRemoveExitCode: nil
+            ),
+            postconditions: .init(
+                gitRegistrationAbsent: false,
+                pathAbsent: false,
+                verifiedAt: nil
+            )
+        )
+    }
+
+    private func retirementEvidenceDTO(
+        _ evidence: GitWorktreeRetirementEvidence
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO.RetirementEvidenceDTO {
+        let formatter = ISO8601DateFormatter()
+        return .init(
+            evidenceID: evidence.evidenceID,
+            state: evidence.state.rawValue,
+            reason: evidence.reason,
+            authorityScope: evidence.authorityScope,
+            appVersion: evidence.appVersion,
+            operationVersion: evidence.operationVersion,
+            generation: evidence.generation,
+            repositoryID: evidence.repositoryID,
+            repositoryRoot: evidence.repositoryRoot,
+            worktreeID: evidence.worktreeID,
+            targetDigest: evidence.targetDigest ?? "",
+            manifestDigest: evidence.manifestDigest ?? "",
+            consumedAuthorizationDigest: evidence.consumedAuthorizationDigest,
+            drain: retirementDrainDTO(evidence.drain ?? .init(
+                drainedSessionIDs: [],
+                activeAdmissionsBefore: 0,
+                activeAdmissionsAfter: 0,
+                liveBindingsRemaining: 0,
+                workspaceClaimsRemaining: 0,
+                watchersRemaining: 0,
+                pendingPublicationsRemaining: 0
+            )),
+            mutation: .init(
+                serializedExecutor: evidence.mutation.serializedExecutor,
+                authorizationConsumedAt: evidence.mutation.authorizationConsumedAt.map(formatter.string(from:)),
+                gitRemoveExitCode: evidence.mutation.gitRemoveExitCode
+            ),
+            postconditions: .init(
+                gitRegistrationAbsent: evidence.postconditions.gitRegistrationAbsent,
+                pathAbsent: evidence.postconditions.pathAbsent,
+                verifiedAt: evidence.postconditions.verifiedAt.map(formatter.string(from:))
+            )
+        )
+    }
+
+    private func retirementDrainDTO(
+        _ drain: GitWorktreeRetirementDrainEvidence
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO.RetirementDrainEvidenceDTO {
+        .init(
+            drainedSessionIDs: drain.drainedSessionIDs,
+            activeAdmissionsBefore: drain.activeAdmissionsBefore,
+            activeAdmissionsAfter: drain.activeAdmissionsAfter,
+            liveBindingsRemaining: drain.liveBindingsRemaining,
+            workspaceClaimsRemaining: drain.workspaceClaimsRemaining,
+            watchersRemaining: drain.watchersRemaining,
+            pendingPublicationsRemaining: drain.pendingPublicationsRemaining
+        )
     }
 
     private func standardizedPath(_ path: String) -> String {

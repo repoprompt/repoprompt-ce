@@ -114,6 +114,369 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testManageWorktreeRetirementPublicPrepareApplyAndEvidenceReadback() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        let authority = GitWorktreeRetirementAuthority(
+            persistenceURL: fixture.sandbox.appendingPathComponent("retirement-authority/state.json")
+        )
+        GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(authority)
+        GitWorktreeRetirementActivation.setEnabledForTesting(false)
+        defer {
+            GitWorktreeRetirementActivation.setEnabledForTesting(false)
+            GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(nil)
+        }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/retire-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let created = try Self.worktreeObject(createValue, key: "created_worktree")
+        let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+        let path = try XCTUnwrap(created["path"]?.stringValue)
+
+        do {
+            _ = try await manageWorktree([
+                "op": .string("retire"),
+                "worktree_id": .string(worktreeID)
+            ])
+            XCTFail("Retirement must be default-off")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.lowercased().contains("activation"), error.localizedDescription)
+        }
+
+        GitWorktreeRetirementActivation.setEnabledForTesting(true)
+        let ancestorAlias = fixture.sandbox.appendingPathComponent("symlink-spelled-ancestor", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: ancestorAlias,
+            withDestinationURL: fixture.sandbox
+        )
+        let ancestorRoot = try await window.workspaceFileContextStore.loadRoot(path: ancestorAlias.path)
+        XCTAssertNotEqual(
+            ancestorRoot.standardizedFullPath,
+            GitWorktreeRetirementAuthority.canonicalWorkspacePath(ancestorRoot.standardizedFullPath)
+        )
+        XCTAssertEqual(
+            GitWorktreeRetirementAuthority.canonicalWorkspacePath(ancestorRoot.standardizedFullPath),
+            GitWorktreeRetirementAuthority.canonicalWorkspacePath(fixture.sandbox.path)
+        )
+        let nestedRoot = try await window.workspaceFileContextStore.loadRoot(
+            path: URL(fileURLWithPath: path).appendingPathComponent("Nested", isDirectory: true).path
+        )
+        let preparedValue = try await manageWorktree([
+            "op": .string("retire"),
+            "worktree_id": .string(worktreeID)
+        ])
+        let prepared = try Self.object(preparedValue, key: "retirement")
+        XCTAssertEqual(prepared["state"]?.stringValue, "authorized")
+        XCTAssertEqual(prepared["worktree_id"]?.stringValue, worktreeID)
+        let rootsAfterPrepare = await window.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+        XCTAssertFalse(rootsAfterPrepare.contains { $0.id == ancestorRoot.id })
+        XCTAssertFalse(rootsAfterPrepare.contains { $0.id == nestedRoot.id })
+        let token = try XCTUnwrap(prepared["authorization_token"]?.stringValue)
+
+        do {
+            _ = try await manageWorktree([
+                "op": .string("retire"),
+                "authorization_token": .string("retire_wrong")
+            ])
+            XCTFail("Wrong token must fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.lowercased().contains("authorization"))
+        }
+        do {
+            _ = try await manageWorktree([
+                "op": .string("retire"),
+                "authorization_token": .string(token),
+                "worktree_id": .string("wt_wrong")
+            ])
+            XCTFail("Wrong worktree selector must not consume authorization")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("sealed retirement target"))
+        }
+        do {
+            _ = try await manageWorktree([
+                "op": .string("retire"),
+                "authorization_token": .string(token),
+                "repo_root": .string(fixture.sandbox.path)
+            ])
+            XCTFail("Wrong repository selector must not consume authorization")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("repository sealed"))
+        }
+
+        let appliedValue = try await manageWorktree([
+            "op": .string("retire"),
+            "authorization_token": .string(token),
+            "worktree_id": .string(worktreeID)
+        ])
+        let applied = try Self.object(appliedValue, key: "retirement")
+        XCTAssertEqual(applied["state"]?.stringValue, "retired")
+        XCTAssertEqual(applied["git_absent"]?.boolValue, true)
+        XCTAssertEqual(applied["path_absent"]?.boolValue, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        let evidence = try XCTUnwrap(applied["evidence"]?.objectValue)
+        XCTAssertNotNil(evidence["evidence_id"]?.stringValue)
+        XCTAssertEqual(evidence["state"]?.stringValue, "retired")
+        XCTAssertEqual(evidence["operation_version"]?.intValue, 3)
+
+        let readbackValue = try await manageWorktree([
+            "op": .string("retire"),
+            "authorization_token": .string(token),
+            "worktree_id": .string(worktreeID)
+        ])
+        let readback = try Self.object(readbackValue, key: "retirement")
+        XCTAssertEqual(readback["state"]?.stringValue, "retired")
+        XCTAssertEqual(
+            readback["evidence"]?.objectValue?["evidence_id"]?.stringValue,
+            evidence["evidence_id"]?.stringValue
+        )
+    }
+
+    func testManageWorktreeRetirementDrainTimeoutReopensAdmissionForCleanRetry() async throws {
+        #if DEBUG
+            let fixture = try Self.makeGitFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+            let authority = GitWorktreeRetirementAuthority(
+                persistenceURL: fixture.sandbox.appendingPathComponent("retirement-authority/state.json")
+            )
+            GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(authority)
+            GitWorktreeRetirementActivation.setEnabledForTesting(true)
+            defer {
+                GitWorktreeRetirementActivation.setEnabledForTesting(false)
+                GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(nil)
+            }
+
+            let window = try await Self.makeWindow(root: fixture.repo)
+            defer {
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+            let createValue = try await manageWorktree([
+                "op": .string("create"),
+                "branch": .string("feature/drain-retry-\(fixture.suffix)"),
+                "base_ref": .string("HEAD")
+            ])
+            let created = try Self.worktreeObject(createValue, key: "created_worktree")
+            let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+            let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
+            let nestedPath = URL(fileURLWithPath: worktreePath)
+                .appendingPathComponent("Nested", isDirectory: true).path
+            let publicationGate = WorktreeRetirementAsyncGate()
+            await window.workspaceFileContextStore.setRootLoadWillPublishHandler { path in
+                guard GitWorktreeRetirementAuthority.workspacePathsIntersect(path, worktreePath) else {
+                    return
+                }
+                await publicationGate.enterAndWait()
+            }
+            await window.workspaceFileContextStore
+                .setWorktreeRetirementWorkspaceDrainTimeoutForTesting(.milliseconds(50))
+            addTeardownBlock {
+                await publicationGate.release()
+                await window.workspaceFileContextStore.setRootLoadWillPublishHandler(nil)
+                await window.workspaceFileContextStore
+                    .setWorktreeRetirementWorkspaceDrainTimeoutForTesting(nil)
+            }
+
+            let loadTask = Task {
+                try await window.workspaceFileContextStore.loadRoot(path: nestedPath)
+            }
+            await publicationGate.waitUntilEntered()
+
+            do {
+                _ = try await manageWorktree([
+                    "op": .string("retire"),
+                    "worktree_id": .string(worktreeID)
+                ])
+                XCTFail("Paused prepublication flight must force a bounded retryable timeout.")
+            } catch {
+                XCTAssertTrue(
+                    error.localizedDescription.contains("safely reopened without permanent residue"),
+                    error.localizedDescription
+                )
+            }
+            XCTAssertNil(try authority.evidence(worktreeID: worktreeID))
+
+            await publicationGate.release()
+            do {
+                _ = try await loadTask.value
+                XCTFail("Timed-out drain must leave the cancelled flight unable to publish.")
+            } catch is CancellationError {
+                // Expected.
+            }
+            await window.workspaceFileContextStore.setRootLoadWillPublishHandler(nil)
+            await window.workspaceFileContextStore
+                .setWorktreeRetirementWorkspaceDrainTimeoutForTesting(nil)
+
+            let retriedValue = try await manageWorktree([
+                "op": .string("retire"),
+                "worktree_id": .string(worktreeID)
+            ])
+            let retried = try Self.object(retriedValue, key: "retirement")
+            XCTAssertEqual(retried["state"]?.stringValue, "authorized")
+            let token = try XCTUnwrap(retried["authorization_token"]?.stringValue)
+            let appliedValue = try await manageWorktree([
+                "op": .string("retire"),
+                "authorization_token": .string(token),
+                "worktree_id": .string(worktreeID)
+            ])
+            XCTAssertEqual(
+                try Self.object(appliedValue, key: "retirement")["state"]?.stringValue,
+                "retired"
+            )
+        #else
+            throw XCTSkip("Retirement drain timeout injection is DEBUG-only.")
+        #endif
+    }
+
+    func testManageWorktreeRetirementReturnsBlockedEvidenceBeforeTokenAndAfterApplyRace() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        let authority = GitWorktreeRetirementAuthority(
+            persistenceURL: fixture.sandbox.appendingPathComponent("retirement-authority/state.json")
+        )
+        GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(authority)
+        GitWorktreeRetirementActivation.setEnabledForTesting(true)
+        defer {
+            GitWorktreeRetirementActivation.setEnabledForTesting(false)
+            GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(nil)
+        }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+
+        let blockedCreate = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/pretoken-residue-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let blockedWorktree = try Self.worktreeObject(blockedCreate, key: "created_worktree")
+        let blockedID = try XCTUnwrap(blockedWorktree["worktree_id"]?.stringValue)
+        let git = GitService()
+        let descriptors = try await git.listWorktrees(at: fixture.repo)
+        let blockedDescriptor = try XCTUnwrap(descriptors.first { $0.worktreeID == blockedID })
+        let blockedTarget = try await git.inspectRetirementTarget(descriptor: blockedDescriptor, generation: 0)
+        let preparation = try authority.begin(blockedTarget.candidate)
+        let blockedEvidence = try authority.blockPreparation(
+            preparation,
+            reason: "injected preparation residue"
+        )
+        XCTAssertEqual(blockedEvidence.state, .blockedResidue)
+
+        let preTokenReadbackValue = try await manageWorktree([
+            "op": .string("retire"),
+            "worktree_id": .string(blockedID)
+        ])
+        let preTokenReadback = try Self.object(preTokenReadbackValue, key: "retirement")
+        XCTAssertEqual(preTokenReadback["state"]?.stringValue, "blocked_residue")
+        XCTAssertNil(preTokenReadback["authorization_token"])
+        XCTAssertEqual(
+            preTokenReadback["evidence"]?.objectValue?["evidence_id"]?.stringValue,
+            blockedEvidence.evidenceID
+        )
+
+        let racedCreate = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/apply-race-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let racedWorktree = try Self.worktreeObject(racedCreate, key: "created_worktree")
+        let racedID = try XCTUnwrap(racedWorktree["worktree_id"]?.stringValue)
+        let racedPath = try XCTUnwrap(racedWorktree["path"]?.stringValue)
+        let preparedValue = try await manageWorktree([
+            "op": .string("retire"),
+            "worktree_id": .string(racedID)
+        ])
+        let token = try XCTUnwrap(
+            Self.object(preparedValue, key: "retirement")["authorization_token"]?.stringValue
+        )
+        try "race\n".write(
+            to: URL(fileURLWithPath: racedPath).appendingPathComponent("race.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let racedApplyValue = try await manageWorktree([
+            "op": .string("retire"),
+            "authorization_token": .string(token),
+            "worktree_id": .string(racedID)
+        ])
+        let racedApply = try Self.object(racedApplyValue, key: "retirement")
+        XCTAssertEqual(racedApply["state"]?.stringValue, "blocked_residue")
+        XCTAssertNotNil(racedApply["evidence"]?.objectValue?["reason"]?.stringValue)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: racedPath))
+    }
+
+    func testPromptExportLeaseDrainsBeforeRetirementCanProceed() async throws {
+        #if DEBUG
+            let fixture = try Self.makeGitFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+            let authority = GitWorktreeRetirementAuthority(
+                persistenceURL: fixture.sandbox.appendingPathComponent("retirement-authority/state.json")
+            )
+            GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(authority)
+            defer { GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(nil) }
+
+            let window = try await Self.makeWindow(root: fixture.repo)
+            defer {
+                window.mcpServer.setPromptExportRetirementLeaseAcquiredForTesting(nil)
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+            let prompt = try await Self.windowTool(named: MCPWindowToolName.prompt, in: window)
+            let createValue = try await manageWorktree([
+                "op": .string("create"),
+                "branch": .string("feature/export-drain-\(fixture.suffix)"),
+                "base_ref": .string("HEAD")
+            ])
+            let created = try Self.worktreeObject(createValue, key: "created_worktree")
+            let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+            let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
+            let exportPath = URL(fileURLWithPath: worktreePath).appendingPathComponent("retirement-export.md").path
+
+            let git = GitService()
+            let descriptors = try await git.listWorktrees(at: fixture.repo)
+            let descriptor = try XCTUnwrap(descriptors.first { $0.worktreeID == worktreeID })
+            let target = try await git.inspectRetirementTarget(descriptor: descriptor, generation: 0)
+            let gate = WorktreeRetirementAsyncGate()
+            window.mcpServer.setPromptExportRetirementLeaseAcquiredForTesting {
+                await gate.enterAndWait()
+            }
+
+            let exportTask = Task {
+                try await prompt([
+                    "op": .string("export"),
+                    "path": .string(exportPath)
+                ])
+            }
+            await gate.waitUntilEntered()
+
+            let preparation = try authority.begin(target.candidate)
+            XCTAssertGreaterThanOrEqual(
+                try authority.activeAdmissionCount(for: preparation),
+                1
+            )
+            XCTAssertThrowsError(
+                try authority.acquireMutationLease(paths: [exportPath])
+            )
+
+            await gate.release()
+            _ = try await exportTask.value
+            try await authority.awaitZeroAdmissions(for: preparation)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: exportPath))
+            _ = try authority.blockPreparation(
+                preparation,
+                reason: "test completed without physical retirement"
+            )
+        #else
+            throw XCTSkip("Prompt export retirement hook is DEBUG-only.")
+        #endif
+    }
+
     func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
@@ -936,8 +1299,13 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     private static func makeGitFixture() throws -> GitFixture {
         let suffix = UUID().uuidString.prefix(8).lowercased()
-        let sandbox = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WorktreeAPISmokeHarnessTests-\(suffix)", isDirectory: true)
+        let sandbox = URL(
+            fileURLWithPath: FileManager.default.temporaryDirectory.path.hasPrefix("/var/")
+                ? "/private\(FileManager.default.temporaryDirectory.path)"
+                : FileManager.default.temporaryDirectory.path,
+            isDirectory: true
+        )
+        .appendingPathComponent("WorktreeAPISmokeHarnessTests-\(suffix)", isDirectory: true)
         let repo = sandbox.appendingPathComponent("repo", isDirectory: true)
         try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
         try runGit(["init"], cwd: repo)
@@ -947,7 +1315,13 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         try runGit(["checkout", "-b", "main"], cwd: repo)
         let trackedFile = repo.appendingPathComponent("Tracked.txt")
         try "original\n".write(to: trackedFile, atomically: true, encoding: .utf8)
-        try runGit(["add", "Tracked.txt"], cwd: repo)
+        let nestedFile = repo.appendingPathComponent("Nested/Nested.txt")
+        try FileManager.default.createDirectory(
+            at: nestedFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "nested\n".write(to: nestedFile, atomically: true, encoding: .utf8)
+        try runGit(["add", "Tracked.txt", "Nested/Nested.txt"], cwd: repo)
         try runGit(["commit", "-m", "Initial commit"], cwd: repo)
         return GitFixture(sandbox: sandbox, repo: repo.standardizedFileURL, trackedFile: trackedFile.standardizedFileURL, suffix: String(suffix))
     }
@@ -1028,6 +1402,32 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             return ""
         }
         return text
+    }
+}
+
+private actor WorktreeRetirementAsyncGate {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async {
+        entered = true
+        entryWaiters.forEach { $0.resume() }
+        entryWaiters.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
     }
 }
 

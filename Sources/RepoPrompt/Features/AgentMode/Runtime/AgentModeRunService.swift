@@ -176,10 +176,33 @@ final class AgentModeRunService {
             ? nil
             : session.selectedModelRaw
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
+        var installedProviderLeaseIDs: [String] = []
+        do {
+            for binding in session.worktreeBindings {
+                guard session.worktreeRetirementProviderLeases[binding.worktreeID] == nil else { continue }
+                session.worktreeRetirementProviderLeases[binding.worktreeID] =
+                    try GitWorktreeRetirementAuthority.operational.acquireBindingLease(
+                        worktreeID: binding.worktreeID,
+                        repositoryID: binding.repositoryID,
+                        canonicalPath: binding.worktreeRootPath
+                    )
+                installedProviderLeaseIDs.append(binding.worktreeID)
+            }
+        } catch {
+            for worktreeID in installedProviderLeaseIDs {
+                session.worktreeRetirementProviderLeases.removeValue(forKey: worktreeID)?.release()
+            }
+            let message = Self.providerStartupFailureMessage(for: error)
+            await failBeforeProviderStartup(session: session, message: message)
+            return selectedAgent == .codexExec ? .failed(message: message) : nil
+        }
         let workspacePath: String?
         do {
             workspacePath = try dependencies.workspacePathProvider(session)
         } catch {
+            for worktreeID in installedProviderLeaseIDs {
+                session.worktreeRetirementProviderLeases.removeValue(forKey: worktreeID)?.release()
+            }
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil

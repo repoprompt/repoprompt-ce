@@ -16,6 +16,92 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertTrue(MCPToolCapabilities.capabilities(for: "merge_worktree").isEmpty)
     }
 
+    func testRetirementRequiresDedicatedCapabilityAndActivationGate() {
+        let ordinary = ["op": Value.string("list")]
+        let retirement = ["op": Value.string("retire")]
+
+        XCTAssertEqual(
+            MCPToolActionContractCatalog.contract(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: ordinary
+            )?.capability,
+            .worktreeManage
+        )
+        XCTAssertEqual(
+            MCPToolActionContractCatalog.contract(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: retirement
+            ),
+            MCPToolActionContract(
+                capability: .irreversibleWorktreeRetirement,
+                admissionClass: .exclusive,
+                approval: .explicitTwoStage,
+                requiresActivationGate: true
+            )
+        )
+        XCTAssertFalse(
+            MCPToolActionContractCatalog.isAuthorized(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: retirement,
+                grantedCapabilities: [.worktreeManage],
+                activationEnabled: true
+            )
+        )
+        XCTAssertFalse(
+            MCPToolActionContractCatalog.isAuthorized(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: retirement,
+                grantedCapabilities: [.irreversibleWorktreeRetirement],
+                activationEnabled: false
+            )
+        )
+        XCTAssertTrue(
+            MCPToolActionContractCatalog.isAuthorized(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: retirement,
+                grantedCapabilities: [.irreversibleWorktreeRetirement],
+                activationEnabled: true
+            )
+        )
+    }
+
+    func testProductionDispatchDeniesRetirementWithoutIrreversibleActionGrant() {
+        let arguments = ["op": Value.string("retire"), "confirm": Value.bool(true)]
+        XCTAssertNotNil(
+            MCPToolActionContractCatalog.dispatchAuthorizationError(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: arguments,
+                additionalGrants: []
+            )
+        )
+        XCTAssertNil(
+            MCPToolActionContractCatalog.dispatchAuthorizationError(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: arguments,
+                additionalGrants: [MCPToolActionContractCatalog.irreversibleRetirementDispatchGrant]
+            )
+        )
+        XCTAssertNil(
+            MCPToolActionContractCatalog.dispatchAuthorizationError(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: ["op": .string("create")],
+                additionalGrants: []
+            )
+        )
+        XCTAssertTrue(
+            AgentModeMCPToolPolicy.codexNativeGrantedTools.contains(
+                MCPToolActionContractCatalog.irreversibleRetirementDispatchGrant
+            )
+        )
+        XCTAssertNil(
+            MCPToolActionContractCatalog.dispatchAuthorizationError(
+                toolName: MCPWindowToolName.manageWorktree,
+                arguments: arguments,
+                additionalGrants: AgentModeMCPToolPolicy.codexNativeGrantedTools
+            )
+        )
+    }
+
     func testManageWorktreeReplyEncodesSnakeCaseVisualBindingFields() throws {
         let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "bind",
@@ -56,6 +142,67 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertEqual(previous["worktree_id"]?.stringValue, "wt_old")
         XCTAssertEqual(previous["logical_root_path"]?.stringValue, "/tmp/repo")
         XCTAssertEqual(previous["visual_color_hex"]?.stringValue, "#7C3AED")
+    }
+
+    func testRetirementReplyEncodesHonestBoundaryAndSingleUseTokenFields() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            retirement: .init(
+                state: "authorized",
+                authorizationToken: "retire_test",
+                worktreeID: "wt_123",
+                path: "/tmp/repo-wt",
+                drainedSessionIDs: ["session-1"],
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: "RepoPrompt-controlled operations only; external processes are excluded.",
+                evidence: .init(
+                    evidenceID: nil,
+                    state: "authorized",
+                    reason: nil,
+                    authorityScope: "RepoPrompt-controlled operations only; external processes are excluded.",
+                    appVersion: "test",
+                    operationVersion: 2,
+                    generation: 7,
+                    repositoryID: "gitrepo_test",
+                    repositoryRoot: "/tmp/repo",
+                    worktreeID: "wt_123",
+                    targetDigest: "target-digest",
+                    manifestDigest: "manifest-digest",
+                    consumedAuthorizationDigest: "authorization-digest",
+                    drain: .init(
+                        drainedSessionIDs: ["session-1"],
+                        activeAdmissionsBefore: 1,
+                        activeAdmissionsAfter: 0,
+                        liveBindingsRemaining: 0,
+                        workspaceClaimsRemaining: 0,
+                        watchersRemaining: 0,
+                        pendingPublicationsRemaining: 0
+                    ),
+                    mutation: .init(
+                        serializedExecutor: false,
+                        authorizationConsumedAt: nil,
+                        gitRemoveExitCode: nil
+                    ),
+                    postconditions: .init(
+                        gitRegistrationAbsent: false,
+                        pathAbsent: false,
+                        verifiedAt: nil
+                    )
+                )
+            )
+        )
+
+        let object = try XCTUnwrap(Self.value(dto).objectValue)
+        let retirement = try XCTUnwrap(object["retirement"]?.objectValue)
+        XCTAssertEqual(retirement["authorization_token"]?.stringValue, "retire_test")
+        XCTAssertEqual(retirement["worktree_id"]?.stringValue, "wt_123")
+        XCTAssertEqual(retirement["drained_session_ids"]?.arrayValue?.compactMap(\.stringValue), ["session-1"])
+        XCTAssertTrue(retirement["authority_boundary"]?.stringValue?.contains("external processes") == true)
+        XCTAssertNil(retirement["git_absent"])
+        let evidence = try XCTUnwrap(retirement["evidence"]?.objectValue)
+        XCTAssertEqual(evidence["generation"]?.intValue, 7)
+        XCTAssertEqual(evidence["manifest_digest"]?.stringValue, "manifest-digest")
     }
 
     private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {

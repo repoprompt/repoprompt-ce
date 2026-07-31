@@ -150,6 +150,30 @@ actor GitService {
     }
 
     #if DEBUG
+        enum RetirementFailurePointForTesting: Equatable {
+            case remove
+            case postcondition
+        }
+
+        private final class RetirementFailureHook: @unchecked Sendable {
+            private let lock = NSLock()
+            private var point: RetirementFailurePointForTesting?
+
+            func set(_ point: RetirementFailurePointForTesting?) {
+                lock.lock()
+                self.point = point
+                lock.unlock()
+            }
+
+            func consume(_ expected: RetirementFailurePointForTesting) -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                guard point == expected else { return false }
+                point = nil
+                return true
+            }
+        }
+
         enum ReceiptCreationFailurePointForTesting: Equatable {
             case targetTreeUnavailable
             case witnessCoverageInvalid
@@ -353,9 +377,14 @@ actor GitService {
     private var preparedBaseProcessEnvironment: [String: String]?
     #if DEBUG
         private nonisolated let receiptCreationFailureHook = ReceiptCreationFailureHook()
+        private nonisolated let retirementFailureHook = RetirementFailureHook()
         private var worktreeMutationLockAcquiredHandlerForTesting: (@Sendable (UUID?) async -> Void)?
         private var targetEvidenceDidSealBeforeCommandHandlerForTesting: (@Sendable () async throws -> Void)?
         private var drainCreationFailureForTesting: (any Error)?
+
+        func setRetirementFailurePointForTesting(_ point: RetirementFailurePointForTesting?) {
+            retirementFailureHook.set(point)
+        }
     #endif
 
     /// Spawns one git child. Injectable for deterministic launch-failure and
@@ -653,10 +682,16 @@ actor GitService {
 
     /// List Git worktrees for the repository using porcelain output.
     /// Prefers `--porcelain -z` and falls back to newline-delimited porcelain on older Git versions.
-    func listWorktrees(at repoURL: URL) async throws -> [GitWorktreeDescriptor] {
+    func listWorktrees(
+        at repoURL: URL,
+        retirementPermit: GitWorktreeRetirementPermit? = nil,
+        retirementAuthority: GitWorktreeRetirementAuthority = .operational
+    ) async throws -> [GitWorktreeDescriptor] {
         let (stdout, stderr, exitCode) = try await runGit(
             ["worktree", "list", "--porcelain", "-z"],
-            at: repoURL
+            at: repoURL,
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority
         )
 
         if exitCode == 0 {
@@ -670,7 +705,9 @@ actor GitService {
 
         let (fallbackStdout, fallbackStderr, fallbackExitCode) = try await runGit(
             ["worktree", "list", "--porcelain"],
-            at: repoURL
+            at: repoURL,
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority
         )
         guard fallbackExitCode == 0 else {
             throw GitError(message: "git worktree list --porcelain failed: \(fallbackStderr)")
@@ -678,6 +715,235 @@ actor GitService {
 
         let records = try GitWorktreePorcelainParser.parse(fallbackStdout, format: .newlineTerminated)
         return try await makeWorktreeDescriptors(from: records, currentRepoURL: repoURL)
+    }
+
+    func inspectRetirementTarget(
+        descriptor: GitWorktreeDescriptor,
+        generation: UInt64,
+        retirementPermit: GitWorktreeRetirementPermit? = nil,
+        retirementAuthority: GitWorktreeRetirementAuthority = .operational
+    ) async throws -> GitWorktreeRetirementTarget {
+        let status = try await runGitData(
+            ["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"],
+            at: URL(fileURLWithPath: descriptor.path),
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority
+        )
+        guard status.2 == 0 else {
+            let detail = String(data: status.1, encoding: .utf8) ?? "non-UTF8 stderr"
+            throw GitWorktreeRetirementError.removalFailed(detail)
+        }
+        try GitWorktreeRetirementStatusInspector.requireClean(status.0)
+        let head = try await runGit(
+            ["rev-parse", "--verify", "HEAD"],
+            at: URL(fileURLWithPath: descriptor.path),
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority
+        )
+        guard head.2 == 0 else {
+            throw GitWorktreeRetirementError.removalFailed(head.1)
+        }
+        let liveHead = head.0.trimmingCharacters(in: .whitespacesAndNewlines)
+        let manifestDigest = try GitWorktreeRetirementManifest.digestDirectory(
+            at: URL(fileURLWithPath: descriptor.path, isDirectory: true)
+        )
+        guard let gitDirectory = descriptor.gitDir else {
+            throw GitWorktreeRetirementError.missingIdentityEvidence(descriptor.path)
+        }
+        let activeOperationCount = try GitWorktreeRetirementOperationInspector.activeOperationCount(
+            gitDirectory: URL(fileURLWithPath: gitDirectory, isDirectory: true),
+            commonGitDirectory: URL(fileURLWithPath: descriptor.repository.commonGitDir, isDirectory: true)
+        )
+        return try GitWorktreeRetirementTarget(
+            descriptor: descriptor,
+            liveHead: liveHead,
+            generation: generation,
+            contentManifestDigest: manifestDigest,
+            activeOperationCount: activeOperationCount
+        )
+    }
+
+    /// Remove one app-managed linked worktree under the same mutation lock used by creation.
+    /// Re-attestation runs under that lock. Authorization consumption is durably persisted
+    /// synchronously after the final comparison and immediately before process admission.
+    func retireWorktree(
+        authorization: GitWorktreeRetirementAuthorization,
+        at repoURL: URL,
+        authority: GitWorktreeRetirementAuthority = .operational
+    ) async throws -> GitWorktreeRetirementEvidence {
+        let sourceLayout = getLayout(for: repoURL)
+        let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
+            ?? repoURL.standardizedFileURL.path
+        let sealedTarget = authorization.target
+
+        return try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
+            guard let self else {
+                throw GitWorktreeRetirementError.removalFailed("Git service was released before retirement")
+            }
+            let attestationPermit = try authority.permit(for: authorization)
+            let before = try await listWorktrees(
+                at: repoURL,
+                retirementPermit: attestationPermit,
+                retirementAuthority: authority
+            )
+            guard let current = before.first(where: { $0.worktreeID == sealedTarget.worktreeID }),
+                  sealedTarget.candidate.matches(current)
+            else {
+                throw GitWorktreeRetirementError.targetChanged
+            }
+            guard !current.isMain else { throw GitWorktreeRetirementError.mainWorktree }
+            guard let mainRootPath = current.repository.mainWorktreeRoot else {
+                throw GitWorktreeRetirementError.targetChanged
+            }
+            let appManagedContainer = GitWorktreeDefaultPathPlanner.defaultContainer(
+                forMainWorktreeRoot: URL(fileURLWithPath: mainRootPath)
+            )
+            guard Self.isPath(URL(fileURLWithPath: current.path), equalToOrInside: appManagedContainer) else {
+                throw GitWorktreeRetirementError.nonAppManagedPath(current.path)
+            }
+
+            let reattested: GitWorktreeRetirementTarget
+            do {
+                reattested = try await inspectRetirementTarget(
+                    descriptor: current,
+                    generation: sealedTarget.generation,
+                    retirementPermit: attestationPermit,
+                    retirementAuthority: authority
+                )
+                guard reattested == sealedTarget else {
+                    throw GitWorktreeRetirementError.targetChanged
+                }
+            } catch {
+                do {
+                    _ = try authority.blockAuthorization(
+                        authorization,
+                        reason: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    )
+                } catch {
+                    throw error
+                }
+                throw error
+            }
+
+            // No await is permitted between this durable consume and remove-process admission.
+            try reattested.candidate.requireCurrentPhysicalIdentity()
+            let permit = try authority.consume(
+                authorization,
+                reattestedTarget: reattested
+            )
+            var observedExitCode: Int32?
+            var observedPostconditions = GitWorktreeRetirementPostconditions.unknown
+            do {
+                #if DEBUG
+                    if retirementFailureHook.consume(.remove) {
+                        throw GitWorktreeRetirementError.removalFailed("injected remove failure")
+                    }
+                #endif
+                let arguments = ["worktree", "remove", current.path]
+                let (_, stderr, exitCode) = try await runGit(
+                    arguments,
+                    at: repoURL,
+                    retirementPermit: permit,
+                    retirementAuthority: authority,
+                    retirementAffectedWorktreeID: current.worktreeID,
+                    retirementAffectedPaths: [URL(fileURLWithPath: current.path)]
+                )
+                observedExitCode = exitCode
+                guard exitCode == 0 else {
+                    throw GitWorktreeRetirementError.removalFailed(
+                        stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+                }
+                #if DEBUG
+                    if retirementFailureHook.consume(.postcondition) {
+                        throw GitWorktreeRetirementError.postconditionFailed("injected postcondition failure")
+                    }
+                #endif
+
+                let after = try await listWorktrees(
+                    at: repoURL,
+                    retirementPermit: permit,
+                    retirementAuthority: authority
+                )
+                let registrationAbsent = !after.contains {
+                    sealedTarget.candidate.isStillRegistered(by: $0)
+                }
+                try sealedTarget.candidate.requireCurrentParentPhysicalIdentity()
+                let registeredPathAbsent = try GitWorktreeRetirementPathInspector.requireAbsentNoFollow(
+                    sealedTarget.path
+                )
+                let canonicalPathAbsent = try GitWorktreeRetirementPathInspector.requireAbsentNoFollow(
+                    sealedTarget.canonicalPath
+                )
+                let gitDirectoryAbsent = try GitWorktreeRetirementPathInspector.requireAbsentNoFollow(
+                    sealedTarget.candidate.gitDirectory.registeredPath
+                )
+                observedPostconditions = .init(
+                    gitRegistrationAbsent: registrationAbsent,
+                    registeredPathAbsent: registeredPathAbsent,
+                    gitDirectoryAbsent: gitDirectoryAbsent,
+                    pathAbsent: registeredPathAbsent && canonicalPathAbsent,
+                    verifiedAt: Date()
+                )
+                guard observedPostconditions.provesRetirement else {
+                    throw GitWorktreeRetirementError.postconditionFailed(
+                        "exact worktree registry, path, gitdir, or lstat absence was not proven"
+                    )
+                }
+                let evidence = try authority.complete(
+                    permit,
+                    gitRemoveExitCode: exitCode,
+                    postconditions: observedPostconditions
+                )
+                await clearLayoutCache()
+                return evidence
+            } catch {
+                let retirementError = error
+                if observedPostconditions.verifiedAt == nil {
+                    do {
+                        let after = try await listWorktrees(
+                            at: repoURL,
+                            retirementPermit: permit,
+                            retirementAuthority: authority
+                        )
+                        let registrationAbsent = !after.contains {
+                            sealedTarget.candidate.isStillRegistered(by: $0)
+                        }
+                        try sealedTarget.candidate.requireCurrentParentPhysicalIdentity()
+                        let registeredPathAbsent = try GitWorktreeRetirementPathInspector.requireAbsentNoFollow(
+                            sealedTarget.path
+                        )
+                        let canonicalPathAbsent = try GitWorktreeRetirementPathInspector.requireAbsentNoFollow(
+                            sealedTarget.canonicalPath
+                        )
+                        let gitDirectoryAbsent = try GitWorktreeRetirementPathInspector.requireAbsentNoFollow(
+                            sealedTarget.candidate.gitDirectory.registeredPath
+                        )
+                        observedPostconditions = .init(
+                            gitRegistrationAbsent: registrationAbsent,
+                            registeredPathAbsent: registeredPathAbsent,
+                            gitDirectoryAbsent: gitDirectoryAbsent,
+                            pathAbsent: registeredPathAbsent && canonicalPathAbsent,
+                            verifiedAt: Date()
+                        )
+                    } catch {
+                        // Unknown fields remain explicit when residue inspection itself cannot prove them.
+                    }
+                }
+                do {
+                    try authority.blockResidue(
+                        permit,
+                        reason: (retirementError as? LocalizedError)?.errorDescription
+                            ?? retirementError.localizedDescription,
+                        gitRemoveExitCode: observedExitCode,
+                        postconditions: observedPostconditions
+                    )
+                } catch {
+                    throw error
+                }
+                throw retirementError
+            }
+        }
     }
 
     /// Create a Git worktree using the existing Git subprocess plumbing.
@@ -697,6 +963,10 @@ actor GitService {
         at repoURL: URL,
         initializationContext: GitWorktreeInitializationContext? = nil
     ) async throws -> GitWorktreeCreateResult {
+        let retirementDestinationLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [request.path.path]
+        )
+        defer { retirementDestinationLease.release() }
         let sourceLayout = getLayout(for: repoURL)
         let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
             ?? repoURL.standardizedFileURL.path
@@ -918,7 +1188,11 @@ actor GitService {
                     #if DEBUG
                         let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
                     #endif
-                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                    let (_, stderr, exitCode) = try await runGit(
+                        args,
+                        at: repoURL,
+                        retirementAffectedPaths: [request.path]
+                    )
                     guard exitCode == 0 else {
                         throw GitError(message: "git worktree add failed: \(stderr)")
                     }
@@ -4116,6 +4390,16 @@ actor GitService {
             priority: priority,
             deadline: admissionDeadline
         )
+        let retirementLease: GitWorktreeRetirementAdmissionLease
+        do {
+            retirementLease = try GitWorktreeRetirementAuthority.operational.acquireGitProcessLease(
+                at: layout.workTreeRoot,
+                commonGitDirectory: layout.commonDir
+            )
+        } catch {
+            await processAdmissionController.release(admissionLease)
+            throw error
+        }
         do {
             try Task.checkCancellation()
             let (stdout, stderr, exitCode) = try await runAdmittedGitData(
@@ -4131,6 +4415,7 @@ actor GitService {
                 commandFamily: family,
                 commandTimeout: timeout
             )
+            retirementLease.release()
             await processAdmissionController.release(admissionLease)
             guard allowedExitCodes.contains(exitCode) else {
                 throw GitTargetEvidenceCollectionError.gitFailure(
@@ -4140,6 +4425,7 @@ actor GitService {
             }
             return stdout
         } catch {
+            retirementLease.release()
             await processAdmissionController.release(admissionLease)
             throw error
         }
@@ -6849,7 +7135,11 @@ actor GitService {
         admissionPriority: GitProcessAdmissionPriority = .userInitiatedAuthority,
         admissionDeadline: GitProcessAdmissionDeadline? = nil,
         commandFamily: GitProcessCommandFamily? = nil,
-        commandTimeout: Duration = GitService.gitProcessTimeout
+        commandTimeout: Duration = GitService.gitProcessTimeout,
+        retirementPermit: GitWorktreeRetirementPermit? = nil,
+        retirementAuthority: GitWorktreeRetirementAuthority = .operational,
+        retirementAffectedWorktreeID: String? = nil,
+        retirementAffectedPaths: [URL] = []
     ) async throws -> (String, String, Int32) {
         let (stdout, stderr, exitCode) = try await runGitData(
             args,
@@ -6864,7 +7154,11 @@ actor GitService {
             admissionPriority: admissionPriority,
             admissionDeadline: admissionDeadline,
             commandFamily: commandFamily,
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority,
+            retirementAffectedWorktreeID: retirementAffectedWorktreeID,
+            retirementAffectedPaths: retirementAffectedPaths
         )
         return (
             String(data: stdout, encoding: .utf8) ?? "",
@@ -6886,7 +7180,11 @@ actor GitService {
         admissionPriority: GitProcessAdmissionPriority = .userInitiatedAuthority,
         admissionDeadline: GitProcessAdmissionDeadline? = nil,
         commandFamily: GitProcessCommandFamily? = nil,
-        commandTimeout: Duration = GitService.gitProcessTimeout
+        commandTimeout: Duration = GitService.gitProcessTimeout,
+        retirementPermit: GitWorktreeRetirementPermit? = nil,
+        retirementAuthority: GitWorktreeRetirementAuthority = .operational,
+        retirementAffectedWorktreeID: String? = nil,
+        retirementAffectedPaths: [URL] = []
     ) async throws -> (Data, Data, Int32) {
         var environment = await processEnvironment()
         environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -6935,6 +7233,25 @@ actor GitService {
             priority: admissionPriority,
             deadline: admissionDeadline
         )
+        let retirementLease: GitWorktreeRetirementAdmissionLease
+        do {
+            let commonDirectory: URL? = switch repositoryBinding {
+            case .inferred:
+                getLayout(for: repoURL)?.commonDir
+            case let .exactObjectRead(layout), let .exactWorktree(layout):
+                layout.commonDir
+            }
+            retirementLease = try retirementAuthority.acquireGitProcessLease(
+                at: repoURL,
+                commonGitDirectory: commonDirectory,
+                affectedWorktreeID: retirementAffectedWorktreeID,
+                affectedPaths: retirementAffectedPaths,
+                permit: retirementPermit
+            )
+        } catch {
+            await processAdmissionController.release(lease)
+            throw error
+        }
         do {
             try Task.checkCancellation()
             let result = try await runAdmittedGitData(
@@ -6950,9 +7267,11 @@ actor GitService {
                 commandFamily: commandFamily ?? Self.commandFamily(for: args),
                 commandTimeout: commandTimeout
             )
+            retirementLease.release()
             await processAdmissionController.release(lease)
             return result
         } catch {
+            retirementLease.release()
             await processAdmissionController.release(lease)
             throw error
         }
@@ -6980,6 +7299,16 @@ actor GitService {
             priority: priority,
             deadline: admissionDeadline
         )
+        let retirementLease: GitWorktreeRetirementAdmissionLease
+        do {
+            retirementLease = try GitWorktreeRetirementAuthority.operational.acquireGitProcessLease(
+                at: layout.workTreeRoot,
+                commonGitDirectory: layout.commonDir
+            )
+        } catch {
+            await processAdmissionController.release(admissionLease)
+            throw error
+        }
         do {
             try Task.checkCancellation()
             let (spool, stderr, exitCode, terminationReason) = try await runAdmittedGitSpooling(
@@ -6992,6 +7321,7 @@ actor GitService {
                 admissionPriority: priority,
                 commandFamily: family
             )
+            retirementLease.release()
             await processAdmissionController.release(admissionLease)
             if terminationReason == .uncaughtSignal {
                 throw GitTargetEvidenceCollectionError.gitSignal(
@@ -7007,6 +7337,7 @@ actor GitService {
             }
             return spool
         } catch {
+            retirementLease.release()
             await processAdmissionController.release(admissionLease)
             throw error
         }

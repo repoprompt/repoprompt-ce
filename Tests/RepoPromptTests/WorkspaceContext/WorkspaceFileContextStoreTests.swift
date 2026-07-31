@@ -7631,6 +7631,71 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     #endif
 
     #if DEBUG
+        func testWorktreeRetirementDrainCancelsAndAwaitsPausedPrepublicationLoadFlight() async throws {
+            let targetRoot = try makeTemporaryRoot(name: "RetirementPausedPrepublication")
+            let unrelatedRoot = try makeTemporaryRoot(name: "RetirementUnrelated")
+            try write("target", to: targetRoot.appendingPathComponent("Target.swift"))
+            try write("unrelated", to: unrelatedRoot.appendingPathComponent("Unrelated.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let unrelated = try await store.loadRoot(path: unrelatedRoot.path)
+            let publicationGate = AsyncGate()
+            let drainCancelledFlight = expectation(
+                description: "retirement drain cancels paused root-load flight"
+            )
+            await store.setRootLoadWillPublishHandler { path in
+                guard path == StandardizedPath.absolute(targetRoot.path) else { return }
+                await publicationGate.markStartedAndWaitForRelease()
+            }
+            await store.setWorktreeRetirementDrainDidCancelLoadFlightHandler {
+                drainCancelledFlight.fulfill()
+            }
+            addTeardownBlock {
+                await publicationGate.release()
+                await store.setRootLoadWillPublishHandler(nil)
+                await store.setWorktreeRetirementDrainDidCancelLoadFlightHandler(nil)
+            }
+
+            let loadTask = Task {
+                try await store.loadRoot(path: targetRoot.path)
+            }
+            await publicationGate.waitUntilStarted()
+
+            let drainCompleted = AsyncSignal()
+            let drainTask = Task {
+                let snapshot = try await store.drainWorkspaceRootsForWorktreeRetirement(
+                    expectedPhysicalPaths: [targetRoot.path],
+                    timeout: .seconds(1)
+                )
+                await drainCompleted.mark()
+                return snapshot
+            }
+            await fulfillment(of: [drainCancelledFlight], timeout: 1)
+            let drainFinishedBeforeFlightRelease = await drainCompleted.isMarked()
+            XCTAssertFalse(
+                drainFinishedBeforeFlightRelease,
+                "Drain must await the cancelled flight before claiming a stable fixed point."
+            )
+
+            await publicationGate.release()
+            do {
+                _ = try await loadTask.value
+                XCTFail("Cancelled prepublication load must not publish a root.")
+            } catch is CancellationError {
+                // Expected.
+            }
+            let snapshot = try await drainTask.value
+            XCTAssertTrue(snapshot.isDrained)
+            XCTAssertEqual(snapshot.cancelledLoadFlightCount, 1)
+            XCTAssertEqual(snapshot.loadedRootsRemaining, 0)
+            XCTAssertEqual(snapshot.loadFlightsRemaining, 0)
+            XCTAssertGreaterThanOrEqual(snapshot.rescanCount, 2)
+
+            let roots = await store.rootRefs(scope: .allLoaded)
+            XCTAssertEqual(roots.map(\.id), [unrelated.id])
+            XCTAssertFalse(roots.contains { $0.standardizedFullPath == StandardizedPath.absolute(targetRoot.path) })
+        }
+
         func testConcurrentSamePathRootLoadsShareInFlightLoad() async throws {
             let root = try makeTemporaryRoot(name: "ConcurrentSamePathLoad")
             try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: root.appendingPathComponent("A.swift"))

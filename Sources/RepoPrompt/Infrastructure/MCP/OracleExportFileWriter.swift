@@ -62,14 +62,14 @@ struct GeneratedOracleExportFileWriter {
             )
             return logicalPath
         } catch let error as MCPError {
-            await cleanupCreatedExportIfPresent(
+            try await cleanupCreatedExportIfPresent(
                 physicalPath: physicalPath,
                 root: scopedRoot,
                 rootScope: destination.lookupContext.rootScope
             )
             throw error
         } catch is FileManagerError {
-            await cleanupCreatedExportIfPresent(
+            try await cleanupCreatedExportIfPresent(
                 physicalPath: physicalPath,
                 root: scopedRoot,
                 rootScope: destination.lookupContext.rootScope
@@ -78,7 +78,7 @@ struct GeneratedOracleExportFileWriter {
                 "Cannot create generated Oracle export at '\(logicalPath)': filesystem operation failed."
             )
         } catch {
-            await cleanupCreatedExportIfPresent(
+            try await cleanupCreatedExportIfPresent(
                 physicalPath: physicalPath,
                 root: scopedRoot,
                 rootScope: destination.lookupContext.rootScope
@@ -110,9 +110,13 @@ struct GeneratedOracleExportFileWriter {
         physicalPath: String,
         root: WorkspaceRootRef,
         rootScope: WorkspaceLookupRootScope
-    ) async {
+    ) async throws {
         guard FileManager.default.fileExists(atPath: physicalPath) else { return }
-        try? FileManager.default.removeItem(atPath: physicalPath)
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [physicalPath]
+        )
+        defer { retirementLease.release() }
+        try FileManager.default.removeItem(atPath: physicalPath)
         let rootPrefix = root.standardizedFullPath.hasSuffix("/") ? root.standardizedFullPath : root.standardizedFullPath + "/"
         guard physicalPath.hasPrefix(rootPrefix) else { return }
         let relativePath = StandardizedPath.relative(String(physicalPath.dropFirst(rootPrefix.count)))

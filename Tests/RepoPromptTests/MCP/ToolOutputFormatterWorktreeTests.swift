@@ -100,6 +100,66 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("<session_id>"), "A completed bind should not suggest rebinding with a placeholder session id.")
     }
 
+    func testRetirementOutputShowsSingleUseApplyAndAuthorityBoundary() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            retirement: .init(
+                state: "authorized",
+                authorizationToken: "retire_test",
+                worktreeID: "wt_feature",
+                path: "/tmp/repo-feature",
+                drainedSessionIDs: [UUID().uuidString],
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: "RepoPrompt-controlled operations only; external processes are excluded.",
+                evidence: .init(
+                    evidenceID: "retirement_evidence",
+                    state: "authorized",
+                    reason: nil,
+                    authorityScope: "RepoPrompt-controlled operations only; external processes are excluded.",
+                    appVersion: "test",
+                    operationVersion: 2,
+                    generation: 9,
+                    repositoryID: "gitrepo_test",
+                    repositoryRoot: "/tmp/repo",
+                    worktreeID: "wt_feature",
+                    targetDigest: "target-digest",
+                    manifestDigest: "manifest-digest",
+                    consumedAuthorizationDigest: "authorization-digest",
+                    drain: .init(
+                        drainedSessionIDs: [],
+                        activeAdmissionsBefore: 0,
+                        activeAdmissionsAfter: 0,
+                        liveBindingsRemaining: 0,
+                        workspaceClaimsRemaining: 0,
+                        watchersRemaining: 0,
+                        pendingPublicationsRemaining: 0
+                    ),
+                    mutation: .init(
+                        serializedExecutor: false,
+                        authorizationConsumedAt: nil,
+                        gitRemoveExitCode: nil
+                    ),
+                    postconditions: .init(
+                        gitRegistrationAbsent: false,
+                        pathAbsent: false,
+                        verifiedAt: nil
+                    )
+                )
+            )
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("### Retirement"), text)
+        XCTAssertTrue(text.contains("Single-use authorization"), text)
+        XCTAssertTrue(text.contains("\"authorization_token\":\"retire_test\""), text)
+        XCTAssertTrue(text.contains("external processes are excluded"), text)
+        XCTAssertTrue(text.contains("retirement_evidence"), text)
+        XCTAssertTrue(text.contains("manifest-digest"), text)
+        XCTAssertTrue(text.contains("authorization-digest"), text)
+    }
+
     func testListOutputShowsVisualIdentityAndBoundedGraph() throws {
         let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "list",

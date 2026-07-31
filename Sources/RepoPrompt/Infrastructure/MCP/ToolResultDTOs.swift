@@ -1523,6 +1523,7 @@ enum ToolResultDTOs {
         let previousBinding: BindingDTO?
         let graph: GraphDTO?
         let merge: MergeDTO?
+        let retirement: RetirementDTO?
         let warning: String?
         let error: String?
 
@@ -1538,6 +1539,7 @@ enum ToolResultDTOs {
             previousBinding: BindingDTO? = nil,
             graph: GraphDTO? = nil,
             merge: MergeDTO? = nil,
+            retirement: RetirementDTO? = nil,
             warning: String? = nil,
             error: String? = nil
         ) {
@@ -1552,14 +1554,137 @@ enum ToolResultDTOs {
             self.previousBinding = previousBinding
             self.graph = graph
             self.merge = merge
+            self.retirement = retirement
             self.warning = warning
             self.error = error
         }
 
         private enum CodingKeys: String, CodingKey {
-            case op, repository, repositories, worktree, worktrees, binding, bindings, graph, merge, warning, error
+            case op, repository, repositories, worktree, worktrees, binding, bindings, graph, merge, retirement, warning, error
             case createdWorktree = "created_worktree"
             case previousBinding = "previous_binding"
+        }
+
+        struct RetirementDTO: Codable, Equatable {
+            let state: String
+            let authorizationToken: String?
+            let worktreeID: String
+            let path: String
+            let drainedSessionIDs: [String]
+            let gitAbsent: Bool?
+            let pathAbsent: Bool?
+            let authorityBoundary: String
+            let evidence: RetirementEvidenceDTO?
+
+            init(
+                state: String,
+                authorizationToken: String?,
+                worktreeID: String,
+                path: String,
+                drainedSessionIDs: [String],
+                gitAbsent: Bool?,
+                pathAbsent: Bool?,
+                authorityBoundary: String,
+                evidence: RetirementEvidenceDTO? = nil
+            ) {
+                self.state = state
+                self.authorizationToken = authorizationToken
+                self.worktreeID = worktreeID
+                self.path = path
+                self.drainedSessionIDs = drainedSessionIDs
+                self.gitAbsent = gitAbsent
+                self.pathAbsent = pathAbsent
+                self.authorityBoundary = authorityBoundary
+                self.evidence = evidence
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case state, path
+                case authorizationToken = "authorization_token"
+                case worktreeID = "worktree_id"
+                case drainedSessionIDs = "drained_session_ids"
+                case gitAbsent = "git_absent"
+                case pathAbsent = "path_absent"
+                case authorityBoundary = "authority_boundary"
+                case evidence
+            }
+        }
+
+        struct RetirementEvidenceDTO: Codable, Equatable {
+            let evidenceID: String?
+            let state: String
+            let reason: String?
+            let authorityScope: String
+            let appVersion: String
+            let operationVersion: Int
+            let generation: UInt64
+            let repositoryID: String
+            let repositoryRoot: String
+            let worktreeID: String
+            let targetDigest: String
+            let manifestDigest: String
+            let consumedAuthorizationDigest: String
+            let drain: RetirementDrainEvidenceDTO
+            let mutation: RetirementMutationEvidenceDTO
+            let postconditions: RetirementPostconditionsDTO
+
+            private enum CodingKeys: String, CodingKey {
+                case state, reason, generation, drain, mutation, postconditions
+                case evidenceID = "evidence_id"
+                case authorityScope = "authority_scope"
+                case appVersion = "app_version"
+                case operationVersion = "operation_version"
+                case repositoryID = "repository_id"
+                case repositoryRoot = "repository_root"
+                case worktreeID = "worktree_id"
+                case targetDigest = "target_digest"
+                case manifestDigest = "manifest_digest"
+                case consumedAuthorizationDigest = "consumed_authorization_digest"
+            }
+        }
+
+        struct RetirementDrainEvidenceDTO: Codable, Equatable {
+            let drainedSessionIDs: [String]
+            let activeAdmissionsBefore: Int
+            let activeAdmissionsAfter: Int
+            let liveBindingsRemaining: Int
+            let workspaceClaimsRemaining: Int
+            let watchersRemaining: Int
+            let pendingPublicationsRemaining: Int
+
+            private enum CodingKeys: String, CodingKey {
+                case drainedSessionIDs = "drained_session_ids"
+                case activeAdmissionsBefore = "active_admissions_before"
+                case activeAdmissionsAfter = "active_admissions_after"
+                case liveBindingsRemaining = "live_bindings_remaining"
+                case workspaceClaimsRemaining = "workspace_claims_remaining"
+                case watchersRemaining = "watchers_remaining"
+                case pendingPublicationsRemaining = "pending_publications_remaining"
+            }
+        }
+
+        struct RetirementMutationEvidenceDTO: Codable, Equatable {
+            let serializedExecutor: Bool
+            let authorizationConsumedAt: String?
+            let gitRemoveExitCode: Int32?
+
+            private enum CodingKeys: String, CodingKey {
+                case serializedExecutor = "serialized_executor"
+                case authorizationConsumedAt = "authorization_consumed_at"
+                case gitRemoveExitCode = "git_remove_exit_code"
+            }
+        }
+
+        struct RetirementPostconditionsDTO: Codable, Equatable {
+            let gitRegistrationAbsent: Bool
+            let pathAbsent: Bool
+            let verifiedAt: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case gitRegistrationAbsent = "git_registration_absent"
+                case pathAbsent = "path_absent"
+                case verifiedAt = "verified_at"
+            }
         }
 
         struct RepositoryDTO: Codable, Equatable {

@@ -22,7 +22,13 @@ enum AgentModeMCPToolPolicy {
         .conversationLog
     ]
 
-    static let grantedTools: Set<String> = MCPToolCapabilities.toolNames(for: grantedCapabilities)
+    private static let irreversibleActionGrants: Set<String> = [
+        MCPToolActionContractCatalog.irreversibleRetirementDispatchGrant
+    ]
+
+    static let grantedTools: Set<String> =
+        MCPToolCapabilities.toolNames(for: grantedCapabilities)
+            .union(irreversibleActionGrants)
 
     /// Tools granted to Claude native-style agent runs.
     /// Claude no longer relies on share_thoughts or wait_for_next_user_instruction,
@@ -34,7 +40,9 @@ enum AgentModeMCPToolPolicy {
         .conversationLog
     ]
 
-    static let claudeNativeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: claudeNativeGrantedCapabilities)
+    static let claudeNativeGrantedTools: Set<String> =
+        MCPToolCapabilities.toolNames(for: claudeNativeGrantedCapabilities)
+            .union(irreversibleActionGrants)
 
     /// Tools granted to Codex native agent runs.
     /// Codex native still needs ask_user + set_status even though it doesn't use
@@ -47,7 +55,9 @@ enum AgentModeMCPToolPolicy {
         .conversationLog
     ]
 
-    static let codexNativeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: codexNativeGrantedCapabilities)
+    static let codexNativeGrantedTools: Set<String> =
+        MCPToolCapabilities.toolNames(for: codexNativeGrantedCapabilities)
+            .union(irreversibleActionGrants)
 
     /// OpenCode ACP uses the Agent Mode app/session control surface.
     static let openCodeGrantedCapabilities: Set<MCPToolCapability> = [
@@ -57,7 +67,9 @@ enum AgentModeMCPToolPolicy {
         .conversationLog
     ]
 
-    static let openCodeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: openCodeGrantedCapabilities)
+    static let openCodeGrantedTools: Set<String> =
+        MCPToolCapabilities.toolNames(for: openCodeGrantedCapabilities)
+            .union(irreversibleActionGrants)
 
     /// Cursor ACP uses the same Agent Mode app/session control surface as OpenCode.
     static let cursorGrantedCapabilities: Set<MCPToolCapability> = [
@@ -67,7 +79,9 @@ enum AgentModeMCPToolPolicy {
         .conversationLog
     ]
 
-    static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
+    static let cursorGrantedTools: Set<String> =
+        MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
+            .union(irreversibleActionGrants)
 
     static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
         switch agent {

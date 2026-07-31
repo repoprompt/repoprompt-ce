@@ -201,6 +201,230 @@ actor WorkspaceFileContextStore {
         case repositoryAuthorityDetached
     }
 
+    struct SessionWorktreeRetirementDrainSnapshot: Equatable {
+        let workspaceClaimCount: Int
+        let watcherAttachmentCount: Int
+        let pendingPublicationCount: Int
+        let isDrained: Bool
+
+        fileprivate init(
+            workspaceClaimCount: Int,
+            watcherAttachmentCount: Int,
+            pendingPublicationCount: Int,
+            isDrained: Bool
+        ) {
+            self.workspaceClaimCount = workspaceClaimCount
+            self.watcherAttachmentCount = watcherAttachmentCount
+            self.pendingPublicationCount = pendingPublicationCount
+            self.isDrained = isDrained
+        }
+    }
+
+    struct WorktreeRetirementWorkspaceDrainSnapshot: Equatable {
+        let cancelledLoadFlightCount: Int
+        let unloadedRootCount: Int
+        let rescanCount: Int
+        let loadFlightsRemaining: Int
+        let loadedRootsRemaining: Int
+        let unloadingRootsRemaining: Int
+        let isDrained: Bool
+    }
+
+    enum WorktreeRetirementWorkspaceDrainError: LocalizedError {
+        case invalidPaths
+        case timedOut(WorktreeRetirementWorkspaceDrainSnapshot)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidPaths:
+                "Retirement workspace drain requires one to sixteen absolute physical paths."
+            case let .timedOut(snapshot):
+                "Retirement workspace drain timed out with \(snapshot.loadFlightsRemaining) root-load flight(s), \(snapshot.loadedRootsRemaining) loaded root(s), and \(snapshot.unloadingRootsRemaining) unloading root(s) remaining."
+            }
+        }
+    }
+
+    /// Cancels and joins every overlapping root-load flight, unloads every overlapping published
+    /// root, and requires two consecutive empty rescans. Call only after retirement admission has
+    /// closed; the authority's canonicalizer makes symlink-spelled ancestors part of the same cut.
+    func drainWorkspaceRootsForWorktreeRetirement(
+        expectedPhysicalPaths: Set<String>,
+        timeout: Duration = .seconds(10)
+    ) async throws -> WorktreeRetirementWorkspaceDrainSnapshot {
+        let canonicalPaths = Set(expectedPhysicalPaths.map {
+            GitWorktreeRetirementAuthority.canonicalWorkspacePath(
+                ($0 as NSString).expandingTildeInPath
+            )
+        })
+        guard !canonicalPaths.isEmpty,
+              canonicalPaths.count <= 16,
+              canonicalPaths.allSatisfy({ $0.hasPrefix("/") })
+        else { throw WorktreeRetirementWorkspaceDrainError.invalidPaths }
+
+        func overlapsRetirementTarget(_ path: String) -> Bool {
+            canonicalPaths.contains {
+                GitWorktreeRetirementAuthority.workspacePathsIntersect(path, $0)
+            }
+        }
+
+        #if DEBUG
+            let effectiveTimeout = worktreeRetirementWorkspaceDrainTimeoutForTesting ?? timeout
+        #else
+            let effectiveTimeout = timeout
+        #endif
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: effectiveTimeout)
+        var cancelledFlightIDs = Set<UUID>()
+        var unloadedRootIDs = Set<UUID>()
+        var rescanCount = 0
+        var stableEmptyScanCount = 0
+
+        while true {
+            try Task.checkCancellation()
+            rescanCount += 1
+            let matchingFlights = rootLoadFlightsByPath.compactMap { path, flight in
+                overlapsRetirementTarget(path) ? flight : nil
+            }
+            let matchingRootIDs = rootStatesByID.compactMap { rootID, state in
+                overlapsRetirementTarget(state.root.standardizedFullPath) ? rootID : nil
+            }
+            let matchingUnloadingCount = unloadingRootPaths.count(where: overlapsRetirementTarget)
+            let snapshot = WorktreeRetirementWorkspaceDrainSnapshot(
+                cancelledLoadFlightCount: cancelledFlightIDs.count,
+                unloadedRootCount: unloadedRootIDs.count,
+                rescanCount: rescanCount,
+                loadFlightsRemaining: matchingFlights.count,
+                loadedRootsRemaining: matchingRootIDs.count,
+                unloadingRootsRemaining: matchingUnloadingCount,
+                isDrained: matchingFlights.isEmpty
+                    && matchingRootIDs.isEmpty
+                    && matchingUnloadingCount == 0
+            )
+
+            if snapshot.isDrained {
+                stableEmptyScanCount += 1
+                if stableEmptyScanCount == 2 { return snapshot }
+                await Task.yield()
+                continue
+            }
+            stableEmptyScanCount = 0
+
+            for flight in matchingFlights {
+                if cancelledFlightIDs.insert(flight.id).inserted {
+                    flight.task.cancel()
+                    #if DEBUG
+                        worktreeRetirementDrainDidCancelLoadFlightHandler?()
+                    #endif
+                }
+            }
+            if !matchingRootIDs.isEmpty {
+                unloadedRootIDs.formUnion(matchingRootIDs)
+                await unloadRoots(ids: matchingRootIDs)
+            }
+
+            guard clock.now < deadline else {
+                throw WorktreeRetirementWorkspaceDrainError.timedOut(snapshot)
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    enum SessionWorktreeRetirementDrainError: LocalizedError {
+        case invalidPaths
+        case timedOut(SessionWorktreeRetirementDrainSnapshot)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidPaths:
+                "Retirement ownership drain requires one to sixteen absolute physical paths."
+            case let .timedOut(snapshot):
+                "Retirement ownership drain timed out with \(snapshot.workspaceClaimCount) workspace claim(s), \(snapshot.watcherAttachmentCount) watcher(s), and \(snapshot.pendingPublicationCount) publication operation(s)."
+            }
+        }
+    }
+
+    func awaitSessionWorktreeRetirementDrain(
+        ownerID: UUID,
+        expectedPhysicalPaths: Set<String>,
+        timeout: Duration = .seconds(10)
+    ) async throws -> SessionWorktreeRetirementDrainSnapshot {
+        let standardizedPaths = Set(expectedPhysicalPaths.map {
+            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+        })
+        guard !standardizedPaths.isEmpty,
+              standardizedPaths.count <= 16,
+              standardizedPaths.allSatisfy({ $0.hasPrefix("/") })
+        else { throw SessionWorktreeRetirementDrainError.invalidPaths }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            try Task.checkCancellation()
+            let cleanupTasks = sessionWorktreeOrphanLoadCleanupsByID.values.compactMap { cleanup in
+                cleanup.ownerID == ownerID && standardizedPaths.contains(cleanup.standardizedPath)
+                    ? cleanup.task
+                    : nil
+            }
+            for task in cleanupTasks {
+                await task.value
+            }
+
+            let ownerTokens = Set(sessionWorktreeOwnershipRecordsByToken.keys.filter { $0.ownerID == ownerID })
+            let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID]
+            let installedTokenCount = installedToken.map { ownerTokens.contains($0) ? 1 : 0 } ?? 0
+            let provisionalTokenCount = ownerTokens.count - installedTokenCount
+            let rootClaimCount = sessionWorktreeOwnershipTokensByRootLifetime.values.reduce(0) {
+                $0 + $1.intersection(ownerTokens).count
+            }
+            let reservationCount = sessionWorktreeReservationTokensByStandardizedPath.reduce(0) {
+                standardizedPaths.contains($1.key) ? $0 + $1.value.intersection(ownerTokens).count : $0
+            }
+            let matchingLiveRootIDs = Set(rootStatesByID.compactMap { rootID, state -> UUID? in
+                state.root.kind == .sessionWorktree
+                    && standardizedPaths.contains(state.root.standardizedFullPath)
+                    ? rootID
+                    : nil
+            })
+            let matchingPending = pendingSeededRootsByID.values.filter {
+                standardizedPaths.contains($0.standardizedPath)
+            }
+            var ingressRootIDs = matchingLiveRootIDs
+            ingressRootIDs.formUnion(matchingPending.map(\.state.root.id))
+            let watcherCount = watcherPublisherAttachmentsByKey.keys.count {
+                ingressRootIDs.contains($0.rootID)
+            }
+            let visibilityWaiterCount = pendingSeededRootVisibilityWaitersByPath.reduce(0) {
+                standardizedPaths.contains($1.key) ? $0 + $1.value.count : $0
+            }
+            let ingress = publisherIngressCoordinator.retirementDrainSnapshot(rootIDs: ingressRootIDs)
+            let unloadingCount = unloadingRootPaths.count { standardizedPaths.contains($0) }
+            let loadFlightCount = sessionWorktreeOrphanLoadCleanupsByID.values.count {
+                $0.ownerID == ownerID && standardizedPaths.contains($0.standardizedPath)
+            } + sessionWorktreeOrphanLoadCleanupOverflowCount
+            let workspaceClaims = installedTokenCount
+                + provisionalTokenCount
+                + rootClaimCount
+                + reservationCount
+                + matchingLiveRootIDs.count
+                + matchingPending.count
+                + visibilityWaiterCount
+                + unloadingCount
+                + loadFlightCount
+            let publications = ingress.outstandingPublicationCount + ingress.waiterCount
+            let snapshot = SessionWorktreeRetirementDrainSnapshot(
+                workspaceClaimCount: workspaceClaims,
+                watcherAttachmentCount: watcherCount,
+                pendingPublicationCount: publications,
+                isDrained: workspaceClaims == 0 && watcherCount == 0 && publications == 0
+            )
+            if snapshot.isDrained { return snapshot }
+            guard clock.now < deadline else {
+                throw SessionWorktreeRetirementDrainError.timedOut(snapshot)
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     #if DEBUG
         enum CodemapGraphIndexBuildLaunchPolicyForTesting: Equatable {
             case enabled
@@ -379,6 +603,7 @@ actor WorkspaceFileContextStore {
         let initializationID: FileSystemSeedInitializationID
         let loadConfiguration: RootLoadConfiguration
         let startupContext: WorktreeStartupContext
+        let retirementLease: GitWorktreeRetirementAdmissionLease
         var phase: WorkspacePendingSeededRootPhase
         var state: RootState
         var indexes: RootIndexBuffers
@@ -1200,6 +1425,9 @@ actor WorkspaceFileContextStore {
 
     #if DEBUG
         private var rootLoadWillStartHandler: (@Sendable (String) async -> Void)?
+        private var rootLoadWillPublishHandler: (@Sendable (String) async -> Void)?
+        private var worktreeRetirementDrainDidCancelLoadFlightHandler: (@Sendable () -> Void)?
+        private var worktreeRetirementWorkspaceDrainTimeoutForTesting: Duration?
         private var sessionWorktreeDrainDidEnterLoadFlightWaitHandler: (@Sendable () -> Void)?
         private var sessionWorktreeDrainLoadFlightWaiterCount = 0
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
@@ -1871,6 +2099,20 @@ actor WorkspaceFileContextStore {
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
             rootLoadWillStartHandler = handler
+        }
+
+        func setRootLoadWillPublishHandler(_ handler: (@Sendable (String) async -> Void)?) {
+            rootLoadWillPublishHandler = handler
+        }
+
+        func setWorktreeRetirementDrainDidCancelLoadFlightHandler(
+            _ handler: (@Sendable () -> Void)?
+        ) {
+            worktreeRetirementDrainDidCancelLoadFlightHandler = handler
+        }
+
+        func setWorktreeRetirementWorkspaceDrainTimeoutForTesting(_ timeout: Duration?) {
+            worktreeRetirementWorkspaceDrainTimeoutForTesting = timeout
         }
 
         func setSessionWorktreeDrainDidEnterLoadFlightWaitHandler(
@@ -2668,6 +2910,7 @@ actor WorkspaceFileContextStore {
 
     private let sessionRootLifetimeClock = WorkspaceSessionRootLifetimeClock()
     private var rootStatesByID: [UUID: RootState] = [:]
+    private var workspaceRootRetirementLeasesByRootID: [UUID: GitWorktreeRetirementAdmissionLease] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
     private var filesByID: [UUID: WorkspaceFileRecord] = [:]
@@ -3541,6 +3784,15 @@ actor WorkspaceFileContextStore {
         else { throw WorkspaceSessionWorktreeOwnershipError.staleUpdate }
 
         let service: FileSystemService
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireWorkspaceRootLease(
+            paths: [standardizedPath]
+        )
+        var installedRetirementLease = false
+        defer {
+            if !installedRetirementLease {
+                retirementLease.release()
+            }
+        }
         do {
             service = try await FileSystemService(
                 path: standardizedPath,
@@ -3589,6 +3841,7 @@ actor WorkspaceFileContextStore {
             initializationID: initializationID,
             loadConfiguration: loadConfiguration,
             startupContext: startupContext,
+            retirementLease: retirementLease,
             phase: .reserved,
             state: topology.state,
             indexes: topology.indexes,
@@ -3607,6 +3860,7 @@ actor WorkspaceFileContextStore {
             activationProof: nil,
             terminalFallbackReason: nil
         )
+        installedRetirementLease = true
         pendingSeededRootIDsByStandardizedPath[standardizedPath] = pendingID
         try registerPendingSessionWorktreeRoot(
             pendingID,
@@ -4529,6 +4783,7 @@ actor WorkspaceFileContextStore {
             await worktreeSeedGitService.releasePendingInitializationAuthorityFence(fence)
         }
         pendingSeededRootsByID.removeValue(forKey: pendingID)
+        pending.retirementLease.release()
         if pendingSeededRootIDsByStandardizedPath[pending.standardizedPath] == pendingID {
             pendingSeededRootIDsByStandardizedPath.removeValue(forKey: pending.standardizedPath)
         }
@@ -5286,6 +5541,7 @@ actor WorkspaceFileContextStore {
                 commit(pending.indexes)
                 rootIDsByStandardizedPath[pending.standardizedPath] = root.id
                 rootStatesByID[root.id] = pending.state
+                workspaceRootRetirementLeasesByRootID[root.id] = pending.retirementLease
                 rootLoadConfigurationsByPath[pending.standardizedPath] = pending.loadConfiguration
                 rootLoadOrder.append(root.id)
                 appliedIndexGenerationsByRootID[root.id] = 0
@@ -10218,10 +10474,6 @@ actor WorkspaceFileContextStore {
         let standardizedPath = (path as NSString).standardizingPath
         guard let flight = rootLoadFlightsByPath[standardizedPath] else { return }
         flight.task.cancel()
-        removeRootLoadFlight(
-            standardizedPath: standardizedPath,
-            expectedFlightID: flight.id
-        )
     }
 
     private func cancelRootLoad(
@@ -10232,10 +10484,6 @@ actor WorkspaceFileContextStore {
               flight.id == expectedFlightID
         else { return }
         flight.task.cancel()
-        removeRootLoadFlight(
-            standardizedPath: standardizedPath,
-            expectedFlightID: expectedFlightID
-        )
     }
 
     private func clearCompletedRootLoadTask(
@@ -10291,6 +10539,15 @@ actor WorkspaceFileContextStore {
                 lifetimeID: existingState.lifetimeID
             )
             return existingState.root
+        }
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireWorkspaceRootLease(
+            paths: [standardizedPath]
+        )
+        var installedRetirementLease = false
+        defer {
+            if !installedRetirementLease {
+                retirementLease.release()
+            }
         }
 
         #if DEBUG
@@ -10419,6 +10676,12 @@ actor WorkspaceFileContextStore {
             let commitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
 
+        #if DEBUG
+            if let rootLoadWillPublishHandler {
+                await rootLoadWillPublishHandler(standardizedPath)
+            }
+        #endif
+        try Task.checkCancellation()
         commit(stagedIndexes)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
@@ -10436,6 +10699,8 @@ actor WorkspaceFileContextStore {
         }
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
         rootStatesByID[root.id] = state
+        workspaceRootRetirementLeasesByRootID[root.id] = retirementLease
+        installedRetirementLease = true
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
@@ -10628,6 +10893,7 @@ actor WorkspaceFileContextStore {
         var seededAuthorityFencesToRelease: [GitWorkspacePendingInitializationAuthorityFence] = []
         var seededAuthorityClaimsToRelease: [WorkspaceRootSeedServingAuthorityClaim] = []
         var ownershipResourcesReleasedByUnload = SessionWorktreeOwnershipRemoval()
+        var retirementLeasesToRelease: [GitWorktreeRetirementAdmissionLease] = []
         var invalidatedOwnershipTokens = Set<WorkspaceSessionWorktreeOwnershipToken>()
         for rootID in orderedRootIDs {
             if let claim = publishedSeededAuthorityClaimsByRootID.removeValue(forKey: rootID) {
@@ -10677,6 +10943,9 @@ actor WorkspaceFileContextStore {
                 sessionRootLifetimeClock.advance()
             }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
+            if let lease = workspaceRootRetirementLeasesByRootID.removeValue(forKey: rootID) {
+                retirementLeasesToRelease.append(lease)
+            }
             invalidateRootSeedSearchShadow(rootID: rootID)
             let rootEpoch = WorkspaceCodemapRootEpoch(
                 rootID: rootID,
@@ -10902,6 +11171,7 @@ actor WorkspaceFileContextStore {
                 !removedStandardizedPaths.contains($0.standardizedPath)
             }
         ))
+        retirementLeasesToRelease.forEach { $0.release() }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.end",

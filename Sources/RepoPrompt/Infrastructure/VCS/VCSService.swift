@@ -620,6 +620,45 @@ public extension VCSService {
         return result
     }
 
+    internal func inspectGitWorktreeRetirementTarget(
+        descriptor: GitWorktreeDescriptor,
+        generation: UInt64,
+        permit: GitWorktreeRetirementPermit? = nil
+    ) async throws -> GitWorktreeRetirementTarget {
+        try await gitBackend().inspectRetirementTarget(
+            descriptor: descriptor,
+            generation: generation,
+            permit: permit
+        )
+    }
+
+    internal func listGitWorktreesForRetirement(
+        at repoURL: URL,
+        permit: GitWorktreeRetirementPermit
+    ) async throws -> [GitWorktreeDescriptor] {
+        try await gitBackend().listWorktreesForRetirement(at: repoURL, permit: permit)
+    }
+
+    internal func retireGitWorktree(
+        authorization: GitWorktreeRetirementAuthorization,
+        at repoURL: URL
+    ) async throws -> GitWorktreeRetirementEvidence {
+        let resolved = await resolveRepo(from: repoURL)
+        guard let resolved else {
+            throw VCSError.notARepository(path: repoURL.path)
+        }
+        guard resolved.backendKind == .git else {
+            throw VCSError.unsupportedOperation(operation: "retire_worktree", backend: resolved.backendKind)
+        }
+        let retired = try await gitBackend().retireWorktree(
+            authorization: authorization,
+            at: resolved.rootURL
+        )
+        invalidateCache(for: resolved.rootURL)
+        invalidateCache(for: URL(fileURLWithPath: retired.registeredPath))
+        return retired
+    }
+
     func inspectGitWorktreeMerge(_ request: GitWorktreeMergeInspectRequest) async throws -> GitWorktreeMergeInspection {
         try await requireGitMergeEndpoints(source: request.source, target: request.target)
         return try await gitBackend().inspectWorktreeMerge(request)

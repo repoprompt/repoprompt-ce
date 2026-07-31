@@ -22,13 +22,13 @@
       "apply_edits": ["rewrite", "single_replace", "multiple_edits"],
       "oracle_utils": ["models", "sessions"],
       "git": ["status", "diff", "log", "show", "blame"],
-      "manage_worktree": ["list", "show", "create", "bind", "select", "unbind", "preview", "apply", "status", "continue", "abort"],
+      "manage_worktree": ["list", "show", "create", "bind", "select", "unbind", "retire", "preview", "apply", "status", "continue", "abort"],
       "agent_explore": ["start", "poll", "wait", "cancel"],
       "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
       "agent_manage": ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"],
       "history": ["list_sessions", "search", "time", "get_session"]
     },
-    "canonical_discriminated_action_count": 86,
+    "canonical_discriminated_action_count": 87,
     "actionless_tool_count": 12,
     "actionless_tools": {
       "get_code_structure": {
@@ -222,6 +222,15 @@
     ]
   },
   "policy": {
+    "action_contracts": {
+      "manage_worktree.retire": {
+        "capability": "irreversible_worktree_retirement",
+        "admission": "exclusive",
+        "approval": "explicit_two_stage",
+        "activation_gate_default": false,
+        "dispatch_grant": "manage_worktree.retire"
+      }
+    },
     "admission": {
       "exclusive": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "workspace_context", "prompt", "apply_edits", "manage_worktree"],
       "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],

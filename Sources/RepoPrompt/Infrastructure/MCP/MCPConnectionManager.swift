@@ -11342,6 +11342,16 @@ actor ServerNetworkManager {
                     log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
                     return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
                 }
+                if let authorizationError = MCPToolActionContractCatalog.dispatchAuthorizationError(
+                    toolName: toolName,
+                    arguments: dispatchArguments,
+                    additionalGrants: policy.additional
+                ) {
+                    return Self.toolErrorResult(
+                        rawJSON: capturedRawJSON,
+                        message: authorizationError
+                    )
+                }
                 if MCPToolCapabilities.capabilities(for: toolName).contains(.agentExploreControl),
                    !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
                        toolName: toolName,

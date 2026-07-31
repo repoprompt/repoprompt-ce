@@ -73,8 +73,13 @@ extension FileSystemService {
     /// service caches plus synthetic delta publication against the eventual on-disk result.
     private func startUncancellableMutation(
         _ operation: FileSystemUncancellableMutation,
+        retirementLease: GitWorktreeRetirementAdmissionLease,
         io: @escaping @Sendable () async throws -> Void
-    ) -> (id: UUID, task: Task<Void, any Error>) {
+    ) -> (
+        id: UUID,
+        task: Task<Void, any Error>,
+        retirementLease: GitWorktreeRetirementAdmissionLease
+    ) {
         let id = UUID()
         #if DEBUG
             let willBegin = mutationIOWillBeginHandler
@@ -87,7 +92,7 @@ extension FileSystemService {
             }
             try await io()
         }
-        return (id, task)
+        return (id, task, retirementLease)
     }
 
     private func awaitUncancellableMutation(
@@ -160,6 +165,13 @@ extension FileSystemService {
         let fm = fm
         let oldTarget = try mutationTarget(forRelativePath: oldRelPath)
         let newTarget = try mutationTarget(forRelativePath: newRelPath)
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [oldTarget.url.path, newTarget.url.path]
+        )
+        var retirementLeaseTransferred = false
+        defer {
+            if !retirementLeaseTransferred { retirementLease.release() }
+        }
         let oldFull = oldTarget.url.path
         let newFull = newTarget.url.path
         try await requireRegularMutationSource(relativePath: oldTarget.relativePath)
@@ -176,10 +188,12 @@ extension FileSystemService {
         try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
         _ = try mutationTarget(forRelativePath: newTarget.relativePath)
 
-        let mutation = startUncancellableMutation(.move) {
+        let mutation = startUncancellableMutation(.move, retirementLease: retirementLease) {
             try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
         }
+        retirementLeaseTransferred = true
         Task.detached { [weak self] in
+            defer { mutation.retirementLease.release() }
             do {
                 try await mutation.task.value
                 await self?.reconcileMovedFile(
@@ -244,6 +258,13 @@ extension FileSystemService {
         try Task.checkCancellation()
         let fm = fm
         let target = try mutationTarget(forRelativePath: relativePath)
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [target.url.path]
+        )
+        var retirementLeaseTransferred = false
+        defer {
+            if !retirementLeaseTransferred { retirementLease.release() }
+        }
         let fullPath = target.url.path
         let fullURL = target.url
 
@@ -262,7 +283,7 @@ extension FileSystemService {
         #else
             let dataPreparation: (@Sendable (String) async throws -> Data)? = nil
         #endif
-        let mutation = startUncancellableMutation(.create) {
+        let mutation = startUncancellableMutation(.create, retirementLease: retirementLease) {
             let data: Data
             if let dataPreparation {
                 data = try await dataPreparation(content)
@@ -277,7 +298,9 @@ extension FileSystemService {
             }
             try FileSystemService.writeFileRobust(to: fullURL, data: data)
         }
+        retirementLeaseTransferred = true
         Task.detached { [weak self] in
+            defer { mutation.retirementLease.release() }
             do {
                 try await mutation.task.value
                 await self?.reconcileCreatedFile(
@@ -323,13 +346,22 @@ extension FileSystemService {
     func deleteFile(atRelativePath relativePath: String) async throws {
         try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [target.url.path]
+        )
+        var retirementLeaseTransferred = false
+        defer {
+            if !retirementLeaseTransferred { retirementLease.release() }
+        }
         try await requireRegularMutationSource(relativePath: target.relativePath)
         try Task.checkCancellation()
         let url = target.url
-        let mutation = startUncancellableMutation(.delete) {
+        let mutation = startUncancellableMutation(.delete, retirementLease: retirementLease) {
             try FileManager.default.removeItem(at: url)
         }
+        retirementLeaseTransferred = true
         Task.detached { [weak self] in
+            defer { mutation.retirementLease.release() }
             do {
                 try await mutation.task.value
                 await self?.reconcileDeletedFile(
@@ -357,6 +389,13 @@ extension FileSystemService {
     func moveItemToTrash(atRelativePath relativePath: String) async throws {
         try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [target.url.path]
+        )
+        var retirementLeaseTransferred = false
+        defer {
+            if !retirementLeaseTransferred { retirementLease.release() }
+        }
         let normalizedRelativePath = target.relativePath
         let url = target.url
         var isDirectory = ObjCBool(false)
@@ -374,9 +413,10 @@ extension FileSystemService {
                 _ = try Self.moveURLToTrashOffActor(url)
             }
         #endif
-        let mutation = startUncancellableMutation(.trash) {
+        let mutation = startUncancellableMutation(.trash, retirementLease: retirementLease) {
             try moveItemToTrashIO(url)
         }
+        retirementLeaseTransferred = true
         trashMutationsAwaitingReconciliation.insert(mutation.id)
         // On macOS, FileManager.trashItem can move the item immediately and then remain
         // synchronously blocked for tens of seconds in post-move system work. Absence of the
@@ -397,6 +437,7 @@ extension FileSystemService {
             }
         }
         Task.detached { [weak self] in
+            defer { mutation.retirementLease.release() }
             do {
                 try await mutation.task.value
                 await self?.reconcileTrashedItemIfPending(
@@ -492,6 +533,13 @@ extension FileSystemService {
     ) async throws -> FileSystemDeferredEditPublicationToken? {
         try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [target.url.path]
+        )
+        var retirementLeaseTransferred = false
+        defer {
+            if !retirementLeaseTransferred { retirementLease.release() }
+        }
         let fullPath = target.url.path
         let fullURL = target.url
         guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
@@ -518,10 +566,12 @@ extension FileSystemService {
             )
         }
 
-        let mutation = startUncancellableMutation(.edit) {
+        let mutation = startUncancellableMutation(.edit, retirementLease: retirementLease) {
             try FileSystemService.writeFileRobust(to: fullURL, data: data)
         }
+        retirementLeaseTransferred = true
         Task.detached { [weak self] in
+            defer { mutation.retirementLease.release() }
             do {
                 try await mutation.task.value
                 await self?.reconcileEditedFile(

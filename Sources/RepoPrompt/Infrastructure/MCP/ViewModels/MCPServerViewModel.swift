@@ -304,6 +304,7 @@ final class MCPServerViewModel: ObservableObject {
         var debugBeforeFileToolLookupContextResolutionForTesting: (@MainActor @Sendable () async -> Void)?
         var debugAfterFileToolLookupContextRootValidationForTesting: (@MainActor @Sendable () async -> Void)?
         var debugFileToolLookupContextDidCoalesceForTesting: (@MainActor @Sendable () async -> Void)?
+        var debugPromptExportRetirementLeaseAcquiredForTesting: (@MainActor @Sendable () async -> Void)?
 
         func setBeforeFileToolLookupContextResolutionForTesting(
             _ handler: (@MainActor @Sendable () async -> Void)?
@@ -321,6 +322,12 @@ final class MCPServerViewModel: ObservableObject {
             _ handler: (@MainActor @Sendable () async -> Void)?
         ) {
             debugFileToolLookupContextDidCoalesceForTesting = handler
+        }
+
+        func setPromptExportRetirementLeaseAcquiredForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            debugPromptExportRetirementLeaseAcquiredForTesting = handler
         }
 
         func fileToolLookupContextCacheStatsForTesting() -> FileToolLookupContextCacheStats {
@@ -6223,6 +6230,15 @@ final class MCPServerViewModel: ObservableObject {
 
         let url = URL(fileURLWithPath: resolvedPath)
         let fm = FileManager.default
+        let retirementLease = try GitWorktreeRetirementAuthority.operational.acquireMutationLease(
+            paths: [resolvedPath]
+        )
+        defer { retirementLease.release() }
+        #if DEBUG
+            if let debugPromptExportRetirementLeaseAcquiredForTesting {
+                await debugPromptExportRetirementLeaseAcquiredForTesting()
+            }
+        #endif
         if fm.fileExists(atPath: url.path) {
             throw MCPError.invalidParams("path already exists: \(resolvedPath).")
         }

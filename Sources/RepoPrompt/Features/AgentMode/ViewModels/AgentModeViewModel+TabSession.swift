@@ -157,6 +157,15 @@ extension AgentModeViewModel {
         var isMCPOriginated: Bool = false
         /// Persisted logical-root to worktree bindings for this Agent session.
         var worktreeBindings: [AgentSessionWorktreeBinding] = []
+        /// Full-lifetime admission leases corresponding one-for-one with live bindings.
+        /// These are runtime-only; persisted bindings must reacquire before provider startup.
+        var worktreeRetirementBindingLeases: [String: GitWorktreeRetirementAdmissionLease] = [:]
+        /// Provider-runtime admission held from before startup through provider and binding teardown.
+        /// It conservatively outlives reusable provider processes so drain evidence cannot report
+        /// zero while a process-capable session still owns the worktree.
+        var worktreeRetirementProviderLeases: [String: GitWorktreeRetirementAdmissionLease] = [:]
+        /// Admission for persisted merge endpoints, including targets not present in bindings.
+        var worktreeRetirementMergeLeases: [String: GitWorktreeRetirementAdmissionLease] = [:]
         /// Persisted resumable worktree-merge operations for this Agent session.
         var worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
         /// Permission profile for the current session. Set to `.mcpSafeDefaults`
