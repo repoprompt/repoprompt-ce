@@ -43,6 +43,16 @@ final class ClaudeAgentModeCoordinator {
         let permissionMode: String?
         let allowNativeBashTool: Bool?
         let mcpStrictMode: Bool?
+        let modelString: String?
+        let effortLevel: ClaudeCodeEffortLevel?
+
+        static func == (lhs: ControllerLaunchSettings, rhs: ControllerLaunchSettings) -> Bool {
+            lhs.runtimeVariant == rhs.runtimeVariant
+                && lhs.workspacePath == rhs.workspacePath
+                && lhs.permissionMode == rhs.permissionMode
+                && lhs.allowNativeBashTool == rhs.allowNativeBashTool
+                && lhs.mcpStrictMode == rhs.mcpStrictMode
+        }
     }
 
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
@@ -101,10 +111,12 @@ final class ClaudeAgentModeCoordinator {
         launchSettings: ControllerLaunchSettings
     ) -> any NativeAgentRuntimeControlling {
         let coreConfig = ClaudeCodeAgentConfig.agentMode(
+            modelString: launchSettings.modelString,
             runtimeVariant: launchSettings.runtimeVariant,
             permissionMode: launchSettings.permissionMode,
             allowNativeBashTool: launchSettings.allowNativeBashTool,
-            mcpStrictMode: launchSettings.mcpStrictMode
+            mcpStrictMode: launchSettings.mcpStrictMode,
+            effortLevel: launchSettings.effortLevel
         )
         let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: coreConfig, mode: .agentMode)
         return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig) {
@@ -274,6 +286,8 @@ final class ClaudeAgentModeCoordinator {
         ).effectiveMode
         let effectiveAllowNativeBashTool = runtimePermission.allowNativeBashTool
         let effectiveMCPStrictMode = runtimePermission.mcpStrictMode
+        let effectiveLaunchModel = effectiveClaudeModel(selectedModelRaw: launchModelRaw)
+        let effectiveLaunchEffort = currentClaudeEffortLevel(for: session)
 
         // If the session's Claude runtime variant or effective permission mode no
         // longer matches the controller, recycle it so the next process launches
@@ -332,7 +346,9 @@ final class ClaudeAgentModeCoordinator {
                 workspacePath: runtimeWorkspacePath,
                 permissionMode: effectivePermissionMode,
                 allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode
+                mcpStrictMode: effectiveMCPStrictMode,
+                modelString: effectiveLaunchModel,
+                effortLevel: effectiveLaunchEffort
             )
             let createdController = claudeControllerFactory(
                 runID,
@@ -388,9 +404,10 @@ final class ClaudeAgentModeCoordinator {
             return true
         }
         let runtimePermission = effectiveClaudeRuntimePermission(for: session)
+        let selectedModelRaw = session.selectedModelRaw
         let effectivePermissionMode = effectiveClaudePermissionResolution(
             for: session,
-            selectedModelRaw: session.selectedModelRaw,
+            selectedModelRaw: selectedModelRaw,
             runtimePermission: runtimePermission
         ).effectiveMode
         let expected = ControllerLaunchSettings(
@@ -398,7 +415,9 @@ final class ClaudeAgentModeCoordinator {
             workspacePath: runtimeWorkspacePath,
             permissionMode: effectivePermissionMode,
             allowNativeBashTool: runtimePermission.allowNativeBashTool,
-            mcpStrictMode: runtimePermission.mcpStrictMode
+            mcpStrictMode: runtimePermission.mcpStrictMode,
+            modelString: effectiveClaudeModel(selectedModelRaw: selectedModelRaw),
+            effortLevel: currentClaudeEffortLevel(for: session)
         )
         return controllerLaunchSettingsByTabID[session.tabID] != expected
     }
@@ -607,7 +626,9 @@ final class ClaudeAgentModeCoordinator {
                 workspacePath: retryWorkspacePath,
                 permissionMode: effectivePermissionMode,
                 allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode
+                mcpStrictMode: effectiveMCPStrictMode,
+                modelString: model,
+                effortLevel: effortLevel
             )
             let freshController = claudeControllerFactory(
                 freshRunID,

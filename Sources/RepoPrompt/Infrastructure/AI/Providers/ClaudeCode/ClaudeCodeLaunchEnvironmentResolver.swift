@@ -118,7 +118,8 @@ struct ClaudeCodeLaunchEnvironment {
 protocol ClaudeCodeLaunchEnvironmentResolving: Sendable {
     func resolve(
         variant: ClaudeCodeRuntimeVariant,
-        requestedModel: String?
+        requestedModel: String?,
+        requestedEffort: String?
     ) async throws -> ClaudeCodeLaunchEnvironment
 }
 
@@ -159,11 +160,13 @@ struct ClaudeCodeLaunchEnvironmentResolver: ClaudeCodeLaunchEnvironmentResolving
 
     func resolve(
         variant: ClaudeCodeRuntimeVariant,
-        requestedModel: String?
+        requestedModel: String?,
+        requestedEffort: String?
     ) async throws -> ClaudeCodeLaunchEnvironment {
         try await ClaudeCompatibleProviderRuntimeBridge.resolveLaunchEnvironment(
             variant: variant,
             requestedModel: requestedModel,
+            requestedEffort: requestedEffort,
             backendConfigProvider: { backendStore.config(for: $0) },
             zaiKeyProvider: zaiKeyProvider,
             backendSecretProvider: backendSecretProvider

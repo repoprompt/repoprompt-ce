@@ -328,8 +328,20 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
     private static let glmAutoCompactWindow = "1000000"
 
     public static func removedEnvironmentKeys(config: ClaudeCompatibleBackendConfig) -> Set<String> {
-        let configuredAuthKey = config.normalized.auth.environmentVariableName
-        return Set(["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].filter { $0 != configuredAuthKey })
+        let normalizedConfig = config.normalized
+        let configuredAuthKey = normalizedConfig.auth.environmentVariableName
+        var removed = Set(["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].filter { $0 != configuredAuthKey })
+        if case .noModel = normalizedConfig.modelBehavior {
+            removed.formUnion([
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_SMALL_FAST_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL"
+            ])
+        }
+        return removed
     }
 
     public static func environment(
@@ -342,19 +354,34 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
             "ANTHROPIC_BASE_URL": normalizedConfig.normalizedBaseURL ?? normalizedConfig.baseURL,
             normalizedConfig.auth.environmentVariableName: apiKey
         ]
+        let normalizedSelectedBackendModelID = selectedBackendModelID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveSlotBackendModelID: String? = if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {
+            if let normalizedSelectedBackendModelID, !normalizedSelectedBackendModelID.isEmpty {
+                normalizedSelectedBackendModelID
+            } else {
+                mapping.normalized.sonnet
+            }
+        } else {
+            nil
+        }
 
         if normalizedConfig.id == .glmZAI {
             environment["API_TIMEOUT_MS"] = glmTimeoutMilliseconds
-            if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: selectedBackendModelID) == 1_000_000 {
+            if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: effectiveSlotBackendModelID) == 1_000_000 {
                 environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = glmAutoCompactWindow
             }
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {
             let normalizedMapping = mapping.normalized
+            let defaultBackendModelID = effectiveSlotBackendModelID ?? normalizedMapping.sonnet
+            environment["ANTHROPIC_MODEL"] = defaultBackendModelID
             environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = normalizedMapping.haiku
             environment["ANTHROPIC_DEFAULT_SONNET_MODEL"] = normalizedMapping.sonnet
             environment["ANTHROPIC_DEFAULT_OPUS_MODEL"] = normalizedMapping.opus
+            environment["ANTHROPIC_SMALL_FAST_MODEL"] = normalizedMapping.haiku
+            environment["CLAUDE_CODE_SUBAGENT_MODEL"] = normalizedMapping.haiku
         }
 
         return environment
@@ -480,6 +507,7 @@ public enum ClaudeCompatibleModelNormalizer {
             return configuredSlot
         }
 
+        guard config.id == .glmZAI else { return nil }
         switch normalized {
         case haikuEquivalentModelRawValue, "glm-4.7":
             return haikuRequestedModelRawValue
@@ -568,7 +596,8 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
 
     public func resolve(
         variant: ClaudeCompatibleRuntimeVariant,
-        requestedModel: String?
+        requestedModel: String?,
+        requestedEffort: String? = nil
     ) async throws -> ClaudeCompatibleLaunchEnvironment {
         switch variant {
         case .standard:
@@ -589,14 +618,20 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             guard let backendID = variant.compatibleBackendID else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported Claude Code runtime variant.")
             }
-            return try await resolveCompatibleBackend(backendID, variant: variant, requestedModel: requestedModel)
+            return try await resolveCompatibleBackend(
+                backendID,
+                variant: variant,
+                requestedModel: requestedModel,
+                requestedEffort: requestedEffort
+            )
         }
     }
 
     private func resolveCompatibleBackend(
         _ backendID: ClaudeCompatibleBackendID,
         variant: ClaudeCompatibleRuntimeVariant,
-        requestedModel: String?
+        requestedModel: String?,
+        requestedEffort: String?
     ) async throws -> ClaudeCompatibleLaunchEnvironment {
         let config = backendConfigProvider(backendID).normalized
         guard config.isEnabled, config.isValid else {
@@ -604,12 +639,14 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
         }
 
         let requestedSpecifier = ClaudeCompatibleEffortEncodedModel(raw: requestedModel)
+        let normalizedRequestedEffort = Self.normalizedEffortRaw(requestedEffort)
+        let effectiveEffortRaw = requestedSpecifier.effortRaw ?? normalizedRequestedEffort
         let effectiveModel: String?
         let selectedBackendModelID: String?
         let environmentConfig: ClaudeCompatibleBackendConfig
         switch config.modelBehavior {
         case .noModel:
-            guard !requestedSpecifier.hasEffort,
+            guard effectiveEffortRaw == nil,
                   isAllowedNoModelSelection(requestedModel, backendID: backendID)
             else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
@@ -622,7 +659,7 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
                let directBackendModelID = requestedSpecifier.baseModel?.lowercased(),
                let directSlot = ClaudeCompatibleModelNormalizer.directSelectableGLMSlotRawValue(for: directBackendModelID)
             {
-                if requestedSpecifier.effortRaw == "xhigh",
+                if effectiveEffortRaw == "xhigh",
                    !ClaudeCompatibleModelNormalizer.supportsXHighEffort(directBackendModelID)
                 {
                     throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
@@ -640,7 +677,7 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
             }
-            if requestedSpecifier.effortRaw == "xhigh",
+            if effectiveEffortRaw == "xhigh",
                !ClaudeCompatibleModelNormalizer.supportsXHighEffort(backendModelID)
             {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
@@ -670,6 +707,12 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             backendID: backendID,
             suppressesEffortSettings: config.modelBehavior == .noModel
         )
+    }
+
+    private static func normalizedEffortRaw(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed == "x-high" ? "xhigh" : trimmed
     }
 
     private func backendModelID(forSlot slot: String, config: ClaudeCompatibleBackendConfig) -> String? {
@@ -738,6 +781,10 @@ public enum ClaudeCompatibleHeadlessRuntime {
 
         if let sessionID = request.resumeSessionID {
             args.append(contentsOf: ["--resume", sessionID])
+        }
+        if request.runtimeConfig.pluginID != .claudeCode {
+            args.append("--bare")
+            args.append(contentsOf: ["--setting-sources", "project,local"])
         }
         if let model = runtimeModelParam(request.launchEnvironment?.effectiveModel) {
             args.append(contentsOf: ["--model", model])

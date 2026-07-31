@@ -125,6 +125,7 @@ enum ClaudeCompatiblePluginBridge {
     static func resolveLaunchEnvironment(
         variant: ClaudeCodeRuntimeVariant,
         requestedModel: String?,
+        requestedEffort: String? = nil,
         backendConfigProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig,
         zaiKeyProvider: @escaping @Sendable () async throws -> String?,
         backendSecretProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) async throws -> String?
@@ -132,6 +133,7 @@ enum ClaudeCompatiblePluginBridge {
         try await ClaudeCompatibleProviderRuntimeBridge.resolveLaunchEnvironment(
             variant: variant,
             requestedModel: requestedModel,
+            requestedEffort: requestedEffort,
             backendConfigProvider: backendConfigProvider,
             zaiKeyProvider: zaiKeyProvider,
             backendSecretProvider: backendSecretProvider
