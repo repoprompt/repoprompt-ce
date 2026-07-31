@@ -192,7 +192,7 @@ class OpenAIProvider: AIProvider {
         return hasChoice && hasDelta && !hasSemanticDelta && !hasFinishReason && !hasUsage
     }
 
-    private static func isTransportActivityChunk(_ result: ChatCompletionChunkObject) -> Bool {
+    static func isTransportActivityChunk(_ result: ChatCompletionChunkObject) -> Bool {
         let choice = result.choices?.first
         let delta = choice?.delta
         return isTransportActivityChunk(
