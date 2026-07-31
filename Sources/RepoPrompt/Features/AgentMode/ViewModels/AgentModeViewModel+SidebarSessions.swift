@@ -369,6 +369,15 @@ extension AgentModeViewModel {
     /// Session-linked sidebar data source.
     /// Blank compose tabs stay hidden until they are explicitly linked to an agent session.
     func sidebarSessions(for tabs: [ComposeTabState]) -> [SidebarSession] {
+        let cacheKey = SidebarSessionRowsCacheKey(
+            workspaceID: workspaceManager?.activeWorkspaceID,
+            sidebarRevision: ui.sessionSidebar.snapshot.revision,
+            tabs: tabs
+        )
+        if let cached = sidebarSessionRowsCache, cached.key == cacheKey {
+            return cached.rows
+        }
+
         let currentIndex = ownerValidatedSessionIndex
         let indexEntriesByTabID = Dictionary(grouping: currentIndex.values, by: \.tabID)
         let authoritativeSessionIDByTabID = Dictionary(
@@ -394,7 +403,7 @@ extension AgentModeViewModel {
                 entries: candidateEntries
             ) != nil
         }
-        return AgentModeSidebarSessionBuilder(
+        let rows = AgentModeSidebarSessionBuilder(
             allTabs: tabs,
             linkedTabs: linkedTabs,
             sessions: sessions,
@@ -405,6 +414,8 @@ extension AgentModeViewModel {
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
             mcpControlledTabIDs: mcpControlledTabIDs
         ).build()
+        sidebarSessionRowsCache = (cacheKey, rows)
+        return rows
     }
 
     func collapsibleSidebarThreadKeys(
@@ -453,6 +464,69 @@ extension AgentModeViewModel {
             else { return nil }
             return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
         }
+    }
+
+    /// Memoized projection consumed by the SwiftUI list. The key names every
+    /// correctness input that can change rows: authoritative sidebar generation,
+    /// search/collapse/attention state, pagination, selection, workspace identity,
+    /// compose/stashed tab state, and archive expansion.
+    func sidebarListProjection(
+        composeTabs: [ComposeTabState],
+        stashedTabs: [StashedTab],
+        currentTabID: UUID?,
+        sidebarSnapshot: AgentSessionSidebarSnapshot,
+        archivedSessionsExpanded: Bool
+    ) -> SidebarListProjection {
+        let key = SidebarListProjectionCacheKey(
+            workspaceID: workspaceManager?.activeWorkspaceID,
+            sidebarSnapshot: sidebarSnapshot,
+            currentTabID: currentTabID,
+            composeTabs: composeTabs,
+            stashedTabs: stashedTabs,
+            archivedSessionsExpanded: archivedSessionsExpanded
+        )
+        if let cached = sidebarListProjectionCache, cached.key == key {
+            return cached.projection
+        }
+
+        let filteredSessions = displaySidebarSessions(
+            for: composeTabs,
+            currentTabID: currentTabID,
+            searchText: sidebarSnapshot.searchText,
+            diagnosticSource: "listProjection"
+        )
+        let effectiveVisibleSessionCount = effectiveSidebarVisibleSessionCount(
+            filteredSessions: filteredSessions,
+            currentTabID: currentTabID,
+            visibleSessionCount: sidebarSnapshot.visibleSessionCount
+        )
+        let pagedSessions = pagedSidebarSessions(
+            filteredSessions: filteredSessions,
+            currentTabID: currentTabID,
+            visibleSessionCount: effectiveVisibleSessionCount
+        )
+        let archivedSessionTabs = archivedSessionTabsForSidebarSnapshot(
+            stashedTabs,
+            searchText: sidebarSnapshot.searchText,
+            prepareSortedRows: archivedSessionsExpanded
+        )
+        let projection = SidebarListProjection(
+            filteredSessions: filteredSessions,
+            pagedSessions: pagedSessions,
+            effectiveVisibleSessionCount: effectiveVisibleSessionCount,
+            archivedSessionTabsForHeader: archivedSessionTabs.filteredTabs,
+            sortedArchivedSessionTabsForRows: archivedSessionTabs.sortedTabs,
+            archivedDateInfoByStashedTabID: archivedSessionTabs.dateInfoByStashedTabID,
+            defaultCollapseSeedKeys: defaultCollapsedSidebarThreadKeys(
+                for: composeTabs,
+                searchText: sidebarSnapshot.searchText
+            )
+        )
+        sidebarListProjectionCache = (key, projection)
+        #if DEBUG
+            test_sidebarListProjectionBuildCount &+= 1
+        #endif
+        return projection
     }
 
     func seedDefaultCollapsedSidebarThreads(_ eligibleKeys: [AgentSidebarThreadKey]) {

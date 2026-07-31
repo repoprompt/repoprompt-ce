@@ -2232,6 +2232,21 @@ import XCTest
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> {
                                 continuation in
                                 continuation.yield(ChatStreamOutput(
+                                    text: "ignored transport activity",
+                                    reasoning: "ignored transport reasoning",
+                                    tokens: ChatTokenInfo(
+                                        promptTokens: 91,
+                                        completionTokens: 92,
+                                        cost: 93
+                                    ),
+                                    isFinal: true,
+                                    cleanupHandle: ProviderConversationCleanupHandle(
+                                        provider: "ignored",
+                                        conversationID: "ignored"
+                                    ),
+                                    isTransportActivity: true
+                                ))
+                                continuation.yield(ChatStreamOutput(
                                     text: "transported oracle response",
                                     reasoning: nil,
                                     tokens: ChatTokenInfo(),
@@ -2271,6 +2286,10 @@ import XCTest
                             freshValue.objectValue?["response"]?.stringValue?
                                 .contains("transported oracle response") == true
                         )
+                        XCTAssertFalse(
+                            freshValue.objectValue?["response"]?.stringValue?
+                                .contains("ignored transport activity") == true
+                        )
                     } else {
                         let freshResponse = try await endpoint.callTool(
                             name: MCPWindowToolName.askOracle,
@@ -2280,11 +2299,9 @@ import XCTest
                             ],
                             timeoutSeconds: 30
                         )
-                        XCTAssertTrue(
-                            try toolResultText(freshResponse).contains(
-                                "transported oracle response"
-                            )
-                        )
+                        let freshText = try toolResultText(freshResponse)
+                        XCTAssertTrue(freshText.contains("transported oracle response"))
+                        XCTAssertFalse(freshText.contains("ignored transport activity"))
                     }
                     let sessionDescriptions = oracleViewModel.sessions.map {
                         "tab=\($0.composeTabID) session=\(String(describing: $0.agentModeSessionID)) run=\(String(describing: $0.agentModeRunID))"
@@ -2316,6 +2333,10 @@ import XCTest
                             continuingValue.objectValue?["response"]?.stringValue?
                                 .contains("transported oracle response") == true
                         )
+                        XCTAssertFalse(
+                            continuingValue.objectValue?["response"]?.stringValue?
+                                .contains("ignored transport activity") == true
+                        )
                     } else {
                         let continuingResponse = try await endpoint.callTool(
                             name: MCPWindowToolName.askOracle,
@@ -2326,11 +2347,9 @@ import XCTest
                             ],
                             timeoutSeconds: 30
                         )
-                        XCTAssertTrue(
-                            try toolResultText(continuingResponse).contains(
-                                "transported oracle response"
-                            )
-                        )
+                        let continuingText = try toolResultText(continuingResponse)
+                        XCTAssertTrue(continuingText.contains("transported oracle response"))
+                        XCTAssertFalse(continuingText.contains("ignored transport activity"))
                     }
                     let continuingSessionIDs = Set(
                         oracleViewModel.sessions.compactMap { session in

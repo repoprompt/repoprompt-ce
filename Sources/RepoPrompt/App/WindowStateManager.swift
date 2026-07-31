@@ -925,6 +925,19 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
+    func stopCodexSessionsAndSignOut() async -> CodexManagedAuthLogoutResult {
+        let participants: [any CodexManagedSessionShutdownParticipant] = allWindows.map(\.agentModeViewModel)
+        return await CodexManagedLogoutCoordinator.shared.stopSessionsAndSignOut(
+            participants: participants,
+            additionalTeardown: {
+                await CodexModelPollingService.shared.suspendForManagedSignOut()
+            },
+            failedLogoutRecovery: {
+                await CodexModelPollingService.shared.resumeAfterManagedAuthentication()
+            }
+        )
+    }
+
     /// Shuts down all agent processes (Claude CLI, Codex app-server) across every window.
     /// Called during app termination to prevent orphaned child processes.
     /// Safe to call after `signalTermination()` — only performs cancellation and process teardown,

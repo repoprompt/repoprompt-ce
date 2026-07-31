@@ -52,6 +52,33 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
         )
     }
 
+    func testRecurringStreamActivityResetsInactivityButNotOverallDeadline() async {
+        let configuration = ContextBuilderFollowUpFinalizationConfiguration(
+            overallTimeout: 35,
+            inactivityTimeout: 10,
+            checkInterval: 1
+        )
+        let state = ContextBuilderFollowUpFinalizationState(startedAt: 0)
+
+        for (activityTime, checkTime) in [(9.0, 17.9), (18.0, 26.9), (27.0, 34.9)] {
+            let update = await state.record(
+                OracleMessageLifecycleActivityEvent(kind: .streamActivity),
+                at: activityTime
+            )
+            XCTAssertEqual(update.phase, .streaming)
+            XCTAssertFalse(update.shouldTransitionToFinalization)
+            let snapshot = await state.timeoutSnapshot(
+                at: checkTime,
+                configuration: configuration
+            )
+            XCTAssertNil(snapshot)
+        }
+
+        let timeout = await state.timeoutSnapshot(at: 35, configuration: configuration)
+        XCTAssertEqual(timeout?.kind, .overall)
+        XCTAssertEqual(timeout?.lastEvent, "Oracle stream activity observed")
+    }
+
     func testStalledFakeQueryTimesOutWithAttributedSubphaseAndCancelsStream() async {
         let clock = ContextBuilderFinalizationTestClock()
         let cancellationRecorder = ContextBuilderFinalizationCancellationRecorder()

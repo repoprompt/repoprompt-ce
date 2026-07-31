@@ -1195,6 +1195,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func stop() {
         stopCodexModelsSubscription()
+        stopRuntimeTasksForManagedLogout()
+    }
+
+    func stopRuntimeTasksForManagedLogout() {
         stopAllCodexIdleShutdownTasks()
         stopAllCodexStallWatchdogTasks()
         stopAllCodexTransportClosedFallbackTasks()
@@ -1221,7 +1225,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    guard let self, let viewModel else { return }
+                    guard snapshot.isAuthorizedForPublication,
+                          let self,
+                          let viewModel
+                    else { return }
                     // Update UI state — registry updates are owned by the polling service
                     viewModel.updateCodexDynamicModels(snapshot.models)
                     // Preserve existing "normalize selection after refresh" behavior
@@ -4712,7 +4719,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         skipResumeWhenNoPriorCodexHistory: Bool = false,
         semanticRunState: AgentSessionRunState? = nil
     ) async {
-        guard session.selectedAgent == .codexExec else { return }
+        let managedSessionFence = CodexManagedSessionFence.shared
+        let sessionInstallationToken = managedSessionFence.capturePublicationToken()
+        guard session.selectedAgent == .codexExec,
+              managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+        else { return }
         let runAttemptIDAtEntry = session.activeRunAttemptID
         let effectiveRunState = semanticRunState ?? session.runState
         cancelCodexIdleShutdown(for: session.tabID)
@@ -4831,7 +4842,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await awaitCodexControllerRetirement(for: session.tabID)
             guard session.selectedAgent == .codexExec,
                   session.runID == runID,
-                  session.activeRunAttemptID == runAttemptIDAtEntry
+                  session.activeRunAttemptID == runAttemptIDAtEntry,
+                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
             else {
                 logCodex("[AgentModeVM][CodexRetirement] replacement abandoned after state changed tab=\(session.tabID) run=\(runID)")
                 return nil
@@ -4899,13 +4911,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     currentTaskLabelKind,
                     wantsComputerUse
                 )
+                guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else {
+                    logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")
+                    await controller.shutdown()
+                    return nil
+                }
                 session.codexController = controller
                 session.codexControllerPermissionProfile = controllerPermissionProfile
                 session.codexControllerTaskLabelKind = currentTaskLabelKind
                 session.codexControllerWorkspacePaths = runtimeWorkspacePaths
                 session.codexControllerFeatureState = desiredFeatureState
             }
-            guard let controller = session.codexController else { return nil }
+            guard let controller = session.codexController,
+                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+            else { return nil }
             controller.ensureEventsStreamReady()
             if session.codexEventTask == nil || session.codexEventTaskRunID != runID {
                 session.codexEventTask?.cancel()
@@ -9270,7 +9289,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func shutdownCodexSession(
         _ session: AgentModeViewModel.TabSession,
         clearTabScopedCoordinatorState: Bool = true,
-        detachedRunID: UUID? = nil
+        detachedRunID: UUID? = nil,
+        preserveNonCodexRunState: Bool = false
     ) async {
         let shutdownRunID = clearTabScopedCoordinatorState ? session.runID : detachedRunID
         if clearTabScopedCoordinatorState {
@@ -9281,7 +9301,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
         session.pendingCommandRunningByKey.removeAll()
-        session.attachmentTurnState = .idle
+        if !preserveNonCodexRunState {
+            session.attachmentTurnState = .idle
+        }
         abandonCodexFallbackQueue(
             session: session,
             reason: "Codex queued follow-up was cancelled because the session shut down."
@@ -9298,7 +9320,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         await awaitCodexControllerRetirement(for: session.tabID)
-        session.runID = nil
+        if !preserveNonCodexRunState {
+            session.runID = nil
+        }
         if clearTabScopedCoordinatorState {
             await stopCodexToolTrackingAndWait(for: session)
         } else {

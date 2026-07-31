@@ -135,6 +135,19 @@ extension AgentModeViewModel {
         case ambiguous(tabIDs: [UUID])
     }
 
+    /// Immutable authority inputs shared by a batch of persistent-session lookups.
+    /// Building these maps is the expensive part: it walks every live, compose, and
+    /// stashed tab. Individual resolutions remain session-specific and preserve the
+    /// same ambiguity and indexed-fallback rules as the scalar lookup.
+    struct PersistentBindingResolutionSnapshot {
+        let liveClaimsByTabID: [UUID: UUID]
+        let workspaceClaimsByTabID: [UUID: Set<UUID>]
+        let claimedTabIDsBySessionID: [UUID: Set<UUID>]
+        let conflictingTabIDsBySessionID: [UUID: Set<UUID>]
+        let indexedTabIDBySessionID: [UUID: UUID]
+        let composeTabIDs: Set<UUID>
+    }
+
     enum PersistentBindingMutationError: Error, Equatable {
         case staleTransition
         case blockedByOwnership
@@ -156,6 +169,39 @@ extension AgentModeViewModel {
         case search
         case visibleCount
         case explicit
+    }
+
+    struct SidebarSessionRowsCacheKey: Equatable {
+        let workspaceID: UUID?
+        let sidebarRevision: Int
+        let tabs: [ComposeTabState]
+    }
+
+    struct SidebarListProjectionCacheKey: Equatable {
+        let workspaceID: UUID?
+        let sidebarSnapshot: AgentSessionSidebarSnapshot
+        let currentTabID: UUID?
+        let composeTabs: [ComposeTabState]
+        let stashedTabs: [StashedTab]
+        let archivedSessionsExpanded: Bool
+    }
+
+    struct SidebarListProjection {
+        let filteredSessions: [SidebarSession]
+        let pagedSessions: [SidebarSession]
+        let effectiveVisibleSessionCount: Int
+        let archivedSessionTabsForHeader: [StashedTab]
+        let sortedArchivedSessionTabsForRows: [StashedTab]
+        let archivedDateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
+
+        var hasMoreSessions: Bool {
+            filteredSessions.count > effectiveVisibleSessionCount
+        }
+
+        var remainingSessionCount: Int {
+            max(0, filteredSessions.count - effectiveVisibleSessionCount)
+        }
     }
 
     /// Signature of a compose tab's sidebar-rendered metadata. Captured separately

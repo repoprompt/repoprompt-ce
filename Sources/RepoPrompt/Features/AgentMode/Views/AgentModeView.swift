@@ -163,8 +163,17 @@ struct AgentModeView: View {
         }
     }
 
-    private func codexManagedLoginAction(openURL: @MainActor @escaping (URL) -> Void) async throws -> Bool {
-        try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
+    private var codexManagedLoginAction: CodexManagedLoginAction {
+        CodexManagedLoginAction(
+            browser: { openURL in
+                try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
+            },
+            deviceCode: { presentDeviceCode in
+                try await windowState.apiSettingsViewModel.startCodexManagedChatgptDeviceCodeLogin(
+                    presentDeviceCode: presentDeviceCode
+                )
+            }
+        )
     }
 }
 

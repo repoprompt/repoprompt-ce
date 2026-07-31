@@ -153,7 +153,7 @@ actor ChatDataService {
         from fileURL: URL
     ) async throws -> ChatSession {
         let filename = fileURL.lastPathComponent
-        guard filename.starts(with: "ChatSession-"), filename.hasSuffix(".json") else {
+        guard filename.hasPrefix("ChatSession-"), filename.hasSuffix(".json") else {
             throw ChatDataError.invalidFilename(filename)
         }
 
@@ -246,7 +246,7 @@ actor ChatDataService {
 
     private nonisolated static func loadChatSessionStubFromDisk(from fileURL: URL) throws -> ChatSession {
         let filename = fileURL.lastPathComponent
-        guard filename.starts(with: "ChatSession-"), filename.hasSuffix(".json") else {
+        guard filename.hasPrefix("ChatSession-"), filename.hasSuffix(".json") else {
             throw ChatDataError.invalidFilename(filename)
         }
 
@@ -291,7 +291,7 @@ actor ChatDataService {
         )
         let jsonFiles = contents.filter {
             $0.pathExtension.lowercased() == "json" &&
-                $0.lastPathComponent.starts(with: "ChatSession-")
+                $0.lastPathComponent.hasPrefix("ChatSession-")
         }
 
         let sortedFiles = jsonFiles.sorted { lhs, rhs in

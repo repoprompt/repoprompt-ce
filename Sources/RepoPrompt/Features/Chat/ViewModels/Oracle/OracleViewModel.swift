@@ -1024,7 +1024,7 @@ class OracleViewModel: ObservableObject {
     /// Minimum interval between watchdog re-arms during streaming (reduces Task churn)
     private let minWatchdogArmInterval: TimeInterval = 1.0
     private let preContentGrace: TimeInterval = 30.0
-    private let postContentGrace: TimeInterval = 10.0
+    static let postContentGrace: TimeInterval = 10.0
     private let finalizationSilenceGrace: TimeInterval = 4.0
     private let finalizationRetryDelay: TimeInterval = 1.5
 
@@ -1162,6 +1162,29 @@ class OracleViewModel: ObservableObject {
         }
     }
 
+    static func lifecycleActivityKind(
+        for output: ChatStreamOutput
+    ) -> OracleMessageLifecycleActivityEvent.Kind? {
+        if output.isTransportActivity || !output.text.isEmpty || !(output.reasoning?.isEmpty ?? true) {
+            return .streamActivity
+        }
+        return nil
+    }
+
+    @MainActor
+    func recordObservedStreamActivity(for queryId: UUID, at now: Date) {
+        lastAnyStreamActivityAt[queryId] = now
+        guard armStreamInactivityWatchdogThrottled(for: queryId, now: now) else { return }
+        emitMessageLifecycleActivity(.streamActivity, for: queryId)
+    }
+
+    #if DEBUG
+        @MainActor
+        func lastObservedStreamActivityForTesting(for queryId: UUID) -> Date? {
+            lastAnyStreamActivityAt[queryId]
+        }
+    #endif
+
     @MainActor
     private func emitMessageLifecycleActivity(
         _ kind: OracleMessageLifecycleActivityEvent.Kind,
@@ -1177,7 +1200,7 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func currentInactivityGrace(for queryId: UUID) -> TimeInterval {
         let seenText = hasSeenNonReasoningText.contains(queryId)
-        return seenText ? postContentGrace : preContentGrace
+        return seenText ? Self.postContentGrace : preContentGrace
     }
 
     @MainActor
@@ -1206,11 +1229,16 @@ class OracleViewModel: ObservableObject {
     /// Throttled watchdog arm: only re-arms if enough time has passed since the last arm.
     /// This dramatically reduces Task allocations/cancellations during fast streaming.
     @MainActor
-    private func armStreamInactivityWatchdogThrottled(for queryId: UUID, now: Date = Date()) {
+    @discardableResult
+    private func armStreamInactivityWatchdogThrottled(
+        for queryId: UUID,
+        now: Date = Date()
+    ) -> Bool {
         let lastArm = lastInactivityWatchdogArmAt[queryId] ?? .distantPast
-        guard now.timeIntervalSince(lastArm) >= minWatchdogArmInterval else { return }
+        guard now.timeIntervalSince(lastArm) >= minWatchdogArmInterval else { return false }
         lastInactivityWatchdogArmAt[queryId] = now
         scheduleStreamInactivityWatchdog(for: queryId)
+        return true
     }
 
     @MainActor
@@ -1253,9 +1281,13 @@ class OracleViewModel: ObservableObject {
             return
         }
 
-        let elapsed = Date().timeIntervalSince(lastAnyActivity)
+        let now = Date()
         let grace = currentInactivityGrace(for: queryId)
-        if elapsed < grace {
+        if !Self.shouldFireStreamInactivityWatchdog(
+            lastActivityAt: lastAnyActivity,
+            now: now,
+            grace: grace
+        ) {
             scheduleStreamInactivityWatchdog(for: queryId)
             return
         }
@@ -1273,6 +1305,14 @@ class OracleViewModel: ObservableObject {
         Task {
             await self.finalizeAIResponse(aiResponseId: queryId, sessionID: sessionID, partialBuffer: content)
         }
+    }
+
+    static func shouldFireStreamInactivityWatchdog(
+        lastActivityAt: Date,
+        now: Date,
+        grace: TimeInterval
+    ) -> Bool {
+        now.timeIntervalSince(lastActivityAt) > grace
     }
 
     @MainActor
@@ -2959,6 +2999,16 @@ class OracleViewModel: ObservableObject {
                 var didFinalize = false
 
                 for try await output in stream {
+                    let activityKind = Self.lifecycleActivityKind(for: output)
+                    if output.isTransportActivity {
+                        await MainActor.run {
+                            if activityKind != nil {
+                                self.recordObservedStreamActivity(for: aiResponseId, at: Date())
+                            }
+                        }
+                        continue
+                    }
+
                     let delta = output.text
                     let reasoningDelta = output.reasoning
                     let tokenInfo = output.tokens
@@ -2975,11 +3025,8 @@ class OracleViewModel: ObservableObject {
                         let sawText = !delta.isEmpty
                         let sawReasoning = !(reasoningDelta?.isEmpty ?? true)
                         let now = Date()
-                        if sawText || sawReasoning {
-                            self.lastAnyStreamActivityAt[aiResponseId] = now
-                            self.emitMessageLifecycleActivity(.streamActivity, for: aiResponseId)
-                            // Use throttled arm to reduce Task churn during fast streaming
-                            self.armStreamInactivityWatchdogThrottled(for: aiResponseId, now: now)
+                        if activityKind != nil {
+                            self.recordObservedStreamActivity(for: aiResponseId, at: now)
                         }
                         if sawText {
                             self.hasSeenNonReasoningText.insert(aiResponseId)

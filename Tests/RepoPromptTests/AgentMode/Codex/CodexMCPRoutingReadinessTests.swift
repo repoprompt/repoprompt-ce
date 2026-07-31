@@ -458,6 +458,33 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         await coordinator.shutdownCodexSession(session)
     }
 
+    func testControllerCreatedAcrossManagedLogoutFenceIsRetiredBeforeInstallation() async {
+        let fence = CodexManagedSessionFence.shared
+        let logoutTokenBox = ManagedLogoutTokenBox()
+        let controller = RoutingReadinessFakeCodexController()
+        let host = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                logoutTokenBox.set(fence.beginLogout())
+                return controller
+            }
+        )
+        host.test_initializeRunService()
+        let session = host.session(for: UUID())
+        session.selectedAgent = .codexExec
+
+        await host.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        XCTAssertNil(session.codexController)
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        if let logoutToken = logoutTokenBox.value {
+            fence.finishLogout(token: logoutToken, succeeded: false)
+        } else {
+            XCTFail("Expected controller construction to begin the logout fence")
+        }
+    }
+
     // MARK: - Harness
 
     private func makeCodexSession() -> AgentModeViewModel.TabSession {
@@ -677,6 +704,19 @@ private final class TerminalPublicationRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return states
+    }
+}
+
+private final class ManagedLogoutTokenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: CodexManagedSessionFence.Token?
+
+    var value: CodexManagedSessionFence.Token? {
+        lock.withLock { stored }
+    }
+
+    func set(_ value: CodexManagedSessionFence.Token) {
+        lock.withLock { stored = value }
     }
 }
 

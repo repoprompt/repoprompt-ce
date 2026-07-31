@@ -163,7 +163,10 @@ private struct MessageFooterStrip: View {
 
 // MARK: - Agent Message Bubble
 
-typealias CodexManagedLoginAction = (@MainActor @escaping (URL) -> Void) async throws -> Bool
+struct CodexManagedLoginAction {
+    let browser: (@MainActor @escaping @Sendable (URL) -> Void) async throws -> Bool
+    let deviceCode: (@MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void) async throws -> Bool
+}
 
 /// A bubble view for displaying agent chat items (user, assistant, tool calls, etc.)
 @MainActor
@@ -186,9 +189,12 @@ struct AgentMessageBubble: View {
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
     @ObservedObject private var fontScale = FontScaleManager.shared
-    @State private var isStartingCodexManagedLogin = false
+    @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
+    @State private var codexManagedLoginOperationID: UUID?
     @State private var codexManagedLoginFeedback: String?
     @State private var codexManagedLoginCompleted = false
+    @State private var codexManagedDeviceCode: CodexManagedChatgptDeviceCode?
+    @State private var didCopyCodexManagedDeviceCode = false
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -843,19 +849,53 @@ struct AgentMessageBubble: View {
                     if shouldShowCodexManagedLoginAction {
                         VStack(alignment: .leading, spacing: 6) {
                             if !codexManagedLoginCompleted {
-                                Button(action: startCodexManagedChatgptLogin) {
-                                    HStack(spacing: 6) {
-                                        if isStartingCodexManagedLogin {
-                                            ProgressView()
-                                                .controlSize(.small)
+                                HStack(spacing: 12) {
+                                    Button(action: startCodexManagedChatgptLogin) {
+                                        HStack(spacing: 6) {
+                                            if activeCodexManagedLoginFlow == .browser {
+                                                ProgressView()
+                                                    .controlSize(.small)
+                                            }
+                                            Text(CodexManagedAuthRecoveryClassifier.loginActionTitle)
                                         }
-                                        Text(isStartingCodexManagedLogin ? "Opening ChatGPT login…" : CodexManagedAuthRecoveryClassifier.loginActionTitle)
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                     }
-                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                    .buttonStyle(.plain)
+                                    .foregroundColor(.primary)
+                                    .disabled(activeCodexManagedLoginFlow == .browser)
+
+                                    Button(action: startCodexManagedChatgptDeviceCodeLogin) {
+                                        Text(CodexManagedAuthRecoveryClassifier.deviceCodeActionTitle)
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .foregroundColor(.secondary)
+                                    .disabled(activeCodexManagedLoginFlow == .deviceCode)
                                 }
-                                .buttonStyle(.plain)
-                                .foregroundColor(.primary)
-                                .disabled(isStartingCodexManagedLogin)
+                            }
+
+                            if let code = codexManagedDeviceCode {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Enter this one-time code on the verification page:")
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                        .foregroundColor(.secondary)
+                                    HStack(spacing: 8) {
+                                        Text(code.userCode)
+                                            .font(.system(size: 16, weight: .semibold, design: .monospaced))
+                                            .textSelection(.enabled)
+                                        Button(didCopyCodexManagedDeviceCode ? "Copied" : "Copy code") {
+                                            copyCodexManagedDeviceCode(code.userCode)
+                                        }
+                                        .buttonStyle(.plain)
+                                        Button("Open verification page") {
+                                            NSWorkspace.shared.open(code.verificationURL)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(8)
+                                .background(Color.secondary.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
                             }
 
                             if let feedback = codexManagedLoginFeedback {
@@ -944,21 +984,32 @@ struct AgentMessageBubble: View {
     }
 
     private func startCodexManagedChatgptLogin() {
-        guard !isStartingCodexManagedLogin else { return }
-        isStartingCodexManagedLogin = true
+        guard activeCodexManagedLoginFlow != .browser else { return }
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        activeCodexManagedLoginFlow = .browser
         codexManagedLoginFeedback = nil
         codexManagedLoginCompleted = false
+        clearCodexManagedDeviceCode()
 
         Task { @MainActor in
-            defer { isStartingCodexManagedLogin = false }
+            defer {
+                if codexManagedLoginOperationID == operationID {
+                    activeCodexManagedLoginFlow = nil
+                    codexManagedLoginOperationID = nil
+                    clearCodexManagedDeviceCode()
+                }
+            }
             do {
                 guard let codexManagedLoginAction else {
                     codexManagedLoginFeedback = "Codex login is unavailable in this view. Open CLI Providers to sign in."
                     return
                 }
-                let authenticated = try await codexManagedLoginAction { url in
+                let authenticated = try await codexManagedLoginAction.browser { url in
+                    guard codexManagedLoginOperationID == operationID else { return }
                     NSWorkspace.shared.open(url)
                 }
+                guard codexManagedLoginOperationID == operationID else { return }
                 guard authenticated else {
                     codexManagedLoginFeedback = "Codex login did not complete. Retry the login or open CLI Providers."
                     return
@@ -966,9 +1017,65 @@ struct AgentMessageBubble: View {
                 codexManagedLoginCompleted = true
                 codexManagedLoginFeedback = "Login complete. Send your next message to reconnect Codex."
             } catch {
+                guard codexManagedLoginOperationID == operationID else { return }
                 codexManagedLoginFeedback = error.localizedDescription
             }
         }
+    }
+
+    private func startCodexManagedChatgptDeviceCodeLogin() {
+        guard activeCodexManagedLoginFlow != .deviceCode else { return }
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        activeCodexManagedLoginFlow = .deviceCode
+        codexManagedLoginFeedback = "Requesting a one-time device code…"
+        codexManagedLoginCompleted = false
+        clearCodexManagedDeviceCode()
+
+        Task { @MainActor in
+            defer {
+                if codexManagedLoginOperationID == operationID {
+                    activeCodexManagedLoginFlow = nil
+                    codexManagedLoginOperationID = nil
+                    clearCodexManagedDeviceCode()
+                }
+            }
+            do {
+                guard let codexManagedLoginAction else {
+                    codexManagedLoginFeedback = "Codex login is unavailable in this view. Open CLI Providers to sign in."
+                    return
+                }
+                let authenticated = try await codexManagedLoginAction.deviceCode { code, shouldOpenVerificationURL in
+                    guard codexManagedLoginOperationID == operationID else { return }
+                    codexManagedDeviceCode = code
+                    codexManagedLoginFeedback = "Enter the code above; RepoPrompt CE will keep checking this separate Codex sign-in."
+                    if shouldOpenVerificationURL {
+                        NSWorkspace.shared.open(code.verificationURL)
+                    }
+                }
+                guard codexManagedLoginOperationID == operationID else { return }
+                guard authenticated else {
+                    codexManagedLoginFeedback = "Codex device-code login did not complete. Request a new code or open CLI Providers."
+                    return
+                }
+                codexManagedLoginCompleted = true
+                codexManagedLoginFeedback = "Login complete. Send your next message to reconnect Codex."
+            } catch {
+                guard codexManagedLoginOperationID == operationID else { return }
+                codexManagedLoginFeedback = error.localizedDescription
+            }
+        }
+    }
+
+    private func clearCodexManagedDeviceCode() {
+        codexManagedDeviceCode = nil
+        didCopyCodexManagedDeviceCode = false
+    }
+
+    private func copyCodexManagedDeviceCode(_ code: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        didCopyCodexManagedDeviceCode = true
     }
 
     private func formatJSON(_ jsonString: String) -> String {
