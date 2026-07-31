@@ -1024,7 +1024,7 @@ class OracleViewModel: ObservableObject {
     /// Minimum interval between watchdog re-arms during streaming (reduces Task churn)
     private let minWatchdogArmInterval: TimeInterval = 1.0
     private let preContentGrace: TimeInterval = 30.0
-    private let postContentGrace: TimeInterval = 10.0
+    private let postContentGrace: TimeInterval = 30.0
     private let finalizationSilenceGrace: TimeInterval = 4.0
     private let finalizationRetryDelay: TimeInterval = 1.5
 
@@ -1160,6 +1160,22 @@ class OracleViewModel: ObservableObject {
         if messageLifecycleActivityObservers[queryId]?.isEmpty == true {
             messageLifecycleActivityObservers.removeValue(forKey: queryId)
         }
+    }
+
+    static func lifecycleActivityKind(
+        for output: ChatStreamOutput
+    ) -> OracleMessageLifecycleActivityEvent.Kind? {
+        if output.isTransportActivity || !output.text.isEmpty || !(output.reasoning?.isEmpty ?? true) {
+            return .streamActivity
+        }
+        return nil
+    }
+
+    @MainActor
+    private func recordObservedStreamActivity(for queryId: UUID, at now: Date) {
+        lastAnyStreamActivityAt[queryId] = now
+        emitMessageLifecycleActivity(.streamActivity, for: queryId)
+        armStreamInactivityWatchdogThrottled(for: queryId, now: now)
     }
 
     @MainActor
@@ -2959,6 +2975,16 @@ class OracleViewModel: ObservableObject {
                 var didFinalize = false
 
                 for try await output in stream {
+                    let activityKind = Self.lifecycleActivityKind(for: output)
+                    if output.isTransportActivity {
+                        await MainActor.run {
+                            if activityKind != nil {
+                                self.recordObservedStreamActivity(for: aiResponseId, at: Date())
+                            }
+                        }
+                        continue
+                    }
+
                     let delta = output.text
                     let reasoningDelta = output.reasoning
                     let tokenInfo = output.tokens
@@ -2975,11 +3001,8 @@ class OracleViewModel: ObservableObject {
                         let sawText = !delta.isEmpty
                         let sawReasoning = !(reasoningDelta?.isEmpty ?? true)
                         let now = Date()
-                        if sawText || sawReasoning {
-                            self.lastAnyStreamActivityAt[aiResponseId] = now
-                            self.emitMessageLifecycleActivity(.streamActivity, for: aiResponseId)
-                            // Use throttled arm to reduce Task churn during fast streaming
-                            self.armStreamInactivityWatchdogThrottled(for: aiResponseId, now: now)
+                        if activityKind != nil {
+                            self.recordObservedStreamActivity(for: aiResponseId, at: now)
                         }
                         if sawText {
                             self.hasSeenNonReasoningText.insert(aiResponseId)

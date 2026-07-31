@@ -351,8 +351,10 @@ private extension String {
 struct AIStreamResult {
     /// Standard type strings for stream results
     static let lifecycleType = "lifecycle"
+    /// Transport-level activity with no semantic assistant payload.
+    static let transportActivityType = "transport_activity"
 
-    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle"
+    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle", "transport_activity"
     let text: String? // normal content (like streaming tokens)
     let reasoning: String? // optional reasoning content
     let promptTokens: Int? // token usage
