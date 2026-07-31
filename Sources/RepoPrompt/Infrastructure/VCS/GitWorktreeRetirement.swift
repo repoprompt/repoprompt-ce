@@ -391,6 +391,98 @@ struct GitWorktreeRetirementTarget: Equatable, Codable {
     }
 }
 
+struct GitWorktreeRetirementCleanupTarget: Equatable, Codable {
+    let candidate: GitWorktreeRetirementCandidate
+    let branch: String?
+    let registeredHead: String
+    let liveHead: String
+    let generation: UInt64
+    let targetDigest: String
+    let activeOperationCount: Int
+
+    var repositoryID: String {
+        candidate.repositoryID
+    }
+
+    var repositoryRoot: String {
+        candidate.repositoryRoot.registeredPath
+    }
+
+    var worktreeID: String {
+        candidate.worktreeID
+    }
+
+    var path: String {
+        candidate.registeredPath
+    }
+
+    var canonicalPath: String {
+        candidate.canonicalPath
+    }
+
+    init(
+        descriptor: GitWorktreeDescriptor,
+        liveHead: String,
+        generation: UInt64,
+        activeOperationCount: Int
+    ) throws {
+        let candidate = try GitWorktreeRetirementCandidate(descriptor: descriptor)
+        guard !descriptor.isLocked, descriptor.lockReason == nil else {
+            throw GitWorktreeRetirementError.lockedWorktree(descriptor.lockReason)
+        }
+        guard activeOperationCount == 0 else {
+            throw GitWorktreeRetirementError.activeOperations(activeOperationCount)
+        }
+        guard let registeredHead = descriptor.head?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !registeredHead.isEmpty,
+              registeredHead == liveHead
+        else { throw GitWorktreeRetirementError.targetChanged }
+        self.candidate = candidate
+        branch = descriptor.branch
+        self.registeredHead = registeredHead
+        self.liveHead = liveHead
+        self.generation = generation
+        self.activeOperationCount = activeOperationCount
+        targetDigest = GitWorktreeRetirementTarget.digest(
+            [
+                "cleanup",
+                candidate.repositoryID,
+                candidate.repositoryRoot.canonicalPath,
+                candidate.commonGitDirectory.canonicalPath,
+                candidate.worktreeID,
+                candidate.registeredPath,
+                candidate.canonicalPath,
+                candidate.gitDirectory.canonicalPath,
+                descriptor.branch ?? "<detached>",
+                registeredHead,
+                liveHead,
+                String(generation),
+                String(candidate.worktreeDirectory.device),
+                String(candidate.worktreeDirectory.inode),
+                String(candidate.gitDirectory.device),
+                String(candidate.gitDirectory.inode)
+            ].joined(separator: "\u{0}")
+        )
+    }
+
+    func matches(_ target: GitWorktreeRetirementTarget) -> Bool {
+        candidate == target.candidate
+            && branch == target.branch
+            && registeredHead == target.registeredHead
+            && liveHead == target.liveHead
+            && generation == target.generation
+            && activeOperationCount == target.activeOperationCount
+    }
+
+    func matchesIdentityAndHead(_ other: GitWorktreeRetirementCleanupTarget) -> Bool {
+        candidate == other.candidate
+            && branch == other.branch
+            && registeredHead == other.registeredHead
+            && liveHead == other.liveHead
+            && activeOperationCount == other.activeOperationCount
+    }
+}
+
 struct GitWorktreeRetirementDrainEvidence: Equatable, Codable {
     let drainedSessionIDs: [String]
     let activeAdmissionsBefore: Int
@@ -465,6 +557,8 @@ struct GitWorktreeRetirementEvidence: Equatable, Codable {
     let canonicalPath: String
     let targetDigest: String?
     let manifestDigest: String?
+    let cleanupManifestDigest: String?
+    let cleanupAuthorizationDigest: String?
     let consumedAuthorizationDigest: String
     let drain: GitWorktreeRetirementDrainEvidence?
     let mutation: GitWorktreeRetirementMutationEvidence
@@ -481,11 +575,56 @@ struct GitWorktreeRetirementPreparation: Equatable {
     let expiresAt: Date
 }
 
+struct GitWorktreeRetirementCleanupPreparation: Equatable {
+    let token: String
+    let tokenDigest: String
+    let target: GitWorktreeRetirementCleanupTarget
+    let cleanupManifestDigest: String
+    let generation: UInt64
+    let startedAt: Date
+}
+
+struct GitWorktreeRetirementCleanupAuthorization: Equatable {
+    let token: String
+    let tokenDigest: String
+    let target: GitWorktreeRetirementCleanupTarget
+    let cleanupManifestDigest: String
+    let drain: GitWorktreeRetirementDrainEvidence
+    let issuedAt: Date
+    let expiresAt: Date
+
+    var generation: UInt64 {
+        target.generation
+    }
+}
+
 struct GitWorktreeRetirementAuthorization: Equatable {
     let token: String
     let tokenDigest: String
+    let cleanupAuthorizationDigest: String?
+    let cleanupManifestDigest: String?
     let target: GitWorktreeRetirementTarget
     let drain: GitWorktreeRetirementDrainEvidence
+    let issuedAt: Date
+    let expiresAt: Date
+}
+
+struct GitWorktreeRetirementProgress: Equatable {
+    enum Phase: String, Equatable {
+        case cleanupAuthorized = "cleanup_authorized"
+        case authorized
+        case applying
+    }
+
+    let phase: Phase
+    let tokenDigest: String
+    let cleanupAuthorizationDigest: String?
+    let candidate: GitWorktreeRetirementCandidate
+    let generation: UInt64
+    let drain: GitWorktreeRetirementDrainEvidence
+    let targetDigest: String
+    let manifestDigest: String?
+    let cleanupManifestDigest: String?
     let issuedAt: Date
     let expiresAt: Date
 }
@@ -493,6 +632,8 @@ struct GitWorktreeRetirementAuthorization: Equatable {
 struct GitWorktreeRetirementPermit: Equatable {
     enum Phase: String, Codable {
         case draining
+        case cleanupDraining = "cleanup_draining"
+        case cleanupAuthorized = "cleanup_authorized"
         case authorized
         case applying
     }
@@ -539,6 +680,9 @@ enum GitWorktreeRetirementError: LocalizedError, Equatable {
     case invalidAuthorization
     case authorizationAlreadyConsumed
     case authorizationExpired
+    case invalidCleanupAuthorization
+    case cleanupAuthorizationAlreadyConsumed
+    case cleanupAuthorizationExpired
     case targetChanged
     case mainWorktree
     case nonAppManagedPath(String)
@@ -572,6 +716,12 @@ enum GitWorktreeRetirementError: LocalizedError, Equatable {
             "Retirement authorization was already consumed and can only be used for durable evidence readback."
         case .authorizationExpired:
             "Retirement authorization expired and the target is durably blocked as residue."
+        case .invalidCleanupAuthorization:
+            "Cleanup authorization is invalid or does not match the sealed worktree target."
+        case .cleanupAuthorizationAlreadyConsumed:
+            "Cleanup authorization was already consumed; read the durable retirement phase instead."
+        case .cleanupAuthorizationExpired:
+            "Cleanup authorization expired and the target is durably blocked as residue."
         case .targetChanged:
             "Worktree identity or content changed after retirement admission closed. No removal was attempted."
         case .mainWorktree:
@@ -676,8 +826,9 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         }
     #endif
     static let authorityScope = "repoprompt_control_plane"
-    static let operationVersion = 3
+    static let operationVersion = 4
     static let authorizationTTL: TimeInterval = 60
+    static let cleanupAuthorizationTTL: TimeInterval = 10 * 60
 
     private enum Resource {
         case binding(repositoryID: String?, worktreeID: String, canonicalPath: String?)
@@ -702,7 +853,26 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
 
     private struct AuthorizationRecord: Codable, Equatable {
         let tokenDigest: String
+        let cleanupAuthorizationDigest: String?
+        let cleanupManifestDigest: String?
         let target: GitWorktreeRetirementTarget
+        let drain: GitWorktreeRetirementDrainEvidence
+        let issuedAt: Date
+        let expiresAt: Date
+    }
+
+    private struct CleanupPreparationRecord: Codable, Equatable {
+        let tokenDigest: String
+        let target: GitWorktreeRetirementCleanupTarget
+        let cleanupManifestDigest: String
+        let generation: UInt64
+        let startedAt: Date
+    }
+
+    private struct CleanupAuthorizationRecord: Codable, Equatable {
+        let tokenDigest: String
+        let target: GitWorktreeRetirementCleanupTarget
+        let cleanupManifestDigest: String
         let drain: GitWorktreeRetirementDrainEvidence
         let issuedAt: Date
         let expiresAt: Date
@@ -715,6 +885,8 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
 
     private enum Record: Codable, Equatable {
         case draining(PreparationRecord)
+        case cleanupDraining(CleanupPreparationRecord)
+        case cleanupAuthorized(CleanupAuthorizationRecord)
         case authorized(AuthorizationRecord)
         case applying(ApplyingRecord)
         case retired(GitWorktreeRetirementEvidence)
@@ -856,6 +1028,293 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         )
     }
 
+    func beginCleanup(
+        _ target: GitWorktreeRetirementCleanupTarget,
+        cleanupManifestDigest: String,
+        now: Date = Date()
+    ) throws -> GitWorktreeRetirementCleanupPreparation {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        for (existingWorktreeID, record) in state.recordsByWorktreeID {
+            let identity = Self.identity(of: record)
+            guard existingWorktreeID != target.worktreeID,
+                  identity.repositoryID != target.repositoryID
+                  || identity.canonicalPath != target.canonicalPath
+            else {
+                throw GitWorktreeRetirementError.alreadyRetiring(existingWorktreeID)
+            }
+        }
+        guard !cleanupManifestDigest.isEmpty else {
+            throw GitWorktreeRetirementError.invalidCleanupAuthorization
+        }
+        let operationLease = try GitWorktreeRetirementFileLease.acquire(
+            at: URL(fileURLWithPath: target.candidate.commonGitDirectory.canonicalPath, isDirectory: true)
+                .appendingPathComponent("repoprompt-retirement.lock"),
+            nonBlocking: true
+        )
+        operationLeasesByWorktreeID[target.worktreeID] = operationLease
+        let token = "cleanup_\(UUID().uuidString.lowercased())"
+        let digest = Self.digest(token)
+        state.stateGeneration &+= 1
+        let record = CleanupPreparationRecord(
+            tokenDigest: digest,
+            target: target,
+            cleanupManifestDigest: cleanupManifestDigest,
+            generation: state.stateGeneration,
+            startedAt: now
+        )
+        state.recordsByWorktreeID[target.worktreeID] = .cleanupDraining(record)
+        do {
+            try persistLocked(expectedOnDiskGeneration: lastPersistedGeneration)
+            lastPersistedGeneration = state.stateGeneration
+        } catch {
+            markPersistenceAmbiguousLocked(error)
+            throw error
+        }
+        return GitWorktreeRetirementCleanupPreparation(
+            token: token,
+            tokenDigest: digest,
+            target: target,
+            cleanupManifestDigest: cleanupManifestDigest,
+            generation: record.generation,
+            startedAt: now
+        )
+    }
+
+    func cancelCleanupPreparationForRetry(
+        _ preparation: GitWorktreeRetirementCleanupPreparation
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupDraining(record)? = state.recordsByWorktreeID[preparation.target.worktreeID],
+              record.tokenDigest == preparation.tokenDigest,
+              record.generation == preparation.generation,
+              record.target == preparation.target,
+              record.cleanupManifestDigest == preparation.cleanupManifestDigest
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        try transitionAndPersistLocked {
+            $0.recordsByWorktreeID.removeValue(forKey: preparation.target.worktreeID)
+        }
+        operationLeasesByWorktreeID.removeValue(forKey: preparation.target.worktreeID)?.release()
+    }
+
+    func permit(
+        for preparation: GitWorktreeRetirementCleanupPreparation
+    ) throws -> GitWorktreeRetirementPermit {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupDraining(record)? = state.recordsByWorktreeID[preparation.target.worktreeID],
+              record.tokenDigest == preparation.tokenDigest,
+              record.generation == preparation.generation,
+              record.target == preparation.target,
+              record.cleanupManifestDigest == preparation.cleanupManifestDigest
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        return GitWorktreeRetirementPermit(
+            authorizationDigest: record.tokenDigest,
+            candidate: record.target.candidate,
+            generation: record.generation,
+            phase: .cleanupDraining
+        )
+    }
+
+    func activeAdmissionCount(
+        for preparation: GitWorktreeRetirementCleanupPreparation
+    ) throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        return activeLeases.values.count {
+            Self.resource($0.resource, matches: preparation.target.candidate, includeRepository: true)
+        }
+    }
+
+    func awaitZeroAdmissions(
+        for preparation: GitWorktreeRetirementCleanupPreparation,
+        timeout: Duration = .seconds(10)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            try Task.checkCancellation()
+            let count = try activeAdmissionCount(for: preparation)
+            if count == 0 { return }
+            guard clock.now < deadline else { throw GitWorktreeRetirementError.drainTimedOut(count) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func authorizeCleanupAfterDrain(
+        _ preparation: GitWorktreeRetirementCleanupPreparation,
+        target: GitWorktreeRetirementCleanupTarget,
+        drain: GitWorktreeRetirementDrainEvidence,
+        now: Date = Date()
+    ) throws -> GitWorktreeRetirementCleanupAuthorization {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupDraining(record)? = state.recordsByWorktreeID[preparation.target.worktreeID],
+              record.tokenDigest == preparation.tokenDigest,
+              record.generation == preparation.generation,
+              record.target.matchesIdentityAndHead(target),
+              record.cleanupManifestDigest == preparation.cleanupManifestDigest,
+              target.generation == preparation.generation,
+              drain.isFullyDrained,
+              !activeLeases.values.contains(where: {
+                  Self.resource($0.resource, matches: target.candidate, includeRepository: true)
+              })
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        let authorization = CleanupAuthorizationRecord(
+            tokenDigest: record.tokenDigest,
+            target: target,
+            cleanupManifestDigest: record.cleanupManifestDigest,
+            drain: drain,
+            issuedAt: now,
+            expiresAt: now.addingTimeInterval(Self.cleanupAuthorizationTTL)
+        )
+        try transitionAndPersistLocked {
+            $0.recordsByWorktreeID[target.worktreeID] = .cleanupAuthorized(authorization)
+        }
+        return GitWorktreeRetirementCleanupAuthorization(
+            token: preparation.token,
+            tokenDigest: authorization.tokenDigest,
+            target: target,
+            cleanupManifestDigest: authorization.cleanupManifestDigest,
+            drain: drain,
+            issuedAt: authorization.issuedAt,
+            expiresAt: authorization.expiresAt
+        )
+    }
+
+    func cleanupAuthorization(
+        token: String,
+        now: Date = Date()
+    ) throws -> GitWorktreeRetirementCleanupAuthorization {
+        let digest = Self.digest(token)
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        for (worktreeID, record) in state.recordsByWorktreeID {
+            if case let .cleanupAuthorized(authorization) = record,
+               authorization.tokenDigest == digest
+            {
+                guard now <= authorization.expiresAt else {
+                    let evidence = Self.blockedEvidence(
+                        cleanupAuthorization: authorization,
+                        reason: GitWorktreeRetirementError.cleanupAuthorizationExpired.localizedDescription,
+                        now: now
+                    )
+                    try transitionAndPersistLocked {
+                        $0.recordsByWorktreeID[worktreeID] = .blockedResidue(evidence)
+                    }
+                    operationLeasesByWorktreeID.removeValue(forKey: worktreeID)?.release()
+                    throw GitWorktreeRetirementError.cleanupAuthorizationExpired
+                }
+                return GitWorktreeRetirementCleanupAuthorization(
+                    token: token,
+                    tokenDigest: digest,
+                    target: authorization.target,
+                    cleanupManifestDigest: authorization.cleanupManifestDigest,
+                    drain: authorization.drain,
+                    issuedAt: authorization.issuedAt,
+                    expiresAt: authorization.expiresAt
+                )
+            }
+            if case let .authorized(authorization) = record,
+               authorization.cleanupAuthorizationDigest == digest
+            {
+                throw GitWorktreeRetirementError.cleanupAuthorizationAlreadyConsumed
+            }
+        }
+        if evidenceLocked(tokenDigest: digest) != nil {
+            throw GitWorktreeRetirementError.cleanupAuthorizationAlreadyConsumed
+        }
+        throw GitWorktreeRetirementError.invalidCleanupAuthorization
+    }
+
+    func permit(
+        for authorization: GitWorktreeRetirementCleanupAuthorization
+    ) throws -> GitWorktreeRetirementPermit {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupAuthorized(record)? = state.recordsByWorktreeID[authorization.target.worktreeID],
+              record.tokenDigest == authorization.tokenDigest,
+              record.target == authorization.target
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        return GitWorktreeRetirementPermit(
+            authorizationDigest: record.tokenDigest,
+            candidate: record.target.candidate,
+            generation: record.target.generation,
+            phase: .cleanupAuthorized
+        )
+    }
+
+    func completeCleanup(
+        _ authorization: GitWorktreeRetirementCleanupAuthorization,
+        target: GitWorktreeRetirementTarget,
+        cleanupManifestDigest: String,
+        now: Date = Date()
+    ) throws -> GitWorktreeRetirementAuthorization {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupAuthorized(record)? = state.recordsByWorktreeID[authorization.target.worktreeID],
+              record.tokenDigest == authorization.tokenDigest,
+              record.target == authorization.target,
+              record.cleanupManifestDigest == authorization.cleanupManifestDigest,
+              record.cleanupManifestDigest == cleanupManifestDigest,
+              record.target.matches(target),
+              !activeLeases.values.contains(where: {
+                  Self.resource($0.resource, matches: target.candidate, includeRepository: true)
+              })
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        guard now <= record.expiresAt else {
+            let evidence = Self.blockedEvidence(
+                cleanupAuthorization: record,
+                reason: GitWorktreeRetirementError.cleanupAuthorizationExpired.localizedDescription,
+                now: now
+            )
+            try transitionAndPersistLocked {
+                $0.recordsByWorktreeID[target.worktreeID] = .blockedResidue(evidence)
+            }
+            operationLeasesByWorktreeID.removeValue(forKey: target.worktreeID)?.release()
+            throw GitWorktreeRetirementError.cleanupAuthorizationExpired
+        }
+        let retirement = AuthorizationRecord(
+            tokenDigest: record.tokenDigest,
+            cleanupAuthorizationDigest: record.tokenDigest,
+            cleanupManifestDigest: record.cleanupManifestDigest,
+            target: target,
+            drain: record.drain,
+            issuedAt: now,
+            expiresAt: now.addingTimeInterval(Self.authorizationTTL)
+        )
+        try transitionAndPersistLocked {
+            $0.recordsByWorktreeID[target.worktreeID] = .authorized(retirement)
+        }
+        return GitWorktreeRetirementAuthorization(
+            token: authorization.token,
+            tokenDigest: retirement.tokenDigest,
+            cleanupAuthorizationDigest: retirement.cleanupAuthorizationDigest,
+            cleanupManifestDigest: retirement.cleanupManifestDigest,
+            target: retirement.target,
+            drain: retirement.drain,
+            issuedAt: retirement.issuedAt,
+            expiresAt: retirement.expiresAt
+        )
+    }
+
     /// Reopens admission after a pre-authorization drain was cancelled or timed out.
     /// No destructive operation can have started while the record is still in `draining`.
     /// Persisting the removal keeps retries clean without weakening authorized/applying tombstones.
@@ -943,6 +1402,8 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         else { throw GitWorktreeRetirementError.invalidAuthorization }
         let authorizationRecord = AuthorizationRecord(
             tokenDigest: record.tokenDigest,
+            cleanupAuthorizationDigest: nil,
+            cleanupManifestDigest: nil,
             target: target,
             drain: drain,
             issuedAt: record.issuedAt,
@@ -954,6 +1415,8 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         return GitWorktreeRetirementAuthorization(
             token: preparation.token,
             tokenDigest: record.tokenDigest,
+            cleanupAuthorizationDigest: nil,
+            cleanupManifestDigest: nil,
             target: target,
             drain: drain,
             issuedAt: record.issuedAt,
@@ -986,6 +1449,8 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
             return GitWorktreeRetirementAuthorization(
                 token: token,
                 tokenDigest: digest,
+                cleanupAuthorizationDigest: authorization.cleanupAuthorizationDigest,
+                cleanupManifestDigest: authorization.cleanupManifestDigest,
                 target: authorization.target,
                 drain: authorization.drain,
                 issuedAt: authorization.issuedAt,
@@ -1037,6 +1502,32 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         return evidence
     }
 
+    @discardableResult
+    func blockCleanupAuthorization(
+        _ authorization: GitWorktreeRetirementCleanupAuthorization,
+        reason: String,
+        now: Date = Date()
+    ) throws -> GitWorktreeRetirementEvidence {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupAuthorized(record)? = state.recordsByWorktreeID[authorization.target.worktreeID],
+              record.tokenDigest == authorization.tokenDigest,
+              record.target == authorization.target
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        let evidence = Self.blockedEvidence(
+            cleanupAuthorization: record,
+            reason: reason,
+            now: now
+        )
+        try transitionAndPersistLocked {
+            $0.recordsByWorktreeID[authorization.target.worktreeID] = .blockedResidue(evidence)
+        }
+        operationLeasesByWorktreeID.removeValue(forKey: authorization.target.worktreeID)?.release()
+        return evidence
+    }
+
     /// Called synchronously after final re-attestation and immediately before the destructive
     /// process is admitted. The consumed state is durably synchronized before returning.
     func consume(
@@ -1062,6 +1553,7 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
             try transitionAndPersistLocked {
                 $0.recordsByWorktreeID[record.target.worktreeID] = .blockedResidue(evidence)
             }
+            operationLeasesByWorktreeID.removeValue(forKey: record.target.worktreeID)?.release()
             throw GitWorktreeRetirementError.authorizationExpired
         }
         let conflicting = activeLeases.values.count {
@@ -1176,6 +1668,49 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         return evidence
     }
 
+    @discardableResult
+    func blockCleanupPreparation(
+        _ preparation: GitWorktreeRetirementCleanupPreparation,
+        target: GitWorktreeRetirementCleanupTarget? = nil,
+        drain: GitWorktreeRetirementDrainEvidence? = nil,
+        reason: String,
+        now: Date = Date()
+    ) throws -> GitWorktreeRetirementEvidence {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard case let .cleanupDraining(record)? = state.recordsByWorktreeID[preparation.target.worktreeID],
+              record.tokenDigest == preparation.tokenDigest
+        else { throw GitWorktreeRetirementError.invalidCleanupAuthorization }
+        let authorization = CleanupAuthorizationRecord(
+            tokenDigest: record.tokenDigest,
+            target: target ?? record.target,
+            cleanupManifestDigest: record.cleanupManifestDigest,
+            drain: drain ?? .init(
+                drainedSessionIDs: [],
+                activeAdmissionsBefore: 0,
+                activeAdmissionsAfter: 0,
+                liveBindingsRemaining: 0,
+                workspaceClaimsRemaining: 0,
+                watchersRemaining: 0,
+                pendingPublicationsRemaining: 0
+            ),
+            issuedAt: record.startedAt,
+            expiresAt: record.startedAt
+        )
+        let evidence = Self.blockedEvidence(
+            cleanupAuthorization: authorization,
+            reason: reason,
+            now: now
+        )
+        try transitionAndPersistLocked {
+            $0.recordsByWorktreeID[preparation.target.worktreeID] = .blockedResidue(evidence)
+        }
+        operationLeasesByWorktreeID.removeValue(forKey: preparation.target.worktreeID)?.release()
+        return evidence
+    }
+
     func evidence(token: String) throws -> GitWorktreeRetirementEvidence? {
         lock.lock()
         defer { lock.unlock() }
@@ -1193,9 +1728,35 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         switch record {
         case let .retired(evidence), let .blockedResidue(evidence):
             return evidence
-        case .draining, .authorized, .applying:
+        case .draining, .cleanupDraining, .cleanupAuthorized, .authorized, .applying:
             return nil
         }
+    }
+
+    func progress(token: String) throws -> GitWorktreeRetirementProgress? {
+        let digest = Self.digest(token)
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        for record in state.recordsByWorktreeID.values {
+            guard let progress = Self.progress(of: record) else { continue }
+            if progress.tokenDigest == digest
+                || progress.cleanupAuthorizationDigest == digest
+            {
+                return progress
+            }
+        }
+        return nil
+    }
+
+    func progress(worktreeID: String) throws -> GitWorktreeRetirementProgress? {
+        lock.lock()
+        defer { lock.unlock() }
+        try requireHealthyLocked()
+        try refreshPersistentStateLocked()
+        guard let record = state.recordsByWorktreeID[worktreeID] else { return nil }
+        return Self.progress(of: record)
     }
 
     func isRetiring(worktreeID: String) -> Bool {
@@ -1204,7 +1765,8 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         do { try refreshPersistentStateLocked() } catch { return true }
         guard loadFailure == nil, let record = state.recordsByWorktreeID[worktreeID] else { return loadFailure != nil }
         switch record {
-        case .draining, .authorized, .applying, .blockedResidue, .retired: return true
+        case .draining, .cleanupDraining, .cleanupAuthorized, .authorized, .applying, .blockedResidue, .retired:
+            return true
         }
     }
 
@@ -1274,6 +1836,18 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
                 expectedDigest = value.tokenDigest
                 expectedGeneration = value.generation
                 expectedPhase = .draining
+            case let .cleanupDraining(value):
+                candidate = value.target.candidate
+                active = true
+                expectedDigest = value.tokenDigest
+                expectedGeneration = value.generation
+                expectedPhase = .cleanupDraining
+            case let .cleanupAuthorized(value):
+                candidate = value.target.candidate
+                active = true
+                expectedDigest = value.tokenDigest
+                expectedGeneration = value.target.generation
+                expectedPhase = .cleanupAuthorized
             case let .authorized(value):
                 candidate = value.target.candidate
                 active = true
@@ -1363,8 +1937,12 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         for record in state.recordsByWorktreeID.values {
             switch record {
             case let .retired(evidence), let .blockedResidue(evidence):
-                if evidence.consumedAuthorizationDigest == tokenDigest { return evidence }
-            case .draining, .authorized, .applying:
+                if evidence.consumedAuthorizationDigest == tokenDigest
+                    || evidence.cleanupAuthorizationDigest == tokenDigest
+                {
+                    return evidence
+                }
+            case .draining, .cleanupDraining, .cleanupAuthorized, .authorized, .applying:
                 continue
             }
         }
@@ -1429,6 +2007,18 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
                     )
                 )
                 changed = true
+            case .cleanupDraining:
+                state.recordsByWorktreeID.removeValue(forKey: worktreeID)
+                changed = true
+            case let .cleanupAuthorized(authorization) where now > authorization.expiresAt:
+                state.recordsByWorktreeID[worktreeID] = .blockedResidue(
+                    Self.blockedEvidence(
+                        cleanupAuthorization: authorization,
+                        reason: GitWorktreeRetirementError.cleanupAuthorizationExpired.localizedDescription,
+                        now: now
+                    )
+                )
+                changed = true
             case let .applying(applying):
                 state.recordsByWorktreeID[worktreeID] = .blockedResidue(
                     Self.makeEvidence(
@@ -1451,7 +2041,7 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
                     )
                 )
                 changed = true
-            case .authorized, .retired, .blockedResidue:
+            case .cleanupAuthorized, .authorized, .retired, .blockedResidue:
                 continue
             }
         }
@@ -1610,6 +2200,10 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         switch record {
         case let .draining(value):
             (value.candidate.repositoryID, value.candidate.canonicalPath)
+        case let .cleanupDraining(value):
+            (value.target.repositoryID, value.target.canonicalPath)
+        case let .cleanupAuthorized(value):
+            (value.target.repositoryID, value.target.canonicalPath)
         case let .authorized(value):
             (value.target.repositoryID, value.target.canonicalPath)
         case let .applying(value):
@@ -1680,6 +2274,55 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
         "retirement_\(digest("\(tokenDigest):\(generation)").prefix(24))"
     }
 
+    private static func progress(of record: Record) -> GitWorktreeRetirementProgress? {
+        switch record {
+        case let .cleanupAuthorized(value):
+            GitWorktreeRetirementProgress(
+                phase: .cleanupAuthorized,
+                tokenDigest: value.tokenDigest,
+                cleanupAuthorizationDigest: value.tokenDigest,
+                candidate: value.target.candidate,
+                generation: value.target.generation,
+                drain: value.drain,
+                targetDigest: value.target.targetDigest,
+                manifestDigest: nil,
+                cleanupManifestDigest: value.cleanupManifestDigest,
+                issuedAt: value.issuedAt,
+                expiresAt: value.expiresAt
+            )
+        case let .authorized(value):
+            GitWorktreeRetirementProgress(
+                phase: .authorized,
+                tokenDigest: value.tokenDigest,
+                cleanupAuthorizationDigest: value.cleanupAuthorizationDigest,
+                candidate: value.target.candidate,
+                generation: value.target.generation,
+                drain: value.drain,
+                targetDigest: value.target.targetDigest,
+                manifestDigest: value.target.contentManifestDigest,
+                cleanupManifestDigest: value.cleanupManifestDigest,
+                issuedAt: value.issuedAt,
+                expiresAt: value.expiresAt
+            )
+        case let .applying(value):
+            GitWorktreeRetirementProgress(
+                phase: .applying,
+                tokenDigest: value.authorization.tokenDigest,
+                cleanupAuthorizationDigest: value.authorization.cleanupAuthorizationDigest,
+                candidate: value.authorization.target.candidate,
+                generation: value.authorization.target.generation,
+                drain: value.authorization.drain,
+                targetDigest: value.authorization.target.targetDigest,
+                manifestDigest: value.authorization.target.contentManifestDigest,
+                cleanupManifestDigest: value.authorization.cleanupManifestDigest,
+                issuedAt: value.authorization.issuedAt,
+                expiresAt: value.authorization.expiresAt
+            )
+        case .draining, .cleanupDraining, .retired, .blockedResidue:
+            nil
+        }
+    }
+
     private static func blockedEvidence(
         preparation: PreparationRecord,
         target: GitWorktreeRetirementTarget?,
@@ -1710,8 +2353,49 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
             canonicalPath: preparation.candidate.canonicalPath,
             targetDigest: target?.targetDigest,
             manifestDigest: target?.contentManifestDigest,
+            cleanupManifestDigest: nil,
+            cleanupAuthorizationDigest: nil,
             consumedAuthorizationDigest: preparation.tokenDigest,
             drain: drain,
+            mutation: .init(serializedExecutor: false, authorizationConsumedAt: nil, gitRemoveExitCode: nil),
+            postconditions: .unknown,
+            recordedAt: now
+        )
+    }
+
+    private static func blockedEvidence(
+        cleanupAuthorization: CleanupAuthorizationRecord,
+        reason: String,
+        now: Date
+    ) -> GitWorktreeRetirementEvidence {
+        let target = cleanupAuthorization.target
+        return GitWorktreeRetirementEvidence(
+            evidenceID: evidenceID(tokenDigest: cleanupAuthorization.tokenDigest, generation: target.generation),
+            state: .blockedResidue,
+            reason: reason,
+            authorityScope: authorityScope,
+            appVersion: appVersion(),
+            operationVersion: operationVersion,
+            generation: target.generation,
+            repositoryID: target.repositoryID,
+            repositoryRoot: target.repositoryRoot,
+            attestedIdentity: .init(
+                repositoryRoot: target.candidate.repositoryRoot,
+                commonGitDirectory: target.candidate.commonGitDirectory,
+                worktreeParentDirectory: target.candidate.worktreeParentDirectory,
+                worktreeDirectory: target.candidate.worktreeDirectory,
+                gitDirectoryParent: target.candidate.gitDirectoryParent,
+                gitDirectory: target.candidate.gitDirectory
+            ),
+            worktreeID: target.worktreeID,
+            registeredPath: target.path,
+            canonicalPath: target.canonicalPath,
+            targetDigest: target.targetDigest,
+            manifestDigest: nil,
+            cleanupManifestDigest: cleanupAuthorization.cleanupManifestDigest,
+            cleanupAuthorizationDigest: cleanupAuthorization.tokenDigest,
+            consumedAuthorizationDigest: cleanupAuthorization.tokenDigest,
+            drain: cleanupAuthorization.drain,
             mutation: .init(serializedExecutor: false, authorizationConsumedAt: nil, gitRemoveExitCode: nil),
             postconditions: .unknown,
             recordedAt: now
@@ -1767,6 +2451,8 @@ final class GitWorktreeRetirementAuthority: @unchecked Sendable {
             canonicalPath: target.canonicalPath,
             targetDigest: target.targetDigest,
             manifestDigest: target.contentManifestDigest,
+            cleanupManifestDigest: authorization.cleanupManifestDigest,
+            cleanupAuthorizationDigest: authorization.cleanupAuthorizationDigest,
             consumedAuthorizationDigest: authorization.tokenDigest,
             drain: authorization.drain,
             mutation: .init(

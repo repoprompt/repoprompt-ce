@@ -52,8 +52,10 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
 
             **Retirement safety**:
             - `retire` is advertised but default-off. It fails closed until RepoPrompt's explicit irreversible-retirement policy gate is activated.
-            - `retire` is two-stage and only accepts RepoPrompt app-managed linked worktrees.
-            - Any staged, unstaged, untracked, or ignored content rejects retirement. There is no force override.
+            - `retire` accepts RepoPrompt app-managed linked worktrees only.
+            - `retirement_action=prepare_cleanup` seals an audited external cleanup-manifest digest, closes admission, drains RepoPrompt ownership, and returns a 10-minute single-use cleanup authorization.
+            - `retirement_action=complete_cleanup` requires the same cleanup token and manifest digest, re-attests physical identity and HEAD, and requires zero staged, unstaged, untracked, or ignored content before returning the existing 60-second retirement authorization.
+            - RepoPrompt never executes caller-supplied cleanup paths. The authorized external cleaner remains outside RepoPrompt's same-user filesystem authority boundary.
             - First call with a worktree selector closes generation-aware RepoPrompt admission, drains app-owned live sessions, mutation leases, workspace ownership/watchers, and Git processes, then returns a short-lived single-use `authorization_token`.
             - Second call with that token re-attests directory identities plus exact content manifest under the serialized executor, durably consumes the token, removes the worktree, and records permanent evidence.
             - The fence covers RepoPrompt-controlled bindings, sessions, writers, watchers, and Git operations only. It does not claim authority over arbitrary external processes, open handles, or same-user filesystem writes.
@@ -97,6 +99,9 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
                     "marker_style": .string(description: "Create/bind: visual marker style", enum: ["dot", "ring", "capsule"]),
                     "all": .boolean(description: "Unbind: remove all worktree bindings for the session."),
                     "authorization_token": .string(description: "Retire apply: single-use token returned by the prepare call."),
+                    "retirement_action": .string(description: "Retire cleanup protocol action.", enum: ["prepare_cleanup", "complete_cleanup"]),
+                    "cleanup_authorization_token": .string(description: "Complete cleanup: single-use token returned by prepare_cleanup."),
+                    "cleanup_manifest_digest": .string(description: "SHA-256 digest of the audited external cleanup manifest. Required and sealed for both cleanup actions."),
                     "operation_id": .string(description: "Merge apply/status/continue/abort: operation ID returned by preview."),
                     "target": .string(description: "Merge preview: target worktree selector. Defaults to @main."),
                     "target_worktree_id": .string(description: "Merge preview: target worktree ID alternative to target."),
@@ -344,6 +349,27 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             arguments: args
         )
         let authority = GitWorktreeRetirementAuthority.operational
+        let retirementAction = trimmedString(args["retirement_action"])?.lowercased()
+        if retirementAction != nil, trimmedString(args["authorization_token"]) != nil {
+            throw MCPError.invalidParams("authorization_token cannot be combined with retirement_action.")
+        }
+        if retirementAction == "prepare_cleanup",
+           trimmedString(args["cleanup_authorization_token"]) != nil
+        {
+            throw MCPError.invalidParams("prepare_cleanup does not accept cleanup_authorization_token.")
+        }
+        if retirementAction == "complete_cleanup" {
+            return try await executeCompleteRetirementCleanup(args: args, authority: authority)
+        }
+        if let retirementAction, retirementAction != "prepare_cleanup" {
+            throw MCPError.invalidParams("retirement_action must be prepare_cleanup or complete_cleanup.")
+        }
+        if retirementAction == nil,
+           trimmedString(args["cleanup_authorization_token"]) != nil
+           || trimmedString(args["cleanup_manifest_digest"]) != nil
+        {
+            throw MCPError.invalidParams("Cleanup token/digest requires an explicit retirement_action.")
+        }
 
         if let token = trimmedString(args["authorization_token"]) {
             if let evidence = try authority.evidence(token: token) {
@@ -382,6 +408,11 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             try validateRetirementApplySelectors(args: args, evidence: evidence)
             return retirementReply(evidence: evidence)
         }
+        if let worktreeID = trimmedString(args["worktree_id"]),
+           let progress = try authority.progress(worktreeID: worktreeID)
+        {
+            return retirementReply(progress: progress)
+        }
 
         let context = try await resolveRepositoryContext(args: args)
         let worktree = try await resolveWorktree(
@@ -402,6 +433,16 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             isEqualOrDescendantOf: appManagedContainer
         ) else {
             throw MCPError.invalidParams(GitWorktreeRetirementError.nonAppManagedPath(worktree.path).localizedDescription)
+        }
+        if retirementAction == "prepare_cleanup" {
+            let cleanupManifestDigest = try cleanupManifestDigest(args)
+            return try await executePrepareRetirementCleanup(
+                args: args,
+                context: context,
+                worktree: worktree,
+                cleanupManifestDigest: cleanupManifestDigest,
+                authority: authority
+            )
         }
         let preflight = try await vcsService.inspectGitWorktreeRetirementTarget(
             descriptor: worktree,
@@ -541,6 +582,225 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
                     preparation,
                     target: sealedTarget,
                     drain: drainEvidence,
+                    reason: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                )
+                return retirementReply(evidence: evidence)
+            } catch {
+                throw MCPError.internalError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func executePrepareRetirementCleanup(
+        args: [String: Value],
+        context: RepositoryContext,
+        worktree: GitWorktreeDescriptor,
+        cleanupManifestDigest: String,
+        authority: GitWorktreeRetirementAuthority
+    ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        let preflight = try await vcsService.inspectGitWorktreeRetirementCleanupTarget(
+            descriptor: worktree,
+            generation: 0
+        )
+        let preparation: GitWorktreeRetirementCleanupPreparation
+        do {
+            preparation = try authority.beginCleanup(
+                preflight,
+                cleanupManifestDigest: cleanupManifestDigest
+            )
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        var sealedTarget: GitWorktreeRetirementCleanupTarget?
+        var drainEvidence: GitWorktreeRetirementDrainEvidence?
+        do {
+            let activeAdmissionsBefore = try authority.activeAdmissionCount(for: preparation)
+            let permit = try authority.permit(for: preparation)
+            var drained: [(window: WindowState, sessionID: UUID)] = []
+            var drainedSessionIDs = Set<UUID>()
+            for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+                let sessionIDs = try await window.agentModeViewModel.drainLiveSessionsForWorktreeRetirement(
+                    worktreeID: worktree.worktreeID,
+                    permit: permit
+                )
+                drained += sessionIDs.map { (window, $0) }
+                drainedSessionIDs.formUnion(sessionIDs)
+            }
+            var workspaceClaimsRemaining = 0
+            var watchersRemaining = 0
+            var publicationsRemaining = 0
+            for window in WindowStatesManager.shared.allWindows where !window.isClosing {
+                let snapshot = try await window.workspaceFileContextStore
+                    .drainWorkspaceRootsForWorktreeRetirement(
+                        expectedPhysicalPaths: [preflight.canonicalPath]
+                    )
+                workspaceClaimsRemaining += snapshot.loadFlightsRemaining
+                    + snapshot.loadedRootsRemaining
+                    + snapshot.unloadingRootsRemaining
+            }
+            try await authority.awaitZeroAdmissions(for: preparation)
+            let stillBound = WindowStatesManager.shared.allWindows.contains { window in
+                window.agentModeViewModel.sessions.values.contains { session in
+                    session.worktreeBindings.contains(where: { $0.worktreeID == worktree.worktreeID })
+                }
+            }
+            guard !stillBound else {
+                throw MCPError.internalError("RepoPrompt still owns a live binding after cleanup drain.")
+            }
+            for entry in drained {
+                let snapshot = try await entry.window.workspaceFileContextStore.awaitSessionWorktreeRetirementDrain(
+                    ownerID: entry.sessionID,
+                    expectedPhysicalPaths: [worktree.path]
+                )
+                workspaceClaimsRemaining += snapshot.workspaceClaimCount
+                watchersRemaining += snapshot.watcherAttachmentCount
+                publicationsRemaining += snapshot.pendingPublicationCount
+            }
+            try await authority.awaitZeroAdmissions(for: preparation)
+            let currentWorktrees = try await vcsService.listGitWorktreesForRetirement(
+                at: context.repo.rootURL,
+                permit: permit
+            )
+            guard let current = currentWorktrees.first(where: {
+                $0.repository.repositoryID == worktree.repository.repositoryID
+                    && $0.worktreeID == worktree.worktreeID
+            }) else { throw GitWorktreeRetirementError.targetChanged }
+            let target = try await vcsService.inspectGitWorktreeRetirementCleanupTarget(
+                descriptor: current,
+                generation: preparation.generation,
+                permit: permit
+            )
+            guard preflight.matchesIdentityAndHead(target) else {
+                throw GitWorktreeRetirementError.targetChanged
+            }
+            sealedTarget = target
+            let drain = try GitWorktreeRetirementDrainEvidence(
+                drainedSessionIDs: drainedSessionIDs.map(\.uuidString).sorted(),
+                activeAdmissionsBefore: activeAdmissionsBefore,
+                activeAdmissionsAfter: authority.activeAdmissionCount(for: preparation),
+                liveBindingsRemaining: stillBound ? 1 : 0,
+                workspaceClaimsRemaining: workspaceClaimsRemaining,
+                watchersRemaining: watchersRemaining,
+                pendingPublicationsRemaining: publicationsRemaining
+            )
+            drainEvidence = drain
+            let authorization = try authority.authorizeCleanupAfterDrain(
+                preparation,
+                target: target,
+                drain: drain
+            )
+            return retirementReply(cleanupAuthorization: authorization)
+        } catch {
+            if Self.isRetryableRetirementDrainFailure(error) {
+                do {
+                    try authority.cancelCleanupPreparationForRetry(preparation)
+                } catch {
+                    throw MCPError.internalError(error.localizedDescription)
+                }
+                throw MCPError.internalError(
+                    "Cleanup drain did not reach a stable pre-authorization cut. Admission was safely reopened without permanent residue; retry prepare_cleanup."
+                )
+            }
+            do {
+                let evidence = try authority.blockCleanupPreparation(
+                    preparation,
+                    target: sealedTarget,
+                    drain: drainEvidence,
+                    reason: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                )
+                return retirementReply(evidence: evidence)
+            } catch {
+                throw MCPError.internalError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func executeCompleteRetirementCleanup(
+        args: [String: Value],
+        authority: GitWorktreeRetirementAuthority
+    ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        guard let token = trimmedString(args["cleanup_authorization_token"]) else {
+            throw MCPError.invalidParams("complete_cleanup requires cleanup_authorization_token.")
+        }
+        let cleanupManifestDigest = try cleanupManifestDigest(args)
+        if let evidence = try authority.evidence(token: token) {
+            try validateCleanupManifestDigest(
+                cleanupManifestDigest,
+                expected: evidence.cleanupManifestDigest
+            )
+            try validateRetirementApplySelectors(args: args, evidence: evidence)
+            return retirementReply(evidence: evidence)
+        }
+        if let progress = try authority.progress(token: token),
+           progress.phase != .cleanupAuthorized
+        {
+            try validateCleanupManifestDigest(
+                cleanupManifestDigest,
+                expected: progress.cleanupManifestDigest
+            )
+            try validateRetirementApplySelectors(
+                args: args,
+                repositoryRoot: progress.candidate.repositoryRoot.registeredPath,
+                worktreeID: progress.candidate.worktreeID,
+                path: progress.candidate.registeredPath
+            )
+            return retirementReply(progress: progress)
+        }
+        let cleanup: GitWorktreeRetirementCleanupAuthorization
+        do {
+            cleanup = try authority.cleanupAuthorization(token: token)
+        } catch {
+            if let evidence = try authority.evidence(token: token) {
+                try validateCleanupManifestDigest(
+                    cleanupManifestDigest,
+                    expected: evidence.cleanupManifestDigest
+                )
+                return retirementReply(evidence: evidence)
+            }
+            if let progress = try authority.progress(token: token) {
+                try validateCleanupManifestDigest(
+                    cleanupManifestDigest,
+                    expected: progress.cleanupManifestDigest
+                )
+                return retirementReply(progress: progress)
+            }
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        try validateRetirementApplySelectors(args: args, cleanupAuthorization: cleanup)
+        do {
+            let permit = try authority.permit(for: cleanup)
+            let worktrees = try await vcsService.listGitWorktreesForRetirement(
+                at: URL(fileURLWithPath: cleanup.target.repositoryRoot),
+                permit: permit
+            )
+            guard let current = worktrees.first(where: {
+                $0.repository.repositoryID == cleanup.target.repositoryID
+                    && $0.worktreeID == cleanup.target.worktreeID
+            }), cleanup.target.candidate.matches(current)
+            else { throw GitWorktreeRetirementError.targetChanged }
+            let target = try await vcsService.inspectGitWorktreeRetirementTarget(
+                descriptor: current,
+                generation: cleanup.generation,
+                permit: permit
+            )
+            let authorization = try authority.completeCleanup(
+                cleanup,
+                target: target,
+                cleanupManifestDigest: cleanupManifestDigest
+            )
+            return retirementReply(authorization: authorization)
+        } catch {
+            if let evidence = try authority.evidence(token: token) {
+                try validateCleanupManifestDigest(
+                    cleanupManifestDigest,
+                    expected: evidence.cleanupManifestDigest
+                )
+                try validateRetirementApplySelectors(args: args, evidence: evidence)
+                return retirementReply(evidence: evidence)
+            }
+            do {
+                let evidence = try authority.blockCleanupAuthorization(
+                    cleanup,
                     reason: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 )
                 return retirementReply(evidence: evidence)
@@ -921,7 +1181,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         case .unbind:
             ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "all"]
         case .retire:
-            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "authorization_token"]
+            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "authorization_token", "retirement_action", "cleanup_authorization_token", "cleanup_manifest_digest"]
         case .preview:
             ["op", "session_id", "repo_root", "target", "target_worktree_id", "include_graph", "graph_limit", "context_lines", "detect_renames", "publish_artifacts"]
         case .apply:
@@ -1022,6 +1282,27 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         return false
     }
 
+    private func cleanupManifestDigest(_ args: [String: Value]) throws -> String {
+        guard let digest = trimmedString(args["cleanup_manifest_digest"])?.lowercased(),
+              digest.count == 64,
+              digest.allSatisfy(\.isHexDigit)
+        else {
+            throw MCPError.invalidParams("cleanup_manifest_digest must be a 64-character SHA-256 hex digest.")
+        }
+        return digest
+    }
+
+    private func validateCleanupManifestDigest(
+        _ supplied: String,
+        expected: String?
+    ) throws {
+        guard let expected, supplied == expected else {
+            throw MCPError.invalidParams(
+                "cleanup_manifest_digest does not match the sealed cleanup authorization."
+            )
+        }
+    }
+
     private func validateRetirementApplySelectors(
         args: [String: Value],
         authorization: GitWorktreeRetirementAuthorization
@@ -1031,6 +1312,18 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             repositoryRoot: authorization.target.repositoryRoot,
             worktreeID: authorization.target.worktreeID,
             path: authorization.target.path
+        )
+    }
+
+    private func validateRetirementApplySelectors(
+        args: [String: Value],
+        cleanupAuthorization: GitWorktreeRetirementCleanupAuthorization
+    ) throws {
+        try validateRetirementApplySelectors(
+            args: args,
+            repositoryRoot: cleanupAuthorization.target.repositoryRoot,
+            worktreeID: cleanupAuthorization.target.worktreeID,
+            path: cleanupAuthorization.target.path
         )
     }
 
@@ -1104,6 +1397,148 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         )
     }
 
+    private func retirementReply(
+        cleanupAuthorization: GitWorktreeRetirementCleanupAuthorization
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        let progress = GitWorktreeRetirementProgress(
+            phase: .cleanupAuthorized,
+            tokenDigest: cleanupAuthorization.tokenDigest,
+            cleanupAuthorizationDigest: cleanupAuthorization.tokenDigest,
+            candidate: cleanupAuthorization.target.candidate,
+            generation: cleanupAuthorization.generation,
+            drain: cleanupAuthorization.drain,
+            targetDigest: cleanupAuthorization.target.targetDigest,
+            manifestDigest: nil,
+            cleanupManifestDigest: cleanupAuthorization.cleanupManifestDigest,
+            issuedAt: cleanupAuthorization.issuedAt,
+            expiresAt: cleanupAuthorization.expiresAt
+        )
+        var reply = retirementReply(progress: progress)
+        reply = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: reply.op,
+            repository: reply.repository,
+            retirement: .init(
+                state: progress.phase.rawValue,
+                authorizationToken: nil,
+                cleanupAuthorizationToken: cleanupAuthorization.token,
+                worktreeID: progress.candidate.worktreeID,
+                path: progress.candidate.registeredPath,
+                drainedSessionIDs: progress.drain.drainedSessionIDs,
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: GitWorktreeRetirementAuthority.authorityScope,
+                evidence: retirementEvidenceDTO(progress)
+            ),
+            warning: "Cleanup authorization expires in 10 minutes and is single-use. The external cleaner must validate the durable phase, target, token digest, and cleanup-manifest digest immediately before each mutation batch."
+        )
+        return reply
+    }
+
+    private func retirementReply(
+        authorization: GitWorktreeRetirementAuthorization
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        let progress = GitWorktreeRetirementProgress(
+            phase: .authorized,
+            tokenDigest: authorization.tokenDigest,
+            cleanupAuthorizationDigest: authorization.cleanupAuthorizationDigest,
+            candidate: authorization.target.candidate,
+            generation: authorization.target.generation,
+            drain: authorization.drain,
+            targetDigest: authorization.target.targetDigest,
+            manifestDigest: authorization.target.contentManifestDigest,
+            cleanupManifestDigest: authorization.cleanupManifestDigest,
+            issuedAt: authorization.issuedAt,
+            expiresAt: authorization.expiresAt
+        )
+        return ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            repository: .init(
+                repositoryID: authorization.target.repositoryID,
+                repoKey: authorization.target.repositoryID,
+                displayName: URL(fileURLWithPath: authorization.target.path).deletingLastPathComponent().lastPathComponent,
+                rootPath: authorization.target.repositoryRoot,
+                commonGitDir: authorization.target.commonGitDirectory,
+                mainWorktreeRoot: authorization.target.repositoryRoot
+            ),
+            retirement: .init(
+                state: "authorized",
+                authorizationToken: authorization.token,
+                worktreeID: authorization.target.worktreeID,
+                path: authorization.target.path,
+                drainedSessionIDs: authorization.drain.drainedSessionIDs,
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: GitWorktreeRetirementAuthority.authorityScope,
+                evidence: retirementEvidenceDTO(progress)
+            ),
+            warning: "Authorization expires in 60 seconds and is single-use. Failure or expiry creates permanent blocked_residue evidence."
+        )
+    }
+
+    private func retirementReply(
+        progress: GitWorktreeRetirementProgress
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            repository: .init(
+                repositoryID: progress.candidate.repositoryID,
+                repoKey: progress.candidate.repositoryID,
+                displayName: URL(fileURLWithPath: progress.candidate.registeredPath).deletingLastPathComponent().lastPathComponent,
+                rootPath: progress.candidate.repositoryRoot.registeredPath,
+                commonGitDir: progress.candidate.commonGitDirectory.registeredPath,
+                mainWorktreeRoot: progress.candidate.repositoryRoot.registeredPath
+            ),
+            retirement: .init(
+                state: progress.phase.rawValue,
+                authorizationToken: nil,
+                worktreeID: progress.candidate.worktreeID,
+                path: progress.candidate.registeredPath,
+                drainedSessionIDs: progress.drain.drainedSessionIDs,
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: GitWorktreeRetirementAuthority.authorityScope,
+                evidence: retirementEvidenceDTO(progress)
+            )
+        )
+    }
+
+    private func retirementEvidenceDTO(
+        _ progress: GitWorktreeRetirementProgress
+    ) -> ToolResultDTOs.ManageWorktreeReplyDTO.RetirementEvidenceDTO {
+        let formatter = ISO8601DateFormatter()
+        return .init(
+            evidenceID: nil,
+            state: progress.phase.rawValue,
+            reason: nil,
+            authorityScope: GitWorktreeRetirementAuthority.authorityScope,
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "development",
+            operationVersion: GitWorktreeRetirementAuthority.operationVersion,
+            generation: progress.generation,
+            repositoryID: progress.candidate.repositoryID,
+            repositoryRoot: progress.candidate.repositoryRoot.registeredPath,
+            worktreeID: progress.candidate.worktreeID,
+            targetDigest: progress.targetDigest,
+            manifestDigest: progress.manifestDigest ?? "",
+            consumedAuthorizationDigest: progress.tokenDigest,
+            phase: progress.phase.rawValue,
+            cleanupManifestDigest: progress.cleanupManifestDigest,
+            cleanupAuthorizationDigest: progress.cleanupAuthorizationDigest,
+            authorizationIssuedAt: formatter.string(from: progress.issuedAt),
+            authorizationExpiresAt: formatter.string(from: progress.expiresAt),
+            drain: retirementDrainDTO(progress.drain),
+            mutation: .init(
+                serializedExecutor: false,
+                authorizationConsumedAt: nil,
+                gitRemoveExitCode: nil
+            ),
+            postconditions: .init(
+                gitRegistrationAbsent: false,
+                pathAbsent: false,
+                verifiedAt: nil
+            )
+        )
+    }
+
     private func retirementEvidenceDTO(
         state: String,
         target: GitWorktreeRetirementTarget,
@@ -1156,6 +1591,11 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             targetDigest: evidence.targetDigest ?? "",
             manifestDigest: evidence.manifestDigest ?? "",
             consumedAuthorizationDigest: evidence.consumedAuthorizationDigest,
+            phase: evidence.state.rawValue,
+            cleanupManifestDigest: evidence.cleanupManifestDigest,
+            cleanupAuthorizationDigest: evidence.cleanupAuthorizationDigest,
+            authorizationIssuedAt: nil,
+            authorizationExpiresAt: nil,
             drain: retirementDrainDTO(evidence.drain ?? .init(
                 drainedSessionIDs: [],
                 activeAdmissionsBefore: 0,

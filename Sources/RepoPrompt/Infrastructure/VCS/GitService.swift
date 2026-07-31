@@ -763,6 +763,48 @@ actor GitService {
         )
     }
 
+    func inspectRetirementCleanupTarget(
+        descriptor: GitWorktreeDescriptor,
+        generation: UInt64,
+        retirementPermit: GitWorktreeRetirementPermit? = nil,
+        retirementAuthority: GitWorktreeRetirementAuthority = .operational
+    ) async throws -> GitWorktreeRetirementCleanupTarget {
+        let status = try await runGitData(
+            ["status", "--porcelain=v1", "-z", "--ignored=no", "--untracked-files=all"],
+            at: URL(fileURLWithPath: descriptor.path),
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority
+        )
+        guard status.2 == 0 else {
+            let detail = String(data: status.1, encoding: .utf8) ?? "non-UTF8 stderr"
+            throw GitWorktreeRetirementError.removalFailed(detail)
+        }
+        try GitWorktreeRetirementStatusInspector.requireClean(status.0)
+        let head = try await runGit(
+            ["rev-parse", "--verify", "HEAD"],
+            at: URL(fileURLWithPath: descriptor.path),
+            retirementPermit: retirementPermit,
+            retirementAuthority: retirementAuthority
+        )
+        guard head.2 == 0 else {
+            throw GitWorktreeRetirementError.removalFailed(head.1)
+        }
+        let liveHead = head.0.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let gitDirectory = descriptor.gitDir else {
+            throw GitWorktreeRetirementError.missingIdentityEvidence(descriptor.path)
+        }
+        let activeOperationCount = try GitWorktreeRetirementOperationInspector.activeOperationCount(
+            gitDirectory: URL(fileURLWithPath: gitDirectory, isDirectory: true),
+            commonGitDirectory: URL(fileURLWithPath: descriptor.repository.commonGitDir, isDirectory: true)
+        )
+        return try GitWorktreeRetirementCleanupTarget(
+            descriptor: descriptor,
+            liveHead: liveHead,
+            generation: generation,
+            activeOperationCount: activeOperationCount
+        )
+    }
+
     /// Remove one app-managed linked worktree under the same mutation lock used by creation.
     /// Re-attestation runs under that lock. Authorization consumption is durably persisted
     /// synchronously after the final comparison and immediately before process admission.

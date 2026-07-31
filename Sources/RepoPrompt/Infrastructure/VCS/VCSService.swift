@@ -632,6 +632,18 @@ public extension VCSService {
         )
     }
 
+    internal func inspectGitWorktreeRetirementCleanupTarget(
+        descriptor: GitWorktreeDescriptor,
+        generation: UInt64,
+        permit: GitWorktreeRetirementPermit? = nil
+    ) async throws -> GitWorktreeRetirementCleanupTarget {
+        try await gitBackend().inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: generation,
+            permit: permit
+        )
+    }
+
     internal func listGitWorktreesForRetirement(
         at repoURL: URL,
         permit: GitWorktreeRetirementPermit

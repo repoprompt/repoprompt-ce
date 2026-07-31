@@ -160,6 +160,18 @@ actor GitBackend: VCSBackend {
         )
     }
 
+    func inspectRetirementCleanupTarget(
+        descriptor: GitWorktreeDescriptor,
+        generation: UInt64,
+        permit: GitWorktreeRetirementPermit? = nil
+    ) async throws -> GitWorktreeRetirementCleanupTarget {
+        try await gitService.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: generation,
+            retirementPermit: permit
+        )
+    }
+
     func listWorktreesForRetirement(
         at repoURL: URL,
         permit: GitWorktreeRetirementPermit

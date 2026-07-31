@@ -109,6 +109,74 @@ Apply the sealed authorization with a second `manage_worktree` call:
 physical directory identities and the exact content manifest under its serialized executor
 before deleting the worktree. Caller booleans never replace the sealed token.
 
+### Audited external cleanup authorization
+
+When ignored content must be removed before retirement, a repository-specific audited
+cleaner can request a cleanup fence without supplying paths to RepoPrompt:
+
+```json
+{
+  "op": "retire",
+  "retirement_action": "prepare_cleanup",
+  "worktree_id": "<worktree-id>",
+  "cleanup_manifest_digest": "<sha256-of-audited-cleanup-manifest>"
+}
+```
+
+RepoPrompt seals the cleanup manifest digest, target identities, registered and canonical
+paths, HEAD, generation, and completed drain. It returns a single-use
+`cleanup_authorization_token` valid for ten minutes. RepoPrompt does not accept or execute
+cleanup paths; the external cleaner owns its repository-specific allowlist and archive
+evidence. Cleanup preflight permits only ignored residue: staged, unstaged, and non-ignored
+untracked content all fail closed. Cleanup manifests must never include `.env*`. Admission
+remains closed while the cleanup authorization exists.
+
+The durable receipt is stored at:
+
+```text
+~/Library/Application Support/RepoPrompt CE/git-worktree-retirement-v3.json
+```
+
+Immediately before every external mutation batch, the cleaner must reread the receipt and
+validate all of these fields:
+
+- top-level `schemaLineage` is `repoprompt.git-worktree-retirement` and `schemaVersion` is
+  `3`;
+- `recordsByWorktreeID["<worktree-id>"].cleanupAuthorized._0` exists;
+- its `tokenDigest` equals the lowercase hexadecimal SHA-256 digest of the UTF-8 cleanup
+  token;
+- its `cleanupManifestDigest` equals the locally recomputed digest of the audited cleanup
+  manifest;
+- `target.candidate.repositoryID`, `worktreeID`, `registeredPath`, and `canonicalPath`
+  equal the expected target;
+- `target.candidate.worktreeDirectory.device` and `.inode` equal the expected physical
+  identity;
+- `target.generation`, `targetDigest`, `issuedAt`, and `expiresAt` match the sealed receipt,
+  and the authorization has not expired; and
+- the sealed drain has zero active admissions after drain, zero live bindings, zero
+  workspace claims, zero watchers, and zero pending publications.
+
+The cleaner must stop if a reread changes the file generation, record case, token digest,
+manifest digest, identity, or expiry. Same-user receipt forgery and filesystem races remain
+outside RepoPrompt's authority boundary.
+
+After cleanup, complete the fence with the same token and manifest digest:
+
+```json
+{
+  "op": "retire",
+  "retirement_action": "complete_cleanup",
+  "cleanup_authorization_token": "<cleanup-token>",
+  "cleanup_manifest_digest": "<same-sha256>"
+}
+```
+
+RepoPrompt re-attests identity and HEAD and requires a literally clean worktree, including
+zero ignored entries. The same token then becomes the existing 60-second retirement
+authorization token. Cancellation or timeout before cleanup authorization is retryable and
+reopens admission. An expiry or unexpected failure after cleanup authorization creates
+readable permanent `blocked_residue`.
+
 ### Evidence and failure behavior
 
 - Successful apply records permanent evidence, including the single-use authorization

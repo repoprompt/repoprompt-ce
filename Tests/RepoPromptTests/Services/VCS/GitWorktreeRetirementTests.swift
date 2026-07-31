@@ -623,6 +623,282 @@ final class GitWorktreeRetirementTests: XCTestCase {
     }
 }
 
+final class GitWorktreeRetirementCleanupAuthorizationTests: XCTestCase {
+    func testCleanupAuthorizationSurvivesRestartKeepsAdmissionClosedAndCompletesToRetirement() async throws {
+        let fixture = try RetirementGitFixture()
+        defer { fixture.cleanup() }
+        let git = GitService()
+        let authority = fixture.makeAuthority()
+        let ignored = fixture.linkedRoot.appendingPathComponent("host-cleanup.cache")
+        try "host cleanup\n".write(to: ignored, atomically: true, encoding: .utf8)
+        try fixture.git(["config", "core.excludesFile", "/dev/null"], at: fixture.linkedRoot)
+        try fixture.git(["config", "status.showUntrackedFiles", "all"], at: fixture.linkedRoot)
+        try "*.cache\n".write(
+            to: fixture.mainRoot.appendingPathComponent(".git/info/exclude"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let descriptor = try await fixture.linkedDescriptor(using: git, authority: authority)
+        try "staged work\n".write(
+            to: fixture.linkedRoot.appendingPathComponent("seed.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        do {
+            _ = try await git.inspectRetirementCleanupTarget(
+                descriptor: descriptor,
+                generation: 0,
+                retirementAuthority: authority
+            )
+            XCTFail("Unstaged tracked work must reject cleanup preflight")
+        } catch {
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .dirtyWorktree)
+        }
+        try fixture.git(["add", "seed.txt"], at: fixture.linkedRoot)
+        do {
+            _ = try await git.inspectRetirementCleanupTarget(
+                descriptor: descriptor,
+                generation: 0,
+                retirementAuthority: authority
+            )
+            XCTFail("Staged tracked work must reject cleanup preflight")
+        } catch {
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .dirtyWorktree)
+        }
+        try fixture.git(["reset", "--hard", "HEAD"], at: fixture.linkedRoot)
+        let untracked = fixture.linkedRoot.appendingPathComponent("unique-untracked.txt")
+        try "unique work\n".write(to: untracked, atomically: true, encoding: .utf8)
+        do {
+            _ = try await git.inspectRetirementCleanupTarget(
+                descriptor: descriptor,
+                generation: 0,
+                retirementAuthority: authority
+            )
+            XCTFail("Non-ignored untracked work must reject cleanup preflight")
+        } catch {
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .dirtyWorktree)
+        }
+        try FileManager.default.removeItem(at: untracked)
+        do {
+            _ = try await git.inspectRetirementTarget(
+                descriptor: descriptor,
+                generation: 0,
+                retirementAuthority: authority
+            )
+            XCTFail("Ignored content must reject ordinary retirement preflight")
+        } catch {
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .ignoredContent)
+        }
+        let preflight = try await git.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: 0,
+            retirementAuthority: authority
+        )
+        let cancelled = try authority.beginCleanup(
+            preflight,
+            cleanupManifestDigest: String(repeating: "0", count: 64)
+        )
+        try authority.cancelCleanupPreparationForRetry(cancelled)
+        let reopened = try authority.acquireMutationLease(paths: [fixture.linkedRoot.path])
+        reopened.release()
+
+        let cleanupManifestDigest = String(repeating: "a", count: 64)
+        let preparation = try authority.beginCleanup(
+            preflight,
+            cleanupManifestDigest: cleanupManifestDigest
+        )
+        let permit = try authority.permit(for: preparation)
+        let sealed = try await git.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: preparation.generation,
+            retirementPermit: permit,
+            retirementAuthority: authority
+        )
+        let cleanup = try authority.authorizeCleanupAfterDrain(
+            preparation,
+            target: sealed,
+            drain: Self.drain()
+        )
+
+        XCTAssertThrowsError(try authority.acquireMutationLease(paths: [fixture.linkedRoot.path]))
+        let restarted = fixture.makeAuthority()
+        let resumed = try restarted.cleanupAuthorization(token: cleanup.token)
+        XCTAssertEqual(resumed.tokenDigest, cleanup.tokenDigest)
+        XCTAssertThrowsError(try restarted.acquireBindingLease(worktreeID: descriptor.worktreeID))
+
+        try FileManager.default.removeItem(at: ignored)
+        let cleanTarget = try await git.inspectRetirementTarget(
+            descriptor: descriptor,
+            generation: cleanup.generation,
+            retirementPermit: restarted.permit(for: resumed),
+            retirementAuthority: restarted
+        )
+        let conflictingLease = try restarted.acquireMutationLease(
+            paths: [fixture.linkedRoot.path],
+            permit: restarted.permit(for: resumed)
+        )
+        XCTAssertThrowsError(
+            try restarted.completeCleanup(
+                resumed,
+                target: cleanTarget,
+                cleanupManifestDigest: cleanupManifestDigest
+            )
+        ) { error in
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .invalidCleanupAuthorization)
+        }
+        conflictingLease.release()
+        let retirement = try restarted.completeCleanup(
+            resumed,
+            target: cleanTarget,
+            cleanupManifestDigest: cleanupManifestDigest
+        )
+
+        XCTAssertEqual(retirement.token, cleanup.token)
+        XCTAssertEqual(retirement.target, cleanTarget)
+        XCTAssertThrowsError(try restarted.cleanupAuthorization(token: cleanup.token)) { error in
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .cleanupAuthorizationAlreadyConsumed)
+        }
+        XCTAssertEqual(try restarted.progress(token: cleanup.token)?.phase, .authorized)
+        _ = try restarted.blockAuthorization(retirement, reason: "test completed without physical retirement")
+    }
+
+    func testCleanupAuthorizationExpiryBecomesPermanentReadbackableResidueAcrossRestart() async throws {
+        let fixture = try RetirementGitFixture()
+        defer { fixture.cleanup() }
+        let git = GitService()
+        let authority = fixture.makeAuthority()
+        let descriptor = try await fixture.linkedDescriptor(using: git, authority: authority)
+        let preflight = try await git.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: 0,
+            retirementAuthority: authority
+        )
+        let cleanupManifestDigest = String(repeating: "b", count: 64)
+        let preparation = try authority.beginCleanup(
+            preflight,
+            cleanupManifestDigest: cleanupManifestDigest
+        )
+        let sealed = try await git.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: preparation.generation,
+            retirementPermit: authority.permit(for: preparation),
+            retirementAuthority: authority
+        )
+        let issuedAt = Date(timeIntervalSince1970: 1000)
+        let cleanup = try authority.authorizeCleanupAfterDrain(
+            preparation,
+            target: sealed,
+            drain: Self.drain(),
+            now: issuedAt
+        )
+        let cleanTarget = try await git.inspectRetirementTarget(
+            descriptor: descriptor,
+            generation: cleanup.generation,
+            retirementPermit: authority.permit(for: cleanup),
+            retirementAuthority: authority
+        )
+
+        XCTAssertThrowsError(
+            try authority.completeCleanup(
+                cleanup,
+                target: cleanTarget,
+                cleanupManifestDigest: cleanupManifestDigest,
+                now: cleanup.expiresAt.addingTimeInterval(1)
+            )
+        ) { error in
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .cleanupAuthorizationExpired)
+        }
+        let evidence = try XCTUnwrap(authority.evidence(token: cleanup.token))
+        XCTAssertEqual(evidence.state, .blockedResidue)
+        XCTAssertEqual(evidence.cleanupAuthorizationDigest, cleanup.tokenDigest)
+        let retirementLock = URL(
+            fileURLWithPath: descriptor.repository.commonGitDir,
+            isDirectory: true
+        ).appendingPathComponent("repoprompt-retirement.lock")
+        let releasedLease = try GitWorktreeRetirementFileLease.acquire(
+            at: retirementLock,
+            nonBlocking: true
+        )
+        releasedLease.release()
+
+        let restarted = fixture.makeAuthority()
+        XCTAssertEqual(try restarted.evidence(token: cleanup.token)?.evidenceID, evidence.evidenceID)
+        XCTAssertThrowsError(try restarted.acquireMutationLease(paths: [fixture.linkedRoot.path]))
+    }
+
+    func testCleanupCompletionRejectsExternalHeadMutationIntoPermanentResidue() async throws {
+        let fixture = try RetirementGitFixture()
+        defer { fixture.cleanup() }
+        let git = GitService()
+        let authority = fixture.makeAuthority()
+        let descriptor = try await fixture.linkedDescriptor(using: git, authority: authority)
+        let preflight = try await git.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: 0,
+            retirementAuthority: authority
+        )
+        let digest = String(repeating: "d", count: 64)
+        let preparation = try authority.beginCleanup(
+            preflight,
+            cleanupManifestDigest: digest
+        )
+        let permit = try authority.permit(for: preparation)
+        let sealed = try await git.inspectRetirementCleanupTarget(
+            descriptor: descriptor,
+            generation: preparation.generation,
+            retirementPermit: permit,
+            retirementAuthority: authority
+        )
+        let cleanup = try authority.authorizeCleanupAfterDrain(
+            preparation,
+            target: sealed,
+            drain: Self.drain()
+        )
+
+        try fixture.git(["commit", "--allow-empty", "-m", "external mutation"], at: fixture.linkedRoot)
+        let mutatedDescriptor = try await fixture.linkedDescriptor(
+            using: git,
+            permit: authority.permit(for: cleanup),
+            authority: authority
+        )
+        let mutatedTarget = try await git.inspectRetirementTarget(
+            descriptor: mutatedDescriptor,
+            generation: cleanup.generation,
+            retirementPermit: authority.permit(for: cleanup),
+            retirementAuthority: authority
+        )
+        XCTAssertThrowsError(
+            try authority.completeCleanup(
+                cleanup,
+                target: mutatedTarget,
+                cleanupManifestDigest: digest
+            )
+        ) { error in
+            XCTAssertEqual(error as? GitWorktreeRetirementError, .invalidCleanupAuthorization)
+        }
+        let evidence = try authority.blockCleanupAuthorization(
+            cleanup,
+            reason: GitWorktreeRetirementError.targetChanged.localizedDescription
+        )
+        XCTAssertEqual(evidence.state, .blockedResidue)
+        XCTAssertNotNil(try authority.evidence(token: cleanup.token))
+        XCTAssertThrowsError(try authority.acquireGitProcessLease(at: fixture.linkedRoot, commonGitDirectory: nil))
+    }
+
+    private static func drain() -> GitWorktreeRetirementDrainEvidence {
+        .init(
+            drainedSessionIDs: [],
+            activeAdmissionsBefore: 0,
+            activeAdmissionsAfter: 0,
+            liveBindingsRemaining: 0,
+            workspaceClaimsRemaining: 0,
+            watchersRemaining: 0,
+            pendingPublicationsRemaining: 0
+        )
+    }
+}
+
 private final class RetirementGitFixture {
     let sandbox: URL
     let mainRoot: URL

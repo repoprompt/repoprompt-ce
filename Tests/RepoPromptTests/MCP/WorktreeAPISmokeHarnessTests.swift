@@ -222,7 +222,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let evidence = try XCTUnwrap(applied["evidence"]?.objectValue)
         XCTAssertNotNil(evidence["evidence_id"]?.stringValue)
         XCTAssertEqual(evidence["state"]?.stringValue, "retired")
-        XCTAssertEqual(evidence["operation_version"]?.intValue, 3)
+        XCTAssertEqual(evidence["operation_version"]?.intValue, 4)
 
         let readbackValue = try await manageWorktree([
             "op": .string("retire"),
@@ -331,6 +331,103 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         #else
             throw XCTSkip("Retirement drain timeout injection is DEBUG-only.")
         #endif
+    }
+
+    func testManageWorktreeHostCleanupAuthorizationCompletesIntoRetirement() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        let stateURL = fixture.sandbox.appendingPathComponent("retirement-authority/state.json")
+        let authority = GitWorktreeRetirementAuthority(persistenceURL: stateURL)
+        GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(authority)
+        GitWorktreeRetirementActivation.setEnabledForTesting(true)
+        defer {
+            GitWorktreeRetirementActivation.setEnabledForTesting(false)
+            GitWorktreeRetirementAuthority.setOperationalAuthorityForTesting(nil)
+        }
+
+        try "*.cleanup-cache\n".write(
+            to: fixture.repo.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try Self.runGit(["add", ".gitignore"], cwd: fixture.repo)
+        try Self.runGit(["commit", "-m", "Ignore host cleanup cache"], cwd: fixture.repo)
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/cleanup-auth-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let created = try Self.worktreeObject(createValue, key: "created_worktree")
+        let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+        let path = try XCTUnwrap(created["path"]?.stringValue)
+        let ignored = URL(fileURLWithPath: path).appendingPathComponent("bulk.cleanup-cache")
+        try "ignored\n".write(to: ignored, atomically: true, encoding: .utf8)
+
+        let preparedValue = try await manageWorktree([
+            "op": .string("retire"),
+            "retirement_action": .string("prepare_cleanup"),
+            "cleanup_manifest_digest": .string(String(repeating: "c", count: 64)),
+            "worktree_id": .string(worktreeID)
+        ])
+        let prepared = try Self.object(preparedValue, key: "retirement")
+        XCTAssertEqual(prepared["state"]?.stringValue, "cleanup_authorized")
+        let cleanupToken = try XCTUnwrap(prepared["cleanup_authorization_token"]?.stringValue)
+        XCTAssertThrowsError(try authority.acquireMutationLease(paths: [path]))
+
+        let state = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any]
+        )
+        XCTAssertEqual(state["schemaLineage"] as? String, "repoprompt.git-worktree-retirement")
+        let records = try XCTUnwrap(state["recordsByWorktreeID"] as? [String: Any])
+        let record = try XCTUnwrap(records[worktreeID] as? [String: Any])
+        let cleanupCase = try XCTUnwrap(record["cleanupAuthorized"] as? [String: Any])
+        let receipt = try XCTUnwrap(cleanupCase["_0"] as? [String: Any])
+        XCTAssertEqual(
+            receipt["tokenDigest"] as? String,
+            GitWorktreeRetirementTarget.digest(cleanupToken)
+        )
+        XCTAssertEqual(receipt["cleanupManifestDigest"] as? String, String(repeating: "c", count: 64))
+        let target = try XCTUnwrap(receipt["target"] as? [String: Any])
+        let candidate = try XCTUnwrap(target["candidate"] as? [String: Any])
+        XCTAssertEqual(candidate["worktreeID"] as? String, worktreeID)
+        XCTAssertEqual(candidate["registeredPath"] as? String, path)
+
+        try FileManager.default.removeItem(at: ignored)
+        let completedValue = try await manageWorktree([
+            "op": .string("retire"),
+            "retirement_action": .string("complete_cleanup"),
+            "cleanup_authorization_token": .string(cleanupToken),
+            "cleanup_manifest_digest": .string(String(repeating: "c", count: 64)),
+            "worktree_id": .string(worktreeID)
+        ])
+        let completed = try Self.object(completedValue, key: "retirement")
+        XCTAssertEqual(completed["state"]?.stringValue, "authorized")
+        XCTAssertEqual(completed["authorization_token"]?.stringValue, cleanupToken)
+        do {
+            _ = try await manageWorktree([
+                "op": .string("retire"),
+                "retirement_action": .string("complete_cleanup"),
+                "cleanup_authorization_token": .string(cleanupToken),
+                "cleanup_manifest_digest": .string(String(repeating: "d", count: 64)),
+                "worktree_id": .string(worktreeID)
+            ])
+            XCTFail("A completed cleanup authorization must reject readback with a different manifest digest.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("does not match"), error.localizedDescription)
+        }
+
+        let appliedValue = try await manageWorktree([
+            "op": .string("retire"),
+            "authorization_token": .string(cleanupToken),
+            "worktree_id": .string(worktreeID)
+        ])
+        let applied = try Self.object(appliedValue, key: "retirement")
+        XCTAssertEqual(applied["state"]?.stringValue, "retired")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
     }
 
     func testManageWorktreeRetirementReturnsBlockedEvidenceBeforeTokenAndAfterApplyRace() async throws {

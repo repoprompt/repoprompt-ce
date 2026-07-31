@@ -158,6 +158,70 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("retirement_evidence"), text)
         XCTAssertTrue(text.contains("manifest-digest"), text)
         XCTAssertTrue(text.contains("authorization-digest"), text)
+
+        let cleanupDTO = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            retirement: .init(
+                state: "cleanup_authorized",
+                authorizationToken: nil,
+                cleanupAuthorizationToken: "cleanup_test",
+                worktreeID: "wt_feature",
+                path: "/tmp/repo-feature",
+                drainedSessionIDs: [],
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: "RepoPrompt-controlled operations only; external processes are excluded.",
+                evidence: .init(
+                    evidenceID: nil,
+                    state: "cleanup_authorized",
+                    reason: nil,
+                    authorityScope: "RepoPrompt-controlled operations only; external processes are excluded.",
+                    appVersion: "test",
+                    operationVersion: 4,
+                    generation: 10,
+                    repositoryID: "gitrepo_test",
+                    repositoryRoot: "/tmp/repo",
+                    worktreeID: "wt_feature",
+                    targetDigest: "cleanup-target-digest",
+                    manifestDigest: "",
+                    consumedAuthorizationDigest: "",
+                    phase: "cleanup_authorized",
+                    cleanupManifestDigest: "cleanup-manifest-digest",
+                    cleanupAuthorizationDigest: "cleanup-authorization-digest",
+                    authorizationIssuedAt: "2026-07-31T10:00:00Z",
+                    authorizationExpiresAt: "2026-07-31T10:10:00Z",
+                    drain: .init(
+                        drainedSessionIDs: [],
+                        activeAdmissionsBefore: 0,
+                        activeAdmissionsAfter: 0,
+                        liveBindingsRemaining: 0,
+                        workspaceClaimsRemaining: 0,
+                        watchersRemaining: 0,
+                        pendingPublicationsRemaining: 0
+                    ),
+                    mutation: .init(
+                        serializedExecutor: false,
+                        authorizationConsumedAt: nil,
+                        gitRemoveExitCode: nil
+                    ),
+                    postconditions: .init(
+                        gitRegistrationAbsent: false,
+                        pathAbsent: false,
+                        verifiedAt: nil
+                    )
+                )
+            )
+        )
+        let cleanupText = try Self.onlyText(
+            ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(cleanupDTO))
+        )
+        XCTAssertTrue(cleanupText.contains("Single-use cleanup authorization"), cleanupText)
+        XCTAssertTrue(cleanupText.contains("\"retirement_action\":\"complete_cleanup\""), cleanupText)
+        XCTAssertTrue(cleanupText.contains("\"cleanup_authorization_token\":\"cleanup_test\""), cleanupText)
+        XCTAssertTrue(cleanupText.contains("\"cleanup_manifest_digest\":\"<same-digest>\""), cleanupText)
+        XCTAssertTrue(cleanupText.contains("cleanup-manifest-digest"), cleanupText)
+        XCTAssertTrue(cleanupText.contains("cleanup-authorization-digest"), cleanupText)
+        XCTAssertTrue(cleanupText.contains("2026-07-31T10:10:00Z"), cleanupText)
     }
 
     func testListOutputShowsVisualIdentityAndBoundedGraph() throws {

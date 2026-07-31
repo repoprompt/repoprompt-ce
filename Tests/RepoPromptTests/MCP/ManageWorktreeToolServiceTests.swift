@@ -203,6 +203,70 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         let evidence = try XCTUnwrap(retirement["evidence"]?.objectValue)
         XCTAssertEqual(evidence["generation"]?.intValue, 7)
         XCTAssertEqual(evidence["manifest_digest"]?.stringValue, "manifest-digest")
+
+        let cleanupDTO = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "retire",
+            retirement: .init(
+                state: "cleanup_authorized",
+                authorizationToken: nil,
+                cleanupAuthorizationToken: "cleanup_test",
+                worktreeID: "wt_123",
+                path: "/tmp/repo-wt",
+                drainedSessionIDs: ["session-1"],
+                gitAbsent: nil,
+                pathAbsent: nil,
+                authorityBoundary: "RepoPrompt-controlled operations only; external processes are excluded.",
+                evidence: .init(
+                    evidenceID: nil,
+                    state: "cleanup_authorized",
+                    reason: nil,
+                    authorityScope: "RepoPrompt-controlled operations only; external processes are excluded.",
+                    appVersion: "test",
+                    operationVersion: 4,
+                    generation: 8,
+                    repositoryID: "gitrepo_test",
+                    repositoryRoot: "/tmp/repo",
+                    worktreeID: "wt_123",
+                    targetDigest: "cleanup-target-digest",
+                    manifestDigest: "",
+                    consumedAuthorizationDigest: "",
+                    phase: "cleanup_authorized",
+                    cleanupManifestDigest: "cleanup-manifest-digest",
+                    cleanupAuthorizationDigest: "cleanup-authorization-digest",
+                    authorizationIssuedAt: "2026-07-31T10:00:00Z",
+                    authorizationExpiresAt: "2026-07-31T10:10:00Z",
+                    drain: .init(
+                        drainedSessionIDs: ["session-1"],
+                        activeAdmissionsBefore: 1,
+                        activeAdmissionsAfter: 0,
+                        liveBindingsRemaining: 0,
+                        workspaceClaimsRemaining: 0,
+                        watchersRemaining: 0,
+                        pendingPublicationsRemaining: 0
+                    ),
+                    mutation: .init(
+                        serializedExecutor: false,
+                        authorizationConsumedAt: nil,
+                        gitRemoveExitCode: nil
+                    ),
+                    postconditions: .init(
+                        gitRegistrationAbsent: false,
+                        pathAbsent: false,
+                        verifiedAt: nil
+                    )
+                )
+            )
+        )
+
+        let cleanupObject = try XCTUnwrap(Self.value(cleanupDTO).objectValue)
+        let cleanup = try XCTUnwrap(cleanupObject["retirement"]?.objectValue)
+        XCTAssertEqual(cleanup["cleanup_authorization_token"]?.stringValue, "cleanup_test")
+        let cleanupEvidence = try XCTUnwrap(cleanup["evidence"]?.objectValue)
+        XCTAssertEqual(cleanupEvidence["phase"]?.stringValue, "cleanup_authorized")
+        XCTAssertEqual(cleanupEvidence["cleanup_manifest_digest"]?.stringValue, "cleanup-manifest-digest")
+        XCTAssertEqual(cleanupEvidence["cleanup_authorization_digest"]?.stringValue, "cleanup-authorization-digest")
+        XCTAssertEqual(cleanupEvidence["authorization_issued_at"]?.stringValue, "2026-07-31T10:00:00Z")
+        XCTAssertEqual(cleanupEvidence["authorization_expires_at"]?.stringValue, "2026-07-31T10:10:00Z")
     }
 
     private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {

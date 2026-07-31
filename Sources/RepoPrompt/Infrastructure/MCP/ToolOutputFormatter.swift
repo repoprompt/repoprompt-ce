@@ -4478,6 +4478,10 @@ extension ToolOutputFormatter {
                     out.append("- **Single-use authorization**: `\(token)`")
                     out.append("- **Next**: apply `manage_worktree {\"op\":\"retire\",\"authorization_token\":\"\(token)\"}` through an authorized MCP connection.")
                 }
+                if let token = retirement.cleanupAuthorizationToken {
+                    out.append("- **Single-use cleanup authorization**: `\(token)`")
+                    out.append("- **Next**: run the audited external cleanup for the sealed manifest, then call `manage_worktree {\"op\":\"retire\",\"retirement_action\":\"complete_cleanup\",\"cleanup_authorization_token\":\"\(token)\",\"cleanup_manifest_digest\":\"<same-digest>\"}`.")
+                }
                 if retirement.gitAbsent == true, retirement.pathAbsent == true {
                     out.append("- **Postconditions**: Git entry absent; path absent")
                 }
@@ -4489,6 +4493,18 @@ extension ToolOutputFormatter {
                     out.append("- **Target digest**: `\(evidence.targetDigest)`")
                     out.append("- **Manifest digest**: `\(evidence.manifestDigest)`")
                     out.append("- **Authorization digest**: `\(evidence.consumedAuthorizationDigest)`")
+                    if let cleanupManifestDigest = evidence.cleanupManifestDigest {
+                        out.append("- **Cleanup manifest digest**: `\(cleanupManifestDigest)`")
+                    }
+                    if let cleanupAuthorizationDigest = evidence.cleanupAuthorizationDigest {
+                        out.append("- **Cleanup authorization digest**: `\(cleanupAuthorizationDigest)`")
+                    }
+                    if let authorizationIssuedAt = evidence.authorizationIssuedAt {
+                        out.append("- **Authorization issued**: `\(authorizationIssuedAt)`")
+                    }
+                    if let authorizationExpiresAt = evidence.authorizationExpiresAt {
+                        out.append("- **Authorization expires**: `\(authorizationExpiresAt)`")
+                    }
                 }
                 out.append("- **Authority boundary**: \(retirement.authorityBoundary)")
             }

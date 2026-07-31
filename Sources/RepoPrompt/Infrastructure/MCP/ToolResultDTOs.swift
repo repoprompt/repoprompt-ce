@@ -1568,6 +1568,7 @@ enum ToolResultDTOs {
         struct RetirementDTO: Codable, Equatable {
             let state: String
             let authorizationToken: String?
+            let cleanupAuthorizationToken: String?
             let worktreeID: String
             let path: String
             let drainedSessionIDs: [String]
@@ -1579,6 +1580,7 @@ enum ToolResultDTOs {
             init(
                 state: String,
                 authorizationToken: String?,
+                cleanupAuthorizationToken: String? = nil,
                 worktreeID: String,
                 path: String,
                 drainedSessionIDs: [String],
@@ -1589,6 +1591,7 @@ enum ToolResultDTOs {
             ) {
                 self.state = state
                 self.authorizationToken = authorizationToken
+                self.cleanupAuthorizationToken = cleanupAuthorizationToken
                 self.worktreeID = worktreeID
                 self.path = path
                 self.drainedSessionIDs = drainedSessionIDs
@@ -1601,6 +1604,7 @@ enum ToolResultDTOs {
             private enum CodingKeys: String, CodingKey {
                 case state, path
                 case authorizationToken = "authorization_token"
+                case cleanupAuthorizationToken = "cleanup_authorization_token"
                 case worktreeID = "worktree_id"
                 case drainedSessionIDs = "drained_session_ids"
                 case gitAbsent = "git_absent"
@@ -1624,9 +1628,60 @@ enum ToolResultDTOs {
             let targetDigest: String
             let manifestDigest: String
             let consumedAuthorizationDigest: String
+            let phase: String?
+            let cleanupManifestDigest: String?
+            let cleanupAuthorizationDigest: String?
+            let authorizationIssuedAt: String?
+            let authorizationExpiresAt: String?
             let drain: RetirementDrainEvidenceDTO
             let mutation: RetirementMutationEvidenceDTO
             let postconditions: RetirementPostconditionsDTO
+
+            init(
+                evidenceID: String?,
+                state: String,
+                reason: String?,
+                authorityScope: String,
+                appVersion: String,
+                operationVersion: Int,
+                generation: UInt64,
+                repositoryID: String,
+                repositoryRoot: String,
+                worktreeID: String,
+                targetDigest: String,
+                manifestDigest: String,
+                consumedAuthorizationDigest: String,
+                phase: String? = nil,
+                cleanupManifestDigest: String? = nil,
+                cleanupAuthorizationDigest: String? = nil,
+                authorizationIssuedAt: String? = nil,
+                authorizationExpiresAt: String? = nil,
+                drain: RetirementDrainEvidenceDTO,
+                mutation: RetirementMutationEvidenceDTO,
+                postconditions: RetirementPostconditionsDTO
+            ) {
+                self.evidenceID = evidenceID
+                self.state = state
+                self.reason = reason
+                self.authorityScope = authorityScope
+                self.appVersion = appVersion
+                self.operationVersion = operationVersion
+                self.generation = generation
+                self.repositoryID = repositoryID
+                self.repositoryRoot = repositoryRoot
+                self.worktreeID = worktreeID
+                self.targetDigest = targetDigest
+                self.manifestDigest = manifestDigest
+                self.consumedAuthorizationDigest = consumedAuthorizationDigest
+                self.phase = phase
+                self.cleanupManifestDigest = cleanupManifestDigest
+                self.cleanupAuthorizationDigest = cleanupAuthorizationDigest
+                self.authorizationIssuedAt = authorizationIssuedAt
+                self.authorizationExpiresAt = authorizationExpiresAt
+                self.drain = drain
+                self.mutation = mutation
+                self.postconditions = postconditions
+            }
 
             private enum CodingKeys: String, CodingKey {
                 case state, reason, generation, drain, mutation, postconditions
@@ -1640,6 +1695,11 @@ enum ToolResultDTOs {
                 case targetDigest = "target_digest"
                 case manifestDigest = "manifest_digest"
                 case consumedAuthorizationDigest = "consumed_authorization_digest"
+                case phase
+                case cleanupManifestDigest = "cleanup_manifest_digest"
+                case cleanupAuthorizationDigest = "cleanup_authorization_digest"
+                case authorizationIssuedAt = "authorization_issued_at"
+                case authorizationExpiresAt = "authorization_expires_at"
             }
         }
 
