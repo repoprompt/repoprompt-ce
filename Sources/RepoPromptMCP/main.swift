@@ -9,7 +9,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.1.1"
+let CLI_VERSION = "1.1.2"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false

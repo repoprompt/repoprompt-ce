@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 import SwiftUI
 
 #if DEBUG
@@ -297,6 +298,8 @@ private extension Array {
 
 @MainActor
 final class WindowRoutingService: Service {
+    let domainRegistrationID = MCPDomainToolRegistrationID()
+
     nonisolated static func validateAddFolderWorkspace(_ workspace: WorkspaceModel) throws {
         guard workspace.isSystemWorkspace == false else {
             throw MCPError.invalidParams("Cannot add folders to system workspace '\(workspace.name)'. Create or switch to a regular workspace first.")
@@ -322,14 +325,10 @@ final class WindowRoutingService: Service {
     // ---------------------------------------------------------------------
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
-    private var previousDisabledTools: Set<String>
 
-    /// Thread-safe tools storage
+    /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
+    /// filtering and window selection are applied from live state outside this cache.
     private let toolsCache = ToolsCache()
-
-    // NotificationCenter observer tokens for cleanup
-    private var userDefaultsObserver: NSObjectProtocol?
-    private var windowCountObserver: NSObjectProtocol?
 
     // ---------------------------------------------------------------------
 
@@ -342,102 +341,23 @@ final class WindowRoutingService: Service {
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
-        previousDisabledTools = Set(UserDefaults.standard.stringArray(forKey: "mcp.disabledTools") ?? [])
-
-        // Initialize cached tools and register service
-        Task {
-            await updateCachedTools()
-
-            // Register only after tools are cached
-            ServiceRegistry.register(self)
-        }
-
-        // Listen for changes to relevant MCP settings
-        userDefaultsObserver = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-
-                let currentDisabledTools = Set(UserDefaults.standard.stringArray(forKey: "mcp.disabledTools") ?? [])
-
-                guard currentDisabledTools != self.previousDisabledTools else { return }
-                self.previousDisabledTools = currentDisabledTools
-
-                let previousTools = await self.tools
-                let previousToolNames = Set(previousTools.map(\.name))
-
-                await self.updateCachedTools()
-
-                let newTools = await self.tools
-                let newToolNames = Set(newTools.map(\.name))
-
-                let addedTools = newTools.filter { !previousToolNames.contains($0.name) }
-                if !addedTools.isEmpty {
-                    ToolAvailabilityStore.shared.registerTools(addedTools)
-                }
-
-                let removedToolNames = previousToolNames.subtracting(newToolNames)
-                if !removedToolNames.isEmpty {
-                    ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
-                }
-
-                await networkMgr.broadcastToolListChanged()
-            }
-        }
-
-        // Listen for window count changes
-        windowCountObserver = NotificationCenter.default.addObserver(
-            forName: .windowCountDidChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-
-                let previousTools = await self.tools
-                let previousToolNames = Set(previousTools.map(\.name))
-
-                // Update cached tools based on new window count
-                await self.updateCachedTools()
-
-                // Update tool availability store
-                let newTools = await self.tools
-                let newToolNames = Set(newTools.map(\.name))
-
-                // Register newly available tools
-                let addedTools = newTools.filter { !previousToolNames.contains($0.name) }
-                if !addedTools.isEmpty {
-                    ToolAvailabilityStore.shared.registerTools(addedTools)
-                }
-
-                // Unregister tools that are no longer available
-                let removedToolNames = previousToolNames.subtracting(newToolNames)
-                if !removedToolNames.isEmpty {
-                    ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
-                }
-
-                // Notify connected clients that the tool list has changed
-                await networkMgr.broadcastToolListChanged()
-            }
-        }
     }
 
-    // ---------------------------------------------------------------------
+    /// Materializes the static M1 routing definitions without publishing them.
+    /// The process composition batches this service with the other application
+    /// service so registration and availability become visible atomically.
+    @MainActor
+    func prepareDomainTools() async {
+        await updateCachedTools()
+    }
 
-    // MARK: Cleanup
-
-    /// ---------------------------------------------------------------------
-    deinit {
-        // Remove NotificationCenter observers to prevent crashes
-        if let observer = userDefaultsObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        if let observer = windowCountObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+    /// Materializes and registers the static M1 routing definitions. The process
+    /// composition owns the returned handle; constructing a service is inert.
+    @MainActor
+    @discardableResult
+    func registerDomainTools() async throws -> MCPDomainToolRegistrationResult {
+        await prepareDomainTools()
+        return try await ServiceRegistry.register(self)
     }
 
     // ---------------------------------------------------------------------

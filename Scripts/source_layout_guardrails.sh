@@ -29,8 +29,10 @@ required_dirs=(
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
+  "Sources/RepoPromptDomainRuntime"
   "Tests/RepoPromptTests"
   "Tests/RepoPromptWorkspaceCoreTests"
+  "Tests/RepoPromptDomainRuntimeTests"
 )
 for dir in "${required_dirs[@]}"; do
   if [[ ! -d "$dir" ]]; then
@@ -249,6 +251,67 @@ if app_by_name_dependencies.count("TreeSitterScannerSupport") != 0:
 if app_by_name_dependencies.count("RepoPromptCodeMapCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptCodeMapCore")
 
+# M1 headless domain runtime is an internal AppKit-free owner boundary. During the
+# two-commit migration it may be staged in Swift 5 or promoted to Swift 6, but the
+# runtime and owner tests must move together and retain complete checking.
+domain_runtime = targets.get("RepoPromptDomainRuntime")
+domain_runtime_tests = targets.get("RepoPromptDomainRuntimeTests")
+if domain_runtime is None:
+    errors.append("RepoPromptDomainRuntime target missing")
+else:
+    if domain_runtime.get("type") != "regular": errors.append("RepoPromptDomainRuntime must remain an internal regular target")
+    if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime": errors.append("RepoPromptDomainRuntime target path drifted")
+    runtime_products = {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in domain_runtime.get("dependencies", [])
+        if "product" in dependency
+    }
+    if runtime_products != {("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 1:
+        errors.append("RepoPromptDomainRuntime must depend only on the pinned MCP SDK product")
+if domain_runtime_tests is None:
+    errors.append("RepoPromptDomainRuntimeTests target missing")
+else:
+    owner_by_name = [dependency["byName"][0] for dependency in domain_runtime_tests.get("dependencies", []) if dependency.get("byName")]
+    owner_products = {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in domain_runtime_tests.get("dependencies", [])
+        if "product" in dependency
+    }
+    if domain_runtime_tests.get("type") != "test": errors.append("RepoPromptDomainRuntimeTests must remain a test target")
+    if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests": errors.append("RepoPromptDomainRuntimeTests target path drifted")
+    if owner_by_name != ["RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 2:
+        errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptDomainRuntime and MCP")
+
+def swift_language_modes(target):
+    return [
+        setting.get("kind", {}).get("swiftLanguageMode", {}).get("_0")
+        for setting in target.get("settings", [])
+        if setting.get("kind", {}).get("swiftLanguageMode")
+    ]
+
+def strict_concurrency_features(target):
+    return [
+        setting.get("kind", {}).get("enableExperimentalFeature", {}).get("_0")
+        for setting in target.get("settings", [])
+        if setting.get("kind", {}).get("enableExperimentalFeature")
+    ]
+
+if domain_runtime is not None and domain_runtime_tests is not None:
+    runtime_modes = swift_language_modes(domain_runtime)
+    owner_modes = swift_language_modes(domain_runtime_tests)
+    if runtime_modes != owner_modes:
+        errors.append("RepoPromptDomainRuntime and owner tests must use the same Swift language mode")
+    elif runtime_modes == ["5"]:
+        if strict_concurrency_features(domain_runtime) != ["StrictConcurrency"] or strict_concurrency_features(domain_runtime_tests) != ["StrictConcurrency"]:
+            errors.append("Swift 5 domain runtime and owner tests must retain complete StrictConcurrency checking")
+    elif runtime_modes != ["6"]:
+        errors.append("RepoPromptDomainRuntime and owner tests must be either Swift 5 + StrictConcurrency or Swift 6")
+if app_by_name_dependencies.count("RepoPromptDomainRuntime") != 1:
+    errors.append("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
+repo_prompt_tests_dependencies = [dependency["byName"][0] for dependency in targets.get("RepoPromptTests", {}).get("dependencies", []) if dependency.get("byName")]
+if repo_prompt_tests_dependencies.count("RepoPromptDomainRuntime") != 1:
+    errors.append("RepoPromptTests must directly consume RepoPromptDomainRuntime for adapter evidence")
+
 code_map_core_tests = targets.get("RepoPromptCodeMapCoreTests", {})
 core_test_dependencies = [
     dependency["byName"][0]
@@ -318,6 +381,40 @@ if [[ -d "$workspace_core_source_dir" ]]; then
     printf '%s\n' "$workspace_core_imports" >&2
   fi
 fi
+
+# RepoPromptDomainRuntime owns only Sendable MCP catalog/runtime values. It must
+# stay free of app/UI/provider/workspace authority; later milestones add those
+# boundaries deliberately instead of smuggling them into the M1 foundation.
+domain_runtime_source_dir="Sources/RepoPromptDomainRuntime"
+if [[ -d "$domain_runtime_source_dir" ]]; then
+  unexpected_domain_runtime_files="$(find "$domain_runtime_source_dir" -type f ! -name '*.swift' -print)"
+  if [[ -n "$unexpected_domain_runtime_files" ]]; then
+    fail "RepoPromptDomainRuntime contains non-Swift source files"
+    printf '%s\n' "$unexpected_domain_runtime_files" >&2
+  fi
+  print_matches \
+    "RepoPromptDomainRuntime imports an app/UI framework" \
+    grep -R -n -E '^import[[:space:]]+(AppKit|SwiftUI|Combine)$' "$domain_runtime_source_dir"
+  print_matches \
+    "RepoPromptDomainRuntime declares MainActor ownership" \
+    grep -R -n -E '@MainActor' "$domain_runtime_source_dir"
+  print_matches \
+    "RepoPromptDomainRuntime contains M2+ workspace/context/run/provider authority" \
+    grep -R -n -E 'DomainWorkspaceStore|DomainContextStore|DomainRunLaunchToken|WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
+fi
+
+service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"
+print_matches \
+  "ServiceRegistry reintroduced stored service/schema/catalog authority" \
+  grep -n -E 'static[[:space:]]+(var|let)[[:space:]]+(services|schemas|catalog)|\[any[[:space:]]+Service\]|\[Tool\]' "$service_registry_source"
+for forwarding_source in \
+  Sources/RepoPrompt/Infrastructure/MCP/MCPGlobalToolNames.swift \
+  Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolNames.swift \
+  Sources/RepoPrompt/Infrastructure/MCP/Policies/MCPToolCapabilities.swift; do
+  print_matches \
+    "MCP compatibility facade contains a second literal tool authority: $forwarding_source" \
+    grep -n -E '"(app_settings|bind_context|manage_selection|read_file|file_search|agent_run|history)"' "$forwarding_source"
+done
 
 # 1. Old top-level layer buckets should not receive files again.
 old_buckets=(

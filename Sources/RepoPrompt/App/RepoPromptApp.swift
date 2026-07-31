@@ -88,8 +88,16 @@ struct RepoPromptSwiftUIApp: App {
                 "RepoPromptApp.init start task running",
                 flushStdout: true
             )
-            await ServerController.shared.startServer()
-            SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
+            do {
+                try await ServerController.shared.startServer()
+                SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
+            } catch {
+                ProcessDebugLogging.log(
+                    prefix: "MCPStartup",
+                    "MCP server startup failed before listener activation: \(String(reflecting: error))",
+                    flushStdout: true
+                )
+            }
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {

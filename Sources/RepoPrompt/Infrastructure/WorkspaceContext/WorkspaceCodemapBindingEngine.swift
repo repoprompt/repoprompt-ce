@@ -597,6 +597,12 @@ actor WorkspaceCodemapBindingEngine {
     private var graphIndexAdmissionQueue: [GraphIndexAdmissionWaiter] = []
     private var activeGraphIndexJobIDs: Set<UUID> = []
     private var graphIndexWatchdogTasks: [UUID: Task<Void, Never>] = [:]
+    private var graphIndexWorkerRecoveryContinuations: [
+        UUID: (
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            continuation: AsyncStream<WorkspaceCodemapGraphIndexWorkerRecoveryState>.Continuation
+        )
+    ] = [:]
     private var prioritizedGraphIndexRootEpoch: WorkspaceCodemapRootEpoch?
     private var graphIndexManifestStagedByteCount: UInt64 = 0
     private var drainingGraphIndexTasks: [UUID: Task<Void, Never>] = [:]
@@ -1201,6 +1207,7 @@ actor WorkspaceCodemapBindingEngine {
         job.retryAttempt = 0
         job.retry = nil
         graphIndexJobs[rootEpoch] = job
+        publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
         #if DEBUG
             recordGraphIndexDebugEvent(
                 kind: .graphIndexRunScheduled,
@@ -1649,6 +1656,36 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
+    func graphIndexWorkerRecoveryUpdates(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> AsyncStream<WorkspaceCodemapGraphIndexWorkerRecoveryState> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            graphIndexWorkerRecoveryContinuations[id] = (rootEpoch, continuation)
+            continuation.yield(graphIndexWorkerRecoveryState(rootEpoch: rootEpoch))
+            continuation.onTermination = { _ in
+                Task { await self.removeGraphIndexWorkerRecoveryContinuation(id) }
+            }
+        }
+    }
+
+    private func graphIndexWorkerRecoveryState(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapGraphIndexWorkerRecoveryState {
+        graphIndexJobs[rootEpoch]?.workerRecoveryExhausted == true ? .exhausted : .available
+    }
+
+    private func publishGraphIndexWorkerRecoveryState(rootEpoch: WorkspaceCodemapRootEpoch) {
+        let state = graphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+        for entry in graphIndexWorkerRecoveryContinuations.values where entry.rootEpoch == rootEpoch {
+            entry.continuation.yield(state)
+        }
+    }
+
+    private func removeGraphIndexWorkerRecoveryContinuation(_ id: UUID) {
+        graphIndexWorkerRecoveryContinuations.removeValue(forKey: id)
+    }
+
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
         var eligible = 0
         var unavailable = 0
@@ -1916,7 +1953,8 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         func debugInstallNonCooperativeGraphIndexWorkerForTesting(
-            rootEpoch: WorkspaceCodemapRootEpoch
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            completionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason = .cancelled
         ) -> Bool {
             guard var job = graphIndexJobs[rootEpoch], job.task == nil else { return false }
             let workerID = UUID()
@@ -1932,10 +1970,23 @@ actor WorkspaceCodemapBindingEngine {
                     jobID: jobID,
                     workerID: workerID,
                     rootEpoch: rootEpoch,
-                    reason: .cancelled
+                    reason: completionReason
                 )
             }
             job.task = task
+            graphIndexJobs[rootEpoch] = job
+            return true
+        }
+
+        func debugSetGraphIndexTerminalPhaseForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            phase: WorkspaceCodemapGraphIndexPhase
+        ) -> Bool {
+            guard graphIndexJobPhaseIsTerminal(phase),
+                  var job = graphIndexJobs[rootEpoch]
+            else { return false }
+            job.phase = phase
+            job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
             graphIndexJobs[rootEpoch] = job
             return true
         }
@@ -5056,6 +5107,7 @@ actor WorkspaceCodemapBindingEngine {
             job.workerRestartRequestedReason = nil
             let task = job.task
             graphIndexJobs[rootEpoch] = job
+            publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
             graphIndexWatchdogTasks.removeValue(forKey: jobID)?.cancel()
             // A cancellation-ignoring worker may still own mutation/publication work for an admitted batch.
             // Keep its admission and resources quarantined until finishGraphIndexWorker releases them.
@@ -5152,6 +5204,12 @@ actor WorkspaceCodemapBindingEngine {
             debugGraphIndexNonCooperativeWorkerGates.removeValue(forKey: jobID)
         #endif
         let restartReason = job.workerRestartRequestedReason
+        let terminalCompletionReconciledRecovery =
+            job.workerRecoveryExhausted && graphIndexJobPhaseIsTerminal(job.phase)
+        if terminalCompletionReconciledRecovery {
+            job.workerRecoveryExhausted = false
+            job.workerRecoveryCount = 0
+        }
         job.workerID = nil
         job.task = nil
         job.lastWorkerCompletionReason = job.workerRecoveryExhausted
@@ -5164,6 +5222,9 @@ actor WorkspaceCodemapBindingEngine {
         job.resources = .zero
         job.checkpoint = makeGraphIndexCheckpoint(job)
         graphIndexJobs[rootEpoch] = job
+        if terminalCompletionReconciledRecovery {
+            publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
+        }
         #if DEBUG
             recordGraphIndexDebugEvent(
                 kind: .graphIndexWorkerFinished,
@@ -5252,6 +5313,7 @@ actor WorkspaceCodemapBindingEngine {
         terminalPhase: WorkspaceCodemapGraphIndexPhase
     ) -> Task<Void, Never>? {
         guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return nil }
+        publishGraphIndexWorkerRecoveryState(rootEpoch: rootEpoch)
         discardGraphIndexManifestStages(&job)
         graphIndexWatchdogTasks.removeValue(forKey: job.id)?.cancel()
         if prioritizedGraphIndexRootEpoch == rootEpoch {

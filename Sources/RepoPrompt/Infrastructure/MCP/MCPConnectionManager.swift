@@ -3,11 +3,11 @@
 import Darwin
 import Dispatch
 import Foundation
-import JSONSchema
 import Logging
 import MCP
 import Ontology
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import SwiftUI
 
@@ -526,6 +526,26 @@ enum MCPRunRouteAuthorityDecision: Equatable {
     case revocationFenced
 }
 
+/// Monotonic timing and sleep dependencies for bootstrap readiness and restart policy.
+/// Production uses system uptime; focused lifecycle tests inject deterministic time.
+struct MCPBootstrapLifecycleTiming {
+    let readinessTimeout: TimeInterval
+    let monotonicNow: @Sendable () -> TimeInterval
+    let readinessSleep: @Sendable (TimeInterval) async throws -> Void
+    let restartSleep: @Sendable (TimeInterval) async throws -> Void
+
+    static let production = MCPBootstrapLifecycleTiming(
+        readinessTimeout: 5.0,
+        monotonicNow: { ProcessInfo.processInfo.systemUptime },
+        readinessSleep: { delay in
+            try await Task.sleep(for: .seconds(delay))
+        },
+        restartSleep: { delay in
+            try await Task.sleep(for: .seconds(delay))
+        }
+    )
+}
+
 /// Manages all MCP connections using the bootstrap UNIX-domain socket.
 /// TCP/Bonjour transport has been removed.
 actor ServerNetworkManager {
@@ -533,6 +553,34 @@ actor ServerNetworkManager {
     /// active client connections.  Use this when you need to reference the
     /// MCP listener from anywhere in the app.
     static let shared = ServerNetworkManager()
+
+    enum StartDegradedReason: String, Equatable {
+        case readinessTimedOut
+        case readinessWaitCancelled
+
+        var statusDescription: String {
+            switch self {
+            case .readinessTimedOut:
+                "bootstrap listener readiness timed out; maintenance recovery active"
+            case .readinessWaitCancelled:
+                "bootstrap listener readiness wait cancelled; maintenance recovery active"
+            }
+        }
+    }
+
+    enum StartOutcome: Equatable {
+        case ready
+        case degraded(StartDegradedReason)
+        case superseded
+    }
+
+    private enum BootstrapReadinessWaitOutcome: Equatable {
+        case ready
+        case timedOut
+        case cancelled
+        case superseded
+    }
+
     private static let repoCLIPrefix = "RepoPrompt CLI"
     private static let toolNameAliases: [String: String] = [
         "discover_manage_selection": "manage_selection",
@@ -808,11 +856,19 @@ actor ServerNetworkManager {
         return "all except \(describeToolList(restricted))"
     }
 
+    private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
 
-    // Bootstrap socket server
+    init(bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production) {
+        self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
+    }
+
+    // Bootstrap socket server. Startup candidates remain separate until bind/listen and
+    // accept-source creation succeed; only bootstrapSocketServer is externally ready.
+    private var bootstrapStartingSocketServer: BootstrapSocketServer?
+    private var bootstrapStartingSocketServerLifecycleGeneration: UInt64?
     private var bootstrapSocketServer: BootstrapSocketServer?
     private var bootstrapSocketServerLifecycleGeneration: UInt64?
     private var bootstrapSocketTask: Task<Void, Never>?
@@ -822,10 +878,10 @@ actor ServerNetworkManager {
     private var bootstrapRestartInProgress: Bool = false
     private var bootstrapRestartToken: UUID?
     private var bootstrapRestartLifecycleGeneration: UInt64?
-    private var lastBootstrapRestartAt: Date = .distantPast
+    private var lastBootstrapRestartAt: TimeInterval = -.infinity
     private let bootstrapRestartMinInterval: TimeInterval = 2.0
     private var bootstrapStartFailures: Int = 0
-    private var lastBootstrapHealthCheckAt: Date = .distantPast
+    private var lastBootstrapHealthCheckAt: TimeInterval = -.infinity
     private let bootstrapHealthCheckInterval: TimeInterval = 5.0
 
     private func resolvedBootstrapSocketURL() -> URL {
@@ -847,7 +903,8 @@ actor ServerNetworkManager {
         }
 
         enum DebugLifecycleFenceCheckpoint: Hashable {
-            case listenerPublishedBeforeStartInvocation
+            case listenerCandidateRegisteredBeforeStartInvocation
+            case listenerStartedBeforeReadyPublication
             case listenerStopReturnedBeforeConditionalClear
             case restartTaskBeforePerform
         }
@@ -883,6 +940,19 @@ actor ServerNetworkManager {
 
         func debugResolvedBootstrapSocketURL() -> URL {
             resolvedBootstrapSocketURL()
+        }
+
+        struct DebugTransportState: Equatable, CustomStringConvertible {
+            let isRunning: Bool
+            let isEnabled: Bool
+
+            var description: String {
+                "running=\(isRunning),enabled=\(isEnabled)"
+            }
+        }
+
+        func debugTransportState() -> DebugTransportState {
+            DebugTransportState(isRunning: isRunningState, isEnabled: isEnabledState)
         }
 
         func debugIsEnabledForBootstrapSocketURLOverride() -> Bool {
@@ -931,13 +1001,25 @@ actor ServerNetworkManager {
             connectionWaiters.count
         }
 
+        func debugHasMaintenanceTaskForLifecycleFenceTest() -> Bool {
+            isRunningState && maintenanceTask != nil
+        }
+
+        func debugBootstrapStartFailureCountForLifecycleFenceTest() -> Int {
+            bootstrapStartFailures
+        }
+
+        func debugRunMaintenanceTickForLifecycleFenceTest() async {
+            await maintenanceTick(lifecycleGeneration: lifecycleGeneration)
+        }
+
         func debugHasCurrentBootstrapListenerForLifecycleFenceTest() -> Bool {
             guard let bootstrapSocketServer else { return false }
             return isCurrentBootstrapListener(bootstrapSocketServer, lifecycleGeneration: lifecycleGeneration)
         }
 
         func debugScheduleDelayedBootstrapRestartForLifecycleFenceTest(delay: TimeInterval) -> Bool {
-            lastBootstrapRestartAt = .distantPast
+            lastBootstrapRestartAt = -.infinity
             let tokenBeforeRestart = bootstrapRestartToken
             restartBootstrapSocketServer(
                 reason: "DEBUG lifecycle fence test",
@@ -963,6 +1045,8 @@ actor ServerNetworkManager {
 
         private func debugRequireFullyStoppedForBootstrapSocketURLOverride() throws {
             guard !isRunningState,
+                  bootstrapStartingSocketServer == nil,
+                  bootstrapStartingSocketServerLifecycleGeneration == nil,
                   bootstrapSocketServer == nil,
                   bootstrapSocketServerLifecycleGeneration == nil,
                   bootstrapSocketTask == nil,
@@ -1789,7 +1873,7 @@ actor ServerNetworkManager {
         let windowID: Int
         let windowStateIdentity: ObjectIdentifier
         let serverViewModelIdentity: ObjectIdentifier
-        let catalogServiceIdentity: ObjectIdentifier
+        let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
     }
 
     struct ToolDispatchAuthorization: @unchecked Sendable {
@@ -2429,20 +2513,18 @@ actor ServerNetworkManager {
 
     private func captureWindowToolDispatchIdentity(
         windowID: Int,
-        catalogServiceIdentity: ObjectIdentifier
+        catalogRegistrationHandle: MCPDomainToolRegistrationHandle
     ) async -> WindowToolDispatchIdentity? {
-        await MainActor.run {
+        guard await ServiceRegistry.isActive(catalogRegistrationHandle) else { return nil }
+        return await MainActor.run {
             guard let window = WindowStatesManager.shared.window(withID: windowID),
-                  !window.isClosing,
-                  ServiceRegistry.services.contains(where: {
-                      ObjectIdentifier($0 as AnyObject) == catalogServiceIdentity
-                  })
+                  !window.isClosing
             else { return nil }
             return WindowToolDispatchIdentity(
                 windowID: windowID,
                 windowStateIdentity: ObjectIdentifier(window),
                 serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
-                catalogServiceIdentity: catalogServiceIdentity
+                catalogRegistrationHandle: catalogRegistrationHandle
             )
         }
     }
@@ -2451,15 +2533,13 @@ actor ServerNetworkManager {
         _ identity: WindowToolDispatchIdentity,
         expectedServerViewModelIdentity: ObjectIdentifier? = nil
     ) async -> Bool {
-        await MainActor.run {
+        guard await ServiceRegistry.isActive(identity.catalogRegistrationHandle) else { return false }
+        return await MainActor.run {
             guard identity.windowID > 0,
                   let window = WindowStatesManager.shared.window(withID: identity.windowID),
                   !window.isClosing,
                   ObjectIdentifier(window) == identity.windowStateIdentity,
-                  ObjectIdentifier(window.mcpServer) == identity.serverViewModelIdentity,
-                  ServiceRegistry.services.contains(where: {
-                      ObjectIdentifier($0 as AnyObject) == identity.catalogServiceIdentity
-                  })
+                  ObjectIdentifier(window.mcpServer) == identity.serverViewModelIdentity
             else { return false }
             if let expectedServerViewModelIdentity {
                 return ObjectIdentifier(window.mcpServer) == expectedServerViewModelIdentity
@@ -4198,7 +4278,8 @@ actor ServerNetworkManager {
         await waitForNewConnection(clientName: Optional(clientName), timeout: timeout)
     }
 
-    func start() async {
+    @discardableResult
+    func start() async -> StartOutcome {
         #if DEBUG
             print("[MCPStartup] ServerNetworkManager.start entered")
         #endif
@@ -4215,11 +4296,87 @@ actor ServerNetworkManager {
         bootstrapSocketTask?.cancel()
         await startBootstrapSocketServer(lifecycleGeneration: startLifecycleGeneration)
 
-        // A full shutdown may have run while listener startup awaited another actor.
-        guard isCurrentLifecycle(startLifecycleGeneration) else { return }
+        // Full stop synchronously invalidates the lifecycle before its first await. Never
+        // install maintenance or report degradation for a generation that is no longer running.
+        guard isCurrentLifecycle(startLifecycleGeneration) else { return .superseded }
 
-        // Start periodic maintenance loop for cleanup tasks
+        // Maintenance ownership belongs to every running lifecycle, including one whose caller
+        // cancels or whose initial readiness join expires. It is cancelled only by full stop or
+        // replaced by a same-generation start, so degraded startup can self-heal later.
         startMaintenanceLoop(lifecycleGeneration: startLifecycleGeneration)
+
+        let readinessOutcome = await waitForBootstrapListenerReady(
+            lifecycleGeneration: startLifecycleGeneration,
+            timeout: bootstrapLifecycleTiming.readinessTimeout
+        )
+        guard isCurrentLifecycle(startLifecycleGeneration) else { return .superseded }
+
+        switch readinessOutcome {
+        case .ready:
+            return .ready
+        case .timedOut:
+            log.error("Bootstrap listener did not become ready within \(bootstrapLifecycleTiming.readinessTimeout)s for lifecycle \(startLifecycleGeneration); maintenance recovery remains active")
+            return .degraded(.readinessTimedOut)
+        case .cancelled:
+            log.warning("Bootstrap listener readiness wait cancelled for lifecycle \(startLifecycleGeneration); maintenance recovery remains active")
+            return .degraded(.readinessWaitCancelled)
+        case .superseded:
+            return .superseded
+        }
+    }
+
+    /// Bounded join on the ready slot. This is the sole startup-completion probe: the slot
+    /// identity must still be current after cross-actor diagnostics, and all listener
+    /// acceptability invariants must hold. Every failed retry sleeps with exponential backoff;
+    /// injected monotonic timing keeps lifecycle tests independent of production deadlines.
+    private func waitForBootstrapListenerReady(
+        lifecycleGeneration expectedLifecycleGeneration: UInt64,
+        timeout: TimeInterval
+    ) async -> BootstrapReadinessWaitOutcome {
+        let deadline = bootstrapLifecycleTiming.monotonicNow() + timeout
+        var retryDelay: TimeInterval = 0.005
+
+        while true {
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return .superseded }
+            guard !Task.isCancelled else { return .cancelled }
+
+            if let server = bootstrapSocketServer,
+               bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
+            {
+                let diagnostics = await server.diagnostics()
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return .superseded }
+                guard !Task.isCancelled else { return .cancelled }
+                if isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration),
+                   diagnostics.isRunning,
+                   diagnostics.listenFDValid,
+                   diagnostics.ownsSocketPath,
+                   diagnostics.acceptSourceExists
+                {
+                    return .ready
+                }
+            }
+
+            let now = bootstrapLifecycleTiming.monotonicNow()
+            guard now < deadline else { return .timedOut }
+            let shouldAttemptStart = bootstrapSocketServer == nil
+                && bootstrapStartingSocketServer == nil
+                && !bootstrapStartInProgress
+                && !bootstrapRestartInProgress
+            let sleepDuration = min(retryDelay, deadline - now)
+            guard sleepDuration > 0 else { return .timedOut }
+            do {
+                try await bootstrapLifecycleTiming.readinessSleep(sleepDuration)
+            } catch {
+                return isCurrentLifecycle(expectedLifecycleGeneration) ? .cancelled : .superseded
+            }
+
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return .superseded }
+            guard !Task.isCancelled else { return .cancelled }
+            if shouldAttemptStart {
+                await startBootstrapSocketServer(lifecycleGeneration: expectedLifecycleGeneration)
+            }
+            retryDelay = min(retryDelay * 2, 0.1)
+        }
     }
 
     /// Starts the periodic maintenance loop for cleanup tasks.
@@ -4429,8 +4586,8 @@ actor ServerNetworkManager {
         guard !bootstrapStartInProgress else { return }
         guard !bootstrapRestartInProgress else { return }
 
-        let now = Date()
-        if !force, now.timeIntervalSince(lastBootstrapHealthCheckAt) < bootstrapHealthCheckInterval {
+        let now = bootstrapLifecycleTiming.monotonicNow()
+        if !force, now - lastBootstrapHealthCheckAt < bootstrapHealthCheckInterval {
             return
         }
         lastBootstrapHealthCheckAt = now
@@ -4488,8 +4645,8 @@ actor ServerNetworkManager {
         guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         guard !bootstrapRestartInProgress else { return }
 
-        let now = Date()
-        guard now.timeIntervalSince(lastBootstrapRestartAt) >= bootstrapRestartMinInterval else { return }
+        let now = bootstrapLifecycleTiming.monotonicNow()
+        guard now - lastBootstrapRestartAt >= bootstrapRestartMinInterval else { return }
 
         bootstrapRestartInProgress = true
         lastBootstrapRestartAt = now
@@ -4497,9 +4654,10 @@ actor ServerNetworkManager {
         bootstrapRestartToken = token
         bootstrapRestartLifecycleGeneration = expectedLifecycleGeneration
 
+        let restartSleep = bootstrapLifecycleTiming.restartSleep
         Task { [weak self] in
             if delay > 0 {
-                try? await Task.sleep(for: .seconds(delay))
+                try? await restartSleep(delay)
             }
             #if DEBUG
                 await self?.debugSuspendLifecycleFenceCheckpointIfNeeded(.restartTaskBeforePerform)
@@ -4573,16 +4731,35 @@ actor ServerNetworkManager {
             && bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
     }
 
-    /// Starts the bootstrap socket server for UNIX socket connections.
+    private func isCurrentBootstrapStartingListener(
+        _ server: BootstrapSocketServer,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) -> Bool {
+        isCurrentLifecycle(expectedLifecycleGeneration)
+            && bootstrapStartingSocketServer === server
+            && bootstrapStartingSocketServerLifecycleGeneration == expectedLifecycleGeneration
+    }
+
+    private func isCurrentBootstrapAdmissionListener(
+        _ server: BootstrapSocketServer,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) -> Bool {
+        isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration)
+            || isCurrentBootstrapStartingListener(server, lifecycleGeneration: expectedLifecycleGeneration)
+    }
+
+    /// Starts the bootstrap socket server for UNIX socket connections. The candidate slot
+    /// gives full stop identity-fenced ownership before the first cross-actor await, while the
+    /// ready slot is published only after bind/listen and accept-source creation succeed.
     private func startBootstrapSocketServer(lifecycleGeneration expectedLifecycleGeneration: UInt64) async {
         #if DEBUG
             print("[MCPStartup] startBootstrapSocketServer entered running=\(isRunningState) enabled=\(isEnabledState) inProgress=\(bootstrapStartInProgress) generation=\(expectedLifecycleGeneration)")
         #endif
         guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         guard !bootstrapStartInProgress else { return }
-        // Never overwrite a listener that another lifecycle is still tearing down.
-        // A new lifecycle maintenance tick will retry once identity-fenced teardown clears it.
-        guard bootstrapSocketServer == nil else { return }
+        // Never overwrite a ready listener or startup candidate that another lifecycle is
+        // still tearing down. Identity-fenced teardown schedules the current replacement.
+        guard bootstrapSocketServer == nil, bootstrapStartingSocketServer == nil else { return }
         bootstrapStartInProgress = true
         bootstrapStartLifecycleGeneration = expectedLifecycleGeneration
         defer { clearBootstrapStartIfMatching(lifecycleGeneration: expectedLifecycleGeneration) }
@@ -4591,10 +4768,10 @@ actor ServerNetworkManager {
 
         let socketURL = resolvedBootstrapSocketURL()
         let server = BootstrapSocketServer(socketURL: socketURL, logger: log)
-        bootstrapSocketServer = server
-        bootstrapSocketServerLifecycleGeneration = expectedLifecycleGeneration
+        bootstrapStartingSocketServer = server
+        bootstrapStartingSocketServerLifecycleGeneration = expectedLifecycleGeneration
         #if DEBUG
-            await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerPublishedBeforeStartInvocation)
+            await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerCandidateRegisteredBeforeStartInvocation)
         #endif
 
         do {
@@ -4614,10 +4791,35 @@ actor ServerNetworkManager {
                     clientName: clientName
                 )
             }
-            guard isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration) else {
-                await server.stop()
+            guard isCurrentBootstrapStartingListener(server, lifecycleGeneration: expectedLifecycleGeneration),
+                  bootstrapSocketServer == nil
+            else {
+                await stopBootstrapStartingSocketServer(
+                    server: server,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                )
                 return
             }
+            #if DEBUG
+                await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerStartedBeforeReadyPublication)
+            #endif
+            guard isCurrentBootstrapStartingListener(server, lifecycleGeneration: expectedLifecycleGeneration),
+                  bootstrapSocketServer == nil
+            else {
+                await stopBootstrapStartingSocketServer(
+                    server: server,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                )
+                return
+            }
+
+            // Publish readiness atomically only after BootstrapSocketServer.start has created
+            // an accepting listener. Admission recognizes this same candidate identity across
+            // the move so queued kernel connections are never rejected during publication.
+            bootstrapStartingSocketServer = nil
+            bootstrapStartingSocketServerLifecycleGeneration = nil
+            bootstrapSocketServer = server
+            bootstrapSocketServerLifecycleGeneration = expectedLifecycleGeneration
             #if DEBUG
                 print("[MCPStartup] BootstrapSocketServer.start succeeded socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
@@ -4627,13 +4829,10 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] BootstrapSocketServer.start failed: \(error)")
             #endif
-            if bootstrapSocketServer === server,
-               bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
-            {
-                bootstrapSocketServer = nil
-                bootstrapSocketServerLifecycleGeneration = nil
-                scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
-            }
+            await stopBootstrapStartingSocketServer(
+                server: server,
+                lifecycleGeneration: expectedLifecycleGeneration
+            )
             guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
             bootstrapStartFailures += 1
             log.error("Failed to start bootstrap socket server: \(error) (failures=\(bootstrapStartFailures))")
@@ -4664,7 +4863,7 @@ actor ServerNetworkManager {
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
         mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
 
-        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+        guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
 
@@ -4705,12 +4904,12 @@ actor ServerNetworkManager {
                 errorCode: MCPBootstrapErrorCode.serverNotReady.rawValue
             ))
         }
-        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+        guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
         #if DEBUG
             await debugAfterBootstrapPolicyReadinessForTesting?(sessionToken)
-            guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+            guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
                 return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
             }
         #endif
@@ -4753,7 +4952,7 @@ actor ServerNetworkManager {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
 
-        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+        guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             releaseBootstrapAdmissionClaim(
                 sessionToken: sessionToken,
                 connectionID: connectionID,
@@ -5540,11 +5739,11 @@ actor ServerNetworkManager {
                             )
                             guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             if !ready {
-                                log.warning("Tool catalog not ready for connection \(connectionID) window=\(windowID.map(String.init) ?? "nil") - proceeding anyway")
-                            }
-
-                            if let windowID {
-                                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
+                                connectionLog(
+                                    "Tool catalog not ready after handshake for connection \(connectionID) "
+                                        + "window=\(windowID.map(String.init) ?? "nil"); tools/list remains fail-closed"
+                                )
+                                return
                             }
                         }
                     } else {
@@ -5602,13 +5801,36 @@ actor ServerNetworkManager {
         scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
     }
 
+    /// Stops one startup candidate without granting stale teardown authority over a newer
+    /// candidate. BootstrapSocketOwnership independently inode-fences pathname removal.
+    private func stopBootstrapStartingSocketServer(
+        server: BootstrapSocketServer?,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) async {
+        guard let server,
+              bootstrapStartingSocketServer === server,
+              bootstrapStartingSocketServerLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
+
+        await server.stop()
+
+        guard bootstrapStartingSocketServer === server,
+              bootstrapStartingSocketServerLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
+        bootstrapStartingSocketServer = nil
+        bootstrapStartingSocketServerLifecycleGeneration = nil
+
+        scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
+    }
+
     /// If stale listener teardown or startup failure cleared an older publication after a
     /// cold start began, restore the current lifecycle promptly. Maintenance is the fallback.
     private func scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding staleLifecycleGeneration: UInt64) {
         let replacementLifecycleGeneration = lifecycleGeneration
         guard replacementLifecycleGeneration != staleLifecycleGeneration,
               isCurrentLifecycle(replacementLifecycleGeneration),
-              bootstrapSocketServer == nil
+              bootstrapSocketServer == nil,
+              bootstrapStartingSocketServer == nil
         else { return }
 
         Task { [weak self] in
@@ -5621,6 +5843,9 @@ actor ServerNetworkManager {
         let stoppedLifecycleGeneration = lifecycleGeneration
         let listenerToStop = bootstrapSocketServerLifecycleGeneration == stoppedLifecycleGeneration
             ? bootstrapSocketServer
+            : nil
+        let startingListenerToStop = bootstrapStartingSocketServerLifecycleGeneration == stoppedLifecycleGeneration
+            ? bootstrapStartingSocketServer
             : nil
         let connectionsToStop = connections.compactMap { connectionID, connectionManager -> (UUID, any MCPServerConnection)? in
             guard connectionLifecycleGenerationByID[connectionID] == stoppedLifecycleGeneration else { return nil }
@@ -5728,6 +5953,10 @@ actor ServerNetworkManager {
         }
 
         await stopBootstrapSocketServer(server: listenerToStop, lifecycleGeneration: stoppedLifecycleGeneration)
+        await stopBootstrapStartingSocketServer(
+            server: startingListenerToStop,
+            lifecycleGeneration: stoppedLifecycleGeneration
+        )
 
         // The registry detach above was synchronous; stale resumptions below only stop the
         // captured manager objects and never mutate a replacement lifecycle's registries.
@@ -6759,13 +6988,13 @@ actor ServerNetworkManager {
         )
     }
 
-    private func cachedSchema(for name: String, schema: JSONSchema, purpose: MCPRunPurpose) async throws -> Value {
+    private func cachedSchema(for name: String, schema: Value, purpose: MCPRunPurpose) async throws -> Value {
         let cacheKey = ToolSchemaCacheKey(name: name, purpose: purpose)
         if let cached = toolSchemaCache[cacheKey] {
             return cached
         }
 
-        var schemaValue = try Value(schema)
+        var schemaValue = schema
 
         if case var .object(dict) = schemaValue,
            dict["type"]?.stringValue == "object",
@@ -6839,16 +7068,28 @@ actor ServerNetworkManager {
 
     /// Checks if a tool's schema declares a `window_id` parameter.
     /// Pure function - doesn't access actor state.
-    private nonisolated func schemaDeclaresWindowID(schema: JSONSchema) -> Bool {
-        // Convert schema to Value and check for window_id in properties
-        guard let schemaValue = try? Value(schema),
-              case let .object(dict) = schemaValue,
+    private nonisolated func schemaDeclaresWindowID(schema: Value) -> Bool {
+        guard case let .object(dict) = schema,
               let props = dict["properties"]?.objectValue
         else {
             return false
         }
         return props.keys.contains("window_id")
     }
+
+    #if DEBUG
+        nonisolated func debugInjectWindowIDIfNeeded(
+            schema: Value,
+            routingWindowID: Int?,
+            args: [String: Value]
+        ) -> [String: Value] {
+            injectWindowIDIfNeeded(
+                schemaDeclaresWindowID: schemaDeclaresWindowID(schema: schema),
+                routingWindowID: routingWindowID,
+                args: args
+            )
+        }
+    #endif
 
     /// Injects `window_id` into tool arguments if:
     /// 1. The tool schema declares a `window_id` parameter
@@ -9535,11 +9776,8 @@ actor ServerNetworkManager {
                 windowID: windowID,
                 timeout: 5.0
             )
-            if !isReady, windowID != nil {
+            guard isReady else {
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
-            }
-            if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
             }
 
             if hydratePersistedPolicy {
@@ -9549,43 +9787,33 @@ actor ServerNetworkManager {
                 )
             }
 
-            let (disabled, registeredServices) = await MainActor.run {
-                (
-                    ToolAvailabilityStore.shared.effectiveDisabledTools,
-                    ServiceRegistry.services
-                )
+            let disabled = await MainActor.run {
+                ToolAvailabilityStore.shared.effectiveDisabledTools
             }
+            let catalog = await ServiceRegistry.catalogSnapshot()
             let policy = effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
-            var seenNames = Set<String>()
-            var names: [String] = []
 
-            if isEnabledState {
-                for service in registeredServices {
-                    for tool in await service.tools {
-                        guard !disabled.contains(tool.name) else { continue }
-                        guard !restricted.contains(tool.name) else { continue }
+            guard isEnabledState else { return [] }
+            return catalog.definitions.compactMap { definition in
+                guard !disabled.contains(definition.name),
+                      !restricted.contains(definition.name)
+                else { return nil }
 
-                        if MCPPolicyGatedTools.names.contains(tool.name),
-                           !additionalTools.contains(tool.name)
-                        {
-                            continue
-                        }
-
-                        if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                            toolName: tool.name,
-                            taskLabelKind: policy.taskLabelKind,
-                            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) { continue }
-
-                        guard seenNames.insert(tool.name).inserted else { continue }
-                        names.append(tool.name)
-                    }
+                if MCPPolicyGatedTools.names.contains(definition.name),
+                   !additionalTools.contains(definition.name)
+                {
+                    return nil
                 }
-            }
 
-            return names.sorted()
+                guard AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                    toolName: definition.name,
+                    taskLabelKind: policy.taskLabelKind,
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                ) else { return nil }
+                return definition.name
+            }.sorted()
         }
 
         func debugSetBeforeToolEventObserverDeliveryForTesting(
@@ -10922,21 +11150,12 @@ actor ServerNetworkManager {
                 windowID: windowID,
                 timeout: 2.0 // Shorter timeout here since handshake should have waited
             )
-            if !isReady {
-                // Only fail closed if we had a specific window to wait for.
-                // If windowID is nil (true multi-window ambiguity), log warning but proceed
-                // with whatever tools are available - the client will need to select a window.
-                if windowID != nil {
-                    log.warning("Tool catalog not ready for tools/list - failing closed for connection \(connectionID) window \(windowID!)")
-                    throw MCPError.internalError("Tool catalog not ready. Please retry.")
-                } else {
-                    connectionLog("Tool catalog readiness skipped for multi-window ambiguous connection \(connectionID)")
-                }
-            }
-
-            // Warm tool cache if we have a bound window
-            if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
+            guard isReady else {
+                connectionLog(
+                    "Tool catalog not ready for tools/list - failing closed for connection \(connectionID) "
+                        + "window=\(windowID.map(String.init) ?? "ambiguous")"
+                )
+                throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
 
             // Opportunistic persisted hydration for resumed agent-mode sessions.
@@ -10947,13 +11166,12 @@ actor ServerNetworkManager {
                 reason: "tools/list"
             )
 
-            // Get all MainActor-isolated data in one hop
-            let (disabled, registeredServices) = await MainActor.run {
-                (
-                    ToolAvailabilityStore.shared.effectiveDisabledTools,
-                    ServiceRegistry.services
-                )
+            let disabled = await MainActor.run {
+                ToolAvailabilityStore.shared.effectiveDisabledTools
             }
+            // Listing consumes one immutable actor snapshot. No per-service scan may
+            // observe a partially-mutated catalog or create a second schema authority.
+            let catalog = await ServiceRegistry.catalogSnapshot()
             let policy = await effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -10967,77 +11185,68 @@ actor ServerNetworkManager {
                 }
             #endif
 
-            var seenNames = Set<String>() // ✱ 2. Deduplication helper
             var tools: [MCP.Tool] = []
 
             // Only proceed when the global MCP switch is ON
             if await isEnabledState {
-                // Enumerate every registered Service
-                for service in registeredServices {
-                    // Walk through the service's declared tools
-                    for tool in await service.tools {
-                        if disabled.contains(tool.name) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "disabled")
-                            #endif
-                            continue
-                        }
-                        if restricted.contains(tool.name) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "restricted")
-                            #endif
-                            continue
-                        }
+                for definition in catalog.definitions {
+                    if disabled.contains(definition.name) {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "disabled")
+                        #endif
+                        continue
+                    }
+                    if restricted.contains(definition.name) {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "restricted")
+                        #endif
+                        continue
+                    }
 
-                        // • hide policy-gated tools unless explicitly granted via additionalTools
-                        if MCPPolicyGatedTools.names.contains(tool.name),
-                           !additionalTools.contains(tool.name)
-                        {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "missing_additional_tool_grant")
-                            #endif
-                            continue
-                        }
+                    // • hide policy-gated tools unless explicitly granted via additionalTools
+                    if MCPPolicyGatedTools.names.contains(definition.name),
+                       !additionalTools.contains(definition.name)
+                    {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "missing_additional_tool_grant")
+                        #endif
+                        continue
+                    }
 
-                        // • role-based advertisement filtering (advertisement-only, not execution-time)
-                        if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                            toolName: tool.name,
-                            taskLabelKind: policy.taskLabelKind,
-                            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "role_advertisement_policy")
-                            #endif
-                            continue
-                        }
+                    // • role-based advertisement filtering (advertisement-only, not execution-time)
+                    if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                        toolName: definition.name,
+                        taskLabelKind: policy.taskLabelKind,
+                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                    ) {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "role_advertisement_policy")
+                        #endif
+                        continue
+                    }
 
-                        // • skip duplicates coming from other windows
-                        guard seenNames.insert(tool.name).inserted else { continue }
+                    let schemaValue = try await cachedSchema(
+                        for: definition.name,
+                        schema: definition.inputSchema,
+                        purpose: policy.purpose
+                    )
+                    let description = advertisedToolDescription(
+                        for: definition.name,
+                        baseDescription: definition.description,
+                        purpose: policy.purpose
+                    )
 
-                        // OK – advertise the tool
-                        let schemaValue = try await cachedSchema(
-                            for: tool.name,
-                            schema: tool.inputSchema,
-                            purpose: policy.purpose
-                        )
-                        let description = advertisedToolDescription(
-                            for: tool.name,
-                            baseDescription: tool.description,
-                            purpose: policy.purpose
-                        )
-
-                        tools.append(
-                            .init(
-                                name: tool.name,
-                                description: description,
-                                inputSchema: schemaValue,
-                                annotations: CodexMCPToolAnnotationProjection.project(
-                                    tool.annotations,
-                                    clientIdentifier: clientIdentifier
-                                )
+                    tools.append(
+                        .init(
+                            name: definition.name,
+                            description: description,
+                            inputSchema: schemaValue,
+                            annotations: CodexMCPToolAnnotationProjection.project(
+                                definition.annotations.mcpAnnotations,
+                                clientIdentifier: clientIdentifier
                             )
                         )
-                    }
+                    )
                 }
             }
 
@@ -11373,26 +11582,25 @@ actor ServerNetworkManager {
                 return result
             }
 
-            // Snapshot routing state before entering the per-connection limiter.
-            // Keep the snapshot local to this call so app-wide tools do not share
-            // mutable cross-connection service state.
+            // Snapshot only routing state before entering the per-connection limiter.
+            // Tool definitions and handlers are resolved exactly once from the domain registry
+            // after window routing chooses the canonical application/window scope.
             let bypassWindowRoutingForSnapshot = Self.shouldBypassWindowRouting(for: toolName)
             connectionLog("tools/call \(toolName): reading MainActor routing state")
-            let routingSnapshot: (Int, [any Service], Bool) = await EditFlowPerf.measure(
+            let routingSnapshot: (Int, Bool) = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.routingSnapshot,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
                 await MainActor.run {
-                    let services = ServiceRegistry.services
                     guard !bypassWindowRoutingForSnapshot else {
-                        return (0, services, false)
+                        return (0, false)
                     }
                     let windows = WindowStatesManager.shared.allWindows
                     let effectiveMode = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
-                    return (windows.count, services, effectiveMode)
+                    return (windows.count, effectiveMode)
                 }
             }
-            connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) services=\(routingSnapshot.1.count) multi=\(routingSnapshot.2)")
+            connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) multi=\(routingSnapshot.1)")
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted,
                 correlation: lifecycleCorrelation,
@@ -11530,8 +11738,9 @@ actor ServerNetworkManager {
                                 // Hidden params like `_windowID` can explicitly redirect a call even
                                 // when the connection already has a preferred window binding.
 
-                                let (windowCount, allServices, multiWindowModeEffective) = routingSnapshot
+                                let (windowCount, multiWindowModeEffective) = routingSnapshot
                                 var chosenID: Int?
+                                var singleWindowFallbackResolvedTool: MCPDomainResolvedTool?
                                 let windowStr: String
                                 let observerRunIDForCallbacksFinal: UUID?
                                 do {
@@ -11649,6 +11858,26 @@ actor ServerNetworkManager {
                                             // Store the mapping for this connection
                                             await self.setConnectionWindowMapping(connectionID, windowID: activeID)
                                         }
+                                    }
+
+                                    // Preserve the legacy single-window fallback even when app routing has
+                                    // not published a chosen window yet. The registry succeeds only when one
+                                    // exact window scope owns this tool, so multi-window ambiguity still fails closed.
+                                    if !bypassWindowRouting,
+                                       windowCount == 1,
+                                       chosenID == nil,
+                                       let fallback = await ServiceRegistry.resolveUniqueWindowTool(toolName: toolName),
+                                       case let .window(fallbackWindowID) = fallback.scope
+                                    {
+                                        singleWindowFallbackResolvedTool = fallback
+                                        chosenID = fallbackWindowID
+                                        await self.setConnectionWindowMapping(
+                                            connectionID,
+                                            windowID: fallbackWindowID
+                                        )
+                                        mcpRoutingLog(
+                                            "Auto-routing conn=\(connectionID) to unique registered window=\(fallbackWindowID)"
+                                        )
                                     }
 
                                     // Only require explicit window selection when multi-window mode is effectively active.
@@ -11979,7 +12208,9 @@ actor ServerNetworkManager {
                                         cleanupDisposition: MCPToolExecutionCleanupDisposition?,
                                         slot: MCPCodeStructureSettlementRegistry.Slot?
                                     )
-                                    if contract.cleanupDisposition == .detachAndSettle {
+                                    if contract.cleanupDisposition == .detachAndSettle,
+                                       toolName != MCPWindowToolName.fileActions
+                                    {
                                         guard let windowID = Self.currentToolDispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
                                         }
@@ -12228,7 +12459,7 @@ actor ServerNetworkManager {
                                                             cancellationOrigin: .watchdogDeadline,
                                                             settlement: "detached",
                                                             graceOutcome: "expired",
-                                                            escalationReason: "read_only_handler_ignored_cancellation"
+                                                            escalationReason: "detach_disposition_handler_ignored_cancellation"
                                                         )
                                                     }
                                                 },
@@ -12370,12 +12601,15 @@ actor ServerNetworkManager {
                                             "settlement": .string(settlement.rawValue)
                                         ]
                                     case MCPToolExecutionWatchdogError.executionDetached:
+                                        let mutationOutcomeMayStillReconcile = toolName == MCPWindowToolName.fileActions
                                         code = "tool_execution_timeout"
-                                        message = "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
+                                        message = mutationOutcomeMayStillReconcile
+                                            ? "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the mutation provider during grace, so it was detached for eventual reconciliation. Inspect the filesystem before issuing another mutation."
+                                            : "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
                                         outcome = "executionDetached"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
-                                            "retryable": .bool(true),
+                                            "retryable": .bool(!mutationOutcomeMayStillReconcile),
                                             "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
                                             "settlement": .string("detached")
                                         ]
@@ -12453,43 +12687,27 @@ actor ServerNetworkManager {
                                     EditFlowPerf.Stage.MCPToolCall.serviceToolLookup,
                                     EditFlowPerf.Dimensions(toolName: toolName)
                                 )
-                                for service in allServices {
-                                    // App-wide coordination tools have a single owning service. Avoid probing
-                                    // unrelated window-scoped services for their tool lists during startup,
-                                    // because some of those lists hop through UI/window state.
-                                    if toolName == "bind_context", !(service is WindowRoutingService) { continue }
-                                    if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) { continue }
-
-                                    let wsSvc = service as? WindowScopedService
-
-                                    // Skip window-scoped services that don't match this connection
-                                    if let wsSvc, windowCount > 1 {
-                                        guard let wID = chosenID, wID == wsSvc.windowID else { continue }
+                                let registrationScope: MCPDomainToolRegistrationScope? = {
+                                    guard let catalogEntry = MCPDomainToolCatalog.entry(named: toolName) else {
+                                        return nil
                                     }
-
-                                    // Get the tool definition (need schema for window_id injection)
-                                    connectionLog("tools/call \(toolName): inspecting service \(String(describing: type(of: service)))")
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let serviceToolsAwaitState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait)
-                                    #endif
-                                    let serviceTools = await service.tools
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait, serviceToolsAwaitState)
-                                    #endif
-                                    connectionLog("tools/call \(toolName): service \(String(describing: type(of: service))) exposes \(serviceTools.count) tools")
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let toolDefinitionScanState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan)
-                                    #endif
-                                    guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else {
-                                        #if DEBUG || EDIT_FLOW_PERF
-                                            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
-                                        #endif
-                                        continue
+                                    switch catalogEntry.scope {
+                                    case .application:
+                                        return .application
+                                    case .window:
+                                        return chosenID.map(MCPDomainToolRegistrationScope.window)
                                     }
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
-                                    #endif
-                                    connectionLog("tools/call \(toolName): dispatching via service \(String(describing: type(of: service))) windowScoped=\(wsSvc != nil)")
+                                }()
+                                var resolvedTool = singleWindowFallbackResolvedTool
+                                if resolvedTool == nil, let registrationScope {
+                                    resolvedTool = await ServiceRegistry.resolve(
+                                        toolName: toolName,
+                                        scope: registrationScope
+                                    )
+                                }
+                                if let resolvedTool {
+                                    let toolDef = resolvedTool.binding.definition
+                                    connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
 
                                     // Inject window_id from routing if tool schema declares it and caller didn't provide it.
                                     // bind_context manages its own window_id semantics and must not be auto-injected.
@@ -12500,8 +12718,8 @@ actor ServerNetworkManager {
                                             let publicWindowIDInjectionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection)
                                         #endif
                                         let routingWindowID: Int? = {
-                                            if let wsSvc {
-                                                return capturedWindowID ?? chosenID ?? wsSvc.windowID
+                                            if case let .window(windowID) = resolvedTool.scope {
+                                                return capturedWindowID ?? chosenID ?? windowID
                                             }
                                             return capturedWindowID ?? chosenID
                                         }()
@@ -12537,16 +12755,15 @@ actor ServerNetworkManager {
                                                 return try await operation()
                                             }
                                         #endif
-                                        return try await toolDef.callAsFunction(effectiveArgs)
+                                        return try await resolvedTool.binding(effectiveArgs)
                                     }
 
-                                    // Now dispatch. If window-scoped, wrap in ownership scope (fallback to service window).
-                                    if let wsSvc {
-                                        let ownershipWindowID = chosenID ?? wsSvc.windowID
-                                        let catalogServiceIdentity = ObjectIdentifier(wsSvc as AnyObject)
+                                    // Window-scoped bindings retain exact registry generation ownership.
+                                    if case let .window(registeredWindowID) = resolvedTool.scope {
+                                        let ownershipWindowID = chosenID ?? registeredWindowID
                                         guard let windowDispatchIdentity = await self.captureWindowToolDispatchIdentity(
                                             windowID: ownershipWindowID,
-                                            catalogServiceIdentity: catalogServiceIdentity
+                                            catalogRegistrationHandle: resolvedTool.handle
                                         ) else {
                                             return Self.executionContractToolErrorResult(
                                                 rawJSON: capturedRawJSON,
@@ -14488,7 +14705,7 @@ actor ServerNetworkManager {
         case (nil, nil):
             true
         case let (sourceListener?, lifecycleGeneration?):
-            isCurrentBootstrapListener(sourceListener, lifecycleGeneration: lifecycleGeneration)
+            isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: lifecycleGeneration)
         default:
             false
         }

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Logging
 import RepoPromptShared
 import SwiftUI
 
@@ -18,6 +19,8 @@ import SwiftUI
 #else
     private func mcpServiceLog(_ message: @autoclosure () -> String) {}
 #endif
+
+private let mcpServiceLogger = Logger(label: "com.repoprompt.mcp.service")
 
 /// Background actor that manages the single MCP server instance and handles all networking/file I/O operations.
 /// This actor ensures that no long-running network or file-system work ever executes on @MainActor.
@@ -77,15 +80,57 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     private let controller = ServerController.shared
+    private let controllerStartOperation: @Sendable () async throws -> Void
+    private let controllerStopOperation: @Sendable () async -> Void
+    private let controllerFullShutdownOperation: @Sendable () async -> Void
 
-    /// Tracks which windows are participating in MCP
-    private var participatingWindows = Set<Int>()
+    private struct StartAttempt {
+        let id: UUID
+        let generation: UInt64
+        let task: Task<Void, Error>
+    }
+
+    private struct TeardownAttempt {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    private struct Participation {
+        let token: UUID
+    }
+
+    private enum LifecycleError: Error {
+        case startSuperseded
+    }
+
+    /// Tracks the newest participation claim for each window. Tokens prevent a
+    /// superseded join from removing a later rejoin for the same window ID.
+    private var participatingWindows: [Int: Participation] = [:]
+    private var lifecycleGeneration: UInt64 = 0
+    private var activeStartAttempt: StartAttempt?
+    private var activeTeardownAttempt: TeardownAttempt?
+    #if DEBUG
+        private var teardownRequestCount = 0
+    #endif
 
     // ──────────────────────────────────────────────
     // MARK: - Initialization
 
     /// ──────────────────────────────────────────────
-    init() {
+    init(
+        controllerStartOperation: @escaping @Sendable () async throws -> Void = {
+            try await ServerController.shared.startServer()
+        },
+        controllerStopOperation: @escaping @Sendable () async -> Void = {
+            await ServerController.shared.stopServer()
+        },
+        controllerFullShutdownOperation: @escaping @Sendable () async -> Void = {
+            await ServerController.shared.fullShutdown()
+        }
+    ) {
+        self.controllerStartOperation = controllerStartOperation
+        self.controllerStopOperation = controllerStopOperation
+        self.controllerFullShutdownOperation = controllerFullShutdownOperation
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
@@ -103,37 +148,130 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     func start() async throws {
+        try await ensureTransportRunning()
+    }
+
+    private func ensureTransportRunning() async throws {
+        while let teardown = activeTeardownAttempt {
+            await teardown.task.value
+            if activeTeardownAttempt?.id == teardown.id {
+                activeTeardownAttempt = nil
+            }
+        }
+        try Task.checkCancellation()
         guard !state.isRunning else { return }
-        // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
-        _ = MCPIntegrationHelper.ensureCodexToolTimeout()
-        mcpServiceLog("Starting MCP listener")
-        await controller.startServer()
+
+        let attempt: StartAttempt
+        if let activeStartAttempt, activeStartAttempt.generation == lifecycleGeneration {
+            attempt = activeStartAttempt
+        } else {
+            lifecycleGeneration &+= 1
+            let generation = lifecycleGeneration
+            let operation = controllerStartOperation
+            let task = Task {
+                // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
+                _ = MCPIntegrationHelper.ensureCodexToolTimeout()
+                mcpServiceLog("Starting MCP listener")
+                try await operation()
+            }
+            attempt = StartAttempt(id: UUID(), generation: generation, task: task)
+            activeStartAttempt = attempt
+        }
+
+        do {
+            try await attempt.task.value
+        } catch {
+            if activeStartAttempt?.id == attempt.id,
+               activeStartAttempt?.generation == attempt.generation,
+               lifecycleGeneration == attempt.generation
+            {
+                activeStartAttempt = nil
+                state.isRunning = false
+                updates.continuation.yield(state)
+            }
+            throw error
+        }
+
+        guard activeStartAttempt?.id == attempt.id,
+              activeStartAttempt?.generation == attempt.generation,
+              lifecycleGeneration == attempt.generation
+        else {
+            if state.isRunning { return }
+            throw LifecycleError.startSuperseded
+        }
+
+        activeStartAttempt = nil
         state.isRunning = true
         updates.continuation.yield(state)
     }
 
-    func stop() async {
-        guard state.isRunning else { return }
+    private func stop() async {
+        guard state.isRunning || activeStartAttempt != nil else { return }
         mcpServiceLog("Stopping MCP listener")
-        await controller.stopServer()
+        await performTeardown(operation: controllerStopOperation)
+    }
+
+    private func performTeardown(
+        operation: @escaping @Sendable () async -> Void
+    ) async {
+        #if DEBUG
+            teardownRequestCount += 1
+        #endif
+        lifecycleGeneration &+= 1
+        let supersededStartAttempt = activeStartAttempt
+        activeStartAttempt = nil
+        supersededStartAttempt?.task.cancel()
         state.isRunning = false
         updates.continuation.yield(state)
+
+        let predecessor = activeTeardownAttempt?.task
+        let task = Task {
+            await predecessor?.value
+            await operation()
+        }
+        let teardown = TeardownAttempt(id: UUID(), task: task)
+        activeTeardownAttempt = teardown
+        await task.value
+        if activeTeardownAttempt?.id == teardown.id {
+            activeTeardownAttempt = nil
+        }
     }
 
     func join(windowID: Int) async throws {
-        let inserted = participatingWindows.insert(windowID).inserted
-        mcpServiceLog("Window \(windowID) joining MCP (new: \(inserted), total: \(participatingWindows.count))")
+        let token = UUID()
+        let replacedExistingClaim = participatingWindows.updateValue(
+            Participation(token: token),
+            forKey: windowID
+        ) != nil
+        mcpServiceLog(
+            "Window \(windowID) joining MCP (replaced: \(replacedExistingClaim), total: \(participatingWindows.count))"
+        )
 
-        if inserted, participatingWindows.count == 1 {
-            try await start() // start() already yields
+        do {
+            try Task.checkCancellation()
+            if !state.isRunning {
+                try await start() // start() already yields
+            }
+            try Task.checkCancellation()
+        } catch {
+            await rollbackParticipation(windowID: windowID, token: token)
+            throw error
         }
 
         // Always re-broadcast so newly-joined windows get an up-to-date snapshot
         updates.continuation.yield(state)
     }
 
+    private func rollbackParticipation(windowID: Int, token: UUID) async {
+        guard participatingWindows[windowID]?.token == token else { return }
+        participatingWindows.removeValue(forKey: windowID)
+        if participatingWindows.isEmpty, state.isRunning {
+            await stop()
+        }
+    }
+
     func leave(windowID: Int) async {
-        let removed = participatingWindows.remove(windowID) != nil
+        let removed = participatingWindows.removeValue(forKey: windowID) != nil
         mcpServiceLog("Window \(windowID) leaving MCP (removed: \(removed), remaining: \(participatingWindows.count))")
 
         if participatingWindows.isEmpty {
@@ -166,28 +304,41 @@ actor MCPService: Sendable {
     }
 
     /// Expose enable/disable for Settings
-    func setEnabled(_ flag: Bool) async {
+    func setEnabled(_ flag: Bool) async throws {
         mcpServiceLog("Setting MCP server enabled: \(flag)")
-        await controller.setEnabled(flag)
+        try await controller.setEnabled(flag)
         // No state change for UI, so no yield necessary
     }
 
     func fullShutdown() async {
         mcpServiceLog("Performing full MCP server shutdown")
         participatingWindows.removeAll()
-        state.isRunning = false
-        updates.continuation.yield(state)
+        await performTeardown(operation: controllerFullShutdownOperation)
 
-        await controller.fullShutdown()
-
-        // Preserve participation registered while the controller shutdown was suspended.
-        // Such a join represents a newer lifecycle and must be made ready again.
-        if !participatingWindows.isEmpty {
-            await controller.startServer()
-            state.isRunning = true
+        // Joins admitted while shutdown was suspended wait on the shared teardown
+        // barrier, then coalesce through the ordinary single-flight start attempt.
+        guard !participatingWindows.isEmpty else { return }
+        let restartParticipants = participatingWindows.keys.sorted()
+        do {
+            try await ensureTransportRunning()
+        } catch {
+            state.isRunning = false
+            updates.continuation.yield(state)
+            mcpServiceLogger.error(
+                "Failed to restart MCP server after superseding participation; owner=fullShutdown windows=\(restartParticipants) error=\(String(reflecting: error))"
+            )
         }
-        updates.continuation.yield(state)
     }
+
+    #if DEBUG
+        func participatingWindowIDsForTesting() -> Set<Int> {
+            Set(participatingWindows.keys)
+        }
+
+        func teardownRequestCountForTesting() -> Int {
+            teardownRequestCount
+        }
+    #endif
 
     func currentRequestConnectionID() async -> UUID? {
         await ServerNetworkManager.shared.currentConnectionUUID()

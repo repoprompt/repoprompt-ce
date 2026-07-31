@@ -8,6 +8,8 @@ import XCTest
         private var savePreparationGates: [WorkspaceSavePreparationGate] = []
         private var saveTasks: [Task<Void, Never>] = []
         private var managersWithSavePreparationHooks: [WorkspaceManagerViewModel] = []
+        private var retainedWorkspaceManagers: [WorkspaceManagerViewModel] = []
+        private var temporaryDirectories: [URL] = []
 
         override func setUp() async throws {
             try await super.setUp()
@@ -28,14 +30,21 @@ import XCTest
             managersWithSavePreparationHooks.removeAll()
             savePreparationGates.removeAll()
             saveTasks.removeAll()
+            for manager in retainedWorkspaceManagers {
+                manager.prepareForWindowClose()
+            }
+            retainedWorkspaceManagers.removeAll()
             await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            for directory in temporaryDirectories {
+                try? FileManager.default.removeItem(at: directory)
+            }
+            temporaryDirectories.removeAll()
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
             try await super.tearDown()
         }
 
         func testSaveKeepsCapturedWorkspaceIdentityAndURLAcrossReorderAfterPreparation() async throws {
             let storageRoot = try temporaryDirectory(named: "IdentityURL")
-            defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -981)
             let manager = composition.workspaceManager
             await manager.awaitInitialized()
@@ -44,6 +53,7 @@ import XCTest
             manager.workspaces.append(contentsOf: [workspaceA, workspaceB])
             let switchResult = await manager.switchWorkspace(to: workspaceA, saveState: false)
             XCTAssertTrue(switchResult.didSwitch)
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
             manager.markWorkspaceDirty()
 
             let gate = WorkspaceSavePreparationGate()
@@ -74,7 +84,6 @@ import XCTest
 
         func testSaveBailsWithoutEnqueueOrAcknowledgementWhenWorkspaceRemovedAfterPreparation() async throws {
             let storageRoot = try temporaryDirectory(named: "Removal")
-            defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -982)
             let manager = composition.workspaceManager
             await manager.awaitInitialized()
@@ -82,6 +91,7 @@ import XCTest
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
             XCTAssertTrue(switchResult.didSwitch)
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
             manager.markWorkspaceDirty()
             let expectedURL = manager.workspaceFileURL(for: workspace)
 
@@ -107,7 +117,6 @@ import XCTest
 
         func testSaveRetriesSameIdentityOnceWhenStateChangesAfterPreparation() async throws {
             let storageRoot = try temporaryDirectory(named: "Retry")
-            defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -983)
             let manager = composition.workspaceManager
             await manager.awaitInitialized()
@@ -115,6 +124,7 @@ import XCTest
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
             XCTAssertTrue(switchResult.didSwitch)
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
             manager.markWorkspaceDirty()
             manager.resetWorkspaceSaveDiagnosticsForTesting()
 
@@ -143,7 +153,6 @@ import XCTest
 
         func testPreparationFailureDoesNotAdvanceLastSavedVersion() async throws {
             let storageRoot = try temporaryDirectory(named: "Failure")
-            defer { try? FileManager.default.removeItem(at: storageRoot) }
             let blockingFile = storageRoot.appendingPathComponent("not-a-directory")
             try Data("block".utf8).write(to: blockingFile)
             let composition = makeComposition(windowID: -984)
@@ -153,6 +162,7 @@ import XCTest
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
             XCTAssertTrue(switchResult.didSwitch)
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
             manager.markWorkspaceDirty()
 
             await manager.pollAndSaveStateAsync()
@@ -163,7 +173,6 @@ import XCTest
 
         func testQuiescentCapturePublishesWorkspaceOnceWithoutReloadingComposeTabs() async throws {
             let storageRoot = try temporaryDirectory(named: "Publication")
-            defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -985)
             let manager = composition.workspaceManager
             await manager.awaitInitialized()
@@ -171,6 +180,7 @@ import XCTest
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
             XCTAssertTrue(switchResult.didSwitch)
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
             manager.markWorkspaceDirty()
             manager.resetWorkspaceSaveDiagnosticsForTesting()
 
@@ -182,12 +192,14 @@ import XCTest
         }
 
         private func makeComposition(windowID: Int) -> WindowStateComposition {
-            WindowStateCompositionFactory.make(
+            let composition = WindowStateCompositionFactory.make(
                 windowID: windowID,
                 deferredInitialAgentSystemWorkspaceRefresh: true,
                 sharedMCPService: MCPService(),
                 workspaceFileContextStore: WorkspaceFileContextStore()
             )
+            retainedWorkspaceManagers.append(composition.workspaceManager)
+            return composition
         }
 
         private func makeWorkspace(name: String, storage: URL) -> WorkspaceModel {
@@ -205,6 +217,7 @@ import XCTest
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("WorkspaceSavePreparationTests-\(name)-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            temporaryDirectories.append(url)
             return url
         }
     }

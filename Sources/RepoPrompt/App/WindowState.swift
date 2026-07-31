@@ -117,6 +117,18 @@ class WindowState: ObservableObject {
     // MARK: - Window identification
 
     private(set) static var windowCounter = 0
+
+    private static func allocateWindowID() -> Int {
+        windowCounter += 1
+        return windowCounter
+    }
+
+    #if DEBUG
+        static func reserveWindowIDForTesting() -> Int {
+            allocateWindowID()
+        }
+    #endif
+
     let windowID: Int
 
     @Published var kind: WindowKind = .standard
@@ -362,8 +374,7 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil
     ) {
         // Assign a unique window ID
-        WindowState.windowCounter += 1
-        windowID = WindowState.windowCounter
+        windowID = WindowState.allocateWindowID()
         let manager = WindowStatesManager.shared
 
         let claimedInitialRefreshDeferral = manager.claimInitialRefreshDeferralForNewWindow()

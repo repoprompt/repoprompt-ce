@@ -237,9 +237,9 @@
       "bounded": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "workspace_context", "prompt", "agent_manage", "share_thoughts", "set_status", "history"]
     },
     "advertisement_profiles": {
-      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "routing_advanced", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
+      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "workspace_mutate", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
       "discover_granted_capabilities": ["user_interaction"],
-      "agent_mode_restricted_capabilities": ["routing_advanced", "conversation_helper", "conversation_send"],
+      "agent_mode_restricted_capabilities": ["workspace_mutate", "conversation_helper", "conversation_send"],
       "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
       "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
       "agent_mode_claude_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
@@ -249,16 +249,16 @@
     },
     "tool_capabilities": {
       "app_settings": ["app_settings"],
-      "bind_context": ["routing_advanced"],
-      "manage_workspaces": ["routing_advanced"],
-      "manage_selection": ["context_mutate"],
+      "bind_context": ["workspace_mutate"],
+      "manage_workspaces": ["workspace_mutate"],
+      "manage_selection": ["selection_mutate"],
       "file_actions": ["file_management"],
       "get_code_structure": ["structural_explore"],
       "get_file_tree": ["structural_explore"],
-      "read_file": [],
-      "file_search": [],
-      "workspace_context": ["context_render"],
-      "prompt": ["context_mutate"],
+      "read_file": ["file_read"],
+      "file_search": ["file_search"],
+      "workspace_context": ["workspace_read"],
+      "prompt": ["prompt_mutate"],
       "apply_edits": ["file_content_edit"],
       "oracle_utils": ["conversation_helper"],
       "ask_oracle": ["agent_conversation_send"],
@@ -274,7 +274,18 @@
       "share_thoughts": ["agent_reasoning_control"],
       "set_status": ["agent_session_control"],
       "wait_for_next_user_instruction": ["agent_reasoning_control"],
-      "history": []
+      "history": ["history_read"]
+    },
+    "client_annotation_profiles": {
+      "direct": "canonical",
+      "discovery": "canonical",
+      "agent_mode_generic_explore": "canonical",
+      "agent_mode_generic_engineer": "canonical",
+      "agent_mode_generic_engineer_orchestrator": "canonical",
+      "agent_mode_claude_engineer": "canonical",
+      "agent_mode_codex_engineer": "suppress_read_only_hint",
+      "agent_mode_open_code_engineer": "canonical",
+      "agent_mode_cursor_engineer": "canonical"
     },
     "resolved_tool_policy_projection_classification": "production_policy_projection_not_runtime_registry_evidence",
     "resolved_tool_policy_projection": {
@@ -301,7 +312,7 @@
     "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay"
   },
   "main_actor": {
-    "mcp_local_declaration_count": 42,
+    "mcp_local_declaration_count": 41,
     "mcp_local_declaration_sites": [
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
@@ -357,11 +368,6 @@
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Policies/MCPGitArtifactAdvertisementRegistry.swift",
         "kind": "class",
         "symbol": "MCPGitArtifactAdvertisementRegistry"
-      },
-      {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift",
-        "kind": "enum",
-        "symbol": "ServiceRegistry"
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/ToolAvailabilityStore.swift",

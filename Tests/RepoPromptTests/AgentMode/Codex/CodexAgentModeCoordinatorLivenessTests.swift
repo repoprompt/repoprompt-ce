@@ -153,6 +153,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
         XCTAssertEqual(controller.shutdownCountSync(), 1)
         XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertFalse(controller.startOrResumeObservedCancellationSync())
         XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
         XCTAssertEqual(session.runState, .running)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
@@ -3131,6 +3132,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     private var readSnapshotCount = 0
     private var readSnapshotIncludeTurnsValues: [Bool] = []
     private var startOrResumeCount = 0
+    private var startOrResumeObservedCancellation = false
     private var startUserTurnCount = 0
     private var startedUserTurnTexts: [String] = []
     private var steerUserTurnIDs: [String] = []
@@ -3220,6 +3222,10 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         startOrResumeCount
     }
 
+    func startOrResumeObservedCancellationSync() -> Bool {
+        startOrResumeObservedCancellation
+    }
+
     func startUserTurnCountSync() -> Int {
         startUserTurnCount
     }
@@ -3246,16 +3252,19 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
         startOrResumeCount += 1
+        startOrResumeObservedCancellation = startOrResumeObservedCancellation || Task.isCancelled
         return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?) async throws -> CodexNativeSessionController.SessionRef {
         startOrResumeCount += 1
+        startOrResumeObservedCancellation = startOrResumeObservedCancellation || Task.isCancelled
         return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexNativeSessionController.SessionRef {
         startOrResumeCount += 1
+        startOrResumeObservedCancellation = startOrResumeObservedCancellation || Task.isCancelled
         return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
 

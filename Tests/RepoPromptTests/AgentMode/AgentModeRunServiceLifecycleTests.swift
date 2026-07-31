@@ -1542,7 +1542,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await MCPRoutingWaiter.notifyRouted(runID: runID)
             }
         }
-        let serverEnabler: AgentModeViewModel.MCPServerEnabler = {}
+        let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
         let host = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,

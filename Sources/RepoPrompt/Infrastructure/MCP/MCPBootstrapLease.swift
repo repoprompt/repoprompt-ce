@@ -163,7 +163,7 @@ actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
     private var spec: MCPBootstrapLeaseSpec
-    private let mcpServerEnabler: (() async -> Void)?
+    private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
@@ -203,7 +203,7 @@ actor MCPBootstrapLease {
     ///     `ServerNetworkManager.shared.clearClientConnectionPolicy(...)`.
     init(
         spec: MCPBootstrapLeaseSpec,
-        mcpServerEnabler: (() async -> Void)? = nil,
+        mcpServerEnabler: (() async -> Bool)? = nil,
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
@@ -239,7 +239,11 @@ actor MCPBootstrapLease {
         // Ensure MCP server is started (agent-mode hook)
         if let enabler = mcpServerEnabler {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) enabling MCP server before gate acquire")
-            await enabler()
+            guard await enabler() else {
+                acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) MCP server enabler failed")
+                await cancelAndCleanup()
+                return false
+            }
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) MCP server enabler completed")
             if shouldAbortAcquire {
                 await cancelAndCleanup()

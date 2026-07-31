@@ -36,7 +36,8 @@ import XCTest
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 try await activateWorkspace(fixture.contextA)
-                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                let serverStarted = await fixture.contextA.window.mcpServer.startServer()
+                XCTAssertTrue(serverStarted)
                 WindowStatesManager.shared.registerWindowState(fixture.contextA.window)
                 let manager = fixture.networkManager
                 let capture = ExplicitWindowRoutingHintCapture()

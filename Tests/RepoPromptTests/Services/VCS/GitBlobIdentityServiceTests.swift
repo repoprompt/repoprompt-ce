@@ -424,8 +424,9 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let child = try fixture.makeRepository(named: "child", files: ["Child.swift": "let child = 1\n"])
         let parent = try fixture.makeRepository(named: "parent", files: ["Real/File.swift": "let real = 1\n"])
+        let childOID = try fixture.head(at: child)
         _ = try fixture.runGit(
-            ["-c", "protocol.file.allow=always", "submodule", "add", child.path, "Vendor/Sub"],
+            ["update-index", "--add", "--cacheinfo", "160000,\(childOID),Vendor/Sub"],
             at: parent
         )
         try fixture.commit("Add submodule", at: parent)

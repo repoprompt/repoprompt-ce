@@ -1,11 +1,11 @@
 # Swift 6.2 Concurrency Migration Ledger
 
-Updated: 2026-07-20
+Updated: 2026-07-26
 
 ## Toolchain and policy
 
 - Active compiler: Apple Swift 6.2.4 (`swift-driver` 1.127.15), arm64-apple-macosx26.0.
-- Root package tools version: 6.2; package default and all non-Item-6 targets remain in Swift 5 language mode.
+- Root package tools version: 6.2; the package default remains Swift 5. Target-local Swift 6 boundaries are listed below; the headless domain runtime is first evidenced with Swift 5 complete checking before its separate M1 language-mode promotion.
 - Migration policy: target-scoped complete strict-concurrency checking first, followed by independently evidenced target-local `.swiftLanguageMode(.v6)`. No default MainActor or Swift 6.2 execution/isolation feature is adopted by this tranche.
 
 ## Completed boundaries
@@ -20,6 +20,7 @@ Updated: 2026-07-20
 | Highlighting query compatibility and C# coverage (Item 13) | `a8885ac9b4fefb7e3af170b5899ad80d5037d7da` | Swift 6 unchanged | All 14 app-owned highlighting queries compile against their registered grammars; C# completes the 14-language CodeMapCore fixture/golden matrix without changing the existing 13 outputs. |
 | `RepoPromptRegexCore` | extraction `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; eight owner tests and Swift 5 app-consumer linkage pass. |
 | `RepoPromptCodeMapCore` / owner tests | extraction `22bfff1c5904d5f02c0a881055142c94f4783a84`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; 16 owner tests, mixed-mode app tests, and both Swift 5 product builds pass. |
+| `RepoPromptDomainRuntime` / owner tests (M1 foundation) | Swift 5 foundation `76f3dcae131b2880a37a4c0ef6d1e80b2e784129`; Swift 6 promotion `5ccbc063` | Swift 6 | AppKit-free runtime/catalog/registry boundary, inert app composition, app/owner consumers, and normalized schema golden forwarding. Complete Swift 5 owner evidence precedes the target-local language promotion; Swift 6 owner and mixed-mode consumer evidence is recorded below. |
 
 ## Item 3 ownership record
 
@@ -52,7 +53,7 @@ Test ownership:
 | `nonisolated(unsafe)` on standard-library `Regex` constants | 25 existing annotations in `LanguageTypeExtractor` | Every value is immutable and initialized once; matching is nonmutating; no mutable shared cache or escaping match state is hidden by the annotation. The annotation exists because the standard-library `Regex` output metadata used here does not expose Sendable conformance. | Re-audit when the deployed Swift standard library makes these concrete/type-erased `Regex` values Sendable; remove only when the active minimum toolchain compiles the declarations without the escape hatch. |
 | `PCRE2Regex: @unchecked Sendable` | One existing class in `RepoPromptRegexCore` | Compilation, including JIT, completes before publication and the compiled `pcre2_code` is immutable afterward. Ordinary matches allocate independent match data/context; `MatchSession` owns mutable state, is deliberately non-Sendable, and is confined to one sequential consumer. A live call retains the regex, preventing deinitialization from racing the call. The current implementation therefore needs no lock around immutable compiled code. | Re-audit on a PCRE2 upgrade or any change that shares mutable match/session state, mutates compiled code after publication, or changes lifetime ownership. |
 
-No new escape hatch or source annotation was added for Item 6. The four target logs and raw verbose invocation evidence contain zero diagnostics attributed to their source or owner-test paths.
+No new escape hatch or source annotation was added for Item 6. M1 likewise adds no `nonisolated(unsafe)`, `@unchecked Sendable`, `@preconcurrency`, or default-actor-isolation escape hatch to `RepoPromptDomainRuntime`. The four target logs and raw verbose invocation evidence contain zero diagnostics attributed to their source or owner-test paths.
 
 ## Item 3 evidence
 
@@ -76,6 +77,20 @@ No new escape hatch or source annotation was added for Item 6. The four target l
 - Swift 5 consumer products: RepoPrompt ticket `6c091ce4…`; repoprompt-mcp ticket `afed7b28…`; both built successfully.
 - Phase boundary: full root ticket `a5f3c831…` passed in 9m28s; full provider ticket `11ad3aad…` passed; lint ticket `ce6cd2f4…`, 23 generator contract tests, and source/license guardrails passed.
 - Package default remains `swiftLanguageModes: [.v5]`; `Package.resolved` and all source files are unchanged.
+
+## M1 headless domain-runtime foundation evidence
+
+- Swift 5 + complete strict-concurrency owner target: conductor ticket `a118d193-0e41-4cd9-93f9-721da73880cd` passed all 9 catalog, per-client visibility/annotation, registry atomicity/generation/concurrency, fingerprint, and inert lifecycle tests with no diagnostics attributed to `Sources/RepoPromptDomainRuntime` or `Tests/RepoPromptDomainRuntimeTests`.
+- Swift 5 consumers: `RepoPrompt` product ticket `ce9039ae-22d8-4a6e-8c83-3e08a682aefa`; `repoprompt-mcp` product ticket `ff33c74a-8d9f-4582-bf7f-7158d01dd773`; both completed successfully before the language-mode change.
+- Target-local Swift 6 promotion: the generated SwiftPM build plan records `-swift-version 6` for `RepoPromptDomainRuntime` and `RepoPromptDomainRuntimeTests`, while `RepoPromptApp` remains `-swift-version 5`; manifest inspection confirms `RepoPromptTests` also retains the package-default Swift 5 mode. Owner ticket `599e517a-6e0b-4e95-ba4c-46b8dc9fa72d` passed all 9 tests after promotion.
+- Swift 6 mixed-mode consumers: `RepoPrompt` product ticket `0e5327fe-cce1-498d-a11d-521288424a9c`; `repoprompt-mcp` product ticket `fb6dff0e-e25c-40af-b48f-667c43bdcab6`; both completed successfully with the package default unchanged.
+- Frozen contract and app adapter parity: M0 contract ticket `cd154249-761a-427f-bd68-9f8045f91265` (3 tests) and catalog/fingerprint/annotation ticket `a654a699-b62d-4ffa-9da2-bbc7de8aa431` (6 tests) passed. The 24 window schema golden signatures are unchanged.
+- Foundation surfaces: Swift 5 strict lint ticket `8a99f8d2-39db-4f41-8e2e-4b8a9b4dd1a8`; Swift 6 promotion lint ticket `d46d3401-2a4e-46ba-9db8-e037ce612e84`; 24 generated-Xcode contracts and source/license guardrails passed after both phases. No visible app lifecycle command or persisted-state migration was run.
+- Review remediation preserves generation/revision across byte-identical registration, keeps replacement fencing for changed fingerprints, scopes canonical fingerprint authority to live registrations, restores unique-window routing, makes enablement follow successful registration, and surfaces typed registration errors with release logging. Swift 6 owner ticket `5228546e-43b3-4158-9495-f0fdd34f31d7` passed all 9 tests; mixed-mode catalog/registration ticket `afb0383b-3a7a-47d1-a57c-0971f39edcda` passed all 7 tests. Bootstrap ticket `ec82203b-8b9f-4e6f-b1cc-17df2a5abd72` passed 16 tests, including fail-closed MCP readiness; Agent lifecycle ticket `f325081a-6cd6-445f-be05-4385f1c47c7a` passed all 34 tests.
+- Compatibility and consumer evidence: M0 contract ticket `fed6ab9f-6592-4a68-8882-ab5dcfb40e77` passed 3 tests; `agent_manage list_agents` capability fixture ticket `2730149b-e320-4ee8-9866-e9728ec0d38f` passed with the serialized `agent_session_control` name retained; `RepoPrompt` product ticket `3697d3a9-af19-4983-99a2-e7050e1d43ba` and `repoprompt-mcp` product ticket `953a19f9-e6e5-4ec9-a6a3-8f5c91e9d038` passed.
+- Review-remediation surfaces: strict lint ticket `62ff9d4c-f918-4542-bde3-4c5ad36e9b83`; authoritative root list and final ledger reconciliation ticket `e82afabf-25f9-4015-9ee9-998a3df5ea73`; provider reconciliation ticket `99725714-1682-4f8e-b466-3be9a98a3dad`; exact reconciliation passed at 3,569 IDs; source/license guardrails and all 24 generated-Xcode contracts passed. No visible app lifecycle command, persistence migration, M2 authority move, push, or PR operation was run.
+- Hosted-CI registration remediation makes application-scoped app-settings and routing services process-lifetime composition owned and removes asynchronous self-registration from `WindowRoutingService`; fixtures join without receiving unregister authority. The focused composition/readiness regression passed under ticket `57a6f0b3-2b4d-4fec-ba04-24a692a1002b`; bootstrap ownership passed 16 tests under `1f325a55-0b33-4b59-9643-e74cf9e56c77`; watchdog/catalog dispatch passed 22 tests under `81ffa576-bde9-4e62-8a4d-dedb9cb6e5fd`; and the Swift 6 runtime owner suite passed under `fba43d8a-8468-47b6-90c5-8b011bfd3d2c`. Swift 5 consumer builds passed for `RepoPrompt` (`c0fb80aa-4c68-4805-942a-d2b6e776338d`) and `repoprompt-mcp` (`0aa1d62a-ddae-466f-a051-d5d8fc48ecf8`); strict lint passed under `f0bf1a30-b9d8-4019-b7b4-278d02e2a5df`; exact ledger reconciliation passed at 3,570 IDs with root ticket `aab63c09-aa10-410e-82fe-12ce4c9ffdd4` and provider ticket `9382c215-7f61-4576-9f39-5828a322381a`.
+- Global-registration review follow-up makes AppDelegate startup the explicit registration mutator, keeps readiness observation-only with bounded backoff and one AppDelegate-owned startup failure diagnostic, fails closed for bound and ambiguous tool-list calls, and limits watchdog fixtures to restoring only their temporary availability toggle. Startup/readiness coverage passed under ticket `b9a267e8-f26e-4544-b3b7-b2ce13871919`; all 22 watchdog integrations passed under `5fd2e7cb-a743-4fd7-81d7-2de477c5ae96`; bootstrap ownership passed under `a71ab852-cb8d-4fe2-ae55-4a3dac0e8bec`; and the Swift 6 runtime owner suite passed under `e408fd29-d792-4dfe-a06d-1662c5bdb772`. Swift 5 consumer builds passed for `RepoPrompt` (`98d59975-17e4-49bb-b1bb-98960a411bed`) and `repoprompt-mcp` (`f16b32b4-9422-4127-9479-824916937977`); strict lint passed under `ef22d371-5d88-4969-85e8-56147519b990`; authoritative root listing passed under `1b164383-0fa2-4486-8f35-2081c15995ae`; and exact 3,570-ID ledger reconciliation passed with root ticket `54817af5-47af-4436-98f8-a8d6eb23086d` and provider ticket `27ce8223-c4f4-4d0f-94c4-9ce7e12e2074`.
 
 ## Item 8 official-source cleanup evidence
 

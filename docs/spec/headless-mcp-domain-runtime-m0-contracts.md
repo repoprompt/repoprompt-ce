@@ -25,21 +25,21 @@ Each row carries a source path, behavior marker, and typed-error marker checked 
 
 ### Tool policy and parity ledger
 
-Capability names below are from `MCPToolCapabilities`; `none` is intentional for tools currently outside capability mapping. Owner is the current app-side authority. “Headless” is the frozen expectation for the later family migration, not an M0 implementation claim.
+Capability names below are from the domain-runtime `MCPDomainToolCatalog`; every public tool has one explicit capability classification. Owner is the current app-side authority. “Headless” is the frozen expectation for the later family migration, not an M0 implementation claim.
 
 | Tool | Capability | Admission / execution | Current owner | Schema/action fixture | Denied/cancel/lifecycle contract | App / headless expectation |
 |---|---|---|---|---|---|---|
 | `app_settings` | app_settings | exclusive / bounded | `AppSettingsMCPService` | manifest + service schema | invalid params; connection cancellation | app authoritative / exact later parity |
-| `bind_context` | routing_advanced | exclusive / workspace lifecycle | `WindowRoutingService` | manifest + service schema | invalid context; bind lifecycle | app authoritative / exact later parity |
-| `manage_workspaces` | routing_advanced | exclusive / workspace lifecycle | `WindowRoutingService` | manifest + service schema | approval/invalid target; workspace lifecycle | app authoritative / exact later parity |
-| `manage_selection` | context_mutate | exclusive / bounded | `MCPSelectionToolProvider` | manifest + catalog golden | artifact fence/invalid params; request cancellation | app authoritative / exact later parity |
+| `bind_context` | workspace_mutate | exclusive / workspace lifecycle | `WindowRoutingService` | manifest + service schema | invalid context; bind lifecycle | app authoritative / exact later parity |
+| `manage_workspaces` | workspace_mutate | exclusive / workspace lifecycle | `WindowRoutingService` | manifest + service schema | approval/invalid target; workspace lifecycle | app authoritative / exact later parity |
+| `manage_selection` | selection_mutate | exclusive / bounded | `MCPSelectionToolProvider` | manifest + catalog golden | artifact fence/invalid params; request cancellation | app authoritative / exact later parity |
 | `file_actions` | file_management | exclusive / bounded | `MCPFileToolProvider` | manifest + catalog golden | mutation/approval errors; request cancellation | app authoritative / exact later parity |
 | `get_code_structure` | structural_explore | small_read / bounded | `MCPFileToolProvider` | manifest + catalog golden | lookup/invalid params; bounded cleanup | app authoritative / exact later parity |
 | `get_file_tree` | structural_explore | small_read / bounded | `MCPFileToolProvider` | manifest + catalog golden | lookup/invalid params; bounded cleanup | app authoritative / exact later parity |
-| `read_file` | none | small_read / bounded | `MCPFileToolProvider` | manifest + catalog golden | authorization/lookup; bounded cleanup | app authoritative / exact later parity |
-| `file_search` | none | file_search / long synchronous | `MCPFileToolProvider` | manifest + catalog golden | lookup/overload; cooperative cancellation | app authoritative / exact later parity |
-| `workspace_context` | context_render | exclusive / bounded | `MCPPromptContextToolProvider` | manifest + catalog golden | export/selector errors; request cancellation | app authoritative / exact later parity |
-| `prompt` | context_mutate | exclusive / bounded | `MCPPromptContextToolProvider` | manifest + catalog golden | export/selector errors; request cancellation | app authoritative / exact later parity |
+| `read_file` | file_read | small_read / bounded | `MCPFileToolProvider` | manifest + catalog golden | authorization/lookup; bounded cleanup | app authoritative / exact later parity |
+| `file_search` | file_search | file_search / long synchronous | `MCPFileToolProvider` | manifest + catalog golden | lookup/overload; cooperative cancellation | app authoritative / exact later parity |
+| `workspace_context` | workspace_read | exclusive / bounded | `MCPPromptContextToolProvider` | manifest + catalog golden | export/selector errors; request cancellation | app authoritative / exact later parity |
+| `prompt` | prompt_mutate | exclusive / bounded | `MCPPromptContextToolProvider` | manifest + catalog golden | export/selector errors; request cancellation | app authoritative / exact later parity |
 | `apply_edits` | file_content_edit | exclusive / interactive | `MCPApplyEditsToolProvider` | manifest + catalog golden | approval/rebase/invalid mode; interactive lifecycle | app authoritative / exact later parity |
 | `oracle_utils` | conversation_helper | control / long synchronous | `MCPOracleToolProvider` | manifest + catalog golden | chat/model errors; cooperative cancellation | app authoritative / exact later parity |
 | `ask_oracle` | agent_conversation_send | control / long synchronous | `MCPOracleToolProvider` | manifest + catalog golden | policy/provider errors; cooperative cancellation | app authoritative / exact later parity |
@@ -53,11 +53,11 @@ Capability names below are from `MCPToolCapabilities`; `none` is intentional for
 | `agent_run` | agent_external_control | control / lifecycle managed | `MCPAgentControlToolProvider` | manifest + catalog golden | policy/provider errors; session lifecycle | app authoritative / exact later parity |
 | `agent_manage` | agent_external_control | control / bounded | `MCPAgentControlToolProvider` | manifest + catalog golden | ownership/invalid session; bounded cleanup | app authoritative / exact later parity |
 | `share_thoughts` | agent_reasoning_control | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
-| `set_status` | agent_session_control | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
+| `set_status` | status_publication (`agent_session_control` serialized compatibility name) | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden + `list_agents` capability fixture | policy/identity errors; request cancellation | app authoritative / exact later parity |
 | `wait_for_next_user_instruction` | agent_reasoning_control | control / interactive | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | terminal/cancel; interactive lifecycle | app authoritative / exact later parity |
-| `history` | none | control / bounded | `MCPHistoryToolProvider` → `HistoryMCPToolService` | manifest + catalog golden | scan budget/invalid params; request cancellation | app authoritative / exact later parity |
+| `history` | history_read | control / bounded | `MCPHistoryToolProvider` → `HistoryMCPToolService` | manifest + catalog golden | scan budget/invalid params; request cancellation | app authoritative / exact later parity |
 
-The manifest freezes the complete tool-to-capability map, including deliberate empty mappings. It also freezes a resolved **production-policy projection**—after restricted-tool filtering, policy-gated grants, and role advertisement—for direct, discovery, generic explore, generic engineer, orchestrator engineer, Claude, Codex, OpenCode, and Cursor profiles. XCTest derives every projection from `MCPToolCapabilities`, `DiscoverMCPToolPolicy`, `AgentModeMCPToolPolicy`, `MCPPolicyGatedTools`, and `AgentModeMCPToolAdvertisementPolicy`; the JSON is not an independent prose assertion. This is deliberately not described as actual runtime `tools/list` registry evidence because M0 does not exercise service registration, user-disabled tools, duplicate suppression, readiness, or connection routing. Admission and execution partitions remain exhaustive and fail closed.
+The manifest freezes the complete tool-to-capability map, including deliberate empty mappings, and explicit per-client annotation profiles. It also freezes a resolved **production-policy projection**—after restricted-tool filtering, policy-gated grants, and role advertisement—for direct, discovery, generic explore, generic engineer, orchestrator engineer, Claude, Codex, OpenCode, and Cursor profiles. XCTest derives every projection from `MCPToolCapabilities`, `DiscoverMCPToolPolicy`, `AgentModeMCPToolPolicy`, `MCPPolicyGatedTools`, and `AgentModeMCPToolAdvertisementPolicy`; the JSON is not an independent prose assertion. This is deliberately not described as actual runtime `tools/list` registry evidence because M0 does not exercise service registration, user-disabled tools, duplicate suppression, readiness, or connection routing. Admission and execution partitions remain exhaustive and fail closed.
 
 ### Dependency and MainActor boundary
 
@@ -146,4 +146,4 @@ The SDK stdio assessment, catalog/actions/defaults/typed errors, capability and 
 
 ### Eight-PR boundary preserved
 
-This first PR remains M0 only. It adds no runtime target, production token type, child listener, credential handoff, persistence journal, provider migration, child launch, CLI reroute, or app cleanup. Those remain obligations of M1–M7 in the established eight-PR sequence; the two carried-forward measurements above are prerequisites for their named decision points, not permission to implement them here.
+The first PR remains M0 only and added no runtime target, production token type, child listener, credential handoff, persistence journal, provider migration, context migration, or UI authority migration. M1 layers only the AppKit-free `RepoPromptDomainRuntime` foundation and owner tests onto this contract: canonical names/capabilities/admission/client annotation profiles, normalized fingerprints, runtime identity/lifecycle values, and an actor registry. `ServiceRegistry` forwards app bindings to that authority; workspace/context authority, child launch, credentials, and providers remain outside the M1 target.

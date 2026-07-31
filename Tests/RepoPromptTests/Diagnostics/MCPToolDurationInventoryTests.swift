@@ -84,6 +84,7 @@ import XCTest
                 XCTAssertEqual(
                     MCPToolDurationInventory.detachAndSettleToolNames,
                     [
+                        MCPWindowToolName.fileActions,
                         MCPWindowToolName.getCodeStructure,
                         MCPWindowToolName.getFileTree,
                         MCPWindowToolName.readFile
@@ -207,6 +208,11 @@ import XCTest
                     caseLabel
                 )
                 XCTAssertEqual(
+                    (payload["file_action_trash_execution_deadline_seconds"] as? NSNumber)?.intValue,
+                    MCPTimeoutPolicy.fileActionTrashExecutionDeadlineSeconds,
+                    caseLabel
+                )
+                XCTAssertEqual(
                     (payload["workspace_switch_execution_deadline_seconds"] as? NSNumber)?.intValue,
                     MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds,
                     caseLabel
@@ -242,6 +248,7 @@ import XCTest
                 XCTAssertEqual(
                     payload["detach_and_settle_tools"] as? [String],
                     [
+                        MCPWindowToolName.fileActions,
                         MCPWindowToolName.getCodeStructure,
                         MCPWindowToolName.getFileTree,
                         MCPWindowToolName.readFile
@@ -256,6 +263,24 @@ import XCTest
                 XCTAssertEqual(
                     getCodeStructure["cleanup_disposition"] as? String,
                     MCPToolExecutionCleanupDisposition.detachAndSettle.rawValue,
+                    caseLabel
+                )
+                let fileActions = try XCTUnwrap(tools.first {
+                    $0["tool"] as? String == MCPWindowToolName.fileActions
+                }, caseLabel)
+                let fileActionOverrides = try XCTUnwrap(
+                    fileActions["conditional_execution_overrides"] as? [[String: Any]],
+                    caseLabel
+                )
+                XCTAssertEqual(fileActionOverrides.map { $0["action"] as? String }, ["delete"], caseLabel)
+                XCTAssertEqual(
+                    fileActionOverrides.map { ($0["execution_deadline_seconds"] as? NSNumber)?.intValue },
+                    [MCPTimeoutPolicy.fileActionTrashExecutionDeadlineSeconds],
+                    caseLabel
+                )
+                XCTAssertEqual(
+                    fileActionOverrides.map { $0["cleanup_disposition"] as? String },
+                    [MCPToolExecutionCleanupDisposition.detachAndSettle.rawValue],
                     caseLabel
                 )
                 let manageWorkspaces = try XCTUnwrap(tools.first {

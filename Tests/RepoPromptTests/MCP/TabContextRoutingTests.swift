@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class TabContextRoutingTests: XCTestCase {
@@ -1859,13 +1860,16 @@ final class TabContextRoutingTests: XCTestCase {
         let connectionID = UUID()
         let windowState = NSObject()
         let serverViewModel = NSObject()
-        let catalogService = NSObject()
         let connection = NSObject()
         let identity = ServerNetworkManager.WindowToolDispatchIdentity(
             windowID: 7,
             windowStateIdentity: ObjectIdentifier(windowState),
             serverViewModelIdentity: ObjectIdentifier(serverViewModel),
-            catalogServiceIdentity: ObjectIdentifier(catalogService)
+            catalogRegistrationHandle: MCPDomainToolRegistrationHandle(
+                registryID: UUID(),
+                registrationID: .init(rawValue: 7),
+                generation: 1
+            )
         )
         let authorization = ServerNetworkManager.ToolDispatchAuthorization(
             connectionID: connectionID,

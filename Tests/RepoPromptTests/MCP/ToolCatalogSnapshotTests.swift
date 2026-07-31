@@ -1,9 +1,9 @@
-import CryptoKit
 import Darwin
 import Foundation
 import MCP
 import Ontology
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -40,6 +40,836 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         }
 
         XCTAssertEqual(signatures, Self.expectedSignatures)
+    }
+
+    func testReadinessCoalescesLightweightScopeQueriesForOneTenAndOneHundredWaiters() async throws {
+        #if DEBUG
+            for waiterCount in [1, 10, 100] {
+                let queryProbe = MCPReadinessScopePresenceProbe()
+                let joinedBarrier = AsyncTestBarrier(participantCount: waiterCount)
+                let readiness = MCPToolCatalogReadiness(
+                    scopePresenceOperation: { requiredNames, scope in
+                        await queryProbe.query(requiredNames: requiredNames, scope: scope)
+                    },
+                    windowStateOperation: { _ in
+                        MCPToolCatalogReadiness.WindowRegistrationState(
+                            toolsEnabled: true,
+                            toolsRequested: true
+                        )
+                    },
+                    checkJoinedOperation: { _ in
+                        await joinedBarrier.arriveAndWait()
+                    }
+                )
+
+                let waiters = (0 ..< waiterCount).map { _ in
+                    Task { await readiness.awaitReady(windowID: 901, timeout: 60) }
+                }
+                await queryProbe.waitUntilFirstQueryEntered()
+                await joinedBarrier.waitUntilComplete()
+                let queriesWhileBlocked = await queryProbe.queryCount
+                XCTAssertEqual(
+                    queriesWhileBlocked,
+                    1,
+                    "\(waiterCount) concurrent waiters must share the initial application-scope query."
+                )
+
+                await queryProbe.releaseFirstQuery()
+                for waiter in waiters {
+                    let ready = await waiter.value
+                    XCTAssertTrue(ready)
+                }
+                let finalQueryCount = await queryProbe.queryCount
+                XCTAssertEqual(
+                    finalQueryCount,
+                    2,
+                    "Readiness should perform one application and one window scope-presence query regardless of waiter count."
+                )
+            }
+        #else
+            throw XCTSkip("Readiness operation-count probes require DEBUG test seams.")
+        #endif
+    }
+
+    func testPresentationSummaryPublicationDoesNotReregisterActiveWindowCatalog() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                window.mcpServer.setServiceForTesting(MCPService(
+                    controllerStartOperation: {},
+                    controllerStopOperation: {},
+                    controllerFullShutdownOperation: {}
+                ))
+
+                let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+                XCTAssertTrue(enabled)
+                let generationBeforeSummary = window.mcpServer.windowToolRegistrationIntentGenerationForTesting()
+                let fixtureToolName = "presentation_only_summary_\(UUID().uuidString)"
+                ToolAvailabilityStore.shared.registerTools([
+                    RepoPromptApp.Tool(
+                        name: fixtureToolName,
+                        description: "Presentation-only summary fixture.",
+                        inputSchema: .object(properties: [:]),
+                        returnsValue: { _ in .object([:]) }
+                    )
+                ])
+
+                await Task { @MainActor in }.value
+                let generationAfterSummary = window.mcpServer.windowToolRegistrationIntentGenerationForTesting()
+                XCTAssertEqual(
+                    generationAfterSummary,
+                    generationBeforeSummary,
+                    "Presentation summaries must not invalidate or re-register the window catalog."
+                )
+
+                ToolAvailabilityStore.shared.unregisterTools([fixtureToolName])
+                _ = await window.mcpServer.setWindowToolsEnabled(false)
+            }
+        #else
+            throw XCTSkip("Window registration intent inspection is DEBUG-only.")
+        #endif
+    }
+
+    func testMCPServiceConcurrentColdJoinsAreSingleFlight() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success])
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: {},
+                controllerFullShutdownOperation: {}
+            )
+            let windowIDs = Array(101 ... 108)
+            let joins = windowIDs.map { windowID in
+                Task { try await service.join(windowID: windowID) }
+            }
+
+            await startProbe.waitUntilAttemptCount(1)
+            let attemptCountBeforeRelease = await startProbe.attemptCount
+            XCTAssertEqual(attemptCountBeforeRelease, 1)
+            await startProbe.releaseAttempt(1)
+            for join in joins {
+                try await join.value
+            }
+
+            let finalAttemptCount = await startProbe.attemptCount
+            let participants = await service.participatingWindowIDsForTesting()
+            let state = await service.currentState()
+            XCTAssertEqual(finalAttemptCount, 1)
+            XCTAssertEqual(participants, Set(windowIDs))
+            XCTAssertTrue(state.isRunning)
+        #else
+            throw XCTSkip("MCP service participation inspection is DEBUG-only")
+        #endif
+    }
+
+    func testMCPServiceSupersededJoinCannotRemoveSameWindowRejoin() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success, .success])
+            let shutdownGate = AsyncTestGate()
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: {},
+                controllerFullShutdownOperation: { await shutdownGate.arriveAndWait() }
+            )
+
+            let staleJoin = Task { try await service.join(windowID: 151) }
+            await startProbe.waitUntilAttemptCount(1)
+            let shutdown = Task { await service.fullShutdown() }
+            await shutdownGate.waitUntilEntered()
+            let replacementJoin = Task { try await service.join(windowID: 151) }
+
+            await startProbe.releaseAttempt(1)
+            do {
+                try await staleJoin.value
+                XCTFail("The pre-shutdown join must be superseded.")
+            } catch {
+                // Expected lifecycle supersession.
+            }
+            let participantsAfterStaleCompletion = await service.participatingWindowIDsForTesting()
+            XCTAssertEqual(participantsAfterStaleCompletion, [151])
+
+            await shutdownGate.release()
+            await startProbe.waitUntilAttemptCount(2)
+            await startProbe.releaseAttempt(2)
+            try await replacementJoin.value
+            await shutdown.value
+
+            let finalParticipants = await service.participatingWindowIDsForTesting()
+            let finalState = await service.currentState()
+            XCTAssertEqual(finalParticipants, [151])
+            XCTAssertTrue(finalState.isRunning)
+        #else
+            throw XCTSkip("MCP service participation inspection is DEBUG-only")
+        #endif
+    }
+
+    func testMCPServiceCancelledJoinRemovesOnlyItsSharedStartClaim() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success])
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: {},
+                controllerFullShutdownOperation: {}
+            )
+
+            let cancelledJoin = Task { try await service.join(windowID: 171) }
+            let retainedJoin = Task { try await service.join(windowID: 172) }
+            await startProbe.waitUntilAttemptCount(1)
+            cancelledJoin.cancel()
+            await startProbe.releaseAttempt(1)
+
+            do {
+                try await cancelledJoin.value
+                XCTFail("The cancelled join must throw.")
+            } catch is CancellationError {
+                // Expected.
+            }
+            try await retainedJoin.value
+
+            let participants = await service.participatingWindowIDsForTesting()
+            let state = await service.currentState()
+            let attemptCount = await startProbe.attemptCount
+            XCTAssertEqual(participants, [172])
+            XCTAssertTrue(state.isRunning)
+            XCTAssertEqual(attemptCount, 1)
+        #else
+            throw XCTSkip("MCP service participation inspection is DEBUG-only")
+        #endif
+    }
+
+    func testMCPServiceDuplicateLeaveConsumesSuspendedStartAttemptOnce() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success])
+            let teardownProbe = ControlledMCPServiceTeardownProbe(attempts: 1)
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: { await teardownProbe.tearDown() },
+                controllerFullShutdownOperation: {}
+            )
+
+            let join = Task { try await service.join(windowID: 180) }
+            await startProbe.waitUntilAttemptCount(1)
+            let firstLeave = Task { await service.leave(windowID: 180) }
+            await teardownProbe.waitUntilAttemptCount(1)
+
+            await service.leave(windowID: 180)
+            let teardownRequests = await service.teardownRequestCountForTesting()
+            XCTAssertEqual(teardownRequests, 1, "A duplicate leave must not retain and tear down the superseded start twice.")
+
+            await teardownProbe.releaseAttempt(1)
+            await startProbe.releaseAttempt(1)
+            await firstLeave.value
+            do {
+                try await join.value
+                XCTFail("The suspended join must be superseded by leave.")
+            } catch {
+                // Expected lifecycle supersession.
+            }
+
+            let participants = await service.participatingWindowIDsForTesting()
+            let state = await service.currentState()
+            XCTAssertTrue(participants.isEmpty)
+            XCTAssertFalse(state.isRunning)
+        #else
+            throw XCTSkip("MCP service teardown inspection is DEBUG-only")
+        #endif
+    }
+
+    func testMCPServiceOverlappingShutdownsFormOneCompleteRestartBarrier() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success, .success])
+            let teardownProbe = ControlledMCPServiceTeardownProbe(attempts: 2)
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: {},
+                controllerFullShutdownOperation: { await teardownProbe.tearDown() }
+            )
+
+            let initialJoin = Task { try await service.join(windowID: 181) }
+            await startProbe.waitUntilAttemptCount(1)
+            await startProbe.releaseAttempt(1)
+            try await initialJoin.value
+
+            let firstShutdown = Task { await service.fullShutdown() }
+            await teardownProbe.waitUntilAttemptCount(1)
+            let secondShutdown = Task { await service.fullShutdown() }
+            let secondRequestRegistered = await Self.waitForTeardownRequestCount(2, service: service)
+            XCTAssertTrue(secondRequestRegistered)
+
+            let replacementJoin = Task { try await service.join(windowID: 182) }
+            await teardownProbe.releaseAttempt(1)
+            await teardownProbe.waitUntilAttemptCount(2)
+            let startCountBeforeCompleteBarrier = await startProbe.attemptCount
+            XCTAssertEqual(startCountBeforeCompleteBarrier, 1)
+
+            await teardownProbe.releaseAttempt(2)
+            await startProbe.waitUntilAttemptCount(2)
+            await startProbe.releaseAttempt(2)
+            try await replacementJoin.value
+            await firstShutdown.value
+            await secondShutdown.value
+
+            let finalParticipants = await service.participatingWindowIDsForTesting()
+            let finalState = await service.currentState()
+            XCTAssertEqual(finalParticipants, [182])
+            XCTAssertTrue(finalState.isRunning)
+        #else
+            throw XCTSkip("MCP service teardown inspection is DEBUG-only")
+        #endif
+    }
+
+    func testMCPServiceFailedStartRollsBackParticipantsAndRetryStarts() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.failure, .success])
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: {},
+                controllerFullShutdownOperation: {}
+            )
+
+            let firstJoin = Task { try await service.join(windowID: 201) }
+            await startProbe.waitUntilAttemptCount(1)
+            await startProbe.releaseAttempt(1)
+            do {
+                try await firstJoin.value
+                XCTFail("The injected first startup must fail.")
+            } catch ControlledMCPServiceStartProbe.Failure.injected {
+                // Expected.
+            }
+
+            let failedParticipants = await service.participatingWindowIDsForTesting()
+            let failedState = await service.currentState()
+            XCTAssertTrue(failedParticipants.isEmpty)
+            XCTAssertFalse(failedState.isRunning)
+
+            let retryJoin = Task { try await service.join(windowID: 202) }
+            await startProbe.waitUntilAttemptCount(2)
+            await startProbe.releaseAttempt(2)
+            try await retryJoin.value
+
+            let retryParticipants = await service.participatingWindowIDsForTesting()
+            let retryState = await service.currentState()
+            let retryAttemptCount = await startProbe.attemptCount
+            XCTAssertEqual(retryParticipants, [202])
+            XCTAssertTrue(retryState.isRunning)
+            XCTAssertEqual(retryAttemptCount, 2)
+        #else
+            throw XCTSkip("MCP service participation inspection is DEBUG-only")
+        #endif
+    }
+
+    func testMCPServiceFullShutdownRestartFailureLeavesNoPhantomParticipants() async throws {
+        #if DEBUG
+            let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success, .failure])
+            let shutdownGate = AsyncTestGate()
+            let service = MCPService(
+                controllerStartOperation: { try await startProbe.start() },
+                controllerStopOperation: {},
+                controllerFullShutdownOperation: { await shutdownGate.arriveAndWait() }
+            )
+
+            let initialJoin = Task { try await service.join(windowID: 301) }
+            await startProbe.waitUntilAttemptCount(1)
+            await startProbe.releaseAttempt(1)
+            try await initialJoin.value
+
+            let shutdown = Task { await service.fullShutdown() }
+            await shutdownGate.waitUntilEntered()
+            let joinEntered = expectation(description: "post-shutdown-boundary join entered")
+            let postBoundaryJoin = Task {
+                joinEntered.fulfill()
+                try await service.join(windowID: 302)
+            }
+            await fulfillment(of: [joinEntered], timeout: 1)
+            let attemptCountDuringShutdown = await startProbe.attemptCount
+            XCTAssertEqual(attemptCountDuringShutdown, 1)
+
+            await shutdownGate.release()
+            await startProbe.waitUntilAttemptCount(2)
+            await startProbe.releaseAttempt(2)
+            do {
+                try await postBoundaryJoin.value
+                XCTFail("The injected restart must fail.")
+            } catch ControlledMCPServiceStartProbe.Failure.injected {
+                // Expected.
+            }
+            await shutdown.value
+
+            let finalParticipants = await service.participatingWindowIDsForTesting()
+            let finalState = await service.currentState()
+            let finalAttemptCount = await startProbe.attemptCount
+            XCTAssertTrue(finalParticipants.isEmpty)
+            XCTAssertFalse(finalState.isRunning)
+            XCTAssertEqual(finalAttemptCount, 2)
+        #else
+            throw XCTSkip("MCP service participation inspection is DEBUG-only")
+        #endif
+    }
+
+    func testServerControllerAwaitsGlobalRegistrationAndFencesSupersededStart() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
+                    let orderingProbe = ServerControllerRegistrationOrderingProbe()
+                    let controller = ServerController(
+                        globalRegistrationOperation: { try await orderingProbe.register() },
+                        beforeTransportActivationOperation: { try await orderingProbe.assertCompleted() },
+                        installNetworkCallbacks: false
+                    )
+                    let start = Task { try await controller.startServer() }
+                    let registrationEntered = await orderingProbe.waitUntilEntered()
+                    XCTAssertTrue(registrationEntered, "ServerController.startServer must invoke global registration.")
+
+                    let blockedState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertFalse(blockedState.isRunning, "Transport must remain stopped while global registration is suspended.")
+                    await orderingProbe.release()
+                    try await start.value
+
+                    let runningState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertTrue(runningState.isRunning)
+                    let catalog = await ServiceRegistry.catalogSnapshot()
+                    XCTAssertTrue(MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                        catalog.activeScopesByToolName[toolName]?.contains(.application) == true
+                    })
+
+                    await controller.fullShutdown()
+                    let supersessionProbe = ServerControllerRegistrationOrderingProbe()
+                    let supersededController = ServerController(
+                        globalRegistrationOperation: { try await supersessionProbe.register() },
+                        beforeTransportActivationOperation: { try await supersessionProbe.assertCompleted() },
+                        installNetworkCallbacks: false
+                    )
+                    let supersededStart = Task { try await supersededController.startServer() }
+                    let supersessionEntered = await supersessionProbe.waitUntilEntered()
+                    XCTAssertTrue(supersessionEntered, "Supersession coverage requires registration to be in flight.")
+                    await supersededController.fullShutdown()
+                    await supersessionProbe.release()
+                    do {
+                        try await supersededStart.value
+                        XCTFail("A full shutdown must supersede registration-blocked startup.")
+                    } catch ServerController.LifecycleError.startSuperseded {
+                        // Expected.
+                    }
+                    let stoppedState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertFalse(stoppedState.isRunning)
+                }
+            }
+        #else
+            throw XCTSkip("Server controller ordering probes require DEBUG lifecycle isolation.")
+        #endif
+    }
+
+    func testServerControllerSetEnabledUsesOrderedSingleFlightAndPropagatesFailure() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
+                    let orderingProbe = ServerControllerRegistrationOrderingProbe()
+                    let controller = ServerController(
+                        globalRegistrationOperation: { try await orderingProbe.register() },
+                        beforeTransportActivationOperation: { try await orderingProbe.assertCompleted() },
+                        installNetworkCallbacks: false
+                    )
+                    let enable = Task { try await controller.setEnabled(true) }
+                    let orderingEntered = await orderingProbe.waitUntilEntered()
+                    XCTAssertTrue(orderingEntered)
+                    let blockedState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertFalse(blockedState.isRunning)
+                    await orderingProbe.release()
+                    try await enable.value
+                    let orderedCounts = await orderingProbe.counts()
+                    XCTAssertEqual(orderedCounts.registration, 1)
+                    XCTAssertEqual(orderedCounts.preActivation, 1)
+
+                    await controller.fullShutdown()
+                    let failureProbe = ServerControllerRegistrationOrderingProbe(failsRegistration: true)
+                    let failingController = ServerController(
+                        globalRegistrationOperation: { try await failureProbe.register() },
+                        beforeTransportActivationOperation: { try await failureProbe.assertCompleted() },
+                        installNetworkCallbacks: false
+                    )
+                    let failedEnable = Task { try await failingController.setEnabled(true) }
+                    let failureEntered = await failureProbe.waitUntilEntered()
+                    XCTAssertTrue(failureEntered)
+                    await failureProbe.release()
+                    do {
+                        try await failedEnable.value
+                        XCTFail("setEnabled(true) must surface global registration failure.")
+                    } catch ServerControllerRegistrationOrderingProbe.Failure.injected {
+                        // Expected.
+                    }
+                    let failureCounts = await failureProbe.counts()
+                    let stoppedState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertEqual(failureCounts.registration, 1)
+                    XCTAssertEqual(failureCounts.preActivation, 0)
+                    XCTAssertFalse(stoppedState.isRunning)
+                }
+            }
+        #else
+            throw XCTSkip("Server controller ordering probes require DEBUG lifecycle isolation.")
+        #endif
+    }
+
+    func testServerControllerSetEnabledReenablesColdTransportAfterDisableAndFullShutdown() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
+                    let controller = ServerController(
+                        globalRegistrationOperation: {},
+                        beforeTransportActivationOperation: {},
+                        installNetworkCallbacks: false
+                    )
+
+                    try await controller.setEnabled(true)
+                    try await controller.setEnabled(false)
+                    let disabledState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertTrue(disabledState.isRunning)
+                    XCTAssertFalse(disabledState.isEnabled)
+
+                    await controller.fullShutdown()
+                    let stoppedState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertFalse(stoppedState.isRunning)
+                    XCTAssertFalse(stoppedState.isEnabled)
+
+                    try await controller.setEnabled(true)
+                    let restartedState = await ServerNetworkManager.shared.debugTransportState()
+                    XCTAssertTrue(restartedState.isRunning)
+                    XCTAssertTrue(
+                        restartedState.isEnabled,
+                        "A cold restart must clear the disabled flag before exposing the transport."
+                    )
+
+                    await controller.fullShutdown()
+                }
+            }
+        #else
+            throw XCTSkip("Server controller transport-state inspection is DEBUG-only.")
+        #endif
+    }
+
+    func testRequestedWindowRegistrationFailureStaysFailClosedUntilExplicitRetry() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                let startProbe = ControlledMCPServiceStartProbe(outcomes: [.failure, .success])
+                let service = MCPService(
+                    controllerStartOperation: { try await startProbe.start() },
+                    controllerStopOperation: {},
+                    controllerFullShutdownOperation: {}
+                )
+                window.mcpServer.setServiceForTesting(service)
+                WindowStatesManager.shared.registerWindowState(window)
+
+                let firstBootstrap = Task { @MainActor in
+                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                }
+                await startProbe.waitUntilAttemptCount(1)
+                await startProbe.releaseAttempt(1)
+                let firstBootstrapReady = await firstBootstrap.value
+                XCTAssertFalse(firstBootstrapReady)
+                XCTAssertTrue(window.mcpServer.windowToolsAreRequested)
+                XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+                XCTAssertNotNil(window.mcpServer.windowToolRegistrationFailureDescription)
+                let failedReadiness = await MCPToolCatalogReadiness.shared.awaitReady(
+                    windowID: window.windowID,
+                    timeout: 0.1
+                )
+                XCTAssertFalse(failedReadiness)
+
+                let retryBootstrap = Task { @MainActor in
+                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                }
+                await startProbe.waitUntilAttemptCount(2)
+                await startProbe.releaseAttempt(2)
+                let retryBootstrapReady = await retryBootstrap.value
+                XCTAssertTrue(retryBootstrapReady)
+                XCTAssertTrue(window.mcpServer.windowToolsAreRequested)
+                XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+                XCTAssertNil(window.mcpServer.windowToolRegistrationFailureDescription)
+                let readyAfterRetry = await MCPToolCatalogReadiness.shared.awaitReady(
+                    windowID: window.windowID,
+                    timeout: 0.2
+                )
+                XCTAssertTrue(readyAfterRetry)
+
+                await window.mcpServer.stopServer()
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+        #else
+            throw XCTSkip("Window registration retry probes require DEBUG service injection.")
+        #endif
+    }
+
+    func testSupersededEnableRetainsRegistrationForDisableAndUniqueWindowRouting() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await Self.purgeStaleWindowScopeRegistrations()
+
+                let supersededWindow = Self.makeWindowWithoutAutoStart()
+                supersededWindow.mcpServer.setServiceForTesting(MCPService(
+                    controllerStartOperation: {},
+                    controllerStopOperation: {},
+                    controllerFullShutdownOperation: {}
+                ))
+                WindowStatesManager.shared.registerWindowState(supersededWindow)
+
+                let registrationGate = AsyncTestGate()
+                supersededWindow.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting {
+                    await registrationGate.arriveAndWait()
+                }
+                let firstEnable = Task { @MainActor in
+                    await supersededWindow.mcpServer.setWindowToolsEnabled(true)
+                }
+                let registrationSuspended = await registrationGate.waitUntilEntered(timeout: .seconds(2))
+                XCTAssertTrue(registrationSuspended, "The first enable must suspend after registering its generation.")
+
+                let supersedingEnable = Task { @MainActor in
+                    await supersededWindow.mcpServer.setWindowToolsEnabled(true)
+                }
+                let secondIntentObserved = await Self.waitForWindowToolIntentGeneration(
+                    2,
+                    window: supersededWindow
+                )
+                XCTAssertTrue(secondIntentObserved)
+
+                let disabling = Task { @MainActor in
+                    await supersededWindow.mcpServer.stopServer()
+                }
+                let disableIntentObserved = await Self.waitForWindowToolIntentGeneration(
+                    3,
+                    window: supersededWindow
+                )
+                XCTAssertTrue(disableIntentObserved)
+
+                await registrationGate.release()
+                let firstEnableResult = await firstEnable.value
+                let supersedingEnableResult = await supersedingEnable.value
+                await disabling.value
+                XCTAssertFalse(firstEnableResult)
+                XCTAssertFalse(supersedingEnableResult)
+                supersededWindow.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting(nil)
+
+                let supersededScope = MCPDomainToolRegistrationScope.window(id: supersededWindow.windowID)
+                let afterDisable = await ServiceRegistry.catalogSnapshot()
+                XCTAssertFalse(
+                    afterDisable.activeScopesByToolName[MCPWindowToolName.readFile]?.contains(supersededScope) == true,
+                    "The disable must reclaim the generation registered by the superseded enable."
+                )
+
+                supersededWindow.beginClose()
+                await supersededWindow.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(supersededWindow)
+
+                let liveWindow = Self.makeWindowWithoutAutoStart()
+                WindowStatesManager.shared.registerWindowState(liveWindow)
+                let liveRegistration: MCPDomainToolRegistrationResult
+                do {
+                    liveRegistration = try await ServiceRegistry.register(
+                        liveWindow.mcpServer.windowMCPToolCatalogService
+                    )
+                } catch {
+                    liveWindow.beginClose()
+                    await liveWindow.tearDown()
+                    WindowStatesManager.shared.unregisterWindowState(liveWindow)
+                    throw error
+                }
+                guard liveRegistration.disposition == .inserted else {
+                    liveWindow.beginClose()
+                    await liveWindow.tearDown()
+                    WindowStatesManager.shared.unregisterWindowState(liveWindow)
+                    throw ToolCatalogFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: liveRegistration.disposition)
+                    )
+                }
+
+                let uniqueReadFile = await ServiceRegistry.resolveUniqueWindowTool(
+                    toolName: MCPWindowToolName.readFile
+                )
+                XCTAssertEqual(
+                    uniqueReadFile?.handle,
+                    liveRegistration.handle,
+                    "A closed superseded window must not poison single-window routing."
+                )
+
+                // The fixture owns this exact generation; release it before window teardown.
+                await ServiceRegistry.unregister(liveRegistration.handle)
+                liveWindow.beginClose()
+                await liveWindow.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(liveWindow)
+            }
+        #else
+            throw XCTSkip("Window registration supersession inspection is DEBUG-only")
+        #endif
+    }
+
+    func testWindowStopWithoutOwnedHandlePreservesExternalRegistrationGeneration() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                let registration: MCPDomainToolRegistrationResult
+                do {
+                    registration = try await ServiceRegistry.register(
+                        window.mcpServer.windowMCPToolCatalogService
+                    )
+                } catch {
+                    await window.tearDown()
+                    throw error
+                }
+                guard registration.disposition == .inserted else {
+                    await window.tearDown()
+                    throw ToolCatalogFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: registration.disposition)
+                    )
+                }
+
+                await window.mcpServer.stopServer()
+                let externalRegistrationIsActive = await ServiceRegistry.isActive(registration.handle)
+                XCTAssertTrue(
+                    externalRegistrationIsActive,
+                    "A window without the generation handle must not unregister an external participant."
+                )
+
+                await ServiceRegistry.unregister(registration.handle)
+                await window.tearDown()
+                let externalRegistrationIsActiveAfterCleanup = await ServiceRegistry.isActive(registration.handle)
+                XCTAssertFalse(externalRegistrationIsActiveAfterCleanup)
+            }
+        #else
+            throw XCTSkip("Window registration ownership inspection is DEBUG-only")
+        #endif
+    }
+
+    func testServiceRegistryReregistrationPreservesLiveHandleAndSurfacesFailures() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                await Self.purgeStaleWindowScopeRegistrations()
+                let window = Self.makeWindowWithoutAutoStart()
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
+                    let before = await ServiceRegistry.catalogSnapshot()
+
+                    XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+                    let serverStarted = await window.mcpServer.startServer()
+                    XCTAssertTrue(serverStarted)
+                    XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+
+                    let afterInitialStart = await ServiceRegistry.catalogSnapshot()
+                    let resolved = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+                    let captured = try XCTUnwrap(resolved)
+                    let bootstrapReady = await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    let afterRepeat = await ServiceRegistry.catalogSnapshot()
+
+                    XCTAssertTrue(bootstrapReady)
+                    let capturedHandleIsActive = await ServiceRegistry.isActive(captured.handle)
+                    XCTAssertTrue(capturedHandleIsActive, "An in-flight call handle must survive byte-identical bootstrap re-registration")
+                    XCTAssertGreaterThan(afterInitialStart.revision, before.revision)
+                    XCTAssertEqual(
+                        afterRepeat.revision,
+                        afterInitialStart.revision,
+                        "Byte-identical bootstrap must preserve handles and catalog revision."
+                    )
+
+                    let disabling = Task { @MainActor in
+                        await window.mcpServer.stopServer()
+                    }
+                    await Task.yield()
+                    let reenabled = await window.mcpServer.startServer()
+                    await disabling.value
+                    let reenabledTool = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+                    XCTAssertTrue(reenabled)
+                    XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+                    XCTAssertNotNil(reenabledTool, "A superseded disable must not remove the newer enable registration")
+
+                    do {
+                        _ = try await ServiceRegistry.register(UnknownCatalogToolService())
+                        XCTFail("Unknown canonical tools must surface registration failure")
+                    } catch let error as MCPDomainToolRegistryError {
+                        XCTAssertEqual(error, .unknownToolName("unknown_catalog_tool"))
+                    }
+                }
+            }
+        #else
+            throw XCTSkip("Bootstrap socket isolation is DEBUG-only")
+        #endif
+    }
+
+    func testAppDelegateStartupPublishesGlobalRegistrationBeforeObservationOnlyReadiness() async {
+        let wiringProbe = AppDelegateRegistrationProbe()
+        let wiringDelegate = AppDelegate()
+        wiringDelegate.setGlobalMCPRegistrationOperationForTesting {
+            try await wiringProbe.register()
+        }
+        let wiringTasks = (0 ..< 8).map { _ in
+            wiringDelegate.startGlobalMCPServiceRegistration()
+        }
+        for wiringTask in wiringTasks {
+            await wiringTask.value
+        }
+        XCTAssertEqual(wiringProbe.invocationCount, 1)
+        XCTAssertNil(wiringDelegate.domainRuntimeStartupFailureDescription)
+
+        let failureProbe = AppDelegateRegistrationProbe(failure: .injected)
+        let failureDelegate = AppDelegate()
+        failureDelegate.setGlobalMCPRegistrationOperationForTesting {
+            try await failureProbe.register()
+        }
+        await failureDelegate.startGlobalMCPServiceRegistration().value
+        await failureDelegate.startGlobalMCPServiceRegistration().value
+        XCTAssertEqual(failureProbe.invocationCount, 1, "A stored startup failure must not retry or log per caller.")
+        XCTAssertNotNil(failureDelegate.domainRuntimeStartupFailureDescription)
+
+        let appDelegate = AppDelegate()
+        await appDelegate.startGlobalMCPServiceRegistration().value
+        XCTAssertNil(appDelegate.domainRuntimeStartupFailureDescription)
+        XCTAssertEqual(
+            AppGlobalMCPServiceComposition.shared.registrationStatus(),
+            .registered
+        )
+
+        let snapshot = await ServiceRegistry.catalogSnapshot()
+        XCTAssertTrue(
+            MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
+            },
+            "AppDelegate startup must publish every application-scoped tool before readiness observes it."
+        )
+        XCTAssertTrue(
+            MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                ToolAvailabilityStore.shared.toolSummaries.contains { $0.name == toolName }
+            },
+            "Composition-owned availability must remain published with the canonical catalog."
+        )
+        let globallyReady = await MCPToolCatalogReadiness.shared.awaitReady(windowID: nil, timeout: 1)
+        XCTAssertTrue(globallyReady)
+
+        let timeout: TimeInterval = 0.2
+        let readinessRevision = snapshot.revision
+        let start = Date()
+        let missingWindowReady = await MCPToolCatalogReadiness.shared.awaitReady(
+            windowID: Int.min,
+            timeout: timeout
+        )
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertFalse(missingWindowReady, "A missing window must remain fail-closed.")
+        let afterMissingWindowReadiness = await ServiceRegistry.catalogSnapshot()
+        XCTAssertEqual(
+            afterMissingWindowReadiness.revision,
+            readinessRevision,
+            "Observation-only readiness must not mutate or repair registration."
+        )
+        XCTAssertGreaterThanOrEqual(elapsed, timeout * 0.85, "Readiness must retain the full recovery window.")
+        XCTAssertLessThan(elapsed, timeout + 0.75, "Readiness must remain bounded.")
+
+        let cancellationStart = Date()
+        let cancelledReadiness = Task {
+            await MCPToolCatalogReadiness.shared.awaitReady(windowID: Int.min, timeout: 5)
+        }
+        cancelledReadiness.cancel()
+        let cancelledReady = await cancelledReadiness.value
+        XCTAssertFalse(cancelledReady)
+        XCTAssertLessThan(Date().timeIntervalSince(cancellationStart), 0.5, "Cancellation must not consume the timeout window.")
     }
 
     func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
@@ -233,19 +1063,30 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             ))
 
             try await MCPSharedServerTestLease.shared.withLease { _ in
+                await Self.purgeStaleWindowScopeRegistrations()
                 let window = Self.makeWindowWithoutAutoStart()
                 let catalogService = window.mcpServer.windowMCPToolCatalogService
 
-                try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { socketURL in
                     let storedAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    let started = await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    XCTAssertTrue(started)
                     XCTAssertEqual(GlobalSettingsStore.shared.mcpAutoStart(), storedAutoStart)
-                    XCTAssertTrue(ServiceRegistry.services.contains { service in
-                        (service as AnyObject) === (catalogService as AnyObject)
+                    let catalogIsRegistered = await ServiceRegistry.isRegistered(catalogService)
+                    let catalog = await ServiceRegistry.catalogSnapshot()
+                    XCTAssertTrue(catalogIsRegistered)
+                    XCTAssertTrue(MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                        catalog.activeScopesByToolName[toolName]?.contains(.application) == true
                     })
-                    XCTAssertFalse(ServiceRegistry.services.contains { service in
-                        (service as AnyObject) === (window.mcpServer as AnyObject)
+                    let windowScope = MCPDomainToolRegistrationScope.window(id: window.windowID)
+                    XCTAssertTrue(MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
+                        catalog.activeScopesByToolName[toolName]?.contains(windowScope) == true
                     })
+                    XCTAssertFalse(catalog.definitions.isEmpty)
+                    XCTAssertEqual(
+                        catalog.activeScopesByToolName[MCPWindowToolName.readFile],
+                        [windowScope]
+                    )
 
                     let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
                     XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSocket)
@@ -347,6 +1188,53 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         }
     }
 
+    private enum ToolCatalogFixtureError: Error {
+        case windowCatalogRegistrationWasNotOwned(String)
+    }
+
+    private final class UnknownCatalogToolService: Service {
+        let domainRegistrationID = MCPDomainToolRegistrationID()
+
+        var tools: [RepoPromptApp.Tool] {
+            get async {
+                [
+                    RepoPromptApp.Tool(
+                        name: "unknown_catalog_tool",
+                        description: "Registration failure fixture.",
+                        inputSchema: .object(properties: [:]),
+                        returnsValue: { _ in .object([:]) }
+                    )
+                ]
+            }
+        }
+    }
+
+    private static func purgeStaleWindowScopeRegistrations() async {
+        let liveWindowIDs = Set(WindowStatesManager.shared.allWindows.map(\.windowID))
+        let snapshot = await ServiceRegistry.catalogSnapshot()
+        var staleScopes = Set<MCPDomainToolRegistrationScope>()
+        for scopes in snapshot.activeScopesByToolName.values {
+            for scope in scopes {
+                guard case let .window(id) = scope,
+                      !liveWindowIDs.contains(id)
+                else { continue }
+                staleScopes.insert(scope)
+            }
+        }
+
+        var staleHandles = Set<MCPDomainToolRegistrationHandle>()
+        for scope in staleScopes {
+            for toolName in MCPDomainToolCatalog.windowToolNames {
+                if let resolved = await ServiceRegistry.resolve(toolName: toolName, scope: scope) {
+                    staleHandles.insert(resolved.handle)
+                }
+            }
+        }
+        for handle in staleHandles {
+            await ServiceRegistry.unregister(handle)
+        }
+    }
+
     private static func makeWindowWithoutAutoStart() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -356,6 +1244,34 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     }
 
     #if DEBUG
+        private static func waitForWindowToolIntentGeneration(
+            _ expectedGeneration: UInt64,
+            window: WindowState,
+            timeout: Duration = .seconds(1)
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while window.mcpServer.windowToolRegistrationIntentGenerationForTesting() < expectedGeneration,
+                  clock.now < deadline
+            {
+                try? await clock.sleep(for: .milliseconds(5))
+            }
+            return window.mcpServer.windowToolRegistrationIntentGenerationForTesting() >= expectedGeneration
+        }
+
+        private static func waitForTeardownRequestCount(
+            _ expectedCount: Int,
+            service: MCPService,
+            timeout: Duration = .seconds(1)
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while await service.teardownRequestCountForTesting() < expectedCount, clock.now < deadline {
+                try? await clock.sleep(for: .milliseconds(5))
+            }
+            return await service.teardownRequestCountForTesting() >= expectedCount
+        }
+
         private struct BootstrapSocketNamespaceFixture {
             let directoryURL: URL
             let socketURL: URL
@@ -383,7 +1299,6 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         private static func withIsolatedBootstrapSocketNamespace(
             window: WindowState,
-            catalogService: MCPWindowToolCatalogService,
             operation: (URL) async throws -> Void
         ) async throws {
             let fixture = try BootstrapSocketNamespaceFixture.make()
@@ -416,7 +1331,6 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 do {
                     try await cleanupIsolatedBootstrapSocketNamespace(
                         window: window,
-                        catalogService: catalogService,
                         fixture: fixture,
                         previousEnabledState: previousEnabledState
                     )
@@ -428,7 +1342,6 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
             try await cleanupIsolatedBootstrapSocketNamespace(
                 window: window,
-                catalogService: catalogService,
                 fixture: fixture,
                 previousEnabledState: previousEnabledState
             )
@@ -436,12 +1349,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         private static func cleanupIsolatedBootstrapSocketNamespace(
             window: WindowState,
-            catalogService: MCPWindowToolCatalogService,
             fixture: BootstrapSocketNamespaceFixture,
             previousEnabledState: Bool
         ) async throws {
             await window.mcpServer.stopServer()
-            ServiceRegistry.unregister(catalogService)
             await window.mcpServer.shutdownListener()
 
             let manager = ServerNetworkManager.shared
@@ -477,6 +1388,25 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             }
         }
     #endif
+
+    @MainActor
+    private final class AppDelegateRegistrationProbe {
+        enum Failure: Error {
+            case injected
+        }
+
+        private let failure: Failure?
+        private(set) var invocationCount = 0
+
+        init(failure: Failure? = nil) {
+            self.failure = failure
+        }
+
+        func register() async throws {
+            invocationCount += 1
+            if let failure { throw failure }
+        }
+    }
 
     private static func schemaProperties(
         for tool: RepoPromptApp.Tool,
@@ -517,40 +1447,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {
         try tools.enumerated().map { index, tool in
-            let schemaValue = try Value(tool.inputSchema)
-            let schemaDigest = try digest(canonicalJSONString(schemaValue))
-            let annotations = annotationSignature(tool.annotations)
-            let descriptionDigest = digest(tool.description)
-            return "\(index)|\(tool.name)|enabled=\(tool.isEnabledByDefault)|ann=\(annotations)|desc=\(descriptionDigest)|schema=\(schemaDigest)"
+            let definition = try tool.domainBinding().definition
+            return try MCPDomainToolFingerprint(definition: definition).goldenSignature(index: index)
         }
-    }
-
-    private static func annotationSignature(_ annotations: MCP.Tool.Annotations) -> String {
-        [
-            "title=\(annotations.title ?? "nil")",
-            "readOnly=\(optionalBool(annotations.readOnlyHint))",
-            "destructive=\(optionalBool(annotations.destructiveHint))",
-            "idempotent=\(optionalBool(annotations.idempotentHint))",
-            "openWorld=\(optionalBool(annotations.openWorldHint))"
-        ].joined(separator: ",")
-    }
-
-    private static func optionalBool(_ value: Bool?) -> String {
-        value.map(String.init) ?? "nil"
-    }
-
-    private static func canonicalJSONString(_ value: Value) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(value)
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    private static func digest(_ string: String) -> String {
-        let data = Data(string.utf8)
-        return SHA256.hash(data: data)
-            .map { String(format: "%02x", $0) }
-            .joined()
     }
 
     private static func renderGolden(_ signatures: [String]) -> String {
@@ -560,5 +1459,234 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         return "\n        private static let expectedSignatures: [String] = [\n"
             + body
             + "\n        ]\n"
+    }
+}
+
+private actor AsyncTestGate {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func arriveAndWait() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered(timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !entered, clock.now < deadline {
+            try? await clock.sleep(for: .milliseconds(10))
+        }
+        return entered
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
+private actor MCPReadinessScopePresenceProbe {
+    private let firstQueryGate = AsyncTestGate()
+    private(set) var queryCount = 0
+
+    func query(
+        requiredNames _: [String],
+        scope _: MCPDomainToolRegistrationScope
+    ) async -> MCPDomainToolScopePresence {
+        queryCount += 1
+        if queryCount == 1 {
+            await firstQueryGate.arriveAndWait()
+        }
+        return MCPDomainToolScopePresence(revision: 1, isComplete: true)
+    }
+
+    func waitUntilFirstQueryEntered() async {
+        await firstQueryGate.waitUntilEntered()
+    }
+
+    func releaseFirstQuery() async {
+        await firstQueryGate.release()
+    }
+}
+
+private actor AsyncTestBarrier {
+    private let participantCount: Int
+    private var arrivals = 0
+    private var participantWaiters: [CheckedContinuation<Void, Never>] = []
+    private var completionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isComplete = false
+
+    init(participantCount: Int) {
+        self.participantCount = participantCount
+    }
+
+    func arriveAndWait() async {
+        guard !isComplete else { return }
+        arrivals += 1
+        if arrivals == participantCount {
+            isComplete = true
+            let participants = participantWaiters
+            let completions = completionWaiters
+            participantWaiters.removeAll()
+            completionWaiters.removeAll()
+            participants.forEach { $0.resume() }
+            completions.forEach { $0.resume() }
+            return
+        }
+        await withCheckedContinuation { continuation in
+            participantWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilComplete() async {
+        guard !isComplete else { return }
+        await withCheckedContinuation { continuation in
+            completionWaiters.append(continuation)
+        }
+    }
+}
+
+private actor ControlledMCPServiceStartProbe {
+    enum Outcome: Equatable {
+        case success
+        case failure
+    }
+
+    enum Failure: Error {
+        case injected
+        case unexpectedAttempt(Int)
+    }
+
+    private let outcomes: [Outcome]
+    private let gates: [AsyncTestGate]
+    private var attemptWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private(set) var attemptCount = 0
+
+    init(outcomes: [Outcome]) {
+        self.outcomes = outcomes
+        gates = outcomes.map { _ in AsyncTestGate() }
+    }
+
+    func start() async throws {
+        attemptCount += 1
+        let attempt = attemptCount
+        let readyWaiters = attemptWaiters.filter { $0.count <= attempt }
+        attemptWaiters.removeAll { $0.count <= attempt }
+        readyWaiters.forEach { $0.continuation.resume() }
+
+        guard outcomes.indices.contains(attempt - 1) else {
+            throw Failure.unexpectedAttempt(attempt)
+        }
+        await gates[attempt - 1].arriveAndWait()
+        if outcomes[attempt - 1] == .failure {
+            throw Failure.injected
+        }
+    }
+
+    func waitUntilAttemptCount(_ count: Int) async {
+        guard attemptCount < count else { return }
+        await withCheckedContinuation { continuation in
+            attemptWaiters.append((count, continuation))
+        }
+    }
+
+    func releaseAttempt(_ attempt: Int) async {
+        guard gates.indices.contains(attempt - 1) else { return }
+        await gates[attempt - 1].release()
+    }
+}
+
+private actor ControlledMCPServiceTeardownProbe {
+    private let gates: [AsyncTestGate]
+    private var attemptWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private(set) var attemptCount = 0
+
+    init(attempts: Int) {
+        gates = (0 ..< attempts).map { _ in AsyncTestGate() }
+    }
+
+    func tearDown() async {
+        attemptCount += 1
+        let attempt = attemptCount
+        let readyWaiters = attemptWaiters.filter { $0.count <= attempt }
+        attemptWaiters.removeAll { $0.count <= attempt }
+        readyWaiters.forEach { $0.continuation.resume() }
+
+        guard gates.indices.contains(attempt - 1) else { return }
+        await gates[attempt - 1].arriveAndWait()
+    }
+
+    func waitUntilAttemptCount(_ count: Int) async {
+        guard attemptCount < count else { return }
+        await withCheckedContinuation { continuation in
+            attemptWaiters.append((count, continuation))
+        }
+    }
+
+    func releaseAttempt(_ attempt: Int) async {
+        guard gates.indices.contains(attempt - 1) else { return }
+        await gates[attempt - 1].release()
+    }
+}
+
+private actor ServerControllerRegistrationOrderingProbe {
+    enum Failure: Error {
+        case injected
+        case transportObservedBeforeRegistration
+    }
+
+    private let gate = AsyncTestGate()
+    private let failsRegistration: Bool
+    private var completed = false
+    private var registrationCount = 0
+    private var preActivationCount = 0
+
+    init(failsRegistration: Bool = false) {
+        self.failsRegistration = failsRegistration
+    }
+
+    func register() async throws {
+        registrationCount += 1
+        await gate.arriveAndWait()
+        if failsRegistration {
+            throw Failure.injected
+        }
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        completed = true
+    }
+
+    func waitUntilEntered(timeout: Duration = .seconds(1)) async -> Bool {
+        await gate.waitUntilEntered(timeout: timeout)
+    }
+
+    func release() async {
+        await gate.release()
+    }
+
+    func assertCompleted() throws {
+        preActivationCount += 1
+        guard completed else { throw Failure.transportObservedBeforeRegistration }
+    }
+
+    func counts() -> (registration: Int, preActivation: Int) {
+        (registrationCount, preActivationCount)
     }
 }

@@ -46,6 +46,9 @@ struct AgentModeView: View {
                     suspended: suspended
                 )
             },
+            retryCodemapGraphIndex: { rootID in
+                await windowState.workspaceFilesViewModel.prioritizeCodemapGraphIndexNow(rootID: rootID)
+            },
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))

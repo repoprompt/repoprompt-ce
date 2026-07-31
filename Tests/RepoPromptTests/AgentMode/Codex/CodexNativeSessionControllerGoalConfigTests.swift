@@ -14,6 +14,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     }
 
     func testAgentModeDefaultCarriesGoalFeatureConfigToStartAndResume() async throws {
+        let expectedGoalSupportEnabled = await MainActor.run {
+            CodexGoalSupport.isEnabled
+        }
         let options = CodexNativeSessionController.Options.agentModeDefault(
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
@@ -22,7 +25,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         try await assertStartAndResumeGoalConfig(
             options: options,
-            expectedGoalSupportEnabled: true,
+            expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedApprovalReviewer: "auto_review"
         )
     }

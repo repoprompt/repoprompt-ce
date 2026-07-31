@@ -9,6 +9,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 
 public struct Tool: Sendable {
     let name: String
@@ -65,6 +66,39 @@ public struct Tool: Sendable {
 
     public func callAsFunction(_ input: [String: Value]) async throws -> Value {
         try await implementation(input)
+    }
+}
+
+extension Tool {
+    func domainBinding() throws -> MCPDomainToolBinding {
+        let definition = try MCPDomainToolDefinition(
+            name: name,
+            description: description,
+            inputSchema: Value(inputSchema),
+            annotations: MCPDomainToolAnnotations(
+                title: annotations.title,
+                readOnlyHint: annotations.readOnlyHint,
+                destructiveHint: annotations.destructiveHint,
+                idempotentHint: annotations.idempotentHint,
+                openWorldHint: annotations.openWorldHint
+            ),
+            isEnabledByDefault: isEnabledByDefault
+        )
+        return MCPDomainToolBinding(definition: definition) { arguments in
+            try await self(arguments)
+        }
+    }
+}
+
+extension MCPDomainToolAnnotations {
+    var mcpAnnotations: MCP.Tool.Annotations {
+        .init(
+            title: title,
+            readOnlyHint: readOnlyHint,
+            destructiveHint: destructiveHint,
+            idempotentHint: idempotentHint,
+            openWorldHint: openWorldHint
+        )
     }
 }
 

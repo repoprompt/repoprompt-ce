@@ -57,8 +57,29 @@ final actor ServerController: ObservableObject {
     /// In-memory copy (always mutate on MainActor)
     private var alwaysAllowedClients: Set<String> = ServerController.loadSanitizedAlwaysAllowedClients()
 
-    // –––––  Private implementation helpers  –––––
+    /// –––––  Private implementation helpers  –––––
+    private enum DesiredTransportState: Equatable {
+        case running
+        case disabled
+        case stopped
+    }
+
+    private struct StartAttempt {
+        let generation: UInt64
+        let task: Task<Void, Error>
+    }
+
+    enum LifecycleError: Error {
+        case startSuperseded
+        case controllerReleased
+    }
+
     private let networkManager = ServerNetworkManager.shared
+    private let globalRegistrationOperation: @Sendable () async throws -> Void
+    private let beforeTransportActivationOperation: @Sendable () async throws -> Void
+    private var lifecycleGeneration: UInt64 = 0
+    private var desiredTransportState: DesiredTransportState = .stopped
+    private var activeStartAttempt: StartAttempt?
     private var activeApprovalDialogs: Set<String> = []
     private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
 
@@ -80,9 +101,19 @@ final actor ServerController: ObservableObject {
     }
 
     /// –––––  Init: wire approval-flow & kick off the listener  –––––
-    init() {
-        Task { [weak self] in
-            await self?.bootstrapCallbacks()
+    init(
+        globalRegistrationOperation: @escaping @Sendable () async throws -> Void = {
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        },
+        beforeTransportActivationOperation: @escaping @Sendable () async throws -> Void = {},
+        installNetworkCallbacks: Bool = true
+    ) {
+        self.globalRegistrationOperation = globalRegistrationOperation
+        self.beforeTransportActivationOperation = beforeTransportActivationOperation
+        if installNetworkCallbacks {
+            Task { [weak self] in
+                await self?.bootstrapCallbacks()
+            }
         }
     }
 
@@ -387,42 +418,122 @@ final actor ServerController: ObservableObject {
     // MARK: – public API –
 
     /// Request to start (or re-enable) the MCP listener.
-    func startServer() async {
-        if await networkManager.isRunning() {
-            await networkManager.setEnabled(true) // expose tools only
-            await networkManager.ensureBootstrapHealthy(force: true)
-        } else {
-            await networkManager.start() // cold start once
-            await networkManager.ensureBootstrapHealthy(force: true)
+    /// Application-scoped domain tools must exist before the listener can advertise
+    /// or accept any window-scoped catalog.
+    func startServer() async throws {
+        if let activeStartAttempt,
+           activeStartAttempt.generation == lifecycleGeneration,
+           desiredTransportState == .running
+        {
+            try await activeStartAttempt.task.value
+            return
         }
-        beginPowerActivity()
-        updateServerStatus("Running")
+
+        lifecycleGeneration &+= 1
+        desiredTransportState = .running
+        let generation = lifecycleGeneration
+        let task = Task { [weak self] in
+            guard let self else { throw LifecycleError.controllerReleased }
+            try await performStart(generation: generation)
+        }
+        activeStartAttempt = StartAttempt(generation: generation, task: task)
+
+        do {
+            try await task.value
+        } catch {
+            if activeStartAttempt?.generation == generation {
+                activeStartAttempt = nil
+            }
+            throw error
+        }
+        if activeStartAttempt?.generation == generation {
+            activeStartAttempt = nil
+        }
+    }
+
+    private func performStart(generation: UInt64) async throws {
+        do {
+            try await globalRegistrationOperation()
+            try requireCurrentStart(generation)
+            try await beforeTransportActivationOperation()
+            try requireCurrentStart(generation)
+
+            let startOutcome: ServerNetworkManager.StartOutcome
+            if await networkManager.isRunning() {
+                try requireCurrentStart(generation)
+                await networkManager.setEnabled(true) // expose tools only
+                try requireCurrentStart(generation)
+                startOutcome = await networkManager.start()
+                try requireCurrentStart(generation)
+                await networkManager.ensureBootstrapHealthy(force: true)
+            } else {
+                try requireCurrentStart(generation)
+                await networkManager.setEnabled(true)
+                try requireCurrentStart(generation)
+                startOutcome = await networkManager.start() // cold start once
+                try requireCurrentStart(generation)
+                await networkManager.ensureBootstrapHealthy(force: true)
+            }
+            try requireCurrentStart(generation)
+            guard let runningStatus = Self.runningStatus(for: startOutcome) else {
+                throw LifecycleError.startSuperseded
+            }
+            beginPowerActivity()
+            updateServerStatus(runningStatus)
+        } catch LifecycleError.startSuperseded {
+            await reconcileSupersededStart()
+            throw LifecycleError.startSuperseded
+        }
+    }
+
+    private func requireCurrentStart(_ generation: UInt64) throws {
+        guard generation == lifecycleGeneration, desiredTransportState == .running else {
+            throw LifecycleError.startSuperseded
+        }
+    }
+
+    private func reconcileSupersededStart() async {
+        switch desiredTransportState {
+        case .running:
+            break
+        case .disabled:
+            await networkManager.setEnabled(false)
+        case .stopped:
+            await networkManager.stop()
+        }
     }
 
     /// Disable the listener.
     func stopServer() async {
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        desiredTransportState = .disabled
         await networkManager.setEnabled(false)
+        guard generation == lifecycleGeneration, desiredTransportState == .disabled else { return }
         endPowerActivity()
         updateServerStatus("Disabled")
     }
 
     /// Completely shut down the listener.
     func fullShutdown() async {
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        desiredTransportState = .stopped
         await networkManager.stop()
+        guard generation == lifecycleGeneration, desiredTransportState == .stopped else { return }
         endPowerActivity()
         updateServerStatus("Stopped")
     }
 
     /// This method will be used to enable/disable all tools at once.
-    func setEnabled(_ enabled: Bool) async {
-        await networkManager.setEnabled(enabled)
+    /// Enabling joins the same single-flight start authority as window startup so
+    /// registration and pre-activation checks always precede transport exposure.
+    func setEnabled(_ enabled: Bool) async throws {
         if enabled {
-            beginPowerActivity()
-            await networkManager.ensureBootstrapHealthy(force: true)
+            try await startServer()
         } else {
-            endPowerActivity()
+            await stopServer()
         }
-        updateServerStatus(enabled ? "Running" : "Disabled")
     }
 
     // This is no longer needed as there are no individual service toggles.
@@ -431,6 +542,17 @@ final actor ServerController: ObservableObject {
     // }
 
     // MARK: – helpers ––––––––––––––––––––––––––––––––––––––––––––––––––
+
+    nonisolated static func runningStatus(for outcome: ServerNetworkManager.StartOutcome) -> String? {
+        switch outcome {
+        case .ready:
+            "Running"
+        case let .degraded(reason):
+            "Running (Degraded: \(reason.statusDescription))"
+        case .superseded:
+            nil
+        }
+    }
 
     /// Timeout for approval dialogs (auto-deny after this duration)
     private let approvalTimeout: TimeInterval = 300

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 @MainActor
 protocol MCPWindowToolProviding {
@@ -8,6 +9,7 @@ protocol MCPWindowToolProviding {
 
 @MainActor
 final class MCPWindowToolCatalogService: WindowScopedService {
+    let domainRegistrationID = MCPDomainToolRegistrationID()
     let windowID: Int
 
     private let providers: [any MCPWindowToolProviding]

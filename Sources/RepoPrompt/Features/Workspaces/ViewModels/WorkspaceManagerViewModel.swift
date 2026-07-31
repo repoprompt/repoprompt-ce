@@ -296,6 +296,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         let tabID: UUID
     }
 
+    private struct DeferredWorkspaceObservation<Value> {
+        let value: Value
+        let workspaceID: UUID?
+        let wasSwitchingWorkspace: Bool
+    }
+
     private var lastSelectionMirrorContext: SelectionMirrorContext?
     private(set) var selectionMirrorContextRevision: UInt64 = 0
 
@@ -316,6 +322,23 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func bumpStateVersion(for id: UUID?) {
         guard let id else { return }
         stateVersionByWorkspaceID[id, default: 0] &+= 1 // wraparound-safe
+    }
+
+    private func captureDeferredWorkspaceObservation<Value>(_ value: Value) -> DeferredWorkspaceObservation<Value> {
+        DeferredWorkspaceObservation(
+            value: value,
+            workspaceID: activeWorkspaceID,
+            wasSwitchingWorkspace: isSwitchingWorkspace
+        )
+    }
+
+    private func acceptsDeferredWorkspaceObservation(
+        _ observation: DeferredWorkspaceObservation<some Any>
+    ) -> Bool {
+        guard let observedWorkspaceID = observation.workspaceID else { return false }
+        return !observation.wasSwitchingWorkspace
+            && !isSwitchingWorkspace
+            && observedWorkspaceID == activeWorkspaceID
     }
 
     private static func allocateWorkspaceSelectionRevision() -> UInt64 {
@@ -1567,12 +1590,17 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // Track when the file selection changes to detect if active preset is dirty
         fileManager.$selectedFiles
-            // Debounce to avoid rapid consecutive events
+            .compactMap { [weak self] selection in
+                self?.captureDeferredWorkspaceObservation(selection)
+            }
+            // Debounce to avoid rapid consecutive events. Keep the emission-time
+            // workspace identity so work queued before/during a switch cannot dirty
+            // whichever workspace happens to be active when the debounce fires.
             .debounce(for: .seconds(0.15), scheduler: DispatchQueue.main)
-            .sink { [weak self] newSelection in
-                guard let self, !self.isSwitchingWorkspace else { return }
-                checkIfActivePresetIsDirty(with: newSelection)
-                bumpStateVersion(for: activeWorkspaceID)
+            .sink { [weak self] observation in
+                guard let self, acceptsDeferredWorkspaceObservation(observation) else { return }
+                checkIfActivePresetIsDirty(with: observation.value)
+                bumpStateVersion(for: observation.workspaceID)
                 // No disk save here - publish in-memory snapshot for mirroring
                 publishActiveComposeTabSnapshot(commitToMemory: true)
             }
@@ -1590,10 +1618,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         promptViewModel.$promptText
             .removeDuplicates()
+            .compactMap { [weak self] promptText in
+                self?.captureDeferredWorkspaceObservation(promptText)
+            }
             .debounce(for: .milliseconds(120), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
-                guard let self, !self.isSwitchingWorkspace else { return }
-                bumpStateVersion(for: activeWorkspaceID)
+            .sink { [weak self] observation in
+                guard let self, acceptsDeferredWorkspaceObservation(observation) else { return }
+                bumpStateVersion(for: observation.workspaceID)
                 // No disk save here - publish in-memory snapshot for mirroring
                 publishActiveComposeTabSnapshot(commitToMemory: true)
             }
@@ -1604,10 +1635,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         // snapshot, causing stale slices to reappear in mirrored tab contexts.
         fileManager.$selectionSlicesByFileID
             .removeDuplicates()
+            .compactMap { [weak self] slices in
+                self?.captureDeferredWorkspaceObservation(slices)
+            }
             .debounce(for: .milliseconds(60), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
-                guard let self, !self.isSwitchingWorkspace else { return }
-                bumpStateVersion(for: activeWorkspaceID)
+            .sink { [weak self] observation in
+                guard let self, acceptsDeferredWorkspaceObservation(observation) else { return }
+                bumpStateVersion(for: observation.workspaceID)
                 // Commit to memory so composeTab(with:) reflects the new slice state immediately.
                 publishActiveComposeTabSnapshot(commitToMemory: true)
             }
