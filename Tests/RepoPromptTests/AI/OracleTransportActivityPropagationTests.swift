@@ -122,6 +122,78 @@ final class OracleTransportActivityPropagationTests: XCTestCase {
     }
 
     @MainActor
+    func testOraclePostContentWatchdogUsesStrictGraceBoundary() {
+        let grace = OracleViewModel.postContentGrace
+        let epsilon = 0.001
+        let origin = Date(timeIntervalSinceReferenceDate: 0)
+
+        for cycle in 1 ... 3 {
+            let heartbeat = origin.addingTimeInterval(Double(cycle) * (grace - epsilon))
+            let scheduledCheck = origin.addingTimeInterval(Double(cycle) * grace)
+            XCTAssertFalse(
+                OracleViewModel.shouldFireStreamInactivityWatchdog(
+                    lastActivityAt: heartbeat,
+                    now: scheduledCheck,
+                    grace: grace
+                )
+            )
+        }
+
+        XCTAssertFalse(
+            OracleViewModel.shouldFireStreamInactivityWatchdog(
+                lastActivityAt: origin,
+                now: origin.addingTimeInterval(grace),
+                grace: grace
+            )
+        )
+        XCTAssertTrue(
+            OracleViewModel.shouldFireStreamInactivityWatchdog(
+                lastActivityAt: origin,
+                now: origin.addingTimeInterval(grace + epsilon),
+                grace: grace
+            )
+        )
+    }
+
+    @MainActor
+    func testOracleCoalescesTransportProgressWhileTrackingEveryHeartbeat() {
+        let oracle = makeOracleViewModel()
+        let recorder = OracleLifecycleActivityRecorder()
+        let queryID = UUID()
+        let observerID = oracle.addMessageLifecycleActivityObserver(for: queryID) {
+            recorder.record($0)
+        }
+        defer {
+            oracle.removeMessageLifecycleActivityObserver(
+                for: queryID,
+                observerID: observerID
+            )
+        }
+
+        let origin = Date(timeIntervalSinceReferenceDate: 100)
+        var latestActivity = origin
+        for step in 0 ... 9 {
+            latestActivity = origin.addingTimeInterval(Double(step) / 10.0)
+            oracle.recordObservedStreamActivity(
+                for: queryID,
+                at: latestActivity
+            )
+        }
+
+        XCTAssertEqual(recorder.kinds, [.streamActivity])
+        XCTAssertEqual(
+            oracle.lastObservedStreamActivityForTesting(for: queryID),
+            latestActivity
+        )
+
+        oracle.recordObservedStreamActivity(
+            for: queryID,
+            at: origin.addingTimeInterval(1.0)
+        )
+        XCTAssertEqual(recorder.kinds, [.streamActivity, .streamActivity])
+    }
+
+    @MainActor
     func testOracleMapsTransportAndSemanticOutputsToExistingStreamActivity() {
         let transportOutput = ChatStreamOutput(
             text: "",
@@ -153,5 +225,45 @@ final class OracleTransportActivityPropagationTests: XCTestCase {
         XCTAssertNil(OracleViewModel.lifecycleActivityKind(for: emptyOutput))
         XCTAssertEqual(OracleViewModel.lifecycleActivityKind(for: contentOutput), .streamActivity)
         XCTAssertEqual(OracleViewModel.lifecycleActivityKind(for: reasoningOutput), .streamActivity)
+    }
+
+    @MainActor
+    private func makeOracleViewModel() -> OracleViewModel {
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
+        let fileManager = WorkspaceFilesViewModel()
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -696,
+            settingsManager: WindowSettingsManager(windowID: -696)
+        )
+        let workspaceManager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        return OracleViewModel(
+            aiQueriesService: aiQueriesService,
+            promptViewModel: prompt,
+            workspaceManager: workspaceManager,
+            chatData: ChatDataService()
+        )
+    }
+}
+
+@MainActor
+private final class OracleLifecycleActivityRecorder {
+    private(set) var kinds: [OracleMessageLifecycleActivityEvent.Kind] = []
+
+    func record(_ event: OracleMessageLifecycleActivityEvent) {
+        kinds.append(event.kind)
     }
 }
