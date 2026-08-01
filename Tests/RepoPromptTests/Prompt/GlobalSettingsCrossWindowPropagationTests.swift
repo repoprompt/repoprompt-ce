@@ -75,6 +75,71 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertEqual(persisted.modelRaw, AgentModel.gpt55CodexLow.rawValue)
     }
 
+    func testContextBuilderPickerExplicitCommitPreservesDirtyCopyAndChatOverlays() async throws {
+        let previousCodexConnected = UserDefaults.standard.object(forKey: "CodexCLIConnected")
+        defer {
+            if let previousCodexConnected {
+                UserDefaults.standard.set(previousCodexConnected, forKey: "CodexCLIConnected")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "CodexCLIConnected")
+            }
+        }
+        UserDefaults.standard.set(true, forKey: "CodexCLIConnected")
+
+        let workspaceID = UUID()
+        let store = try makeIsolatedStore()
+        store.setWorkspaceAgentModelsInheritanceMode(
+            workspaceID: workspaceID,
+            mode: .useWorkspaceOverrides
+        )
+        let settingsManager = WindowSettingsManager(windowID: 3, store: store)
+        let prompt = makePromptViewModel(
+            windowID: 3,
+            store: store,
+            workspaceID: workspaceID,
+            settingsManager: settingsManager
+        )
+        prompt.apiSettingsViewModel?.test_completeContextBuilderProviderValidation(
+            verifiedProviders: [.codexExec]
+        )
+        await drainMainQueue()
+
+        var dirtyCopy = settingsManager.copySettings(for: workspaceID)
+        dirtyCopy.fileTreeOption = .files
+        settingsManager.updateCopySettings(dirtyCopy, commit: false)
+
+        var dirtyChat = settingsManager.chatSettings(for: workspaceID)
+        dirtyChat.discoveryTokenBudget = 12345
+        settingsManager.updateChatSettings(dirtyChat, commit: false)
+
+        var recommendationsDidApplyCount = 0
+        let didApplyCancellable = NotificationCenter.default
+            .publisher(for: .recommendationsDidApply)
+            .filter {
+                $0.userInfo?[AgentModelsSettingsNotification.sourceWorkspaceIDKey] as? UUID == workspaceID
+            }
+            .sink { _ in recommendationsDidApplyCount += 1 }
+        defer { didApplyCancellable.cancel() }
+
+        prompt.contextBuilderAgent = .codexExec
+        prompt.selectContextBuilderAgentModel(rawModel: AgentModel.gpt55CodexLow.rawValue)
+        prompt.commitContextBuilderSettings()
+        await drainMainQueue()
+
+        XCTAssertEqual(recommendationsDidApplyCount, 0)
+        XCTAssertEqual(settingsManager.copySettings(for: workspaceID).fileTreeOption, .files)
+        XCTAssertEqual(settingsManager.chatSettings(for: workspaceID).discoveryTokenBudget, 12345)
+        XCTAssertEqual(prompt.contextBuilderAgent, .codexExec)
+        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, AgentModel.gpt55CodexLow.rawValue)
+
+        let profile = store.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        XCTAssertEqual(profile.contextBuilderAgentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(
+            profile.contextBuilderModelsByAgent?[AgentProviderKind.codexExec.rawValue],
+            AgentModel.gpt55CodexLow.rawValue
+        )
+    }
+
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side
     // publish is covered by SettingsJSONOnlyPersistenceTests.testGlobalDefaultsSettersPublishObjectWillChange
     // and the VM-side subscription + re-seed is covered by testOracleModelChangePropagatesAcrossWindows
@@ -94,7 +159,12 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         return GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
     }
 
-    private func makePromptViewModel(windowID: Int, store: GlobalSettingsStore) -> PromptViewModel {
+    private func makePromptViewModel(
+        windowID: Int,
+        store: GlobalSettingsStore,
+        workspaceID: UUID? = nil,
+        settingsManager: WindowSettingsManager? = nil
+    ) -> PromptViewModel {
         let secureService = SecureKeysService(secureStorage: TestSecureStorageBackend(values: [:]))
         let keyManager = KeyManager(secureService: secureService)
         let apiSettings = APISettingsViewModel(
@@ -102,11 +172,15 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )
+        let fileManager = WorkspaceFilesViewModel()
+        if let workspaceID {
+            fileManager.setCurrentWorkspaceID(workspaceID)
+        }
         return PromptViewModel(
-            fileManager: WorkspaceFilesViewModel(),
+            fileManager: fileManager,
             apiSettingsViewModel: apiSettings,
             windowID: windowID,
-            settingsManager: WindowSettingsManager(windowID: windowID, store: store)
+            settingsManager: settingsManager ?? WindowSettingsManager(windowID: windowID, store: store)
         )
     }
 
