@@ -939,6 +939,7 @@ struct AgentMessageBubble: View {
                 isMarkdown: true,
                 allowInteraction: true,
                 forceTextColor: .secondary.opacity(0.85),
+                renderCadence: item.isStreaming ? .streamingCoalesced : .immediate
                 bareURLLinkificationPolicy: .httpHTTPSOnly
             )
             .padding(.vertical, 6)

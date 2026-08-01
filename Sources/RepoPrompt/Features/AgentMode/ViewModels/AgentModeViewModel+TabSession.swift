@@ -46,6 +46,7 @@ extension AgentModeViewModel {
         var onRunStateChanged: ((TabSession) -> Void)?
         #if DEBUG
             private(set) var test_incrementalRetentionCompactionCount = 0
+            private(set) var test_sourceItemIDRepairPassCount = 0
         #endif
 
         /// Run state
@@ -1072,6 +1073,9 @@ extension AgentModeViewModel {
             _ candidateItems: [AgentChatItem],
             diagnosticContext: String
         ) -> [AgentChatItem] {
+            #if DEBUG
+                test_sourceItemIDRepairPassCount += 1
+            #endif
             let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
             if repair.didRepair {
                 AgentSourceItemIDRepair.logDiagnostics(
@@ -1097,6 +1101,9 @@ extension AgentModeViewModel {
             _ candidateItems: [AgentChatItem],
             diagnosticContext: String
         ) -> Bool {
+            #if DEBUG
+                test_sourceItemIDRepairPassCount += 1
+            #endif
             let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
             guard repair.didRepair else { return false }
             AgentSourceItemIDRepair.logDiagnostics(
@@ -1323,6 +1330,21 @@ extension AgentModeViewModel {
             sourceItemsRevision &+= 1
             derivedTranscriptSyncState = nil
             onSourceItemsChanged?(self, mutation)
+        }
+
+        private func commitIncrementalItemUpdate(
+            previousItem: AgentChatItem,
+            updatedItem: AgentChatItem,
+            at index: Int,
+            mutation: AgentModeViewModel.SourceItemsMutation
+        ) {
+            suppressSourceItemsChanged = true
+            items[index] = updatedItem
+            suppressSourceItemsChanged = false
+            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+            finishIncrementalSourceItemsMutation(mutation)
         }
 
         #if DEBUG
@@ -1555,8 +1577,9 @@ extension AgentModeViewModel {
             var newItem = item
             newItem.sequenceIndex = nextSequenceIndex
             nextSequenceIndex += 1
-            let candidateItems = items + [newItem]
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem") {
+            if liveItemIDs.contains(newItem.id),
+               commitRepairedSourceItemsIfNeeded(items + [newItem], diagnosticContext: "appendItem")
+            {
                 if newItem.kind == .user {
                     hasSentFirstMessage = true
                     lastUserMessageAt = newItem.timestamp
@@ -1584,21 +1607,22 @@ extension AgentModeViewModel {
             guard items.indices.contains(index) else { return }
             let previousItem = items[index]
             guard updatedItem != previousItem else { return }
-            var candidateItems = items
-            candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
-                lastActivityAt = Date()
-                isDirty = true
-                return
+            if previousItem.id != updatedItem.id,
+               liveItemIDs.contains(updatedItem.id)
+            {
+                var candidateItems = items
+                candidateItems[index] = updatedItem
+                if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
+                    lastActivityAt = Date()
+                    isDirty = true
+                    return
+                }
             }
-            suppressSourceItemsChanged = true
-            items[index] = updatedItem
-            suppressSourceItemsChanged = false
-            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
-            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
-            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-            finishIncrementalSourceItemsMutation(
-                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            commitIncrementalItemUpdate(
+                previousItem: previousItem,
+                updatedItem: updatedItem,
+                at: index,
+                mutation: .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
             )
             lastActivityAt = Date()
             isDirty = true
@@ -1610,20 +1634,12 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
-            var candidateItems = items
-            candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem") {
-                lastActivityAt = Date()
-                isDirty = true
-                return
-            }
-            suppressSourceItemsChanged = true
-            items[index] = updatedItem
-            suppressSourceItemsChanged = false
-            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
-            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
-            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-            finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+            commitIncrementalItemUpdate(
+                previousItem: previousItem,
+                updatedItem: updatedItem,
+                at: index,
+                mutation: .mutate(index: index, itemKind: updatedItem.kind)
+            )
             lastActivityAt = Date()
             isDirty = true
         }
@@ -1650,21 +1666,11 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
-            var candidateItems = items
-            candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem") {
-                lastActivityAt = Date()
-                isDirty = true
-                return
-            }
-            suppressSourceItemsChanged = true
-            items[index] = updatedItem
-            suppressSourceItemsChanged = false
-            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
-            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
-            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-            finishIncrementalSourceItemsMutation(
-                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            commitIncrementalItemUpdate(
+                previousItem: previousItem,
+                updatedItem: updatedItem,
+                at: index,
+                mutation: .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
             )
             lastActivityAt = Date()
             isDirty = true
