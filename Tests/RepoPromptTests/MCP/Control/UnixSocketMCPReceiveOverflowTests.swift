@@ -1,9 +1,45 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
+    func testFrameCapFailsClosedWithDistinctTerminalCause() async throws {
+        let descriptors = try Self.makeSocketPair()
+        defer { Self.closeIfOpen(descriptors[1]) }
+
+        let transport = try UnixSocketMCPTransport(
+            connectedFD: descriptors[0],
+            maximumFrameByteCount: 4
+        )
+        try await transport.connect()
+        let stream = await transport.receive()
+
+        try Self.writeAll(Data("12345\n".utf8), to: descriptors[1])
+        let didFail = await Self.waitUntil(timeout: 5) {
+            let snapshot = await transport.ingressSnapshot()
+            return snapshot.terminalCause == .frameTooLarge
+        }
+        XCTAssertTrue(didFail)
+
+        var iterator = stream.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            XCTFail("Expected oversized frame to terminate the stream")
+        } catch {
+            XCTAssertEqual(
+                error as? MCPNewlineFrameTooLargeError,
+                MCPNewlineFrameTooLargeError(maximumByteCount: 4, accumulatedByteCount: 5)
+            )
+        }
+
+        let closeValue = await transport.closeSnapshot()
+        let closeSnapshot = try XCTUnwrap(closeValue)
+        XCTAssertEqual(closeSnapshot.cause, .frameTooLarge)
+        XCTAssertEqual(closeSnapshot.initiator, .peer)
+    }
+
     func testOverflowPreservesAcceptedOrderTerminatesStreamAndPublishesStableDiagnostics() async throws {
         #if DEBUG
             let descriptors = try Self.makeSocketPair()
@@ -253,7 +289,9 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
                 Darwin.write(fd, buffer.baseAddress, buffer.count)
             }
             if written < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard written > 0 else {
@@ -283,7 +321,9 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if await condition() { return true }
+            if await condition() {
+                return true
+            }
             try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
         }
         return await condition()

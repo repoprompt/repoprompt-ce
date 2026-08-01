@@ -9,6 +9,7 @@ public enum MCPTransportTerminalCause: String, Codable, Equatable, Sendable {
     case writeStall = "write_stall"
     case writeHangup = "write_hangup"
     case receiveBufferOverflow = "receive_buffer_overflow"
+    case frameTooLarge = "frame_too_large"
     case localDisconnect = "local_disconnect"
     case connectFailure = "connect_failure"
     case connectCancelled = "connect_cancelled"

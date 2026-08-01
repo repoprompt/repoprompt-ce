@@ -57,6 +57,84 @@ import SystemPackage
     }
 #endif
 
+struct BootstrapSocketMCPReceiveBufferOverflowError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    let capacity: Int
+
+    var description: String {
+        "CLI MCP receive buffer overflow (capacity=\(capacity))"
+    }
+
+    var errorDescription: String? {
+        description
+    }
+}
+
+private final class BootstrapSocketMCPIngressGate: @unchecked Sendable {
+    enum OfferResult {
+        case accepted
+        case overflow
+        case terminal
+    }
+
+    private let lock = NSLock()
+    private let receiveBufferCapacity: Int
+    private var isTerminal = false
+    /// First-writer-wins terminal cause. Overflow is recorded synchronously on
+    /// `.dropped` so a racing EOF/error teardown still finishes the stream with
+    /// the authoritative overflow error (mirrors app UnixSocketMCPTransport).
+    private var terminalError: (any Swift.Error)?
+
+    init(receiveBufferCapacity: Int) {
+        self.receiveBufferCapacity = max(1, receiveBufferCapacity)
+    }
+
+    func offer(
+        _ frame: Data,
+        to continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    ) -> OfferResult {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isTerminal else { return .terminal }
+
+        switch continuation.yield(frame) {
+        case .enqueued:
+            return .accepted
+        case .dropped:
+            isTerminal = true
+            if terminalError == nil {
+                terminalError = BootstrapSocketMCPReceiveBufferOverflowError(
+                    capacity: receiveBufferCapacity
+                )
+            }
+            return .overflow
+        case .terminated:
+            isTerminal = true
+            return .terminal
+        @unknown default:
+            isTerminal = true
+            return .terminal
+        }
+    }
+
+    /// Marks the gate terminal. Optional `error` is recorded only when no
+    /// stronger cause (e.g. overflow) was already stored.
+    func markTerminal(error: (any Swift.Error)? = nil) {
+        lock.lock()
+        isTerminal = true
+        if terminalError == nil, let error {
+            terminalError = error
+        }
+        lock.unlock()
+    }
+
+    /// Authoritative terminal error for stream finish (overflow wins over nil/EOF).
+    func authoritativeTerminalError() -> (any Swift.Error)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminalError
+    }
+}
+
 /// MCP Transport implementation for CLI that wraps an already-connected UNIX socket FD.
 /// This is used after the bootstrap handshake completes to run MCP.Client over the socket.
 public actor BootstrapSocketMCPTransport: Transport {
@@ -67,8 +145,11 @@ public actor BootstrapSocketMCPTransport: Transport {
     private var streamFinished = false
     private var socketClosed = false
     private var connectionAttempted = false
+    private let receiveBufferCapacity: Int
+    private let maximumFrameByteCount: Int
 
     private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
+    private nonisolated let ingressGate: BootstrapSocketMCPIngressGate
     private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
 
     private let readQueue = DispatchQueue(label: "com.repoprompt.ce.mcp.cli.socket.read", qos: .userInitiated)
@@ -122,8 +203,11 @@ public actor BootstrapSocketMCPTransport: Transport {
         connectedFD: Int32,
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
-        writePollIntervalMilliseconds: Int32 = 250
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount
     ) throws {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         do {
             try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
         } catch {
@@ -138,12 +222,17 @@ public actor BootstrapSocketMCPTransport: Transport {
         }
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
+        self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        self.maximumFrameByteCount = max(1, maximumFrameByteCount)
+        ingressGate = BootstrapSocketMCPIngressGate(
+            receiveBufferCapacity: sanitizedReceiveBufferCapacity
+        )
 
         // Create message stream (buffered to avoid unbounded growth if consumer is slow)
         var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
         messageStream = AsyncThrowingStream(
             Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
+            bufferingPolicy: .bufferingOldest(sanitizedReceiveBufferCapacity)
         ) { continuation = $0 }
         messageContinuation = continuation
     }
@@ -265,7 +354,9 @@ public actor BootstrapSocketMCPTransport: Transport {
 
             if written < 0 {
                 let err = errno
-                if err == EINTR { continue }
+                if err == EINTR {
+                    continue
+                }
                 if err == EAGAIN || err == EWOULDBLOCK {
                     try waitForSocketWritable(
                         lastProgressAt: lastProgressAt,
@@ -320,13 +411,17 @@ public actor BootstrapSocketMCPTransport: Transport {
             let result = poll(&pfd, 1, pollTimeout)
 
             if result < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 let error = MCPError.transportError(Errno(rawValue: errno))
                 closeAfterSendFailure(error)
                 throw error
             }
 
-            if result == 0 { continue }
+            if result == 0 {
+                continue
+            }
 
             if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
                 closeAfterSendFailure(MCPError.connectionClosed)
@@ -370,6 +465,10 @@ public actor BootstrapSocketMCPTransport: Transport {
         func debugReleaseReaderCancellationCallbacks() {
             callbackGate.release(.cancellation)
         }
+
+        func debugIsStreamFinished() -> Bool {
+            streamFinished
+        }
     #endif
 
     private nonisolated func scheduleReaderTerminalCallback(_ callback: @escaping @Sendable () -> Void) {
@@ -400,13 +499,29 @@ public actor BootstrapSocketMCPTransport: Transport {
 
         let cont = messageContinuation
         let log = logger
+        let receiveBufferCapacity = receiveBufferCapacity
 
         let newReader = NewlineDelimitedSocketReader(
             fd: fd,
             queue: readQueue,
             logger: log,
-            onFrame: { frame in
-                cont.yield(frame)
+            maximumFrameByteCount: maximumFrameByteCount,
+            onFrame: { [weak self] frame in
+                guard let self else { return }
+                switch ingressGate.offer(frame, to: cont) {
+                case .accepted:
+                    break
+                case .overflow:
+                    // Cause is already recorded synchronously on the gate; the
+                    // async task only drives teardown. finishStreamIfNeeded always
+                    // resolves the gate's authoritative overflow error.
+                    let error = BootstrapSocketMCPReceiveBufferOverflowError(
+                        capacity: receiveBufferCapacity
+                    )
+                    Task { await self.handleReceiveBufferOverflow(error, from: identity) }
+                case .terminal:
+                    break
+                }
             },
             onTerminal: { [weak self] terminal in
                 guard let transport = self else { return }
@@ -521,6 +636,23 @@ public actor BootstrapSocketMCPTransport: Transport {
         }
     }
 
+    private func handleReceiveBufferOverflow(
+        _ error: BootstrapSocketMCPReceiveBufferOverflowError,
+        from identity: ReaderIdentity
+    ) {
+        // Identity may already be cleared if a racing EOF teardown won the stop race.
+        // The gate still holds the overflow cause recorded synchronously at yield-drop.
+        let isCurrentReader = activeReaderOwnership?.identity == identity
+        if !isCurrentReader, activeReaderOwnership != nil {
+            // A newer reader owns the socket; do not tear it down for a stale overflow.
+            return
+        }
+        if !streamFinished {
+            logger.error("BootstrapSocketMCPTransport receive buffer overflow; terminating connection")
+        }
+        tearDownSocket(error: error)
+    }
+
     private func tearDownSocket(error: Swift.Error? = nil) {
         isConnected = false
         if !socketClosed {
@@ -537,9 +669,12 @@ public actor BootstrapSocketMCPTransport: Transport {
     private func finishStreamIfNeeded(throwing error: Swift.Error? = nil) {
         guard !streamFinished else { return }
         streamFinished = true
+        // Prefer a synchronously recorded overflow cause over a racing EOF/nil teardown.
+        let resolvedError = ingressGate.authoritativeTerminalError() ?? error
+        ingressGate.markTerminal(error: resolvedError)
 
-        if let error {
-            messageContinuation.finish(throwing: error)
+        if let resolvedError {
+            messageContinuation.finish(throwing: resolvedError)
         } else {
             messageContinuation.finish()
         }

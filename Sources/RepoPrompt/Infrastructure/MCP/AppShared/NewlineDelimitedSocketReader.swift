@@ -10,6 +10,7 @@
 import Dispatch
 import Foundation
 import Logging
+import RepoPromptShared
 
 #if canImport(Darwin)
     import Darwin
@@ -117,9 +118,7 @@ public final class NewlineDelimitedSocketReader {
     private let fd: Int32
     private let queue: DispatchQueue
     private let logger: Logger
-    private let delimiter: UInt8
     private let chunkSize: Int
-    private let bufferReservation: Int
     private let maxReadCallsPerEvent: Int
     private let maxBytesPerEvent: Int
     private let maxFramesPerEvent: Int
@@ -133,7 +132,7 @@ public final class NewlineDelimitedSocketReader {
 
     private var source: ReadEventSource?
     private var pendingCancelledSources: [ObjectIdentifier: ReadEventSource] = [:]
-    private var buffer = Data()
+    private var frameAccumulator: MCPNewlineFrameAccumulator
     private var lifecycle = Lifecycle.idle
     private var generation: UInt64 = 0
     private var pumpRunning = false
@@ -147,6 +146,7 @@ public final class NewlineDelimitedSocketReader {
         delimiter: UInt8 = UInt8(ascii: "\n"),
         chunkSize: Int = 16384,
         bufferReservation: Int = 64 * 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount,
         onFrame: @escaping (Data) -> Void,
         onTerminal: @escaping (NewlineDelimitedSocketReaderTerminal) -> Void,
         onBytesRead: (() -> Void)? = nil,
@@ -159,6 +159,7 @@ public final class NewlineDelimitedSocketReader {
             delimiter: delimiter,
             chunkSize: chunkSize,
             bufferReservation: bufferReservation,
+            maximumFrameByteCount: maximumFrameByteCount,
             onFrame: onFrame,
             onEOF: { onTerminal(.eof(hasResidualData: $0)) },
             onError: { onTerminal(.error($0)) },
@@ -174,6 +175,7 @@ public final class NewlineDelimitedSocketReader {
         delimiter: UInt8 = UInt8(ascii: "\n"),
         chunkSize: Int = 16384,
         bufferReservation: Int = 64 * 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount,
         onFrame: @escaping (Data) -> Void,
         onEOF: @escaping (_ hasResidualData: Bool) -> Void,
         onError: @escaping (Swift.Error) -> Void,
@@ -187,6 +189,7 @@ public final class NewlineDelimitedSocketReader {
             delimiter: delimiter,
             chunkSize: chunkSize,
             bufferReservation: bufferReservation,
+            maximumFrameByteCount: maximumFrameByteCount,
             maxReadCallsPerEvent: Self.defaultMaxReadCallsPerEvent,
             maxBytesPerEvent: Self.defaultMaxBytesPerEvent,
             maxFramesPerEvent: Self.defaultMaxFramesPerEvent,
@@ -206,6 +209,7 @@ public final class NewlineDelimitedSocketReader {
         delimiter: UInt8 = UInt8(ascii: "\n"),
         chunkSize: Int = 16384,
         bufferReservation: Int = 64 * 1024,
+        maximumFrameByteCount: Int = MCPNewlineFrameAccumulator.defaultMaximumFrameByteCount,
         maxReadCallsPerEvent: Int = NewlineDelimitedSocketReader.defaultMaxReadCallsPerEvent,
         maxBytesPerEvent: Int = NewlineDelimitedSocketReader.defaultMaxBytesPerEvent,
         maxFramesPerEvent: Int = NewlineDelimitedSocketReader.defaultMaxFramesPerEvent,
@@ -219,9 +223,7 @@ public final class NewlineDelimitedSocketReader {
         self.fd = fd
         self.queue = queue
         self.logger = logger
-        self.delimiter = delimiter
-        self.chunkSize = chunkSize
-        self.bufferReservation = bufferReservation
+        self.chunkSize = max(1, chunkSize)
         self.maxReadCallsPerEvent = max(1, maxReadCallsPerEvent)
         self.maxBytesPerEvent = max(1, maxBytesPerEvent)
         self.maxFramesPerEvent = max(1, maxFramesPerEvent)
@@ -231,7 +233,11 @@ public final class NewlineDelimitedSocketReader {
         self.onError = onError
         self.onBytesRead = onBytesRead
         self.onCancel = onCancel
-        buffer.reserveCapacity(bufferReservation)
+        frameAccumulator = MCPNewlineFrameAccumulator(
+            delimiter: delimiter,
+            maximumFrameByteCount: maximumFrameByteCount,
+            bufferReservation: bufferReservation
+        )
         queue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -241,7 +247,7 @@ public final class NewlineDelimitedSocketReader {
 
             generation &+= 1
             let sourceGeneration = generation
-            buffer.removeAll(keepingCapacity: true)
+            frameAccumulator.reset()
             readableEventPending = false
             pumpRunning = false
             pumpScheduled = false
@@ -305,10 +311,16 @@ public final class NewlineDelimitedSocketReader {
         var frameCount = 0
 
         while pumpGeneration == generation, lifecycle == .running {
-            frameCount += drainCompleteFrames(
-                limit: maxFramesPerEvent - frameCount,
-                generation: pumpGeneration
-            )
+            do {
+                frameCount += try drainCompleteFrames(
+                    limit: maxFramesPerEvent - frameCount,
+                    generation: pumpGeneration
+                )
+            } catch {
+                logger.error("NewlineDelimitedSocketReader framing error: \(String(describing: error))")
+                finishTerminalOnQueue(.failure(error), generation: pumpGeneration)
+                return false
+            }
             guard pumpGeneration == generation, lifecycle == .running else { return false }
             if frameCount >= maxFramesPerEvent {
                 return true
@@ -336,11 +348,11 @@ public final class NewlineDelimitedSocketReader {
             }
 
             if bytesRead == 0 {
-                finishTerminalOnQueue(.success(!buffer.isEmpty), generation: pumpGeneration)
+                finishTerminalOnQueue(.success(frameAccumulator.hasResidualData), generation: pumpGeneration)
                 return false
             }
 
-            buffer.append(readBuffer, count: bytesRead)
+            frameAccumulator.append(UnsafeBufferPointer(start: readBuffer, count: bytesRead))
             byteCount += bytesRead
             if !notifiedBytesRead {
                 notifiedBytesRead = true
@@ -352,18 +364,15 @@ public final class NewlineDelimitedSocketReader {
     }
 
     @discardableResult
-    private func drainCompleteFrames(limit: Int, generation pumpGeneration: UInt64) -> Int {
+    private func drainCompleteFrames(limit: Int, generation pumpGeneration: UInt64) throws -> Int {
         guard limit > 0 else { return 0 }
 
         var drainedCount = 0
         while drainedCount < limit,
               pumpGeneration == generation,
               lifecycle == .running,
-              let newlineIndex = buffer.firstIndex(of: delimiter)
+              let frame = try frameAccumulator.nextFrame()
         {
-            let frame = Data(buffer[..<newlineIndex])
-            let nextStart = buffer.index(after: newlineIndex)
-            buffer.removeSubrange(..<nextStart)
             drainedCount += 1
 
             if !frame.isEmpty {
@@ -408,7 +417,7 @@ public final class NewlineDelimitedSocketReader {
         lifecycle = .stopped
         readableEventPending = false
         pumpScheduled = false
-        buffer.removeAll(keepingCapacity: true)
+        frameAccumulator.reset()
         cancelCurrentSourceOnQueue()
     }
 
