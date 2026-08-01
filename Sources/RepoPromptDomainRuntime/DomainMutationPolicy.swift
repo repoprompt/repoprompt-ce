@@ -388,7 +388,7 @@ package actor DomainMutationPolicyStore {
             version: DomainMutationPolicyDocument.schemaVersion,
             profileIdentifier: legacy.profileIdentifier,
             revision: legacy.revision,
-            headlessGrants: legacy.headlessGrants.map { grant in
+            headlessGrants: try legacy.headlessGrants.map { grant in
                 try validateGrant(grant)
                 return try canonicalizedGrant(grant)
             },
