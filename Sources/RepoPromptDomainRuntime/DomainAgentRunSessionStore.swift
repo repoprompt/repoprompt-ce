@@ -662,7 +662,7 @@ package actor DomainAgentRunSessionStore {
         let waiterID = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                guard !isShuttingDown else {
+                guard !Task.isCancelled, !isShuttingDown else {
                     continuation.resume(returning: .cancelled)
                     return
                 }

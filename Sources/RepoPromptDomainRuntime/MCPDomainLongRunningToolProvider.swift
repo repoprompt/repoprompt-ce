@@ -254,14 +254,16 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         case "ask_oracle", "oracle_send", "context_builder":
             return ["ai_cost", "external_process"]
         case "agent_explore":
-            return arguments["op"]?.stringValue == "start" ? ["ai_cost", "external_process"] : []
+            return normalizedOperation(arguments, fallback: "") == "start"
+                ? ["ai_cost", "external_process"]
+                : []
         case "agent_run":
-            let operation = arguments["op"]?.stringValue ?? "wait"
+            let operation = normalizedOperation(arguments, fallback: "wait")
             return ["start", "steer", "respond"].contains(operation)
                 ? ["ai_cost", "external_process"]
                 : []
         case "agent_manage":
-            let operation = arguments["op"]?.stringValue ?? "list_sessions"
+            let operation = canonicalOperation(arguments, fallback: "list_sessions")
             if ["resume_session", "handoff"].contains(operation) {
                 return ["ai_cost", "external_process"]
             }
@@ -279,13 +281,31 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         case "context_builder", "ask_oracle", "oracle_send":
             return true
         case "agent_explore":
-            return arguments["op"]?.stringValue == "start"
+            return normalizedOperation(arguments, fallback: "") == "start"
         case "agent_run":
-            let operation = arguments["op"]?.stringValue ?? "wait"
+            let operation = normalizedOperation(arguments, fallback: "wait")
             return ["start", "steer", "respond"].contains(operation)
         default:
             return false
         }
+    }
+
+    private func normalizedOperation(
+        _ arguments: [String: Value],
+        fallback: String
+    ) -> String {
+        guard let operation = arguments["op"]?.stringValue else { return fallback }
+        return operation
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private func canonicalOperation(
+        _ arguments: [String: Value],
+        fallback: String
+    ) -> String {
+        let operation = normalizedOperation(arguments, fallback: fallback)
+        return operation == "extract_handoff" ? "handoff" : operation
     }
 
     private func activityKind(_ toolName: String) -> DomainActivityKind {
@@ -324,7 +344,14 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
             return TimeInterval(supplied)
         }
         if let adapter {
-            let resolved = try await adapter.resolveDefaultTimeoutSeconds(request)
+            let resolved: TimeInterval
+            do {
+                resolved = try await adapter.resolveDefaultTimeoutSeconds(request)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                return 300
+            }
             guard resolved.isFinite, resolved > 0 else {
                 throw MCPError.internalError("ask_user workspace timeout is invalid")
             }

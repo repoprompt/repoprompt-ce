@@ -28,6 +28,20 @@ package struct DomainCredentialEnvelopeDescriptor: Hashable, Sendable {
     package let runtimeGeneration: UInt64
     package let scope: DomainCredentialScope
     package let expiresAt: ContinuousClock.Instant
+
+    package init(
+        envelopeID: UUID,
+        runtimeID: UUID,
+        runtimeGeneration: UInt64,
+        scope: DomainCredentialScope,
+        expiresAt: ContinuousClock.Instant
+    ) {
+        self.envelopeID = envelopeID
+        self.runtimeID = runtimeID
+        self.runtimeGeneration = runtimeGeneration
+        self.scope = scope
+        self.expiresAt = expiresAt
+    }
 }
 
 package enum DomainCredentialPayloadError: Error, Equatable, Sendable {
@@ -119,16 +133,46 @@ private final class DomainSecureCredentialBuffer: @unchecked Sendable {
 package final class DomainCredentialPayload: @unchecked Sendable, CustomStringConvertible {
     private let storage: DomainSecureCredentialBuffer
     private let originalByteCount: Int
+    private let expiresAt: ContinuousClock.Instant
+    private let lifetimeLock = NSLock()
+    private var expiryTask: Task<Void, Never>?
 
-    fileprivate init(storage: DomainSecureCredentialBuffer) {
+    fileprivate init(
+        storage: DomainSecureCredentialBuffer,
+        expiresAt: ContinuousClock.Instant
+    ) {
         self.storage = storage
         originalByteCount = storage.byteCount
+        self.expiresAt = expiresAt
+        let taskStorage = storage
+        expiryTask = Task {
+            do {
+                try await ContinuousClock().sleep(until: expiresAt)
+            } catch {
+                return
+            }
+            taskStorage.zeroInPlace()
+        }
+    }
+
+    deinit {
+        revoke()
+        storage.zeroInPlace()
     }
 
     package func withConsumedBytes<Result>(
         _ body: (UnsafeRawBufferPointer) throws -> Result
     ) throws -> Result {
-        try storage.consume(body)
+        defer { revoke() }
+        return try storage.consume(body)
+    }
+
+    private func revoke() {
+        lifetimeLock.lock()
+        let task = expiryTask
+        expiryTask = nil
+        lifetimeLock.unlock()
+        task?.cancel()
     }
 
     package var description: String {
@@ -143,11 +187,17 @@ package final class DomainCredentialPayload: @unchecked Sendable, CustomStringCo
         package func test_isOwnedStorageZeroed() -> Bool {
             storage.testIsZeroed()
         }
+
+        package func test_expiresAt() -> ContinuousClock.Instant {
+            expiresAt
+        }
     #endif
 }
 
 package enum DomainCredentialEnvelopeError: Error, Equatable, Sendable {
     case unavailable
+    case payloadTooLarge
+    case tooManyOutstandingEnvelopes
     case expired
     case alreadyConsumed
     case runtimeMismatch
@@ -156,21 +206,29 @@ package enum DomainCredentialEnvelopeError: Error, Equatable, Sendable {
 }
 
 package actor DomainCredentialEnvelopeStore {
-    private enum State: Sendable {
+    package static let maximumPayloadBytes = 64 * 1024
+    package static let maximumOutstandingEnvelopeCount = 256
+    package static let maximumTombstoneCount = 256
+
+    private enum State: Sendable, Equatable {
         case active
         case consumed
+        case expired
         case revoked
     }
 
     private struct Record: Sendable {
         let descriptor: DomainCredentialEnvelopeDescriptor
-        let storage: DomainSecureCredentialBuffer
+        var storage: DomainSecureCredentialBuffer?
         var state: State
     }
 
     private let identity: DomainRuntimeIdentity
     private let clock = ContinuousClock()
     private var records: [UUID: Record] = [:]
+    private var terminalOrder: [UUID] = []
+    private var activeEnvelopeCount = 0
+    private var expiryTasks: [UUID: Task<Void, Never>] = [:]
     private var isShuttingDown = false
 
     package init(identity: DomainRuntimeIdentity) {
@@ -183,6 +241,13 @@ package actor DomainCredentialEnvelopeStore {
         lifetime: Duration = .seconds(60)
     ) throws -> DomainCredentialEnvelopeDescriptor {
         guard !isShuttingDown, !bytes.isEmpty else { throw DomainCredentialEnvelopeError.unavailable }
+        guard bytes.count <= Self.maximumPayloadBytes else {
+            throw DomainCredentialEnvelopeError.payloadTooLarge
+        }
+        pruneExpiredRecords()
+        guard activeEnvelopeCount < Self.maximumOutstandingEnvelopeCount else {
+            throw DomainCredentialEnvelopeError.tooManyOutstandingEnvelopes
+        }
         let descriptor = DomainCredentialEnvelopeDescriptor(
             envelopeID: UUID(),
             runtimeID: identity.runtimeID,
@@ -195,6 +260,8 @@ package actor DomainCredentialEnvelopeStore {
             storage: DomainSecureCredentialBuffer(bytes: bytes),
             state: .active
         )
+        activeEnvelopeCount += 1
+        scheduleExpiry(for: descriptor)
         return descriptor
     }
 
@@ -202,65 +269,161 @@ package actor DomainCredentialEnvelopeStore {
         _ descriptor: DomainCredentialEnvelopeDescriptor,
         scope: DomainCredentialScope
     ) throws -> DomainCredentialPayload {
+        guard let record = records[descriptor.envelopeID] else {
+            throw DomainCredentialEnvelopeError.unavailable
+        }
+        guard descriptor.runtimeID == record.descriptor.runtimeID,
+              descriptor.runtimeGeneration == record.descriptor.runtimeGeneration
+        else {
+            throw DomainCredentialEnvelopeError.runtimeMismatch
+        }
+        guard descriptor.scope == record.descriptor.scope,
+              scope == record.descriptor.scope
+        else {
+            throw DomainCredentialEnvelopeError.scopeMismatch
+        }
+        guard descriptor.expiresAt == record.descriptor.expiresAt else {
+            throw DomainCredentialEnvelopeError.unavailable
+        }
         guard descriptor.runtimeID == identity.runtimeID,
               descriptor.runtimeGeneration == identity.lifecycleGeneration
         else {
             throw DomainCredentialEnvelopeError.runtimeMismatch
         }
-        guard descriptor.scope == scope else { throw DomainCredentialEnvelopeError.scopeMismatch }
-        guard var record = records[descriptor.envelopeID] else {
-            throw DomainCredentialEnvelopeError.unavailable
-        }
         switch record.state {
         case .consumed:
             throw DomainCredentialEnvelopeError.alreadyConsumed
+        case .expired:
+            throw DomainCredentialEnvelopeError.expired
         case .revoked:
             throw DomainCredentialEnvelopeError.revoked
         case .active:
             break
         }
         guard clock.now < record.descriptor.expiresAt else {
-            record.storage.zeroInPlace()
-            record.state = .revoked
-            records[descriptor.envelopeID] = record
+            expire(envelopeID: descriptor.envelopeID)
             throw DomainCredentialEnvelopeError.expired
+        }
+        guard let sourceStorage = record.storage else {
+            throw DomainCredentialEnvelopeError.alreadyConsumed
         }
         let payloadStorage: DomainSecureCredentialBuffer
         do {
-            payloadStorage = try record.storage.clone()
+            payloadStorage = try sourceStorage.clone()
         } catch {
             throw DomainCredentialEnvelopeError.alreadyConsumed
         }
-        record.storage.zeroInPlace()
-        record.state = .consumed
-        records[descriptor.envelopeID] = record
-        return DomainCredentialPayload(storage: payloadStorage)
+        transitionToTerminal(envelopeID: descriptor.envelopeID, state: .consumed)
+        return DomainCredentialPayload(
+            storage: payloadStorage,
+            expiresAt: record.descriptor.expiresAt
+        )
+    }
+
+    private func scheduleExpiry(for descriptor: DomainCredentialEnvelopeDescriptor) {
+        let envelopeID = descriptor.envelopeID
+        expiryTasks[envelopeID] = Task { [weak self] in
+            do {
+                try await ContinuousClock().sleep(until: descriptor.expiresAt)
+            } catch {
+                return
+            }
+            await self?.expire(envelopeID: envelopeID)
+        }
+    }
+
+    private func pruneExpiredRecords() {
+        let now = clock.now
+        let expiredIDs = records.compactMap { id, record in
+            guard record.state == .active, now >= record.descriptor.expiresAt else { return nil }
+            return id
+        }
+        for id in expiredIDs {
+            expire(envelopeID: id)
+        }
+    }
+
+    private func expire(envelopeID: UUID) {
+        guard let record = records[envelopeID], record.state == .active else { return }
+        guard clock.now >= record.descriptor.expiresAt else {
+            scheduleExpiry(for: record.descriptor)
+            return
+        }
+        expiryTasks.removeValue(forKey: envelopeID)?.cancel()
+        transitionToTerminal(envelopeID: envelopeID, state: .expired)
+    }
+
+    private func transitionToTerminal(envelopeID: UUID, state: State) {
+        guard var record = records[envelopeID], record.state == .active else { return }
+        expiryTasks.removeValue(forKey: envelopeID)?.cancel()
+        record.storage?.zeroInPlace()
+        record.storage = nil
+        record.state = state
+        records[envelopeID] = record
+        activeEnvelopeCount = max(0, activeEnvelopeCount - 1)
+        terminalOrder.append(envelopeID)
+        trimTombstones()
+    }
+
+    private func trimTombstones() {
+        while terminalOrder.count > Self.maximumTombstoneCount {
+            let oldest = terminalOrder.removeFirst()
+            records.removeValue(forKey: oldest)
+        }
     }
 
     package func revoke(_ envelopeID: UUID) {
-        guard var record = records[envelopeID] else { return }
-        record.storage.zeroInPlace()
-        record.state = .revoked
-        records[envelopeID] = record
+        guard records[envelopeID]?.state == .active else { return }
+        expiryTasks.removeValue(forKey: envelopeID)?.cancel()
+        transitionToTerminal(envelopeID: envelopeID, state: .revoked)
     }
 
     package func shutdown() {
         isShuttingDown = true
-        for id in records.keys {
-            guard var record = records[id] else { continue }
-            record.storage.zeroInPlace()
-            record.state = .revoked
-            records[id] = record
+        for task in expiryTasks.values {
+            task.cancel()
+        }
+        expiryTasks.removeAll()
+        let activeIDs = records.compactMap { id, record in
+            record.state == .active ? id : nil
+        }
+        for id in activeIDs {
+            transitionToTerminal(envelopeID: id, state: .revoked)
         }
     }
 
     #if DEBUG
         package func test_ownedStorageBytes(envelopeID: UUID) -> [UInt8]? {
-            records[envelopeID]?.storage.testSnapshot()
+            records[envelopeID]?.storage?.testSnapshot()
         }
 
         package func test_isOwnedStorageZeroed(envelopeID: UUID) -> Bool? {
-            records[envelopeID]?.storage.testIsZeroed()
+            guard let record = records[envelopeID] else { return nil }
+            return record.storage?.testIsZeroed() ?? (record.state != .active)
+        }
+
+        package func test_recordCount() -> Int {
+            records.count
+        }
+
+        package func test_activeEnvelopeCount() -> Int {
+            activeEnvelopeCount
+        }
+
+        package func test_tombstoneCount() -> Int {
+            terminalOrder.count
+        }
+
+        package func test_terminalStorageCount() -> Int {
+            records.values.reduce(into: 0) { count, record in
+                if record.state != .active, record.storage != nil {
+                    count += 1
+                }
+            }
+        }
+
+        package func test_expiryTaskCount() -> Int {
+            expiryTasks.count
         }
     #endif
 }

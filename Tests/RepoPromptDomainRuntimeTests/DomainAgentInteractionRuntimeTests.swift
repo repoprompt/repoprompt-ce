@@ -95,6 +95,25 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         XCTAssertFalse(remainsActive)
     }
 
+    func testPreCancelledWaitDoesNotRegisterAContinuation() async {
+        let fixture = makeStoreFixture()
+        let store = fixture.store
+        let registration = await store.register(sessionID: UUID())
+        let cursor = DomainAgentSessionWaitCursor(registration: registration, epoch: nil)
+        let waiter = Task {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            return await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
+        }
+        waiter.cancel()
+        let disposition = await waiter.value
+        let waiterCount = await store.test_waiterCount(registration: registration)
+        XCTAssertEqual(disposition, .cancelled)
+        XCTAssertEqual(waiterCount, 0)
+        _ = await store.shutdown(deadline: .milliseconds(20))
+    }
+
     func testShutdownAtomicallyDetachesWaitersAcrossConcurrentSettlementRaces() async throws {
         let fixture = makeStoreFixture()
         let store = fixture.store
@@ -710,6 +729,58 @@ final class DomainInteractionBrokerTests: XCTestCase {
         XCTAssertTrue(snapshot.pendingRequestIDs.isEmpty)
         XCTAssertGreaterThanOrEqual(snapshot.ignoredLateResponseCount, 1)
     }
+
+    func testUncooperativeProviderCancellationSettlesWaiterBeforeCleanup() async {
+        let broker = DomainInteractionBroker()
+        let cleanupStarted = BoundedAsyncSignal()
+        let cleanupGate = UncooperativeCleanupGate()
+        let cleanupFinished = BoundedAsyncSignal()
+        let waiterSettled = BoundedAsyncSignal()
+        let recorder = InvocationRecorder()
+        let waiter = Task {
+            let result = await broker.request(
+                .init(
+                    toolName: "ask_user",
+                    payload: [:],
+                    deadline: Date().addingTimeInterval(1)
+                ),
+                appUI: DomainInteractionProvider(
+                    kind: .appUI,
+                    present: { _ in
+                        try await Task.sleep(for: .seconds(10))
+                        return .string("late")
+                    },
+                    cancel: { _ in
+                        await recorder.record("cancel")
+                        await cleanupStarted.signal()
+                        await cleanupGate.wait()
+                        await cleanupFinished.signal()
+                    }
+                )
+            )
+            await waiterSettled.signal()
+            return result
+        }
+        while await broker.snapshot().pendingRequestIDs.isEmpty {
+            await Task.yield()
+        }
+
+        waiter.cancel()
+        let cleanupWasStarted = await cleanupStarted.wait(timeout: .seconds(1))
+        let settledBeforeCleanupRelease = await waiterSettled.wait(timeout: .milliseconds(100))
+        await cleanupGate.release()
+        let cleanupDidFinish = await cleanupFinished.wait(timeout: .seconds(1))
+        let result = await waiter.value
+        let cancellationCalls = await recorder.values()
+        let snapshot = await broker.snapshot()
+
+        XCTAssertTrue(cleanupWasStarted)
+        XCTAssertTrue(settledBeforeCleanupRelease)
+        XCTAssertTrue(cleanupDidFinish)
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(cancellationCalls, ["cancel"])
+        XCTAssertTrue(snapshot.pendingRequestIDs.isEmpty)
+    }
 }
 
 final class DomainCredentialAndChildLaunchTests: XCTestCase {
@@ -739,7 +810,7 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
         let payload = try await store.redeem(descriptor, scope: scope)
         let consumedStoreBytes = await store.test_ownedStorageBytes(envelopeID: descriptor.envelopeID)
         let consumedStoreIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: descriptor.envelopeID)
-        XCTAssertEqual(consumedStoreBytes, [0, 0, 0, 0])
+        XCTAssertNil(consumedStoreBytes)
         XCTAssertEqual(consumedStoreIsZeroed, true)
         XCTAssertEqual(payload.test_ownedStorageBytes(), [1, 2, 3, 4])
         let consumed = try payload.withConsumedBytes { Array($0) }
@@ -768,7 +839,7 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
         await store.revoke(revoked.envelopeID)
         let revokedBytes = await store.test_ownedStorageBytes(envelopeID: revoked.envelopeID)
         let revokedIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: revoked.envelopeID)
-        XCTAssertEqual(revokedBytes, [0])
+        XCTAssertNil(revokedBytes)
         XCTAssertEqual(revokedIsZeroed, true)
         await XCTAssertThrowsErrorAsync {
             _ = try await store.redeem(revoked, scope: scope)
@@ -783,19 +854,184 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
         }
         let expiredBytes = await store.test_ownedStorageBytes(envelopeID: expired.envelopeID)
         let expiredIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: expired.envelopeID)
-        XCTAssertEqual(expiredBytes, [0])
+        XCTAssertNil(expiredBytes)
         XCTAssertEqual(expiredIsZeroed, true)
         let shutdown = try await store.issue(bytes: [7], scope: scope)
         await store.shutdown()
         let shutdownBytes = await store.test_ownedStorageBytes(envelopeID: shutdown.envelopeID)
         let shutdownIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: shutdown.envelopeID)
-        XCTAssertEqual(shutdownBytes, [0])
+        XCTAssertNil(shutdownBytes)
         XCTAssertEqual(shutdownIsZeroed, true)
         await XCTAssertThrowsErrorAsync {
             _ = try await store.redeem(shutdown, scope: scope)
         } verify: {
             XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .revoked)
         }
+    }
+
+    func testCredentialEnvelopeExpiryZeroizesOwnedStorageWithoutRedemption() async throws {
+        let identity = makeIdentity()
+        let store = DomainCredentialEnvelopeStore(identity: identity)
+        let scope = DomainCredentialScope(
+            providerIdentifier: "codex",
+            runID: UUID(),
+            principalID: UUID(),
+            purpose: "agent_run"
+        )
+        let descriptor = try await store.issue(
+            bytes: [10, 11, 12],
+            scope: scope,
+            lifetime: .milliseconds(10)
+        )
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while await store.test_isOwnedStorageZeroed(envelopeID: descriptor.envelopeID) != true,
+              clock.now < deadline
+        {
+            await Task.yield()
+        }
+        let isZeroed = await store.test_isOwnedStorageZeroed(envelopeID: descriptor.envelopeID)
+        let ownedBytes = await store.test_ownedStorageBytes(envelopeID: descriptor.envelopeID)
+        XCTAssertEqual(isZeroed, true)
+        XCTAssertNil(ownedBytes)
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.redeem(descriptor, scope: scope)
+        } verify: {
+            XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .expired)
+        }
+    }
+
+    func testCredentialEnvelopeRedemptionValidatesStoredDescriptorAndScope() async throws {
+        let identity = makeIdentity()
+        let store = DomainCredentialEnvelopeStore(identity: identity)
+        let scope = DomainCredentialScope(
+            providerIdentifier: "codex",
+            runID: UUID(),
+            principalID: UUID(),
+            purpose: "agent_run"
+        )
+        let descriptor = try await store.issue(bytes: [21, 22], scope: scope)
+        let forgedScope = DomainCredentialScope(
+            providerIdentifier: "claude",
+            runID: scope.runID,
+            principalID: scope.principalID,
+            purpose: scope.purpose
+        )
+        let forgedScopeDescriptor = DomainCredentialEnvelopeDescriptor(
+            envelopeID: descriptor.envelopeID,
+            runtimeID: descriptor.runtimeID,
+            runtimeGeneration: descriptor.runtimeGeneration,
+            scope: forgedScope,
+            expiresAt: descriptor.expiresAt
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.redeem(forgedScopeDescriptor, scope: forgedScope)
+        } verify: {
+            XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .scopeMismatch)
+        }
+        let forgedDeadlineDescriptor = DomainCredentialEnvelopeDescriptor(
+            envelopeID: descriptor.envelopeID,
+            runtimeID: descriptor.runtimeID,
+            runtimeGeneration: descriptor.runtimeGeneration,
+            scope: scope,
+            expiresAt: descriptor.expiresAt.advanced(by: .seconds(60))
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.redeem(forgedDeadlineDescriptor, scope: scope)
+        } verify: {
+            XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .unavailable)
+        }
+        let ownedBytes = await store.test_ownedStorageBytes(envelopeID: descriptor.envelopeID)
+        XCTAssertEqual(ownedBytes, [21, 22])
+        let payload = try await store.redeem(descriptor, scope: scope)
+        XCTAssertEqual(try payload.withConsumedBytes { Array($0) }, [21, 22])
+        await store.shutdown()
+    }
+
+    func testRedeemedCredentialPayloadRetainsDeadlineAndZeroizesIndependently() async throws {
+        let identity = makeIdentity()
+        let store = DomainCredentialEnvelopeStore(identity: identity)
+        let scope = DomainCredentialScope(
+            providerIdentifier: "codex",
+            runID: UUID(),
+            principalID: UUID(),
+            purpose: "agent_run"
+        )
+        let descriptor = try await store.issue(
+            bytes: [31, 32, 33],
+            scope: scope,
+            lifetime: .milliseconds(20)
+        )
+        let payload = try await store.redeem(descriptor, scope: scope)
+        XCTAssertEqual(payload.test_expiresAt(), descriptor.expiresAt)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while !payload.test_isOwnedStorageZeroed(), clock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(payload.test_isOwnedStorageZeroed())
+        XCTAssertThrowsError(try payload.withConsumedBytes { Array($0) }) {
+            XCTAssertEqual($0 as? DomainCredentialPayloadError, .alreadyConsumed)
+        }
+        await store.shutdown()
+    }
+
+    func testCredentialEnvelopeBoundsActiveRecordsAndTerminalTombstones() async throws {
+        let identity = makeIdentity()
+        let store = DomainCredentialEnvelopeStore(identity: identity)
+        let scope = DomainCredentialScope(
+            providerIdentifier: "codex",
+            runID: UUID(),
+            principalID: UUID(),
+            purpose: "agent_run"
+        )
+        let oversized = Array(
+            repeating: UInt8(1),
+            count: DomainCredentialEnvelopeStore.maximumPayloadBytes + 1
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.issue(bytes: oversized, scope: scope)
+        } verify: {
+            XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .payloadTooLarge)
+        }
+        for _ in 0 ..< DomainCredentialEnvelopeStore.maximumOutstandingEnvelopeCount {
+            _ = try await store.issue(bytes: [41], scope: scope)
+        }
+        let activeCount = await store.test_activeEnvelopeCount()
+        XCTAssertEqual(activeCount, DomainCredentialEnvelopeStore.maximumOutstandingEnvelopeCount)
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.issue(bytes: [42], scope: scope)
+        } verify: {
+            XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .tooManyOutstandingEnvelopes)
+        }
+        await store.shutdown()
+        let shutdownActiveCount = await store.test_activeEnvelopeCount()
+        let shutdownTerminalStorageCount = await store.test_terminalStorageCount()
+        let shutdownExpiryTaskCount = await store.test_expiryTaskCount()
+        let shutdownRecordCount = await store.test_recordCount()
+        XCTAssertEqual(shutdownActiveCount, 0)
+        XCTAssertEqual(shutdownTerminalStorageCount, 0)
+        XCTAssertEqual(shutdownExpiryTaskCount, 0)
+        XCTAssertLessThanOrEqual(
+            shutdownRecordCount,
+            DomainCredentialEnvelopeStore.maximumTombstoneCount
+        )
+
+        let tombstoneStore = DomainCredentialEnvelopeStore(identity: identity)
+        for _ in 0 ... DomainCredentialEnvelopeStore.maximumTombstoneCount {
+            let descriptor = try await tombstoneStore.issue(bytes: [51], scope: scope)
+            let payload = try await tombstoneStore.redeem(descriptor, scope: scope)
+            _ = try payload.withConsumedBytes { _ in () }
+        }
+        let tombstoneCount = await tombstoneStore.test_tombstoneCount()
+        let tombstoneRecordCount = await tombstoneStore.test_recordCount()
+        let tombstoneStorageCount = await tombstoneStore.test_terminalStorageCount()
+        let tombstoneExpiryTaskCount = await tombstoneStore.test_expiryTaskCount()
+        XCTAssertEqual(tombstoneCount, DomainCredentialEnvelopeStore.maximumTombstoneCount)
+        XCTAssertEqual(tombstoneRecordCount, DomainCredentialEnvelopeStore.maximumTombstoneCount)
+        XCTAssertEqual(tombstoneStorageCount, 0)
+        XCTAssertEqual(tombstoneExpiryTaskCount, 0)
+        await tombstoneStore.shutdown()
     }
 
     func testInjectedPrivateChildHarnessCarriesSingleUseTokenAndEnvelopeReference() async throws {
@@ -1018,6 +1254,92 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
         XCTAssertEqual(activities.recentTerminal.map(\.state), [.completed, .failed, .failed])
     }
 
+    func testLongRunningProviderNormalizesOperationBeforeApprovalAndChildLaunch() async throws {
+        let runtime = makeRuntime(mode: .app)
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = InvocationRecorder()
+        let carrier = DomainChildLaunchCarrier(
+            runID: UUID(),
+            launchTokenID: UUID(),
+            credentialEnvelope: nil,
+            environment: [
+                DomainChildLaunchCarrier.endpointEnvironmentKey: "injected://child",
+                DomainChildLaunchCarrier.launchTokenEnvironmentKey: "token"
+            ]
+        )
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: runtime.identity,
+            policyStore: runtime.mutationPolicyStore,
+            interactionBroker: runtime.interactionBroker,
+            activityCenter: runtime.activityCenter,
+            prepareChildLaunch: { _, _, _ in
+                await recorder.record("prepared")
+                return carrier
+            }
+        )
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "agent_run",
+                description: "operation normalization fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            await recorder.record(
+                DomainChildLaunchContext.current?.environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey]
+                    ?? "missing"
+            )
+            return .string("ok")
+        }
+        let wrapped = provider.wrapping(binding)
+        let arguments = ["op": Value.string("\n  StEeR \t")]
+
+        do {
+            _ = try await wrapped(arguments)
+            XCTFail("Case- and whitespace-variant AI work must require approval")
+        } catch {
+            XCTAssertEqual(error as? DomainMutationPolicyError, .principalMissing)
+        }
+        let deniedCalls = await recorder.values()
+        XCTAssertTrue(deniedCalls.isEmpty)
+
+        let routedSecurity = makeRunSecurityContext(
+            identity: runtime.identity,
+            grantedTools: ["agent_run"],
+            hasAuthoritativeRoutingContext: true
+        )
+        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(routedSecurity) {
+            try await wrapped(arguments)
+        }
+        XCTAssertEqual(value, .string("ok"))
+        let successfulCalls = await recorder.values()
+        XCTAssertEqual(successfulCalls, ["prepared", "token"])
+    }
+
+    func testAgentManageExtractHandoffAliasSharesApprovalClassification() async throws {
+        let runtime = makeRuntime(mode: .app)
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "agent_manage",
+                description: "handoff alias approval fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            .string("executed")
+        }
+        let wrapped = runtime.longRunningToolProvider.wrapping(binding)
+        for operation in ["handoff", " \nEXTRACT_HANDOFF\t"] {
+            do {
+                _ = try await wrapped(["op": .string(operation)])
+                XCTFail("agent_manage.\(operation) must require the handoff approval classes")
+            } catch {
+                XCTAssertEqual(error as? DomainMutationPolicyError, .principalMissing)
+            }
+        }
+    }
+
     func testAskUserUsesInjectedWorkspaceTimeoutAndDismissesOnCallerCancellationOnce() async throws {
         let runtime = makeRuntime(mode: .app)
         try await runtime.start()
@@ -1077,6 +1399,44 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.deadline?.timeIntervalSinceNow ?? 0, 800)
         let brokerSnapshot = await runtime.interactionBroker.snapshot()
         XCTAssertTrue(brokerSnapshot.pendingRequestIDs.isEmpty)
+    }
+
+    func testAskUserFallsBackToDefaultTimeoutWhenInteractiveContextIsUnavailable() async throws {
+        let runtime = makeRuntime(mode: .standalone)
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = InteractionAdapterRecorder()
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "ask_user",
+                description: "headless timeout fallback fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            .string("app")
+        }
+        let adapter = DomainLongRunningInteractionAdapter(
+            isAvailable: { _ in false },
+            resolveDefaultTimeoutSeconds: { _ in
+                throw TestError.expectedAcceptedEpoch
+            },
+            cancel: { _ in }
+        )
+        await runtime.interactionBroker.installNegotiatedElicitationProvider(
+            DomainInteractionProvider(kind: .elicitation) { request in
+                await recorder.recordDeadline(request.deadline)
+                return .string("elicitation")
+            }
+        )
+        let wrapped = runtime.longRunningToolProvider.wrapping(
+            binding,
+            interactionAdapter: adapter
+        )
+        let result = try await wrapped(["questions": .array([])])
+        XCTAssertEqual(result, .string("elicitation"))
+        let snapshot = await recorder.snapshot()
+        XCTAssertGreaterThan(snapshot.deadline?.timeIntervalSinceNow ?? 0, 299)
+        XCTAssertLessThan(snapshot.deadline?.timeIntervalSinceNow ?? 0, 302)
     }
 
     func testLongRunningProviderCoversFrozenFamiliesAndInteractionFallbackOrder() async throws {
@@ -1165,6 +1525,28 @@ private actor InteractionAdapterRecorder {
             presentationRequestID: presentedRequestID,
             cancellationRequestIDs: cancelledRequestIDs
         )
+    }
+}
+
+private actor UncooperativeCleanupGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isReleased = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func release() {
+        guard !isReleased else { return }
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 
