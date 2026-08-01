@@ -362,12 +362,14 @@ class SourceAndLedgerTests(unittest.TestCase):
             calls.append(list(command))
             if optimizer.DEFAULT_IMPACTED_BRANCH_RANGE in command:
                 return FakeCompletedProcess("Sources/Branch.swift\nShared.swift\n")
+            if "ls-files" in command:
+                return FakeCompletedProcess("Sources/Untracked.swift\n")
             return FakeCompletedProcess("Shared.swift\nTests/WorktreeTests.swift\n")
 
         with mock.patch.object(optimizer, "run_command", side_effect=fake_run_command):
             changed = optimizer.changed_files_for_range(Path("/repo"), optimizer.DEFAULT_IMPACTED_RANGE)
 
-        self.assertEqual(changed, ["Shared.swift", "Sources/Branch.swift", "Tests/WorktreeTests.swift"])
+        self.assertEqual(changed, ["Shared.swift", "Sources/Branch.swift", "Sources/Untracked.swift", "Tests/WorktreeTests.swift"])
         self.assertEqual(
             calls[0],
             ["git", "diff", "--name-only", "--diff-filter=ACMRT", "origin/main...HEAD", "--"],
@@ -376,6 +378,7 @@ class SourceAndLedgerTests(unittest.TestCase):
             calls[1],
             ["git", "diff", "--name-only", "--diff-filter=ACMRT", "HEAD", "--"],
         )
+        self.assertEqual(calls[2], ["git", "ls-files", "--others", "--exclude-standard"])
 
     def test_impacted_tests_selects_test_file_smoke_floor_and_skips_heavy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -495,6 +498,33 @@ class SourceAndLedgerTests(unittest.TestCase):
 
         self.assertIn("full root suite", str(ctx.exception))
         self.assertIn("Package.swift", str(ctx.exception))
+
+    def test_impacted_tests_broad_boundary_can_run_full_root_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(ledger, [{
+                "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                "target": "root", "suite": "RepoPromptTests.ExampleTests",
+                "method": "testOne", "execution_tier": "routine",
+            }])
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test"], process_exit_code=0,
+                stdout="{}", stderr="", result={"state": "completed", "exitCode": 0, "logPath": "/tmp/full.log"},
+                log_text="", ticket="full-ticket",
+            )
+            with (
+                mock.patch.object(optimizer, "changed_files_for_range", return_value=["Package.swift"]),
+                mock.patch.object(optimizer, "run_conductor", return_value=run) as conductor_run,
+            ):
+                payload = optimizer.impacted_tests(
+                    root, ledger, "HEAD", run_selected=True,
+                    validate_live_list=False, fallback_full=True,
+                )
+
+        conductor_run.assert_called_once_with(root, "root")
+        self.assertTrue(payload["full_root_required"])
+        self.assertEqual(payload["run"]["ticket"], "full-ticket")
 
     def test_impacted_tests_focused_run_failure_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

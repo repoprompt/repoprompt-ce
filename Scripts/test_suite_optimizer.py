@@ -774,13 +774,14 @@ def changed_files_for_range(repo_root: Path, range_spec: str) -> list[str]:
             DEFAULT_IMPACTED_BRANCH_RANGE,
         )
         # Diff against HEAD so staged-but-uncommitted changes (index-vs-HEAD)
-        # are captured alongside unstaged worktree changes. A plain worktree-vs-
-        # index diff would hide staged changes, which breaks the usual
-        # stage-intended-changes-then-validate pre-commit flow. Untracked files
-        # are intentionally excluded; they include scratch artifacts and local
-        # investigation docs that will never be committed.
+        # are captured alongside unstaged worktree changes. Include untracked
+        # files too: a newly authored source/test is part of ordinary local
+        # validation even before it is staged.
         worktree_changed = changed_files_for_git_diff(repo_root, ["HEAD"], "worktree")
-        return sorted(set(branch_changed).union(worktree_changed))
+        untracked = run_command(["git", "ls-files", "--others", "--exclude-standard"], repo_root)
+        if untracked.returncode != 0:
+            raise OptimizerError(f"git untracked-file discovery failed: {untracked.stderr.strip()}")
+        return sorted(set(branch_changed).union(worktree_changed, untracked.stdout.splitlines()))
     return sorted(set(changed_files_for_git_diff(repo_root, [range_spec], range_spec)))
 
 
@@ -819,6 +820,7 @@ def impacted_tests(
     smoke_floor_suites: Sequence[str] = DEFAULT_SMOKE_FLOOR_SUITES,
     run_selected: bool = False,
     validate_live_list: bool = True,
+    fallback_full: bool = False,
 ) -> dict[str, Any]:
     rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
     live_ids: set[str] | None = None
@@ -846,12 +848,27 @@ def impacted_tests(
             domains.add(domain)
     if broad_reasons:
         full_count = len(rows)
-        if run_selected:
+        if run_selected and not fallback_full:
             raise OptimizerError(
                 "impacted selection requires the full root suite; rerun as "
                 "`make dev-test` (or `conductor test`). broad boundaries: "
                 + ", ".join(broad_reasons)
             )
+        run_payload = None
+        if run_selected:
+            run = run_conductor(repo_root, "root")
+            run_payload = {
+                "command": run.command,
+                "process_exit_code": run.process_exit_code,
+                "state": run.result.get("state"),
+                "exit_code": run.result.get("exitCode"),
+                "ticket": run.ticket,
+                "log_path": run.result.get("logPath"),
+            }
+            if run.process_exit_code != 0 or run.result.get("state") != "completed" or run.result.get("exitCode") != 0:
+                raise OptimizerError(
+                    f"full-root fallback failed: ticket={run.ticket} log={run.result.get('logPath')}"
+                )
         return {
             "range": range_spec,
             "changed_files": changed,
@@ -867,7 +884,7 @@ def impacted_tests(
             "smoke_floor_suites": list(smoke_floor_suites),
             "skipped_heavy_or_opt_in": [],
             "command": [str(repo_root / "conductor"), "test"],
-            "run": None,
+            "run": run_payload,
         }
     for row in rows:
         if row.suite in smoke_floor_suites:
@@ -2285,6 +2302,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not run conductor test --list before selecting impacted rows",
     )
+    impacted_parser.add_argument(
+        "--fallback-full",
+        action="store_true",
+        help="run the full root suite when impacted selection reaches an uncertain broad boundary",
+    )
 
     shard_parser = subparsers.add_parser(
         "shard-plan",
@@ -2367,6 +2389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 smoke_floor_suites=smoke_floor,
                 run_selected=args.run,
                 validate_live_list=not args.skip_live_list_validation,
+                fallback_full=args.fallback_full,
             )
         elif args.command == "shard-plan":
             payload = shard_root_tests(args.ledger, args.shards, include_heavy=args.include_heavy)
