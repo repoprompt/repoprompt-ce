@@ -366,13 +366,29 @@ extension AgentModeViewModel {
         return pinned + unpinned
     }
 
+    private func makeSessionSidebarStashedTabSignatures(
+        for stashedTabs: [StashedTab]
+    ) -> [AgentSessionSidebarStashedTabSignature] {
+        stashedTabs.enumerated().map { index, stashedTab in
+            AgentSessionSidebarStashedTabSignature(
+                stashedTabID: stashedTab.id,
+                stashedAt: stashedTab.stashedAt,
+                rawTabName: stashedTab.tab.name,
+                tabMetadata: makeSessionSidebarTabMetadataSignature(
+                    for: stashedTab.tab,
+                    order: index
+                )
+            )
+        }
+    }
+
     /// Session-linked sidebar data source.
     /// Blank compose tabs stay hidden until they are explicitly linked to an agent session.
     func sidebarSessions(for tabs: [ComposeTabState]) -> [SidebarSession] {
         let cacheKey = SidebarSessionRowsCacheKey(
             workspaceID: workspaceManager?.activeWorkspaceID,
             sidebarRevision: ui.sessionSidebar.snapshot.revision,
-            tabs: tabs
+            tabMetadataSignatures: makeSessionSidebarTabMetadataSignatures(for: tabs)
         )
         if let cached = sidebarSessionRowsCache, cached.key == cacheKey {
             return cached.rows
@@ -415,6 +431,9 @@ extension AgentModeViewModel {
             mcpControlledTabIDs: mcpControlledTabIDs
         ).build()
         sidebarSessionRowsCache = (cacheKey, rows)
+        #if DEBUG
+            test_sidebarSessionRowsBuildCount &+= 1
+        #endif
         return rows
     }
 
@@ -481,8 +500,8 @@ extension AgentModeViewModel {
             workspaceID: workspaceManager?.activeWorkspaceID,
             sidebarSnapshot: sidebarSnapshot,
             currentTabID: currentTabID,
-            composeTabs: composeTabs,
-            stashedTabs: stashedTabs,
+            composeTabMetadataSignatures: makeSessionSidebarTabMetadataSignatures(for: composeTabs),
+            stashedTabSignatures: makeSessionSidebarStashedTabSignatures(for: stashedTabs),
             archivedSessionsExpanded: archivedSessionsExpanded
         )
         if let cached = sidebarListProjectionCache, cached.key == key {

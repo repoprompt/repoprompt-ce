@@ -308,6 +308,30 @@ extension AgentModeViewModel {
         _ = ui.sessionSidebar.clearRunStateAttention(for: tabIDs)
     }
 
+    /// Captures the compact compose-tab metadata that can affect sidebar rows.
+    /// This is the shared authority for refresh fingerprints and projection caches.
+    func makeSessionSidebarTabMetadataSignature(
+        for tab: ComposeTabState,
+        order: Int
+    ) -> AgentSessionSidebarTabMetadataSignature {
+        AgentSessionSidebarTabMetadataSignature(
+            tabID: tab.id,
+            order: order,
+            normalizedName: AgentSessionRestoreSupport.normalizedSessionTitle(tab.name),
+            activeAgentSessionID: tab.activeAgentSessionID,
+            isPinned: tab.isPinned,
+            lastModified: tab.lastModified
+        )
+    }
+
+    func makeSessionSidebarTabMetadataSignatures(
+        for tabs: [ComposeTabState]
+    ) -> [AgentSessionSidebarTabMetadataSignature] {
+        tabs.enumerated().map { index, tab in
+            makeSessionSidebarTabMetadataSignature(for: tab, order: index)
+        }
+    }
+
     /// Captures the current VM-level sidebar inputs (compose tab titles/metadata,
     /// sessions, sessionIndex, sort dates, badges, tree state, current tab, etc.)
     /// into a value-type fingerprint. Snapshotting every `TabSession` into
@@ -315,18 +339,7 @@ extension AgentModeViewModel {
     /// independent of class identity.
     func makeSessionSidebarContentFingerprint(for sidebarTabs: [ComposeTabState]? = nil) -> AgentSessionSidebarContentFingerprint {
         let tabs = sidebarTabs ?? sidebarContentFingerprintTabs
-        let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature] = tabs
-            .enumerated()
-            .map { index, tab in
-                AgentSessionSidebarTabMetadataSignature(
-                    tabID: tab.id,
-                    order: index,
-                    normalizedName: AgentSessionRestoreSupport.normalizedSessionTitle(tab.name),
-                    activeAgentSessionID: tab.activeAgentSessionID,
-                    isPinned: tab.isPinned,
-                    lastModified: tab.lastModified
-                )
-            }
+        let tabMetadataSignatures = makeSessionSidebarTabMetadataSignatures(for: tabs)
         let signatures: [AgentSessionSidebarTabSignature] = sessions
             .keys
             .sorted { $0.uuidString < $1.uuidString }

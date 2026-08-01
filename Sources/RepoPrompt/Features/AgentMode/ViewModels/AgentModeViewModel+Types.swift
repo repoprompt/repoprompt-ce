@@ -174,15 +174,15 @@ extension AgentModeViewModel {
     struct SidebarSessionRowsCacheKey: Equatable {
         let workspaceID: UUID?
         let sidebarRevision: Int
-        let tabs: [ComposeTabState]
+        let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
     }
 
     struct SidebarListProjectionCacheKey: Equatable {
         let workspaceID: UUID?
         let sidebarSnapshot: AgentSessionSidebarSnapshot
         let currentTabID: UUID?
-        let composeTabs: [ComposeTabState]
-        let stashedTabs: [StashedTab]
+        let composeTabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
+        let stashedTabSignatures: [AgentSessionSidebarStashedTabSignature]
         let archivedSessionsExpanded: Bool
     }
 
@@ -215,6 +215,16 @@ extension AgentModeViewModel {
         let activeAgentSessionID: UUID?
         let isPinned: Bool
         let lastModified: Date
+    }
+
+    /// Signature of a stashed tab's archived-sidebar projection inputs and the
+    /// fields read from cached `StashedTab` row values. Full compose state is
+    /// intentionally excluded because restore/delete resolve the current tab by ID.
+    struct AgentSessionSidebarStashedTabSignature: Equatable {
+        let stashedTabID: UUID
+        let stashedAt: Date
+        let rawTabName: String
+        let tabMetadata: AgentSessionSidebarTabMetadataSignature
     }
 
     /// Signature of a single `TabSession`'s sidebar-relevant state. Captured into a
