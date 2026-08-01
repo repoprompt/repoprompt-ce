@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin
 #else
@@ -13,6 +14,7 @@ private let fileSystemMutationIOQueue = DispatchQueue(
 
 private struct FileSystemMutationIOExecutor {
     let operation: FileSystemUncancellableMutation
+    let physicalMutationGuard: DomainMutationPhysicalCommitGuard?
     let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)?
 
     func callAsFunction(_ io: @escaping @Sendable () throws -> Void) async throws {
@@ -20,6 +22,7 @@ private struct FileSystemMutationIOExecutor {
             fileSystemMutationIOQueue.async {
                 willExecute?(operation)
                 do {
+                    try physicalMutationGuard?.revalidate()
                     try io()
                     continuation.resume()
                 } catch {
@@ -101,7 +104,7 @@ extension FileSystemService {
         _ operation: FileSystemUncancellableMutation,
         relativePaths: Set<String>,
         io: @escaping @Sendable (FileSystemMutationIOExecutor) async throws -> Void
-    ) throws -> (id: UUID, task: Task<Void, any Error>) {
+    ) async throws -> (id: UUID, task: Task<Void, any Error>) {
         let authorityPaths = mutationAuthorityPaths(relativePaths)
         guard !hasInFlightMutation(conflictingWith: authorityPaths) else {
             throw FileSystemError.mutationInProgress
@@ -115,7 +118,12 @@ extension FileSystemService {
             let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
             let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
         #endif
-        let executor = FileSystemMutationIOExecutor(operation: operation, willExecute: willExecute)
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        let executor = FileSystemMutationIOExecutor(
+            operation: operation,
+            physicalMutationGuard: physicalMutationGuard,
+            willExecute: willExecute
+        )
         let task = Task.detached(priority: .utility) {
             if let willBegin {
                 await willBegin(operation)
@@ -282,10 +290,12 @@ extension FileSystemService {
         }
 
         let destDir = (newFull as NSString).deletingLastPathComponent
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        try physicalMutationGuard?.revalidate()
         try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
         _ = try mutationTarget(forRelativePath: newTarget.relativePath)
 
-        let mutation = try startUncancellableMutation(
+        let mutation = try await startUncancellableMutation(
             .move,
             relativePaths: [oldTarget.relativePath, newTarget.relativePath]
         ) { executor in
@@ -362,6 +372,8 @@ extension FileSystemService {
         let fullURL = target.url
 
         let directoryURL = fullURL.deletingLastPathComponent()
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        try physicalMutationGuard?.revalidate()
         try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
         _ = try mutationTarget(forRelativePath: target.relativePath)
         guard !fm.fileExists(atPath: fullPath, isDirectory: nil) else {
@@ -376,7 +388,7 @@ extension FileSystemService {
         #else
             let dataPreparation: (@Sendable (String) async throws -> Data)? = nil
         #endif
-        let mutation = try startUncancellableMutation(
+        let mutation = try await startUncancellableMutation(
             .create,
             relativePaths: [target.relativePath]
         ) { executor in
@@ -445,7 +457,7 @@ extension FileSystemService {
         try await requireRegularMutationSource(relativePath: target.relativePath)
         try Task.checkCancellation()
         let url = target.url
-        let mutation = try startUncancellableMutation(
+        let mutation = try await startUncancellableMutation(
             .delete,
             relativePaths: [target.relativePath]
         ) { executor in
@@ -498,7 +510,7 @@ extension FileSystemService {
                 _ = try Self.moveURLToTrashOffActor(url)
             }
         #endif
-        let mutation = try startUncancellableMutation(
+        let mutation = try await startUncancellableMutation(
             .trash,
             relativePaths: [normalizedRelativePath]
         ) { executor in
@@ -647,7 +659,7 @@ extension FileSystemService {
             )
         }
 
-        let mutation = try startUncancellableMutation(
+        let mutation = try await startUncancellableMutation(
             .edit,
             relativePaths: [target.relativePath]
         ) { executor in

@@ -6,6 +6,137 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPProtectedMutationInvocationIntegrationTests: XCTestCase {
+        func testPromptStateMutationsCommitWithoutPhysicalPathAdmission() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                do {
+                    try await registerDomainWorkspace(fixture.contextA)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:prompt-state")
+                    )
+                    try await bind(endpoint, to: fixture.contextA.tabID)
+
+                    let runtime = AppDomainRuntimeComposition.shared.runtime
+                    var journalKeys = try await Set(runtime.mutationJournal.snapshot().recordSnapshots.map(\.key))
+                    let preset = fixture.contextA.window.promptManager.currentCopyPreset()
+                    let mutations: [(toolName: String, action: String, arguments: [String: Any])] = [
+                        ("prompt", "set", ["op": "set", "text": "alpha"]),
+                        ("prompt", "append", ["op": "append", "text": " beta"]),
+                        ("prompt", "clear", ["op": "clear"]),
+                        ("prompt", "select_preset", ["op": "select_preset", "preset": preset.id.uuidString]),
+                        ("workspace_context", "select_preset", ["op": "select_preset", "preset": preset.id.uuidString])
+                    ]
+
+                    for (index, mutation) in mutations.enumerated() {
+                        var arguments = mutation.arguments
+                        arguments["operation_id"] = "prompt-state-\(index)"
+                        let response = try await endpoint.callTool(name: mutation.toolName, arguments: arguments)
+                        let result = try toolResult(response)
+                        XCTAssertFalse(result.isError, "\(mutation.toolName).\(mutation.action): \(result.text)")
+                        let capture = try await captureJournalRecord(
+                            runtime: runtime,
+                            excluding: journalKeys,
+                            toolName: mutation.toolName,
+                            action: mutation.action
+                        )
+                        journalKeys = capture.allKeys
+                        XCTAssertEqual(capture.record.status.rawValue, DomainMutationJournalStatus.applied.rawValue)
+                        XCTAssertNil(capture.record.pathFence)
+                    }
+                    XCTAssertEqual(fixture.contextA.window.promptManager.promptText, "")
+
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testFileActionRevalidatesFenceAfterCommitAtBlockingIOBoundary() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let store = fixture.contextA.window.workspaceFileContextStore
+                let parent = fixture.contextA.rootURL.appendingPathComponent("late-swap-parent", isDirectory: true)
+                let outside = fixture.rootURL.appendingPathComponent("late-swap-outside", isDirectory: true)
+                let target = parent.appendingPathComponent("nested/blocked.txt")
+                let escapedTarget = outside.appendingPathComponent("nested/blocked.txt")
+                let swap = MutationBoundarySwapRecorder()
+                do {
+                    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+                    try await store.startWatchingRoot(id: fixture.contextA.rootID)
+                    let loadedService = await store.fileSystemServiceForTesting(rootID: fixture.contextA.rootID)
+                    let service = try XCTUnwrap(loadedService)
+                    await service.setMutationIOWillExecuteHandlerForTesting { operation in
+                        guard operation == .create else { return }
+                        swap.perform {
+                            try FileManager.default.removeItem(at: parent)
+                            try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+                        }
+                    }
+
+                    try await registerDomainWorkspace(fixture.contextA)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:late-fence")
+                    )
+                    try await bind(endpoint, to: fixture.contextA.tabID)
+                    let runtime = AppDomainRuntimeComposition.shared.runtime
+                    let journalKeys = try await Set(runtime.mutationJournal.snapshot().recordSnapshots.map(\.key))
+
+                    let response = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": target.path,
+                            "content": "must not escape",
+                            "operation_id": "late-fence-swap"
+                        ]
+                    )
+                    let result = try toolResult(response)
+                    XCTAssertTrue(result.isError, result.text)
+                    XCTAssertTrue(swap.didPerform)
+                    XCTAssertNil(swap.error)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: escapedTarget.path))
+                    let capture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    XCTAssertEqual(
+                        capture.record.status.rawValue,
+                        DomainMutationJournalStatus.indeterminateAfterCommit.rawValue
+                    )
+
+                    await service.setMutationIOWillExecuteHandlerForTesting(nil)
+                    try? FileManager.default.removeItem(at: parent)
+                    try? FileManager.default.removeItem(at: outside)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    if let service = await store.fileSystemServiceForTesting(rootID: fixture.contextA.rootID) {
+                        await service.setMutationIOWillExecuteHandlerForTesting(nil)
+                    }
+                    try? FileManager.default.removeItem(at: parent)
+                    try? FileManager.default.removeItem(at: outside)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAppInvocationUsesCoordinatorRegistrationAfterReRegistrationAndHonorsInjectedIdentity() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -695,6 +826,41 @@ import XCTest
                     code: Int(result.terminationStatus),
                     userInfo: [NSLocalizedDescriptionKey: result.outputText]
                 )
+            }
+        }
+    }
+
+    private final class MutationBoundarySwapRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedDidPerform = false
+        private var storedError: (any Error)?
+
+        var didPerform: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedDidPerform
+        }
+
+        var error: (any Error)? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedError
+        }
+
+        func perform(_ operation: @Sendable () throws -> Void) {
+            lock.lock()
+            guard !storedDidPerform else {
+                lock.unlock()
+                return
+            }
+            storedDidPerform = true
+            lock.unlock()
+            do {
+                try operation()
+            } catch {
+                lock.lock()
+                storedError = error
+                lock.unlock()
             }
         }
     }

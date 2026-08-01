@@ -6577,7 +6577,10 @@ final class MCPServerViewModel: ObservableObject {
                 rootMappings: mutationRootMappings
             )
             try await MCPDomainMutationCommitContext.willCommit()
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
             try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+            try physicalMutationGuard?.revalidate()
             try content.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             throw MCPError.invalidParams("File creation failed for '\(resolvedPath)': \(error.localizedDescription)")

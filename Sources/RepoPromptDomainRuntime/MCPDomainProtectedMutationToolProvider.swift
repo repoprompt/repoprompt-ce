@@ -157,8 +157,9 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         case "manage_worktree" where stage == .m4B:
             let action = arguments["op"]?.stringValue ?? "list"
             let mutating = ["create", "bind", "select", "unbind", "apply", "continue", "abort"].contains(action)
-                || arguments["persist_visuals"]?.boolValue == true
-            return mutating ? .init(toolName: toolName, action: action) : nil
+            let persistsVisuals = ["list", "show"].contains(action)
+                && arguments["persist_visuals"]?.boolValue == true
+            return mutating || persistsVisuals ? .init(toolName: toolName, action: action) : nil
         default:
             return nil
         }
@@ -232,6 +233,10 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 admitPhysicalTargets: { paths, mappings in
                     try await admissionState.admit(paths: paths, rootMappings: mappings)
                 },
+                physicalMutationGuard: {
+                    guard await commitState.hasBegunCommit() else { return nil }
+                    return try await admissionState.physicalMutationGuard()
+                },
                 willCommit: {
                     try await commitState.beginIfNeeded {
                         try await admissionState.prepareCommit()
@@ -303,8 +308,10 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
 
     private static func requiresPhysicalAdmission(_ operation: DomainProtectedMutationOperation) -> Bool {
         switch operation.toolName {
-        case "file_actions", "apply_edits", "prompt", "workspace_context":
+        case "file_actions", "apply_edits":
             true
+        case "prompt", "workspace_context":
+            operation.action == "export"
         case "manage_worktree":
             ["create", "apply", "continue", "abort"].contains(operation.action)
         default:
@@ -445,6 +452,16 @@ private actor DomainMutationPhysicalAdmissionState {
             try await DomainMutationPathFence.revalidate(pathFence)
         }
         try await journal.markCommitting(ticket)
+    }
+
+    func physicalMutationGuard() throws -> DomainMutationPhysicalCommitGuard? {
+        guard let pathFence else {
+            if requiresPhysicalAdmission {
+                throw DomainMutationPathFenceError.scopeUnavailable
+            }
+            return nil
+        }
+        return DomainMutationPhysicalCommitGuard(snapshot: pathFence)
     }
 
     private static func nearestExistingAncestor(of path: String) -> String? {

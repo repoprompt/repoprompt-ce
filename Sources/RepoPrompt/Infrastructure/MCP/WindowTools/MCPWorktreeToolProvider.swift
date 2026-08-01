@@ -153,9 +153,11 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         let omittedPrunableCount = allWorktrees.count - worktrees.count
         let includeStatus = parseBool(args["include_status"]) ?? false
         let persistVisuals = parseBool(args["persist_visuals"]) ?? false
-        if persistVisuals, !worktrees.isEmpty {
-            let logicalRoot = try await logicalRoot(for: context)
-            try await admitLogicalMutationRoots([logicalRoot.standardizedFullPath])
+        if persistVisuals {
+            if !worktrees.isEmpty {
+                let logicalRoot = try await logicalRoot(for: context)
+                try await admitLogicalMutationRoots([logicalRoot.standardizedFullPath])
+            }
             try await MCPDomainMutationCommitContext.willCommit()
         }
         let dtos = try await worktrees.asyncMap { worktree in
@@ -376,8 +378,8 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         if !authorizationRoots.isEmpty {
             try await admitLogicalMutationRoots(authorizationRoots)
         }
+        try await MCPDomainMutationCommitContext.willCommit()
         if !removed.isEmpty {
-            try await MCPDomainMutationCommitContext.willCommit()
             _ = try await agentModeVM.transitionWorktreeBindings(
                 remaining,
                 forSessionID: sessionID,

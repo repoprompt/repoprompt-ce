@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -937,7 +938,7 @@ actor GitService {
                         throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
                     }
                     let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
-                    let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
+                    let includeCopyResult = try await copyWorktreeIncludeFilesIfRequested(
                         request: mutationRequest,
                         sourceRepoURL: repoURL,
                         destinationURL: destinationURL
@@ -1583,13 +1584,14 @@ actor GitService {
         request: GitWorktreeCreateRequest,
         sourceRepoURL: URL,
         destinationURL: URL
-    ) async -> GitWorktreeIncludeCopyResult? {
+    ) async throws -> GitWorktreeIncludeCopyResult? {
         guard request.copyWorktreeIncludeFiles,
               let appManagedContainer = request.appManagedContainer,
               Self.isPath(destinationURL, equalToOrInside: appManagedContainer)
         else { return nil }
         let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
         guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         do {
             let (stdout, stderr, exitCode) = try await runGit(
@@ -1603,12 +1605,15 @@ actor GitService {
                     errorSummaries: ["could not list Git-ignored files: \(stderr)"]
                 )
             }
-            return GitWorktreeIncludeCopier.copyIncludedFiles(
+            return try GitWorktreeIncludeCopier.copyIncludedFiles(
                 from: sourceRepoURL,
                 to: destinationURL,
                 ignoredFilesNULOutput: stdout,
-                appManagedContainer: appManagedContainer
+                appManagedContainer: appManagedContainer,
+                physicalMutationGuard: physicalMutationGuard
             )
+        } catch let error as DomainMutationPathFenceError {
+            throw error
         } catch {
             return GitWorktreeIncludeCopyResult(
                 copiedCount: 0,
@@ -7464,6 +7469,7 @@ actor GitService {
         #if DEBUG
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
@@ -7518,6 +7524,7 @@ actor GitService {
                 let spawnStartedAt = DispatchTime.now().uptimeNanoseconds
                 do {
                     try lifecycleController.checkCancellationBeforeSpawn()
+                    try physicalMutationGuard?.revalidate()
                     let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
                         family: commandFamily,
                         priority: admissionPriority
