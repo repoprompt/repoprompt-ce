@@ -14,6 +14,10 @@ APP_PID=""
 APP_COMMAND=""
 APP_START=""
 TEMP_ROOT=""
+ISOLATED_HOME=""
+ISOLATED_TMP=""
+SMOKE_KEYCHAIN_PATH=""
+SMOKE_KEYCHAIN_PASSWORD=""
 APP_LOG=""
 MCP_SOCKET_PATH=""
 DIAGNOSTICS_DIR="${REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR:-}"
@@ -26,6 +30,17 @@ fail() {
 
 log_phase() {
     printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+isolated_security() {
+    env -i \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        HOME="$ISOLATED_HOME" \
+        CFFIXED_USER_HOME="$ISOLATED_HOME" \
+        TMPDIR="$ISOLATED_TMP/" \
+        USER="${USER:-runner}" \
+        LOGNAME="${LOGNAME:-${USER:-runner}}" \
+        /usr/bin/security "$@"
 }
 
 process_matches() {
@@ -73,6 +88,10 @@ cleanup() {
         printf '%s\n' "--- packaged app log tail ---" >&2
         tail -100 "$APP_LOG" >&2 || true
     fi
+    if [[ -n "$SMOKE_KEYCHAIN_PATH" && -n "$ISOLATED_HOME" && -n "$ISOLATED_TMP" ]]; then
+        isolated_security delete-keychain "$SMOKE_KEYCHAIN_PATH" >/dev/null 2>&1 || true
+    fi
+    SMOKE_KEYCHAIN_PASSWORD=""
     [[ -z "$TEMP_ROOT" ]] || rm -rf "$TEMP_ROOT"
     exit "$status"
 }
@@ -123,9 +142,20 @@ TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/repoprompt-packaged-smoke.XXXXXX")"
 ISOLATED_HOME="$TEMP_ROOT/home"
 ISOLATED_TMP="$TEMP_ROOT/tmp"
 APP_LOG="$TEMP_ROOT/app.log"
-mkdir -p "$ISOLATED_HOME" "$ISOLATED_TMP"
-chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_TMP"
+mkdir -p "$ISOLATED_HOME/Library/Keychains" "$ISOLATED_HOME/Library/Preferences" "$ISOLATED_TMP"
+chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_HOME/Library" \
+    "$ISOLATED_HOME/Library/Keychains" "$ISOLATED_HOME/Library/Preferences" "$ISOLATED_TMP"
 HELPER_DEBUG_LOG="$ISOLATED_HOME/Library/Application Support/RepoPrompt CE/socket-proxy-debug.log"
+# The signed app must exercise its production Keychain backend, but the isolated HOME has no
+# login keychain. Supply a short-lived unlocked default so first-launch writes cannot request UI.
+SMOKE_KEYCHAIN_PATH="$ISOLATED_HOME/Library/Keychains/repoprompt-packaged-smoke.keychain-db"
+SMOKE_KEYCHAIN_PASSWORD="$(uuidgen)"
+log_phase "$SMOKE_LABEL provisioning isolated unlocked user keychain"
+isolated_security create-keychain -p "$SMOKE_KEYCHAIN_PASSWORD" "$SMOKE_KEYCHAIN_PATH"
+isolated_security set-keychain-settings -lut 900 "$SMOKE_KEYCHAIN_PATH"
+isolated_security unlock-keychain -p "$SMOKE_KEYCHAIN_PASSWORD" "$SMOKE_KEYCHAIN_PATH"
+isolated_security list-keychains -d user -s "$SMOKE_KEYCHAIN_PATH"
+isolated_security default-keychain -d user -s "$SMOKE_KEYCHAIN_PATH"
 
 "$SOCKET_OWNER_HELPER" preflight "$MCP_SOCKET_DIR" ||
     fail "$SMOKE_LABEL requires no pre-existing live release MCP socket in $MCP_SOCKET_DIR"
