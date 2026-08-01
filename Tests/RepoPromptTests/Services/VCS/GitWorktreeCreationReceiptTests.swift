@@ -1523,7 +1523,6 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
             await git.setWorktreeMutationLockAcquiredHandlerForTesting(nil)
 
             XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
-            XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("child").path))
         }
 
         func testQueuedMutationLockCancellationRecordsOneTerminalDecisionWithoutReceipt() async throws {

@@ -2306,11 +2306,22 @@ import XCTest
                 )
             }
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+            let runID = try XCTUnwrap(context.runID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
-                runID: XCTUnwrap(context.runID),
+                runID: runID,
                 purpose: .agentModeRun,
                 windowID: context.windowID
+            )
+            let registration = try await AppDomainRuntimeComposition.shared.runtime
+                .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
+            _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: context.workspaceID, contextID: context.tabID)
+                ),
+                operationID: UUID()
             )
             fixture.contextA.window.mcpServer.installFrozenTabContext(
                 clientID: endpoint.connectionID.uuidString,
