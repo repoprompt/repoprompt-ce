@@ -575,6 +575,113 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertFalse(failureDetachedDuringDrain.succeeded)
     }
 
+    func testMappedRunPromotesQueuedContextBeforePeerEOFTeardown() async throws {
+        #if DEBUG
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await window.workspaceManager.awaitInitialized()
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ContextBuilderQueuedRouteCleanupTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Context Builder queued route cleanup test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderRunLifecycleTests.queuedRouteCleanup"
+            )
+
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let clientName = "context-builder-queued-route-cleanup-test"
+            let connectionID = UUID()
+            let runID = UUID()
+            let prompt = "queued exact context survives orderly peer EOF"
+            var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            tab.promptText = prompt
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: activeWorkspace.id))
+
+            window.mcpServer.installTabContext(
+                clientID: nil,
+                clientName: clientName,
+                windowID: window.windowID,
+                workspaceID: activeWorkspace.id,
+                snapshot: tab,
+                runID: runID,
+                signalRouting: false
+            )
+            XCTAssertEqual(
+                window.mcpServer.pendingContextQueueLength(
+                    clientName: clientName,
+                    windowID: window.windowID
+                ),
+                1
+            )
+
+            XCTAssertNotNil(
+                window.mcpServer.registerPendingPolicyRunIDMapping(
+                    connectionID: connectionID,
+                    runID: runID,
+                    windowID: window.windowID,
+                    clientName: clientName
+                )
+            )
+            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), connectionID)
+
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: connectionID,
+                connection: ContextBuilderCleanupTestConnection(),
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                connectionID: connectionID,
+                runID: runID,
+                purpose: .discoverRun,
+                windowID: window.windowID
+            )
+
+            // Deliberately do not call any context-resolving tool path. The child only
+            // initialized/listed tools and then ended through orderly peer EOF.
+            await ServerNetworkManager.shared.removeConnection(
+                connectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    initiator: .peer
+                )
+            )
+
+            XCTAssertTrue(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: connectionID,
+                    runID: runID
+                )
+            )
+            let commitOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                connectionID: connectionID,
+                expectedRunID: runID,
+                isStillCurrent: { true }
+            )
+            XCTAssertEqual(commitOutcome.outcome, .committed)
+            XCTAssertEqual(commitOutcome.committedTab?.nestedRunID, runID)
+            XCTAssertEqual(commitOutcome.committedTab?.identity.tabID, tabID)
+        #else
+            throw XCTSkip("Queued route cleanup test uses DEBUG-only connection fixtures.")
+        #endif
+    }
+
     func testRealConnectionCleanupCannotEraseContextBeforeCommit() async throws {
         #if DEBUG
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
