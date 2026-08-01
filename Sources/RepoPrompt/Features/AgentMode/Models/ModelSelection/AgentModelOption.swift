@@ -6,6 +6,7 @@ struct AgentModelOption: Identifiable, Hashable {
     let description: String?
     let isPlaceholderDefault: Bool
     let isProviderDefault: Bool
+    let codexBaseModelID: String?
     let supportedReasoningEfforts: [CodexReasoningEffort]
     let defaultReasoningEffort: CodexReasoningEffort?
 
@@ -15,6 +16,7 @@ struct AgentModelOption: Identifiable, Hashable {
         description: String?,
         isPlaceholderDefault: Bool,
         isProviderDefault: Bool,
+        codexBaseModelID: String? = nil,
         supportedReasoningEfforts: [CodexReasoningEffort] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil
     ) {
@@ -23,6 +25,7 @@ struct AgentModelOption: Identifiable, Hashable {
         self.description = description
         self.isPlaceholderDefault = isPlaceholderDefault
         self.isProviderDefault = isProviderDefault
+        self.codexBaseModelID = codexBaseModelID
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
     }
@@ -32,6 +35,7 @@ struct AgentModelOption: Identifiable, Hashable {
         displayName: String,
         description: String?,
         isDefault: Bool,
+        codexBaseModelID: String? = nil,
         supportedReasoningEfforts: [CodexReasoningEffort] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil
     ) {
@@ -42,6 +46,7 @@ struct AgentModelOption: Identifiable, Hashable {
         self.description = description
         isPlaceholderDefault = isPlaceholder && isDefault
         isProviderDefault = !isPlaceholder && isDefault
+        self.codexBaseModelID = codexBaseModelID
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
     }

@@ -202,25 +202,34 @@ enum CodexDynamicModelMapper {
 
     private static func normalizedEfforts(for record: CodexDynamicModelRecord, fallbackDescription: String) -> [EffortEntry] {
         var descriptionsByEffort: [CodexReasoningEffort: String] = [:]
+        var effortOrder: [CodexReasoningEffort] = []
         for entry in record.supportedReasoningEfforts {
-            guard let effort = CodexReasoningEffort.parse(entry.reasoningEffort),
-                  descriptionsByEffort[effort] == nil else { continue }
-            descriptionsByEffort[effort] = entry.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let effort = CodexReasoningEffort.parse(entry.reasoningEffort) else { continue }
+            let description = entry.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let existing = descriptionsByEffort[effort] {
+                if description.localizedCaseInsensitiveCompare(existing) == .orderedAscending {
+                    descriptionsByEffort[effort] = description
+                }
+            } else {
+                effortOrder.append(effort)
+                descriptionsByEffort[effort] = description
+            }
         }
 
         let defaultEffort = CodexReasoningEffort.parse(record.defaultReasoningEffort)
         if let defaultEffort, descriptionsByEffort[defaultEffort] == nil {
+            effortOrder.append(defaultEffort)
             descriptionsByEffort[defaultEffort] = fallbackDescription
         }
 
         guard !descriptionsByEffort.isEmpty else { return [] }
 
+        let orderedEfforts = CodexReasoningEffort.ordered(effortOrder)
         let effectiveDefault = defaultEffort
-            ?? CodexReasoningEffort.displayOrder.first(where: { descriptionsByEffort[$0] != nil })
-            ?? descriptionsByEffort.keys.first
+            ?? orderedEfforts.first
 
         var output: [EffortEntry] = []
-        for effort in CodexReasoningEffort.displayOrder {
+        for effort in orderedEfforts {
             guard let description = descriptionsByEffort[effort] else { continue }
             output.append(
                 EffortEntry(
@@ -234,8 +243,7 @@ enum CodexDynamicModelMapper {
     }
 
     private static func effortRank(_ effort: CodexReasoningEffort?) -> Int {
-        guard let effort else { return -1 }
-        return CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? Int.max
+        CodexReasoningEffort.rank(effort)
     }
 
     private static func normalizeID(_ id: String) -> String {
@@ -347,6 +355,7 @@ enum CodexDynamicModelStore {
         let description = model.description.trimmingCharacters(in: .whitespacesAndNewlines)
         let defaultReasoningEffort = CodexReasoningEffort.parse(model.defaultReasoningEffort)?.rawValue
         var reasoningDescriptionsByEffort: [CodexReasoningEffort: String] = [:]
+        var effortOrder: [CodexReasoningEffort] = []
         for entry in model.supportedReasoningEfforts {
             guard let effort = CodexReasoningEffort.parse(entry.reasoningEffort) else { continue }
             let effortDescription = entry.description.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -355,6 +364,7 @@ enum CodexDynamicModelStore {
                     reasoningDescriptionsByEffort[effort] = effortDescription
                 }
             } else {
+                effortOrder.append(effort)
                 reasoningDescriptionsByEffort[effort] = effortDescription
             }
         }
@@ -362,9 +372,10 @@ enum CodexDynamicModelStore {
            let defaultEffort = CodexReasoningEffort(rawValue: defaultReasoningEffort),
            reasoningDescriptionsByEffort[defaultEffort] == nil
         {
+            effortOrder.append(defaultEffort)
             reasoningDescriptionsByEffort[defaultEffort] = description
         }
-        let reasoningEfforts: [CodexDynamicReasoningRecord] = CodexReasoningEffort.displayOrder.compactMap {
+        let reasoningEfforts: [CodexDynamicReasoningRecord] = CodexReasoningEffort.ordered(effortOrder).compactMap {
             effort -> CodexDynamicReasoningRecord? in
             guard let effortDescription = reasoningDescriptionsByEffort[effort] else { return nil }
             return CodexDynamicReasoningRecord(

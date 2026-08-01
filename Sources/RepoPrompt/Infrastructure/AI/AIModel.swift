@@ -1643,6 +1643,9 @@ public enum AIModel: Equatable, Hashable {
     static func stripCodexReasoningSuffix(from label: String) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
+        if trimmed.caseInsensitiveCompare("GPT-5.1 Codex Max") == .orderedSame {
+            return trimmed
+        }
 
         let specifier = codexSpecifierFromSemanticLabel(trimmed)
         guard specifier.reasoningEffort != nil, let baseModel = specifier.baseModel else {
@@ -1751,8 +1754,7 @@ public enum AIModel: Equatable, Hashable {
     }
 
     private static func reasoningSortRank(_ effort: CodexReasoningEffort?) -> Int {
-        guard let effort else { return -1 }
-        return CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? Int.max
+        CodexReasoningEffort.rank(effort)
     }
 
     private static func codexBaseModelID(for model: AIModel) -> String {

@@ -257,9 +257,7 @@ enum ACPDynamicModelStore {
     }
 
     private static func normalizedReasoningEffortRaws(_ efforts: [CodexReasoningEffort]) -> [String] {
-        let unique = Set(efforts)
-        return CodexReasoningEffort.displayOrder
-            .filter { unique.contains($0) }
+        CodexReasoningEffort.ordered(efforts)
             .map(\.rawValue)
     }
 
@@ -267,7 +265,7 @@ enum ACPDynamicModelStore {
         var seen = Set<CodexReasoningEffort>()
         let parsed = efforts.compactMap(CodexReasoningEffort.parse)
             .filter { seen.insert($0).inserted }
-        return CodexReasoningEffort.displayOrder.filter { parsed.contains($0) }
+        return CodexReasoningEffort.ordered(parsed)
     }
 
     private static func normalizedOptionalString(_ value: String?) -> String? {
