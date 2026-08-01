@@ -174,16 +174,6 @@ package actor DomainMutationApprovalBroker {
             return
         }
         let generation = presenterGeneration
-        let accepted = await presenter.present(pending.request)
-        guard active?.request.id == pending.request.id,
-              presenterGeneration == generation
-        else {
-            return
-        }
-        guard accepted else {
-            await finish(id: pending.request.id, result: .presenterUnavailable)
-            return
-        }
         let delay = max(0, pending.request.deadline.timeIntervalSinceNow)
         timeoutTask?.cancel()
         timeoutTask = Task { [weak self] in
@@ -193,6 +183,16 @@ package actor DomainMutationApprovalBroker {
                 return
             }
             await self?.timeout(requestID: pending.request.id)
+        }
+        let accepted = await presenter.present(pending.request)
+        guard active?.request.id == pending.request.id,
+              presenterGeneration == generation
+        else {
+            return
+        }
+        guard accepted else {
+            await finish(id: pending.request.id, result: .presenterUnavailable)
+            return
         }
     }
 

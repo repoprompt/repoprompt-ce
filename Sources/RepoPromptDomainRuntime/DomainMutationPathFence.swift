@@ -61,6 +61,13 @@ package enum DomainMutationPathFence {
         }.value
     }
 
+    package static func canonicalPath(_ path: String) -> String? {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        guard let resolution = try? resolvePotentialPath(expanded) else { return nil }
+        return resolution.path
+    }
+
     package static func revalidate(_ snapshot: DomainMutationPathFenceSnapshot) async throws {
         try await Task.detached(priority: .utility) {
             for root in snapshot.authorizedRoots {

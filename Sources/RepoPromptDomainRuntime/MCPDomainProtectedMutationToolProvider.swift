@@ -186,7 +186,13 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             context: securityContext,
             toolName: operation.toolName,
             action: operation.action,
-            workspaceID: securityContext.workspaceID
+            workspaceID: securityContext.workspaceID,
+            canonicalRoots: Self.canonicalRoots(
+                operation: operation,
+                arguments: effectiveArguments,
+                securityContext: securityContext,
+                includeAuthoritativeRoots: false
+            )
         )
         try Task.checkCancellation()
 
@@ -268,19 +274,29 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
     private static func canonicalRoots(
         operation: DomainProtectedMutationOperation,
         arguments: [String: Value],
-        securityContext: DomainToolInvocationSecurityContext
+        securityContext: DomainToolInvocationSecurityContext,
+        includeAuthoritativeRoots: Bool = true
     ) -> Set<String> {
-        var roots = securityContext.authorizedCanonicalRoots
+        var roots = includeAuthoritativeRoots ? securityContext.authorizedCanonicalRoots : []
+        func insertAbsoluteRoot(_ rawPath: String?) {
+            guard let rawPath,
+                  let canonical = DomainMutationPathFence.canonicalPath(rawPath)
+            else { return }
+            roots.insert(canonical)
+        }
         if operation.toolName == "manage_workspaces",
-           ["add_folder", "create"].contains(operation.action),
-           let rawPath = arguments["folder_path"]?.stringValue?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !rawPath.isEmpty
+           ["add_folder", "create"].contains(operation.action)
         {
-            let expanded = (rawPath as NSString).expandingTildeInPath
-            if expanded.hasPrefix("/") {
-                roots.insert(URL(fileURLWithPath: expanded).standardizedFileURL.path)
-            }
+            insertAbsoluteRoot(
+                arguments["folder_path"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        if operation.toolName == "manage_worktree" {
+            insertAbsoluteRoot(
+                arguments["repo_root"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         }
         return roots
     }

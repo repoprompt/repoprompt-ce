@@ -93,6 +93,136 @@ import XCTest
             }
         }
 
+        func testRunScopedAppManagedWorktreeCreateRetainsLogicalRootAuthorization() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let repo = fixture.contextA.rootURL
+                let branch = "m4/app-managed-\(UUID().uuidString.lowercased())"
+                let appManagedContainer = GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: repo)
+                let worktree = appManagedContainer.appendingPathComponent(
+                    "m4-app-managed-\(UUID().uuidString.lowercased())",
+                    isDirectory: true
+                )
+                var worktreeCreated = false
+                do {
+                    try await registerDomainWorkspace(fixture.contextA)
+                    try FileManager.default.createDirectory(at: appManagedContainer, withIntermediateDirectories: true)
+                    try initializeGitRepository(at: repo)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:app-managed")
+                    )
+                    try await bind(endpoint, to: fixture.contextA.tabID)
+                    await manager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+                    let securityContext = await manager.debugDomainInvocationSecurityContextForTesting(
+                        connectionID: endpoint.connectionID,
+                        toolName: "manage_worktree"
+                    )
+                    XCTAssertEqual(securityContext.principal.kind.rawValue, DomainClientPrincipalKind.runScoped.rawValue)
+                    XCTAssertTrue(securityContext.authorizedCanonicalRoots.contains(repo.path))
+                    XCTAssertTrue(securityContext.ephemeralGrantedToolNames.contains("manage_worktree"))
+
+                    let response = try await endpoint.callTool(
+                        name: "manage_worktree",
+                        arguments: [
+                            "op": "create",
+                            "repo_root": repo.path,
+                            "path": worktree.path,
+                            "branch": branch,
+                            "base_ref": "HEAD",
+                            "operation_id": "app-managed-run-scoped"
+                        ]
+                    )
+                    let result = try toolResult(response)
+                    XCTAssertFalse(result.isError, result.text)
+                    worktreeCreated = true
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path))
+
+                    try removeWorktreeIfPresent(worktree, from: repo)
+                    worktreeCreated = false
+                    await manager.setRunPurpose(.unknown, for: endpoint.connectionID)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.setRunPurpose(.unknown, for: endpoint.connectionID)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    if worktreeCreated {
+                        try? removeWorktreeIfPresent(worktree, from: repo)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testRunScopedAppManagedWorktreeCreateRejectsResolvedContainerSymlinkEscape() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let repo = fixture.contextA.rootURL
+                let branch = "m4/app-managed-escape-\(UUID().uuidString.lowercased())"
+                let appManagedContainer = GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: repo)
+                let outside = appManagedContainer.deletingLastPathComponent().appendingPathComponent(
+                    "m4-app-managed-outside-\(UUID().uuidString.lowercased())",
+                    isDirectory: true
+                )
+                let link = appManagedContainer.appendingPathComponent("link", isDirectory: true)
+                let escapedWorktree = link.appendingPathComponent("child", isDirectory: true)
+                var worktreeCreated = false
+                do {
+                    try await registerDomainWorkspace(fixture.contextA)
+                    try FileManager.default.createDirectory(at: appManagedContainer, withIntermediateDirectories: true)
+                    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+                    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+                    try initializeGitRepository(at: repo)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:app-managed-escape")
+                    )
+                    try await bind(endpoint, to: fixture.contextA.tabID)
+                    await manager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+
+                    let response = try await endpoint.callTool(
+                        name: "manage_worktree",
+                        arguments: [
+                            "op": "create",
+                            "repo_root": repo.path,
+                            "path": escapedWorktree.path,
+                            "branch": branch,
+                            "base_ref": "HEAD",
+                            "operation_id": "app-managed-symlink-escape"
+                        ]
+                    )
+                    let result = try toolResult(response)
+                    worktreeCreated = !result.isError && FileManager.default.fileExists(atPath: escapedWorktree.path)
+                    XCTAssertTrue(result.isError, result.text)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: escapedWorktree.path))
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("child").path))
+
+                    try? FileManager.default.removeItem(at: link)
+                    try? FileManager.default.removeItem(at: outside)
+                    await manager.setRunPurpose(.unknown, for: endpoint.connectionID)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.setRunPurpose(.unknown, for: endpoint.connectionID)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    if worktreeCreated {
+                        try? removeWorktreeIfPresent(escapedWorktree, from: repo)
+                    }
+                    try? FileManager.default.removeItem(at: link)
+                    try? FileManager.default.removeItem(at: outside)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testCorrelationReuseExportEscapeAndBoundWorktreeTranslationCrossAppProvider() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)

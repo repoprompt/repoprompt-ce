@@ -53,7 +53,8 @@ package struct DomainHeadlessMutationGrant: Codable, Hashable, Identifiable, Sen
 }
 
 package struct DomainMutationPolicyDocument: Codable, Hashable, Sendable {
-    package static let schemaVersion = 1
+    package static let schemaVersion = 2
+    package static let legacySchemaVersion = 1
 
     package let version: Int
     package let profileIdentifier: String
@@ -287,7 +288,8 @@ package actor DomainMutationPolicyStore {
         guard !document.headlessGrants.contains(where: { $0.id == grant.id }) else {
             throw DomainMutationPolicyError.invalidGrant("duplicate grant id")
         }
-        return try await persist(grants: document.headlessGrants + [grant])
+        let grantToPersist = try canonicalizedGrant(grant)
+        return try await persist(grants: document.headlessGrants + [grantToPersist])
     }
 
     @discardableResult
@@ -310,12 +312,11 @@ package actor DomainMutationPolicyStore {
 
     private static func roots(_ requested: Set<String>, areCoveredBy authorized: Set<String>) -> Bool {
         requested.allSatisfy { requestedRoot in
-            let requested = URL(fileURLWithPath: (requestedRoot as NSString).expandingTildeInPath)
-                .standardizedFileURL.path
+            guard let requested = DomainMutationPathFence.canonicalPath(requestedRoot) else {
+                return false
+            }
             return authorized.contains { authorizedRoot in
-                let authorized = URL(fileURLWithPath: (authorizedRoot as NSString).expandingTildeInPath)
-                    .standardizedFileURL.path
-                return requested == authorized || requested.hasPrefix(authorized.hasSuffix("/") ? authorized : authorized + "/")
+                requested == authorizedRoot || requested.hasPrefix(authorizedRoot.hasSuffix("/") ? authorizedRoot : authorizedRoot + "/")
             }
         }
     }
@@ -345,6 +346,62 @@ package actor DomainMutationPolicyStore {
         }
     }
 
+    private func canonicalizedGrant(_ grant: DomainHeadlessMutationGrant) throws -> DomainHeadlessMutationGrant {
+        let roots = try Set(grant.canonicalRoots.map { root in
+            guard let canonical = DomainMutationPathFence.canonicalPath(root) else {
+                throw DomainMutationPolicyError.invalidGrant("canonical roots must be absolute paths")
+            }
+            return canonical
+        })
+        return DomainHeadlessMutationGrant(
+            id: grant.id,
+            principalKey: grant.principalKey,
+            allowedOperations: grant.allowedOperations,
+            workspaceIDs: grant.workspaceIDs,
+            canonicalRoots: roots,
+            provider: grant.provider,
+            issuedAt: grant.issuedAt,
+            expiresAt: grant.expiresAt,
+            revokedAt: grant.revokedAt,
+            revision: grant.revision
+        )
+    }
+
+    private func validateStoredDocument(_ document: DomainMutationPolicyDocument) throws {
+        for grant in document.headlessGrants {
+            try validateGrant(grant)
+            guard grant.canonicalRoots.allSatisfy({ root in
+                guard let canonical = DomainMutationPathFence.canonicalPath(root) else {
+                    return false
+                }
+                return canonical == root
+            }) else {
+                throw DomainMutationPolicyError.invalidGrant("stored canonical roots are invalid")
+            }
+        }
+    }
+
+    private func migratedDocument(
+        from legacy: DomainMutationPolicyDocument
+    ) throws -> DomainMutationPolicyDocument {
+        DomainMutationPolicyDocument(
+            version: DomainMutationPolicyDocument.schemaVersion,
+            profileIdentifier: legacy.profileIdentifier,
+            revision: legacy.revision,
+            headlessGrants: legacy.headlessGrants.map { grant in
+                try validateGrant(grant)
+                return try canonicalizedGrant(grant)
+            },
+            updatedAt: legacy.updatedAt
+        )
+    }
+
+    private func encodedDocument(_ document: DomainMutationPolicyDocument) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(document)
+    }
+
     /// Reloads the versioned snapshot for every authorization/revalidation boundary so
     /// TTY policy administration and revocation are visible to already-running brokers.
     private func refreshFromPersistence() async {
@@ -366,15 +423,34 @@ package actor DomainMutationPolicyStore {
                 return
             }
             let decoded = try JSONDecoder().decode(DomainMutationPolicyDocument.self, from: data)
-            guard decoded.version == DomainMutationPolicyDocument.schemaVersion,
-                  decoded.profileIdentifier == profileIdentifier
-            else {
+            guard decoded.profileIdentifier == profileIdentifier else {
                 health = .degradedReadOnly(reason: "future_or_wrong_profile")
                 return
             }
-            document = decoded
-            documentDigest = digest
-            health = .ready
+            if decoded.version == DomainMutationPolicyDocument.schemaVersion {
+                try validateStoredDocument(decoded)
+                document = decoded
+                documentDigest = digest
+                health = .ready
+            } else if decoded.version == DomainMutationPolicyDocument.legacySchemaVersion {
+                let migrated = try migratedDocument(from: decoded)
+                let migratedData = try encodedDocument(migrated)
+                do {
+                    try await persistence.compareAndSwapProtectedMutationPolicyData(
+                        expectedDigest: digest,
+                        data: migratedData
+                    )
+                } catch DomainPersistenceError.externalDocumentConflict {
+                    documentDigest = nil
+                    health = .degradedReadOnly(reason: "policy_changed")
+                    return
+                }
+                document = migrated
+                documentDigest = DomainContentDigest.sha256(migratedData)
+                health = .ready
+            } else {
+                health = .degradedReadOnly(reason: "future_or_wrong_profile")
+            }
         } catch {
             health = .degradedReadOnly(reason: "corrupt_policy")
         }

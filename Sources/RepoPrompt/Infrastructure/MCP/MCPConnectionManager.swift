@@ -13440,8 +13440,8 @@ actor ServerNetworkManager {
                 }
                 workspaceID = handle.context.workspaceID
                 workspaceRevision = handle.workspaceRevision
-                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.map {
-                    URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath).standardizedFileURL.path
+                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.compactMap {
+                    DomainMutationPathFence.canonicalPath($0)
                 })
             } catch {
                 // Registration is authoritative only together with a resolved domain context.
