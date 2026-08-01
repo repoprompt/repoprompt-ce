@@ -57,7 +57,7 @@ Capability names below are from the domain-runtime `MCPDomainToolCatalog`; every
 | `wait_for_next_user_instruction` | agent_reasoning_control | control / interactive | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | terminal/cancel; interactive lifecycle | app authoritative / exact later parity |
 | `history` | history_read | control / bounded | `MCPDomainReadToolProvider` → `MCPHistoryToolProvider` / `HistoryMCPToolService` backend | manifest + catalog golden | scan budget/invalid params; request cancellation | shared app/headless provider; app scanner backend |
 
-The manifest freezes the complete one-capability-per-tool map and explicit per-client annotation profiles. It also freezes the resolved `tools/list` output—after restricted-tool filtering, policy-gated grants, and role advertisement—for direct, discovery, generic explore, generic engineer, orchestrator engineer, Claude, Codex, OpenCode, and Cursor profiles. XCTest derives every list from `MCPToolCapabilities`, `DiscoverMCPToolPolicy`, `AgentModeMCPToolPolicy`, `MCPPolicyGatedTools`, and `AgentModeMCPToolAdvertisementPolicy`; the JSON is not an independent prose assertion. Admission and execution partitions remain exhaustive and fail closed.
+The manifest freezes the complete tool-to-capability map, including deliberate empty mappings, and explicit per-client annotation profiles. It also freezes a resolved **production-policy projection**—after restricted-tool filtering, policy-gated grants, and role advertisement—for direct, discovery, generic explore, generic engineer, orchestrator engineer, Claude, Codex, OpenCode, and Cursor profiles. XCTest derives every projection from `MCPToolCapabilities`, `DiscoverMCPToolPolicy`, `AgentModeMCPToolPolicy`, `MCPPolicyGatedTools`, and `AgentModeMCPToolAdvertisementPolicy`; the JSON is not an independent prose assertion. This is deliberately not described as actual runtime `tools/list` registry evidence because M0 does not exercise service registration, user-disabled tools, duplicate suppression, readiness, or connection routing. Admission and execution partitions remain exhaustive and fail closed.
 
 ### Dependency and MainActor boundary
 
@@ -113,9 +113,9 @@ The manifest classifies durable files, in-memory window overlays, runtime-policy
 
 `GlobalSettingsStore` is file-backed at `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`. `WindowSettingsManager` is an in-memory overlay that writes only on explicit commit or opt-in auto-persist. Approval, tool availability, apply-edits policy, and host admission UserDefaults are runtime-policy migration candidates, not presentation preferences. Working-journal rows freeze the later M2/M4 migration accounting without implementing it.
 
-### EditFlowPerf structural contract — carried forward before M2 no-regression decisions
+### EditFlowPerf deterministic contract-evidence index — carried forward before M2 no-regression decisions
 
-`headless-mcp-domain-runtime-m0-editflowperf-baseline.json` records a checkout-size snapshot (2,341 tracked files; 1,654 source/test/script files; 42,426,964 bytes); those counts are not a representative-workspace or latency sample. Executable tests guard queue, MainActor, execution, durability, and response event contracts. The artifact separately preserves the historical observed work-count blob `f2c2693e7956c561dced51fc51fa165676a7efbc`.
+`headless-mcp-domain-runtime-m0-editflowperf-baseline.json` records a checkout-size snapshot (2,341 tracked files; 1,654 source/test/script files; 42,426,964 bytes); those counts are not a representative-workspace or latency sample. The artifact is an informational index over deterministic executable contracts, not proof that those separate tests passed in the current run. Its M0 evidence floors require substantive queue aging/cancellation, correlated lifecycle, workload-matrix, durability, response-delivery, checkout-size, and historical work-count observations. Every executable citation is reconciled with the curated test ledger, and every stage records the ledger-owned source path. The artifact separately preserves the historical observed work-count blob `f2c2693e7956c561dced51fc51fa165676a7efbc` and validates its object-ID shape plus positive scenario counts.
 
 No live command was attempted because the task prohibited visible app lifecycle actions. Therefore the live MCP round trip is `not_observed_task_prohibited`, not an observed failure or blocked execution. Before M2 makes no-regression decisions, use a separately authorized, already-running CE debug app and `make dev-smoke`; never infer live latency from XCTest timing.
 
@@ -142,7 +142,7 @@ M0 is a **contract freeze complete with two carried-forward evidence gates**, no
 1. packaged-child credential access must be measured before M5 credential transport; until then direct access is excluded and the parent-owned, minimum-scope in-memory handoff is mandatory;
 2. live EditFlowPerf latency must be measured before M2 no-regression decisions using a separately authorized, already-running CE debug app.
 
-The SDK stdio assessment, catalog/actions/defaults/typed errors, capability and resolved discovery profiles, dependency/MainActor inventories, approval semantics, persistence/save classification, and private endpoint/token contract are guarded now. Later milestones must update the parity ledger, per-tool actor denominator, and migration rows deliberately as families move.
+The SDK stdio assessment, catalog/actions/defaults/typed errors, capability and resolved policy projections, dependency/MainActor inventories, approval semantics, persistence/save classification, and private endpoint/token contract are guarded now. Later milestones must update the parity ledger, per-tool actor denominator, and migration rows deliberately as families move.
 
 ### Eight-PR boundary preserved
 

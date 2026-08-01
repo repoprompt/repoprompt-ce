@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-package struct DomainWindowDescriptor: Codable, Equatable, Sendable {
+package struct DomainWindowDescriptor: Codable, Equatable {
     package let windowID: Int
     package let generation: UInt64
     package let activeWorkspaceID: UUID?
@@ -26,7 +26,7 @@ package struct DomainWindowDescriptor: Codable, Equatable, Sendable {
     }
 }
 
-package struct DomainConnectionRegistration: Codable, Hashable, Sendable {
+package struct DomainConnectionRegistration: Codable, Hashable {
     package let connectionID: UUID
     package let generation: UInt64
     package let runtimeID: UUID
@@ -38,19 +38,19 @@ package struct DomainConnectionRegistration: Codable, Hashable, Sendable {
     }
 }
 
-package enum DomainBinding: Codable, Equatable, Sendable {
+package enum DomainBinding: Codable, Equatable {
     case unbound
     case context(DomainContextIdentity, explicit: Bool)
     case appPresentationWindow(Int)
     case runScoped(runID: UUID, context: DomainContextIdentity)
 }
 
-package struct DomainConnectionBindingSnapshot: Codable, Equatable, Sendable {
+package struct DomainConnectionBindingSnapshot: Codable, Equatable {
     package let registration: DomainConnectionRegistration
     package let binding: DomainBinding
 }
 
-package struct DomainRoutingSnapshot: Codable, Equatable, Sendable {
+package struct DomainRoutingSnapshot: Codable, Equatable {
     package let runtimeID: UUID
     package let revision: UInt64
     package let windows: [DomainWindowDescriptor]
@@ -58,7 +58,7 @@ package struct DomainRoutingSnapshot: Codable, Equatable, Sendable {
     package let pendingRunContexts: [UUID: DomainContextIdentity]
 }
 
-package enum DomainRoutingDisposition: String, Codable, Sendable {
+package enum DomainRoutingDisposition: String, Codable {
     case applied
     case unchanged
     case conflict
@@ -66,24 +66,19 @@ package enum DomainRoutingDisposition: String, Codable, Sendable {
     case staleGeneration
 }
 
-package struct DomainRoutingOutcome: Codable, Equatable, Sendable {
+package struct DomainRoutingOutcome: Codable, Equatable {
     package let operationID: UUID
     package let disposition: DomainRoutingDisposition
     package let snapshot: DomainRoutingSnapshot
     package let diagnostic: String?
 }
 
-package struct DomainRunLaunchToken: Sendable {
+package struct DomainRunLaunchToken {
     package let tokenID: UUID
     package let material: String
-
-    init(tokenID: UUID, material: String) {
-        self.tokenID = tokenID
-        self.material = material
-    }
 }
 
-package struct DomainRunLaunchReservationRequest: Sendable {
+package struct DomainRunLaunchReservationRequest {
     package let runID: UUID
     package let context: DomainContextIdentity
     package let expectedContextRevision: UInt64
@@ -123,7 +118,7 @@ package struct DomainRunLaunchReservationRequest: Sendable {
     }
 }
 
-package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
+package enum DomainRunLaunchRedemptionResult: Equatable {
     case accepted(DomainConnectionBindingSnapshot)
     case unknown
     case expired
@@ -133,20 +128,24 @@ package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
     case revoked
 }
 
-package enum DomainRunLaunchTokenError: Error, Equatable, Sendable {
+package enum DomainRunLaunchTokenError: Error, Equatable {
+    case runtimeStopped
     case contextUnavailable
     case staleContextRevision(expected: UInt64, actual: UInt64)
     case randomGenerationFailed
 }
 
 package actor DomainRoutingCoordinator {
-    private enum TokenState: Sendable {
+    static let maximumRoutingOperations = 4096
+    static let maximumTokenRecords = 1024
+
+    private enum TokenState: Equatable {
         case active
         case consumed
         case revoked
     }
 
-    private struct TokenRecord: Sendable {
+    private struct TokenRecord {
         let tokenID: UUID
         let digest: String
         let request: DomainRunLaunchReservationRequest
@@ -160,13 +159,19 @@ package actor DomainRoutingCoordinator {
     private let metrics: DomainRuntimeMetricsSink
     private let clock = ContinuousClock()
     private var revision: UInt64 = 0
+    private var isStopped = false
     private var windows: [Int: DomainWindowDescriptor] = [:]
     private var nextWindowGeneration: [Int: UInt64] = [:]
     private var connections: [UUID: DomainConnectionBindingSnapshot] = [:]
     private var nextConnectionGeneration: [UUID: UInt64] = [:]
     private var pendingRunContexts: [UUID: DomainContextIdentity] = [:]
     private var tokenRecords: [String: TokenRecord] = [:]
+    private var tokenDigestsByID: [UUID: String] = [:]
+    private var tokenIssueOrder: [String] = []
+    private var tokenIssueOrderHead = 0
     private var routingOperations: [UUID: DomainRoutingOutcome] = [:]
+    private var routingOperationOrder: [UUID] = []
+    private var routingOperationOrderHead = 0
 
     init(
         identity: DomainRuntimeIdentity,
@@ -294,6 +299,7 @@ package actor DomainRoutingCoordinator {
         presentationRevision: UInt64,
         operationID: UUID
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         let generation = nextWindowGeneration[windowID, default: 0] &+ 1
         nextWindowGeneration[windowID] = generation
@@ -314,6 +320,7 @@ package actor DomainRoutingCoordinator {
         operationID: UUID,
         expectedRevision: UInt64? = nil
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard expectedRevision == nil || expectedRevision == revision else {
             return finish(operationID, disposition: .conflict, diagnostic: "routing_revision_mismatch")
@@ -347,6 +354,7 @@ package actor DomainRoutingCoordinator {
         generation: UInt64,
         operationID: UUID
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard let current = windows[windowID] else {
             return finish(operationID, disposition: .unchanged, diagnostic: nil)
@@ -370,6 +378,7 @@ package actor DomainRoutingCoordinator {
     }
 
     package func registerConnection(connectionID: UUID, operationID: UUID) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         let generation = nextConnectionGeneration[connectionID, default: 0] &+ 1
         nextConnectionGeneration[connectionID] = generation
@@ -389,6 +398,7 @@ package actor DomainRoutingCoordinator {
         _ connection: DomainConnectionRegistration,
         operationID: UUID
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard let current = connections[connection.connectionID] else {
             return finish(operationID, disposition: .unchanged, diagnostic: nil)
@@ -407,6 +417,18 @@ package actor DomainRoutingCoordinator {
         operationID: UUID,
         expectedRevision: UInt64? = nil
     ) async -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
+        // Resolve the async context dependency first so validation and commit below run
+        // without suspension: actor reentrancy cannot interleave routing-state changes
+        // between the checks and the committed binding.
+        var contextExists = true
+        switch binding {
+        case let .context(context, _), let .runScoped(_, context):
+            contextExists = await contextStore.snapshot(context) != nil
+        case .appPresentationWindow, .unbound:
+            break
+        }
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard expectedRevision == nil || expectedRevision == revision else {
             return finish(operationID, disposition: .conflict, diagnostic: "routing_revision_mismatch")
@@ -420,8 +442,8 @@ package actor DomainRoutingCoordinator {
             return finish(operationID, disposition: .rejected, diagnostic: "run_scoped_binding_is_immutable")
         }
         switch binding {
-        case let .context(context, _), let .runScoped(_, context):
-            guard await contextStore.snapshot(context) != nil else {
+        case .context, .runScoped:
+            guard contextExists else {
                 return finish(operationID, disposition: .rejected, diagnostic: "context_unavailable")
             }
         case let .appPresentationWindow(windowID):
@@ -445,9 +467,11 @@ package actor DomainRoutingCoordinator {
     package func issueLaunchToken(
         _ request: DomainRunLaunchReservationRequest
     ) async throws -> DomainRunLaunchToken {
+        guard !isStopped else { throw DomainRunLaunchTokenError.runtimeStopped }
         guard let context = await contextStore.snapshot(request.context) else {
             throw DomainRunLaunchTokenError.contextUnavailable
         }
+        guard !isStopped else { throw DomainRunLaunchTokenError.runtimeStopped }
         guard context.revisions.workingRevision == request.expectedContextRevision else {
             throw DomainRunLaunchTokenError.staleContextRevision(
                 expected: request.expectedContextRevision,
@@ -465,6 +489,7 @@ package actor DomainRoutingCoordinator {
         let digest = DomainContentDigest.sha256(Data(material.utf8))
         let now = clock.now
         let tokenID = UUID()
+        sweepExpiredTokens(now: now)
         tokenRecords[digest] = TokenRecord(
             tokenID: tokenID,
             digest: digest,
@@ -473,6 +498,9 @@ package actor DomainRoutingCoordinator {
             expiresAt: now.advanced(by: request.lifetime),
             state: .active
         )
+        tokenDigestsByID[tokenID] = digest
+        tokenIssueOrder.append(digest)
+        enforceTokenCapacity()
         pendingRunContexts[request.runID] = request.context
         revision &+= 1
         metrics.record(DomainRuntimeMetric(
@@ -509,6 +537,7 @@ package actor DomainRoutingCoordinator {
         }
         guard clock.now < record.expiresAt else {
             record.state = .revoked
+            pendingRunContexts.removeValue(forKey: record.request.runID)
             tokenRecords[digest] = record
             return .expired
         }
@@ -545,7 +574,8 @@ package actor DomainRoutingCoordinator {
     }
 
     package func revokeLaunchToken(_ tokenID: UUID) {
-        for (digest, var record) in tokenRecords where record.tokenID == tokenID {
+        guard !isStopped else { return }
+        if let digest = tokenDigestsByID[tokenID], var record = tokenRecords[digest] {
             record.state = .revoked
             pendingRunContexts.removeValue(forKey: record.request.runID)
             tokenRecords[digest] = record
@@ -553,7 +583,56 @@ package actor DomainRoutingCoordinator {
         revision &+= 1
     }
 
+    /// Retires expired reservations (releasing their pending run contexts) and drops retired
+    /// records once their lifetime has elapsed, so token bookkeeping cannot grow with uptime.
+    private func sweepExpiredTokens(now: ContinuousClock.Instant) {
+        guard !tokenRecords.isEmpty else { return }
+        for (digest, record) in tokenRecords where now >= record.expiresAt {
+            if record.state == .active {
+                pendingRunContexts.removeValue(forKey: record.request.runID)
+            }
+            removeTokenRecord(digest: digest)
+        }
+    }
+
+    /// Deterministically evicts the oldest-issued records once the bound is exceeded.
+    private func enforceTokenCapacity() {
+        while tokenRecords.count > Self.maximumTokenRecords, tokenIssueOrderHead < tokenIssueOrder.count {
+            let digest = tokenIssueOrder[tokenIssueOrderHead]
+            tokenIssueOrderHead += 1
+            guard let record = tokenRecords[digest] else { continue }
+            if record.state == .active {
+                pendingRunContexts.removeValue(forKey: record.request.runID)
+            }
+            removeTokenRecord(digest: digest)
+        }
+        compactTokenIssueOrderIfNeeded()
+    }
+
+    /// Expiry can remove records without advancing the FIFO head. Rebuild from live digests
+    /// only after a fixed amount of slack is consumed, keeping storage bounded while making
+    /// the O(n) rebuild amortized O(1) across token issuance.
+    private func compactTokenIssueOrderIfNeeded() {
+        let maximumStoredDigests = Self.maximumTokenRecords * 2
+        guard tokenIssueOrder.count > maximumStoredDigests else { return }
+        tokenIssueOrder = tokenIssueOrder[tokenIssueOrderHead...].filter {
+            tokenRecords[$0] != nil
+        }
+        tokenIssueOrderHead = 0
+    }
+
+    func tokenBookkeepingCounts() -> (records: Int, issueOrderStorage: Int, pendingRunContexts: Int) {
+        (tokenRecords.count, tokenIssueOrder.count, pendingRunContexts.count)
+    }
+
+    private func removeTokenRecord(digest: String) {
+        guard let record = tokenRecords.removeValue(forKey: digest) else { return }
+        tokenDigestsByID.removeValue(forKey: record.tokenID)
+    }
+
     package func shutdown() {
+        guard !isStopped else { return }
+        isStopped = true
         for (digest, var record) in tokenRecords {
             if case .active = record.state {
                 record.state = .revoked
@@ -564,6 +643,15 @@ package actor DomainRoutingCoordinator {
         windows.removeAll()
         connections.removeAll()
         revision &+= 1
+    }
+
+    private func stoppedOutcome(_ operationID: UUID) -> DomainRoutingOutcome {
+        DomainRoutingOutcome(
+            operationID: operationID,
+            disposition: .rejected,
+            snapshot: snapshot(),
+            diagnostic: "routing_coordinator_stopped"
+        )
     }
 
     private func finish(
@@ -577,11 +665,20 @@ package actor DomainRoutingCoordinator {
             snapshot: snapshot(),
             diagnostic: diagnostic
         )
-        routingOperations[operationID] = outcome
-        if routingOperations.count > 4096,
-           let oldestOperationID = routingOperations.keys.first
+        if routingOperations.updateValue(outcome, forKey: operationID) == nil {
+            routingOperationOrder.append(operationID)
+        }
+        while routingOperations.count > Self.maximumRoutingOperations,
+              routingOperationOrderHead < routingOperationOrder.count
         {
-            routingOperations.removeValue(forKey: oldestOperationID)
+            routingOperations.removeValue(forKey: routingOperationOrder[routingOperationOrderHead])
+            routingOperationOrderHead += 1
+        }
+        if routingOperationOrderHead >= Self.maximumRoutingOperations,
+           routingOperationOrderHead * 2 >= routingOperationOrder.count
+        {
+            routingOperationOrder.removeFirst(routingOperationOrderHead)
+            routingOperationOrderHead = 0
         }
         return outcome
     }

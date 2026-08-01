@@ -683,6 +683,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let service = try XCTUnwrap(loadedService)
             let publications = LockedFileSystemPublications()
             let publicationCancellable = await service.publisherForChanges().sink { publications.append($0) }
+            let initialMonitorCompletionCount = await service.mutationMonitorCompletionCountForTesting()
             let mutationGate = AsyncGate()
             await service.setMutationIOWillBeginHandlerForTesting { operation in
                 guard operation == .edit else { return }
@@ -726,10 +727,43 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "old")
             let waiterCountAfterCancellation = await service.pendingMutationWaiterCountForTesting()
             XCTAssertEqual(waiterCountAfterCancellation, 0)
+            let retainedFenceCount = await store.codemapPathFenceCountForTesting(
+                rootID: record.id,
+                relativePath: "OverwriteAfterCancellation.swift"
+            )
+            XCTAssertEqual(retainedFenceCount, 1)
+
+            let drainCompletedSignal = AsyncSignal()
+            let drainTask = Task {
+                await service.awaitMutationDrain(conflictingWith: ["OverwriteAfterCancellation.swift"])
+                await drainCompletedSignal.mark()
+            }
+            let drainWaiterRegistered = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await service.pendingMutationDrainWaiterCountForTesting() == 1
+            }
+            XCTAssertTrue(drainWaiterRegistered)
+            let drainCompletedBeforeRelease = await drainCompletedSignal.isMarked()
+            XCTAssertFalse(drainCompletedBeforeRelease)
 
             await mutationGate.release()
             let observedCancellation = await resultTask.value
             XCTAssertTrue(observedCancellation)
+            let drainCompleted = await waitForAsyncCondition(timeout: .seconds(5)) {
+                await drainCompletedSignal.isMarked()
+            }
+            XCTAssertTrue(drainCompleted)
+            if drainCompleted {
+                await drainTask.value
+            } else {
+                drainTask.cancel()
+            }
+            let fenceReleased = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await store.codemapPathFenceCountForTesting(
+                    rootID: record.id,
+                    relativePath: "OverwriteAfterCancellation.swift"
+                ) == 0
+            }
+            XCTAssertTrue(fenceReleased)
             let reconciled = await waitForAsyncCondition(timeout: .seconds(5)) {
                 guard (try? String(contentsOf: fileURL, encoding: .utf8)) == "new" else { return false }
                 return await (try? store.readContent(
@@ -742,6 +776,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNotNil(catalogFile)
             let finalWaiterCount = await service.pendingMutationWaiterCountForTesting()
             XCTAssertEqual(finalWaiterCount, 0)
+            let finalMutationCount = await service.pendingInFlightMutationCountForTesting()
+            XCTAssertEqual(finalMutationCount, 0)
+            let finalDrainWaiterCount = await service.pendingMutationDrainWaiterCountForTesting()
+            XCTAssertEqual(finalDrainWaiterCount, 0)
+            let finalMonitorCompletionCount = await service.mutationMonitorCompletionCountForTesting()
+            XCTAssertEqual(finalMonitorCompletionCount, initialMonitorCompletionCount + 1)
             let fallbackPublished = await waitForAsyncCondition(timeout: .seconds(2)) {
                 publications.snapshot().contains { publication in
                     publication.source == .syntheticMutation
@@ -822,6 +862,69 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await postTokenStore.setStoreEditDeferredPublicationDidRegisterHandlerForTesting(nil)
             await postTokenStore.stopWatchingRoot(id: postTokenRecord.id)
             cancellables.insert(postTokenCancellable)
+
+            let unloadRoot = try makeTemporaryRoot(name: "CancelledOverwriteAfterRootUnload")
+            let unloadFileURL = unloadRoot.appendingPathComponent("Unload.swift")
+            try write("old", to: unloadFileURL)
+            let unloadStore = WorkspaceFileContextStore()
+            let unloadRecord = try await unloadStore.loadRoot(path: unloadRoot.path)
+            let maybeUnloadService = await unloadStore.fileSystemServiceForTesting(rootID: unloadRecord.id)
+            let unloadService = try XCTUnwrap(maybeUnloadService)
+            let unloadGate = AsyncGate()
+            await unloadService.setMutationIOWillBeginHandlerForTesting { operation in
+                guard operation == .edit else { return }
+                await unloadGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await unloadGate.release()
+                await unloadService.setMutationIOWillBeginHandlerForTesting(nil)
+                await unloadStore.unloadRoot(id: unloadRecord.id)
+            }
+
+            let unloadEditTask = Task {
+                try await unloadStore.editFile(
+                    rootID: unloadRecord.id,
+                    relativePath: "Unload.swift",
+                    newContent: "new"
+                )
+            }
+            await unloadGate.waitUntilStarted()
+            let unloadWaiterRegistered = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await unloadService.pendingMutationWaiterCountForTesting() == 1
+            }
+            XCTAssertTrue(unloadWaiterRegistered)
+            unloadEditTask.cancel()
+            do {
+                _ = try await unloadEditTask.value
+                XCTFail("Expected cancellation before root unload")
+            } catch is CancellationError {
+                // Expected.
+            }
+            let unloadFenceRetained = await unloadStore.codemapPathFenceCountForTesting(
+                rootID: unloadRecord.id,
+                relativePath: "Unload.swift"
+            )
+            XCTAssertEqual(unloadFenceRetained, 1)
+
+            await unloadStore.unloadRoot(id: unloadRecord.id)
+            let fenceRemovedByUnload = await unloadStore.codemapPathFenceCountForTesting(
+                rootID: unloadRecord.id,
+                relativePath: "Unload.swift"
+            )
+            XCTAssertEqual(fenceRemovedByUnload, 0)
+            let pendingReschedulesAfterUnload = await unloadStore.pendingCodemapGraphIndexRescheduleCountForTesting()
+            XCTAssertEqual(pendingReschedulesAfterUnload, 0)
+
+            await unloadGate.release()
+            let lateReleaseDiscarded = await waitForAsyncCondition(timeout: .seconds(5)) {
+                let mutations = await unloadService.pendingInFlightMutationCountForTesting()
+                let discarded = await unloadStore.discardedCodemapPathFenceReleaseCountForTesting()
+                return mutations == 0 && discarded == 1
+            }
+            XCTAssertTrue(lateReleaseDiscarded)
+            let pendingReschedulesAfterLateRelease = await unloadStore.pendingCodemapGraphIndexRescheduleCountForTesting()
+            XCTAssertEqual(pendingReschedulesAfterLateRelease, 0)
+            await unloadService.setMutationIOWillBeginHandlerForTesting(nil)
         }
 
         func testCancelledMoveDeleteAndTrashSettleBeforeIOAndReconcileAfterCompletion() async throws {
@@ -946,6 +1049,165 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                     return await store.file(rootID: record.id, relativePath: "Trash.swift") == nil
                 }
             )
+        }
+
+        func testMutationCompletionBeforeWaiterRegistrationSettlesWithoutLostWakeup() async throws {
+            let root = try makeTemporaryRoot(name: "MutationCompletionMailbox")
+            let trashURL = root.appendingPathComponent("Trash.swift")
+            let editURL = root.appendingPathComponent("Edit.swift")
+            try write("trash", to: trashURL)
+            try write("old", to: editURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+            await service.setMoveItemToTrashIOForTesting { url in
+                try FileManager.default.removeItem(at: url)
+            }
+            let registrationGate = AsyncGate()
+            await service.setMutationWaiterWillRegisterHandlerForTesting { operation in
+                guard operation == .trash else { return }
+                await registrationGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await service.setMutationWaiterWillRegisterHandlerForTesting(nil)
+                await service.setMoveItemToTrashIOForTesting(nil)
+            }
+
+            let settledSignal = AsyncSignal()
+            let mutationTask = Task {
+                do {
+                    try await store.moveItemToTrash(rootID: record.id, relativePath: "Trash.swift")
+                    await settledSignal.mark()
+                    return true
+                } catch {
+                    await settledSignal.mark()
+                    return false
+                }
+            }
+            await registrationGate.waitUntilStarted()
+
+            let completionArrivedFirst = await waitForAsyncCondition(timeout: .seconds(2)) {
+                guard !FileManager.default.fileExists(atPath: trashURL.path) else { return false }
+                return await service.pendingMutationCompletionCountForTesting() == 1
+            }
+            XCTAssertTrue(completionArrivedFirst, "Detached completion did not reach the mailbox before waiter registration")
+
+            await registrationGate.release()
+            let settled = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await settledSignal.isMarked()
+            }
+            XCTAssertTrue(settled, "Precompleted mutation did not settle after waiter registration resumed")
+            if !settled {
+                mutationTask.cancel()
+            }
+            let mutationSucceeded = await mutationTask.value
+            let pendingWaiters = await service.pendingMutationWaiterCountForTesting()
+            let pendingCompletions = await service.pendingMutationCompletionCountForTesting()
+            XCTAssertTrue(mutationSucceeded)
+            XCTAssertEqual(pendingWaiters, 0)
+            XCTAssertEqual(pendingCompletions, 0)
+
+            let editRegistrationGate = AsyncGate()
+            await service.setMutationWaiterWillRegisterHandlerForTesting { operation in
+                guard operation == .edit else { return }
+                await editRegistrationGate.markStartedAndWaitForRelease()
+            }
+            let editSettledSignal = AsyncSignal()
+            let editTask = Task {
+                do {
+                    _ = try await store.editFile(
+                        rootID: record.id,
+                        relativePath: "Edit.swift",
+                        newContent: "new"
+                    )
+                    await editSettledSignal.mark()
+                    return true
+                } catch {
+                    await editSettledSignal.mark()
+                    return false
+                }
+            }
+            await editRegistrationGate.waitUntilStarted()
+
+            let deferredEditArrivedFirst = await waitForAsyncCondition(timeout: .seconds(2)) {
+                let pendingCompletions = await service.pendingMutationCompletionCountForTesting()
+                let pendingPublications = await service.pendingDeferredEditPublicationCountForTesting()
+                return pendingCompletions == 1 && pendingPublications == 1
+            }
+            XCTAssertTrue(
+                deferredEditArrivedFirst,
+                "Precompleted edit did not retain its deferred publication with the completion mailbox"
+            )
+
+            await editRegistrationGate.release()
+            let editSettled = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await editSettledSignal.isMarked()
+            }
+            XCTAssertTrue(editSettled, "Precompleted edit did not settle after waiter registration resumed")
+            if !editSettled {
+                editTask.cancel()
+            }
+            let editSucceeded = await editTask.value
+            let editedContent = try String(contentsOf: editURL, encoding: .utf8)
+            let pendingEditCompletions = await service.pendingMutationCompletionCountForTesting()
+            let pendingEditPublications = await service.pendingDeferredEditPublicationCountForTesting()
+            XCTAssertTrue(editSucceeded)
+            XCTAssertEqual(editedContent, "new")
+            XCTAssertEqual(pendingEditCompletions, 0)
+            XCTAssertEqual(pendingEditPublications, 0)
+        }
+
+        func testTrashSettlesFromDurableAbsenceBeforeFinderCallReturns() async throws {
+            let root = try makeTemporaryRoot(name: "TrashDurableAbsence")
+            let trashURL = root.appendingPathComponent("Trash.swift")
+            try write("trash", to: trashURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(loadedService)
+            let finderTailRelease = DispatchSemaphore(value: 0)
+            await service.setMoveItemToTrashIOForTesting { url in
+                try FileManager.default.removeItem(at: url)
+                finderTailRelease.wait()
+            }
+            addTeardownBlock {
+                finderTailRelease.signal()
+                await service.setMoveItemToTrashIOForTesting(nil)
+            }
+
+            let settledSignal = AsyncSignal()
+            let mutationTask = Task {
+                do {
+                    try await store.moveItemToTrash(rootID: record.id, relativePath: "Trash.swift")
+                    await settledSignal.mark()
+                    return true
+                } catch {
+                    await settledSignal.mark()
+                    return false
+                }
+            }
+            let settledBeforeFinderReturned = await waitForAsyncCondition(timeout: .seconds(2)) {
+                await settledSignal.isMarked()
+            }
+            XCTAssertTrue(
+                settledBeforeFinderReturned,
+                "Durable source-path absence did not settle while Finder tail work remained blocked"
+            )
+            if !settledBeforeFinderReturned {
+                mutationTask.cancel()
+            }
+            let mutationSucceeded = await mutationTask.value
+            let catalogFile = await store.file(rootID: record.id, relativePath: "Trash.swift")
+            let pendingWaiters = await service.pendingMutationWaiterCountForTesting()
+            let pendingCompletions = await service.pendingMutationCompletionCountForTesting()
+            XCTAssertTrue(mutationSucceeded)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: trashURL.path))
+            XCTAssertNil(catalogFile)
+            XCTAssertEqual(pendingWaiters, 0)
+            XCTAssertEqual(pendingCompletions, 0)
+
+            finderTailRelease.signal()
         }
 
         func testStopWatchingRootDrainsTrackedPublisherIngress() async throws {
@@ -5656,6 +5918,44 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
 
         do {
+            let caseLabel = "testWorkspaceFileEditHostAbsoluteOverwriteCreateBypassesCatalogPathMatching"
+            let root = try makeTemporaryRoot(name: "EditHostAbsoluteOverwrite")
+            let target = root.appendingPathComponent("Nested/Missing.swift")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let host = WorkspaceFileEditHost(
+                store: store,
+                lookupRootScope: .visibleWorkspace,
+                createPathResolutionPolicy: .canonicalAliasFirst,
+                selectCreatedFiles: false
+            )
+
+            #if DEBUG
+                EditFlowPerf.resetDebugCaptureForTesting()
+                switch EditFlowPerf.beginDebugCapture(label: caseLabel, maxSamples: 100) {
+                case .started:
+                    break
+                case .busy:
+                    return XCTFail(caseLabel + ": Performance capture should start")
+                }
+            #endif
+
+            try await host.writeText(path: target.path, content: "created", overwrite: true)
+
+            #if DEBUG
+                let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+                let pathSnapshotBuildCount = capture.stages
+                    .filter { $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild) }
+                    .reduce(0) { $0 + $1.sampleCount }
+                XCTAssertEqual(pathSnapshotBuildCount, 0, caseLabel)
+            #endif
+            let createdContent = try await store.readContent(rootID: record.id, relativePath: "Nested/Missing.swift")
+            let createdFile = await store.file(rootID: record.id, relativePath: "Nested/Missing.swift")
+            XCTAssertEqual(createdContent, "created", caseLabel)
+            XCTAssertNotNil(createdFile, caseLabel)
+        }
+
+        do {
             let caseLabel = "testApplyEditsRewriteCreateImmediatelyMaterializesForStoreLookupAndRead"
             let root = try makeTemporaryRoot(name: "ApplyEditsCreatePostcondition")
             let store = WorkspaceFileContextStore()
@@ -6118,7 +6418,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
 
             do {
-                try await host.writeText(path: "ignored/report.md", content: "must not escape", overwrite: false)
+                try await host.writeText(
+                    path: root.appendingPathComponent("ignored/report.md").path,
+                    content: "must not escape",
+                    overwrite: false
+                )
                 XCTFail(caseLabel + ": " + "Expected symlinked parent create to fail")
             } catch {}
 
@@ -6136,7 +6440,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
 
             do {
-                try await host.writeText(path: "report.ignored", content: "must not escape", overwrite: false)
+                try await host.writeText(
+                    path: root.appendingPathComponent("report.ignored").path,
+                    content: "must not escape",
+                    overwrite: false
+                )
                 XCTFail(caseLabel + ": " + "Expected dangling symlink create to fail")
             } catch {}
 

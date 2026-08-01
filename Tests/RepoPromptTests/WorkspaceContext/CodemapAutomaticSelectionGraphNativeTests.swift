@@ -61,8 +61,8 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let seed = try XCTUnwrap(files.first {
             $0.standardizedRelativePath == "Sources/Seed.swift"
         })
-        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: seed.id))
-        _ = try await readyResult(settledResult(store: store, ticket: ticket))
+        let initialDemand = try await readyArtifactDemand(store: store, forFileID: seed.id)
+        let ticket = initialDemand.ticket
 
         await store.setCodemapPathInvalidationStageHandlerForTesting { epoch, _, stage in
             guard epoch == ticket.rootEpoch, stage == .rootMutationFence else { return }
@@ -196,19 +196,11 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         let unrelated = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
 
-        let sourceSeed = await store.requestCodemapArtifact(
+        _ = try await readyArtifactDemand(
+            store: store,
             forFileID: source.id,
             priority: .background
         )
-        let sourceReady: WorkspaceCodemapArtifactDemandResult = switch sourceSeed {
-        case let .pending(ticket):
-            try await settledResult(store: store, ticket: ticket)
-        default:
-            sourceSeed
-        }
-        guard case .ready = sourceReady else {
-            return XCTFail("Expected the source artifact to be ready before graph-native selection.")
-        }
         let automaticDemandTicketOffset = fixture.demandedTickets.values.count
 
         _ = try await awaitCodemapGraphsReady(store: store, rootIDs: [loaded.id])
@@ -558,6 +550,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         XCTAssertFalse(result.issues.isEmpty)
         let demanded = Array(fixture.demandedTickets.values.dropFirst(ticketOffset))
         XCTAssertEqual(demanded.map(\.fileID), [target.id])
+        XCTAssertEqual(demandAttempts.value, 1)
         XCTAssertEqual(Set(cleaned.values.map(\.retainID)), Set(demanded.map(\.retainID)))
     }
 

@@ -26,6 +26,74 @@ final class CodexModelPollingServiceTests: XCTestCase {
         await service.shutdown()
     }
 
+    func testManagedSignOutSuspensionRestartsPollingAfterAuthenticationWithoutTerminalShutdown() async throws {
+        let client = PollingClientSpy()
+        let service = CodexModelPollingService(
+            client: client,
+            intervalNanos: 60_000_000_000,
+            stopClientOnShutdown: true,
+            stopClientWhenIdle: true
+        )
+        let consumer = await makeConsumer(service: service)
+        try await waitUntil { await client.listCallCount >= 1 }
+
+        await service.suspendForManagedSignOut()
+        let isSuspended = await service.test_isSuspendedForManagedSignOut()
+        let subscriberCount = await service.test_subscriberCount()
+        let callsAtSuspension = await client.listCallCount
+        let stopCallsAtSuspension = await client.stopCallCount
+        XCTAssertTrue(isSuspended)
+        XCTAssertEqual(subscriberCount, 1)
+        XCTAssertGreaterThanOrEqual(stopCallsAtSuspension, 1)
+
+        await service.refreshNow()
+        let callsAfterSuspendedRefresh = await client.listCallCount
+        XCTAssertEqual(callsAfterSuspendedRefresh, callsAtSuspension)
+
+        await service.resumeAfterManagedAuthentication()
+        let remainsSuspended = await service.test_isSuspendedForManagedSignOut()
+        XCTAssertFalse(remainsSuspended)
+        try await waitUntil { await client.listCallCount > callsAtSuspension }
+
+        consumer.cancel()
+        await consumer.value
+        await service.shutdown()
+    }
+
+    func testBufferedSnapshotIsRejectedAfterManagedLogoutInvalidatesItsAuthToken() async throws {
+        let model = CodexAppServerClient.RemoteModel(
+            id: "stale-\(UUID().uuidString)",
+            model: "stale-model",
+            displayName: "Stale Model",
+            description: "Test model",
+            isDefault: false,
+            supportedReasoningEfforts: [],
+            defaultReasoningEffort: nil
+        )
+        let client = PollingClientSpy(models: [model])
+        let service = CodexModelPollingService(client: client)
+        let stream = await service.subscribe()
+        var iterator = stream.makeAsyncIterator()
+        try await waitUntil { await service.latestSnapshot() != nil }
+
+        let fence = CodexManagedSessionFence.shared
+        let logoutToken = await MainActor.run { fence.beginLogout() }
+        await service.suspendForManagedSignOut()
+
+        let bufferedSnapshot = await iterator.next()
+        let isAuthorized = await MainActor.run {
+            bufferedSnapshot?.isAuthorizedForPublication ?? true
+        }
+        XCTAssertFalse(isAuthorized)
+        let latestAfterSuspend = await service.latestSnapshot()
+        XCTAssertNil(latestAfterSuspend)
+
+        await MainActor.run {
+            fence.finishLogout(token: logoutToken, succeeded: false)
+        }
+        await service.shutdown()
+    }
+
     private func makeConsumer(
         service: CodexModelPollingService
     ) async -> Task<Void, Never> {
@@ -52,12 +120,17 @@ final class CodexModelPollingServiceTests: XCTestCase {
 }
 
 private actor PollingClientSpy: CodexModelListingClient {
+    private let models: [CodexAppServerClient.RemoteModel]
     private(set) var listCallCount = 0
     private(set) var stopCallCount = 0
 
+    init(models: [CodexAppServerClient.RemoteModel] = []) {
+        self.models = models
+    }
+
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         listCallCount += 1
-        return []
+        return models
     }
 
     func stop() async {

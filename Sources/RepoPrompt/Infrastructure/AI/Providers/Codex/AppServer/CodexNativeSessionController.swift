@@ -493,7 +493,10 @@ final class CodexNativeSessionController {
         let runtimeStatus: RuntimeStatus
         let currentTurnID: String?
         let activeTurnIDs: [String]
+        /// Identifier paired with `latestTurnStatus`; this is the last terminal turn, not an active turn.
+        let latestTerminalTurnID: String?
         let latestTurnStatus: TurnStatus?
+        let latestTurnFailure: TurnFailure?
         let activeToolItems: [ToolItemObservation]
         let hasAuthoritativeActiveTurnItems: Bool
 
@@ -505,7 +508,9 @@ final class CodexNativeSessionController {
             runtimeStatus: RuntimeStatus,
             currentTurnID: String?,
             activeTurnIDs: [String],
+            latestTerminalTurnID: String? = nil,
             latestTurnStatus: TurnStatus?,
+            latestTurnFailure: TurnFailure? = nil,
             activeToolItems: [ToolItemObservation] = [],
             hasAuthoritativeActiveTurnItems: Bool = false
         ) {
@@ -516,7 +521,9 @@ final class CodexNativeSessionController {
             self.runtimeStatus = runtimeStatus
             self.currentTurnID = currentTurnID
             self.activeTurnIDs = activeTurnIDs
+            self.latestTerminalTurnID = latestTerminalTurnID
             self.latestTurnStatus = latestTurnStatus
+            self.latestTurnFailure = latestTurnFailure
             self.activeToolItems = activeToolItems
             self.hasAuthoritativeActiveTurnItems = hasAuthoritativeActiveTurnItems
         }
@@ -558,6 +565,7 @@ final class CodexNativeSessionController {
         var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
+        var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
@@ -587,6 +595,7 @@ final class CodexNativeSessionController {
             suppressThirdPartyMCPServers: Bool = false,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
             Options(
@@ -596,6 +605,7 @@ final class CodexNativeSessionController {
                         (
                             goalSupportEnabled: goalSupportEnabledProvider(),
                             reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
+                            memoriesEnabled: memoriesEnabledProvider(),
                             computerUseEnabled: computerUseEnabledProvider()
                         )
                     }
@@ -604,6 +614,7 @@ final class CodexNativeSessionController {
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
+                        memoriesEnabled: featurePolicy.memoriesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled
                     )
                 },
@@ -614,6 +625,7 @@ final class CodexNativeSessionController {
                 processModelReasoningSummary: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
+                memoriesEnabledProvider: memoriesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider
             )
         }
@@ -622,6 +634,11 @@ final class CodexNativeSessionController {
     enum ClientShutdownBehavior {
         case none
         case stopOnShutdown
+    }
+
+    private enum ThreadMemoryMode: String {
+        case enabled
+        case disabled
     }
 
     private enum LifecycleState {
@@ -1272,6 +1289,16 @@ final class CodexNativeSessionController {
             }
             await ensureInboundStreamsStarted()
 
+            if let resumeThreadID {
+                let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {
+                    guard let memoriesEnabledProvider = options.memoriesEnabledProvider else { return nil }
+                    return memoriesEnabledProvider() ? .enabled : .disabled
+                }
+                if let desiredMemoryMode {
+                    try await setThreadMemoryMode(desiredMemoryMode, threadID: resumeThreadID)
+                }
+            }
+
             let configOverrides = await options.configOverridesProvider()
             let result: [String: Any]
             #if DEBUG
@@ -1377,6 +1404,17 @@ final class CodexNativeSessionController {
             }
             throw error
         }
+    }
+
+    private func setThreadMemoryMode(_ mode: ThreadMemoryMode, threadID: String) async throws {
+        _ = try await performRequest(
+            method: "thread/memoryMode/set",
+            params: [
+                "threadId": threadID,
+                "mode": mode.rawValue
+            ],
+            timeout: options.requestTimeout
+        )
     }
 
     func readThreadSnapshot(
@@ -2010,7 +2048,9 @@ final class CodexNativeSessionController {
         let runtimeStatus = parseThreadRuntimeStatus(from: thread["status"])
         let turns = thread["turns"] as? [[String: Any]] ?? []
         var activeTurnIDs: [String] = []
+        var latestTerminalTurnID: String?
         var latestTurnStatus: TurnStatus?
+        var latestTurnFailure: TurnFailure?
         var activeToolItems: [ThreadSnapshot.ToolItemObservation] = []
         var authoritativeActiveTurnIDs: Set<String> = []
         for turn in turns {
@@ -2033,7 +2073,9 @@ final class CodexNativeSessionController {
                 }
             }
             if let parsedStatus = parseTerminalTurnStatus(from: statusRaw) {
+                latestTerminalTurnID = turnID
                 latestTurnStatus = parsedStatus
+                latestTurnFailure = parsedStatus == .failed ? parseTurnFailure(from: turn) : nil
             }
         }
         let hasAuthoritativeActiveTurnItems = !activeTurnIDs.isEmpty
@@ -2046,7 +2088,9 @@ final class CodexNativeSessionController {
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.last,
             activeTurnIDs: activeTurnIDs,
+            latestTerminalTurnID: latestTerminalTurnID,
             latestTurnStatus: latestTurnStatus,
+            latestTurnFailure: latestTurnFailure,
             activeToolItems: activeToolItems,
             hasAuthoritativeActiveTurnItems: hasAuthoritativeActiveTurnItems
         )
@@ -2119,6 +2163,7 @@ final class CodexNativeSessionController {
         await MainActor.run {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
+                memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
                 computerUseEnabled: options.computerUseEnabledProvider()
             )
         }
@@ -2883,6 +2928,12 @@ final class CodexNativeSessionController {
                 }
             }
 
+            let isCommandExecution = typeRaw == "commandexecution"
+                || typeRaw == "command_execution"
+            if method == "item/completed", isCommandExecution, let scope {
+                guard markCanonicalItemCompleted(scope) else { return }
+            }
+
             if typeRaw == "mcptoolcall" || typeRaw == "mcp_tool_call" {
                 guard let scope else { return }
                 if method == "item/completed" {
@@ -2980,6 +3031,11 @@ final class CodexNativeSessionController {
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
+            if let scope = Self.canonicalItemScope(from: params),
+               completedCanonicalItemScopes.contains(scope)
+            {
+                break
+            }
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
                 break
             }
@@ -8235,6 +8291,7 @@ final class CodexNativeSessionController {
         suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
+        memoriesEnabled: Bool = false,
         computerUseEnabled: Bool = false
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
@@ -8249,7 +8306,11 @@ final class CodexNativeSessionController {
         )
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,
-            featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled)
+            featurePolicy: .resolved(
+                goalsEnabled: goalSupportEnabled,
+                memoriesEnabled: memoriesEnabled,
+                computerUseEnabled: computerUseEnabled
+            )
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,

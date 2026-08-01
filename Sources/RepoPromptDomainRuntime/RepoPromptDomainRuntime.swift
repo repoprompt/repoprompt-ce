@@ -14,6 +14,7 @@ package struct DomainRuntimeConfiguration: Sendable {
     package let temporaryDirectory: URL
     package let legacyRuntimeDefaults: [String: Data]
     package let externalReloadInterval: Duration?
+    package let externalReloadMaximumInterval: Duration
     package let metrics: DomainRuntimeMetricsSink
     package let protectedMutationStage: DomainProtectedMutationStage
 
@@ -26,6 +27,7 @@ package struct DomainRuntimeConfiguration: Sendable {
         temporaryDirectory: URL,
         legacyRuntimeDefaults: [String: Data] = [:],
         externalReloadInterval: Duration? = .seconds(1),
+        externalReloadMaximumInterval: Duration = .seconds(30),
         metrics: DomainRuntimeMetricsSink = .disabled,
         protectedMutationStage: DomainProtectedMutationStage = .m3Compatibility
     ) {
@@ -38,6 +40,7 @@ package struct DomainRuntimeConfiguration: Sendable {
         self.temporaryDirectory = temporaryDirectory
         self.legacyRuntimeDefaults = legacyRuntimeDefaults
         self.externalReloadInterval = externalReloadInterval
+        self.externalReloadMaximumInterval = externalReloadMaximumInterval
         self.metrics = metrics
         self.protectedMutationStage = protectedMutationStage
     }
@@ -242,19 +245,40 @@ package actor MCPDomainRuntime {
 
     private func startExternalReloadPollingIfNeeded() {
         guard externalReloadTask == nil,
-              let interval = configuration.externalReloadInterval
+              let minimumInterval = configuration.externalReloadInterval
         else { return }
+        let maximumInterval = max(
+            minimumInterval,
+            configuration.externalReloadMaximumInterval
+        )
         externalReloadTask = Task { [weak self] in
+            var interval = minimumInterval
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(for: interval)
                 } catch {
                     return
                 }
-                guard !Task.isCancelled else { return }
-                await self?.workspaceStore.reloadExternalChanges()
+                guard !Task.isCancelled, let self else { return }
+                let activity = await workspaceStore.reloadExternalChanges()
+                await synchronizeLifecycleWithWorkspaceHealth()
+                interval = switch activity {
+                case .changed:
+                    minimumInterval
+                case .unchanged, .recoveryPending:
+                    min(interval * 2, maximumInterval)
+                }
             }
         }
+    }
+
+    private func synchronizeLifecycleWithWorkspaceHealth() async {
+        guard lifecycle == .ready || lifecycle == .degraded else { return }
+        let snapshot = await workspaceAuthority.snapshot()
+        let next: DomainRuntimeLifecycle = snapshot.health.acceptsMutations ? .ready : .degraded
+        guard next != lifecycle else { return }
+        lifecycle = next
+        publishSnapshot()
     }
 
     private func publishSnapshot() {

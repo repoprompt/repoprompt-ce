@@ -31,7 +31,7 @@ struct AgentModeDetailWithSidebarView: View {
             stressHarness: AgentChatStressHarness?,
             windowID: Int,
             currentTabID: UUID?,
-            codexManagedLoginAction: @escaping CodexManagedLoginAction
+            codexManagedLoginAction: CodexManagedLoginAction
         ) {
             self.agentModeVM = agentModeVM
             self.runtimeVM = runtimeVM
@@ -59,7 +59,7 @@ struct AgentModeDetailWithSidebarView: View {
             stressHarness: AgentChatStressHarness?,
             windowID: Int,
             currentTabID: UUID?,
-            codexManagedLoginAction: @escaping CodexManagedLoginAction
+            codexManagedLoginAction: CodexManagedLoginAction
         ) {
             self.init(
                 agentModeVM: agentModeVM,
@@ -88,7 +88,7 @@ struct AgentModeDetailWithSidebarView: View {
             selectionCoordinator: WorkspaceSelectionCoordinator,
             windowID: Int,
             currentTabID: UUID?,
-            codexManagedLoginAction: @escaping CodexManagedLoginAction
+            codexManagedLoginAction: CodexManagedLoginAction
         ) {
             self.agentModeVM = agentModeVM
             self.runtimeVM = runtimeVM
@@ -114,7 +114,7 @@ struct AgentModeDetailWithSidebarView: View {
             selectionCoordinator: WorkspaceSelectionCoordinator,
             windowID: Int,
             currentTabID: UUID?,
-            codexManagedLoginAction: @escaping CodexManagedLoginAction
+            codexManagedLoginAction: CodexManagedLoginAction
         ) {
             self.init(
                 agentModeVM: agentModeVM,

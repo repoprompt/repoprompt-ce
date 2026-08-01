@@ -1,7 +1,16 @@
 import CryptoKit
 import Foundation
 
-package struct DomainContextIdentity: Codable, Hashable, Sendable {
+package enum DomainWorkspaceStoragePath {
+    package static func directoryName(name: String, id: UUID) -> String {
+        let safeName = name
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Workspace-\(safeName)-\(id.uuidString)"
+    }
+}
+
+package struct DomainContextIdentity: Codable, Hashable {
     package let workspaceID: UUID
     package let contextID: UUID
 
@@ -11,7 +20,7 @@ package struct DomainContextIdentity: Codable, Hashable, Sendable {
     }
 }
 
-package struct DomainRevisionState: Codable, Equatable, Sendable {
+package struct DomainRevisionState: Codable, Equatable {
     package let workingRevision: UInt64
     package let savedRevision: UInt64
     package let dirtyRevision: UInt64?
@@ -29,7 +38,7 @@ package struct DomainRevisionState: Codable, Equatable, Sendable {
     )
 }
 
-package enum DomainAuthorityHealth: Codable, Equatable, Sendable {
+package enum DomainAuthorityHealth: Codable, Equatable {
     case writable
     case externalConflict(reason: String)
     case degradedReadOnly(reason: String)
@@ -41,7 +50,7 @@ package enum DomainAuthorityHealth: Codable, Equatable, Sendable {
     }
 }
 
-package struct DomainContextMetadata: Codable, Equatable, Sendable {
+package struct DomainContextMetadata: Codable, Equatable {
     package let identity: DomainContextIdentity
     package let name: String
     package let activeAgentSessionID: UUID?
@@ -66,7 +75,7 @@ package struct DomainContextMetadata: Codable, Equatable, Sendable {
     }
 }
 
-package struct DomainWorkspaceMetadata: Codable, Equatable, Sendable {
+package struct DomainWorkspaceMetadata: Codable, Equatable {
     package let workspaceID: UUID
     package let schemaVersion: Int
     package let name: String
@@ -103,7 +112,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable, Sendable {
     }
 }
 
-package struct DomainWorkspaceDocument: Codable, Equatable, Sendable {
+package struct DomainWorkspaceDocument: Codable, Equatable {
     package let workspaceID: UUID
     package let fileURL: URL
     package let documentBytes: Data
@@ -129,20 +138,20 @@ package struct DomainWorkspaceDocument: Codable, Equatable, Sendable {
     }
 }
 
-package struct DomainContextSnapshot: Codable, Equatable, Sendable {
+package struct DomainContextSnapshot: Codable, Equatable {
     package let metadata: DomainContextMetadata
     package let revisions: DomainRevisionState
     package let health: DomainAuthorityHealth
 }
 
-package struct DomainWorkspaceSnapshot: Codable, Equatable, Sendable {
+package struct DomainWorkspaceSnapshot: Codable, Equatable {
     package let document: DomainWorkspaceDocument
     package let revisions: DomainRevisionState
     package let health: DomainAuthorityHealth
     package let contexts: [DomainContextSnapshot]
 }
 
-package struct DomainWorkspaceCatalogSnapshot: Equatable, Sendable {
+package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let runtimeIdentity: DomainRuntimeIdentity
     package let isBootstrapped: Bool
     package let publicationSequence: UInt64
@@ -167,7 +176,7 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable, Sendable {
     }
 }
 
-package enum DomainWorkspaceEventKind: String, Codable, Sendable {
+package enum DomainWorkspaceEventKind: String, Codable {
     case bootstrapped
     case workspaceCreated
     case workspaceDeleted
@@ -180,24 +189,26 @@ package enum DomainWorkspaceEventKind: String, Codable, Sendable {
     case operationDeduplicated
 }
 
-package struct DomainWorkspaceEvent: Codable, Equatable, Sendable {
+package struct DomainWorkspaceEvent: Codable, Equatable {
     package let runtimeID: UUID
     package let sequence: UInt64
+    package let catalogRevision: UInt64
     package let kind: DomainWorkspaceEventKind
     package let workspaceID: UUID?
     package let contextID: UUID?
     package let operationID: UUID?
+    package let origin: DomainCommandOrigin?
     package let revisions: DomainRevisionState?
     package let timestamp: Date
     package let diagnostic: String?
 }
 
-package struct DomainWorkspaceSnapshotSubscription: Sendable {
+package struct DomainWorkspaceSnapshotSubscription {
     package let snapshot: DomainWorkspaceCatalogSnapshot
     package let events: AsyncStream<DomainWorkspaceEvent>
 }
 
-package enum DomainWorkspaceDocumentError: Error, Equatable, Sendable {
+package enum DomainWorkspaceDocumentError: Error, Equatable {
     case invalidTopLevel
     case missingWorkspaceID
     case futureSchema(Int)
@@ -224,12 +235,16 @@ private enum DomainWorkspaceDocumentDecoder {
         guard schemaVersion <= maximumSupportedSchemaVersion else {
             throw DomainWorkspaceDocumentError.futureSchema(schemaVersion)
         }
+        var contextIDs = Set<UUID>()
         let contexts = try ((object["composeTabs"] as? [Any]) ?? []).map { raw -> DomainContextMetadata in
             guard let context = raw as? [String: Any],
                   let contextIDString = context["id"] as? String,
                   let contextID = UUID(uuidString: contextIDString)
             else {
                 throw DomainWorkspaceDocumentError.invalidContext(nil)
+            }
+            guard contextIDs.insert(contextID).inserted else {
+                throw DomainWorkspaceDocumentError.invalidContext(contextID)
             }
             let bytes = try JSONSerialization.data(withJSONObject: context, options: [.sortedKeys])
             return DomainContextMetadata(

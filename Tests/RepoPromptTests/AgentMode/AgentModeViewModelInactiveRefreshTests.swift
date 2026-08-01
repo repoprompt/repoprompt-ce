@@ -749,6 +749,106 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         }
     }
 
+    func testSidebarListProjectionMemoizesWithinExplicitRenderGeneration() {
+        let viewModel = makeViewModel()
+        let composeTabs = (0 ..< 400).map { index in
+            ComposeTabState(
+                id: UUID(),
+                name: "Session \(index)",
+                activeAgentSessionID: UUID()
+            )
+        }
+        let stashedTabs = (0 ..< 200).map { index in
+            StashedTab(tab: ComposeTabState(
+                id: UUID(),
+                name: "Archived \(index)",
+                activeAgentSessionID: UUID()
+            ))
+        }
+        var workspace = makeWorkspace(
+            name: "Sidebar projection scale",
+            tabs: composeTabs,
+            activeTabID: composeTabs.first?.id
+        )
+        workspace.stashedTabs = stashedTabs
+        let manager = makeWorkspaceManager(workspaces: [workspace])
+        manager.activeWorkspace = workspace
+        viewModel.workspaceManager = manager
+        let snapshot = viewModel.ui.sessionSidebar.snapshot
+
+        _ = viewModel.sidebarListProjection(
+            composeTabs: composeTabs,
+            stashedTabs: stashedTabs,
+            currentTabID: composeTabs.first?.id,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: false
+        )
+        _ = viewModel.sidebarListProjection(
+            composeTabs: composeTabs,
+            stashedTabs: stashedTabs,
+            currentTabID: composeTabs.first?.id,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: false
+        )
+        XCTAssertEqual(viewModel.test_sidebarListProjectionBuildCount, 1)
+
+        var renamedTabs = composeTabs
+        renamedTabs[0].name = "Renamed"
+        _ = viewModel.sidebarListProjection(
+            composeTabs: renamedTabs,
+            stashedTabs: stashedTabs,
+            currentTabID: composeTabs.first?.id,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: false
+        )
+        XCTAssertEqual(viewModel.test_sidebarListProjectionBuildCount, 2)
+
+        viewModel.setSessionSidebarSearchText("Session 2")
+        _ = viewModel.sidebarListProjection(
+            composeTabs: renamedTabs,
+            stashedTabs: stashedTabs,
+            currentTabID: composeTabs.first?.id,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: true
+        )
+        XCTAssertEqual(viewModel.test_sidebarListProjectionBuildCount, 3)
+    }
+
+    func testBatchWorktreeBindingStatesBuildsAuthoritySnapshotOnceAtScale() {
+        let viewModel = makeViewModel()
+        let composeCount = 300
+        let stashedCount = 300
+        var composeTabs: [ComposeTabState] = []
+        var sessionIDs = Set<UUID>()
+
+        for _ in 0 ..< composeCount {
+            let tabID = UUID()
+            let sessionID = UUID()
+            let session = AgentModeViewModel.TabSession(tabID: tabID)
+            _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+            viewModel.test_installLiveSession(session)
+            composeTabs.append(ComposeTabState(id: tabID, activeAgentSessionID: sessionID))
+            sessionIDs.insert(sessionID)
+        }
+
+        var workspace = makeWorkspace(
+            name: "Batch binding scale",
+            tabs: composeTabs,
+            activeTabID: composeTabs.first?.id
+        )
+        workspace.stashedTabs = (0 ..< stashedCount).map { _ in
+            StashedTab(tab: ComposeTabState(id: UUID(), activeAgentSessionID: UUID()))
+        }
+        viewModel.workspaceManager = makeWorkspaceManager(workspaces: [workspace])
+        viewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
+
+        let states = viewModel.test_worktreeBindingStates(forAgentSessionIDs: sessionIDs)
+
+        XCTAssertEqual(states.count, composeCount)
+        XCTAssertTrue(states.values.allSatisfy { $0 == .unhydrated })
+        XCTAssertEqual(viewModel.test_persistentBindingResolutionBuildCount, 1)
+    }
+
     func testPersistentBindingMoveIsBlockedByRunOwnershipAndStoreRegistration() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()

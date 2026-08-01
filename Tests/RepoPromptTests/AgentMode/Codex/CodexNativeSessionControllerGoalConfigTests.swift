@@ -14,6 +14,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     }
 
     func testAgentModeDefaultCarriesGoalFeatureConfigToStartAndResume() async throws {
+        let expectedGoalSupportEnabled = await MainActor.run {
+            CodexGoalSupport.isEnabled
+        }
         let options = CodexNativeSessionController.Options.agentModeDefault(
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
@@ -22,7 +25,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         try await assertStartAndResumeGoalConfig(
             options: options,
-            expectedGoalSupportEnabled: true,
+            expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedApprovalReviewer: "auto_review"
         )
     }
@@ -69,6 +72,68 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             expectedGoalSupportEnabled: true,
             expectedReasoningSummary: "auto"
         )
+    }
+
+    func testAgentModeDefaultCarriesMemoriesOptInToProcessStartAndThreadStartResume() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            memoriesEnabledProvider: { true }
+        )
+
+        try await assertStartAndResumeGoalConfig(
+            options: options,
+            expectedGoalSupportEnabled: true,
+            expectedMemoriesEnabled: true
+        )
+    }
+
+    func testResumeReconcilesPersistedMemoryModeAcrossBothTransitions() async throws {
+        try await assertResumeMemoryModeTransition(
+            initialMode: "enabled",
+            desiredEnabled: false
+        )
+        try await assertResumeMemoryModeTransition(
+            initialMode: "disabled",
+            desiredEnabled: true
+        )
+    }
+
+    func testResumeFailsClosedWhenMemoryModeReconciliationIsRejected() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            memoriesEnabledProvider: { true }
+        )
+        let (controller, recordURL) = try await makeController(
+            options: options,
+            rejectMemoryModeRequests: true
+        )
+        addTeardownBlock {
+            await controller.shutdown()
+        }
+
+        var capturedError: Error?
+        do {
+            _ = try await controller.startOrResume(
+                existing: .init(
+                    conversationID: "existing-thread",
+                    rolloutPath: nil,
+                    model: nil,
+                    reasoningEffort: nil
+                ),
+                baseInstructions: "Agent"
+            )
+            XCTFail("Expected memory-mode reconciliation to fail")
+        } catch {
+            capturedError = error
+        }
+
+        XCTAssertTrue(capturedError?.localizedDescription.contains("memory mode rejected") == true)
+        XCTAssertEqual(try recordedRequests(for: "thread/memoryMode/set", at: recordURL).count, 1)
+        XCTAssertEqual(try recordedRequests(for: "thread/resume", at: recordURL).count, 0)
     }
 
     func testDefaultConfigOverridesOmitThreadReasoningSummaryWhenUnspecified() {
@@ -890,6 +955,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         options: CodexNativeSessionController.Options,
         expectedGoalSupportEnabled: Bool,
         expectedReasoningSummary: String = "none",
+        expectedMemoriesEnabled: Bool = false,
         expectedApprovalReviewer: String = "user"
     ) async throws {
         let (startController, startRecordURL) = try await makeController(options: options)
@@ -900,12 +966,22 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             in: recordedParams(for: "thread/start", at: startRecordURL),
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedReasoningSummary: expectedReasoningSummary,
+            expectedMemoriesEnabled: expectedMemoriesEnabled,
             expectedApprovalReviewer: expectedApprovalReviewer,
             label: "thread/start"
         )
         try assertProcessLaunchOmitsReasoningSummaryOverride(at: startRecordURL, label: "thread/start process")
+        try assertProcessMemoriesConfig(
+            at: startRecordURL,
+            expectedEnabled: expectedMemoriesEnabled,
+            label: "thread/start process"
+        )
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: startRecordURL, label: "thread/start process")
-        XCTAssertEqual(try recordedRequests(for: "thread/memoryMode/set", at: startRecordURL).count, 0)
+        XCTAssertEqual(
+            try recordedRequests(for: "thread/memoryMode/set", at: startRecordURL).count,
+            0,
+            "thread/start relies on its memory config without a second reconciliation request"
+        )
 
         let (resumeController, resumeRecordURL) = try await makeController(options: options)
         let existing = CodexNativeSessionController.SessionRef(
@@ -921,12 +997,77 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             in: recordedParams(for: "thread/resume", at: resumeRecordURL),
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedReasoningSummary: expectedReasoningSummary,
+            expectedMemoriesEnabled: expectedMemoriesEnabled,
             expectedApprovalReviewer: expectedApprovalReviewer,
             label: "thread/resume"
         )
         try assertProcessLaunchOmitsReasoningSummaryOverride(at: resumeRecordURL, label: "thread/resume process")
+        try assertProcessMemoriesConfig(
+            at: resumeRecordURL,
+            expectedEnabled: expectedMemoriesEnabled,
+            label: "thread/resume process"
+        )
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: resumeRecordURL, label: "thread/resume process")
-        XCTAssertEqual(try recordedRequests(for: "thread/memoryMode/set", at: resumeRecordURL).count, 0)
+        try assertMemoryModeRequest(
+            at: resumeRecordURL,
+            expectedThreadID: "existing-thread",
+            expectedEnabled: expectedMemoriesEnabled,
+            label: "thread/resume"
+        )
+        try assertRequestOrder(
+            first: "thread/memoryMode/set",
+            second: "thread/resume",
+            at: resumeRecordURL,
+            label: "resumed thread reconciliation"
+        )
+    }
+
+    private func assertResumeMemoryModeTransition(
+        initialMode: String,
+        desiredEnabled: Bool
+    ) async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            memoriesEnabledProvider: { desiredEnabled }
+        )
+        let (controller, recordURL) = try await makeController(
+            options: options,
+            initialMemoryMode: initialMode
+        )
+        addTeardownBlock {
+            await controller.shutdown()
+        }
+
+        _ = try await controller.startOrResume(
+            existing: .init(
+                conversationID: "existing-thread",
+                rolloutPath: nil,
+                model: nil,
+                reasoningEffort: nil
+            ),
+            baseInstructions: "Agent"
+        )
+        await controller.shutdown()
+
+        let expectedMode = desiredEnabled ? "enabled" : "disabled"
+        try assertMemoryModeRequest(
+            at: recordURL,
+            expectedThreadID: "existing-thread",
+            expectedEnabled: desiredEnabled,
+            label: "\(initialMode)-to-\(expectedMode)"
+        )
+        try assertRequestOrder(
+            first: "thread/memoryMode/set",
+            second: "thread/resume",
+            at: recordURL,
+            label: "\(initialMode)-to-\(expectedMode)"
+        )
+        XCTAssertEqual(
+            try recordedRequest(for: "thread/resume", at: recordURL)["memoryMode"] as? String,
+            expectedMode
+        )
     }
 
     private func makeOptions() -> CodexNativeSessionController.Options {
@@ -939,7 +1080,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
     private func makeController(
         options: CodexNativeSessionController.Options,
-        goalStatus: String? = nil
+        goalStatus: String? = nil,
+        initialMemoryMode: String = "disabled",
+        rejectMemoryModeRequests: Bool = false
     ) async throws -> (CodexNativeSessionController, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexNativeSessionControllerGoalConfigTests-\(UUID().uuidString)", isDirectory: true)
@@ -950,7 +1093,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let executableURL = try makeFakeCodexAppServer(
             in: directory,
             recordURL: recordURL,
-            goalStatus: goalStatus
+            goalStatus: goalStatus,
+            initialMemoryMode: initialMemoryMode,
+            rejectMemoryModeRequests: rejectMemoryModeRequests
         )
         let client = CodexAppServerClient()
         await client.updateConfig(
@@ -979,7 +1124,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         recordURL: URL,
         ignoreInitializeRequests: Bool = false,
         ignoreTurnStartRequests: Bool = false,
-        goalStatus: String? = nil
+        goalStatus: String? = nil,
+        initialMemoryMode: String = "disabled",
+        rejectMemoryModeRequests: Bool = false
     ) throws -> URL {
         let scriptURL = directory.appendingPathComponent("fake-codex")
         let script = """
@@ -996,12 +1143,17 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         ignore_initialize_requests = \(ignoreInitializeRequests ? "True" : "False")
         ignore_turn_start_requests = \(ignoreTurnStartRequests ? "True" : "False")
         goal_status = \(goalStatus.map { String(reflecting: $0) } ?? "None")
+        memory_mode = \(String(reflecting: initialMemoryMode))
+        reject_memory_mode_requests = \(rejectMemoryModeRequests ? "True" : "False")
 
         with open(record_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"method": "__process_args", "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\\n")
 
         def respond(request_id, result):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+
+        def reject(request_id, message):
+            print(json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": message}}), flush=True)
 
         for line in sys.stdin:
             try:
@@ -1011,15 +1163,19 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             method = request.get("method")
             has_params = "params" in request
             params = request.get("params") or {}
+            if method == "thread/memoryMode/set" and not reject_memory_mode_requests:
+                memory_mode = params.get("mode", memory_mode)
             with open(record_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"method": method, "hasParams": has_params, "params": params}) + "\\n")
+                handle.write(json.dumps({"method": method, "hasParams": has_params, "params": params, "memoryMode": memory_mode}) + "\\n")
             if "id" not in request:
                 continue
             if method == "initialize" and ignore_initialize_requests:
                 continue
             if method == "turn/start" and ignore_turn_start_requests:
                 continue
-            if method == "thread/start":
+            if method == "thread/memoryMode/set" and reject_memory_mode_requests:
+                reject(request["id"], "memory mode rejected")
+            elif method == "thread/start":
                 respond(request["id"], {"thread": {"id": "fresh-thread", "status": "idle", "turns": []}})
             elif method == "thread/resume":
                 respond(request["id"], {"thread": {"id": params.get("threadId", "resumed-thread"), "status": "idle", "turns": []}})
@@ -1119,6 +1275,16 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         return requests
     }
 
+    private func recordedRequestMethods(at recordURL: URL) throws -> [String] {
+        let data = try Data(contentsOf: recordURL)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        return try text.split(whereSeparator: { $0.isNewline }).compactMap { line in
+            let lineData = try XCTUnwrap(String(line).data(using: .utf8))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: lineData) as? [String: Any])
+            return object["method"] as? String
+        }
+    }
+
     private func recordedProcessArguments(at recordURL: URL) throws -> [String] {
         let request = try recordedRequest(for: "__process_args", at: recordURL)
         return try XCTUnwrap(request["argv"] as? [String])
@@ -1142,6 +1308,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         in params: [String: Any],
         expectedGoalSupportEnabled: Bool,
         expectedReasoningSummary: String,
+        expectedMemoriesEnabled: Bool,
         expectedApprovalReviewer: String,
         label: String
     ) throws {
@@ -1150,9 +1317,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(params["approvalsReviewer"] as? String, expectedApprovalReviewer, label)
         let config = try XCTUnwrap(params["config"] as? [String: Any], label)
         XCTAssertEqual(config["features.goals"] as? Bool, expectedGoalSupportEnabled, label)
-        XCTAssertEqual(config["features.memories"] as? Bool, false, label)
-        XCTAssertEqual(config["memories.generate_memories"] as? Bool, false, label)
-        XCTAssertEqual(config["memories.use_memories"] as? Bool, false, label)
+        XCTAssertEqual(config["features.memories"] as? Bool, expectedMemoriesEnabled, label)
+        XCTAssertEqual(config["memories.generate_memories"] as? Bool, expectedMemoriesEnabled, label)
+        XCTAssertEqual(config["memories.use_memories"] as? Bool, expectedMemoriesEnabled, label)
         XCTAssertEqual(config["features.computer_use"] as? Bool, false, label)
         XCTAssertEqual(
             config["features.code_mode.direct_only_tool_namespaces"] as? [String],
@@ -1165,6 +1332,43 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertNil(config["approval_policy"], label)
         XCTAssertNil(config["sandbox_mode"], label)
         XCTAssertNil(config["approvals_reviewer"], label)
+    }
+
+    private func assertMemoryModeRequest(
+        at recordURL: URL,
+        expectedThreadID: String,
+        expectedEnabled: Bool,
+        label: String
+    ) throws {
+        let requests = try recordedRequests(for: "thread/memoryMode/set", at: recordURL)
+        XCTAssertEqual(requests.count, 1, label)
+        let request = try XCTUnwrap(requests.first, label)
+        let params = try XCTUnwrap(request["params"] as? [String: Any], label)
+        XCTAssertEqual(params["threadId"] as? String, expectedThreadID, label)
+        XCTAssertEqual(params["mode"] as? String, expectedEnabled ? "enabled" : "disabled", label)
+    }
+
+    private func assertRequestOrder(
+        first: String,
+        second: String,
+        at recordURL: URL,
+        label: String
+    ) throws {
+        let methods = try recordedRequestMethods(at: recordURL)
+        let firstIndex = try XCTUnwrap(methods.firstIndex(of: first), label)
+        let secondIndex = try XCTUnwrap(methods.firstIndex(of: second), label)
+        XCTAssertLessThan(firstIndex, secondIndex, label)
+    }
+
+    private func assertProcessMemoriesConfig(
+        at recordURL: URL,
+        expectedEnabled: Bool,
+        label: String
+    ) throws {
+        let arguments = try recordedProcessArguments(at: recordURL)
+        for key in ["features.memories", "memories.generate_memories", "memories.use_memories"] {
+            XCTAssertTrue(arguments.contains("\(key)=\(expectedEnabled)"), "\(label): \(key)")
+        }
     }
 
     private func assertProcessLaunchOmitsReasoningSummaryOverride(at recordURL: URL, label: String) throws {

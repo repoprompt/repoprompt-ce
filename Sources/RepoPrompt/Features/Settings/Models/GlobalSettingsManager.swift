@@ -1289,6 +1289,16 @@ class GlobalSettingsStore: ObservableObject {
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
+    func codexMemoriesEnabled() -> Bool {
+        CodexMemories.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMemoriesEnabled)
+    }
+
+    func setCodexMemoriesEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexMemoriesEnabled = enabled
+        }
+    }
+
     func providerConversationCleanupAction() -> ProviderConversationCleanupAction {
         guard let raw = scalarPreferences.agentMode?.providerConversationCleanupAction,
               let action = ProviderConversationCleanupAction(rawValue: raw)

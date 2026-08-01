@@ -5,11 +5,9 @@ package enum MCPGlobalToolName {
     package static let bindContext = "bind_context"
     package static let manageWorkspaces = "manage_workspaces"
 
-    package static let orderedToolNames = [
-        appSettings,
-        bindContext,
-        manageWorkspaces,
-    ]
+    package static var orderedToolNames: [String] {
+        MCPDomainToolCatalog.globalToolNames
+    }
 }
 
 package enum MCPWindowToolName {
@@ -38,32 +36,9 @@ package enum MCPWindowToolName {
     package static let setStatus = "set_status"
     package static let waitForNextInstruction = "wait_for_next_user_instruction"
 
-    package static let orderedToolNames = [
-        manageSelection,
-        fileActions,
-        getCodeStructure,
-        getFileTree,
-        readFile,
-        search,
-        workspaceContext,
-        prompt,
-        applyEdits,
-        oracleUtils,
-        askOracle,
-        oracleSend,
-        oracleChatLog,
-        git,
-        manageWorktree,
-        contextBuilder,
-        askUser,
-        agentExplore,
-        agentRun,
-        agentManage,
-        shareThoughts,
-        setStatus,
-        waitForNextInstruction,
-        history,
-    ]
+    package static var orderedToolNames: [String] {
+        MCPDomainToolCatalog.windowToolNames
+    }
 }
 
 package enum MCPDomainToolScopeKind: String, CaseIterable, Sendable {

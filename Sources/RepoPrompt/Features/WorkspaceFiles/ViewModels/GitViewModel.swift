@@ -375,7 +375,7 @@ final class GitViewModel: ObservableObject {
 
         rootUpdateTask?.cancel()
         rootUpdateTask = Task { [weak self, statusActor, rootFolders, rootPaths, standardizedRootPaths, standardizedPathByRootPath, generation, inclusionMode] in
-            guard await TaskCancellationDelay.wait(nanoseconds: 150_000_000) else { return }
+            try? await Task.sleep(nanoseconds: 150_000_000)
             guard !Task.isCancelled else { return }
             let currentInclusionMode = await MainActor.run {
                 self?.gitDiffInclusionMode ?? inclusionMode
@@ -445,7 +445,7 @@ final class GitViewModel: ObservableObject {
         gitContextRefreshTask = Task { [weak self, refreshGitContexts] in
             while !Task.isCancelled {
                 if intervalNanoseconds > 0 {
-                    guard await TaskCancellationDelay.wait(nanoseconds: intervalNanoseconds) else { break }
+                    try? await Task.sleep(nanoseconds: intervalNanoseconds)
                 }
                 guard !Task.isCancelled else { break }
                 guard let request = self?.beginPeriodicGitContextRefresh() else {
@@ -653,7 +653,7 @@ final class GitViewModel: ObservableObject {
 
         searchDebounceTask?.cancel()
         searchDebounceTask = Task { [weak self] in
-            guard await TaskCancellationDelay.wait(nanoseconds: 500_000_000) else { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self?.isFilteringPaused = false

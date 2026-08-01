@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "recorded_at": "2026-07-26",
+  "classification": "deterministic_contract_evidence_index_not_live_latency_baseline",
+  "curated_test_ledger": "Scripts/Fixtures/test-suite-contract-ledger.tsv",
   "checkout_baseline": {
     "base_commit": "664252ebc85e",
     "workspace": "repoprompt-ce-release",
@@ -15,11 +17,25 @@
     "reason": "No live command was attempted because the M0 task explicitly prohibited launching, relaunching, or stopping the visible app; this is a constraint record, not an observed blocked execution.",
     "fallback": "Use an already-running CE debug app and make dev-smoke in a separately authorized later measurement; do not infer live wall-clock latency from unit tests."
   },
+  "m0_evidence_floors": {
+    "minimum_tracked_files": 2000,
+    "minimum_tracked_source_test_script_files": 1500,
+    "minimum_tracked_source_test_script_bytes": 40000000,
+    "minimum_controlled_queue_age_milliseconds": 250,
+    "minimum_joined_tool_lifecycle_event_count": 14,
+    "minimum_workload_matrix_count": 5,
+    "minimum_response_delivery_event_count": 7,
+    "minimum_durability_stage_count": 2,
+    "minimum_durability_lifecycle_event_count": 4,
+    "required_unique_executable_citations": 3,
+    "minimum_historical_git_command_scenarios": 5
+  },
   "guarded_stage_contracts": [
     {
       "stage": "queue",
-      "evidence_kind": "executable_contract",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
         "ordinary_connection_capacity": 1,
         "file_search_connection_capacity": 4,
@@ -30,8 +46,9 @@
     },
     {
       "stage": "main_actor",
-      "evidence_kind": "executable_contract",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
         "ordered_events": ["MCP.ToolCall.MainActorScheduled", "MCP.ToolCall.MainActorEntered", "MCP.ToolCall.MainActorExited"],
         "shared_request_identity_required": true
@@ -39,8 +56,9 @@
     },
     {
       "stage": "execution",
-      "evidence_kind": "executable_contract",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
         "joined_tool_lifecycle_event_count": 14,
         "workload_matrix_count": 5,
@@ -49,8 +67,9 @@
     },
     {
       "stage": "persistence",
-      "evidence_kind": "executable_contract",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
       "evidence": "RepoPromptTests.WorkspaceSelectionPersistenceTests/testDiskWriterFlushAndAtomicWriteTelemetryCarryDurabilityAttributionWithoutPaths",
+      "source_file": "Tests/RepoPromptTests/WorkspaceContext/WorkspaceSelectionPersistenceTests.swift",
       "observations": {
         "stage_names": ["EditFlow.WorkspaceDurability.FlushWait", "EditFlow.WorkspaceDurability.AtomicWrite"],
         "lifecycle_events": ["WorkspaceDurability.FlushBegan", "WorkspaceDurability.FlushEnded", "WorkspaceDurability.WriteBegan", "WorkspaceDurability.WriteEnded"],
@@ -59,8 +78,9 @@
     },
     {
       "stage": "response",
-      "evidence_kind": "executable_contract",
+      "evidence_kind": "curated_ledger_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
         "ordered_event_count": 7,
         "ordered_events": ["frame_accepted", "sdk_decode_completed", "handler_result_ready", "sdk_encode_completed", "transport_write_completed", "frame_committed", "stdout_write_completed"],
@@ -86,5 +106,5 @@
       "cache_hit": false
     }
   },
-  "interpretation": "This is an M0 structural contract and deterministic-work record, not a live latency baseline. The checkout counts describe only this checkout. Executable guards freeze the five EditFlowPerf boundaries; live latency remains unobserved and must be measured before M2 no-regression decisions."
+  "interpretation": "This is an M0 deterministic contract-evidence index, not a live latency baseline. The checkout counts describe only this checkout. Evidence floors make the referenced queue, MainActor, execution, durability, response, and historical work-count observations substantive; ledger and source-file provenance keep every executable citation resolvable. The artifact does not prove those separate tests passed in the current run, and live latency remains unobserved until measured before M2 no-regression decisions."
 }

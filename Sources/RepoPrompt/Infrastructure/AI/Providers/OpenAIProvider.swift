@@ -171,6 +171,44 @@ class OpenAIProvider: AIProvider {
         return parameters
     }
 
+    static func isTransportActivityChunk(
+        hasChoice: Bool,
+        hasDelta: Bool,
+        content: String?,
+        reasoning: String?,
+        role: String?,
+        hasToolCalls: Bool,
+        hasFunctionCall: Bool,
+        refusal: String?,
+        hasFinishReason: Bool,
+        hasUsage: Bool
+    ) -> Bool {
+        let hasSemanticDelta = !(content?.isEmpty ?? true)
+            || !(reasoning?.isEmpty ?? true)
+            || role != nil
+            || hasToolCalls
+            || hasFunctionCall
+            || !(refusal?.isEmpty ?? true)
+        return hasChoice && hasDelta && !hasSemanticDelta && !hasFinishReason && !hasUsage
+    }
+
+    static func isTransportActivityChunk(_ result: ChatCompletionChunkObject) -> Bool {
+        let choice = result.choices?.first
+        let delta = choice?.delta
+        return isTransportActivityChunk(
+            hasChoice: choice != nil,
+            hasDelta: delta != nil,
+            content: delta?.content,
+            reasoning: delta?.reasoningContent,
+            role: delta?.role,
+            hasToolCalls: delta?.toolCalls != nil,
+            hasFunctionCall: delta?.functionCall != nil,
+            refusal: delta?.refusal,
+            hasFinishReason: choice?.finishReason != nil,
+            hasUsage: result.usage != nil
+        )
+    }
+
     func streamMessage(
         _ aiMessage: AIMessage,
         model: AIModel,
@@ -268,6 +306,13 @@ class OpenAIProvider: AIProvider {
                     for try await result in stream {
                         // Check cancellation to exit promptly when consumer stops reading
                         if Task.isCancelled { break }
+
+                        if Self.isTransportActivityChunk(result) {
+                            continuation.yield(
+                                AIStreamResult(type: AIStreamResult.transportActivityType, text: nil)
+                            )
+                            continue
+                        }
 
                         let content = result.choices?.first?.delta?.content ?? ""
                         let reasoning = result.choices?.first?.delta?.reasoningContent ?? ""

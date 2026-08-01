@@ -263,7 +263,8 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
 
         await gate.release()
@@ -426,7 +427,8 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
         controller.onEnsureEventsStreamReady = { [weak session, weak controller] in
             guard let session, let controller,

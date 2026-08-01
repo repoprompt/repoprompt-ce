@@ -70,12 +70,18 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             named: "submodule-source",
             files: ["Sources/Submodule.swift": SwiftFixtureSource.emptyStruct("Submodule")]
         )
+        let submodule = canonical.appendingPathComponent("Vendor/Sub", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: submodule.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(at: submoduleSource, to: submodule)
+        let submoduleOID = try fixture.head(at: submoduleSource)
         _ = try fixture.runGit(
-            ["-c", "protocol.file.allow=always", "submodule", "add", submoduleSource.path, "Vendor/Sub"],
+            ["update-index", "--add", "--cacheinfo", "160000,\(submoduleOID),Vendor/Sub"],
             at: canonical
         )
         try fixture.commit("Add submodule", at: canonical)
-        let submodule = canonical.appendingPathComponent("Vendor/Sub", isDirectory: true)
 
         let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
         let canonicalCapability = try await capability(

@@ -136,6 +136,9 @@ package struct MCPDomainToolRegistrationHandle: Hashable, Sendable {
     }
 }
 
+/// A resolved value represents admitted work. Registry removal prevents future
+/// resolution but does not cancel or await an operation already captured here;
+/// connection/service teardown remains the cancellation authority for admitted work.
 package struct MCPDomainResolvedTool: Sendable {
     package let handle: MCPDomainToolRegistrationHandle
     package let scope: MCPDomainToolRegistrationScope

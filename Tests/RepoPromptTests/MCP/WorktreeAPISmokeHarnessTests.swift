@@ -900,13 +900,25 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         #endif
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        await window.workspaceManager.awaitInitialized()
 
         let workspace = window.workspaceManager.createWorkspace(
             name: "Worktree API Smoke \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
             ephemeral: true
         )
-        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "worktreeAPISmokeHarness")
+        let switchResult = await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "worktreeAPISmokeHarness"
+        )
+        guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspace.id else {
+            throw NSError(
+                domain: "WorktreeAPISmokeHarnessTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: switchResult.message ?? "Project workspace did not become active"]
+            )
+        }
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)

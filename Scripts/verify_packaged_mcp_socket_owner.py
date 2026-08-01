@@ -43,6 +43,10 @@ class OwnershipError(RuntimeError):
     pass
 
 
+class SocketSnapshotChanged(OwnershipError):
+    """A normal concurrent socket-directory transition that callers may retry."""
+
+
 class ProcFDInfo(ctypes.Structure):
     _fields_ = [("proc_fd", ctypes.c_int32), ("proc_fdtype", ctypes.c_uint32)]
 
@@ -273,9 +277,9 @@ def verify_socket_snapshot(
 ) -> None:
     actual_directory, actual_sockets = capture_socket_snapshot(directory, allow_missing=expected_directory is None)
     if actual_directory != expected_directory:
-        raise OwnershipError(f"release socket directory changed during ownership inspection: {directory}")
+        raise SocketSnapshotChanged(f"release socket directory changed during ownership inspection: {directory}")
     if actual_sockets != expected_sockets:
-        raise OwnershipError(f"release socket paths changed during ownership inspection: {directory}")
+        raise SocketSnapshotChanged(f"release socket paths changed during ownership inspection: {directory}")
 
 
 def ownership_lock_path(socket_path: Path) -> Path:
@@ -567,7 +571,15 @@ def find_owner(directory: Path, expected_pid: int, expected_executable: Path) ->
     validate_expected_process(expected_pid, expected_executable)
     directory_identity, socket_identities = capture_socket_snapshot(directory, allow_missing=True)
     claims = live_release_claims(directory)
-    verify_socket_snapshot(directory, directory_identity, socket_identities)
+    try:
+        verify_socket_snapshot(directory, directory_identity, socket_identities)
+    except SocketSnapshotChanged:
+        # The expected app creates the owner-only directory, lock, and socket while the
+        # smoke polls. A transition during this one inspection is not proof of a foreign
+        # owner; return the documented retry status and require the next pass to prove
+        # the complete process, listener, path, lock, and bound-identity chain.
+        validate_expected_process(expected_pid, expected_executable)
+        return None
     validate_expected_process(expected_pid, expected_executable)
 
     for name, pids in sorted(claims.items()):
@@ -594,7 +606,11 @@ def find_owner(directory: Path, expected_pid: int, expected_executable: Path) ->
         )
     owned_path = directory / owned[0]
     validate_bound_identity_evidence(owned_path, expected_pid, socket_identities[owned[0]])
-    verify_socket_snapshot(directory, directory_identity, socket_identities)
+    try:
+        verify_socket_snapshot(directory, directory_identity, socket_identities)
+    except SocketSnapshotChanged:
+        validate_expected_process(expected_pid, expected_executable)
+        return None
     validate_expected_process(expected_pid, expected_executable)
     return owned_path
 

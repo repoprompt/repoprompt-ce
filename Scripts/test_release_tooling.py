@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -17,6 +18,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+from unittest import mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -1067,6 +1069,14 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('[helper, "-e", "windows"]', source)
         self.assertIn('HELPER_REQUEST_TIMEOUT="${REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT:-30}"', source)
         self.assertIn('timeout=int(helper_timeout)', source)
+        self.assertIn('"MCP_SOCKET_DEBUG": "1"', source)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR', source)
+        self.assertIn('sample "$APP_PID" 5 1', source)
+        cleanup = source.split("cleanup() {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(cleanup.index("set +e"), cleanup.index("sample "))
+        self.assertLess(cleanup.index("set +e"), cleanup.index('kill -TERM "$APP_PID"'))
+        self.assertIn('helper-socket-debug.log', source)
+        self.assertIn('except subprocess.TimeoutExpired as error:', source)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT must be a positive integer', source)
         self.assertIn('log_phase() {', source)
         self.assertIn('windows-attempt-${attempt}.out', source)
@@ -1091,6 +1101,27 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('rm -rf "$TEMP_ROOT"', source)
         self.assertNotIn("pkill", source)
         self.assertNotIn("open -n", source)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
+    def test_packaged_socket_owner_find_treats_startup_snapshot_transition_as_retryable(self) -> None:
+        helper_path = SCRIPT_DIR / "verify_packaged_mcp_socket_owner.py"
+        spec = importlib.util.spec_from_file_location("verify_packaged_mcp_socket_owner_test", helper_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+
+        missing_snapshot = (None, {})
+        created_snapshot = ((101, 202), {})
+        with (
+            mock.patch.object(helper, "validate_expected_process") as validate_process,
+            mock.patch.object(helper, "capture_socket_snapshot", side_effect=[missing_snapshot, created_snapshot]),
+            mock.patch.object(helper, "live_release_claims", return_value={}),
+        ):
+            result = helper.find_owner(Path("/tmp/repoprompt-ce-mcp-test"), 123, Path("/tmp/RepoPrompt"))
+
+        self.assertIsNone(result)
+        self.assertEqual(validate_process.call_count, 2)
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_rejects_live_preflight_and_accepts_exact_owner(self) -> None:
@@ -2521,6 +2552,7 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
 
         self.assertIn("name: Publish Tip", tip_workflow)
         self.assertIn("group: main-tip-channel", tip_workflow)
+        self.assertIn("cancel-in-progress: true", tip_workflow)
         self.assertIn("should-publish", tip_workflow)
         self.assertIn("stable-appcast.xml", tip_workflow)
         self.assertIn('build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"', tip_workflow)
@@ -2529,6 +2561,9 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', tip_workflow)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics', tip_workflow)
+        self.assertIn("Upload Tip smoke diagnostics", tip_workflow)
+        self.assertIn("RepoPrompt-CE-tip-smoke-diagnostics", tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', tip_workflow)
         self.assertIn(
             'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',

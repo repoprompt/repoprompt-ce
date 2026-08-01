@@ -160,15 +160,23 @@ private final class MCPGitRequestContext {
     }
 }
 
-private actor GitArtifactCommitResultBox {
-    private var aliases: [String] = []
+private struct GitArtifactCommitProjection {
+    let aliases: [String]
+    let selectionRevision: UInt64
+}
 
-    func store(_ aliases: [String]) {
-        self.aliases = aliases
+private actor GitArtifactCommitResultBox {
+    private var result: GitArtifactCommitProjection?
+
+    func store(aliases: [String], selectionRevision: UInt64) {
+        result = GitArtifactCommitProjection(
+            aliases: aliases,
+            selectionRevision: selectionRevision
+        )
     }
 
-    func value() -> [String] {
-        aliases
+    func value() -> GitArtifactCommitProjection? {
+        result
     }
 }
 
@@ -187,6 +195,11 @@ private struct MCPGitArtifactReadinessPreparation {
     let warningsBySnapshotDir: [String: String]
 }
 
+private struct MCPGitStagedAdvertisement {
+    let artifacts: [GitDiffPublishedArtifact]
+    let expectedSelectionRevision: UInt64?
+}
+
 private struct MCPGitDiffRepoOutcome {
     typealias Reply = ToolResultDTOs.GitToolReplyDTO
 
@@ -197,7 +210,7 @@ private struct MCPGitDiffRepoOutcome {
 @MainActor
 final class MCPGitToolProvider {
     private let dependencies: MCPWindowToolDependencies
-    private var stagedAdvertisementsByInvocation: [UUID: [GitDiffPublishedArtifact]] = [:]
+    private var stagedAdvertisementsByInvocation: [UUID: MCPGitStagedAdvertisement] = [:]
 
     init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
         self.dependencies = dependencies
@@ -335,6 +348,7 @@ final class MCPGitToolProvider {
 
     func executeDomainRead(
         context: DomainReadInvocationContext,
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         args: [String: Value],
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
@@ -344,6 +358,7 @@ final class MCPGitToolProvider {
             let reply = try await executeGitTool(
                 args: args,
                 connectionID: connectionID,
+                appContext: appContext,
                 advertisementInvocationID: invocationID,
                 sideEffects: sideEffects
             )
@@ -352,7 +367,7 @@ final class MCPGitToolProvider {
                 toolName: MCPWindowToolName.git
             )
             try Task.checkCancellation()
-            if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
+            if let stagedAdvertisement = await takeStagedAdvertisement(invocationID: invocationID) {
                 try await sideEffects.submitAndWait(
                     effectClass: .gitArtifacts,
                     fingerprint: "git_artifact_advertisement"
@@ -361,13 +376,16 @@ final class MCPGitToolProvider {
                     do {
                         _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
                             MCPWindowToolName.git,
-                            advertised
+                            stagedAdvertisement.artifacts,
+                            stagedAdvertisement.expectedSelectionRevision,
+                            appContext
                         )
                     } catch let error as CancellationError {
                         throw error
                     } catch {
                         await dependencies.invalidateAdvertisedGitArtifactsForCurrentTab(
-                            MCPWindowToolName.git
+                            MCPWindowToolName.git,
+                            appContext
                         )
                         dependencies.logDebug(
                             "Git artifacts were published, but advertised aliases were not authorized: \(error.localizedDescription)"
@@ -384,7 +402,7 @@ final class MCPGitToolProvider {
 
     private func takeStagedAdvertisement(
         invocationID: UUID
-    ) -> [GitDiffPublishedArtifact]? {
+    ) -> MCPGitStagedAdvertisement? {
         stagedAdvertisementsByInvocation.removeValue(forKey: invocationID)
     }
 
@@ -395,6 +413,7 @@ final class MCPGitToolProvider {
     private func executeGitTool(
         args: [String: Value],
         connectionID: UUID?,
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         advertisementInvocationID: UUID,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.GitToolReplyDTO {
@@ -403,6 +422,7 @@ final class MCPGitToolProvider {
             try await executeGitToolBody(
                 args: args,
                 connectionID: connectionID,
+                appContext: appContext,
                 advertisementInvocationID: advertisementInvocationID,
                 sideEffects: sideEffects
             )
@@ -412,6 +432,7 @@ final class MCPGitToolProvider {
     private func executeGitToolBody(
         args: [String: Value],
         connectionID: UUID?,
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         advertisementInvocationID: UUID,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.GitToolReplyDTO {
@@ -429,7 +450,15 @@ final class MCPGitToolProvider {
         guard let workspaceManager = dependencies.workspaceManager else {
             throw MCPError.invalidParams("Workspace manager unavailable for git tool.")
         }
-        guard let workspace = workspaceManager.activeWorkspace else {
+        // Domain reads execute against the workspace captured at resolve time; only the legacy
+        // non-domain path may fall back to the window's active workspace.
+        let capturedWorkspaceID = appContext?.resolvedTabContext.snapshot.workspaceID
+        let routedWorkspace: WorkspaceModel? = if let capturedWorkspaceID {
+            workspaceManager.workspaces.first { $0.id == capturedWorkspaceID }
+        } else {
+            workspaceManager.activeWorkspace
+        }
+        guard let workspace = routedWorkspace else {
             throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
         }
         let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
@@ -438,7 +467,11 @@ final class MCPGitToolProvider {
 
         // Generic callers retain first-root compatibility. Exact Agent Context Builder Discover
         // runs instead use the immutable selected-repository target carried by their tab snapshot.
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata: MCPServerViewModel.RequestMetadata = if let appContext {
+            appContext.metadata
+        } else {
+            await dependencies.captureRequestMetadata()
+        }
         let hasExplicitPathspecs = !(args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             || (args["paths"]?.arrayValue?.contains { !($0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) } ?? false)
         let preLookupSelectedPublicationContext: MCPServerViewModel.ResolvedTabContextSnapshot? = if op == .diff,
@@ -446,7 +479,7 @@ final class MCPGitToolProvider {
                                                                                                      !hasExplicitPathspecs,
                                                                                                      (args["scope"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all") == "selected"
         {
-            try dependencies.resolveTabContextSnapshot(
+            try appContext?.resolvedTabContext ?? dependencies.resolveTabContextSnapshot(
                 metadata,
                 MCPWindowToolName.git,
                 .allowLegacyImplicitRouting
@@ -454,7 +487,11 @@ final class MCPGitToolProvider {
         } else {
             nil
         }
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        let lookupContext: WorkspaceLookupContext = if let appContext {
+            appContext.lookupContext
+        } else {
+            await dependencies.resolveFileToolLookupContext(metadata)
+        }
         let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
         let allRepos = await requestContext.allRepos()
@@ -596,7 +633,10 @@ final class MCPGitToolProvider {
             publishedOutcomes: [MCPContextBuilderGitPublishedOutcome] = []
         ) async throws -> MCPGitArtifactReadinessPreparation {
             guard !publishedSets.isEmpty else {
-                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                    artifacts: [],
+                    expectedSelectionRevision: nil
+                )
                 return MCPGitArtifactReadinessPreparation(
                     autoSelectedAliases: [],
                     warningsBySnapshotDir: [:]
@@ -616,7 +656,10 @@ final class MCPGitToolProvider {
                         "Git artifact readiness: snapshot was published, but the exact Git-data root could not be loaded (\(error.localizedDescription)); no primary artifact was auto-selected."
                     )
                 }
-                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                    artifacts: [],
+                    expectedSelectionRevision: nil
+                )
                 return MCPGitArtifactReadinessPreparation(
                     autoSelectedAliases: [],
                     warningsBySnapshotDir: warningParts.mapValues { $0.joined(separator: "\n") }
@@ -633,7 +676,10 @@ final class MCPGitToolProvider {
                         store: dependencies.promptVM.workspaceFileContextStore
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
-                    stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                    stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                        artifacts: [],
+                        expectedSelectionRevision: nil
+                    )
                     throw MCPError.invalidParams(error.localizedDescription)
                 }
             }
@@ -668,6 +714,7 @@ final class MCPGitToolProvider {
             }
 
             var autoSelectedAliases: [String] = []
+            var expectedAdvertisementSelectionRevision: UInt64?
             if !readyCandidates.isEmpty {
                 do {
                     let resultBox = GitArtifactCommitResultBox()
@@ -681,11 +728,18 @@ final class MCPGitToolProvider {
                         let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
                             MCPWindowToolName.git,
                             candidatesToCommit,
-                            sourceSelection
+                            sourceSelection,
+                            appContext
                         )
-                        await resultBox.store(commit.autoSelectedAliases)
+                        await resultBox.store(
+                            aliases: commit.autoSelectedAliases,
+                            selectionRevision: commit.selectionRevision
+                        )
                     }
-                    autoSelectedAliases = await resultBox.value()
+                    if let commit = await resultBox.value() {
+                        autoSelectedAliases = commit.aliases
+                        expectedAdvertisementSelectionRevision = commit.selectionRevision
+                    }
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -699,7 +753,10 @@ final class MCPGitToolProvider {
             }
 
             try Task.checkCancellation()
-            stagedAdvertisementsByInvocation[advertisementInvocationID] = advertisedCandidates
+            stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                artifacts: advertisedCandidates,
+                expectedSelectionRevision: expectedAdvertisementSelectionRevision
+            )
 
             return MCPGitArtifactReadinessPreparation(
                 autoSelectedAliases: autoSelectedAliases,
@@ -1083,6 +1140,7 @@ final class MCPGitToolProvider {
                 let allSelectedAbsolutePaths: [String]
                 if usesSelectedScope {
                     let resolvedContext = try preLookupSelectedPublicationContext
+                        ?? appContext?.resolvedTabContext
                         ?? dependencies.resolveTabContextSnapshot(
                             metadata,
                             MCPWindowToolName.git,

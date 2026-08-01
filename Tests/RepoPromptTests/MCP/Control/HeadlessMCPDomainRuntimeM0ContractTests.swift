@@ -183,7 +183,11 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             })
         )
 
-        let resolvedProfiles = try stringArrays(policy, key: "resolved_tools_list")
+        XCTAssertEqual(
+            try string(policy, key: "resolved_tool_policy_projection_classification"),
+            "production_policy_projection_not_runtime_registry_evidence"
+        )
+        let resolvedProfiles = try stringArrays(policy, key: "resolved_tool_policy_projection")
         XCTAssertEqual(resolvedProfiles["direct"], resolvedAdvertisedTools(allTools: allTools))
         XCTAssertEqual(
             resolvedProfiles["discovery"],
@@ -248,6 +252,22 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         )
         XCTAssertEqual(sourceDependencies, expectedDependencies)
         XCTAssertEqual(expectedDependencies.count, try integer(dependencies, key: "stored_dependency_count"))
+    }
+
+    func testEveryExecutableEvidenceCitationResolvesInCuratedTestLedger() throws {
+        let artifactPaths = [
+            "Scripts/Fixtures/headless_mcp_domain_runtime_m0_contract.json",
+            "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
+        ]
+        var citations = Set<String>()
+        for path in artifactPaths {
+            try citations.formUnion(executableTestCitations(in: loadJSONObject(path)))
+        }
+
+        XCTAssertEqual(citations.count, 6, "Update the reviewed M0 citation inventory when evidence is added or removed")
+        let ledgerEntries = try curatedTestLedgerEntries()
+        let missing = citations.filter { ledgerEntries[$0] == nil }.sorted()
+        XCTAssertTrue(missing.isEmpty, "M0 executable citations missing from the curated test ledger: \(missing)")
     }
 
     func testSDKCredentialAndPrivateChildContractsAreFailClosedEvidence() throws {
@@ -515,6 +535,35 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         )
         XCTAssertTrue(promptReadBackend.contains("appContext.resolvedTabContext"))
         XCTAssertTrue(promptReadBackend.contains("simplePromptReply(tabContext.promptText"))
+        let gitReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
+        )
+        // Git domain reads execute against resolve-time captured authority: metadata, lookup
+        // context, routed workspace, and tab context all come from the invocation snapshot, and
+        // the artifact side effects advertise against the same captured context instead of
+        // re-resolving the current request.
+        XCTAssertTrue(gitReadBackend.contains("appContext.metadata"))
+        XCTAssertTrue(gitReadBackend.contains("appContext.lookupContext"))
+        XCTAssertTrue(gitReadBackend.contains("appContext?.resolvedTabContext"))
+        XCTAssertTrue(gitReadBackend.contains("capturedWorkspaceID"))
+        let tabContextExtension = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift"
+        )
+        XCTAssertTrue(tabContextExtension.contains("capturedContext: DomainReadAppExecutionContext? = nil"))
+        XCTAssertTrue(tabContextExtension.contains("capturedContext.resolvedTabContext.snapshot"))
+        // The primary artifact commit is the third advertisement-adjacent seam: it must accept
+        // the captured context and fail closed when the captured connection identity is missing.
+        XCTAssertTrue(tabContextExtension.contains("Connection identity is unavailable for Git artifact publication"))
+        let windowToolDependencies = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift"
+        )
+        XCTAssertEqual(
+            windowToolDependencies.components(
+                separatedBy: "_ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?"
+            ).count - 1,
+            3,
+            "Commit, replace, and invalidate git artifact seams must all carry the captured domain read context."
+        )
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
             .union(m3NonMainActorHops)
@@ -563,17 +612,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
 
         let baseline = try loadJSONObject("docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json")
-        let constraints = try dictionary(baseline, key: "capture_constraints")
-        XCTAssertEqual(try string(constraints, key: "live_mcp_round_trip_status"), "not_observed_task_prohibited")
-        XCTAssertTrue(try string(constraints, key: "fallback").contains("already-running CE debug app"))
-        let stages = try dictionaries(baseline, key: "guarded_stage_contracts")
-        XCTAssertEqual(Set(stages.compactMap { $0["stage"] as? String }), ["queue", "main_actor", "execution", "persistence", "response"])
-        XCTAssertTrue(stages.allSatisfy {
-            $0["evidence"] != nil && $0["observations"] != nil && ($0["evidence_kind"] as? String) == "executable_contract"
-        })
-        let checkout = try dictionary(baseline, key: "checkout_baseline")
-        XCTAssertEqual(try string(checkout, key: "classification"), "current_checkout_size_snapshot_not_performance_sample")
-        XCTAssertGreaterThan(try integer(checkout, key: "tracked_files"), 2000)
+        try assertSubstantiveEditFlowPerfEvidence(in: baseline)
 
         let performance = try dictionary(manifest, key: "performance_baseline")
         XCTAssertEqual(try string(performance, key: "live_sample_status"), "not_observed_task_prohibited")
@@ -642,6 +681,173 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
 
     private func integer(_ object: [String: Any], key: String) throws -> Int {
         try XCTUnwrap((object[key] as? NSNumber)?.intValue, key)
+    }
+
+    private func executableTestCitations(in value: Any) -> Set<String> {
+        if let dictionary = value as? [String: Any] {
+            return dictionary.values.reduce(into: Set<String>()) { result, child in
+                result.formUnion(executableTestCitations(in: child))
+            }
+        }
+        if let array = value as? [Any] {
+            return array.reduce(into: Set<String>()) { result, child in
+                result.formUnion(executableTestCitations(in: child))
+            }
+        }
+        guard let string = value as? String,
+              string.hasPrefix("RepoPromptTests.") || string.hasPrefix("RepoPromptClaudeCompatibleProviderTests.")
+        else { return [] }
+        return [string]
+    }
+
+    private func curatedTestLedgerEntries() throws -> [String: String] {
+        let ledger = try source("Scripts/Fixtures/test-suite-contract-ledger.tsv")
+        let lines = ledger.split(separator: "\n", omittingEmptySubsequences: true)
+        let header = try XCTUnwrap(lines.first, "test ledger header")
+            .split(separator: "\t", omittingEmptySubsequences: false)
+            .map(String.init)
+        let methodIDIndex = try XCTUnwrap(header.firstIndex(of: "method_id"))
+        let fileIndex = try XCTUnwrap(header.firstIndex(of: "file"))
+        var entries: [String: String] = [:]
+        entries.reserveCapacity(lines.count - 1)
+
+        for line in lines.dropFirst() {
+            let columns = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard columns.indices.contains(methodIDIndex), columns.indices.contains(fileIndex) else {
+                XCTFail("Malformed curated test ledger row: \(line.prefix(120))")
+                continue
+            }
+            let ledgerID = columns[methodIDIndex]
+            guard let separator = ledgerID.firstIndex(of: "/") else {
+                XCTFail("Malformed curated test ledger method_id: \(ledgerID)")
+                continue
+            }
+            let citation = String(ledgerID[ledgerID.index(after: separator)...])
+            XCTAssertNil(entries.updateValue(columns[fileIndex], forKey: citation), "Duplicate curated test ledger ID: \(citation)")
+        }
+        return entries
+    }
+
+    private func assertSubstantiveEditFlowPerfEvidence(in baseline: [String: Any]) throws {
+        XCTAssertEqual(
+            try string(baseline, key: "classification"),
+            "deterministic_contract_evidence_index_not_live_latency_baseline"
+        )
+        XCTAssertEqual(
+            try string(baseline, key: "curated_test_ledger"),
+            "Scripts/Fixtures/test-suite-contract-ledger.tsv"
+        )
+
+        let constraints = try dictionary(baseline, key: "capture_constraints")
+        XCTAssertEqual(try string(constraints, key: "live_mcp_round_trip_status"), "not_observed_task_prohibited")
+        XCTAssertTrue(try string(constraints, key: "fallback").contains("already-running CE debug app"))
+
+        let evidenceFloorsField = "m0_evidence_floors"
+        let floors = try dictionary(baseline, key: evidenceFloorsField)
+        let checkout = try dictionary(baseline, key: "checkout_baseline")
+        XCTAssertEqual(try string(checkout, key: "classification"), "current_checkout_size_snapshot_not_performance_sample")
+        XCTAssertGreaterThanOrEqual(try integer(checkout, key: "tracked_files"), try integer(floors, key: "minimum_tracked_files"))
+        XCTAssertGreaterThanOrEqual(
+            try integer(checkout, key: "tracked_source_test_script_files"),
+            try integer(floors, key: "minimum_tracked_source_test_script_files")
+        )
+        XCTAssertGreaterThanOrEqual(
+            try integer(checkout, key: "tracked_source_test_script_bytes"),
+            try integer(floors, key: "minimum_tracked_source_test_script_bytes")
+        )
+        XCTAssertTrue(try isLowercaseHexIdentifier(string(checkout, key: "base_commit"), length: 7 ... 40))
+
+        let ledgerEntries = try curatedTestLedgerEntries()
+        let stages = try dictionaries(baseline, key: "guarded_stage_contracts")
+        let expectedStages: Set = ["queue", "main_actor", "execution", "persistence", "response"]
+        XCTAssertEqual(stages.count, expectedStages.count)
+        XCTAssertEqual(Set(stages.compactMap { $0["stage"] as? String }), expectedStages)
+        var evidenceCitations = Set<String>()
+
+        for stageRecord in stages {
+            let stage = try string(stageRecord, key: "stage")
+            XCTAssertEqual(
+                try string(stageRecord, key: "evidence_kind"),
+                "curated_ledger_executable_contract_reference",
+                stage
+            )
+            let citation = try string(stageRecord, key: "evidence")
+            let sourceFile = try string(stageRecord, key: "source_file")
+            XCTAssertEqual(ledgerEntries[citation], sourceFile, "\(stage) evidence provenance")
+            evidenceCitations.insert(citation)
+            let observations = try dictionary(stageRecord, key: "observations")
+
+            switch stage {
+            case "queue":
+                let ordinaryCapacity = try integer(observations, key: "ordinary_connection_capacity")
+                XCTAssertGreaterThan(ordinaryCapacity, 0)
+                XCTAssertGreaterThanOrEqual(try integer(observations, key: "file_search_connection_capacity"), ordinaryCapacity)
+                XCTAssertGreaterThanOrEqual(try integer(observations, key: "store_search_capacity"), ordinaryCapacity)
+                XCTAssertGreaterThanOrEqual(
+                    try integer(observations, key: "controlled_oldest_waiter_age_milliseconds"),
+                    try integer(floors, key: "minimum_controlled_queue_age_milliseconds")
+                )
+                XCTAssertGreaterThan(try integer(observations, key: "cancelled_waiter_count"), 0)
+            case "main_actor":
+                XCTAssertEqual(
+                    try strings(observations, key: "ordered_events"),
+                    ["MCP.ToolCall.MainActorScheduled", "MCP.ToolCall.MainActorEntered", "MCP.ToolCall.MainActorExited"]
+                )
+                XCTAssertEqual(observations["shared_request_identity_required"] as? Bool, true)
+            case "execution":
+                XCTAssertGreaterThanOrEqual(
+                    try integer(observations, key: "joined_tool_lifecycle_event_count"),
+                    try integer(floors, key: "minimum_joined_tool_lifecycle_event_count")
+                )
+                let matrices = try strings(observations, key: "workload_matrices")
+                XCTAssertEqual(matrices.count, try integer(observations, key: "workload_matrix_count"))
+                XCTAssertGreaterThanOrEqual(matrices.count, try integer(floors, key: "minimum_workload_matrix_count"))
+                XCTAssertEqual(Set(matrices).count, matrices.count)
+            case "persistence":
+                let stageNames = try strings(observations, key: "stage_names")
+                let lifecycleEvents = try strings(observations, key: "lifecycle_events")
+                XCTAssertGreaterThanOrEqual(stageNames.count, try integer(floors, key: "minimum_durability_stage_count"))
+                XCTAssertGreaterThanOrEqual(
+                    lifecycleEvents.count,
+                    try integer(floors, key: "minimum_durability_lifecycle_event_count")
+                )
+                XCTAssertEqual(observations["path_data_in_dimensions"] as? Bool, false)
+            case "response":
+                let orderedEvents = try strings(observations, key: "ordered_events")
+                XCTAssertEqual(orderedEvents.count, try integer(observations, key: "ordered_event_count"))
+                XCTAssertGreaterThanOrEqual(
+                    orderedEvents.count,
+                    try integer(floors, key: "minimum_response_delivery_event_count")
+                )
+                XCTAssertEqual(orderedEvents.first, "frame_accepted")
+                XCTAssertEqual(orderedEvents.last, "stdout_write_completed")
+                XCTAssertEqual(observations["shared_request_identity_required"] as? Bool, true)
+            default:
+                XCTFail("Unexpected EditFlowPerf stage: \(stage)")
+            }
+        }
+        XCTAssertEqual(evidenceCitations.count, try integer(floors, key: "required_unique_executable_citations"))
+
+        let historical = try dictionary(baseline, key: "historical_work_count_evidence")
+        XCTAssertEqual(try string(historical, key: "status"), "observed_no_visible_app")
+        XCTAssertTrue(try isLowercaseHexIdentifier(string(historical, key: "git_blob"), length: 40 ... 40))
+        XCTAssertTrue(try isLowercaseHexIdentifier(string(historical, key: "source_commit"), length: 7 ... 40))
+        let gitCommands = try dictionary(historical, key: "git_commands")
+        XCTAssertGreaterThanOrEqual(
+            gitCommands.count,
+            try integer(floors, key: "minimum_historical_git_command_scenarios")
+        )
+        XCTAssertTrue(gitCommands.values.allSatisfy { ($0 as? NSNumber)?.intValue ?? 0 > 0 })
+        let readFile = try dictionary(historical, key: "read_file_fixture")
+        XCTAssertGreaterThan(try integer(readFile, key: "full_disk_bytes"), try integer(readFile, key: "returned_bytes"))
+        XCTAssertGreaterThan(try integer(readFile, key: "returned_bytes"), 0)
+        XCTAssertGreaterThan(try integer(readFile, key: "returned_lines"), 0)
+        XCTAssertEqual(readFile["cache_hit"] as? Bool, false)
+    }
+
+    private func isLowercaseHexIdentifier(_ value: String, length: ClosedRange<Int>) -> Bool {
+        let allowed = CharacterSet(charactersIn: "0123456789abcdef")
+        return length.contains(value.count) && value.unicodeScalars.allSatisfy(allowed.contains)
     }
 
     private func schemaProperties(for tool: RepoPromptApp.Tool) throws -> [String: Value] {

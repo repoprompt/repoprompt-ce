@@ -35,22 +35,25 @@ struct WorkspaceFileEditHost: FileEditHost {
     }
 
     func writeText(path: String, content: String, overwrite: Bool) async throws {
-        if overwrite,
-           let resolved = await mutationService.exactExistingFile(path, rootScope: lookupRootScope)
-        {
-            try await mutationService.overwrite(
-                file: resolved,
-                content: content,
-                mutationRootMappings: mutationRootMappings
-            )
-            return
+        if overwrite {
+            let resolved = await mutationService.exactExistingFile(path, rootScope: lookupRootScope)
+            try Task.checkCancellation()
+            if let resolved {
+                try await mutationService.overwrite(
+                    file: resolved,
+                    content: content,
+                    mutationRootMappings: mutationRootMappings
+                )
+                return
+            }
         }
 
+        try Task.checkCancellation()
         let writeResult = try await mutationService.createFileWithPostcondition(
             userPath: path,
             content: content,
             rootScope: lookupRootScope,
-            selectedFileFullPaths: selectedFileFullPaths(),
+            selectedFileFullPaths: (path as NSString).expandingTildeInPath.hasPrefix("/") ? [] : selectedFileFullPaths(),
             pathResolutionPolicy: createPathResolutionPolicy,
             mutationRootMappings: mutationRootMappings
         )

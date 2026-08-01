@@ -146,14 +146,18 @@ struct MCPWindowToolDependencies {
     typealias CommitPrimaryGitDiffArtifactsToCurrentTab = @MainActor @Sendable (
         _ toolName: String,
         _ candidates: [GitDiffPublishedArtifact],
-        _ sourceSelection: StoredSelection?
+        _ sourceSelection: StoredSelection?,
+        _ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?
     ) async throws -> MCPServerViewModel.PrimaryGitArtifactCommitResult
     typealias ReplaceAdvertisedGitArtifactsForCurrentTab = @MainActor @Sendable (
         _ toolName: String,
-        _ artifacts: [GitDiffPublishedArtifact]
+        _ artifacts: [GitDiffPublishedArtifact],
+        _ expectedSelectionRevision: UInt64?,
+        _ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?
     ) async throws -> MCPGitArtifactAdvertisementSnapshot
     typealias InvalidateAdvertisedGitArtifactsForCurrentTab = @MainActor @Sendable (
-        _ toolName: String
+        _ toolName: String,
+        _ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?
     ) async -> Void
     typealias FreezePromptGitReviewContext = @MainActor @Sendable (
         _ context: MCPServerViewModel.TabScopedContext

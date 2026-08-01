@@ -482,6 +482,17 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
     || grep -q 'resolveTabContextSnapshot' <<<"$(sed -n '/func selectionRefreshedContext/,/private func simplePromptReply/p' "$m3_prompt_backend")"; then
     fail "M3 app backend stopped consuming captured authority or repeated heavyweight routing"
   fi
+  m3_git_backend="Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
+  if ! grep -q 'appContext.metadata' "$m3_git_backend" \
+    || ! grep -q 'appContext.lookupContext' "$m3_git_backend" \
+    || ! grep -q 'appContext?.resolvedTabContext' "$m3_git_backend" \
+    || ! grep -q 'capturedWorkspaceID' "$m3_git_backend"; then
+    fail "M3 git backend stopped consuming captured authority"
+  fi
+  if ! sed -n '/commitPrimaryGitDiffArtifactsToCurrentTab(/,/)/p' "$m3_git_backend" | grep -q 'appContext' \
+    || ! sed -n '/replaceAdvertisedGitArtifactsForCurrentTab(/,/)/p' "$m3_git_backend" | grep -q 'appContext'; then
+    fail "M3 git artifact side effects no longer carry captured authority"
+  fi
 
   m3_side_effects="$domain_runtime_source_dir/DomainReadSideEffectCoordinator.swift"
   if ! grep -q 'case selection' "$m3_side_effects" || ! grep -q 'case gitArtifacts' "$m3_side_effects"; then

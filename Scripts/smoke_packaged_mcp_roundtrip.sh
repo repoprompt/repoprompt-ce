@@ -16,6 +16,8 @@ APP_START=""
 TEMP_ROOT=""
 APP_LOG=""
 MCP_SOCKET_PATH=""
+DIAGNOSTICS_DIR="${REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR:-}"
+HELPER_DEBUG_LOG=""
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -38,6 +40,24 @@ process_matches() {
 
 cleanup() {
     local status=$?
+    # Diagnostics are best-effort and must never prevent exact-PID shutdown or temp cleanup.
+    set +e
+    if (( status != 0 )) && [[ -n "$DIAGNOSTICS_DIR" ]]; then
+        mkdir -p "$DIAGNOSTICS_DIR"
+        if process_matches && command -v sample >/dev/null 2>&1; then
+            log_phase "$SMOKE_LABEL capturing launched app sample after failure"
+            sample "$APP_PID" 5 1 -file "$DIAGNOSTICS_DIR/packaged-app.sample.txt" >/dev/null 2>&1 || true
+        fi
+        [[ -z "$APP_LOG" || ! -f "$APP_LOG" ]] || cp "$APP_LOG" "$DIAGNOSTICS_DIR/packaged-app.log"
+        [[ -z "$HELPER_DEBUG_LOG" || ! -f "$HELPER_DEBUG_LOG" ]] || cp "$HELPER_DEBUG_LOG" "$DIAGNOSTICS_DIR/helper-socket-debug.log"
+        if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
+            find "$TEMP_ROOT" -maxdepth 1 -type f \( -name 'windows-attempt-*' -o -name 'socket-owner.err' -o -name 'launched-process.json' \) \
+                -exec cp {} "$DIAGNOSTICS_DIR/" \; 2>/dev/null || true
+        fi
+        printf '%s\n' "--- packaged app sample excerpt ---" >&2
+        sed -n '1,220p' "$DIAGNOSTICS_DIR/packaged-app.sample.txt" >&2 2>/dev/null || true
+        printf 'Packaged smoke diagnostics retained at %s\n' "$DIAGNOSTICS_DIR" >&2
+    fi
     if process_matches; then
         kill -TERM "$APP_PID" 2>/dev/null || true
         for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -105,6 +125,7 @@ ISOLATED_TMP="$TEMP_ROOT/tmp"
 APP_LOG="$TEMP_ROOT/app.log"
 mkdir -p "$ISOLATED_HOME" "$ISOLATED_TMP"
 chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_TMP"
+HELPER_DEBUG_LOG="$ISOLATED_HOME/Library/Application Support/RepoPrompt CE/socket-proxy-debug.log"
 
 "$SOCKET_OWNER_HELPER" preflight "$MCP_SOCKET_DIR" ||
     fail "$SMOKE_LABEL requires no pre-existing live release MCP socket in $MCP_SOCKET_DIR"
@@ -152,6 +173,7 @@ environment = {
     "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "runner")),
     "LANG": "C",
     "LC_ALL": "C",
+    "MCP_SOCKET_DEBUG": "1",
 }
 try:
     completed = subprocess.run(
@@ -161,7 +183,12 @@ try:
         capture_output=True,
         timeout=int(helper_timeout),
     )
-except subprocess.TimeoutExpired:
+except subprocess.TimeoutExpired as error:
+    for value, destination in ((error.stdout, sys.stdout), (error.stderr, sys.stderr)):
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            print(value, end="", file=destination)
     raise SystemExit(124)
 if completed.stdout:
     print(completed.stdout, end="")
@@ -207,6 +234,10 @@ while (( $(date +%s) <= deadline )); do
     last_status=$?
     set -e
     log_phase "$SMOKE_LABEL CLI windows attempt ${attempt} exited with $last_status"
+    if (( last_status != 0 )) && [[ -f "$HELPER_DEBUG_LOG" ]]; then
+        printf '%s\n' "--- helper socket debug tail (attempt $attempt) ---" >&2
+        tail -100 "$HELPER_DEBUG_LOG" >&2 || true
+    fi
     if (( last_status == 0 )); then
         cat "$attempt_stdout"
         cat "$attempt_stderr" >&2

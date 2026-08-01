@@ -1126,6 +1126,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
+                    guard snapshot.isAuthorizedForPublication else { return }
                     self?.codexDynamicModels = snapshot.models
                 }
             }

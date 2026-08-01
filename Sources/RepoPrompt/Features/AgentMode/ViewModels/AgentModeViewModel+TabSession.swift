@@ -512,6 +512,7 @@ extension AgentModeViewModel {
             var computerUseEnabled: Bool
             var goalSupportEnabled: Bool
             var reasoningSummariesEnabled: Bool
+            var memoriesEnabled: Bool
         }
 
         var pendingCodexComputerUseActivation: CodexComputerUseActivation?
