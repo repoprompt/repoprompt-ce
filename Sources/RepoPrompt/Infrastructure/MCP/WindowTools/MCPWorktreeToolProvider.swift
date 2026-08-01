@@ -316,10 +316,10 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: true)
         let sessionID = try await resolveBindingSessionID(args: args)
         try validateLiveSession(sessionID, in: dependencies.requireTargetWindow())
-        let logicalRoot = try await logicalRoot(for: context)
+        let repositoryRoot = try await logicalRoot(for: context)
         let worktreeRoot = try await logicalRoot(for: worktree, context: context)
         try await admitLogicalMutationRoots([
-            logicalRoot.standardizedFullPath,
+            repositoryRoot.standardizedFullPath,
             worktreeRoot.standardizedFullPath
         ])
         try await MCPDomainMutationCommitContext.willCommit()
