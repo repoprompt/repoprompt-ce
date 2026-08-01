@@ -2315,11 +2315,12 @@ import XCTest
             )
             let registration = try await AppDomainRuntimeComposition.shared.runtime
                 .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
+            let workspaceID = try XCTUnwrap(context.workspaceID)
             _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
                 connection: registration,
                 binding: .runScoped(
                     runID: runID,
-                    context: .init(workspaceID: context.workspaceID, contextID: context.tabID)
+                    context: .init(workspaceID: workspaceID, contextID: context.tabID)
                 ),
                 operationID: UUID()
             )
