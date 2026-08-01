@@ -37,13 +37,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         let callsAfterDistinctRequest = await calls.value
         XCTAssertEqual(callsAfterDistinctRequest, 2)
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invoke(
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invoke(
                 binding,
                 arguments: reusedCorrelation,
                 requestIdentitySeed: "request-1"
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .operationIDCollision("correlation-1"))
         }
         let callsAfterCollision = await calls.value
@@ -64,12 +64,12 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             return .string("unexpected")
         }
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invoke(
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invoke(
                 neverCalled,
                 arguments: fixture.arguments(operationID: "outside", path: link.appendingPathComponent("file.txt").path)
             )
-        ) { error in
+        }) { error in
             XCTAssertTrue(error is DomainMutationPathFenceError)
         }
         let callsAfterAdmission = await calls.value
@@ -84,12 +84,12 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             await calls.increment()
             return .string("unexpected")
         }
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invoke(
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invoke(
                 swapped,
                 arguments: fixture.arguments(operationID: "swap", path: link.appendingPathComponent("file.txt").path)
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationPathFenceError, .pathResolutionChanged(link.appendingPathComponent("file.txt").path))
         }
         let callsAfterPrecommit = await calls.value
@@ -141,9 +141,9 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             "operation_id": .string("logical-outside")
         ]
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invokeLogical(binding, arguments: arguments)
-        ) { error in
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invokeLogical(binding, arguments: arguments)
+        }) { error in
             XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
         }
         let callCount = await calls.value
@@ -186,8 +186,8 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         )
         XCTAssertEqual(rootAResult.stringValue, "applied")
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invokeLogical(
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invokeLogical(
                 binding,
                 arguments: [
                     "op": .string("bind"),
@@ -198,7 +198,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
                 authorizedCanonicalRoots: authorizedRoots,
                 ephemeralGrantedToolNames: []
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
         }
         let callCount = await calls.value
@@ -245,15 +245,15 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
                 "operation_id": .string("post-resolution-\(selector.label)")
             ]
             arguments.merge(selector.values) { _, new in new }
-            await XCTAssertThrowsErrorAsync(
-                try fixture.invokeLogical(
+            await XCTAssertThrowsErrorAsync({
+                try await fixture.invokeLogical(
                     binding,
                     arguments: arguments,
                     requestIdentitySeed: "post-resolution-\(selector.label)",
                     authorizedCanonicalRoots: [fixture.root.path, rootB.path],
                     ephemeralGrantedToolNames: []
                 )
-            ) { error in
+            }) { error in
                 XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing, selector.label)
             }
         }
@@ -291,8 +291,8 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             return .string("unexpected")
         }
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invokeLogical(
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invokeLogical(
                 binding,
                 arguments: [
                     "op": .string("unbind"),
@@ -303,7 +303,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
                 authorizedCanonicalRoots: [fixture.root.path, rootB.path],
                 ephemeralGrantedToolNames: []
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
         }
         let callCount = await calls.value
@@ -324,13 +324,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             return .string("unexpected")
         }
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.invoke(
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invoke(
                 binding,
                 arguments: fixture.arguments(operationID: "parent-swap", path: target),
                 requestIdentitySeed: "parent-swap-request"
             )
-        ) { error in
+        }) { error in
             XCTAssertTrue(error is DomainMutationPathFenceError)
         }
         let callsAfterParentSwap = await calls.value
@@ -407,13 +407,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             await restartedCalls.increment()
             return .string("duplicate")
         }
-        await XCTAssertThrowsErrorAsync(
-            try restarted.invoke(
+        await XCTAssertThrowsErrorAsync({
+            try await restarted.invoke(
                 restartedBinding,
                 arguments: arguments,
                 requestIdentitySeed: "cancel-after-request"
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .interruptedCommit("cancel-after"))
         }
         let callsAfterRestart = await restartedCalls.value
@@ -445,13 +445,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         }
         await gate.waitUntilEntered()
 
-        await XCTAssertThrowsErrorAsync(
-            try second.invoke(
+        await XCTAssertThrowsErrorAsync({
+            try await second.invoke(
                 secondBinding,
                 arguments: arguments,
                 requestIdentitySeed: "n-writer-request"
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .operationInProgress("n-writer"))
         }
         await gate.release()
@@ -678,7 +678,7 @@ private func m4bTTYAdministrator() -> DomainClientPrincipal {
 }
 
 private func XCTAssertThrowsErrorAsync(
-    _ expression: @autoclosure () async throws -> some Any,
+    _ expression: () async throws -> some Any,
     _ verify: (Error) -> Void = { _ in }
 ) async {
     do {
