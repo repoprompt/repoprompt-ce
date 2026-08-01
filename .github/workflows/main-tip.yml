@@ -7,9 +7,17 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      commit:
-        description: Commit SHA on protected main to publish as tip
-        required: false
+      ci_run_id:
+        description: Successful canonical CI run ID containing the Tip stage artifact
+        required: true
+        type: string
+      ci_run_attempt:
+        description: Exact attempt number for the successful CI run
+        required: true
+        type: string
+      expected_sha:
+        description: Exact full protected-main SHA built by that CI attempt
+        required: true
         type: string
 
 concurrency:
@@ -27,22 +35,31 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
   setup:
     name: Resolve Tip Commit
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      github.repository == 'repoprompt/repoprompt-ce' &&
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'success')
     runs-on: macos-26
     outputs:
-      commit: ${{ steps.tip.outputs.commit }}
-      short-sha: ${{ steps.tip.outputs.short-sha }}
-      build-number: ${{ steps.tip.outputs.build-number }}
-      tag: ${{ steps.tip.outputs.tag }}
+      commit: ${{ steps.build.outputs.commit }}
+      short-sha: ${{ steps.build.outputs.short-sha }}
+      build-number: ${{ steps.build.outputs.build-number }}
+      tag: ${{ steps.build.outputs.tag }}
       tooling-commit: ${{ steps.tip.outputs.tooling-commit }}
-      should-publish: ${{ steps.tip.outputs.should-publish }}
+      should-publish: ${{ steps.build.outputs.should-publish }}
+      source-run-id: ${{ steps.tip.outputs.source-run-id }}
+      source-run-attempt: ${{ steps.tip.outputs.source-run-attempt }}
+      stage-artifact-id: ${{ steps.tip.outputs.artifact-id }}
+      stage-artifact-name: ${{ steps.tip.outputs.artifact-name }}
+      stable-build-number: ${{ steps.build.outputs.stable-build-number }}
+      commit-sequence: ${{ steps.build.outputs.commit-sequence }}
+      archive-basename: ${{ steps.build.outputs.archive-basename }}
     steps:
       - name: Check out trusted tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -51,54 +68,77 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve protected main commit
+      - name: Resolve exact successful CI stage
         id: tip
         env:
-          REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
+          CANONICAL_REPOSITORY: repoprompt/repoprompt-ce
+          SOURCE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_run_id || github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_run_attempt || github.event.workflow_run.run_attempt }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "CI run ID must be a positive integer" >&2; exit 1; }
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || { echo "CI run attempt must be a positive integer" >&2; exit 1; }
+          run_json="$RUNNER_TEMP/ci-run.json"
+          workflow_json="$RUNNER_TEMP/ci-workflow.json"
+          artifacts_json="$RUNNER_TEMP/ci-artifacts.json"
+          gh api "repos/$CANONICAL_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$run_json"
+          gh api "repos/$CANONICAL_REPOSITORY/actions/workflows/ci.yml" > "$workflow_json"
+          gh api "repos/$CANONICAL_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" > "$artifacts_json"
+          python3 Scripts/verify_tip_ci_artifact.py resolve \
+            --repository "$CANONICAL_REPOSITORY" \
+            --workflow-path .github/workflows/ci.yml \
+            --run-id "$SOURCE_RUN_ID" \
+            --run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --expected-sha "$EXPECTED_SHA" \
+            --run-json "$run_json" \
+            --workflow-json "$workflow_json" \
+            --artifacts-json "$artifacts_json" \
+            --github-output "$GITHUB_OUTPUT"
+
+          git fetch --no-tags origin main
+          git rev-parse --verify "$EXPECTED_SHA^{commit}" >/dev/null
+          git merge-base --is-ancestor "$EXPECTED_SHA" origin/main || {
+            echo "CI head SHA is not reachable from protected origin/main" >&2
+            exit 1
+          }
+          {
+            echo "source-run-id=$SOURCE_RUN_ID"
+            echo "tooling-commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download exact CI stage for identity resolution
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.tip.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          repository: repoprompt/repoprompt-ce
+          run-id: ${{ steps.tip.outputs.source-run-id }}
+          path: staged-tip-setup
+          merge-multiple: true
+
+      - name: Resolve staged Tip build identity
+        id: build
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.event.workflow_run.head_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
           TIP_GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main
-          commit="${REQUESTED_COMMIT:-$(git rev-parse origin/main)}"
-          commit="$(git rev-parse "$commit^{commit}")"
-          git merge-base --is-ancestor "$commit" origin/main || {
-            echo "Requested tip commit is not reachable from origin/main" >&2
-            exit 1
-          }
-          short_sha="$(git rev-parse --short=12 "$commit")"
-          build_sequence="$(git rev-list --count "$commit")"
-          (( build_sequence <= 9999 )) || {
-            echo "Tip build sequence exceeds the three-component CFBundleVersion capacity" >&2
-            exit 1
-          }
-
-          stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
-          curl --fail --location --retry 3 --silent --show-error \
-            https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml \
-            --output "$stable_appcast"
-          stable_build_number="$(python3 - "$stable_appcast" <<'PYTHON'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse(sys.argv[1]).getroot()
-          versions = [
-              (element.text or "").strip()
-              for element in root.iter()
-              if element.tag.rsplit("}", 1)[-1] == "version"
-          ]
-          if len(versions) != 1 or not versions[0].isdigit():
-              raise SystemExit("Stable appcast must contain exactly one numeric sparkle:version")
-          print(versions[0])
-          PYTHON
-          )"
-          (( ${#stable_build_number} <= 4 )) || {
-            echo "Stable build number exceeds CFBundleVersion's four-digit major component" >&2
-            exit 1
-          }
-          build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"
-          archive_basename="RepoPrompt-tip-$short_sha-$build_number"
-          tag="tip-$short_sha"
+          shopt -s nullglob
+          entries=(staged-tip-setup/*)
+          metadata=(staged-tip-setup/*-stage-metadata.json)
+          [[ "${#entries[@]}" == "3" ]] || { echo "Expected exactly three staged Tip files" >&2; exit 1; }
+          [[ "${#metadata[@]}" == "1" ]] || { echo "Expected exactly one staged Tip metadata file" >&2; exit 1; }
+          tip_json="$RUNNER_TEMP/tip-build.json"
+          python3 Scripts/resolve_tip_build.py \
+            --repository "$GITHUB_WORKSPACE" \
+            --commit "$EXPECTED_SHA" \
+            --stage-metadata "${metadata[0]}" \
+            --github-output "$GITHUB_OUTPUT" > "$tip_json"
+          tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag"])' "$tip_json")"
+          archive_basename="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_basename"])' "$tip_json")"
 
           lookup_classification="$(./Scripts/lookup_public_tip_release.sh \
             "$TIP_UPDATE_REPOSITORY" \
@@ -107,7 +147,7 @@ jobs:
           case "$lookup_classification" in
             found)
               should_publish=false
-              echo "Existing tip release response classification=complete; skipping rebuild."
+              echo "Existing tip release response classification=complete; skipping publish."
               ;;
             not-found)
               should_publish=true
@@ -117,69 +157,16 @@ jobs:
               exit 1
               ;;
           esac
-          {
-            echo "commit=$commit"
-            echo "short-sha=$short_sha"
-            echo "build-number=$build_number"
-            echo "tag=$tag"
-            echo "tooling-commit=$(git rev-parse HEAD)"
-            echo "should-publish=$should_publish"
-          } >> "$GITHUB_OUTPUT"
-
-  stage:
-    name: Build Tip Source Without Secrets
-    needs: setup
-    if: needs.setup.outputs.should-publish == 'true'
-    runs-on: macos-26
-    permissions:
-      contents: read
-    steps:
-      - name: Check out trusted tooling
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          ref: ${{ needs.setup.outputs.tooling-commit }}
-          path: trusted-control-plane
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check out tip source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          path: tip-source
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Stage tip artifact
-        env:
-          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
-          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
-          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-          TIP_TAG: ${{ needs.setup.outputs.tag }}
-          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
-          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
-          # Link Sentry and preserve dSYMs without exposing DSN or auth in this stage.
-          REPOPROMPT_ENABLE_SENTRY: "1"
-        run: ./trusted-control-plane/Scripts/main_tip_release.sh stage
-
-      - name: Upload staged tip source
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: RepoPrompt-CE-staged-tip
-          path: |
-            tip-source/dist/*-stage.zip
-            tip-source/dist/*-stage.zip.sha256
-          if-no-files-found: error
-          retention-days: 1
+          echo "should-publish=$should_publish" >> "$GITHUB_OUTPUT"
 
   sign:
     name: Sign and Notarize Tip
-    needs:
-      - setup
-      - stage
+    needs: setup
+    if: needs.setup.outputs.should-publish == 'true'
     environment: tip-release
     runs-on: macos-26
     permissions:
+      actions: read
       contents: read
     steps:
       - name: Check out trusted tooling
@@ -190,11 +177,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download staged tip source
+      - name: Download exact CI Tip stage artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: RepoPrompt-CE-staged-tip
+          artifact-ids: ${{ needs.setup.outputs.stage-artifact-id }}
+          github-token: ${{ github.token }}
+          repository: repoprompt/repoprompt-ce
+          run-id: ${{ needs.setup.outputs.source-run-id }}
           path: staged-tip
+          merge-multiple: true
 
       - name: Check out approved tip source as data
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -207,17 +198,45 @@ jobs:
       - name: Verify and expand staged tip source
         env:
           RELEASE_COMMIT: ${{ needs.setup.outputs.commit }}
+          SOURCE_RUN_ID: ${{ needs.setup.outputs.source-run-id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.setup.outputs.source-run-attempt }}
+          STAGE_ARTIFACT_NAME: ${{ needs.setup.outputs.stage-artifact-name }}
+          STABLE_BUILD_NUMBER: ${{ needs.setup.outputs.stable-build-number }}
+          COMMIT_SEQUENCE: ${{ needs.setup.outputs.commit-sequence }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          ARCHIVE_BASENAME: ${{ needs.setup.outputs.archive-basename }}
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
         run: |
           set -euo pipefail
           shopt -s nullglob
+          entries=(staged-tip/*)
           archives=(staged-tip/*-stage.zip)
           checksums=(staged-tip/*-stage.zip.sha256)
+          metadata=(staged-tip/*-stage-metadata.json)
+          [[ "${#entries[@]}" == "3" ]] || { echo "Expected exactly three staged tip artifact files" >&2; exit 1; }
           [[ "${#archives[@]}" == "1" ]] || { echo "Expected one staged tip ZIP" >&2; exit 1; }
           [[ "${#checksums[@]}" == "1" ]] || { echo "Expected one staged tip checksum" >&2; exit 1; }
+          [[ "${#metadata[@]}" == "1" ]] || { echo "Expected one staged tip metadata file" >&2; exit 1; }
+          [[ "${archives[0]}" == "staged-tip/$ARCHIVE_BASENAME-stage.zip" ]] || { echo "Staged tip archive name mismatch" >&2; exit 1; }
           [[ "${checksums[0]}" == "${archives[0]}.sha256" ]] || { echo "Staged tip checksum name mismatch" >&2; exit 1; }
+          [[ "${metadata[0]}" == "staged-tip/$ARCHIVE_BASENAME-stage-metadata.json" ]] || { echo "Staged tip metadata name mismatch" >&2; exit 1; }
           (cd staged-tip && shasum -a 256 -c "$(basename "${checksums[0]}")")
           ./trusted-control-plane/Scripts/extract_staged_release.py "${archives[0]}" tip-source RepoPrompt
+          python3 trusted-control-plane/Scripts/verify_tip_ci_artifact.py verify-metadata \
+            --repository repoprompt/repoprompt-ce \
+            --workflow-path .github/workflows/ci.yml \
+            --run-id "$SOURCE_RUN_ID" \
+            --run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --expected-sha "$RELEASE_COMMIT" \
+            --artifact-name "$STAGE_ARTIFACT_NAME" \
+            --stable-build-number "$STABLE_BUILD_NUMBER" \
+            --commit-sequence "$COMMIT_SEQUENCE" \
+            --build-number "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" \
+            --tag "$TIP_TAG" \
+            --metadata "${metadata[0]}" \
+            --archive "${archives[0]}" \
+            --checksum "${checksums[0]}" \
+            --app-manifest tip-source/.build/release/RepoPrompt-artifact-manifest.json
           REPOPROMPT_RELEASE_SOURCE_ROOT=tip-source \
             REPOPROMPT_APPROVED_SOURCE_ROOT=approved-source \
             ./trusted-control-plane/Scripts/validate_staged_release.sh
@@ -308,7 +327,7 @@ jobs:
       - name: Upload signed tip assets for smoke and publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: RepoPrompt-CE-signed-tip
+          name: RepoPrompt-CE-signed-tip-${{ github.run_id }}-${{ needs.setup.outputs.commit }}
           path: |
             tip-source/dist/*.zip
             tip-source/dist/*.dmg
@@ -317,7 +336,7 @@ jobs:
             tip-source/dist/*-artifact-manifest.json
             tip-source/dist/*-metadata.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
 
   smoke-no-secrets:
     name: Smoke Tip Without Release Secrets
@@ -339,7 +358,7 @@ jobs:
       - name: Download signed tip assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: RepoPrompt-CE-signed-tip
+          name: RepoPrompt-CE-signed-tip-${{ github.run_id }}-${{ needs.setup.outputs.commit }}
           path: signed-tip
 
       - name: Verify and smoke signed tip
@@ -374,7 +393,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: RepoPrompt-CE-tip-smoke-diagnostics
+          name: RepoPrompt-CE-tip-smoke-diagnostics-${{ github.run_attempt }}
           path: ${{ runner.temp }}/tip-smoke-diagnostics
           if-no-files-found: warn
           retention-days: 3
@@ -400,7 +419,7 @@ jobs:
       - name: Download signed tip assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: RepoPrompt-CE-signed-tip
+          name: RepoPrompt-CE-signed-tip-${{ github.run_id }}-${{ needs.setup.outputs.commit }}
           path: tip-assets
 
       - name: Publish tip update release

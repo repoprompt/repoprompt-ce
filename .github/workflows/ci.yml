@@ -48,6 +48,76 @@ jobs:
       - name: Run release workflow tests
         run: make release-selftest
 
+  tip-stage:
+    name: Tip Stage (secretless exact head)
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'repoprompt/repoprompt-ce'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact main commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Tip build metadata
+        id: tip
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]] || {
+            echo "Tip stage checkout does not match github.sha" >&2
+            exit 1
+          }
+          stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml \
+            --output "$stable_appcast"
+          python3 Scripts/resolve_tip_build.py \
+            --repository "$GITHUB_WORKSPACE" \
+            --commit "$EXPECTED_SHA" \
+            --stable-appcast "$stable_appcast" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Stage exact Tip source without secrets
+        env:
+          TIP_COMMIT: ${{ steps.tip.outputs.commit }}
+          TIP_SHORT_SHA: ${{ steps.tip.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ steps.tip.outputs.build-number }}
+          TIP_TAG: ${{ steps.tip.outputs.tag }}
+          TIP_STABLE_BUILD_NUMBER: ${{ steps.tip.outputs.stable-build-number }}
+          TIP_COMMIT_SEQUENCE: ${{ steps.tip.outputs.commit-sequence }}
+          TIP_STAGE_REPOSITORY: repoprompt/repoprompt-ce
+          TIP_STAGE_WORKFLOW: .github/workflows/ci.yml
+          TIP_STAGE_EVENT: push
+          TIP_STAGE_BRANCH: main
+          TIP_STAGE_RUN_ID: ${{ github.run_id }}
+          TIP_STAGE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          TIP_STAGE_ARTIFACT_NAME: RepoPrompt-CE-tip-stage-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          REPOPROMPT_REQUIRE_TIP_STAGE_METADATA: "1"
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./Scripts/main_tip_release.sh stage
+
+      - name: Upload exact Tip stage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-tip-stage-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            dist/*-stage.zip
+            dist/*-stage.zip.sha256
+            dist/*-stage-metadata.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
   build-and-test:
     name: Build and Test (app shard ${{ matrix.shard }})
     runs-on: macos-26

@@ -221,31 +221,43 @@ repository. Tip workflows must never write to `repoprompt-ce-updates`, must not
 use `v*` tags, and must not feed into `Promote Release`. Stable promotion remains
 the only path that updates the stable appcast.
 
-`Publish Tip` runs after successful CI on `main` and can also be dispatched
-manually. It stages the tip source without secrets, signs and notarizes without
-executing packaged app/helper code, runs the PR #441 hardened packaged smoke on a
-fresh no-secret runner, then publishes a normal GitHub release in the dedicated
-tip update repository using an immutable tag shaped like `tip-<shortsha>`. The
-release is marked latest inside the tip-only repository so GitHub's
+Canonical `main` push CI stages the exact `github.sha` in a parallel,
+secretless `tip-stage` job. Pull-request CI cannot run that job. The producer
+uploads `RepoPrompt-CE-tip-stage-<ci-run-id>-<attempt>-<full-sha>` with the stage
+ZIP, its checksum, and the minimal run/build identity metadata for 30 days.
+`Publish Tip` consumes that exact artifact only after a successful canonical CI
+`workflow_run`; manual dispatch requires the CI run ID, its current completed
+attempt, and the expected full SHA explicitly and never selects a latest run.
+
+The protected workflow verifies the upstream repository, CI workflow, push
+event, `main` branch, run ID, attempt, full head SHA, artifact identity, checksum,
+stage metadata, packaged manifest, dSYMs, and approved source before importing
+release credentials. It then signs and notarizes without executing packaged
+app/helper code, runs the PR #441 hardened packaged smoke on a fresh no-secret
+runner, and publishes a normal GitHub release in the dedicated tip update
+repository using an immutable tag shaped like `tip-<shortsha>`. The release is
+marked latest inside the tip-only repository so GitHub's
 `releases/latest/download/appcast.xml` URL resolves for opted-in clients. Do not
 mark the tip release as a prerelease: GitHub excludes prereleases from
 `releases/latest`.
 
-Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow
-reads the currently published stable appcast and combines that stable build with
-the source commit count. For example, commit sequence `795` on stable build `28`
-becomes Tip build `28.7.95`: it is newer than stable `28`, while stable `29`
-still supersedes it. This keeps Stable and Tip in one monotonic Sparkle version
-space without forcing stable releases to adopt repository-sized build numbers.
-The source commit count must remain at or below `9999`; replace this encoding
-before the repository reaches that limit.
+Tip `CFBundleVersion` values sort between adjacent stable builds. The CI
+producer reads the currently published stable appcast and the shared resolver
+combines that stable build with the exact source commit count. For example,
+commit sequence `795` on stable build `28` becomes Tip build `28.7.95`: it is
+newer than stable `28`, while stable `29` still supersedes it. The consumer uses
+the same resolver against the retained metadata, so a later stable release does
+not change the identity of an already-staged Tip. This keeps Stable and Tip in
+one monotonic Sparkle version space without forcing stable releases to adopt
+repository-sized build numbers. The source commit count must remain at or below
+`9999`; replace this encoding before the repository reaches that limit.
 
 The workflow uses GitHub concurrency to allow one active and one pending run.
 New successful `main` runs replace an older pending run while an active signing
-or notarization run finishes. Before compiling, it uses the workflow's read-only
-`github.token` to check for a complete release for the immutable `tip-<shortsha>`
-tag and skips an already-published commit. The protected update-repository token
-remains confined to the publishing job.
+or notarization run finishes. Before signing, it uses the workflow's read-only
+`github.token` to check for a complete release for the immutable
+`tip-<shortsha>` tag and skips an already-published commit. The protected
+update-repository token remains confined to the publishing job.
 
 Configure a protected GitHub Actions environment named `tip-release`. It can use
 the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
@@ -266,6 +278,24 @@ the job, and requires the final artifact manifest to record
 `telemetry_enabled: true`. The workflow materializes Sentry auth in an
 owner-only temporary token file and removes it through the job's always-run
 cleanup step.
+
+The CI consumer accepts the newest retained Tip stage artifact at or before the
+successful run attempt. This matters for **Re-run failed jobs**: if the Tip stage
+job already passed, GitHub keeps that earlier-attempt artifact while rerunning
+only failed shards under a newer overall attempt. The artifact's own attempt is
+still bound into its name and signed-stage metadata and is verified before any
+release secret is exposed.
+
+After signing succeeds, `Publish Tip` retains the uniquely named signed asset
+artifact for 30 days. If packaged smoke or publishing fails, open that same
+workflow run in GitHub Actions and choose **Re-run failed jobs**. GitHub reuses
+the successful sign job and its retained artifact, so those downstream jobs do
+not rebuild or resign. Do not start an unbound replacement run or rerun all jobs
+for this recovery path. After 30 days the signed artifact expires and the
+shortcut is unavailable; use a new manual `Publish Tip` dispatch with the exact
+still-retained CI run ID, its current completed attempt, and expected SHA (which
+signs again), or let a new canonical `main` CI run stage a new artifact. This retention mechanism does
+not make publishing idempotent and does not resume a partially created release.
 
 ## Contributor release candidate
 

@@ -2554,8 +2554,316 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         )
 
 
+    def test_tip_build_resolver_rejects_bad_appcasts_commits_and_overflow(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        repository = root / "repository"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.email", "tip@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.name", "Tip Test"], check=True)
+        for index in range(3):
+            (repository / "fixture").write_text(f"{index}\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "fixture"], check=True)
+            subprocess.run(["git", "-C", str(repository), "commit", "-qm", f"fixture {index}"], check=True)
+        commit = subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        appcast = root / "appcast.xml"
+        appcast.write_text(
+            '<rss xmlns:sparkle="https://sparkle-project.org/xml-namespaces/sparkle"><channel>'
+            "<item><sparkle:version>42</sparkle:version></item></channel></rss>\n",
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "resolve_tip_build.py"),
+            "--repository",
+            str(repository),
+            "--commit",
+            commit,
+            "--stable-appcast",
+            str(appcast),
+        ]
+        resolved = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        metadata = json.loads(resolved.stdout)
+        self.assertEqual(metadata["stable_build_number"], "42")
+        self.assertEqual(metadata["commit_sequence"], 3)
+        self.assertEqual(metadata["build_number"], "42.0.3")
+        self.assertEqual(metadata["tag"], f"tip-{commit[:12]}")
+
+        malformed_documents = [
+            "<rss>",
+            "<rss><channel /></rss>",
+            "<rss><version>1</version><version>2</version></rss>",
+        ]
+        for document in malformed_documents:
+            with self.subTest(document=document):
+                appcast.write_text(document, encoding="utf-8")
+                rejected = subprocess.run(command, text=True, capture_output=True)
+                self.assertNotEqual(rejected.returncode, 0)
+
+        for version in ("0", "01", "+1", "1.2", "10000"):
+            with self.subTest(version=version):
+                appcast.write_text(f"<rss><version>{version}</version></rss>\n", encoding="utf-8")
+                rejected = subprocess.run(command, text=True, capture_output=True)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("canonical positive decimal", rejected.stderr)
+
+        appcast.write_text("<rss><version>42</version></rss>\n", encoding="utf-8")
+        missing_commit = command.copy()
+        missing_commit[missing_commit.index(commit)] = "0" * 40
+        rejected = subprocess.run(missing_commit, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+
+        module_spec = importlib.util.spec_from_file_location("resolve_tip_build", SCRIPT_DIR / "resolve_tip_build.py")
+        self.assertIsNotNone(module_spec)
+        self.assertIsNotNone(module_spec.loader)
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        with mock.patch.object(module, "run_git", side_effect=[commit, "10000"]):
+            with self.assertRaisesRegex(SystemExit, "between 1 and 9999"):
+                module.resolve(repository, commit, "42", "RepoPrompt")
+
+    def test_tip_build_resolver_reuses_and_checks_staged_identity(self) -> None:
+        repository = SCRIPT_DIR.parent
+        commit = subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        sequence = int(
+            subprocess.check_output(
+                ["git", "-C", str(repository), "rev-list", "--count", commit],
+                text=True,
+            ).strip()
+        )
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        metadata_path = root / "stage-metadata.json"
+        expected = {
+            "head_sha": commit,
+            "stable_build_number": "42",
+            "commit_sequence": sequence,
+            "build_number": f"42.{sequence // 100}.{sequence % 100}",
+            "tag": f"tip-{commit[:12]}",
+            "archive": f"RepoPrompt-tip-{commit[:12]}-42.{sequence // 100}.{sequence % 100}-stage.zip",
+        }
+        metadata_path.write_text(json.dumps(expected), encoding="utf-8")
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "resolve_tip_build.py"),
+            "--repository",
+            str(repository),
+            "--commit",
+            commit,
+            "--stage-metadata",
+            str(metadata_path),
+        ]
+        resolved = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        tampered = dict(expected)
+        tampered["build_number"] = "42.0.0"
+        metadata_path.write_text(json.dumps(tampered), encoding="utf-8")
+        rejected = subprocess.run(command, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("build_number mismatch", rejected.stderr)
+
+    def test_tip_ci_artifact_verifier_correlates_run_and_payload_metadata(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        commit = "a" * 40
+        run_id = 12345
+        run_attempt = 3
+        artifact_attempt = 2
+        repository_id = 987
+        artifact_name = f"RepoPrompt-CE-tip-stage-{run_id}-{artifact_attempt}-{commit}"
+        run = {
+            "id": run_id,
+            "run_attempt": run_attempt,
+            "name": "CI",
+            "workflow_id": 55,
+            "path": ".github/workflows/ci.yml@refs/heads/main",
+            "event": "push",
+            "head_branch": "main",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": commit,
+            "repository": {"id": repository_id, "full_name": "repoprompt/repoprompt-ce"},
+            "head_repository": {"id": repository_id, "full_name": "repoprompt/repoprompt-ce"},
+        }
+        workflow = {"id": 55, "path": ".github/workflows/ci.yml"}
+        artifact = {
+            "id": 777,
+            "name": artifact_name,
+            "expired": False,
+            "size_in_bytes": 100,
+            "digest": f"sha256:{'b' * 64}",
+            "workflow_run": {
+                "id": run_id,
+                "head_sha": commit,
+                "head_branch": "main",
+                "repository_id": repository_id,
+                "head_repository_id": repository_id,
+            },
+        }
+        earlier_artifact = dict(
+            artifact,
+            id=776,
+            name=f"RepoPrompt-CE-tip-stage-{run_id}-1-{commit}",
+        )
+        run_path = root / "run.json"
+        workflow_path = root / "workflow.json"
+        artifacts_path = root / "artifacts.json"
+        output_path = root / "output"
+        run_path.write_text(json.dumps(run), encoding="utf-8")
+        workflow_path.write_text(json.dumps(workflow), encoding="utf-8")
+        artifacts_path.write_text(json.dumps({"artifacts": [earlier_artifact, artifact]}), encoding="utf-8")
+        resolve_command = [
+            sys.executable,
+            str(SCRIPT_DIR / "verify_tip_ci_artifact.py"),
+            "resolve",
+            "--repository",
+            "repoprompt/repoprompt-ce",
+            "--workflow-path",
+            ".github/workflows/ci.yml",
+            "--run-id",
+            str(run_id),
+            "--run-attempt",
+            str(run_attempt),
+            "--expected-sha",
+            commit,
+            "--run-json",
+            str(run_path),
+            "--workflow-json",
+            str(workflow_path),
+            "--artifacts-json",
+            str(artifacts_path),
+            "--github-output",
+            str(output_path),
+        ]
+        resolved = subprocess.run(resolve_command, text=True, capture_output=True)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        output = output_path.read_text(encoding="utf-8")
+        self.assertIn("artifact-id=777", output)
+        self.assertIn(f"source-run-attempt={artifact_attempt}", output)
+        self.assertNotIn("artifact-digest", output)
+
+        for field, bad_value in (
+            ("run_attempt", 4),
+            ("event", "pull_request"),
+            ("head_branch", "feature"),
+            ("head_sha", "c" * 40),
+            ("conclusion", "failure"),
+        ):
+            with self.subTest(field=field):
+                tampered_run = dict(run)
+                tampered_run[field] = bad_value
+                run_path.write_text(json.dumps(tampered_run), encoding="utf-8")
+                rejected = subprocess.run(resolve_command, text=True, capture_output=True)
+                self.assertNotEqual(rejected.returncode, 0)
+        run_path.write_text(json.dumps(run), encoding="utf-8")
+
+        tampered_run = dict(run)
+        tampered_run["repository"] = {"id": repository_id, "full_name": "attacker/fork"}
+        run_path.write_text(json.dumps(tampered_run), encoding="utf-8")
+        rejected = subprocess.run(resolve_command, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        run_path.write_text(json.dumps(run), encoding="utf-8")
+
+        artifacts_path.write_text(json.dumps({"artifacts": [artifact, artifact]}), encoding="utf-8")
+        rejected = subprocess.run(resolve_command, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("exactly one Tip stage artifact for attempt", rejected.stderr)
+        future_artifact = dict(
+            artifact,
+            name=f"RepoPrompt-CE-tip-stage-{run_id}-{run_attempt + 1}-{commit}",
+        )
+        artifacts_path.write_text(json.dumps({"artifacts": [future_artifact]}), encoding="utf-8")
+        rejected = subprocess.run(resolve_command, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("attempt exceeds the completed CI run attempt", rejected.stderr)
+        tampered_artifact = dict(artifact)
+        tampered_artifact["workflow_run"] = dict(artifact["workflow_run"], id=run_id + 1)
+        artifacts_path.write_text(json.dumps({"artifacts": [tampered_artifact]}), encoding="utf-8")
+        rejected = subprocess.run(resolve_command, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        artifacts_path.write_text(json.dumps({"artifacts": [artifact]}), encoding="utf-8")
+
+        archive = root / "RepoPrompt-tip-aaaaaaaaaaaa-42.1.23-stage.zip"
+        checksum = root / f"{archive.name}.sha256"
+        manifest = root / "RepoPrompt-artifact-manifest.json"
+        archive.write_bytes(b"stage archive")
+        manifest.write_bytes(b'{"manifest":1}\n')
+        archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        checksum.write_text(f"{archive_digest}  {archive.name}\n", encoding="utf-8")
+        stage_metadata = {
+            "schema_version": 1,
+            "repository": "repoprompt/repoprompt-ce",
+            "workflow": ".github/workflows/ci.yml",
+            "event": "push",
+            "branch": "main",
+            "run_id": run_id,
+            "run_attempt": artifact_attempt,
+            "head_sha": commit,
+            "artifact_name": artifact_name,
+            "stable_build_number": "42",
+            "commit_sequence": 123,
+            "build_number": "42.1.23",
+            "tag": "tip-aaaaaaaaaaaa",
+            "archive": archive.name,
+            "archive_sha256": archive_digest,
+            "checksum": checksum.name,
+            "checksum_sha256": hashlib.sha256(checksum.read_bytes()).hexdigest(),
+            "app_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        }
+        metadata_path = root / "stage-metadata.json"
+        metadata_path.write_text(json.dumps(stage_metadata), encoding="utf-8")
+        metadata_command = [
+            sys.executable,
+            str(SCRIPT_DIR / "verify_tip_ci_artifact.py"),
+            "verify-metadata",
+            "--repository",
+            "repoprompt/repoprompt-ce",
+            "--workflow-path",
+            ".github/workflows/ci.yml",
+            "--run-id",
+            str(run_id),
+            "--run-attempt",
+            str(artifact_attempt),
+            "--expected-sha",
+            commit,
+            "--artifact-name",
+            artifact_name,
+            "--stable-build-number",
+            "42",
+            "--commit-sequence",
+            "123",
+            "--build-number",
+            "42.1.23",
+            "--tag",
+            "tip-aaaaaaaaaaaa",
+            "--metadata",
+            str(metadata_path),
+            "--archive",
+            str(archive),
+            "--checksum",
+            str(checksum),
+            "--app-manifest",
+            str(manifest),
+        ]
+        verified = subprocess.run(metadata_command, text=True, capture_output=True)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        manifest.write_bytes(b"tampered\n")
+        rejected = subprocess.run(metadata_command, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("app_manifest_sha256 mismatch", rejected.stderr)
+
     def test_main_tip_workflow_keeps_tip_separate_and_uses_hardened_smoke(self) -> None:
-        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
+        tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
+        ci_workflow = (workflows_dir / "ci.yml").read_text(encoding="utf-8")
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
 
@@ -2575,8 +2883,10 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         )
         self.assertNotIn("cancel-in-progress: true", concurrency_block)
         self.assertIn("should-publish", tip_workflow)
-        self.assertIn("stable-appcast.xml", tip_workflow)
-        self.assertIn('build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"', tip_workflow)
+        self.assertNotIn("stable-appcast.xml", tip_workflow)
+        self.assertIn("--stage-metadata", tip_workflow)
+        self.assertIn("stable-appcast.xml", ci_workflow)
+        self.assertIn("Scripts/resolve_tip_build.py", ci_workflow)
         self.assertIn("environment: tip-release", tip_workflow)
         self.assertIn("TIP_UPDATE_REPOSITORY_TOKEN", tip_workflow)
         self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
@@ -2584,7 +2894,7 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics', tip_workflow)
         self.assertIn("Upload Tip smoke diagnostics", tip_workflow)
-        self.assertIn("RepoPrompt-CE-tip-smoke-diagnostics", tip_workflow)
+        self.assertIn("RepoPrompt-CE-tip-smoke-diagnostics-${{ github.run_attempt }}", tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', tip_workflow)
         self.assertIn(
             'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
@@ -2600,7 +2910,8 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertNotIn("release-draft-creation", tip_workflow)
         self.assertNotIn("PUBLIC_UPDATE_REPOSITORY_TOKEN", tip_workflow)
 
-        stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        self.assertNotIn("\n  stage:", tip_workflow)
+        stage_job = ci_workflow.split("\n  tip-stage:", 1)[1].split("\n  build-and-test:", 1)[0]
         sign_job = tip_workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
         sign_step = sign_job.split("      - name: Sign and notarize staged tip", 1)[1].split(
             "      - name: Remove ephemeral keychain", 1
@@ -2609,12 +2920,22 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             "      - name: Upload signed tip assets", 1
         )[0]
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', stage_job)
+        self.assertIn("github.event_name == 'push'", stage_job)
+        self.assertIn("github.ref == 'refs/heads/main'", stage_job)
+        self.assertIn("github.repository == 'repoprompt/repoprompt-ce'", stage_job)
+        self.assertIn("RepoPrompt-CE-tip-stage-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}", stage_job)
+        self.assertIn("retention-days: 30", stage_job)
+        self.assertIn("compression-level: 0", stage_job)
         for protected_name in (
+            "secrets.",
             "SENTRY_DSN",
             "SENTRY_AUTH_TOKEN",
             "REPOPROMPT_SENTRY_ORG",
             "REPOPROMPT_SENTRY_PROJECT",
             "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
+            "SIGN_IDENTITY",
+            "NOTARYTOOL_",
+            "SPARKLE_PRIVATE_KEY",
         ):
             self.assertNotIn(protected_name, stage_job)
         self.assertIn("Install Sentry CLI for Tip symbol upload", sign_job)
@@ -2639,6 +2960,22 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             ),
             1,
         )
+        verify_stage = sign_job.index("Verify and expand staged tip source")
+        import_certificate = sign_job.index("Import Developer ID certificate")
+        prepare_secrets = sign_job.index("Prepare provisioning profile and notarization key")
+        prepare_sentry = sign_job.index("Prepare Tip Sentry auth token file")
+        self.assertIn("verify_tip_ci_artifact.py verify-metadata", sign_job)
+        self.assertIn("extract_staged_release.py", sign_job)
+        self.assertIn("validate_staged_release.sh", sign_job)
+        self.assertLess(verify_stage, import_certificate)
+        self.assertLess(verify_stage, prepare_secrets)
+        self.assertLess(verify_stage, prepare_sentry)
+        self.assertIn("RepoPrompt-CE-signed-tip-${{ github.run_id }}-${{ needs.setup.outputs.commit }}", sign_job)
+        self.assertEqual(
+            tip_workflow.count("RepoPrompt-CE-signed-tip-${{ github.run_id }}-${{ needs.setup.outputs.commit }}"),
+            3,
+        )
+        self.assertIn("retention-days: 30", sign_job)
         self.assertLess(
             sign_job.index("Install Sentry CLI for Tip symbol upload"),
             sign_job.index("Sign and notarize staged tip"),
@@ -2712,20 +3049,39 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             package_script,
         )
 
-    def test_main_tip_setup_uses_read_only_github_token_for_release_lookup_helper(self) -> None:
+    def test_main_tip_requires_explicit_exact_ci_provenance(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
-        setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  stage:", 1)[0]
-        after_setup = tip_workflow.split("\n  stage:", 1)[1]
+        setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  sign:", 1)[0]
+        sign_job = tip_workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
         before_publish, publish_job = tip_workflow.split("\n  publish:", 1)
 
-        self.assertIn("permissions:\n  contents: read", tip_workflow)
+        self.assertIn("actions: read", tip_workflow)
+        for input_name in ("ci_run_id", "ci_run_attempt", "expected_sha"):
+            self.assertRegex(
+                tip_workflow,
+                rf"(?m)^      {input_name}:\n(?:        [^\n]*\n)*        required: true$",
+            )
+        self.assertNotIn("latest", setup_job.lower())
+        self.assertIn("github.event.workflow_run.id", setup_job)
+        self.assertIn("github.event.workflow_run.run_attempt", setup_job)
+        self.assertIn("github.event.workflow_run.head_sha", setup_job)
+        self.assertIn('gh api "repos/$CANONICAL_REPOSITORY/actions/runs/$SOURCE_RUN_ID"', setup_job)
+        self.assertIn("verify_tip_ci_artifact.py resolve", setup_job)
+        self.assertIn("--run-attempt \"$SOURCE_RUN_ATTEMPT\"", setup_job)
+        self.assertIn("--expected-sha \"$EXPECTED_SHA\"", setup_job)
+        self.assertIn("artifact-ids: ${{ steps.tip.outputs.artifact-id }}", setup_job)
+        self.assertIn("run-id: ${{ steps.tip.outputs.source-run-id }}", setup_job)
+        self.assertIn("merge-multiple: true", setup_job)
         self.assertIn("./Scripts/lookup_public_tip_release.sh", setup_job)
         self.assertIn("TIP_GH_TOKEN: ${{ github.token }}", setup_job)
-        self.assertEqual(tip_workflow.count("${{ github.token }}"), 1)
-        self.assertNotIn("${{ github.token }}", after_setup)
         self.assertNotIn("environment: tip-release", setup_job)
+        self.assertNotIn("secrets.", setup_job)
         self.assertNotIn("Authorization:", setup_job)
-        self.assertNotIn("api.github.com", setup_job)
+        self.assertIn("artifact-ids: ${{ needs.setup.outputs.stage-artifact-id }}", sign_job)
+        self.assertIn("run-id: ${{ needs.setup.outputs.source-run-id }}", sign_job)
+        self.assertIn("merge-multiple: true", sign_job)
+        self.assertEqual(tip_workflow.count("merge-multiple: true"), 2)
+        self.assertNotIn("stage-artifact-digest", tip_workflow)
         self.assertNotIn("TIP_UPDATE_REPOSITORY_TOKEN", before_publish)
         self.assertIn("TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}", publish_job)
         self.assertEqual(tip_workflow.count("TIP_UPDATE_REPOSITORY_TOKEN"), 1)
@@ -3271,16 +3627,18 @@ label_generated_tip_appcast""",
         workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
         release_workflow = (workflows_dir / "release.yml").read_text(encoding="utf-8")
         tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
+        ci_workflow = (workflows_dir / "ci.yml").read_text(encoding="utf-8")
 
         release_stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
-        tip_stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        tip_stage_job = ci_workflow.split("\n  tip-stage:", 1)[1].split("\n  build-and-test:", 1)[0]
         release_stage_function = release_script.split("stage_publish_release() {", 1)[1].split("\n}", 1)[0]
         tip_stage_function = tip_script.split("stage_tip() {", 1)[1].split("\n}", 1)[0]
         release_resolver = release_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
         tip_resolver = tip_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
 
         self.assertIn("run: ./trusted-control-plane/Scripts/release.sh stage-publish", release_stage_job)
-        self.assertIn("run: ./trusted-control-plane/Scripts/main_tip_release.sh stage", tip_stage_job)
+        self.assertIn("run: ./Scripts/main_tip_release.sh stage", tip_stage_job)
+        self.assertNotIn("\n  stage:", tip_workflow)
         self.assertIn("resolve_without_lockfile_drift", release_stage_function)
         self.assertIn("resolve_without_lockfile_drift", tip_stage_function)
         self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_resolver)

@@ -45,6 +45,7 @@ FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
+STAGE_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-stage-metadata.json"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
 SIGN_UPDATE="$TRUSTED_ROOT/Vendor/Sparkle/bin/sign_update"
 TMP_DIR=""
@@ -133,6 +134,98 @@ write_tip_metadata() {
 JSON
 }
 
+write_tip_stage_metadata() {
+    [[ "${REPOPROMPT_REQUIRE_TIP_STAGE_METADATA:-0}" == "1" ]] || return 0
+    for name in \
+        TIP_STAGE_REPOSITORY \
+        TIP_STAGE_WORKFLOW \
+        TIP_STAGE_EVENT \
+        TIP_STAGE_BRANCH \
+        TIP_STAGE_RUN_ID \
+        TIP_STAGE_RUN_ATTEMPT \
+        TIP_STAGE_ARTIFACT_NAME \
+        TIP_STABLE_BUILD_NUMBER \
+        TIP_COMMIT_SEQUENCE; do
+        require_env "$name"
+    done
+    [[ "$TIP_STAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "TIP_STAGE_RUN_ID must be a positive integer"
+    [[ "$TIP_STAGE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || fail "TIP_STAGE_RUN_ATTEMPT must be a positive integer"
+    [[ "$TIP_COMMIT_SEQUENCE" =~ ^[1-9][0-9]*$ ]] || fail "TIP_COMMIT_SEQUENCE must be a positive integer"
+
+    local archive_digest checksum_digest app_manifest_digest
+    archive_digest="$(shasum -a 256 "$STAGE_ARCHIVE" | awk '{print $1}')"
+    checksum_digest="$(shasum -a 256 "$STAGE_ARCHIVE_CHECKSUM" | awk '{print $1}')"
+    app_manifest_digest="$(shasum -a 256 "$BUILD_ARTIFACT_MANIFEST" | awk '{print $1}')"
+    python3 - \
+        "$STAGE_METADATA" \
+        "$TIP_STAGE_REPOSITORY" \
+        "$TIP_STAGE_WORKFLOW" \
+        "$TIP_STAGE_EVENT" \
+        "$TIP_STAGE_BRANCH" \
+        "$TIP_STAGE_RUN_ID" \
+        "$TIP_STAGE_RUN_ATTEMPT" \
+        "$TIP_COMMIT" \
+        "$TIP_STAGE_ARTIFACT_NAME" \
+        "$TIP_STABLE_BUILD_NUMBER" \
+        "$TIP_COMMIT_SEQUENCE" \
+        "$TIP_BUILD_NUMBER" \
+        "$TIP_TAG" \
+        "$(basename "$STAGE_ARCHIVE")" \
+        "$archive_digest" \
+        "$(basename "$STAGE_ARCHIVE_CHECKSUM")" \
+        "$checksum_digest" \
+        "$app_manifest_digest" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+(
+    output,
+    repository,
+    workflow,
+    event,
+    branch,
+    run_id,
+    run_attempt,
+    head_sha,
+    artifact_name,
+    stable_build_number,
+    commit_sequence,
+    build_number,
+    tag,
+    archive,
+    archive_sha256,
+    checksum,
+    checksum_sha256,
+    app_manifest_sha256,
+) = sys.argv[1:]
+metadata = {
+    "schema_version": 1,
+    "repository": repository,
+    "workflow": workflow,
+    "event": event,
+    "branch": branch,
+    "run_id": int(run_id),
+    "run_attempt": int(run_attempt),
+    "head_sha": head_sha,
+    "artifact_name": artifact_name,
+    "stable_build_number": stable_build_number,
+    "commit_sequence": int(commit_sequence),
+    "build_number": build_number,
+    "tag": tag,
+    "archive": archive,
+    "archive_sha256": archive_sha256,
+    "checksum": checksum,
+    "checksum_sha256": checksum_sha256,
+    "app_manifest_sha256": app_manifest_sha256,
+}
+Path(output).write_text(
+    json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PYTHON
+}
+
 require_tip_sentry_configuration() {
     release_sentry_linking_enabled ||
         fail "Official Tip signing requires REPOPROMPT_ENABLE_SENTRY=1"
@@ -204,6 +297,7 @@ stage_tip() {
     write_tip_metadata
     ditto -c -k --norsrc "$stage_root" "$STAGE_ARCHIVE"
     (cd "$DIST_DIR" && shasum -a 256 "$(basename "$STAGE_ARCHIVE")" > "$(basename "$STAGE_ARCHIVE_CHECKSUM")")
+    write_tip_stage_metadata
     printf 'OK: staged tip build %s (%s) for %s.\n' "$TIP_TAG" "$TIP_BUILD_NUMBER" "$TIP_COMMIT"
 }
 
