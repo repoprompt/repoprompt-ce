@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 struct WorktreeMergeReviewScope: Hashable {
@@ -416,6 +417,7 @@ extension AgentModeViewModel {
             operation.lastError = nil
         }
         do {
+            try await MCPDomainMutationCommitContext.willCommit()
             let result = try await VCSService.shared.applyGitWorktreeMerge(.init(
                 preview: preview,
                 commitMessage: commitMessage
@@ -468,6 +470,7 @@ extension AgentModeViewModel {
             pending.lastError = nil
         }
         do {
+            try await MCPDomainMutationCommitContext.willCommit()
             let result = try await VCSService.shared.applyGitWorktreeMerge(.init(
                 preview: preview,
                 commitMessage: commitMessage
@@ -517,6 +520,7 @@ extension AgentModeViewModel {
             pending.lastError = nil
         }
         do {
+            try await MCPDomainMutationCommitContext.willCommit()
             let result = try await VCSService.shared.continueGitWorktreeMerge(.init(
                 source: operation.source,
                 target: operation.target,
@@ -548,6 +552,7 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams("abort is only valid for an active worktree merge operation.")
         }
         do {
+            try await MCPDomainMutationCommitContext.willCommit()
             let result = try await VCSService.shared.abortGitWorktreeMerge(.init(target: operation.target))
             try updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
                 AgentWorktreeMergeCoordinator.abort(result: result, operation: &pending)

@@ -122,12 +122,14 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
             let store = await MainActor.run { dependencies.promptVM.workspaceFileContextStore }
+            let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
             let host = WorkspaceFileEditHost(
                 store: store,
                 selectionCoordinator: dependencies.selectionCoordinator,
                 lookupRootScope: lookupContext.rootScope,
                 createPathResolutionPolicy: .canonicalAliasFirst,
-                selectCreatedFiles: true
+                selectCreatedFiles: true,
+                mutationRootMappings: mutationRootMappings
             )
             let service = ApplyEditsService(engine: .default, host: host)
 

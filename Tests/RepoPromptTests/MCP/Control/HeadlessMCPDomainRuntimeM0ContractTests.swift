@@ -31,6 +31,22 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(try string(actionEvidence, key: "status"), "explicitly_unmeasured_in_m0")
         XCTAssertEqual(actionEvidence["wire_envelope_claim"] as? Bool, false)
 
+        let protectedMutations = try dictionary(catalog, key: "m4_" + "protected_mutations")
+        XCTAssertEqual(try string(protectedMutations, key: "construction_stage"), "m4b")
+        XCTAssertEqual(
+            try strings(protectedMutations, key: "gate_4a_families"),
+            ["manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces"]
+        )
+        XCTAssertEqual(
+            try strings(protectedMutations, key: "gate_4b_families"),
+            ["file_actions", "apply_edits", "manage_worktree"]
+        )
+        let registrySource = try source("Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift")
+        XCTAssertTrue(registrySource.contains("protectedMutationProvider.protectedBinding"))
+        XCTAssertEqual(registrySource.components(separatedBy: "protectedMutationProvider.protectedBinding").count - 1, 1)
+        let compositionSource = try source("Sources/RepoPrompt/App/AppDomainRuntimeComposition.swift")
+        XCTAssertTrue(compositionSource.contains("protectedMutationStage: .m4B"))
+
         let window = makeWindowWithoutAutoStart()
         addTeardownBlock { @MainActor in
             window.beginClose()
@@ -373,10 +389,33 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             try strings(approval, key: "workspace_operations")
         )
         XCTAssertEqual(try string(approval, key: "cancellation_result"), "denied")
+        XCTAssertEqual(try string(approval, key: "authority"), "DomainMutationApprovalBroker")
+        XCTAssertEqual(try string(approval, key: "presenter"), "WorkspaceApprovalManager")
+        XCTAssertEqual(try string(approval, key: "late_response"), "ignored")
         let approvalManager = try source("Sources/RepoPrompt/Infrastructure/MCP/WorkspaceApproval/WorkspaceApprovalManager.swift")
-        XCTAssertTrue(approvalManager.contains("continuation.resume(returning: .denied)"))
+        XCTAssertTrue(approvalManager.contains("AppKit presenter and compatibility-policy façade"))
+        XCTAssertTrue(approvalManager.contains("case .denied, .cancelled, .presenterUnavailable:"))
+        let approvalBroker = try source("Sources/RepoPromptDomainRuntime/DomainMutationApproval.swift")
+        XCTAssertTrue(approvalBroker.contains("package actor DomainMutationApprovalBroker"))
+        XCTAssertTrue(approvalBroker.contains("guard active?.request.id == requestID else { return }"))
 
         let actorInventory = try dictionary(manifest, key: "main_actor")
+        XCTAssertEqual(
+            try strings(actorInventory, key: "m4_non_main_actor_authorities"),
+            ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "DomainMutationJournal", "DomainMutationPathFence", "MCPDomainProtectedMutationToolProvider"]
+        )
+        let journalSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationJournal.swift")
+        XCTAssertTrue(journalSource.contains("package actor DomainMutationJournal"))
+        XCTAssertTrue(journalSource.contains("case indeterminateAfterCommit"))
+        XCTAssertFalse(journalSource.contains("import AppKit"))
+        let pathFenceSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPathFence.swift")
+        XCTAssertTrue(pathFenceSource.contains("rootIdentityChanged"))
+        XCTAssertTrue(pathFenceSource.contains("pathResolutionChanged"))
+        XCTAssertFalse(pathFenceSource.contains("import AppKit"))
+        XCTAssertEqual(try string(actorInventory, key: "m4_" + "main_actor_presenter"), "WorkspaceApprovalManager")
+        let policySource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPolicy.swift")
+        XCTAssertTrue(policySource.contains("package actor DomainMutationPolicyStore"))
+        XCTAssertFalse(policySource.contains("import AppKit"))
         let scannerFixture = """
         @MainActor final class InlineActor {}
           @MainActor

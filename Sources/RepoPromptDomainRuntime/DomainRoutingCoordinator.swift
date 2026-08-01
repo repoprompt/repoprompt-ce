@@ -195,6 +195,15 @@ package actor DomainRoutingCoordinator {
         )
     }
 
+    /// Returns the coordinator-owned registration token for the live connection incarnation.
+    /// Callers must never synthesize a generation from transport lifecycle counters.
+    package func currentRegistration(connectionID: UUID) throws -> DomainConnectionRegistration {
+        guard let current = connections[connectionID] else {
+            throw DomainReadContextResolutionError.connectionUnavailable
+        }
+        return current.registration
+    }
+
     package func resolveReadContext(
         connection registration: DomainConnectionRegistration
     ) async throws -> DomainReadContextHandle {

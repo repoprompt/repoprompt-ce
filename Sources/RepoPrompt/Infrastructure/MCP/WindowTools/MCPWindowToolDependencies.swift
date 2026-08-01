@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 /// Constructor-time dependency bundle for extracted window-tool providers.
 ///
@@ -310,7 +311,11 @@ struct MCPWindowToolDependencies {
         _ display: FilePathDisplay
     ) async throws -> [ToolResultDTOs.SelectedFileInfo]
     typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabScopedContext) async -> String
-    typealias WritePromptExportFile = @MainActor @Sendable (_ path: String, _ content: String) async throws -> String
+    typealias WritePromptExportFile = @MainActor @Sendable (
+        _ path: String,
+        _ content: String,
+        _ mutationRootMappings: [DomainMutationPhysicalRootMapping]
+    ) async throws -> String
     typealias LatestTokenBreakdown = @MainActor @Sendable () -> TokenCountingViewModel.TokenBreakdown
 
     let executeOracleUtils: ExecuteTool

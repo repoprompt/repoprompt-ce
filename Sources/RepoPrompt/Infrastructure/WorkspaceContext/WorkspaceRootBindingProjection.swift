@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct WorkspaceRootBindingProjection: Equatable {
     let sessionID: UUID
@@ -764,5 +765,22 @@ struct WorkspaceLookupContext: Equatable {
 
     func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         bindingProjection?.physicalizeSelection(selection) ?? selection
+    }
+
+    func domainMutationPhysicalRootMappings(
+        store: WorkspaceFileContextStore
+    ) async -> [DomainMutationPhysicalRootMapping] {
+        let roots = await store.rootRefs(scope: rootScope)
+        let boundRoots = bindingProjection?.boundRootsForMetadata ?? []
+        return roots.map { root in
+            let physical = root.standardizedFullPath
+            let canonical = boundRoots.first {
+                $0.physicalRoot.standardizedFullPath == physical
+            }?.logicalRoot.standardizedFullPath ?? physical
+            return DomainMutationPhysicalRootMapping(
+                canonicalRoot: canonical,
+                physicalRoot: physical
+            )
+        }
     }
 }

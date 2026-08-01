@@ -29,7 +29,10 @@ enum ServiceRegistry {
         #endif
         let bindings: [MCPDomainToolBinding]
         do {
-            bindings = try tools.map { try $0.domainBinding() }
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            bindings = try tools.map {
+                try runtime.protectedMutationProvider.protectedBinding($0.domainBinding())
+            }
         } catch {
             #if DEBUG || EDIT_FLOW_PERF
                 EditFlowPerf.end(

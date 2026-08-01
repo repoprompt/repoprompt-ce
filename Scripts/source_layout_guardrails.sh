@@ -673,6 +673,7 @@ allowed_tracked_docs=(
   "docs/spec/headless-mcp-domain-runtime-m2-context-authority.md"
   "docs/spec/headless-mcp-domain-runtime-m3-evidence.json"
   "docs/spec/headless-mcp-domain-runtime-m3-read-discovery.md"
+  "docs/spec/headless-mcp-domain-runtime-m4-protected-mutations.md"
   "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"

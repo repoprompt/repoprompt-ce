@@ -1343,12 +1343,24 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertNotEqual(refreshed.routingRevision, readHandle.routingRevision)
 
         _ = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
+        let currentRegistration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+        XCTAssertEqual(currentRegistration.connectionID, connectionID)
+        XCTAssertEqual(currentRegistration.runtimeID, runtime.identity.runtimeID)
+        XCTAssertEqual(currentRegistration.generation, registration.generation + 1)
         let stale = await runtime.routingCoordinator.bind(
             connection: registration,
             binding: .unbound,
             operationID: UUID()
         )
         XCTAssertEqual(stale.disposition, .staleGeneration)
+        let current = await runtime.routingCoordinator.bind(
+            connection: currentRegistration,
+            binding: .context(context, explicit: true),
+            operationID: UUID()
+        )
+        XCTAssertEqual(current.disposition, .applied)
+        let restartedHandle = try await runtime.routingCoordinator.resolveReadContext(connection: currentRegistration)
+        XCTAssertEqual(restartedHandle.context, context)
 
         let token = try await runtime.routingCoordinator.issueLaunchToken(.init(
             runID: UUID(),

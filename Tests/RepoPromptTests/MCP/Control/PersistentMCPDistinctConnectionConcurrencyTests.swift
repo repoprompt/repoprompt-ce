@@ -1896,7 +1896,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         let capabilityToken: String?
         let ready: Bool
         let viable: Bool
-        let peerPID: Int
+        let peerPID: Int?
         let selectedWindowID: Int?
         let restrictedTools: Set<String>
         let additionalTools: Set<String>
@@ -1961,6 +1961,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 connectionID: connectionID,
                 sessionToken: sessionToken,
                 clientPid: Int(getpid()),
+                observedKernelPeerPID: Int(getpid()),
                 clientName: clientName,
                 purpose: .unknown,
                 codeMapsDisabled: false,

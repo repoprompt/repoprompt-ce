@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
@@ -2541,6 +2542,7 @@ enum CLIMode {
     case proxy
     case interactive(InteractiveOptions)
     case exec(ExecOptions)
+    case policyAdministration([String])
 }
 
 private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
@@ -2554,6 +2556,9 @@ private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
 func parseCLIMode() -> CLIMode {
     let args = CommandLine.arguments.dropFirst() // Skip executable name
     let hasUserArgs = !args.isEmpty
+    if args.first == "policy" {
+        return .policyAdministration(Array(args.dropFirst()))
+    }
     var interactiveOptions = InteractiveOptions()
     var execOptions = ExecOptions()
     var isInteractive = false
@@ -3553,6 +3558,10 @@ signal(SIGPIPE, SIG_IGN)
 /// Parse CLI mode
 let mode = parseCLIMode()
 
+if case let .policyAdministration(arguments) = mode {
+    await exit(RuntimePolicyAdministration.run(arguments: arguments))
+}
+
 // Exec mode is a bounded one-shot command runner. Run it directly instead of
 // through ServiceGroup so completion exits deterministically.
 if case let .exec(options) = mode {
@@ -3616,6 +3625,8 @@ case let .interactive(options):
     service = InteractiveMCPService(options: options, logger: log)
 case let .exec(options):
     service = ExecMCPService(options: options, logger: log)
+case .policyAdministration:
+    fatalError("Policy administration exits before service composition")
 }
 
 /// Use a quiet logger for ServiceLifecycle to suppress internal debug output

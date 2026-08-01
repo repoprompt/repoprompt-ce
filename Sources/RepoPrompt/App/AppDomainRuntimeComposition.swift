@@ -15,11 +15,21 @@ final class AppDomainRuntimeComposition: Sendable {
         ).first ?? FileManager.default.temporaryDirectory
         let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
         var legacyRuntimeDefaults: [String: Data] = [:]
-        let customStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
+        let defaults = UserDefaults.standard
+        let customStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
         if let customStoragePath,
            let bytes = try? JSONEncoder().encode(customStoragePath)
         {
             legacyRuntimeDefaults["GlobalCustomStorageURL"] = bytes
+        }
+        for key in ["workspace.approvalSettings", "agentModeAutoEditEnabled"] {
+            if let data = defaults.data(forKey: key) {
+                legacyRuntimeDefaults[key] = data
+            } else if defaults.object(forKey: key) != nil,
+                      let data = try? JSONSerialization.data(withJSONObject: defaults.object(forKey: key) as Any)
+            {
+                legacyRuntimeDefaults[key] = data
+            }
         }
         let workspaceStorageDirectory = customStoragePath.map {
             URL(fileURLWithPath: $0, isDirectory: true)
@@ -33,7 +43,8 @@ final class AppDomainRuntimeComposition: Sendable {
                 eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
                 temporaryDirectory: FileManager.default.temporaryDirectory
                     .appendingPathComponent("RepoPrompt CE", isDirectory: true),
-                legacyRuntimeDefaults: legacyRuntimeDefaults
+                legacyRuntimeDefaults: legacyRuntimeDefaults,
+                protectedMutationStage: .m4B
             )
         )
     }

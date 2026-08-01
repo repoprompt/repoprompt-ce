@@ -42,7 +42,8 @@ private let bootstrapLog: Logger = {
 actor BootstrapSocketConnectionManager: MCPServerConnection {
     private let connectionID: UUID
     private let sessionToken: String
-    private let clientPid: Int
+    private let claimedClientPID: Int
+    private let observedKernelPeerPID: Int?
     private let _clientName: String?
     private let purpose: MCPRunPurpose
     private let server: MCP.Server
@@ -64,9 +65,14 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         sessionToken
     }
 
-    /// Verified peer PID for this connection (from the bootstrap socket).
-    func peerPID() -> Int {
-        clientPid
+    /// Kernel-observed peer PID for this connection. A client-declared PID is never returned here.
+    func peerPID() -> Int? {
+        observedKernelPeerPID
+    }
+
+    /// Client-declared handshake PID retained only for compatibility diagnostics and admission heuristics.
+    func claimedPID() -> Int {
+        claimedClientPID
     }
 
     private var healthMonitoringTask: Task<Void, Never>?
@@ -80,6 +86,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         connectionID: UUID,
         sessionToken: String,
         clientPid: Int,
+        observedKernelPeerPID: Int? = nil,
         clientName: String?,
         purpose: MCPRunPurpose,
         codeMapsDisabled: Bool,
@@ -89,7 +96,8 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     ) throws {
         self.connectionID = connectionID
         self.sessionToken = sessionToken
-        self.clientPid = clientPid
+        claimedClientPID = clientPid
+        self.observedKernelPeerPID = observedKernelPeerPID
         _clientName = clientName
         self.purpose = purpose
         self.parentManager = parentManager

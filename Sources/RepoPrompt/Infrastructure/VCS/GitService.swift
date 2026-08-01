@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -753,17 +754,20 @@ actor GitService {
                     if let mutationLockAcquiredHandler {
                         await mutationLockAcquiredHandler(initializationContext?.correlationID)
                     }
+                #endif
+                let mutationRequest = try Self.canonicalizedAppManagedRequestAtMutationBoundary(request)
+                #if DEBUG
                     let parentLookupTrace = initializationContext.map { _ in ReceiptParentLookupTrace() }
                     var receiptDecision = initialReceiptDecision
                 #endif
-                if let mainWorktreeRoot = request.mainWorktreeRoot {
+                if let mainWorktreeRoot = mutationRequest.mainWorktreeRoot {
                     do {
                         try GitWorktreeDefaultPathPlanner.validate(
-                            path: request.path,
+                            path: mutationRequest.path,
                             mainWorktreeRoot: mainWorktreeRoot,
-                            knownWorktreeRoots: request.knownWorktreeRoots,
-                            appManagedContainer: request.appManagedContainer,
-                            allowExternalPath: request.allowExternalPath
+                            knownWorktreeRoots: mutationRequest.knownWorktreeRoots,
+                            appManagedContainer: mutationRequest.appManagedContainer,
+                            allowExternalPath: mutationRequest.allowExternalPath
                         )
                     } catch {
                         #if DEBUG
@@ -842,7 +846,7 @@ actor GitService {
                             )
                     #endif
                     var targetTree = try? await resolveTreeOID(
-                        request.baseRef?.isEmpty == false ? request.baseRef! : "HEAD",
+                        mutationRequest.baseRef?.isEmpty == false ? mutationRequest.baseRef! : "HEAD",
                         in: sourceLayout
                     )
                     #if DEBUG
@@ -859,9 +863,9 @@ actor GitService {
                             receiptDecision?.witnessRequested = true
                         #endif
                         parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
-                        if let stableWatchRootURL = request.appManagedContainer {
+                        if let stableWatchRootURL = mutationRequest.appManagedContainer {
                             witnessSession = creationReceiptCoordinator.start(
-                                destinationURL: request.path,
+                                destinationURL: mutationRequest.path,
                                 stableWatchRootURL: stableWatchRootURL
                             )
                         }
@@ -899,21 +903,21 @@ actor GitService {
                 }
                 do {
                     var args = ["worktree", "add"]
-                    if request.force { args.append("--force") }
-                    if request.detach { args.append("--detach") }
-                    if let lockReason = request.lockReason {
+                    if mutationRequest.force { args.append("--force") }
+                    if mutationRequest.detach { args.append("--detach") }
+                    if let lockReason = mutationRequest.lockReason {
                         args.append("--lock")
                         if !lockReason.isEmpty {
                             args.append("--reason")
                             args.append(lockReason)
                         }
                     }
-                    if let branch = request.branch, !branch.isEmpty {
+                    if let branch = mutationRequest.branch, !branch.isEmpty {
                         args.append("-b")
                         args.append(branch)
                     }
-                    args.append(request.path.standardizedFileURL.path)
-                    if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
+                    args.append(mutationRequest.path.standardizedFileURL.path)
+                    if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
                     #if DEBUG
                         let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
@@ -928,14 +932,14 @@ actor GitService {
                     #endif
 
                     await clearLayoutCache()
-                    let createdPath = request.path.standardizedFileURL.path
+                    let createdPath = mutationRequest.path.standardizedFileURL.path
                     let worktrees = try await listWorktrees(at: repoURL)
                     guard let created = worktrees.first(where: { $0.path == createdPath }) else {
                         throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
                     }
                     let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
-                    let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
-                        request: request,
+                    let includeCopyResult = try await copyWorktreeIncludeFilesIfRequested(
+                        request: mutationRequest,
                         sourceRepoURL: repoURL,
                         destinationURL: destinationURL
                     )
@@ -1101,10 +1105,10 @@ actor GitService {
                             parentCompatibilityKey: parentEvidence.snapshot.compatibilityKey,
                             parentAuthorityBefore: parentEvidence.lease.snapshot,
                             targetAuthorityAfter: targetAuthority,
-                            requestedBaseRef: request.baseRef,
+                            requestedBaseRef: mutationRequest.baseRef,
                             resolvedBaseTreeOID: parentEvidence.baseTree,
                             repositoryRelativeRootPrefix: initializationContext.repositoryRelativeRootPrefix,
-                            plannedTargetPath: request.path.standardizedFileURL.path,
+                            plannedTargetPath: mutationRequest.path.standardizedFileURL.path,
                             actualTargetPath: created.path,
                             exactCopiedRelativePaths: includeCopyResult?.copiedRelativePaths ?? [],
                             includeCopyHadFailures: includeCopyHadFailures,
@@ -1580,13 +1584,14 @@ actor GitService {
         request: GitWorktreeCreateRequest,
         sourceRepoURL: URL,
         destinationURL: URL
-    ) async -> GitWorktreeIncludeCopyResult? {
+    ) async throws -> GitWorktreeIncludeCopyResult? {
         guard request.copyWorktreeIncludeFiles,
               let appManagedContainer = request.appManagedContainer,
               Self.isPath(destinationURL, equalToOrInside: appManagedContainer)
         else { return nil }
         let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
         guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         do {
             let (stdout, stderr, exitCode) = try await runGit(
@@ -1600,12 +1605,15 @@ actor GitService {
                     errorSummaries: ["could not list Git-ignored files: \(stderr)"]
                 )
             }
-            return GitWorktreeIncludeCopier.copyIncludedFiles(
+            return try GitWorktreeIncludeCopier.copyIncludedFiles(
                 from: sourceRepoURL,
                 to: destinationURL,
                 ignoredFilesNULOutput: stdout,
-                appManagedContainer: appManagedContainer
+                appManagedContainer: appManagedContainer,
+                physicalMutationGuard: physicalMutationGuard
             )
+        } catch let error as DomainMutationPathFenceError {
+            throw error
         } catch {
             return GitWorktreeIncludeCopyResult(
                 copiedCount: 0,
@@ -1613,6 +1621,33 @@ actor GitService {
                 errorSummaries: ["could not copy .worktreeinclude files: \(error.localizedDescription)"]
             )
         }
+    }
+
+    private static func canonicalizedAppManagedRequestAtMutationBoundary(
+        _ request: GitWorktreeCreateRequest
+    ) throws -> GitWorktreeCreateRequest {
+        guard !request.allowExternalPath, let appManagedContainer = request.appManagedContainer else {
+            return request
+        }
+        let canonicalContainer = GitRepoRootAuthorization.canonicalPath(appManagedContainer.path)
+        let canonicalDestination = GitRepoRootAuthorization.canonicalPath(request.path.path)
+        let containerPrefix = canonicalContainer.hasSuffix("/") ? canonicalContainer : canonicalContainer + "/"
+        guard canonicalDestination == canonicalContainer || canonicalDestination.hasPrefix(containerPrefix) else {
+            throw GitError(message: "app-managed worktree destination resolved outside its managed container: \(request.path.path)")
+        }
+        return GitWorktreeCreateRequest(
+            path: URL(fileURLWithPath: canonicalDestination, isDirectory: true),
+            branch: request.branch,
+            baseRef: request.baseRef,
+            detach: request.detach,
+            force: request.force,
+            lockReason: request.lockReason,
+            allowExternalPath: request.allowExternalPath,
+            appManagedContainer: URL(fileURLWithPath: canonicalContainer, isDirectory: true),
+            mainWorktreeRoot: request.mainWorktreeRoot,
+            knownWorktreeRoots: request.knownWorktreeRoots,
+            copyWorktreeIncludeFiles: request.copyWorktreeIncludeFiles
+        )
     }
 
     private static func canonicalPathSet(_ paths: [URL]) -> Set<String> {
@@ -7434,6 +7469,7 @@ actor GitService {
         #if DEBUG
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
@@ -7488,6 +7524,7 @@ actor GitService {
                 let spawnStartedAt = DispatchTime.now().uptimeNanoseconds
                 do {
                     try lifecycleController.checkCancellationBeforeSpawn()
+                    try physicalMutationGuard?.revalidate()
                     let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
                         family: commandFamily,
                         priority: admissionPriority

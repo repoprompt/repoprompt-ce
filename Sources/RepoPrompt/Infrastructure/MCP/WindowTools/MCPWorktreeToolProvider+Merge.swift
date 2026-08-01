@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 extension MCPWorktreeToolProvider {
@@ -61,6 +62,11 @@ extension MCPWorktreeToolProvider {
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let operationID = try requiredOperationID(args)
+        let pending = try dependencies.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
+            sessionID: session.sessionID,
+            operationID: operationID
+        )
+        try await admitMergePhysicalTargets(pending, sessionID: session.sessionID)
         let commitMessage = trimmedString(args["commit_message"])
         let result: GitWorktreeMergeApplyResult
         if session.isRoutedAgentMode {
@@ -122,6 +128,7 @@ extension MCPWorktreeToolProvider {
         guard confirmed else {
             throw MCPError.invalidParams("continue requires confirm=true for plain MCP callers.")
         }
+        try await admitMergePhysicalTargets(operation, sessionID: session.sessionID)
         let result = try await dependencies.requireTargetWindow().agentModeViewModel.continueWorktreeMerge(
             sessionID: session.sessionID,
             operationID: operation.id,
@@ -151,6 +158,7 @@ extension MCPWorktreeToolProvider {
         guard confirmed else {
             throw MCPError.invalidParams("abort requires confirm=true for plain MCP callers.")
         }
+        try await admitMergePhysicalTargets(operation, sessionID: session.sessionID)
         let result = try await dependencies.requireTargetWindow().agentModeViewModel.abortWorktreeMerge(
             sessionID: session.sessionID,
             operationID: operation.id,
@@ -178,6 +186,30 @@ extension MCPWorktreeToolProvider {
                 error: result.aborted ? nil : result.message,
                 nextActions: nextActions(for: status, operationID: operation.id, target: result.target)
             )
+        )
+    }
+
+    private func admitMergePhysicalTargets(
+        _ operation: AgentSessionWorktreeMergeOperation,
+        sessionID: UUID
+    ) async throws {
+        let paths = [operation.source.path, operation.target.path]
+        let bindings = try dependencies.requireTargetWindow().agentModeViewModel
+            .worktreeBindings(forAgentSessionID: sessionID)
+        var mappings = bindings.map {
+            DomainMutationPhysicalRootMapping(
+                canonicalRoot: $0.logicalRootPath,
+                physicalRoot: $0.worktreeRootPath
+            )
+        }
+        for path in paths where !mappings.contains(where: {
+            path == $0.physicalRoot || path.hasPrefix($0.physicalRoot + "/")
+        }) {
+            mappings.append(.init(canonicalRoot: path, physicalRoot: path))
+        }
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            paths,
+            rootMappings: mappings
         )
     }
 

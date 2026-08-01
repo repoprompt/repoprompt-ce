@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -72,6 +73,141 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             }
         #else
             throw XCTSkip("Bootstrap socket listener descriptor seam is DEBUG-only")
+        #endif
+    }
+
+    func testBootstrapHandshakeSeparatesKernelObservedPIDFromClaimedPID() async throws {
+        #if DEBUG
+            let fixture = try TemporarySocketFixture.make(prefix: "peer-identity-success")
+            defer { fixture.removeOwnedDirectory() }
+            let claimedPID = 41001
+            let observedPID = Int(getpid())
+            let recorder = BootstrapProcessIdentityRecorder()
+            let server = BootstrapSocketServer(
+                socketURL: fixture.socketURL,
+                peerPIDResolver: { _ in observedPID }
+            )
+            try await server.start { _, _, processIdentity, _ in
+                await recorder.record(processIdentity)
+                return .reject()
+            }
+            do {
+                let clientFD = try Self.connectRawUnixClient(to: fixture.socketURL)
+                defer { Self.closeIfOpen(clientFD) }
+                try Self.writeBootstrapRequest(to: clientFD, clientPid: claimedPID)
+                _ = try Self.readBootstrapResponse(from: clientFD)
+                let recorded = await Self.waitUntil { await recorder.value != nil }
+                XCTAssertTrue(recorded)
+                let identity = await recorder.value
+                XCTAssertEqual(identity?.claimedPID, claimedPID)
+                XCTAssertEqual(identity?.observedKernelPID, observedPID)
+                XCTAssertEqual(identity?.admissionPID, observedPID)
+                await server.stop()
+            } catch {
+                await server.stop()
+                throw error
+            }
+        #else
+            throw XCTSkip("Bootstrap socket peer identity seam is DEBUG-only")
+        #endif
+    }
+
+    func testBootstrapHandshakeDoesNotVerifySpoofedClaimedPIDWhenKernelLookupFails() async throws {
+        #if DEBUG
+            let fixture = try TemporarySocketFixture.make(prefix: "peer-identity-failure")
+            defer { fixture.removeOwnedDirectory() }
+            let spoofedClaimedPID = Int(getpid())
+            let recorder = BootstrapProcessIdentityRecorder()
+            let server = BootstrapSocketServer(
+                socketURL: fixture.socketURL,
+                peerPIDResolver: { _ in nil }
+            )
+            try await server.start { _, _, processIdentity, _ in
+                await recorder.record(processIdentity)
+                return .reject()
+            }
+            do {
+                let clientFD = try Self.connectRawUnixClient(to: fixture.socketURL)
+                defer { Self.closeIfOpen(clientFD) }
+                try Self.writeBootstrapRequest(to: clientFD, clientPid: spoofedClaimedPID)
+                _ = try Self.readBootstrapResponse(from: clientFD)
+                let recorded = await Self.waitUntil { await recorder.value != nil }
+                XCTAssertTrue(recorded)
+                let identity = await recorder.value
+                XCTAssertEqual(identity?.claimedPID, spoofedClaimedPID)
+                XCTAssertNil(identity?.observedKernelPID)
+                XCTAssertEqual(identity?.admissionPID, spoofedClaimedPID)
+                await server.stop()
+            } catch {
+                await server.stop()
+                throw error
+            }
+        #else
+            throw XCTSkip("Bootstrap socket peer identity seam is DEBUG-only")
+        #endif
+    }
+
+    func testAppProxyFastPathDeniesClaimedPIDWhenKernelPeerLookupFails() async throws {
+        #if DEBUG
+            try await Self.withIsolatedManagerSocket(
+                prefix: "app-proxy-peer-identity",
+                bootstrapPeerPIDResolver: { _ in nil }
+            ) { manager, socketURL in
+                await manager.setConnectionApprovalHandler { _, _ in true }
+                await manager.start()
+                let listenerReady = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(listenerReady)
+
+                let sessionToken = "app-proxy-peer-identity-\(UUID().uuidString)"
+                let claimedPID = Int(getpid())
+                let clientFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(clientFD) }
+                try Self.writeBootstrapRequest(
+                    to: clientFD,
+                    sessionToken: sessionToken,
+                    clientPid: claimedPID,
+                    clientName: "spoofed-app-proxy"
+                )
+                let response = try Self.readBootstrapResponse(from: clientFD)
+                XCTAssertEqual(response.type, "accepted")
+
+                let registered = await Self.waitUntil {
+                    await manager.debugConnectionIDForSessionToken(sessionToken) != nil
+                }
+                XCTAssertTrue(registered)
+                let registeredConnectionID = await manager.debugConnectionIDForSessionToken(sessionToken)
+                let connectionID = try XCTUnwrap(registeredConnectionID)
+                let bootstrapIdentity = await manager.debugBootstrapProcessIdentityForTesting(
+                    connectionID: connectionID
+                )
+                XCTAssertEqual(bootstrapIdentity?.claimedPID, claimedPID)
+                XCTAssertNil(bootstrapIdentity?.observedKernelPID)
+                let observedPeerPID = await manager.peerPID(for: connectionID)
+                XCTAssertNil(observedPeerPID)
+
+                let context = await manager.debugDomainInvocationSecurityContextForTesting(
+                    connectionID: connectionID,
+                    toolName: "file_actions"
+                )
+                XCTAssertEqual(context.principal.kind, .appProxy)
+                XCTAssertEqual(context.principal.assurance, .displayNameOnly)
+                XCTAssertNil(context.principal.processID)
+                XCTAssertEqual(context.principal.claimedProcessID, Int32(claimedPID))
+                XCTAssertNil(context.principal.verifiedIdentityFingerprint)
+                do {
+                    _ = try await AppDomainRuntimeComposition.shared.runtime.mutationPolicyStore.authorize(
+                        context: context,
+                        toolName: "file_actions",
+                        action: "create",
+                        canonicalRoots: []
+                    )
+                    XCTFail("Client-declared PID must not enter the verified appProxy fast path")
+                } catch {
+                    XCTAssertEqual(error as? DomainMutationPolicyError, .principalUnverified)
+                }
+            }
+        #else
+            throw XCTSkip("Bootstrap socket peer identity seam is DEBUG-only")
         #endif
     }
 
@@ -1197,11 +1333,15 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         private static func withIsolatedManagerSocket(
             prefix: String,
             bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
+            bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil,
             operation: (ServerNetworkManager, URL) async throws -> Void
         ) async throws {
             let fixture = try TemporarySocketFixture.make(prefix: prefix)
             defer { fixture.removeOwnedDirectory() }
-            let manager = ServerNetworkManager(bootstrapLifecycleTiming: bootstrapLifecycleTiming)
+            let manager = ServerNetworkManager(
+                bootstrapLifecycleTiming: bootstrapLifecycleTiming,
+                bootstrapPeerPIDResolver: bootstrapPeerPIDResolver
+            )
             try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
 
             func stopAndRestoreManager() async throws {
@@ -1267,11 +1407,12 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
     private static func writeBootstrapRequest(
         to fd: Int32,
         sessionToken: String = "fd-hardening-\(UUID().uuidString)",
+        clientPid: Int = Int(getpid()),
         clientName: String = "fd-hardening-test"
     ) throws {
         var payload = try JSONEncoder().encode(MCPBootstrapRequest(
             sessionToken: sessionToken,
-            clientPid: Int(getpid()),
+            clientPid: clientPid,
             clientName: clientName
         ))
         payload.append(UInt8(ascii: "\n"))
@@ -1519,6 +1660,14 @@ private final class SynchronousFDRecorder: @unchecked Sendable {
         }
     }
 #endif
+
+private actor BootstrapProcessIdentityRecorder {
+    private(set) var value: BootstrapClientProcessIdentity?
+
+    func record(_ value: BootstrapClientProcessIdentity) {
+        self.value = value
+    }
+}
 
 private actor OptionalBoolRecorder {
     private(set) var value: Bool?

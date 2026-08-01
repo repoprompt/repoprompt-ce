@@ -1605,9 +1605,13 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return "" }
             return await buildTabClipboardContent(cfg: cfg, context: context)
         },
-        writePromptExportFile: { [weak self] path, content in
+        writePromptExportFile: { [weak self] path, content, mutationRootMappings in
             guard let self else { throw MCPError.internalError("Window deallocated while exporting prompt") }
-            return try await writePromptExportFile(path: path, content: content)
+            return try await writePromptExportFile(
+                path: path,
+                content: content,
+                mutationRootMappings: mutationRootMappings
+            )
         },
         latestTokenBreakdown: { [weak self] in
             guard let self else { return TokenCountingViewModel.TokenBreakdown(total: 0, files: 0, prompt: 0, meta: 0, fileTree: 0, git: 0, other: 0) }
@@ -6207,6 +6211,7 @@ final class MCPServerViewModel: ObservableObject {
         let effectiveNewPath = newPath.map { lookupContext.translateInputPath($0) }
         let shouldSelectCreatedFileInActiveUI = resolvedContext.usesActiveTabCompatibility
         let store = promptVM.workspaceFileContextStore
+        let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
@@ -6236,7 +6241,8 @@ final class MCPServerViewModel: ObservableObject {
                     content: content,
                     overwrite: policy == "overwrite",
                     addToSelection: shouldSelectCreatedFileInActiveUI,
-                    lookupRootScope: lookupContext.rootScope
+                    lookupRootScope: lookupContext.rootScope,
+                    mutationRootMappings: mutationRootMappings
                 )
 
             case "delete":
@@ -6245,13 +6251,22 @@ final class MCPServerViewModel: ObservableObject {
                 guard effectivePath.hasPrefix("/") else {
                     throw MCPError.invalidParams("delete requires an absolute path. Received: \(path)")
                 }
-                try await moveItemToTrash(path: effectivePath, lookupRootScope: lookupContext.rootScope)
+                try await moveItemToTrash(
+                    path: effectivePath,
+                    lookupRootScope: lookupContext.rootScope,
+                    mutationRootMappings: mutationRootMappings
+                )
 
             case "move", "rename":
                 guard let newPath else {
                     throw MCPError.invalidParams("new_path is required for move/rename action")
                 }
-                try await renameFile(oldPath: effectivePath, newPath: effectiveNewPath ?? newPath, lookupRootScope: lookupContext.rootScope)
+                try await renameFile(
+                    oldPath: effectivePath,
+                    newPath: effectiveNewPath ?? newPath,
+                    lookupRootScope: lookupContext.rootScope,
+                    mutationRootMappings: mutationRootMappings
+                )
 
             default:
                 throw MCPError.invalidParams("invalid action: \(action). Must be 'create', 'delete', or 'move'")
@@ -6338,7 +6353,8 @@ final class MCPServerViewModel: ObservableObject {
         content: String,
         overwrite: Bool = false,
         addToSelection: Bool = true,
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
     ) async throws {
         do {
             let store = promptVM.workspaceFileContextStore
@@ -6347,7 +6363,8 @@ final class MCPServerViewModel: ObservableObject {
                 selectionCoordinator: selectionCoordinator,
                 lookupRootScope: lookupRootScope,
                 createPathResolutionPolicy: .literalPreferredIfStronger,
-                selectCreatedFiles: addToSelection
+                selectCreatedFiles: addToSelection,
+                mutationRootMappings: mutationRootMappings
             )
             try await host.writeText(path: path, content: content, overwrite: overwrite)
         } catch is CancellationError {
@@ -6511,7 +6528,11 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     /// Writes prompt export content, allowing absolute paths outside the workspace.
-    private func writePromptExportFile(path rawPath: String, content: String) async throws -> String {
+    private func writePromptExportFile(
+        path rawPath: String,
+        content: String,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping]
+    ) async throws -> String {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let expandedPath = (trimmed as NSString).expandingTildeInPath
         let standardizedPath = (expandedPath as NSString).standardizingPath
@@ -6519,7 +6540,13 @@ final class MCPServerViewModel: ObservableObject {
 
         // Relative paths should continue to be resolved inside the workspace.
         guard resolvedPath.hasPrefix("/") else {
-            try await writeFile(path: resolvedPath, content: content, overwrite: false, addToSelection: false)
+            try await writeFile(
+                path: resolvedPath,
+                content: content,
+                overwrite: false,
+                addToSelection: false,
+                mutationRootMappings: mutationRootMappings
+            )
             return resolvedPath
         }
 
@@ -6529,7 +6556,13 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         if isUnderRoot {
-            try await writeFile(path: resolvedPath, content: content, overwrite: false, addToSelection: false)
+            try await writeFile(
+                path: resolvedPath,
+                content: content,
+                overwrite: false,
+                addToSelection: false,
+                mutationRootMappings: mutationRootMappings
+            )
             return resolvedPath
         }
 
@@ -6539,7 +6572,15 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("path already exists: \(resolvedPath).")
         }
         do {
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [url.standardizedFileURL.path],
+                rootMappings: mutationRootMappings
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
             try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+            try physicalMutationGuard?.revalidate()
             try content.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             throw MCPError.invalidParams("File creation failed for '\(resolvedPath)': \(error.localizedDescription)")
@@ -6548,7 +6589,12 @@ final class MCPServerViewModel: ObservableObject {
         return resolvedPath
     }
 
-    private func renameFile(oldPath: String, newPath: String, lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace) async throws {
+    private func renameFile(
+        oldPath: String,
+        newPath: String,
+        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
+    ) async throws {
         let store = promptVM.workspaceFileContextStore
         let mutationService = WorkspaceFileMutationService(store: store)
         let source = try await mutationService.resolveExactExistingFileForMutation(oldPath, rootScope: lookupRootScope)
@@ -6579,10 +6625,23 @@ final class MCPServerViewModel: ObservableObject {
         if await store.file(rootID: source.rootID, relativePath: newRelativePath) != nil {
             throw MCPError.invalidParams("path already exists: \(newPath)")
         }
+        let destination = StandardizedPath.join(
+            standardizedRoot: sourceRoot.standardizedFullPath,
+            standardizedRelativePath: newRelativePath
+        )
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            [source.standardizedFullPath, destination],
+            rootMappings: mutationRootMappings
+        )
+        try await MCPDomainMutationCommitContext.willCommit()
         try await store.moveFile(rootID: source.rootID, from: source.standardizedRelativePath, to: newRelativePath)
     }
 
-    private func moveItemToTrash(path: String, lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace) async throws {
+    private func moveItemToTrash(
+        path: String,
+        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
+    ) async throws {
         let store = promptVM.workspaceFileContextStore
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         if let issue = await store.exactPathResolutionIssue(for: trimmed, kind: .either, rootScope: lookupRootScope) {
@@ -6590,6 +6649,11 @@ final class MCPServerViewModel: ObservableObject {
         }
         let mutationService = WorkspaceFileMutationService(store: store)
         if let file = await mutationService.exactExistingFile(trimmed, rootScope: lookupRootScope) {
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [file.standardizedFullPath],
+                rootMappings: mutationRootMappings
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
             try await store.moveItemToTrash(rootID: file.rootID, relativePath: file.standardizedRelativePath)
             return
         }
@@ -6597,6 +6661,11 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("Unknown or unloaded path: \(path).")
         }
         if let folder = lookup.folder {
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [folder.standardizedFullPath],
+                rootMappings: mutationRootMappings
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
             try await store.moveItemToTrash(rootID: folder.rootID, relativePath: folder.standardizedRelativePath)
         } else {
             throw MCPError.invalidParams("Unknown or unloaded path: \(path).")
