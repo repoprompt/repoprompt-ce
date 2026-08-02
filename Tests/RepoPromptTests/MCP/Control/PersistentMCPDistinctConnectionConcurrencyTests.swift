@@ -1549,6 +1549,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
         static func make(
             lease: MCPSharedServerTestLease.Ownership,
+            domainRuntime: MCPDomainRuntime? = nil,
             contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
             contextASearchFileCount: Int = 1
         ) async throws -> PersistentMCPTestFixture {
@@ -1562,12 +1563,18 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let windowA = if let contextBuilderProviderFactory {
+            let windowA = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else if let contextBuilderProviderFactory {
                 WindowState(contextBuilderProviderFactory: contextBuilderProviderFactory)
             } else {
                 WindowState()
             }
-            let windowB = WindowState()
+            let windowB = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else {
+                WindowState()
+            }
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
