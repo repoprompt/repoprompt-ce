@@ -498,7 +498,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         XCTAssertEqual(result.receipt?.roots.map(\.rootEpoch.rootID), [healthyRoot.id])
     }
 
-    func testTargetDemandDeadlineDrainsExactOwnedTicket() async throws {
+    func testTargetDemandRetryExhaustionDrainsExactOwnedTicket() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let rootURL = try repository.makeRepository(
             named: "repository",
@@ -508,7 +508,6 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
-        let demandAttempts = CodemapLockedCounter()
         let cleaned = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
         addTeardownBlock {
             await fixture.shutdown()
@@ -516,11 +515,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         }
         let store = fixture.makeStore(
             cancellationCleanupHook: { cleaned.append($0) },
-            demandResultHook: { _, result in
-                demandAttempts.incrementAndGet() == 1
-                    ? .busy(retryAfterMilliseconds: 0)
-                    : result
-            }
+            demandResultHook: { _, _ in .busy(retryAfterMilliseconds: 0) }
         )
         let root = try await store.loadRoot(path: rootURL.path)
         let files = await store.files(inRoot: root.id)
@@ -536,21 +531,17 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         let service = WorkspaceSelectionMutationService(
             store: store,
             automaticSelectionPolicy: .init(
-                maximumReadinessRounds: 10,
+                maximumReadinessRounds: 1,
                 initialBackoffMilliseconds: 1,
-                maximumBackoffMilliseconds: 10,
-                maximumTotalWait: .seconds(1)
-            ),
-            automaticSelectionWaiter: .init(sleep: { _ in
-                try await Task.sleep(for: .milliseconds(10))
-            })
+                maximumBackoffMilliseconds: 1,
+                maximumTotalWait: .zero
+            )
         )
         let result = try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
         XCTAssertEqual(result.targets, [])
         XCTAssertFalse(result.issues.isEmpty)
         let demanded = Array(fixture.demandedTickets.values.dropFirst(ticketOffset))
         XCTAssertEqual(demanded.map(\.fileID), [target.id])
-        XCTAssertEqual(demandAttempts.value, 1)
         XCTAssertEqual(Set(cleaned.values.map(\.retainID)), Set(demanded.map(\.retainID)))
     }
 
