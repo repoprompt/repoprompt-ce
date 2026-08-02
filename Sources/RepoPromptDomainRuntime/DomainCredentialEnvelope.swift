@@ -334,7 +334,7 @@ package actor DomainCredentialEnvelopeStore {
 
     private func pruneExpiredRecords() {
         let now = clock.now
-        let expiredIDs = records.compactMap { id, record in
+        let expiredIDs = records.compactMap { id, record -> UUID? in
             guard record.state == .active, now >= record.descriptor.expiresAt else { return nil }
             return id
         }
