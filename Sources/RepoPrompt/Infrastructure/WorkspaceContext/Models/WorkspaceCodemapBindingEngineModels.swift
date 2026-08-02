@@ -778,6 +778,11 @@ enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
     case prioritizeRestart
 }
 
+enum WorkspaceCodemapGraphIndexWorkerRecoveryState: Hashable {
+    case available
+    case exhausted
+}
+
 enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {
     case current
     case restarted

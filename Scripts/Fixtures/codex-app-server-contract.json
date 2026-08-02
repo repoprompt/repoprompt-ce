@@ -17,6 +17,54 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "account/login/start",
+      "alwaysSent": [
+        "type"
+      ],
+      "enumValues": {
+        "type": [
+          "chatgpt",
+          "chatgptDeviceCode"
+        ]
+      },
+      "responseSchema": "v2/LoginAccountResponse.json",
+      "consumedResponse": [
+        {
+          "path": "type",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "loginId",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "authUrl",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "userCode",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "verificationUrl",
+          "presence": "conditional",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "account/login/cancel",
+      "alwaysSent": [
+        "loginId"
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "model/list",
       "alwaysSent": [
         "limit"
@@ -190,6 +238,20 @@
           "nullable": true
         }
       ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/memoryMode/set",
+      "alwaysSent": [
+        "threadId",
+        "mode"
+      ],
+      "enumValues": {
+        "mode": [
+          "enabled",
+          "disabled"
+        ]
+      }
     },
     {
       "union": "ClientRequest.json",
@@ -606,6 +668,27 @@
       "union": "ClientNotification.json",
       "method": "initialized",
       "alwaysSent": []
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "account/login/completed",
+      "consumedParams": [
+        {
+          "path": "loginId",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "success",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "error",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
     },
     {
       "union": "ServerNotification.json",

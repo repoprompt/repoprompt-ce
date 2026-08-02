@@ -531,6 +531,17 @@ PY
     || grep -q 'resolveTabContextSnapshot' <<<"$(sed -n '/func selectionRefreshedContext/,/private func simplePromptReply/p' "$m3_prompt_backend")"; then
     fail "M3 app backend stopped consuming captured authority or repeated heavyweight routing"
   fi
+  m3_git_backend="Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
+  if ! grep -q 'appContext.metadata' "$m3_git_backend" \
+    || ! grep -q 'appContext.lookupContext' "$m3_git_backend" \
+    || ! grep -q 'appContext?.resolvedTabContext' "$m3_git_backend" \
+    || ! grep -q 'capturedWorkspaceID' "$m3_git_backend"; then
+    fail "M3 git backend stopped consuming captured authority"
+  fi
+  if ! sed -n '/commitPrimaryGitDiffArtifactsToCurrentTab(/,/)/p' "$m3_git_backend" | grep -q 'appContext' \
+    || ! sed -n '/replaceAdvertisedGitArtifactsForCurrentTab(/,/)/p' "$m3_git_backend" | grep -q 'appContext'; then
+    fail "M3 git artifact side effects no longer carry captured authority"
+  fi
 
   m3_side_effects="$domain_runtime_source_dir/DomainReadSideEffectCoordinator.swift"
   if ! grep -q 'case selection' "$m3_side_effects" || ! grep -q 'case gitArtifacts' "$m3_side_effects"; then
@@ -719,11 +730,14 @@ allowed_tracked_docs=(
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
+existing_tracked_docs=()
 while IFS= read -r path; do
-  allowed_tracked_docs+=("$path")
-done < <(git ls-files 'docs/test-suite-optimizer')
+  if [[ -e "$path" ]]; then
+    existing_tracked_docs+=("$path")
+  fi
+done < <(git ls-files docs)
 unexpected_tracked_docs="$(comm -23 \
-  <(git ls-files docs | sort) \
+  <(printf '%s\n' "${existing_tracked_docs[@]}" | sort) \
   <(printf '%s\n' "${allowed_tracked_docs[@]}" | sort))"
 if [[ -n "$unexpected_tracked_docs" ]]; then
   fail "unexpected tracked docs found; keep agent-authored working documents local or add durable docs to the explicit allowlist"

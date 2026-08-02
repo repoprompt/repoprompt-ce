@@ -254,6 +254,7 @@ enum FileSystemError: Error {
     case isDirectory
     case failedToCreateDirectory(Error)
     case invalidRelativePath
+    case mutationInProgress
 }
 
 extension FileSystemError: LocalizedError {
@@ -261,6 +262,8 @@ extension FileSystemError: LocalizedError {
         switch self {
         case .invalidRelativePath:
             "Unsafe workspace mutation path: target escapes the loaded root, contains traversal, or uses a symbolic-link component."
+        case .mutationInProgress:
+            "A conflicting filesystem mutation is still completing. The operation was not started."
         default:
             nil
         }

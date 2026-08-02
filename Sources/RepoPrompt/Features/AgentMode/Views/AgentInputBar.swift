@@ -1269,6 +1269,14 @@ struct AgentComposerView: View, Equatable {
                         }
                     ))
                     .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
+
+                    Toggle("Local Memories", isOn: Binding(
+                        get: { codexTools.memoriesEnabled },
+                        set: { newValue in
+                            actions.applyCodexToolSettingMutation(.memories(enabled: newValue))
+                        }
+                    ))
+                    .hoverTooltip("Let Codex generate and reuse local memories across Agent Mode chats. Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.")
                 } header: {
                     Text("Tools")
                 }

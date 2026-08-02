@@ -37,13 +37,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         let callsAfterDistinctRequest = await calls.value
         XCTAssertEqual(callsAfterDistinctRequest, 2)
 
-        await XCTAssertThrowsErrorAsync(
+        await XCTAssertThrowsErrorAsync({
             try await fixture.invoke(
                 binding,
                 arguments: reusedCorrelation,
                 requestIdentitySeed: "request-1"
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .operationIDCollision("correlation-1"))
         }
         let callsAfterCollision = await calls.value
@@ -64,12 +64,12 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             return .string("unexpected")
         }
 
-        await XCTAssertThrowsErrorAsync(
+        await XCTAssertThrowsErrorAsync({
             try await fixture.invoke(
                 neverCalled,
                 arguments: fixture.arguments(operationID: "outside", path: link.appendingPathComponent("file.txt").path)
             )
-        ) { error in
+        }) { error in
             XCTAssertTrue(error is DomainMutationPathFenceError)
         }
         let callsAfterAdmission = await calls.value
@@ -84,12 +84,12 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             await calls.increment()
             return .string("unexpected")
         }
-        await XCTAssertThrowsErrorAsync(
+        await XCTAssertThrowsErrorAsync({
             try await fixture.invoke(
                 swapped,
                 arguments: fixture.arguments(operationID: "swap", path: link.appendingPathComponent("file.txt").path)
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationPathFenceError, .pathResolutionChanged(link.appendingPathComponent("file.txt").path))
         }
         let callsAfterPrecommit = await calls.value
@@ -105,7 +105,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             DomainMutationPhysicalRootMapping(
                 canonicalRoot: fixture.root.path,
                 physicalRoot: worktreeRoot.path
-            ),
+            )
         ]) { _ in
             try await MCPDomainMutationCommitContext.willCommit()
             return .string("translated")
@@ -126,6 +126,190 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         XCTAssertEqual(record?.pathFence?.coveredRoots, [worktreeRoot.standardizedFileURL.path])
     }
 
+    func testDurableLogicalMutationRejectsRepoRootOutsideAuthoritativeScopeBeforeBackend() async throws {
+        let fixture = try M4BFixture()
+        let calls = MutationCounter()
+        let binding = fixture.logicalBinding { _ in
+            try await MCPDomainMutationCommitContext.willCommit()
+            await calls.increment()
+            return .string("unexpected")
+        }
+        let outsideRoot = fixture.storage.appendingPathComponent("outside-repo", isDirectory: true)
+        let arguments: [String: Value] = [
+            "op": .string("bind"),
+            "repo_root": .string(outsideRoot.path),
+            "operation_id": .string("logical-outside")
+        ]
+
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invokeLogical(binding, arguments: arguments)
+        }) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testDurableLogicalMutationUsesOnlyRequestedRootForMultiRootGrant() async throws {
+        let fixture = try M4BFixture()
+        let rootB = fixture.storage.appendingPathComponent("root-b", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+        let grant = DomainHeadlessMutationGrant(
+            principalKey: "test-app-fingerprint",
+            allowedOperations: ["manage_worktree.bind"],
+            canonicalRoots: [fixture.root.path],
+            provider: "test",
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        _ = try await fixture.runtime.mutationPolicyStore.addGrant(
+            grant,
+            expectedRevision: 0,
+            administrator: m4bTTYAdministrator()
+        )
+        let calls = MutationCounter()
+        let binding = fixture.logicalBinding { _ in
+            try await MCPDomainMutationCommitContext.willCommit()
+            await calls.increment()
+            return .string("applied")
+        }
+        let authorizedRoots: Set<String> = [fixture.root.path, rootB.path]
+        let rootAResult = try await fixture.invokeLogical(
+            binding,
+            arguments: [
+                "op": .string("bind"),
+                "repo_root": .string(fixture.root.path),
+                "operation_id": .string("logical-root-a")
+            ],
+            requestIdentitySeed: "logical-root-a-request",
+            authorizedCanonicalRoots: authorizedRoots,
+            ephemeralGrantedToolNames: []
+        )
+        XCTAssertEqual(rootAResult.stringValue, "applied")
+
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invokeLogical(
+                binding,
+                arguments: [
+                    "op": .string("bind"),
+                    "repo_root": .string(rootB.path),
+                    "operation_id": .string("logical-root-b")
+                ],
+                requestIdentitySeed: "logical-root-b-request",
+                authorizedCanonicalRoots: authorizedRoots,
+                ephemeralGrantedToolNames: []
+            )
+        }) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testDurableLogicalMutationRequiresPostResolutionForDefaultAndAlternateSelectors() async throws {
+        let fixture = try M4BFixture()
+        let rootB = fixture.storage.appendingPathComponent("root-b", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+        let grant = DomainHeadlessMutationGrant(
+            principalKey: "test-app-fingerprint",
+            allowedOperations: ["manage_worktree.bind"],
+            canonicalRoots: [fixture.root.path],
+            provider: "test",
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        _ = try await fixture.runtime.mutationPolicyStore.addGrant(
+            grant,
+            expectedRevision: 0,
+            administrator: m4bTTYAdministrator()
+        )
+        let calls = MutationCounter()
+        let binding = fixture.logicalBinding { _ in
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [rootB.path],
+                rootMappings: [
+                    DomainMutationPhysicalRootMapping(canonicalRoot: rootB.path, physicalRoot: rootB.path)
+                ]
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            await calls.increment()
+            return .string("unexpected")
+        }
+        let selectors: [(label: String, values: [String: Value])] = [
+            ("default", [:]),
+            ("repo-key", ["repo_key": .string("repo-b")]),
+            ("root-name", ["repo_root": .string("root-b")]),
+            ("main-alias", ["repo_root": .string("@main")])
+        ]
+        for selector in selectors {
+            var arguments: [String: Value] = [
+                "op": .string("bind"),
+                "operation_id": .string("post-resolution-\(selector.label)")
+            ]
+            arguments.merge(selector.values) { _, new in new }
+            await XCTAssertThrowsErrorAsync({
+                try await fixture.invokeLogical(
+                    binding,
+                    arguments: arguments,
+                    requestIdentitySeed: "post-resolution-\(selector.label)",
+                    authorizedCanonicalRoots: [fixture.root.path, rootB.path],
+                    ephemeralGrantedToolNames: []
+                )
+            }) { error in
+                XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing, selector.label)
+            }
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testDurableLogicalMutationRejectsMultiRootUnbindAllBeforeBackend() async throws {
+        let fixture = try M4BFixture()
+        let rootB = fixture.storage.appendingPathComponent("root-b", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+        let grant = DomainHeadlessMutationGrant(
+            principalKey: "test-app-fingerprint",
+            allowedOperations: ["manage_worktree.unbind"],
+            canonicalRoots: [fixture.root.path],
+            provider: "test",
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        _ = try await fixture.runtime.mutationPolicyStore.addGrant(
+            grant,
+            expectedRevision: 0,
+            administrator: m4bTTYAdministrator()
+        )
+        let calls = MutationCounter()
+        let binding = fixture.logicalBinding { _ in
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [fixture.root.path, rootB.path],
+                rootMappings: [
+                    DomainMutationPhysicalRootMapping(canonicalRoot: fixture.root.path, physicalRoot: fixture.root.path),
+                    DomainMutationPhysicalRootMapping(canonicalRoot: rootB.path, physicalRoot: rootB.path)
+                ]
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            await calls.increment()
+            return .string("unexpected")
+        }
+
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invokeLogical(
+                binding,
+                arguments: [
+                    "op": .string("unbind"),
+                    "all": .bool(true),
+                    "operation_id": .string("unbind-all-multi-root")
+                ],
+                requestIdentitySeed: "unbind-all-multi-root-request",
+                authorizedCanonicalRoots: [fixture.root.path, rootB.path],
+                ephemeralGrantedToolNames: []
+            )
+        }) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
+    }
+
     func testNonexistentParentIdentitySwapFailsImmediatelyBeforeCommit() async throws {
         let fixture = try M4BFixture()
         let parent = fixture.root.appendingPathComponent("existing-parent", isDirectory: true)
@@ -140,13 +324,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             return .string("unexpected")
         }
 
-        await XCTAssertThrowsErrorAsync(
+        await XCTAssertThrowsErrorAsync({
             try await fixture.invoke(
                 binding,
                 arguments: fixture.arguments(operationID: "parent-swap", path: target),
                 requestIdentitySeed: "parent-swap-request"
             )
-        ) { error in
+        }) { error in
             XCTAssertTrue(error is DomainMutationPathFenceError)
         }
         let callsAfterParentSwap = await calls.value
@@ -223,13 +407,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             await restartedCalls.increment()
             return .string("duplicate")
         }
-        await XCTAssertThrowsErrorAsync(
+        await XCTAssertThrowsErrorAsync({
             try await restarted.invoke(
                 restartedBinding,
                 arguments: arguments,
                 requestIdentitySeed: "cancel-after-request"
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .interruptedCommit("cancel-after"))
         }
         let callsAfterRestart = await restartedCalls.value
@@ -261,13 +445,13 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         }
         await gate.waitUntilEntered()
 
-        await XCTAssertThrowsErrorAsync(
+        await XCTAssertThrowsErrorAsync({
             try await second.invoke(
                 secondBinding,
                 arguments: arguments,
                 requestIdentitySeed: "n-writer-request"
             )
-        ) { error in
+        }) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .operationInProgress("n-writer"))
         }
         await gate.release()
@@ -317,7 +501,7 @@ private final class M4BFixture: @unchecked Sendable {
             "action": .string("create"),
             "operation_id": .string(operationID),
             "path": .string(path ?? root.appendingPathComponent("file.txt").path),
-            "content": .string("content"),
+            "content": .string("content")
         ]
     }
 
@@ -326,7 +510,7 @@ private final class M4BFixture: @unchecked Sendable {
         operation: @Sendable @escaping ([String: Value]) async throws -> Value
     ) -> MCPDomainToolBinding {
         let mappings = rootMappings ?? [
-            DomainMutationPhysicalRootMapping(canonicalRoot: root.path, physicalRoot: root.path),
+            DomainMutationPhysicalRootMapping(canonicalRoot: root.path, physicalRoot: root.path)
         ]
         return runtime.protectedMutationProvider.protectedBinding(MCPDomainToolBinding(
             definition: MCPDomainToolDefinition(
@@ -345,6 +529,20 @@ private final class M4BFixture: @unchecked Sendable {
                 )
                 return try await operation(arguments)
             }
+        ))
+    }
+
+    func logicalBinding(
+        operation: @Sendable @escaping ([String: Value]) async throws -> Value
+    ) -> MCPDomainToolBinding {
+        runtime.protectedMutationProvider.protectedBinding(MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: operation
         ))
     }
 
@@ -381,11 +579,49 @@ private final class M4BFixture: @unchecked Sendable {
             try await binding(arguments)
         }
     }
+
+    func invokeLogical(
+        _ binding: MCPDomainToolBinding,
+        arguments: [String: Value],
+        workspaceRevision: UInt64 = 7,
+        requestIdentitySeed: String = UUID().uuidString,
+        authorizedCanonicalRoots: Set<String>? = nil,
+        ephemeralGrantedToolNames: Set<String> = ["manage_worktree"]
+    ) async throws -> Value {
+        var context = DomainToolInvocationSecurityContext(
+            principal: DomainClientPrincipal(
+                principalID: UUID(),
+                stableKey: "app:test",
+                displayName: "test app proxy",
+                kind: .runScoped,
+                assurance: .hostLaunchToken,
+                processID: 42,
+                runID: UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF"),
+                provider: "test",
+                verifiedIdentityFingerprint: "test-app-fingerprint"
+            ),
+            connectionID: UUID(),
+            connectionGeneration: 1,
+            invocationID: UUID(),
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            workspaceID: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
+            workspaceRevision: workspaceRevision,
+            authorizedCanonicalRoots: authorizedCanonicalRoots ?? [root.path],
+            ephemeralGrantedToolNames: ephemeralGrantedToolNames
+        )
+        context.overrideMutationRequestKeyForTesting(requestIdentitySeed)
+        return try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await binding(arguments)
+        }
+    }
 }
 
 private actor MutationCounter {
     private(set) var value = 0
-    func increment() { value += 1 }
+    func increment() {
+        value += 1
+    }
 }
 
 private actor MutationAttemptBehavior {
@@ -428,8 +664,21 @@ private actor MutationGate {
     }
 }
 
-private func XCTAssertThrowsErrorAsync<T>(
-    _ expression: @autoclosure () async throws -> T,
+private func m4bTTYAdministrator() -> DomainClientPrincipal {
+    DomainClientPrincipal(
+        principalID: UUID(),
+        stableKey: nil,
+        displayName: "local tty",
+        kind: .ttyAdministrator,
+        assurance: .localTTY,
+        processID: 42,
+        runID: nil,
+        provider: nil
+    )
+}
+
+private func XCTAssertThrowsErrorAsync(
+    _ expression: () async throws -> some Any,
     _ verify: (Error) -> Void = { _ in }
 ) async {
     do {

@@ -468,6 +468,8 @@ final actor ServerController: ObservableObject {
                 await networkManager.ensureBootstrapHealthy(force: true)
             } else {
                 try requireCurrentStart(generation)
+                await networkManager.setEnabled(true)
+                try requireCurrentStart(generation)
                 startOutcome = await networkManager.start() // cold start once
                 try requireCurrentStart(generation)
                 await networkManager.ensureBootstrapHealthy(force: true)
@@ -524,24 +526,13 @@ final actor ServerController: ObservableObject {
     }
 
     /// This method will be used to enable/disable all tools at once.
-    func setEnabled(_ enabled: Bool) async {
-        lifecycleGeneration &+= 1
-        let generation = lifecycleGeneration
-        desiredTransportState = enabled ? .running : .disabled
-        await networkManager.setEnabled(enabled)
-        guard generation == lifecycleGeneration else { return }
+    /// Enabling joins the same single-flight start authority as window startup so
+    /// registration and pre-activation checks always precede transport exposure.
+    func setEnabled(_ enabled: Bool) async throws {
         if enabled {
-            let startOutcome = await networkManager.start()
-            guard generation == lifecycleGeneration, desiredTransportState == .running else { return }
-            await networkManager.ensureBootstrapHealthy(force: true)
-            guard generation == lifecycleGeneration, desiredTransportState == .running,
-                  let runningStatus = Self.runningStatus(for: startOutcome)
-            else { return }
-            beginPowerActivity()
-            updateServerStatus(runningStatus)
+            try await startServer()
         } else {
-            endPowerActivity()
-            updateServerStatus("Disabled")
+            await stopServer()
         }
     }
 

@@ -87,6 +87,37 @@ final class DomainMutationApprovalBrokerTests: XCTestCase {
         XCTAssertTrue(snapshot.queuedRequestIDs.isEmpty)
     }
 
+    func testPresenterDeadlineReleasesQueueWhenPresentationHangs() async throws {
+        let broker = DomainMutationApprovalBroker()
+        let gate = ApprovalPresentationGate()
+        let firstRequest = request(summary: "blocked", deadline: Date().addingTimeInterval(0.02))
+        let secondRequest = request(summary: "queued")
+        let presenter = DomainMutationApprovalPresenter(
+            present: { request in
+                if request.id == firstRequest.id {
+                    await gate.wait()
+                }
+                return true
+            },
+            dismiss: { _ in }
+        )
+        await broker.registerPresenter(presenter)
+
+        let firstTask = Task { await broker.request(firstRequest) }
+        try await waitForActive(firstRequest.id, broker: broker)
+        let secondTask = Task { await broker.request(secondRequest) }
+        try await waitForQueue([secondRequest.id], broker: broker)
+
+        let firstResult = await firstTask.value
+        XCTAssertEqual(firstResult, .timeout)
+        try await waitForActive(secondRequest.id, broker: broker)
+        await broker.resolve(requestID: secondRequest.id, approved: true)
+        let secondResult = await secondTask.value
+        XCTAssertEqual(secondResult, .approved(alwaysAllow: false))
+        await gate.release()
+        await broker.shutdown()
+    }
+
     func testCallerTaskCancellationSettlesRequestExactlyOnce() async throws {
         let broker = DomainMutationApprovalBroker()
         let recorder = ApprovalRecorder()
@@ -138,6 +169,24 @@ final class DomainMutationApprovalBrokerTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(1))
         }
         XCTFail("Approval request queue did not match expected order")
+    }
+}
+
+private actor ApprovalPresentationGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

@@ -20,23 +20,79 @@ import RepoPromptDomainRuntime
 #endif
 
 /// Coordinates tool catalog readiness for MCP connections.
-/// Ensures that before a connection can list tools, all required services
-/// are registered and their tools are built.
+/// Readiness observes only actor-owned scope/name presence. It never materializes
+/// definitions, fingerprints, or catalog digests, and concurrent callers share
+/// an in-flight check for the same scope.
 actor MCPToolCatalogReadiness {
+    struct WindowRegistrationState {
+        let toolsEnabled: Bool
+        let toolsRequested: Bool
+    }
+
+    private enum CheckKey: Hashable {
+        case application
+        case window(Int)
+    }
+
+    private struct CheckAttempt {
+        let id: UUID
+        let task: Task<Bool, Never>
+    }
+
+    typealias ScopePresenceOperation = @Sendable (
+        _ requiredToolNames: [String],
+        _ scope: MCPDomainToolRegistrationScope
+    ) async -> MCPDomainToolScopePresence
+    typealias WindowStateOperation = @Sendable (_ windowID: Int) async -> WindowRegistrationState?
+
     static let shared = MCPToolCatalogReadiness()
 
-    private init() {}
+    private let scopePresenceOperation: ScopePresenceOperation
+    private let windowStateOperation: WindowStateOperation
+    private var activeChecks: [CheckKey: CheckAttempt] = [:]
+    #if DEBUG
+        private let checkJoinedOperation: @Sendable (Int?) async -> Void
+    #endif
+
+    private init() {
+        scopePresenceOperation = { requiredToolNames, scope in
+            await ServiceRegistry.scopePresence(
+                requiredToolNames: requiredToolNames,
+                scope: scope
+            )
+        }
+        windowStateOperation = { windowID in
+            await MainActor.run {
+                guard let server = WindowStatesManager.shared.window(withID: windowID)?.mcpServer else {
+                    return nil
+                }
+                return WindowRegistrationState(
+                    toolsEnabled: server.windowToolsEnabled,
+                    toolsRequested: server.windowToolsAreRequested
+                )
+            }
+        }
+        #if DEBUG
+            checkJoinedOperation = { _ in }
+        #endif
+    }
+
+    #if DEBUG
+        init(
+            scopePresenceOperation: @escaping ScopePresenceOperation,
+            windowStateOperation: @escaping WindowStateOperation,
+            checkJoinedOperation: @escaping @Sendable (Int?) async -> Void = { _ in }
+        ) {
+            self.scopePresenceOperation = scopePresenceOperation
+            self.windowStateOperation = windowStateOperation
+            self.checkJoinedOperation = checkJoinedOperation
+        }
+    #endif
 
     /// Default timeout for readiness wait
     static let defaultTimeout: TimeInterval = 5.0
 
     /// Wait for the tool catalog to be ready for a given window.
-    /// This ensures required services are registered and tools are built.
-    ///
-    /// - Parameters:
-    ///   - windowID: The window ID to wait for (nil to skip window-specific checks)
-    ///   - timeout: Maximum time to wait
-    /// - Returns: true if ready, false if timeout
     func awaitReady(windowID: Int?, timeout: TimeInterval = defaultTimeout) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(max(0, timeout)))
@@ -69,64 +125,72 @@ actor MCPToolCatalogReadiness {
         return false
     }
 
-    /// Ensure tools are built for a window by accessing them.
-    /// This forces lazy tool cache population and AWAITS completion.
-    func warmToolCache(windowID: Int) async {
-        // Get the MCPServerViewModel on MainActor
-        let mcpServer: MCPServerViewModel? = await MainActor.run {
-            WindowStatesManager.shared.window(withID: windowID)?.mcpServer
+    private func checkServicesReady(windowID: Int?) async -> Bool {
+        let key = windowID.map(CheckKey.window) ?? .application
+        if let activeCheck = activeChecks[key] {
+            #if DEBUG
+                await checkJoinedOperation(windowID)
+            #endif
+            return await activeCheck.task.value
         }
 
-        guard let mcpServer else {
-            mcpToolCatalogReadinessLog("Cannot warm tool cache - window \(windowID) not found")
-            return
+        let scopePresenceOperation = scopePresenceOperation
+        let windowStateOperation = windowStateOperation
+        let task = Task {
+            await Self.performReadinessCheck(
+                windowID: windowID,
+                scopePresenceOperation: scopePresenceOperation,
+                windowStateOperation: windowStateOperation
+            )
         }
-
-        // Actually await the catalog service tools to force cache build.
-        // This will hop to MainActor internally since MCPServerViewModel is @MainActor.
-        #if DEBUG || EDIT_FLOW_PERF
-            let readinessWarmAccessState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.readinessWarmAccess)
+        let attempt = CheckAttempt(id: UUID(), task: task)
+        activeChecks[key] = attempt
+        #if DEBUG
+            await checkJoinedOperation(windowID)
         #endif
-        _ = await mcpServer.windowMCPTools
-        #if DEBUG || EDIT_FLOW_PERF
-            EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.readinessWarmAccess, readinessWarmAccessState)
-        #endif
-        mcpToolCatalogReadinessLog("Tool cache warmed for window \(windowID)")
+        let result = await task.value
+        if activeChecks[key]?.id == attempt.id {
+            activeChecks.removeValue(forKey: key)
+        }
+        return result
     }
 
-    /// Check if required services are ready (MainActor)
-    @MainActor
-    private func checkServicesReady(windowID: Int?) async -> Bool {
-        let snapshot = await ServiceRegistry.catalogSnapshot()
-        let globalCatalogReady = MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
-            snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
-        }
-        guard globalCatalogReady else {
+    private static func performReadinessCheck(
+        windowID: Int?,
+        scopePresenceOperation: ScopePresenceOperation,
+        windowStateOperation: WindowStateOperation
+    ) async -> Bool {
+        let globalPresence = await scopePresenceOperation(
+            MCPDomainToolCatalog.globalToolNames,
+            .application
+        )
+        guard globalPresence.isComplete else {
             mcpToolCatalogReadinessLog("Application-scoped global domain registrations are not ready")
             return false
         }
 
         guard let windowID else { return true }
-        guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+        guard let windowState = await windowStateOperation(windowID) else {
             mcpToolCatalogReadinessLog("Window \(windowID) not found during readiness check")
             return false
         }
 
-        if !window.mcpServer.windowToolsEnabled {
-            if window.mcpServer.windowToolsAreRequested {
+        if !windowState.toolsEnabled {
+            if windowState.toolsRequested {
                 mcpToolCatalogReadinessLog("Window \(windowID) requested tools but registration is not ready")
                 return false
             }
             mcpToolCatalogReadinessLog("Window \(windowID) intentionally has tools disabled after global readiness")
             return true
         }
-        let requiredScope = MCPDomainToolRegistrationScope.window(id: windowID)
-        let windowCatalogReady = MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
-            snapshot.activeScopesByToolName[toolName]?.contains(requiredScope) == true
-        }
-        if !windowCatalogReady {
+
+        let windowPresence = await scopePresenceOperation(
+            MCPDomainToolCatalog.windowToolNames,
+            .window(id: windowID)
+        )
+        if !windowPresence.isComplete {
             mcpToolCatalogReadinessLog("Window domain tool registration for window \(windowID) not ready")
         }
-        return windowCatalogReady
+        return windowPresence.isComplete
     }
 }

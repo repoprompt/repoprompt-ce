@@ -554,6 +554,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
+        var codexMemoriesEnabled: Bool?
         var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         var agentSessionHandoffInstructions: String?
@@ -568,6 +569,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
+            codexMemoriesEnabled: Bool? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil
@@ -581,6 +583,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
+            self.codexMemoriesEnabled = codexMemoriesEnabled
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions

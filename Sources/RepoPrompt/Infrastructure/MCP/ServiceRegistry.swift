@@ -118,6 +118,16 @@ enum ServiceRegistry {
         await AppDomainRuntimeComposition.shared.runtime.toolRegistry.snapshot()
     }
 
+    static func scopePresence(
+        requiredToolNames: [String],
+        scope: MCPDomainToolRegistrationScope
+    ) async -> MCPDomainToolScopePresence {
+        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.scopePresence(
+            requiredToolNames: requiredToolNames,
+            scope: scope
+        )
+    }
+
     static func resolve(
         toolName: String,
         scope: MCPDomainToolRegistrationScope

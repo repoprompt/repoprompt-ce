@@ -4,6 +4,7 @@ import SwiftUI
 struct CLIProvidersSettingsView: View {
     @ObservedObject var viewModel: APISettingsViewModel
     @ObservedObject var promptViewModel: PromptViewModel
+    @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
     let windowID: Int
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
@@ -37,7 +38,12 @@ struct CLIProvidersSettingsView: View {
     @State private var alertMessage = ""
     @State private var isLoadingClaudeCode = false
     @State private var isLoadingCodex = false
-    @State private var isLoggingIntoCodex = false
+    @State private var isSigningOutCodex = false
+    @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
+    @State private var codexManagedLoginOperationID: UUID?
+    @State private var codexManagedDeviceCode: CodexManagedChatgptDeviceCode?
+    @State private var didCopyCodexManagedDeviceCode = false
+    @State private var showCodexSignOutConfirmation = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
     @State private var isLoadingZAI = false
@@ -86,7 +92,9 @@ struct CLIProvidersSettingsView: View {
         case .testingAppServer:
             "Testing Codex app-server…"
         case .loggingIn:
-            "Waiting for ChatGPT login to complete…"
+            codexManagedDeviceCode == nil
+                ? "Waiting for ChatGPT login to complete…"
+                : "Waiting for device-code sign-in to complete…"
         case .authRequired:
             "Codex authentication needs attention. Use Login with ChatGPT, then retry."
         case let .failed(message):
@@ -143,7 +151,17 @@ struct CLIProvidersSettingsView: View {
             }
         }
         .alert(isPresented: $showAlert) {
-            if showClaudeCodeTraceDump, viewModel.hasClaudeCodeTrace() {
+            if showCodexSignOutConfirmation {
+                Alert(
+                    title: Text(CodexManagedSignOutConfirmation.title),
+                    message: Text(CodexManagedSignOutConfirmation.message),
+                    primaryButton: .destructive(
+                        Text(CodexManagedSignOutConfirmation.confirmTitle),
+                        action: stopCodexSessionsAndSignOut
+                    ),
+                    secondaryButton: .cancel(Text(CodexManagedSignOutConfirmation.cancelTitle))
+                )
+            } else if showClaudeCodeTraceDump, viewModel.hasClaudeCodeTrace() {
                 Alert(
                     title: Text("CLI Provider Management"),
                     message: Text(alertMessage),
@@ -185,6 +203,7 @@ struct CLIProvidersSettingsView: View {
                 showCodexTraceDump = false
                 showOpenCodeTraceDump = false
                 showCursorTraceDump = false
+                showCodexSignOutConfirmation = false
             }
         }
     }
@@ -1502,10 +1521,40 @@ struct CLIProvidersSettingsView: View {
 
     // MARK: - Codex Card
 
+    private func codexAccountSummary(_ account: CodexManagedAccount) -> some View {
+        let projection = account.settingsProjection
+        return Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+            GridRow {
+                Text("Account")
+                    .foregroundColor(.secondary)
+                Text(projection.account)
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                Text("Plan")
+                    .foregroundColor(.secondary)
+                Text(projection.plan)
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                Text("Authentication")
+                    .foregroundColor(.secondary)
+                Text(projection.authentication)
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .font(.caption)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
     private var codexCard: some View {
         providerCard(
             title: "Codex CLI",
-            subtitle: "Runs the Codex CLI through RepoPrompt, honoring your existing login and configuration.",
+            subtitle: "Runs RepoPrompt CE's managed Codex runtime with a separate sign-in from ~/.codex.",
             infoURL: "https://developers.openai.com/codex/cli/",
             isConnected: viewModel.isCodexConnected,
             isExpanded: $isCodexExpanded
@@ -1527,6 +1576,15 @@ struct CLIProvidersSettingsView: View {
                 if viewModel.isCodexConnected {
                     Divider()
 
+                    if let account = viewModel.managedCodexAccount {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Signed in to Codex")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            codexAccountSummary(account)
+                        }
+                    }
+
                     HStack(spacing: 8) {
                         Button(action: { testCodexConnection() }) {
                             if isLoadingCodex {
@@ -1537,16 +1595,25 @@ struct CLIProvidersSettingsView: View {
                                 Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
                             }
                         }
-                        .disabled(isLoadingCodex)
+                        .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
                         .buttonStyle(CustomButtonStyle())
 
                         Spacer()
 
-                        Button(action: { signOutFromCodex() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
+                        if viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true {
+                            Button(action: requestCodexSignOutConfirmation) {
+                                if isSigningOutCodex {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                        .frame(height: 16)
+                                } else {
+                                    Text("Sign Out")
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
+                            .buttonStyle(CustomButtonStyle())
                         }
-                        .buttonStyle(CustomButtonStyle())
                     }
 
                     if case let .connected(resolvedExecutable) = viewModel.codexConnectionPhase,
@@ -1576,11 +1643,15 @@ struct CLIProvidersSettingsView: View {
                                 Label("Connect", systemImage: "link")
                             }
                         }
-                        .disabled(isLoadingCodex || isLoggingIntoCodex)
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow != nil
+                                || codexSessionFence.isLogoutInProgress
+                        )
                         .buttonStyle(CustomButtonStyle())
 
                         Button(action: { startCodexManagedChatgptLogin() }) {
-                            if isLoggingIntoCodex {
+                            if activeCodexManagedLoginFlow == .browser {
                                 ProgressView()
                                     .scaleEffect(0.6)
                                     .frame(height: 16)
@@ -1588,8 +1659,56 @@ struct CLIProvidersSettingsView: View {
                                 Text(CodexManagedAuthRecoveryClassifier.loginActionTitle)
                             }
                         }
-                        .disabled(isLoadingCodex || isLoggingIntoCodex || !viewModel.canAttemptCodexManagedLogin)
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow == .browser
+                                || (activeCodexManagedLoginFlow == nil && !viewModel.canAttemptCodexManagedLogin)
+                        )
                         .buttonStyle(CustomButtonStyle())
+
+                        Button(action: { startCodexManagedChatgptDeviceCodeLogin() }) {
+                            if activeCodexManagedLoginFlow == .deviceCode {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Text(CodexManagedAuthRecoveryClassifier.deviceCodeActionTitle)
+                            }
+                        }
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow == .deviceCode
+                                || (activeCodexManagedLoginFlow == nil && !viewModel.canAttemptCodexManagedLogin)
+                        )
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    if let code = codexManagedDeviceCode {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Enter this one-time code on the verification page:")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            HStack(spacing: 10) {
+                                Text(code.userCode)
+                                    .font(.system(size: 18, weight: .semibold, design: .monospaced))
+                                    .textSelection(.enabled)
+                                Button(didCopyCodexManagedDeviceCode ? "Copied" : "Copy code") {
+                                    copyCodexManagedDeviceCode(code.userCode)
+                                }
+                                .buttonStyle(CustomButtonStyle())
+                                Button("Open verification page") {
+                                    NSWorkspace.shared.open(code.verificationURL)
+                                }
+                                .buttonStyle(CustomButtonStyle())
+                            }
+                            Text("Open the verification page in a browser, enter the code, and leave this panel open. RepoPrompt CE will keep checking this separate Codex sign-in until it completes or expires.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .background(Color.secondary.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
 
                     if let error = viewModel.codexError, !error.isEmpty {
@@ -2035,39 +2154,110 @@ struct CLIProvidersSettingsView: View {
     }
 
     private func startCodexManagedChatgptLogin() {
-        isLoggingIntoCodex = true
-        Task {
+        guard activeCodexManagedLoginFlow != .browser else { return }
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        activeCodexManagedLoginFlow = .browser
+        clearCodexManagedDeviceCode()
+
+        Task { @MainActor in
+            defer { finishCodexManagedLogin(operationID: operationID) }
             do {
                 let ok = try await viewModel.startCodexManagedChatgptLogin { url in
+                    guard codexManagedLoginOperationID == operationID else { return }
                     NSWorkspace.shared.open(url)
                 }
-                await MainActor.run {
-                    isLoggingIntoCodex = false
-                    if ok {
-                        alertMessage = "Codex ChatGPT login completed."
-                        showCodexTraceDump = false
-                        showAlert = true
-                        onAPIKeyUpdated?()
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    isLoggingIntoCodex = false
-                    alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                guard codexManagedLoginOperationID == operationID else { return }
+                if ok {
+                    alertMessage = "Codex ChatGPT login completed."
                     showCodexTraceDump = false
                     showAlert = true
+                    onAPIKeyUpdated?()
                 }
+            } catch {
+                guard codexManagedLoginOperationID == operationID else { return }
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
             }
         }
     }
 
-    private func signOutFromCodex() {
-        Task {
-            await viewModel.resetCodexConnectionForSignOut(windowID: windowID)
-            await MainActor.run {
-                alertMessage = "Signed out from Codex CLI"
+    private func startCodexManagedChatgptDeviceCodeLogin() {
+        guard activeCodexManagedLoginFlow != .deviceCode else { return }
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        activeCodexManagedLoginFlow = .deviceCode
+        clearCodexManagedDeviceCode()
+
+        Task { @MainActor in
+            defer { finishCodexManagedLogin(operationID: operationID) }
+            do {
+                let ok = try await viewModel.startCodexManagedChatgptDeviceCodeLogin { code, shouldOpenVerificationURL in
+                    guard codexManagedLoginOperationID == operationID else { return }
+                    codexManagedDeviceCode = code
+                    if shouldOpenVerificationURL {
+                        NSWorkspace.shared.open(code.verificationURL)
+                    }
+                }
+                guard codexManagedLoginOperationID == operationID else { return }
+                if ok {
+                    alertMessage = "Codex ChatGPT device-code login completed."
+                    showCodexTraceDump = false
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                guard codexManagedLoginOperationID == operationID else { return }
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
+            }
+        }
+    }
+
+    private func finishCodexManagedLogin(operationID: UUID) {
+        guard codexManagedLoginOperationID == operationID else { return }
+        codexManagedLoginOperationID = nil
+        activeCodexManagedLoginFlow = nil
+        clearCodexManagedDeviceCode()
+    }
+
+    private func clearCodexManagedDeviceCode() {
+        codexManagedDeviceCode = nil
+        didCopyCodexManagedDeviceCode = false
+    }
+
+    private func copyCodexManagedDeviceCode(_ code: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        didCopyCodexManagedDeviceCode = true
+    }
+
+    private func requestCodexSignOutConfirmation() {
+        guard viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true,
+              !codexSessionFence.isLogoutInProgress
+        else { return }
+        showCodexSignOutConfirmation = true
+        showAlert = true
+    }
+
+    private func stopCodexSessionsAndSignOut() {
+        guard CodexManagedSignOutConfirmation.shouldProceed(with: .stopSessionsAndSignOut) else { return }
+        isSigningOutCodex = true
+        Task { @MainActor in
+            do {
+                try await viewModel.stopCodexSessionsAndSignOut(windowID: windowID)
+                isSigningOutCodex = false
+                alertMessage = "Signed out from Codex."
+                showCodexTraceDump = false
                 showAlert = true
                 onAPIKeyUpdated?()
+            } catch {
+                isSigningOutCodex = false
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
             }
         }
     }

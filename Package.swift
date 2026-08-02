@@ -82,7 +82,8 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
     "RepoPromptMCP",
-    "RepoPromptShared"
+    "RepoPromptShared",
+    .product(name: "Markdown", package: "swift-markdown")
 ]
 
 var repoPromptTestSwiftSettings: [SwiftSetting] = [

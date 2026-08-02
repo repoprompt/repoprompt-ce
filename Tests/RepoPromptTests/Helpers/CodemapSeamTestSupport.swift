@@ -112,6 +112,7 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
     func readyArtifactDemand(
         store: WorkspaceFileContextStore,
         forFileID fileID: UUID,
+        priority: CodeMapArtifactBuildPriority = .demand,
         timeout: Duration = .seconds(30),
         file: StaticString = #filePath,
         line: UInt = #line
@@ -120,7 +121,7 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         let deadline = clock.now.advanced(by: timeout)
         var lastNonReadyResult: WorkspaceCodemapArtifactDemandResult?
         while clock.now < deadline {
-            let initial = await store.requestCodemapArtifact(forFileID: fileID)
+            let initial = await store.requestCodemapArtifact(forFileID: fileID, priority: priority)
             switch initial {
             case let .pending(ticket):
                 let result = try await settledResult(store: store, ticket: ticket)

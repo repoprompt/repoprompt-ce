@@ -218,7 +218,9 @@ actor MCPService: Sendable {
             teardownRequestCount += 1
         #endif
         lifecycleGeneration &+= 1
-        activeStartAttempt?.task.cancel()
+        let supersededStartAttempt = activeStartAttempt
+        activeStartAttempt = nil
+        supersededStartAttempt?.task.cancel()
         state.isRunning = false
         updates.continuation.yield(state)
 
@@ -302,9 +304,9 @@ actor MCPService: Sendable {
     }
 
     /// Expose enable/disable for Settings
-    func setEnabled(_ flag: Bool) async {
+    func setEnabled(_ flag: Bool) async throws {
         mcpServiceLog("Setting MCP server enabled: \(flag)")
-        await controller.setEnabled(flag)
+        try await controller.setEnabled(flag)
         // No state change for UI, so no yield necessary
     }
 

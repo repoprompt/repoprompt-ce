@@ -13,8 +13,18 @@ on:
         type: string
 
 concurrency:
-  group: main-tip-channel
-  cancel-in-progress: false
+  group: >-
+    ${{
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'success') &&
+      'main-tip-channel' ||
+      format('main-tip-skipped-{0}', github.run_id)
+    }}
+  # Tip is a rolling channel: once main advances, completing an older artifact only
+  # delays the commit users actually asked the channel to publish. A failed CI
+  # notification receives a unique group so it cannot evict a healthy pending or
+  # in-flight Tip build before setup's success guard skips the replacement run.
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
 permissions:
   contents: read
@@ -336,6 +346,7 @@ jobs:
         env:
           REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"
           REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"
+          REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -353,10 +364,20 @@ jobs:
             LOGNAME="$LOGNAME" \
             REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT" \
             REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT" \
+            REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR="$REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR" \
             ./trusted-control-plane/Scripts/smoke_packaged_mcp_roundtrip.sh \
             "extracted/RepoPrompt CE.app" \
             "Tip packaged app" \
             "${manifests[0]}"
+
+      - name: Upload Tip smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-tip-smoke-diagnostics
+          path: ${{ runner.temp }}/tip-smoke-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
 
   publish:
     name: Publish Tip Appcast

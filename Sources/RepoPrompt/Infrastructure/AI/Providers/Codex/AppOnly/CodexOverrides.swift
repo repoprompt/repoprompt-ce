@@ -33,14 +33,19 @@ enum CodexOverrides {
 
     struct FeaturePolicy: Equatable {
         var goalsEnabled: Bool
+        var memoriesEnabled: Bool
         var computerUseEnabled: Bool
 
-        static let defaultDisabled = FeaturePolicy(goalsEnabled: false, computerUseEnabled: false)
-        static let enabledForGoals = FeaturePolicy(goalsEnabled: true, computerUseEnabled: false)
-        static let enabledForComputerUse = FeaturePolicy(goalsEnabled: false, computerUseEnabled: true)
+        static let defaultDisabled = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: false)
+        static let enabledForGoals = FeaturePolicy(goalsEnabled: true, memoriesEnabled: false, computerUseEnabled: false)
+        static let enabledForComputerUse = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: true)
 
-        static func resolved(goalsEnabled: Bool, computerUseEnabled: Bool) -> FeaturePolicy {
-            FeaturePolicy(goalsEnabled: goalsEnabled, computerUseEnabled: computerUseEnabled)
+        static func resolved(goalsEnabled: Bool, memoriesEnabled: Bool, computerUseEnabled: Bool) -> FeaturePolicy {
+            FeaturePolicy(
+                goalsEnabled: goalsEnabled,
+                memoriesEnabled: memoriesEnabled,
+                computerUseEnabled: computerUseEnabled
+            )
         }
     }
 
@@ -163,6 +168,11 @@ enum CodexOverrides {
         var config = forcedDisabledConfig
         if featurePolicy.goalsEnabled {
             config["features.goals"] = true
+        }
+        if featurePolicy.memoriesEnabled {
+            config["features.memories"] = true
+            config["memories.generate_memories"] = true
+            config["memories.use_memories"] = true
         }
         guard featurePolicy.computerUseEnabled else {
             return config

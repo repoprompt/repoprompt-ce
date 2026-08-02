@@ -1072,14 +1072,13 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)
 
-    def test_output_transport_selection_is_pty_only_for_watchdog_non_list_tests(self) -> None:
+    def test_output_transport_selection_is_pty_only_for_watchdog_tests(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         jobs = [
             ("build", {}, "pipe"),
             ("test", {}, "pipe"),
             ("provider-test", {}, "pipe"),
-            ("test", {"list": True, "xctestStallSeconds": 5.0}, "pipe"),
             ("test", {"xctestStallSeconds": 5.0}, "pty"),
             ("provider-test", {"xctestStallSeconds": 5.0}, "pty"),
             ("test", {"xctestStallSeconds": 5.0, "xctestStallWakeProbe": True}, "pty"),
@@ -1682,67 +1681,6 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         )
         self.assertEqual(root_lanes, ["build"])
         self.assertEqual(root_cwd, state.paths.repo_root)
-
-    def test_test_list_cli_preserves_build_lane_and_package_roots(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
-            code = conductor.handle_real_operation(state.paths, "test", ["--list"])
-
-        self.assertEqual(code, 0)
-        self.assertEqual(enqueue.call_args.args[2], {"list": True})
-
-        registry = conductor.OperationRegistry(state.paths.repo_root)
-        root_argv, root_lanes, root_cwd, _env, _timeout = registry.prepare(
-            {"operation": "test", "args": {"list": True}}
-        )
-        provider_argv, provider_lanes, provider_cwd, _env, _timeout = registry.prepare(
-            {"operation": "provider-test", "args": {"list": True}}
-        )
-
-        self.assertEqual(root_argv, ["swift", "test", "list"])
-        self.assertEqual(root_lanes, ["build"])
-        self.assertEqual(root_cwd, state.paths.repo_root)
-        self.assertEqual(provider_argv, ["swift", "test", "list"])
-        self.assertEqual(provider_lanes, ["build"])
-        self.assertEqual(
-            provider_cwd,
-            state.paths.repo_root / "Packages" / "RepoPromptAgentProviders",
-        )
-
-    def test_test_list_rejects_filters_and_stall_diagnostics(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            conductor.handle_real_operation(state.paths, "test", ["--list", "--filter", "ExampleTests"])
-        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined"):
-            conductor.handle_real_operation(
-                state.paths,
-                "provider-test",
-                ["--list", "--xctest-stall-seconds", "10"],
-            )
-        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined"):
-            conductor.handle_real_operation(
-                state.paths,
-                "test",
-                ["--list", "--test-product", "RepoPromptWorkspaceTests"],
-            )
-
-        registry = conductor.OperationRegistry(state.paths.repo_root)
-        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with a filter"):
-            registry.prepare(
-                {
-                    "operation": "test",
-                    "args": {"list": True, "filter": "ExampleTests"},
-                }
-            )
-        with self.assertRaisesRegex(conductor.ConductorError, "cannot be combined with --test-product"):
-            registry.prepare(
-                {
-                    "operation": "test",
-                    "args": {"list": True, "testProduct": "RepoPromptWorkspaceTests"},
-                }
-            )
 
     def test_codex_packaging_environment_survives_client_snapshot_and_build_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,100 @@ final class TabContextRoutingTests: XCTestCase {
         super.tearDown()
     }
 
+    func testScopedReadRebindsStaleRebindableBindingsButNeverRunScoped() {
+        let t1 = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
+        let t2 = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
+        let target = DomainBinding.context(t2, explicit: false)
+
+        // Fresh or never-bound connections always bind toward routing truth.
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(existing: nil, target: target))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(existing: .unbound, target: target))
+
+        // A binding publication racing a tab switch leaves the connection on the previous target;
+        // rebindable bindings must follow the freshly resolved target instead of failing the read.
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .context(t1, explicit: false),
+            target: target
+        ))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .context(t2, explicit: false),
+            target: .context(t2, explicit: true)
+        ))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .appPresentationWindow(7),
+            target: target
+        ))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .appPresentationWindow(7),
+            target: .appPresentationWindow(8)
+        ))
+
+        // Already-current bindings stay untouched: no redundant coordinator mutation per read.
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .context(t2, explicit: false),
+            target: target
+        ))
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .appPresentationWindow(7),
+            target: .appPresentationWindow(7)
+        ))
+
+        // Run-scoped bindings are immutable for the lifetime of their run: the read resolver must
+        // fail closed rather than mutate them, even when the routed target has moved on.
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .runScoped(runID: UUID(), context: t1),
+            target: target
+        ))
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .runScoped(runID: UUID(), context: t2),
+            target: .runScoped(runID: UUID(), context: t2)
+        ))
+    }
+
+    func testScopedReadFinalValidationRejectsMismatchedRunIdentity() {
+        let runA = UUID()
+        let runB = UUID()
+
+        // The only acceptable run-scoped resolution is the exact requested run.
+        XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: runA,
+            resolvedBindingKind: .runScoped(runID: runA)
+        ))
+        XCTAssertFalse(
+            MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+                requestedRunID: runA,
+                resolvedBindingKind: .runScoped(runID: runB)
+            ),
+            "A different run over the same workspace/context must fail closed, never serve the read."
+        )
+
+        // A run-scoped request must not execute over a plain binding.
+        XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: runA,
+            resolvedBindingKind: .explicit
+        ))
+        XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: runA,
+            resolvedBindingKind: .appPresentation
+        ))
+
+        // A non-run request must not execute under someone else's run-scoped binding.
+        XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: nil,
+            resolvedBindingKind: .runScoped(runID: runA)
+        ))
+
+        // Plain bindings satisfy non-run requests.
+        XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: nil,
+            resolvedBindingKind: .explicit
+        ))
+        XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: nil,
+            resolvedBindingKind: .appPresentation
+        ))
+    }
+
     func testBindingResolverResolvesExplicitContextIDAndLegacyTabIDAlias() async throws {
         let contextID = UUID()
         let workspaceID = UUID()
@@ -1731,6 +1825,78 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testDomainRoutingUsesWindowWideRevisionAcrossLowerSelectionRevision() async throws {
+        let authorityRoot = try makeTemporaryDirectory(named: "window-routing-revision")
+        let storageOverride = ScopedGlobalWorkspaceStorageOverride(authorityRoot: authorityRoot)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app,
+            profileIdentifier: "window-routing-revision-\(UUID().uuidString)",
+            storageDirectory: authorityRoot,
+            eventDirectory: authorityRoot.appendingPathComponent("events"),
+            temporaryDirectory: authorityRoot.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState(domainRuntime: runtime)
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            _ = await runtime.shutdown()
+            storageOverride.restore()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        await window.workspaceManager.awaitInitialized()
+
+        let connectionID = UUID()
+        var first = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: window.windowID,
+            workspaceID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "First",
+            runID: nil,
+            explicitlyBound: false
+        )
+        first.selectionRevision = 50
+        window.mcpServer.publishDomainRoutingBinding(connectionID: connectionID, context: first)
+        await window.mcpServer.domainRoutingPublishTask?.value
+
+        var second = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: window.windowID,
+            workspaceID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "Second",
+            runID: nil,
+            explicitlyBound: false
+        )
+        second.selectionRevision = 0
+        window.mcpServer.publishDomainRoutingBinding(connectionID: connectionID, context: second)
+        await window.mcpServer.domainRoutingPublishTask?.value
+
+        let routing = await runtime.routingCoordinator.snapshot()
+        let descriptor = try XCTUnwrap(routing.windows.first { $0.windowID == window.windowID })
+        XCTAssertEqual(descriptor.activeContextID, second.tabID)
+        XCTAssertEqual(descriptor.presentationRevision, 2)
+        let connection = try XCTUnwrap(routing.connections.first {
+            $0.registration.connectionID == connectionID
+        })
+        guard case let .appPresentationWindow(boundWindowID) = connection.binding else {
+            return XCTFail("Expected the connection to retain its presentation-window binding")
+        }
+        XCTAssertEqual(boundWindowID, window.windowID)
+    }
+
+    @MainActor
     func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
         let authorityRoot = try makeTemporaryDirectory(named: "isolated-domain-authority")
         // Scope ownership is established before runtime startup can throw. A successful startup
@@ -3119,6 +3285,7 @@ final class TabContextRoutingTests: XCTestCase {
             let window = WindowState()
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            await window.workspaceManager.awaitInitialized()
 
             do {
                 let sources = root.appendingPathComponent("Sources", isDirectory: true)
@@ -3133,11 +3300,18 @@ final class TabContextRoutingTests: XCTestCase {
                     repoPaths: [root.path],
                     ephemeral: true
                 )
-                await window.workspaceManager.switchWorkspace(
+                let switchResult = await window.workspaceManager.switchWorkspace(
                     to: workspace,
                     saveState: false,
                     reason: "callerBindingRegressionFixture"
                 )
+                guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspace.id else {
+                    throw NSError(
+                        domain: "TabContextRoutingTests",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: switchResult.message ?? "Caller-binding workspace did not become active"]
+                    )
+                }
                 let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
                 window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
                 _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
@@ -3387,6 +3561,7 @@ final class TabContextRoutingTests: XCTestCase {
         selection: StoredSelection,
         name: String
     ) async {
+        await window.workspaceManager.awaitInitialized()
         let workspace = WorkspaceModel(
             id: workspaceID,
             name: name,
@@ -3398,11 +3573,15 @@ final class TabContextRoutingTests: XCTestCase {
             activeComposeTabID: tabID
         )
         window.workspaceManager.workspaces = [workspace]
-        await window.workspaceManager.switchWorkspace(
+        let switchResult = await window.workspaceManager.switchWorkspace(
             to: workspace,
             saveState: false,
             reason: "selectionPropagationLifecycleTest"
         )
+        guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspaceID else {
+            XCTFail(switchResult.message ?? "Selection workspace did not become active")
+            return
+        }
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
         guard var installedTab = window.workspaceManager.composeTab(for: identity) else {
             XCTFail("Expected installed selection tab")

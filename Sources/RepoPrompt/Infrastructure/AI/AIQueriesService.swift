@@ -27,19 +27,22 @@ public struct ChatStreamOutput {
     public let tokens: ChatTokenInfo
     public let isFinal: Bool
     public let cleanupHandle: ProviderConversationCleanupHandle?
+    public let isTransportActivity: Bool
 
     public init(
         text: String,
         reasoning: String?,
         tokens: ChatTokenInfo,
         isFinal: Bool,
-        cleanupHandle: ProviderConversationCleanupHandle? = nil
+        cleanupHandle: ProviderConversationCleanupHandle? = nil,
+        isTransportActivity: Bool = false
     ) {
         self.text = text
         self.reasoning = reasoning
         self.tokens = tokens
         self.isFinal = isFinal
         self.cleanupHandle = cleanupHandle
+        self.isTransportActivity = isTransportActivity
     }
 }
 
@@ -318,6 +321,17 @@ public class AIQueriesService {
         return trimmed.hasPrefix("**") || trimmed.contains("****")
     }
 
+    static func transportActivityOutput(for result: AIStreamResult) -> ChatStreamOutput? {
+        guard result.type == AIStreamResult.transportActivityType else { return nil }
+        return ChatStreamOutput(
+            text: "",
+            reasoning: nil,
+            tokens: ChatTokenInfo(),
+            isFinal: false,
+            isTransportActivity: true
+        )
+    }
+
     static func cleanupHandle(for result: AIStreamResult, model: AIModel) -> ProviderConversationCleanupHandle? {
         if let explicit = result.cleanupHandle {
             return explicit.hasProviderIdentifier ? explicit : nil
@@ -405,6 +419,11 @@ public class AIQueriesService {
                             if Task.isCancelled || managerCancelled {
                                 wasCancelled = true
                                 break streamLoop
+                            }
+
+                            if let activityOutput = Self.transportActivityOutput(for: result) {
+                                continuation.yield(activityOutput)
+                                continue streamLoop
                             }
 
                             var shouldYield = false

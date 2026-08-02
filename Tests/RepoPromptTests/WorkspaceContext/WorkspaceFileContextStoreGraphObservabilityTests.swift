@@ -54,6 +54,22 @@
             XCTAssertTrue(rootSnapshot.milestones.contains { $0.kind == "retryExhausted" })
             XCTAssertTrue(snapshot.storeEvents?.events.contains { $0.kind == "retryExhausted" } == true)
 
+            let acceptedExhaustion = await store.debugSetCodemapGraphIndexWorkerRecoveryStateForTesting(
+                rootID: loaded.id,
+                state: .exhausted
+            )
+            XCTAssertTrue(acceptedExhaustion)
+            let workerExhaustedStatus = await store.currentCodemapRootStatusUpdate()
+            let workerExhaustedRoot = try XCTUnwrap(
+                workerExhaustedStatus.roots.first { $0.rootEpoch.rootID == loaded.id }
+            )
+            XCTAssertEqual(workerExhaustedRoot.availability, .unavailable)
+            XCTAssertEqual(workerExhaustedRoot.unavailableReason, .workerRecoveryExhausted)
+            _ = await store.debugSetCodemapGraphIndexWorkerRecoveryStateForTesting(
+                rootID: loaded.id,
+                state: .available
+            )
+
             let cursor = try XCTUnwrap(snapshot.storeEvents?.events.first?.ordinal)
             let paged = await store.debugCodemapGraphIndexStoreEvents(
                 rootID: loaded.id,

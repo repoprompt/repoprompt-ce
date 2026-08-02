@@ -287,8 +287,11 @@ public class APISettingsViewModel: ObservableObject {
     @Published var isCodexConnected: Bool = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
     @Published var codexError: String? = nil
     @Published private(set) var codexConnectionPhase: CodexConnectionPhase = UserDefaults.standard.bool(forKey: "CodexCLIConnected") ? .connected(resolvedExecutable: nil) : .idle
+    @Published private(set) var codexManagedLoginFlow: CodexManagedLoginFlow?
+    @Published private(set) var managedCodexAccount: CodexManagedAccount?
     @Published private(set) var availableCodexModels: [CodexAppServerClient.RemoteModel] = []
     private var codexLogCollector: CLIProcessLogCollector?
+    private var codexManagedLoginOperationID: UUID?
     // OpenCode CLI / ACP
     @Published var isOpenCodeConnected: Bool = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
     @Published var openCodeError: String? = nil
@@ -514,7 +517,8 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     var canAttemptCodexManagedLogin: Bool {
-        switch codexConnectionPhase {
+        guard !codexSessionFence.isLogoutInProgress else { return false }
+        return switch codexConnectionPhase {
         case .resolvingExecutable, .testingAppServer, .loggingIn, .executableUnavailable:
             false
         case .idle, .refreshingAuth, .authRequired, .connected, .failed:
@@ -537,8 +541,34 @@ public class APISettingsViewModel: ObservableObject {
                 provider,
                 verified: contextBuilderProviderIsConnected(provider)
             )
+            guard provider == .codexExec else { return }
+            if isCodexConnected {
+                Task { [weak self] in
+                    await self?.refreshManagedCodexAccountSnapshotIfConnected()
+                }
+            } else {
+                applyAuthoritativeCodexDisconnectedState()
+            }
         }
         .store(in: &cliConnectionCancellables)
+    }
+
+    private func applyAuthoritativeCodexDisconnectedState() {
+        managedCodexAccount = nil
+        codexConnectionPhase = .idle
+        codexError = nil
+        stopCodexModelsSubscription()
+        availableCodexModels = []
+    }
+
+    private func refreshManagedCodexAccountSnapshotIfConnected() async {
+        guard isCodexConnected else { return }
+        let publicationToken = codexSessionFence.capturePublicationToken()
+        let account = await codexManagedAuthRecovery.managedAccountSnapshot()
+        guard isCodexConnected,
+              codexSessionFence.allowsAuthenticationPublication(publicationToken)
+        else { return }
+        managedCodexAccount = account
     }
 
     private func reloadCLIConnectionFlagsFromDefaults() {
@@ -548,6 +578,9 @@ public class APISettingsViewModel: ObservableObject {
             claudeCodeCLIStatus = .binaryPresent
         }
         isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
+        if !isCodexConnected {
+            managedCodexAccount = nil
+        }
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
         guard wasCursorConnected != isCursorConnected else { return }
@@ -958,6 +991,9 @@ public class APISettingsViewModel: ObservableObject {
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
     private let codexModelPollingService: CodexModelPollingService
+    private let codexManagedAuthRecovery: any CodexManagedAuthRecovering
+    private let codexSessionFence: CodexManagedSessionFence
+    private let codexExecutablePreflight: @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution
     private let storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)?
     private let contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)?
     private var hasPreparedForWindowClose = false
@@ -967,12 +1003,20 @@ public class APISettingsViewModel: ObservableObject {
         keyManager: KeyManager,
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
+        codexManagedAuthRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        codexSessionFence: CodexManagedSessionFence = .shared,
+        codexExecutablePreflight: @escaping @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution = { collector in
+            await CodexProviderHelpers.preflightCodexExecutable(logCollector: collector)
+        },
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
     ) {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
         self.codexModelPollingService = codexModelPollingService
+        self.codexManagedAuthRecovery = codexManagedAuthRecovery
+        self.codexSessionFence = codexSessionFence
+        self.codexExecutablePreflight = codexExecutablePreflight
         self.storedDataLoadBoundary = storedDataLoadBoundary
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         installCLIConnectionObservers()
@@ -1149,6 +1193,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateClaude = isClaudeCodeConnected
         let shouldValidateClaudeBinary = hasActiveClaudeCompatibleBackend
         let shouldValidateCodex = isCodexConnected
+        let codexPublicationToken = codexSessionFence.capturePublicationToken()
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
 
@@ -1166,10 +1211,17 @@ public class APISettingsViewModel: ObservableObject {
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
-            applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
+            let codexPublicationAllowed = codexSessionFence.allowsAuthenticationPublication(codexPublicationToken)
+            applyContextBuilderProviderValidationResult(
+                codexPublicationAllowed && readiness.1,
+                provider: .codexExec
+            )
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
-            if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
+            if codexPublicationAllowed,
+               isCodexConnected,
+               isVerifiedContextBuilderProvider(.codexExec)
+            {
                 startCodexModelsSubscriptionIfNeeded()
             }
             isContextBuilderProviderValidationComplete = true
@@ -1230,10 +1282,15 @@ public class APISettingsViewModel: ObservableObject {
 
     private func probeCachedCodexConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        switch await CodexManagedAuthRecoveryService.shared.refreshManagedAccount() {
-        case .recovered:
+        let publicationToken = codexSessionFence.capturePublicationToken()
+        let refreshResult = await codexManagedAuthRecovery.refreshManagedAccount()
+        guard codexSessionFence.allowsAuthenticationPublication(publicationToken) else { return false }
+        switch refreshResult {
+        case let .recovered(account):
+            managedCodexAccount = account
             return true
         case .requiresUserLogin, .executableUnavailable:
+            managedCodexAccount = nil
             return false
         }
     }
@@ -2850,8 +2907,14 @@ public class APISettingsViewModel: ObservableObject {
         error: String?,
         phase: CodexConnectionPhase,
         updateModels: Bool,
-        windowID: Int = 0
+        windowID: Int = 0,
+        publicationToken: CodexManagedSessionFence.Token? = nil
     ) async {
+        guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
+        if connected {
+            await codexModelPollingService.resumeAfterManagedAuthentication()
+            guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
+        }
         isCodexConnected = connected
         setContextBuilderProviderVerified(.codexExec, verified: connected)
         codexError = error
@@ -2866,6 +2929,7 @@ public class APISettingsViewModel: ObservableObject {
         if updateModels {
             await updateAvailableModels()
         }
+        guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
         NotificationCenter.default.post(
             name: .codexConnectionChanged,
             object: nil,
@@ -2908,83 +2972,244 @@ public class APISettingsViewModel: ObservableObject {
             || lowered.contains("'codex' executable")
     }
 
-    func resetCodexConnectionForSignOut(windowID: Int) async {
-        codexLogCollector = nil
-        await applyCodexConnectionState(
-            connected: false,
-            error: nil,
-            phase: .idle,
-            updateModels: true,
-            windowID: windowID
-        )
+    func stopCodexSessionsAndSignOut(windowID: Int) async throws {
+        guard managedCodexAccount?.isConfirmedManagedAuthentication == true else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Managed Codex sign out is only available for a confirmed managed account."
+            )
+        }
+        codexManagedLoginOperationID = nil
+        codexManagedLoginFlow = nil
+        let result = await WindowStatesManager.shared.stopCodexSessionsAndSignOut()
+        switch result {
+        case .signedOut:
+            codexLogCollector = nil
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: nil,
+                phase: .idle,
+                updateModels: true,
+                windowID: windowID
+            )
+        case let .failed(message):
+            applyCodexConnectionPhase(.failed(message: message), error: message)
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .executableUnavailable(message):
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: .executableUnavailable(message: message),
+                updateModels: true,
+                windowID: windowID
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
     }
 
     func startCodexManagedChatgptLogin(
-        openURL: @MainActor @escaping (URL) -> Void
+        openURL: @MainActor @escaping @Sendable (URL) -> Void
     ) async throws -> Bool {
+        guard let authenticationGeneration = codexSessionFence.beginAuthenticationAttempt() else {
+            throw AIProviderError.invalidConfiguration(detail: "Wait for Codex sign out to finish before signing in again.")
+        }
+        let operationID = beginCodexManagedLogin(flow: .browser)
+        defer { finishCodexManagedLogin(operationID: operationID) }
         await CLIEnvironmentCache.shared.invalidate()
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
         applyCodexConnectionPhase(.resolvingExecutable)
 
-        let resolution = await CodexProviderHelpers.preflightCodexExecutable()
+        let resolution = await codexExecutablePreflight(nil)
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
         guard resolution.status == .available else {
+            managedCodexAccount = nil
             await applyCodexConnectionState(
                 connected: false,
                 error: resolution.userMessage,
                 phase: .executableUnavailable(message: resolution.userMessage),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
 
         applyCodexConnectionPhase(.loggingIn)
 
-        let result = await CodexManagedAuthRecoveryService.shared.startManagedChatgptLogin(openURL: openURL)
+        let result = await codexManagedAuthRecovery.startManagedChatgptLogin(openURL: openURL)
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
         switch result {
-        case .authenticated:
+        case let .authenticated(account):
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = account
             await applyCodexConnectionState(
                 connected: true,
                 error: nil,
                 phase: .connected(resolvedExecutable: resolution.displayDescription),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
-            return true
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        case .authenticatedWithoutManagedAccount:
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
         case let .failed(message):
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: codexFailurePhase(for: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             throw AIProviderError.invalidConfiguration(detail: message)
         case let .executableUnavailable(message):
+            managedCodexAccount = nil
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: .executableUnavailable(message: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             throw AIProviderError.invalidConfiguration(detail: message)
         }
     }
 
+    func startCodexManagedChatgptDeviceCodeLogin(
+        presentDeviceCode: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
+    ) async throws -> Bool {
+        guard let authenticationGeneration = codexSessionFence.beginAuthenticationAttempt() else {
+            throw AIProviderError.invalidConfiguration(detail: "Wait for Codex sign out to finish before signing in again.")
+        }
+        let operationID = beginCodexManagedLogin(flow: .deviceCode)
+        defer { finishCodexManagedLogin(operationID: operationID) }
+        await CLIEnvironmentCache.shared.invalidate()
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
+        applyCodexConnectionPhase(.resolvingExecutable)
+
+        let resolution = await codexExecutablePreflight(nil)
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
+        guard resolution.status == .available else {
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: resolution.userMessage,
+                phase: .executableUnavailable(message: resolution.userMessage),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
+        }
+
+        applyCodexConnectionPhase(.loggingIn)
+
+        let result = await codexManagedAuthRecovery.startManagedChatgptDeviceCodeLogin(
+            presentDeviceCode: presentDeviceCode
+        )
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
+        switch result {
+        case let .authenticated(account):
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = account
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        case .authenticatedWithoutManagedAccount:
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        case let .failed(message):
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: codexFailurePhase(for: message),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .executableUnavailable(message):
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: .executableUnavailable(message: message),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    private func beginCodexManagedLogin(flow: CodexManagedLoginFlow) -> UUID {
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        codexManagedLoginFlow = flow
+        return operationID
+    }
+
+    private func finishCodexManagedLogin(operationID: UUID) {
+        guard codexManagedLoginOperationID == operationID else { return }
+        codexManagedLoginOperationID = nil
+        codexManagedLoginFlow = nil
+    }
+
     func testCodexConnection() async throws -> Bool {
+        guard let authenticationGeneration = codexSessionFence.beginAuthenticationAttempt() else {
+            throw AIProviderError.invalidConfiguration(detail: "Wait for Codex sign out to finish before testing the connection.")
+        }
         let collector = CLIProcessLogCollector()
         collector.append("Codex CLI connection test started")
         codexLogCollector = collector
 
         collector.append("Refreshing login-shell environment cache")
         await CLIEnvironmentCache.shared.invalidate()
+        guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
 
         applyCodexConnectionPhase(.resolvingExecutable)
         collector.append("Resolving Codex CLI executable before authentication checks")
-        let resolution = await CodexProviderHelpers.preflightCodexExecutable(logCollector: collector)
+        let resolution = await codexExecutablePreflight(collector)
+        guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
         guard resolution.status == .available else {
+            managedCodexAccount = nil
             collector.append("Codex executable unavailable before managed authentication refresh")
             await applyCodexConnectionState(
                 connected: false,
                 error: resolution.userMessage,
                 phase: .executableUnavailable(message: resolution.userMessage),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
@@ -2993,26 +3218,34 @@ public class APISettingsViewModel: ObservableObject {
 
         applyCodexConnectionPhase(.refreshingAuth)
         collector.append("Checking Codex managed authentication state before health check")
-        switch await CodexManagedAuthRecoveryService.shared.refreshManagedAccount() {
-        case .recovered:
+        let refreshResult = await codexManagedAuthRecovery.refreshManagedAccount()
+        guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
+        switch refreshResult {
+        case let .recovered(account):
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = account
             collector.append("Codex managed authentication preflight succeeded")
         case let .requiresUserLogin(message):
+            managedCodexAccount = nil
             collector.append("Codex managed authentication preflight requires user login")
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: .authRequired(message: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
         case let .executableUnavailable(message):
+            managedCodexAccount = nil
             collector.append("Codex executable unavailable before health check")
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: .executableUnavailable(message: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
@@ -3029,13 +3262,16 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Health check completed with status: \(ok ? "success" : "empty response")")
             collector.append("Disposing Codex CLI provider resources")
             await provider.dispose()
+            guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
             await applyCodexConnectionState(
                 connected: ok,
                 error: ok ? nil : "Codex CLI health check returned an empty response.",
                 phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
+            guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             if ok {
                 collector.append("Codex CLI marked as connected")
                 codexLogCollector = nil
@@ -3045,13 +3281,15 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             collector.append("Disposing Codex CLI provider resources after failure")
             await provider.dispose()
+            guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
             let finalMessage = friendlyCodexMessage(for: error)
             await applyCodexConnectionState(
                 connected: false,
                 error: finalMessage,
                 phase: codexFailurePhase(for: finalMessage),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(finalMessage)")
             throw error
@@ -3604,9 +3842,12 @@ public class APISettingsViewModel: ObservableObject {
             let stream = await codexModelPollingService.subscribe()
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
-                await MainActor.run {
+                let didPublish = await MainActor.run {
+                    guard snapshot.isAuthorizedForPublication else { return false }
                     self.availableCodexModels = snapshot.models
+                    return true
                 }
+                guard didPublish else { continue }
                 await updateAvailableModels()
             }
         }
@@ -3618,6 +3859,14 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     #if DEBUG
+        func test_refreshManagedCodexAccountSnapshotIfConnected() async {
+            await refreshManagedCodexAccountSnapshotIfConnected()
+        }
+
+        func test_applyAuthoritativeCodexDisconnectedState() {
+            applyAuthoritativeCodexDisconnectedState()
+        }
+
         func test_startCodexModelsSubscriptionIfNeeded() {
             startCodexModelsSubscriptionIfNeeded()
         }

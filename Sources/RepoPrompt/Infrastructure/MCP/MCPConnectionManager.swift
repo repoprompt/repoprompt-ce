@@ -5778,10 +5778,6 @@ actor ServerNetworkManager {
                                 )
                                 return
                             }
-
-                            if let windowID {
-                                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
-                            }
                         }
                     } else {
                         self.pendingConnections.removeValue(forKey: connectionID)
@@ -5789,12 +5785,6 @@ actor ServerNetworkManager {
                     return approved
                 }
 
-                guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
-                await self.installNegotiatedElicitationProvider(
-                    connectionID: connectionID,
-                    lifecycleGeneration: expectedLifecycleGeneration,
-                    manager: manager
-                )
                 guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
 
                 // Update identity after successful start
@@ -5818,31 +5808,6 @@ actor ServerNetworkManager {
                     )
                 )
             }
-        }
-    }
-
-    private func installNegotiatedElicitationProvider(
-        connectionID: UUID,
-        lifecycleGeneration expectedLifecycleGeneration: UInt64,
-        manager: BootstrapSocketConnectionManager
-    ) async {
-        guard isCurrentConnection(
-            connectionID,
-            lifecycleGeneration: expectedLifecycleGeneration
-        ) else {
-            return
-        }
-        let broker = AppDomainRuntimeComposition.shared.runtime.interactionBroker
-        await broker.installNegotiatedElicitationProvider(
-            MCPAskUserElicitationBridge.provider(connection: manager),
-            clientID: connectionID
-        )
-        guard isCurrentConnection(
-            connectionID,
-            lifecycleGeneration: expectedLifecycleGeneration
-        ) else {
-            await broker.installNegotiatedElicitationProvider(nil, clientID: connectionID)
-            return
         }
     }
 
@@ -6818,9 +6783,6 @@ actor ServerNetworkManager {
         // by the commit path's isStillCurrent checks.
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
-        let interactionBroker = AppDomainRuntimeComposition.shared.runtime.interactionBroker
-        await interactionBroker.cancel(clientID: id)
-        await interactionBroker.installNegotiatedElicitationProvider(nil, clientID: id)
         let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
         let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
 
@@ -9893,9 +9855,6 @@ actor ServerNetworkManager {
             guard isReady else {
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
-            if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
-            }
 
             if hydratePersistedPolicy {
                 _ = await hydratePersistedAgentModePolicyForConnectionIfNeeded(
@@ -11275,11 +11234,6 @@ actor ServerNetworkManager {
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
 
-            // Warm tool cache if we have a bound window
-            if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
-            }
-
             // Opportunistic persisted hydration for resumed agent-mode sessions.
             // Persisted routing metadata may restore window/run mapping, and cached
             // run policy (if available) can restore gated tool visibility.
@@ -12330,7 +12284,9 @@ actor ServerNetworkManager {
                                         cleanupDisposition: MCPToolExecutionCleanupDisposition?,
                                         slot: MCPCodeStructureSettlementRegistry.Slot?
                                     )
-                                    if contract.cleanupDisposition == .detachAndSettle {
+                                    if contract.cleanupDisposition == .detachAndSettle,
+                                       toolName != MCPWindowToolName.fileActions
+                                    {
                                         guard let windowID = Self.currentToolDispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
                                         }
@@ -12579,7 +12535,7 @@ actor ServerNetworkManager {
                                                             cancellationOrigin: .watchdogDeadline,
                                                             settlement: "detached",
                                                             graceOutcome: "expired",
-                                                            escalationReason: "read_only_handler_ignored_cancellation"
+                                                            escalationReason: "detach_disposition_handler_ignored_cancellation"
                                                         )
                                                     }
                                                 },
@@ -12721,12 +12677,15 @@ actor ServerNetworkManager {
                                             "settlement": .string(settlement.rawValue)
                                         ]
                                     case MCPToolExecutionWatchdogError.executionDetached:
+                                        let mutationOutcomeMayStillReconcile = toolName == MCPWindowToolName.fileActions
                                         code = "tool_execution_timeout"
-                                        message = "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
+                                        message = mutationOutcomeMayStillReconcile
+                                            ? "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the mutation provider during grace, so it was detached for eventual reconciliation. Inspect the filesystem before issuing another mutation."
+                                            : "Tool '\(toolName)' exceeded its \(selectedDeadlineDescription)-second execution contract. Watchdog cancellation did not settle the read-only provider during grace, so it was detached for eventual cleanup."
                                         outcome = "executionDetached"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
-                                            "retryable": .bool(true),
+                                            "retryable": .bool(!mutationOutcomeMayStillReconcile),
                                             "cancellation_origin": .string(MCPToolExecutionCancellationOrigin.watchdogDeadline.rawValue),
                                             "settlement": .string("detached")
                                         ]
@@ -13474,8 +13433,8 @@ actor ServerNetworkManager {
                 }
                 workspaceID = handle.context.workspaceID
                 workspaceRevision = handle.workspaceRevision
-                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.map {
-                    URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath).standardizedFileURL.path
+                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.compactMap {
+                    DomainMutationPathFence.canonicalPath($0)
                 })
             } catch {
                 // Registration is authoritative only together with a resolved domain context.

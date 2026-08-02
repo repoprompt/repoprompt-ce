@@ -252,7 +252,7 @@ package actor DomainMutationJournal {
     ) async throws {
         let resultData = try JSONEncoder().encode(result)
         try await transition(ticket, now: now) { record in
-            guard record.status == .committing || record.status == .admitted else {
+            guard record.status == .committing else {
                 throw DomainMutationJournalError.ownershipLost(record.operationID)
             }
             return record.updating(status: .applied, resultData: resultData, now: now)
@@ -410,18 +410,22 @@ package struct DomainMutationPhysicalRootMapping: Hashable, Sendable {
 
 package struct DomainMutationCommitController: Sendable {
     private let admitOperation: @Sendable ([String], [DomainMutationPhysicalRootMapping]) async throws -> Void
+    private let physicalGuardOperation: @Sendable () async throws -> DomainMutationPhysicalCommitGuard?
     private let commitOperation: @Sendable () async throws -> Void
 
     package init(
         admitPhysicalTargets: @Sendable @escaping ([String], [DomainMutationPhysicalRootMapping]) async throws -> Void = { _, _ in },
+        physicalMutationGuard: @Sendable @escaping () async throws -> DomainMutationPhysicalCommitGuard? = { nil },
         willCommit: @Sendable @escaping () async throws -> Void
     ) {
         admitOperation = admitPhysicalTargets
+        physicalGuardOperation = physicalMutationGuard
         commitOperation = willCommit
     }
 
     package init(operation: @Sendable @escaping () async throws -> Void) {
         admitOperation = { _, _ in }
+        physicalGuardOperation = { nil }
         commitOperation = operation
     }
 
@@ -430,6 +434,10 @@ package struct DomainMutationCommitController: Sendable {
         rootMappings: [DomainMutationPhysicalRootMapping]
     ) async throws {
         try await admitOperation(paths, rootMappings)
+    }
+
+    package func physicalMutationGuard() async throws -> DomainMutationPhysicalCommitGuard? {
+        try await physicalGuardOperation()
     }
 
     package func willCommit() async throws {
@@ -445,6 +453,10 @@ package enum MCPDomainMutationCommitContext {
         rootMappings: [DomainMutationPhysicalRootMapping]
     ) async throws {
         try await controller?.admitPhysicalTargets(paths, rootMappings: rootMappings)
+    }
+
+    package static func physicalMutationGuard() async throws -> DomainMutationPhysicalCommitGuard? {
+        try await controller?.physicalMutationGuard()
     }
 
     package static func willCommit() async throws {

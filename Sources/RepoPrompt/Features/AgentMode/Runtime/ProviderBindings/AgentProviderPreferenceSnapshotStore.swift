@@ -165,6 +165,8 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
         case let .reasoningSummaries(enabled):
             CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
+        case let .memories(enabled):
+            CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
         case let .mcpServer(normalizedName, enabled):
             CodexAgentToolPreferences.setMCPServerEnabled(
                 normalizedName: normalizedName,
@@ -191,6 +193,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     func setCodexReasoningSummariesEnabled(_ enabled: Bool) {
         applyCodexToolSettingMutation(.reasoningSummaries(enabled: enabled))
+    }
+
+    func setCodexMemoriesEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.memories(enabled: enabled))
     }
 
     func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
@@ -371,6 +377,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
+                memoriesEnabled: codexMemoriesEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -386,6 +393,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
+                memoriesEnabled: codexMemoriesEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -431,6 +439,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     private func codexReasoningSummariesEnabled() -> Bool {
         CodexAgentModeBooleanPreference.reasoningSummaries.isEnabled(defaults: defaults)
+    }
+
+    private func codexMemoriesEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults)
     }
 
     private func claudeEffortLevel(

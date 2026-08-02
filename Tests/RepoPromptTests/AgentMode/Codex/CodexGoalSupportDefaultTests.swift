@@ -57,6 +57,22 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         XCTAssertFalse(CodexReasoningSummaries.isEnabled(defaults: defaults))
     }
 
+    func testMissingUserDefaultsMemoriesKeyDefaultsDisabled() throws {
+        let defaults = try makeIsolatedDefaults()
+
+        XCTAssertNil(defaults.object(forKey: CodexMemories.defaultsKey))
+        XCTAssertFalse(CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults))
+    }
+
+    func testInjectedUserDefaultsMemoriesPreferencePersistsOptIn() throws {
+        let defaults = try makeIsolatedDefaults()
+
+        CodexAgentModeBooleanPreference.memories.setEnabled(true, defaults: defaults)
+
+        XCTAssertEqual(defaults.object(forKey: CodexMemories.defaultsKey) as? Bool, true)
+        XCTAssertTrue(CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults))
+    }
+
     func testMissingGlobalSettingsGoalScalarDefaultsEnabled() throws {
         let store = try makeStore(document: GlobalSettingsDocument(
             scalarPreferences: GlobalScalarPreferences(agentMode: .init())
@@ -104,6 +120,35 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         ))
 
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
+    }
+
+    func testMissingGlobalSettingsMemoriesScalarDefaultsDisabled() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+
+        XCTAssertFalse(store.codexMemoriesEnabled())
+    }
+
+    func testGlobalSettingsMemoriesOptInPersistsAcrossReload() throws {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexMemoriesPersistenceTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: temp)
+        }
+        let fileStore = GlobalSettingsFileStore(fileURL: temp.appendingPathComponent("Settings/globalSettings.json"))
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+        let defaults = try makeIsolatedDefaults()
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        store.setCodexMemoriesEnabled(true)
+
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertTrue(reloaded.codexMemoriesEnabled())
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.agentMode?.codexMemoriesEnabled, true)
     }
 
     func testProviderConversationCleanupActionDefaultsArchiveAndPersistsDelete() throws {

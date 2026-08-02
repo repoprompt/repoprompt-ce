@@ -108,7 +108,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
             "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
             "throw failure",
             "let effectivePath = lookupContext.translateInputPath(path)",
-            "awaitAppliedIngressForExplicitRequest("
+            "awaitAppliedIngressForExplicitRequests("
         ], in: body)
     }
 
@@ -147,7 +147,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
 
         try Self.assertOrdered([
-            "freshness = \"pending\"",
+            "let freshness = \"fresh\"",
             "let baseSelection = resolvedContext.snapshot.selection",
             "let requestedSelection = addResult.selection",
             "resolvedContext.snapshot.selection = requestedSelection",
@@ -158,6 +158,27 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertFalse(body.contains("private discovery selection"))
         XCTAssertTrue(body.contains("use operation ID \\(operationID) only to correlate this result"))
         XCTAssertFalse(body.contains("reconcile using operation ID"))
+    }
+
+    func testDurableFileActionDoesNotReenterStoreForPostMutationIngress() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func performFileAction(\n",
+            to: "    /// Creates a **new** file"
+        ))
+        let postMutation = try XCTUnwrap(body.slice(
+            from: "        // The filesystem mutation is durable.",
+            to: "        if action.lowercased() == \"create\", !resolvedContext.usesActiveTabCompatibility {"
+        ))
+
+        XCTAssertTrue(postMutation.contains("let freshness = \"fresh\""))
+        XCTAssertFalse(postMutation.contains("awaitAppliedIngressForExplicitRequest"))
+        XCTAssertFalse(postMutation.contains("awaitAppliedIngressForExplicitRequests"))
+        try Self.assertOrdered([
+            "MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)",
+            "let freshness = \"fresh\"",
+            "MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)"
+        ], in: postMutation)
     }
 
     func testFileActionsOperationIDSchemaDescribesCorrelationWithoutJournalSemantics() throws {

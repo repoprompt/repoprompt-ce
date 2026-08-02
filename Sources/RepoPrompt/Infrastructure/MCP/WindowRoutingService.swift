@@ -343,12 +343,20 @@ final class WindowRoutingService: Service {
         self.networkMgr = networkMgr
     }
 
+    /// Materializes the static M1 routing definitions without publishing them.
+    /// The process composition batches this service with the other application
+    /// service so registration and availability become visible atomically.
+    @MainActor
+    func prepareDomainTools() async {
+        await updateCachedTools()
+    }
+
     /// Materializes and registers the static M1 routing definitions. The process
     /// composition owns the returned handle; constructing a service is inert.
     @MainActor
     @discardableResult
     func registerDomainTools() async throws -> MCPDomainToolRegistrationResult {
-        await updateCachedTools()
+        await prepareDomainTools()
         return try await ServiceRegistry.register(self)
     }
 

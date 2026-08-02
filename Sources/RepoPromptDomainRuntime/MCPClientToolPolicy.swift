@@ -159,6 +159,25 @@ package enum MCPClientToolPolicyCatalog {
 
     package static let policyGatedToolNames = MCPDomainToolCatalog.toolNames(for: policyGatedCapabilities)
 
+    private static let agentExternalControlToolNames = MCPDomainToolCatalog.toolNames(for: [.agentExternalControl])
+    private static let hiddenToolNamesByRole: [MCPClientTaskRole: Set<String>] = {
+        let exploreControlTools = MCPDomainToolCatalog.toolNames(for: [.agentExploreControl])
+        var exploreCapabilities = discoveryRestrictedCapabilities
+        exploreCapabilities.remove(.agentReasoningControl)
+        exploreCapabilities.remove(.statusPublication)
+        exploreCapabilities.remove(.appSettings)
+        exploreCapabilities.insert(.conversationLog)
+        exploreCapabilities.insert(.selectionMutate)
+        exploreCapabilities.insert(.promptMutate)
+        exploreCapabilities.insert(.workspaceRead)
+
+        return [
+            .direct: exploreControlTools,
+            .explore: MCPDomainToolCatalog.toolNames(for: exploreCapabilities).union(exploreControlTools),
+            .engineer: agentExternalControlToolNames,
+        ]
+    }()
+
     package static func classification(
         for profile: MCPClientToolPolicyProfile
     ) -> MCPClientToolPolicyClassification {
@@ -169,23 +188,10 @@ package enum MCPClientToolPolicyCatalog {
     }
 
     package static func hiddenToolNames(for role: MCPClientTaskRole) -> Set<String> {
-        let exploreControlTools = MCPDomainToolCatalog.toolNames(for: [.agentExploreControl])
-        switch role {
-        case .direct:
-            return exploreControlTools
-        case .explore:
-            var capabilities = discoveryRestrictedCapabilities
-            capabilities.remove(.agentReasoningControl)
-            capabilities.remove(.statusPublication)
-            capabilities.remove(.appSettings)
-            capabilities.insert(.conversationLog)
-            capabilities.insert(.selectionMutate)
-            capabilities.insert(.promptMutate)
-            capabilities.insert(.workspaceRead)
-            return MCPDomainToolCatalog.toolNames(for: capabilities).union(exploreControlTools)
-        case .engineer:
-            return MCPDomainToolCatalog.toolNames(for: [.agentExternalControl])
+        guard let names = hiddenToolNamesByRole[role] else {
+            preconditionFailure("Missing MCP hidden-tool policy for role: \(role.rawValue)")
         }
+        return names
     }
 
     package static func shouldAdvertise(
@@ -195,7 +201,7 @@ package enum MCPClientToolPolicyCatalog {
     ) -> Bool {
         if role != .explore,
            allowsAgentExternalControlTools,
-           MCPDomainToolCatalog.capabilities(for: toolName).contains(.agentExternalControl)
+           agentExternalControlToolNames.contains(toolName)
         {
             return true
         }

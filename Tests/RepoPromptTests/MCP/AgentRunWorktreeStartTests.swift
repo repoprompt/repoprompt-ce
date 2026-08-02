@@ -4449,17 +4449,25 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             windows.append(ownership)
             WindowStatesManager.shared.registerWindowState(window)
             ownership.isRegistered = true
+            await window.workspaceManager.awaitInitialized()
 
             let workspace = window.workspaceManager.createWorkspace(
                 name: "Agent Run Worktree Start \(UUID().uuidString.prefix(8))",
                 repoPaths: roots.map(\.path),
                 ephemeral: true
             )
-            await window.workspaceManager.switchWorkspace(
+            let switchResult = await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
                 reason: "agentRunWorktreeStartTests"
             )
+            guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspace.id else {
+                throw NSError(
+                    domain: "AgentRunWorktreeStartTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: switchResult.message ?? "Project workspace did not become active"]
+                )
+            }
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
             if loadRoots {

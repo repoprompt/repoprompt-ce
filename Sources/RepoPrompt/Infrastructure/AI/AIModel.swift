@@ -1050,7 +1050,7 @@ public enum AIModel: Equatable, Hashable {
     }
 
     var isOpenRouterModel: Bool {
-        Self.modelGroups[ProviderIndex.openRouter].contains(self) || (rawValue.starts(with: "openrouter_custom_"))
+        Self.modelGroups[ProviderIndex.openRouter].contains(self) || (rawValue.hasPrefix("openrouter_custom_"))
     }
 
     var isOllamaModel: Bool {
@@ -1197,7 +1197,7 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle custom OpenRouter models
-        if normalizedRawValue.starts(with: "openrouter_custom_") {
+        if normalizedRawValue.hasPrefix("openrouter_custom_") {
             return .openrouterCustom(name: String(normalizedRawValue.dropFirst("openrouter_custom_".count)))
         }
 
@@ -1218,7 +1218,7 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle Codex CLI models with prefix
-        if normalizedRawValue.starts(with: "codex_cli_") {
+        if normalizedRawValue.hasPrefix("codex_cli_") {
             if let model = modelDefinitions.first(where: { $0.rawValue == normalizedRawValue })?.model {
                 return model
             }
@@ -1235,17 +1235,17 @@ public enum AIModel: Equatable, Hashable {
                 return nil
             }
         }
-        if normalizedRawValue.starts(with: "codex_custom_") {
+        if normalizedRawValue.hasPrefix("codex_custom_") {
             return .codexCustom(name: String(normalizedRawValue.dropFirst("codex_custom_".count)))
         }
-        if normalizedRawValue.starts(with: "opencode_custom_") {
+        if normalizedRawValue.hasPrefix("opencode_custom_") {
             return .openCodeCustom(name: String(normalizedRawValue.dropFirst("opencode_custom_".count)))
         }
-        if normalizedRawValue.starts(with: "cursor_custom_") {
+        if normalizedRawValue.hasPrefix("cursor_custom_") {
             return .cursorCustom(name: String(normalizedRawValue.dropFirst("cursor_custom_".count)))
         }
 
-        if normalizedRawValue.starts(with: "openai_custom_reasoning_") {
+        if normalizedRawValue.hasPrefix("openai_custom_reasoning_") {
             let rest = String(normalizedRawValue.dropFirst("openai_custom_reasoning_".count))
             let parts = rest.components(separatedBy: "__")
             if parts.count >= 2,
@@ -1257,7 +1257,7 @@ public enum AIModel: Equatable, Hashable {
             }
         }
 
-        if normalizedRawValue.starts(with: "openai_custom_responses_") {
+        if normalizedRawValue.hasPrefix("openai_custom_responses_") {
             let name = String(normalizedRawValue.dropFirst("openai_custom_responses_".count))
             guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return .openaiCustomResponses(name: name)
@@ -1277,24 +1277,24 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle Grok custom models
-        if normalizedRawValue.starts(with: "grok_custom_") {
+        if normalizedRawValue.hasPrefix("grok_custom_") {
             return .grokCustom(name: String(normalizedRawValue.dropFirst("grok_custom_".count)))
         }
 
         // Handle Groq custom models
-        if normalizedRawValue.starts(with: "groq_custom_") {
+        if normalizedRawValue.hasPrefix("groq_custom_") {
             return .groqCustom(name: String(normalizedRawValue.dropFirst("groq_custom_".count)))
         }
 
-        if normalizedRawValue.starts(with: "ollama_") {
+        if normalizedRawValue.hasPrefix("ollama_") {
             return .ollama
         }
 
         // Handle custom provider models
-        if normalizedRawValue.starts(with: "custom_provider_user_") {
+        if normalizedRawValue.hasPrefix("custom_provider_user_") {
             return .customProviderUser(name: String(normalizedRawValue.dropFirst("custom_provider_user_".count)))
         }
-        if normalizedRawValue.starts(with: "custom_provider_") {
+        if normalizedRawValue.hasPrefix("custom_provider_") {
             let modelName = String(normalizedRawValue.dropFirst("custom_provider_".count))
             if let config = try? CustomProviderConfiguration.load() {
                 // Preserve the user's selection and show the real provider name when available
@@ -1306,7 +1306,7 @@ public enum AIModel: Equatable, Hashable {
         }
 
         // Handle Fireworks models
-        if normalizedRawValue.starts(with: "accounts/fireworks/models/") {
+        if normalizedRawValue.hasPrefix("accounts/fireworks/models/") {
             return modelDefinitions.first { $0.rawValue == normalizedRawValue }?.model
         }
 

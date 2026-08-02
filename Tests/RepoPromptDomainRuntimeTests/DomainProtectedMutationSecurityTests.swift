@@ -266,6 +266,52 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(callCount, 1)
     }
 
+    func testGrantRootContainmentResolvesSymlinksBeforeAuthorization() async throws {
+        let storage = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-symlink-grant-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let grantedRoot = storage.appendingPathComponent("granted", isDirectory: true)
+        let outsideRoot = storage.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: grantedRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideRoot, withIntermediateDirectories: true)
+
+        let fixture = try RuntimeFixture(mode: .standalone, storage: storage)
+        let grant = DomainHeadlessMutationGrant(
+            principalKey: "client:test",
+            allowedOperations: ["manage_selection.set"],
+            canonicalRoots: [grantedRoot.path],
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        let added = try await fixture.runtime.mutationPolicyStore.addGrant(
+            grant,
+            expectedRevision: 0,
+            administrator: Self.ttyAdministrator()
+        )
+        XCTAssertEqual(added.headlessGrants.first?.canonicalRoots, [grantedRoot.path])
+
+        try FileManager.default.removeItem(at: grantedRoot)
+        try FileManager.default.createSymbolicLink(at: grantedRoot, withDestinationURL: outsideRoot)
+        let requestedPath = grantedRoot.appendingPathComponent("secret.txt").path
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "manage_selection", calls: calls)
+        let context = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [requestedPath],
+            ephemeralGrantedToolNames: []
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                try await binding(["op": .string("set")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
+    }
+
     func testPolicyAdministrationRequiresLocalTTYPrincipalAndRejectsStaleRevision() async throws {
         let fixture = try RuntimeFixture(mode: .standalone)
         let grant = DomainHeadlessMutationGrant(

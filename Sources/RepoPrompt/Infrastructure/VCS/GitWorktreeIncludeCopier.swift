@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 enum GitWorktreeIncludeCopier {
     private static let includeFileName = ".worktreeinclude"
@@ -8,8 +9,9 @@ enum GitWorktreeIncludeCopier {
         to destinationRoot: URL,
         ignoredFilesNULOutput: String,
         appManagedContainer: URL? = nil,
-        fileManager: FileManager = .default
-    ) -> GitWorktreeIncludeCopyResult? {
+        fileManager: FileManager = .default,
+        physicalMutationGuard: DomainMutationPhysicalCommitGuard? = nil
+    ) throws -> GitWorktreeIncludeCopyResult? {
         let includeURL = sourceRoot.appendingPathComponent(includeFileName, isDirectory: false)
         guard fileManager.fileExists(atPath: includeURL.path) else { return nil }
 
@@ -87,10 +89,24 @@ enum GitWorktreeIncludeCopier {
                     skippedSummaries.append("source is not a regular file for \(relativePath)")
                     continue
                 }
+            } catch {
+                errorSummaries.append("failed to inspect \(relativePath): \(error.localizedDescription)")
+                continue
+            }
+
+            try physicalMutationGuard?.revalidate()
+            do {
                 try fileManager.createDirectory(
                     at: destinationURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
+            } catch {
+                errorSummaries.append("failed to prepare \(relativePath): \(error.localizedDescription)")
+                continue
+            }
+
+            try physicalMutationGuard?.revalidate()
+            do {
                 try fileManager.copyItem(at: sourceURL, to: destinationURL)
                 copiedCount += 1
                 copiedRelativePaths.append(pathComponents.joined(separator: "/"))

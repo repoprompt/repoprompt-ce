@@ -216,6 +216,14 @@ struct CodexProviderToolsRuntimeSection: View {
             )
             .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
 
+            ProviderRuntimeToggleRow(
+                title: "Local Memories",
+                description: "Let Codex generate and reuse local memories across Agent Mode chats. Memories are stored under Codex home (normally ~/.codex/memories). Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.",
+                isOn: tools.memoriesEnabled,
+                onChange: { onApplyMutation(.memories(enabled: $0)) }
+            )
+            .hoverTooltip("Controls Codex memory generation and use for app-server launch and thread start/resume. Off by default.")
+
             ProviderRuntimeSubsection(
                 title: "MCP servers",
                 subtitle: "Choose which configured MCP servers Codex can use. RepoPrompt is required for app integration."

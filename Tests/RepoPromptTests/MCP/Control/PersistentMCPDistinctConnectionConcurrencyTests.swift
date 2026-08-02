@@ -1549,6 +1549,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
         static func make(
             lease: MCPSharedServerTestLease.Ownership,
+            domainRuntime: MCPDomainRuntime? = nil,
             contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
             contextASearchFileCount: Int = 1
         ) async throws -> PersistentMCPTestFixture {
@@ -1562,12 +1563,18 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let windowA = if let contextBuilderProviderFactory {
+            let windowA = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else if let contextBuilderProviderFactory {
                 WindowState(contextBuilderProviderFactory: contextBuilderProviderFactory)
             } else {
                 WindowState()
             }
-            let windowB = WindowState()
+            let windowB = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else {
+                WindowState()
+            }
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -1846,6 +1853,32 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             // and restores the inherited transport state; this fixture never owns global
             // registration handles.
             await ServerNetworkManager.shared.setEnabled(true)
+        }
+
+        func registerDomainWorkspace(_ context: PersistentMCPTestContext) async throws {
+            let workspace = try XCTUnwrap(
+                context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+            )
+            try await registerDomainWorkspace(
+                workspace,
+                rootURL: context.rootURL,
+                windowID: context.window.windowID
+            )
+        }
+
+        func registerDomainWorkspace(
+            _ workspace: WorkspaceModel,
+            rootURL: URL,
+            windowID: Int
+        ) async throws {
+            let client = DomainWorkspaceAuthorityClient(
+                store: AppDomainRuntimeComposition.shared.runtime.workspaceStore,
+                windowID: windowID
+            )
+            _ = try await client.registerForRead(
+                workspace,
+                fileURL: rootURL.appendingPathComponent("fixture.repoprompt-workspace")
+            )
         }
 
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Ordered public tool-family groups for a window-scoped MCP catalog.
 enum MCPWindowToolGroup: CaseIterable, Hashable {
@@ -67,6 +68,6 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
     }
 
     static var orderedToolNames: [String] {
-        allCases.flatMap(\.orderedToolNames)
+        MCPDomainToolCatalog.windowToolNames
     }
 }

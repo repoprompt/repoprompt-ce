@@ -51,6 +51,20 @@ package enum DomainMutationPathFenceError: Error, Equatable, LocalizedError, Sen
     }
 }
 
+package struct DomainMutationPhysicalCommitGuard: Sendable {
+    private let snapshot: DomainMutationPathFenceSnapshot
+
+    package init(snapshot: DomainMutationPathFenceSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    /// Revalidates the admitted path identities synchronously at a path-based mutation boundary.
+    /// This narrows the race window but does not make the later path operation descriptor-bound.
+    package func revalidate() throws {
+        try DomainMutationPathFence.revalidateBlocking(snapshot)
+    }
+}
+
 package enum DomainMutationPathFence {
     package static func admit(
         requestedPaths: [String],
@@ -61,25 +75,36 @@ package enum DomainMutationPathFence {
         }.value
     }
 
+    package static func canonicalPath(_ path: String) -> String? {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        guard let resolution = try? resolvePotentialPath(expanded) else { return nil }
+        return resolution.path
+    }
+
     package static func revalidate(_ snapshot: DomainMutationPathFenceSnapshot) async throws {
         try await Task.detached(priority: .utility) {
-            for root in snapshot.authorizedRoots {
-                let currentRoot = try identity(root.originalPath)
-                guard currentRoot == root else {
-                    throw DomainMutationPathFenceError.rootIdentityChanged(root.originalPath)
-                }
-            }
-            for entry in snapshot.entries {
-                let resolution = try resolvePotentialPath(entry.requestedPath)
-                let currentAnchor = try identity(entry.existingAnchor.originalPath)
-                guard resolution.path == entry.resolvedPath,
-                      currentAnchor == entry.existingAnchor,
-                      isContained(resolution.path, by: entry.authorizedRoot.resolvedPath)
-                else {
-                    throw DomainMutationPathFenceError.pathResolutionChanged(entry.requestedPath)
-                }
-            }
+            try revalidateBlocking(snapshot)
         }.value
+    }
+
+    package static func revalidateBlocking(_ snapshot: DomainMutationPathFenceSnapshot) throws {
+        for root in snapshot.authorizedRoots {
+            let currentRoot = try identity(root.originalPath)
+            guard currentRoot == root else {
+                throw DomainMutationPathFenceError.rootIdentityChanged(root.originalPath)
+            }
+        }
+        for entry in snapshot.entries {
+            let resolution = try resolvePotentialPath(entry.requestedPath)
+            let currentAnchor = try identity(entry.existingAnchor.originalPath)
+            guard resolution.path == entry.resolvedPath,
+                  currentAnchor == entry.existingAnchor,
+                  isContained(resolution.path, by: entry.authorizedRoot.resolvedPath)
+            else {
+                throw DomainMutationPathFenceError.pathResolutionChanged(entry.requestedPath)
+            }
+        }
     }
 
     private static func admitBlocking(

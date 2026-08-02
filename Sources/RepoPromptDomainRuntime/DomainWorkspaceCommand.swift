@@ -7,6 +7,17 @@ package enum DomainCommandOrigin: Codable, Equatable, Sendable {
     case externalReload
 }
 
+private extension DomainCommandOrigin {
+    var fingerprintComponent: String {
+        switch self {
+        case let .appPresentation(windowID): "presentation:\(windowID)"
+        case let .appMCP(connectionID): "app-mcp:\(connectionID?.uuidString ?? "nil")"
+        case .standalone: "standalone"
+        case .externalReload: "external-reload"
+        }
+    }
+}
+
 package enum DomainWorkspaceCommand: Codable, Equatable, Sendable {
     case createWorkspace(DomainWorkspaceDocument)
     case replaceWorkingDocument(DomainWorkspaceDocument)
@@ -40,10 +51,27 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
     }
 
     package var fingerprint: String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = (try? encoder.encode(self)) ?? Data(operationID.uuidString.utf8)
-        return DomainContentDigest.sha256(data)
+        var components = [
+            operationID.uuidString,
+            expectedCatalogRevision.map(String.init) ?? "nil",
+            expectedWorkspaceRevision.map(String.init) ?? "nil",
+            expectedContextRevision.map(String.init) ?? "nil",
+            origin.fingerprintComponent
+        ]
+        switch command {
+        case let .createWorkspace(document):
+            components += ["create", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]
+        case let .replaceWorkingDocument(document):
+            components += ["replace", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]
+        case let .saveWorkspaceDocument(workspaceID):
+            components += ["save", workspaceID.uuidString]
+        case let .deleteWorkspace(workspaceID):
+            components += ["delete", workspaceID.uuidString]
+        case let .resolveExternalConflict(workspaceID, acceptExternal):
+            components += ["resolve", workspaceID.uuidString, acceptExternal ? "external" : "local"]
+        }
+        let canonical = components.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        return DomainContentDigest.sha256(Data(canonical.utf8))
     }
 }
 

@@ -35,6 +35,89 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         XCTAssertNotNil(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
     }
 
+    func testManagedLogoutFenceBlocksCodexSubmitAndPreservesDraftAndTranscript() {
+        let vm = makeViewModel()
+        let tabID = UUID()
+        let session = vm.session(for: tabID)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .codexExec
+        session.draftText = "unsent draft"
+        session.replaceItems([.user("existing transcript", sequenceIndex: 1)])
+        let originalItems = session.items
+        let generation = CodexManagedSessionFence.shared.beginLogout()
+        defer {
+            CodexManagedSessionFence.shared.finishLogout(token: generation, succeeded: false)
+        }
+
+        let result = vm.submitUserTurn(text: "must not send", tabID: tabID)
+
+        XCTAssertEqual(result, .blocked(message: CodexManagedSessionFence.blockedMessage))
+        XCTAssertEqual(session.draftText, "unsent draft")
+        XCTAssertEqual(session.items, originalItems)
+    }
+
+    func testManagedLogoutStopsOnlyCodexRuntimeAndPreservesSessionContent() async {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let codexTabID = UUID()
+        let claudeTabID = UUID()
+        let codexSession = vm.session(for: codexTabID)
+        let claudeSession = vm.session(for: claudeTabID)
+        codexSession.selectedAgent = .codexExec
+        codexSession.hasLoadedPersistedState = true
+        codexSession.draftText = "codex draft"
+        codexSession.replaceItems([.user("codex transcript", sequenceIndex: 1)])
+        codexSession.codexController = controller
+        codexSession.runState = .running
+        codexSession.runID = UUID()
+        codexSession.testInstallPersistentSessionBinding(sessionID: UUID())
+        codexSession.beginRunAttempt(source: "managed-logout-test")
+        claudeSession.selectedAgent = .claudeCode
+        claudeSession.draftText = "claude draft"
+        claudeSession.replaceItems([.user("claude transcript", sequenceIndex: 1)])
+        claudeSession.runState = .running
+
+        await vm.stopCodexSessionsForManagedLogout()
+
+        XCTAssertFalse(codexSession.runState.isActive)
+        XCTAssertEqual(recorder.shutdownInvocationCount(), 1)
+        XCTAssertNil(codexSession.codexController)
+        XCTAssertEqual(codexSession.draftText, "codex draft")
+        XCTAssertEqual(codexSession.items.map(\.text), ["codex transcript"])
+        XCTAssertEqual(claudeSession.draftText, "claude draft")
+        XCTAssertEqual(claudeSession.items.map(\.text), ["claude transcript"])
+        XCTAssertEqual(claudeSession.runState, .running)
+    }
+
+    func testManagedLogoutRetiresLingeringCodexControllerAfterProviderSelectionChanged() async {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let lingeringSession = vm.session(for: UUID())
+        let plainClaudeSession = vm.session(for: UUID())
+        lingeringSession.selectedAgent = .claudeCode
+        lingeringSession.codexController = controller
+        lingeringSession.codexConversationID = "lingering-codex-thread"
+        lingeringSession.draftText = "preserved draft"
+        lingeringSession.replaceItems([.assistant("preserved transcript", sequenceIndex: 1)])
+        lingeringSession.runState = .running
+        let unrelatedRunID = UUID()
+        lingeringSession.runID = unrelatedRunID
+        plainClaudeSession.selectedAgent = .claudeCode
+        plainClaudeSession.runState = .running
+
+        await vm.stopCodexSessionsForManagedLogout()
+
+        XCTAssertEqual(recorder.shutdownInvocationCount(), 1)
+        XCTAssertNil(lingeringSession.codexController)
+        XCTAssertEqual(lingeringSession.draftText, "preserved draft")
+        XCTAssertEqual(lingeringSession.items.map(\.text), ["preserved transcript"])
+        XCTAssertEqual(lingeringSession.runState, .running)
+        XCTAssertEqual(lingeringSession.runID, unrelatedRunID)
+        XCTAssertEqual(plainClaudeSession.runState, .running)
+    }
+
     func testComposerCancelTargetUsesExplicitTabSessionIdentity() throws {
         let vm = makeViewModel()
         let runningTabID = UUID()
@@ -869,6 +952,8 @@ private final class StopSubmitSendRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var texts: [String] = []
     private var compactionInvocations = 0
+    private var cancelInvocations = 0
+    private var shutdownInvocations = 0
 
     func record(_ text: String) {
         lock.lock()
@@ -892,6 +977,22 @@ private final class StopSubmitSendRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return compactionInvocations
+    }
+
+    func recordCancel() {
+        lock.withLock { cancelInvocations += 1 }
+    }
+
+    func cancelInvocationCount() -> Int {
+        lock.withLock { cancelInvocations }
+    }
+
+    func recordShutdown() {
+        lock.withLock { shutdownInvocations += 1 }
+    }
+
+    func shutdownInvocationCount() -> Int {
+        lock.withLock { shutdownInvocations }
     }
 }
 
@@ -985,7 +1086,13 @@ private final class StopSubmitNoopCodexController: CodexSessionControlling {
         false
     }
 
-    func cancelCurrentTurn() async {}
-    func shutdown() async {}
+    func cancelCurrentTurn() async {
+        recorder?.recordCancel()
+    }
+
+    func shutdown() async {
+        recorder?.recordShutdown()
+    }
+
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
 }
