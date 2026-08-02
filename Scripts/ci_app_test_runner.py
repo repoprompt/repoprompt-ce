@@ -38,7 +38,6 @@ class OutputSnapshot:
 @dataclass
 class OutputState:
     output_seen: threading.Event = field(default_factory=threading.Event)
-    failure_seen: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     first_failure_line: str | None = None
     last_started_test: str | None = None
@@ -55,7 +54,6 @@ class OutputState:
                 self.last_started_test = started_test
             if failure_line is not None and self.first_failure_line is None:
                 self.first_failure_line = failure_line
-                self.failure_seen.set()
 
     def snapshot(self) -> OutputSnapshot:
         with self.lock:
@@ -429,22 +427,6 @@ def run_suite_attempt(
                 attempts=attempt,
             )
 
-        if state.failure_seen.is_set():
-            stop_process_tree_func(process)
-            relay.join(timeout=10)
-            snapshot = state.snapshot()
-            return SuiteRunResult(
-                suite=suite,
-                state="failed",
-                exit_code=1,
-                elapsed_seconds=time.monotonic() - start,
-                output_seen=snapshot.output_seen,
-                first_failure_line=snapshot.first_failure_line,
-                last_started_test=snapshot.last_started_test,
-                timed_out_after_seconds=None,
-                attempts=attempt,
-            )
-
         if cancellation_event is not None and cancellation_event.is_set():
             stop_process_tree_func(process)
             relay.join(timeout=10)
@@ -579,7 +561,7 @@ def report_suite_result(result: SuiteRunResult, output: TextIO) -> None:
 
     if result.first_failure_line is not None:
         print(
-            f"::error::{result.suite} failed; stopping after first XCTest issue. "
+            f"::error::{result.suite} failed; "
             f"elapsed={result.elapsed_seconds:.1f}s; "
             f"last_started_test={format_last_started(result.last_started_test)}",
             flush=True,
@@ -735,7 +717,20 @@ def run_all_suites(
             file=output,
         )
 
+    if test_bundle is None and test_bundles is not None:
+        for suite in selected_suites:
+            if bundle_for_suite(suite, test_bundles) is not None:
+                continue
+            print(
+                f"::error::No XCTest bundle found for suite target {test_target_for_suite(suite)} "
+                f"while routing {suite}; available bundles: {sorted(test_bundles)}",
+                flush=True,
+                file=output,
+            )
+            return 1
+
     passed_results: list[SuiteRunResult] = []
+    failed_results: list[SuiteRunResult] = []
     for suite in selected_suites:
         result = run_and_report_single_suite(
             suite,
@@ -749,9 +744,12 @@ def run_all_suites(
             test_bundles=test_bundles,
             xctest_binary=xctest_binary,
         )
-        if result.state != "passed":
+        if result.state == "cancelled":
             return result.exit_code
-        passed_results.append(result)
+        if result.state == "passed":
+            passed_results.append(result)
+        else:
+            failed_results.append(result)
 
     if passed_results:
         print("Slowest app test suites:", flush=True, file=output)
@@ -760,6 +758,23 @@ def run_all_suites(
             key=lambda candidate: (-candidate.elapsed_seconds, candidate.suite),
         )[:10]:
             print(f"  {result.elapsed_seconds:6.1f}s  {result.suite}", flush=True, file=output)
+
+    if failed_results:
+        print(
+            f"::error::App test shard {shard_index}/{shard_count} completed with "
+            f"{len(failed_results)} failed suite(s).",
+            flush=True,
+            file=output,
+        )
+        print("Failed app test suites:", flush=True, file=output)
+        for result in failed_results:
+            print(
+                f"  {result.suite}: {result.state} "
+                f"(exit={result.exit_code}, elapsed={result.elapsed_seconds:.1f}s)",
+                flush=True,
+                file=output,
+            )
+        return 1
     return 0
 
 

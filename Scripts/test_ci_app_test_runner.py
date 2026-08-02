@@ -17,14 +17,26 @@ import ci_app_test_runner
 class FakeProcess:
     next_pid = 1000
 
-    def __init__(self, lines: list[str] | None = None, *, returncode: int | None = None) -> None:
+    def __init__(
+        self,
+        lines: list[str] | None = None,
+        *,
+        returncode: int | None = None,
+        returncode_after_output: int | None = None,
+    ) -> None:
         self.lines = lines or []
         self.returncode = returncode
+        self.returncode_after_output = returncode_after_output
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
-        self.stdout = iter(self.lines)
+        self.stdout = self.iter_lines()
         self.kill_called = False
         self.wait_called = False
+
+    def iter_lines(self):
+        yield from self.lines
+        if self.returncode_after_output is not None:
+            self.returncode = self.returncode_after_output
 
     def poll(self) -> int | None:
         return self.returncode
@@ -155,15 +167,17 @@ class CIAppTestRunnerTests(unittest.TestCase):
             ci_app_test_runner.os.getpgrp = original_getpgrp
             ci_app_test_runner.os.getpgid = original_getpgid
 
-    def test_fail_fast_stops_after_first_xctest_issue(self) -> None:
+    def test_xctest_assertion_does_not_stop_suite_process_early(self) -> None:
         stopped: list[FakeProcess] = []
         output = io.StringIO()
         fake = FakeProcess(
             [
                 "Test Case '-[RepoPromptTests.S testExample]' started.\n",
                 "/tmp/File.swift:10: error: -[RepoPromptTests.S testExample] : XCTAssert failed\n",
-                "line that would have appeared before a hang\n",
-            ]
+                "Test Case '-[RepoPromptTests.S testLater]' started.\n",
+                "/tmp/File.swift:20: error: -[RepoPromptTests.S testLater] : XCTAssertEqual failed\n",
+            ],
+            returncode_after_output=1,
         )
 
         result = ci_app_test_runner.run_suite(
@@ -178,9 +192,10 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         self.assertEqual(result.state, "failed")
         self.assertEqual(result.exit_code, 1)
-        self.assertEqual(result.last_started_test, "RepoPromptTests.S testExample")
+        self.assertEqual(result.last_started_test, "RepoPromptTests.S testLater")
         self.assertIn("XCTAssert failed", result.first_failure_line or "")
-        self.assertEqual(stopped, [fake])
+        self.assertIn("XCTAssertEqual failed", output.getvalue())
+        self.assertEqual(stopped, [])
 
     def test_nonzero_process_exit_returns_process_status(self) -> None:
         result = ci_app_test_runner.run_suite(
@@ -658,6 +673,68 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, ["RepoPromptTests.A", "RepoPromptTests.B"])
+
+    def test_run_all_suites_collects_failures_and_continues(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_suite(suite, **kwargs):
+            calls.append(suite)
+            if suite == "RepoPromptTests.A":
+                return ci_app_test_runner.SuiteRunResult(
+                    suite=suite,
+                    state="failed",
+                    exit_code=1,
+                    elapsed_seconds=0.1,
+                    output_seen=True,
+                    first_failure_line="A failed",
+                    last_started_test="RepoPromptTests.A testFailure",
+                    timed_out_after_seconds=None,
+                    attempts=1,
+                )
+            if suite == "RepoPromptTests.C":
+                return ci_app_test_runner.SuiteRunResult(
+                    suite=suite,
+                    state="timed_out",
+                    exit_code=ci_app_test_runner.TIMEOUT_EXIT_CODE,
+                    elapsed_seconds=1.0,
+                    output_seen=True,
+                    first_failure_line=None,
+                    last_started_test="RepoPromptTests.C testTimeout",
+                    timed_out_after_seconds=1.0,
+                    attempts=1,
+                )
+            return ci_app_test_runner.SuiteRunResult(
+                suite=suite,
+                state="passed",
+                exit_code=0,
+                elapsed_seconds=0.2,
+                output_seen=True,
+                first_failure_line=None,
+                last_started_test=None,
+                timed_out_after_seconds=None,
+                attempts=1,
+            )
+
+        output = io.StringIO()
+        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
+            exit_code = ci_app_test_runner.run_all_suites(
+                ["RepoPromptTests.C", "RepoPromptTests.B", "RepoPromptTests.A"],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            calls,
+            ["RepoPromptTests.A", "RepoPromptTests.B", "RepoPromptTests.C"],
+        )
+        summary = output.getvalue().split("Failed app test suites:\n", 1)[1]
+        self.assertIn("2 failed suite(s)", output.getvalue())
+        self.assertIn("RepoPromptTests.A: failed", summary)
+        self.assertIn("RepoPromptTests.C: timed_out", summary)
 
     def test_run_all_suites_executes_only_the_selected_lpt_shard(self) -> None:
         calls: list[str] = []
