@@ -107,7 +107,6 @@ struct WorkspaceFileMutationService {
             [file.standardizedFullPath],
             rootMappings: mutationRootMappings
         )
-        try await MCPDomainMutationCommitContext.willCommit()
         let result = try await store.editFile(rootID: file.rootID, relativePath: file.standardizedRelativePath, newContent: content)
         if let result {
             return .fromCatalogMaterialization(result)
@@ -273,7 +272,6 @@ struct WorkspaceFileMutationService {
             [absolutePath],
             rootMappings: mutationRootMappings
         )
-        try await MCPDomainMutationCommitContext.willCommit()
         let result = try await store.createFile(
             rootID: root.id,
             relativePath: relativePath,

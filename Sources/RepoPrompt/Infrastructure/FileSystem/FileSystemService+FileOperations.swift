@@ -119,8 +119,8 @@ extension FileSystemService {
                 let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
                 let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
             #endif
-            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
             try await MCPDomainMutationCommitContext.willCommit()
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
             let executor = FileSystemMutationIOExecutor(
                 operation: operation,
                 physicalMutationGuard: physicalMutationGuard,
