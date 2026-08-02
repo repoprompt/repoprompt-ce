@@ -279,6 +279,8 @@ import XCTest
                     let runCodemapE2E = CodemapE2ETestGate.isEnabled
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: logicalFile.path,
                         searchPattern: worktreeSentinel,
                         probeCodeStructure: runCodemapE2E
@@ -644,6 +646,8 @@ import XCTest
                     )
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: logicalBranchOnly.path,
                         searchPattern: "DeferredOnlyAgentRoute",
                         probeCodeStructure: false
@@ -970,6 +974,8 @@ import XCTest
                     try await configureAgentModeEndpoint(endpoint, context: frozenContext, fixture: fixture)
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: fixture.contextA.fileURL.path,
                         searchPattern: canonicalSentinel
                     )
@@ -1087,6 +1093,8 @@ import XCTest
                     )
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: ceFile.path,
                         searchPattern: ceMarker,
                         publishImplicitGitArtifacts: true,
@@ -1297,6 +1305,8 @@ import XCTest
                     )
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: fixture.contextA.fileURL.path,
                         searchPattern: canonicalSentinel
                     )
@@ -1989,6 +1999,8 @@ import XCTest
                     let gate = cancelDuringRun ? ContextBuilderProbeGate() : nil
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextB.workspaceID,
+                        contextID: fixture.contextB.tabID,
                         logicalFilePath: fixture.contextB.fileURL.path,
                         searchPattern: fixture.contextB.sentinel,
                         probeCodeStructure: false,
@@ -2307,7 +2319,7 @@ import XCTest
             }
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
             let runID = try XCTUnwrap(context.runID)
-            try await fixture.networkManager.debugSeedConnectionRunRouting(
+            await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
                 runID: runID,
                 purpose: .agentModeRun,
@@ -2436,6 +2448,8 @@ import XCTest
     private final class ContextBuilderWorktreeProbeFactory {
         private struct Configuration {
             let networkManager: ServerNetworkManager
+            let workspaceID: UUID
+            let contextID: UUID
             let logicalFilePath: String
             let searchPattern: String
             let publishImplicitGitArtifacts: Bool
@@ -2453,6 +2467,8 @@ import XCTest
 
         func configure(
             networkManager: ServerNetworkManager,
+            workspaceID: UUID,
+            contextID: UUID,
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool = false,
@@ -2462,6 +2478,8 @@ import XCTest
         ) {
             configuration = Configuration(
                 networkManager: networkManager,
+                workspaceID: workspaceID,
+                contextID: contextID,
                 logicalFilePath: logicalFilePath,
                 searchPattern: searchPattern,
                 publishImplicitGitArtifacts: publishImplicitGitArtifacts,
@@ -2486,6 +2504,8 @@ import XCTest
             return ContextBuilderWorktreeProbeProvider(
                 state: state,
                 networkManager: configuration.networkManager,
+                workspaceID: configuration.workspaceID,
+                contextID: configuration.contextID,
                 logicalFilePath: configuration.logicalFilePath,
                 searchPattern: configuration.searchPattern,
                 publishImplicitGitArtifacts: configuration.publishImplicitGitArtifacts,
@@ -2501,6 +2521,8 @@ import XCTest
     private final class ContextBuilderWorktreeProbeProvider: HeadlessAgentProvider {
         private let state: ContextBuilderWorktreeProbeState
         private let networkManager: ServerNetworkManager
+        private let workspaceID: UUID
+        private let contextID: UUID
         private let logicalFilePath: String
         private let searchPattern: String
         private let publishImplicitGitArtifacts: Bool
@@ -2515,6 +2537,8 @@ import XCTest
         init(
             state: ContextBuilderWorktreeProbeState,
             networkManager: ServerNetworkManager,
+            workspaceID: UUID,
+            contextID: UUID,
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool,
@@ -2526,6 +2550,8 @@ import XCTest
         ) {
             self.state = state
             self.networkManager = networkManager
+            self.workspaceID = workspaceID
+            self.contextID = contextID
             self.logicalFilePath = logicalFilePath
             self.searchPattern = searchPattern
             self.publishImplicitGitArtifacts = publishImplicitGitArtifacts
@@ -2563,6 +2589,29 @@ import XCTest
                 ]
             )
             self.endpoint = endpoint
+
+            _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator
+                .registerConnection(connectionID: endpoint.connectionID, operationID: UUID())
+            let registration = try await AppDomainRuntimeComposition.shared.runtime.routingCoordinator
+                .currentRegistration(connectionID: endpoint.connectionID)
+            let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: workspaceID, contextID: contextID)
+                ),
+                operationID: UUID()
+            )
+            guard routingOutcome.disposition == .applied || routingOutcome.disposition == .unchanged else {
+                throw NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: routingOutcome.diagnostic
+                            ?? "Domain run routing was not established for the probe endpoint"
+                    ]
+                )
+            }
 
             let selectionBeforeRead = try await selectionObservation(endpoint.callTool(
                 name: MCPWindowToolName.manageSelection,

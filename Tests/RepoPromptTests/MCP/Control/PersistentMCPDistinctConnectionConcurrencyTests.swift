@@ -1596,9 +1596,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     label: "B",
                     searchFileCount: 1
                 )
-                try await ensureRequiredCatalogAndEnableTransport(
-                    contexts: [XCTUnwrap(contextA), XCTUnwrap(contextB)]
-                )
+                let requiredContexts = try [XCTUnwrap(contextA), XCTUnwrap(contextB)]
+                try await ensureRequiredCatalogAndEnableTransport(contexts: requiredContexts)
+                try await registerDomainWorkspaces(requiredContexts)
                 let fixture = try PersistentMCPTestFixture(
                     rootURL: rootURL,
                     contextA: XCTUnwrap(contextA),
@@ -1846,6 +1846,24 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             // and restores the inherited transport state; this fixture never owns global
             // registration handles.
             await ServerNetworkManager.shared.setEnabled(true)
+        }
+
+        private static func registerDomainWorkspaces(
+            _ contexts: [PersistentMCPTestContext]
+        ) async throws {
+            for context in contexts {
+                let workspace = try XCTUnwrap(
+                    context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+                )
+                let client = DomainWorkspaceAuthorityClient(
+                    store: AppDomainRuntimeComposition.shared.runtime.workspaceStore,
+                    windowID: context.window.windowID
+                )
+                _ = try await client.registerForRead(
+                    workspace,
+                    fileURL: context.rootURL.appendingPathComponent("fixture.repoprompt-workspace")
+                )
+            }
         }
 
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {

@@ -1629,8 +1629,13 @@ actor GitService {
         guard !request.allowExternalPath, let appManagedContainer = request.appManagedContainer else {
             return request
         }
-        let canonicalContainer = GitRepoRootAuthorization.canonicalPath(appManagedContainer.path)
-        let canonicalDestination = GitRepoRootAuthorization.canonicalPath(request.path.path)
+        guard let canonicalContainer = DomainMutationPathFence.canonicalPath(appManagedContainer.path),
+              let canonicalDestination = DomainMutationPathFence.canonicalPath(request.path.path)
+        else {
+            throw GitError(
+                message: "app-managed worktree destination could not be resolved safely: \(request.path.path)"
+            )
+        }
         let containerPrefix = canonicalContainer.hasSuffix("/") ? canonicalContainer : canonicalContainer + "/"
         guard canonicalDestination == canonicalContainer || canonicalDestination.hasPrefix(containerPrefix) else {
             throw GitError(message: "app-managed worktree destination resolved outside its managed container: \(request.path.path)")

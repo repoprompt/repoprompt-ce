@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
@@ -796,7 +797,7 @@ import XCTest
                     XCTAssertTrue(previewResponse.rawJSON.contains("MAP.txt"))
                     XCTAssertTrue(previewResponse.rawJSON.contains("all.patch"))
 
-                    _ = try await endpoint.callTool(
+                    let removeResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.manageSelection,
                         arguments: [
                             "op": "remove",
@@ -806,6 +807,7 @@ import XCTest
                         ],
                         timeoutSeconds: 20
                     )
+                    XCTAssertFalse(removeResponse.rawJSON.contains("\"isError\":true"), removeResponse.rawJSON)
                     let removedSelection = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(
                             with: fixture.contextA.tabID
@@ -823,6 +825,7 @@ import XCTest
                         ],
                         timeoutSeconds: 20
                     )
+                    XCTAssertFalse(readdedResponse.rawJSON.contains("\"isError\":true"), readdedResponse.rawJSON)
                     XCTAssertTrue(readdedResponse.rawJSON.contains("MAP.txt"))
                     XCTAssertTrue(readdedResponse.rawJSON.contains("all.patch"))
                     _ = try await endpoint.callTool(
@@ -2779,16 +2782,33 @@ import XCTest
             context: MCPServerViewModel.TabContextSnapshot,
             fixture: PersistentMCPTestFixture
         ) async throws {
-            _ = try await endpoint.callTool(
+            let bindResponse = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
             )
+            XCTAssertFalse(bindResponse.rawJSON.contains("\"isError\":true"), bindResponse.rawJSON)
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+            let runID = try XCTUnwrap(context.runID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
-                runID: XCTUnwrap(context.runID),
+                runID: runID,
                 purpose: .agentModeRun,
                 windowID: context.windowID
+            )
+            let registration = try await AppDomainRuntimeComposition.shared.runtime
+                .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
+            let workspaceID = try XCTUnwrap(context.workspaceID)
+            let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: workspaceID, contextID: context.tabID)
+                ),
+                operationID: UUID()
+            )
+            XCTAssertTrue(
+                routingOutcome.disposition == .applied || routingOutcome.disposition == .unchanged,
+                routingOutcome.diagnostic ?? "Domain run routing was not established"
             )
             await fixture.networkManager.debugSetAdditionalTools(
                 for: endpoint.connectionID,
