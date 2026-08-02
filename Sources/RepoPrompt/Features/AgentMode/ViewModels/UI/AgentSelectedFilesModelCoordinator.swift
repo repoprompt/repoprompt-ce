@@ -277,7 +277,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
     private var cachedModelOrder: [AgentSelectedFilesModelIdentity] = []
     private var completedCountSnapshots: [AgentSelectedFilesModelIdentity: AgentContextFileCodemapCountSummary] = [:]
     private var completedEntryMetricsSnapshots: [AgentSelectedFilesModelIdentity: PromptContextEntryMetricsSnapshot] = [:]
-    private var loadingEntryMetricsSnapshot: PromptContextEntryMetricsSnapshot?
 
     private struct VisibleFileMetricsScope: Equatable {
         let filePathDisplay: FilePathDisplay
@@ -341,12 +340,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
     ) -> AgentSelectedFilesRefreshOutcome? {
         guard let entryMetricsSnapshot = request.entryMetricsSnapshot else { return nil }
         guard displayedModelMatches(request.identity) || loadingIdentity == request.identity else { return nil }
-        if loadingIdentity == request.identity,
-           loadingEntryMetricsSnapshot == entryMetricsSnapshot
-        {
-            debugStats.skippedLoading += 1
-            return .skippedLoading
-        }
         if completedDisplayedModelMatches(request.identity),
            completedEntryMetricsSnapshots[request.identity] == entryMetricsSnapshot
         {
@@ -433,7 +426,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         let refreshID = UUID()
         self.refreshID = refreshID
         loadingIdentity = request.identity
-        loadingEntryMetricsSnapshot = request.entryMetricsSnapshot
         state = AgentSelectedFilesModelState(
             model: shouldClearDisplayedModel ? nil : state.model,
             rowSplit: shouldClearDisplayedModel ? .empty : state.rowSplit,
@@ -514,7 +506,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                           loadingIdentity == request.identity
                     else { return }
                     loadingIdentity = nil
-                    loadingEntryMetricsSnapshot = nil
                     self.refreshID = nil
                     refreshTask = nil
                     state = AgentSelectedFilesModelState(
@@ -568,7 +559,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                     totalSelectedDisplayTokens: resolvedModel.totalSelectedDisplayTokens
                 )
                 loadingIdentity = nil
-                loadingEntryMetricsSnapshot = nil
                 self.refreshID = nil
                 refreshTask = nil
                 debugStats.resolverCompletions += 1
@@ -595,7 +585,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         refreshTask = nil
         refreshID = nil
         loadingIdentity = nil
-        loadingEntryMetricsSnapshot = nil
         state = keepLoadedModel
             ? AgentSelectedFilesModelState(
                 model: state.model,
@@ -741,7 +730,6 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         refreshTask = nil
         refreshID = nil
         loadingIdentity = nil
-        loadingEntryMetricsSnapshot = nil
     }
 
     private func cacheModel(_ model: AgentContextExportModel, for identity: AgentSelectedFilesModelIdentity) {

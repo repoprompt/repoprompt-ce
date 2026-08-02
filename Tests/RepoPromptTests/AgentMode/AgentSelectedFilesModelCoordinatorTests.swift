@@ -62,9 +62,6 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.model?.totalSelectedDisplayTokens, 0)
         XCTAssertTrue(coordinator.isLoading)
         XCTAssertFalse(coordinator.canMutateDisplayedModel)
-        XCTAssertEqual(coordinator.refreshAfterTokenMetricsCompletion(enrichedRequest), .skippedLoading)
-        let startCountWhileLoading = await resolver.startCount()
-        XCTAssertEqual(startCountWhileLoading, 2)
 
         await resolver.releaseNext()
         let expectedMetrics = AgentContextExportRow.Metrics.known(
