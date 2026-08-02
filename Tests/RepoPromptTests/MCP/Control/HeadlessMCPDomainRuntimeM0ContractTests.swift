@@ -254,20 +254,28 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(expectedDependencies.count, try integer(dependencies, key: "stored_dependency_count"))
     }
 
-    func testEveryExecutableEvidenceCitationResolvesInCuratedTestLedger() throws {
+    func testEveryExecutableEvidenceCitationResolvesInDeclaredSourceFile() throws {
         let artifactPaths = [
             "Scripts/Fixtures/headless_mcp_domain_runtime_m0_contract.json",
             "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
         ]
         var citations = Set<String>()
+        var declaredSources: [String: Set<String>] = [:]
         for path in artifactPaths {
-            try citations.formUnion(executableTestCitations(in: loadJSONObject(path)))
+            let artifact = try loadJSONObject(path)
+            citations.formUnion(executableTestCitations(in: artifact))
+            for (citation, sources) in executableTestCitationSources(in: artifact) {
+                declaredSources[citation, default: []].formUnion(sources)
+            }
         }
 
         XCTAssertEqual(citations.count, 6, "Update the reviewed M0 citation inventory when evidence is added or removed")
-        let ledgerEntries = try curatedTestLedgerEntries()
-        let missing = citations.filter { ledgerEntries[$0] == nil }.sorted()
-        XCTAssertTrue(missing.isEmpty, "M0 executable citations missing from the curated test ledger: \(missing)")
+        XCTAssertEqual(Set(declaredSources.keys), citations, "Every M0 executable citation must declare its source_file")
+        for citation in citations.union(declaredSources.keys).sorted() {
+            let sourceFiles = try XCTUnwrap(declaredSources[citation], citation)
+            XCTAssertEqual(sourceFiles.count, 1, "Each citation must resolve to one declared source_file: \(citation)")
+            try assertExecutableTestCitation(citation, sourceFile: XCTUnwrap(sourceFiles.first))
+        }
     }
 
     func testSDKCredentialAndPrivateChildContractsAreFailClosedEvidence() throws {
@@ -700,32 +708,238 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         return [string]
     }
 
-    private func curatedTestLedgerEntries() throws -> [String: String] {
-        let ledger = try source("Scripts/Fixtures/test-suite-contract-ledger.tsv")
-        let lines = ledger.split(separator: "\n", omittingEmptySubsequences: true)
-        let header = try XCTUnwrap(lines.first, "test ledger header")
-            .split(separator: "\t", omittingEmptySubsequences: false)
-            .map(String.init)
-        let methodIDIndex = try XCTUnwrap(header.firstIndex(of: "method_id"))
-        let fileIndex = try XCTUnwrap(header.firstIndex(of: "file"))
-        var entries: [String: String] = [:]
-        entries.reserveCapacity(lines.count - 1)
-
-        for line in lines.dropFirst() {
-            let columns = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            guard columns.indices.contains(methodIDIndex), columns.indices.contains(fileIndex) else {
-                XCTFail("Malformed curated test ledger row: \(line.prefix(120))")
-                continue
+    private func executableTestCitationSources(in value: Any) -> [String: Set<String>] {
+        if let dictionary = value as? [String: Any] {
+            var result = dictionary.values.reduce(into: [String: Set<String>]()) { result, child in
+                for (citation, sources) in executableTestCitationSources(in: child) {
+                    result[citation, default: []].formUnion(sources)
+                }
             }
-            let ledgerID = columns[methodIDIndex]
-            guard let separator = ledgerID.firstIndex(of: "/") else {
-                XCTFail("Malformed curated test ledger method_id: \(ledgerID)")
-                continue
+            let citation = (dictionary["citation"] as? String) ?? (dictionary["evidence"] as? String)
+            if let citation,
+               let sourceFile = dictionary["source_file"] as? String
+            {
+                result[citation, default: []].insert(sourceFile)
             }
-            let citation = String(ledgerID[ledgerID.index(after: separator)...])
-            XCTAssertNil(entries.updateValue(columns[fileIndex], forKey: citation), "Duplicate curated test ledger ID: \(citation)")
+            return result
         }
-        return entries
+        if let array = value as? [Any] {
+            return array.reduce(into: [String: Set<String>]()) { result, child in
+                for (citation, sources) in executableTestCitationSources(in: child) {
+                    result[citation, default: []].formUnion(sources)
+                }
+            }
+        }
+        return [:]
+    }
+
+    private enum SwiftLexicalState {
+        case code
+        case lineComment
+        case blockComment(depth: Int)
+        case string(hashCount: Int, quoteCount: Int)
+    }
+
+    private func assertExecutableTestCitation(_ citation: String, sourceFile: String) throws {
+        let citationExpression = try NSRegularExpression(
+            pattern: #"\A(RepoPromptTests|RepoPromptClaudeCompatibleProviderTests)\.([A-Za-z_][A-Za-z0-9_]*)/(test[A-Za-z0-9_]*)\z"#
+        )
+        let citationMatch = try XCTUnwrap(
+            citationExpression.firstMatch(
+                in: citation,
+                range: NSRange(citation.startIndex..., in: citation)
+            ),
+            "Executable citation must be Module.Suite/testMethod with an approved test-module prefix: \(citation)"
+        )
+        let module = try capture(citationMatch, group: 1, in: citation)
+        let suite = try capture(citationMatch, group: 2, in: citation)
+        let method = try capture(citationMatch, group: 3, in: citation)
+        let expectedSourceRoot = switch module {
+        case "RepoPromptTests":
+            "Tests/RepoPromptTests/"
+        case "RepoPromptClaudeCompatibleProviderTests":
+            "Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests/"
+        default:
+            try XCTUnwrap(nil as String?, "Unsupported executable citation module: \(module)")
+        }
+        XCTAssertTrue(
+            sourceFile.hasPrefix(expectedSourceRoot) && sourceFile.hasSuffix(".swift"),
+            "Citation module \(module) does not own declared source_file: \(sourceFile)"
+        )
+
+        let code = try sanitizedSwiftSource(source(sourceFile))
+        let suitePattern = NSRegularExpression.escapedPattern(for: suite)
+        let declarationExpression = try NSRegularExpression(
+            pattern: #"(?m)^[ \t]*(?:(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\([^\n]*\))?)\s+|(?:public|package|internal|private|fileprivate|open|final)\s+)*class\s+"#
+                + suitePattern
+                + #"\s*:\s*XCTestCase(?:\s*,[^\{\n]+)?\s*\{"#
+        )
+        let declarations = declarationExpression.matches(
+            in: code,
+            range: NSRange(code.startIndex..., in: code)
+        )
+        XCTAssertEqual(
+            declarations.count,
+            1,
+            "Declared source_file must contain exactly one XCTestCase declaration for \(suite): \(sourceFile)"
+        )
+        let declaration = try XCTUnwrap(declarations.first, suite)
+        let declarationRange = try XCTUnwrap(Range(declaration.range, in: code), suite)
+        let openingBrace = try XCTUnwrap(code[declarationRange].lastIndex(of: "{"), suite)
+        let closingBrace = try XCTUnwrap(
+            matchingClosingBrace(in: code, openingBrace: openingBrace),
+            "Unterminated XCTestCase declaration for \(suite): \(sourceFile)"
+        )
+        let body = topLevelTypeBody(code[code.index(after: openingBrace) ..< closingBrace])
+        let methodPattern = NSRegularExpression.escapedPattern(for: method)
+        let methodExpression = try NSRegularExpression(
+            pattern: #"(?m)^[ \t]*(?:(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\([^\n]*\))?)\s+|(?:public|package|internal|private|fileprivate|open|final|override|static|class|mutating|nonmutating|nonisolated|required|convenience|distributed)\s+)*func\s+"#
+                + methodPattern
+                + #"\s*\("#
+        )
+        XCTAssertEqual(
+            methodExpression.numberOfMatches(
+                in: body,
+                range: NSRange(body.startIndex..., in: body)
+            ),
+            1,
+            "Declared XCTestCase \(suite) must contain exactly one func \(method)( declaration: \(sourceFile)"
+        )
+    }
+
+    private func capture(_ match: NSTextCheckingResult, group: Int, in text: String) throws -> String {
+        let range = try XCTUnwrap(Range(match.range(at: group), in: text))
+        return String(text[range])
+    }
+
+    private func sanitizedSwiftSource(_ source: String) -> String {
+        let input = Array(source)
+        var output = input
+        var state = SwiftLexicalState.code
+        var index = 0
+
+        func blank(_ position: Int) {
+            if input[position] != "\n" {
+                output[position] = " "
+            }
+        }
+
+        while index < input.count {
+            switch state {
+            case .code:
+                if input[index] == "/", index + 1 < input.count, input[index + 1] == "/" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = .lineComment
+                } else if input[index] == "/", index + 1 < input.count, input[index + 1] == "*" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = .blockComment(depth: 1)
+                } else if input[index] == "\"" {
+                    var hashCount = 0
+                    var hashIndex = index
+                    while hashIndex > 0, input[hashIndex - 1] == "#" {
+                        hashIndex -= 1
+                        hashCount += 1
+                        blank(hashIndex)
+                    }
+                    let quoteCount = index + 2 < input.count && input[index + 1] == "\"" && input[index + 2] == "\"" ? 3 : 1
+                    for position in index ..< index + quoteCount {
+                        blank(position)
+                    }
+                    index += quoteCount
+                    state = .string(hashCount: hashCount, quoteCount: quoteCount)
+                } else {
+                    index += 1
+                }
+            case .lineComment:
+                if input[index] == "\n" {
+                    index += 1
+                    state = .code
+                } else {
+                    blank(index)
+                    index += 1
+                }
+            case let .blockComment(depth):
+                if input[index] == "/", index + 1 < input.count, input[index + 1] == "*" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = .blockComment(depth: depth + 1)
+                } else if input[index] == "*", index + 1 < input.count, input[index + 1] == "/" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = depth == 1 ? .code : .blockComment(depth: depth - 1)
+                } else {
+                    blank(index)
+                    index += 1
+                }
+            case let .string(hashCount, quoteCount):
+                if isSwiftStringTerminator(input, at: index, hashCount: hashCount, quoteCount: quoteCount) {
+                    for position in index ..< index + quoteCount + hashCount {
+                        blank(position)
+                    }
+                    index += quoteCount + hashCount
+                    state = .code
+                } else {
+                    blank(index)
+                    index += 1
+                }
+            }
+        }
+        return String(output)
+    }
+
+    private func isSwiftStringTerminator(
+        _ characters: [Character],
+        at index: Int,
+        hashCount: Int,
+        quoteCount: Int
+    ) -> Bool {
+        guard index + quoteCount + hashCount <= characters.count else { return false }
+        guard (0 ..< quoteCount).allSatisfy({ characters[index + $0] == "\"" }) else { return false }
+        guard (0 ..< hashCount).allSatisfy({ characters[index + quoteCount + $0] == "#" }) else { return false }
+        if hashCount > 0 { return true }
+
+        var backslashCount = 0
+        var cursor = index
+        while cursor > 0, characters[cursor - 1] == "\\" {
+            backslashCount += 1
+            cursor -= 1
+        }
+        return backslashCount.isMultiple(of: 2)
+    }
+
+    private func matchingClosingBrace(in source: String, openingBrace: String.Index) -> String.Index? {
+        var depth = 1
+        var index = source.index(after: openingBrace)
+        while index < source.endIndex {
+            if source[index] == "{" {
+                depth += 1
+            } else if source[index] == "}" {
+                depth -= 1
+                if depth == 0 { return index }
+            }
+            index = source.index(after: index)
+        }
+        return nil
+    }
+
+    private func topLevelTypeBody(_ body: Substring) -> String {
+        var depth = 0
+        return String(body.map { character in
+            defer {
+                if character == "{" {
+                    depth += 1
+                } else if character == "}" {
+                    depth -= 1
+                }
+            }
+            return depth == 0 || character == "\n" ? character : " "
+        })
     }
 
     private func assertSubstantiveEditFlowPerfEvidence(in baseline: [String: Any]) throws {
@@ -733,10 +947,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             try string(baseline, key: "classification"),
             "deterministic_contract_evidence_index_not_live_latency_baseline"
         )
-        XCTAssertEqual(
-            try string(baseline, key: "curated_test_ledger"),
-            "Scripts/Fixtures/test-suite-contract-ledger.tsv"
-        )
+        XCTAssertEqual(try string(baseline, key: "citation_provenance"), "declared_source_file")
 
         let constraints = try dictionary(baseline, key: "capture_constraints")
         XCTAssertEqual(try string(constraints, key: "live_mcp_round_trip_status"), "not_observed_task_prohibited")
@@ -757,7 +968,6 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         )
         XCTAssertTrue(try isLowercaseHexIdentifier(string(checkout, key: "base_commit"), length: 7 ... 40))
 
-        let ledgerEntries = try curatedTestLedgerEntries()
         let stages = try dictionaries(baseline, key: "guarded_stage_contracts")
         let expectedStages: Set = ["queue", "main_actor", "execution", "persistence", "response"]
         XCTAssertEqual(stages.count, expectedStages.count)
@@ -768,12 +978,12 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             let stage = try string(stageRecord, key: "stage")
             XCTAssertEqual(
                 try string(stageRecord, key: "evidence_kind"),
-                "curated_ledger_executable_contract_reference",
+                "source_file_executable_contract_reference",
                 stage
             )
             let citation = try string(stageRecord, key: "evidence")
             let sourceFile = try string(stageRecord, key: "source_file")
-            XCTAssertEqual(ledgerEntries[citation], sourceFile, "\(stage) evidence provenance")
+            try assertExecutableTestCitation(citation, sourceFile: sourceFile)
             evidenceCitations.insert(citation)
             let observations = try dictionary(stageRecord, key: "observations")
 

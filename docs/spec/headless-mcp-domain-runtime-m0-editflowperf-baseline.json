@@ -2,7 +2,7 @@
   "schema_version": 1,
   "recorded_at": "2026-07-26",
   "classification": "deterministic_contract_evidence_index_not_live_latency_baseline",
-  "curated_test_ledger": "Scripts/Fixtures/test-suite-contract-ledger.tsv",
+  "citation_provenance": "declared_source_file",
   "checkout_baseline": {
     "base_commit": "664252ebc85e",
     "workspace": "repoprompt-ce-release",
@@ -33,7 +33,7 @@
   "guarded_stage_contracts": [
     {
       "stage": "queue",
-      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence_kind": "source_file_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState",
       "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
@@ -46,7 +46,7 @@
     },
     {
       "stage": "main_actor",
-      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence_kind": "source_file_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
       "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
@@ -56,7 +56,7 @@
     },
     {
       "stage": "execution",
-      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence_kind": "source_file_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
       "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {
@@ -67,7 +67,7 @@
     },
     {
       "stage": "persistence",
-      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence_kind": "source_file_executable_contract_reference",
       "evidence": "RepoPromptTests.WorkspaceSelectionPersistenceTests/testDiskWriterFlushAndAtomicWriteTelemetryCarryDurabilityAttributionWithoutPaths",
       "source_file": "Tests/RepoPromptTests/WorkspaceContext/WorkspaceSelectionPersistenceTests.swift",
       "observations": {
@@ -78,7 +78,7 @@
     },
     {
       "stage": "response",
-      "evidence_kind": "curated_ledger_executable_contract_reference",
+      "evidence_kind": "source_file_executable_contract_reference",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
       "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
       "observations": {

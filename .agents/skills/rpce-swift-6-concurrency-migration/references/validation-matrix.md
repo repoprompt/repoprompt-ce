@@ -52,7 +52,7 @@ make guardrails
 
 Add `make dev-build` when packaging or assembled behavior is affected. Add the documented live CE MCP smoke flow only for MCP, Agent Mode, CLI, or running-app behavior. Launching or relaunching the visible app requires explicit user approval.
 
-When test executables change, follow `docs/testing.md`, run the authoritative test list, and verify the curated ledger.
+When test executables change, follow `docs/testing.md`, run the smallest focused daemon test, and broaden to the affected target or full suite when the migration boundary warrants it.
 
 ## Language-mode acceptance gate
 

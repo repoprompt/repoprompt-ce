@@ -680,11 +680,14 @@ allowed_tracked_docs=(
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
+existing_tracked_docs=()
 while IFS= read -r path; do
-  allowed_tracked_docs+=("$path")
-done < <(git ls-files 'docs/test-suite-optimizer')
+  if [[ -e "$path" ]]; then
+    existing_tracked_docs+=("$path")
+  fi
+done < <(git ls-files docs)
 unexpected_tracked_docs="$(comm -23 \
-  <(git ls-files docs | sort) \
+  <(printf '%s\n' "${existing_tracked_docs[@]}" | sort) \
   <(printf '%s\n' "${allowed_tracked_docs[@]}" | sort))"
 if [[ -n "$unexpected_tracked_docs" ]]; then
   fail "unexpected tracked docs found; keep agent-authored working documents local or add durable docs to the explicit allowlist"

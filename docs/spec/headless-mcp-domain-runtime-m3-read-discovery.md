@@ -44,7 +44,7 @@ Historical visibility is preserved at the app seam:
 - Awaited authority: `DomainWorkspaceContextAuthorityTests/testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence` plus the routing refresh test's unrelated-window revision change.
 - Failure recovery and real contention: seven `DomainReadSideEffectCoordinatorTests` cover failed-effect recovery, expired-receipt fail-closed behavior, exact/drain cancellation semantics, same-context selection ordering, and concurrent Git artifact progress.
 - App parity: `MCPCodeStructureWorktreeTests` (9), `WorktreeAPISmokeHarnessTests` (5), and a final combined read/search/history/Git/oracle/watchdog/persistent-connection run (102) all pass with zero failures.
-- Source/MainActor guards: the M0 contract ledger and `source_layout_guardrails.sh` enforce all nine shared definitions, the family requirement mapping, awaited read registration, absence of repeated `validateDomainReadContext`, absence of presentation registration in read resolution, independent effect classes, and non-poisoning effect chaining.
+- Source/MainActor guards: the M0 contract manifest and `source_layout_guardrails.sh` enforce all nine shared definitions, the family requirement mapping, awaited read registration, absence of repeated `validateDomainReadContext`, absence of presentation registration in read resolution, independent effect classes, and non-poisoning effect chaining.
 
 ## Bounded latency measurement
 
