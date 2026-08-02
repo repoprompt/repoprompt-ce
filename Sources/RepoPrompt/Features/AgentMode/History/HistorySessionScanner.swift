@@ -569,6 +569,13 @@ actor HistoryInventoryScanGate {
         }
     }
 
+    deinit {
+        for waiter in waiters {
+            waiter.continuation.resume(throwing: CancellationError())
+        }
+        waiters = []
+    }
+
     func snapshotForTesting() -> (hasHolder: Bool, waiterCount: Int) {
         (holderID != nil, waiters.count)
     }
