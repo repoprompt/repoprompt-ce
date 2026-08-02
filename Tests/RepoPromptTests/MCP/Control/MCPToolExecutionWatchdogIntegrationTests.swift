@@ -1912,6 +1912,7 @@ import XCTest
                         ]
                     )
                     endpoint = createdEndpoint
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     let bindResponse = try await createdEndpoint.callTool(
                         name: "bind_context",
                         arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]

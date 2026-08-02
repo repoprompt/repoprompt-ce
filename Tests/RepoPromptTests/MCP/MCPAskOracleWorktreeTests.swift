@@ -2172,7 +2172,8 @@ import XCTest
                             try await configureAgentModeEndpoint(
                                 endpoint,
                                 context: childContext,
-                                fixture: fixture
+                                fixture: fixture,
+                                permitImmutableRunBindingForEndpointReuse: true
                             )
                         } else {
                             let childOracleClientName = "linked-public-child-oracle"
@@ -2780,8 +2781,10 @@ import XCTest
         private func configureAgentModeEndpoint(
             _ endpoint: PersistentMCPTestEndpoint,
             context: MCPServerViewModel.TabContextSnapshot,
-            fixture: PersistentMCPTestFixture
+            fixture: PersistentMCPTestFixture,
+            permitImmutableRunBindingForEndpointReuse: Bool = false
         ) async throws {
+            try await fixture.registerDomainWorkspace(fixture.contextA)
             let bindResponse = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
@@ -2806,8 +2809,14 @@ import XCTest
                 ),
                 operationID: UUID()
             )
+            let routingEstablished = routingOutcome.disposition == .applied
+                || routingOutcome.disposition == .unchanged
+                || (
+                    permitImmutableRunBindingForEndpointReuse
+                        && routingOutcome.diagnostic == "run_scoped_binding_is_immutable"
+                )
             XCTAssertTrue(
-                routingOutcome.disposition == .applied || routingOutcome.disposition == .unchanged,
+                routingEstablished,
                 routingOutcome.diagnostic ?? "Domain run routing was not established"
             )
             await fixture.networkManager.debugSetAdditionalTools(

@@ -6633,7 +6633,6 @@ final class MCPServerViewModel: ObservableObject {
             [source.standardizedFullPath, destination],
             rootMappings: mutationRootMappings
         )
-        try await MCPDomainMutationCommitContext.willCommit()
         try await store.moveFile(rootID: source.rootID, from: source.standardizedRelativePath, to: newRelativePath)
     }
 
@@ -6653,7 +6652,6 @@ final class MCPServerViewModel: ObservableObject {
                 [file.standardizedFullPath],
                 rootMappings: mutationRootMappings
             )
-            try await MCPDomainMutationCommitContext.willCommit()
             try await store.moveItemToTrash(rootID: file.rootID, relativePath: file.standardizedRelativePath)
             return
         }
@@ -6665,7 +6663,6 @@ final class MCPServerViewModel: ObservableObject {
                 [folder.standardizedFullPath],
                 rootMappings: mutationRootMappings
             )
-            try await MCPDomainMutationCommitContext.willCommit()
             try await store.moveItemToTrash(rootID: folder.rootID, relativePath: folder.standardizedRelativePath)
         } else {
             throw MCPError.invalidParams("Unknown or unloaded path: \(path).")

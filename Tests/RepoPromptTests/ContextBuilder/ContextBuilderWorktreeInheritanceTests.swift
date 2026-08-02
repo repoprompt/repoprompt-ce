@@ -277,6 +277,7 @@ import XCTest
                         }
 
                     let runCodemapE2E = CodemapE2ETestGate.isEnabled
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
                         workspaceID: fixture.contextA.workspaceID,
@@ -644,6 +645,7 @@ import XCTest
                         fixture: fixture,
                         bindContext: false
                     )
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
                         workspaceID: fixture.contextA.workspaceID,
@@ -972,6 +974,7 @@ import XCTest
                     )
                     let endpoint = try fixture.endpointA()
                     try await configureAgentModeEndpoint(endpoint, context: frozenContext, fixture: fixture)
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
                         workspaceID: fixture.contextA.workspaceID,
@@ -1091,6 +1094,7 @@ import XCTest
                         context: frozenContext,
                         fixture: fixture
                     )
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
                         workspaceID: fixture.contextA.workspaceID,
@@ -1303,6 +1307,7 @@ import XCTest
                         ),
                         seededSelectionRevision
                     )
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
                         workspaceID: fixture.contextA.workspaceID,
@@ -1997,6 +2002,11 @@ import XCTest
                     await Task.yield()
 
                     let gate = cancelDuringRun ? ContextBuilderProbeGate() : nil
+                    try await fixture.registerDomainWorkspace(
+                        sourceWorkspaceB,
+                        rootURL: fixture.contextB.rootURL,
+                        windowID: window.windowID
+                    )
                     factory.configure(
                         networkManager: fixture.networkManager,
                         workspaceID: fixture.contextB.workspaceID,
@@ -2311,6 +2321,10 @@ import XCTest
             fixture: PersistentMCPTestFixture,
             bindContext: Bool = true
         ) async throws {
+            let fixtureContext = context.workspaceID == fixture.contextB.workspaceID
+                ? fixture.contextB
+                : fixture.contextA
+            try await fixture.registerDomainWorkspace(fixtureContext)
             if bindContext {
                 _ = try await endpoint.callTool(
                     name: "bind_context",
@@ -2325,6 +2339,12 @@ import XCTest
                 purpose: .agentModeRun,
                 windowID: context.windowID
             )
+            if !bindContext {
+                _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.registerConnection(
+                    connectionID: endpoint.connectionID,
+                    operationID: UUID()
+                )
+            }
             let registration = try await AppDomainRuntimeComposition.shared.runtime
                 .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
             let workspaceID = try XCTUnwrap(context.workspaceID)

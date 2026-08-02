@@ -111,26 +111,32 @@ extension FileSystemService {
         }
         let id = UUID()
         inFlightMutations[id] = FileSystemInFlightMutation(relativePaths: authorityPaths)
-        #if DEBUG
-            let willBegin = mutationIOWillBeginHandler
-            let willExecute = mutationIOWillExecuteHandler
-        #else
-            let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
-            let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
-        #endif
-        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-        let executor = FileSystemMutationIOExecutor(
-            operation: operation,
-            physicalMutationGuard: physicalMutationGuard,
-            willExecute: willExecute
-        )
-        let task = Task.detached(priority: .utility) {
-            if let willBegin {
-                await willBegin(operation)
+        do {
+            #if DEBUG
+                let willBegin = mutationIOWillBeginHandler
+                let willExecute = mutationIOWillExecuteHandler
+            #else
+                let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
+                let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
+            #endif
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try await MCPDomainMutationCommitContext.willCommit()
+            let executor = FileSystemMutationIOExecutor(
+                operation: operation,
+                physicalMutationGuard: physicalMutationGuard,
+                willExecute: willExecute
+            )
+            let task = Task.detached(priority: .utility) {
+                if let willBegin {
+                    await willBegin(operation)
+                }
+                try await io(executor)
             }
-            try await io(executor)
+            return (id, task)
+        } catch {
+            inFlightMutations.removeValue(forKey: id)
+            throw error
         }
-        return (id, task)
     }
 
     private func awaitUncancellableMutation(
