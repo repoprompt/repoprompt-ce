@@ -62,6 +62,9 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.model?.totalSelectedDisplayTokens, 0)
         XCTAssertTrue(coordinator.isLoading)
         XCTAssertFalse(coordinator.canMutateDisplayedModel)
+        XCTAssertEqual(coordinator.refreshAfterTokenMetricsCompletion(enrichedRequest), .skippedLoading)
+        let startCountWhileLoading = await resolver.startCount()
+        XCTAssertEqual(startCountWhileLoading, 2)
 
         await resolver.releaseNext()
         let expectedMetrics = AgentContextExportRow.Metrics.known(
@@ -79,6 +82,9 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.model?.totalSelectedDisplayTokens, 91)
         XCTAssertEqual(coordinator.debugStats.resolverStarts, 2)
         XCTAssertEqual(coordinator.debugStats.resolverCompletions, 2)
+        XCTAssertEqual(coordinator.refreshAfterTokenMetricsCompletion(enrichedRequest), .skippedLoaded)
+        let startCountAfterCompletion = await resolver.startCount()
+        XCTAssertEqual(startCountAfterCompletion, 2)
     }
 
     @MainActor
@@ -1432,6 +1438,10 @@ private actor GatedTokenMetricsModelResolver {
     func releaseNext() {
         guard !continuations.isEmpty else { return }
         continuations.removeFirst().resume()
+    }
+
+    func startCount() -> Int {
+        starts
     }
 }
 
