@@ -88,9 +88,17 @@ final class DomainMutationApprovalBrokerTests: XCTestCase {
     }
 
     func testPresenterDeadlineReleasesQueueWhenPresentationHangs() async throws {
-        let broker = DomainMutationApprovalBroker()
+        let firstDeadline = Date().addingTimeInterval(60)
+        let deadlineGate = ApprovalPresentationGate()
+        let broker = DomainMutationApprovalBroker(waitForDeadline: { deadline in
+            if deadline == firstDeadline {
+                await deadlineGate.wait()
+            } else {
+                try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)))
+            }
+        })
         let gate = ApprovalPresentationGate()
-        let firstRequest = request(summary: "blocked", deadline: Date().addingTimeInterval(0.02))
+        let firstRequest = request(summary: "blocked", deadline: firstDeadline)
         let secondRequest = request(summary: "queued")
         let presenter = DomainMutationApprovalPresenter(
             present: { request in
@@ -108,6 +116,7 @@ final class DomainMutationApprovalBrokerTests: XCTestCase {
         let secondTask = Task { await broker.request(secondRequest) }
         try await waitForQueue([secondRequest.id], broker: broker)
 
+        await deadlineGate.release()
         let firstResult = await firstTask.value
         XCTAssertEqual(firstResult, .timeout)
         try await waitForActive(secondRequest.id, broker: broker)

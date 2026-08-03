@@ -172,8 +172,7 @@ enum RuntimePolicyAdministration {
             eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
             temporaryDirectory: FileManager.default.temporaryDirectory
                 .appendingPathComponent("RepoPrompt CE", isDirectory: true),
-            externalReloadInterval: nil,
-            protectedMutationStage: .m4A
+            externalReloadInterval: nil
         ))
     }
 

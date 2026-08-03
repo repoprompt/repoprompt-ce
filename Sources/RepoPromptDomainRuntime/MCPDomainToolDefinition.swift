@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 
-package struct MCPDomainToolAnnotations: Hashable, Sendable {
+package struct MCPDomainToolAnnotations: Codable, Hashable, Sendable {
     package let title: String?
     package let readOnlyHint: Bool?
     package let destructiveHint: Bool?
@@ -38,7 +38,7 @@ package struct MCPDomainToolAnnotations: Hashable, Sendable {
     }
 }
 
-package struct MCPDomainToolDefinition: Hashable, Sendable {
+package struct MCPDomainToolDefinition: Codable, Hashable, Sendable {
     package let name: String
     package let description: String
     package let inputSchema: Value
@@ -77,14 +77,24 @@ package struct MCPDomainToolBinding: Sendable {
     }
 }
 
+package struct DomainStandaloneScopeID: Codable, Hashable, Sendable {
+    package let rawValue: UUID
+
+    package init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+}
+
 package enum MCPDomainToolRegistrationScope: Hashable, Sendable {
     case application
     case window(id: Int)
+    case standalone(id: DomainStandaloneScopeID)
 
     package var kind: MCPDomainToolScopeKind {
         switch self {
         case .application: .application
         case .window: .window
+        case .standalone: .standalone
         }
     }
 }

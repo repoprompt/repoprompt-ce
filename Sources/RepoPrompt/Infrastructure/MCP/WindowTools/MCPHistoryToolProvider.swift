@@ -8,8 +8,7 @@ final class MCPHistoryToolProvider {
     private let scanner: any HistorySessionScanning
 
     init(
-        runtime _: MCPWindowToolRuntime,
-        dependencies _: MCPWindowToolDependencies? = nil,
+        runtime _: MCPAppToolBinder,
         scannerFactory: @escaping @Sendable () -> any HistorySessionScanning = { HistorySessionScanner() }
     ) {
         scanner = scannerFactory()

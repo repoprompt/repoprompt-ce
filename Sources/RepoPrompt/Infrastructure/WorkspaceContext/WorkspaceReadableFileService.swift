@@ -1,4 +1,8 @@
 import Foundation
+#if os(macOS)
+    import Darwin
+    import RepoPromptC
+#endif
 
 enum WorkspaceReadableFileResolution {
     case readable(WorkspaceReadableFileHandle)
@@ -8,15 +12,21 @@ enum WorkspaceReadableFileResolution {
 }
 
 struct WorkspaceReadableFileService {
+    static let externalReadByteLimit = 10_000_000
+    private static let externalReadChunkSize = 1_048_576
+
     let store: WorkspaceFileContextStore
     let homeDirectoryURL: URL
+    let beforeExternalReadOpenForTesting: (@Sendable (String) throws -> Void)?
 
     init(
         store: WorkspaceFileContextStore,
-        homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser
+        homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser,
+        beforeExternalReadOpenForTesting: (@Sendable (String) throws -> Void)? = nil
     ) {
         self.store = store
         self.homeDirectoryURL = homeDirectoryURL
+        self.beforeExternalReadOpenForTesting = beforeExternalReadOpenForTesting
     }
 
     func awaitFreshnessForExplicitRequest(
@@ -325,10 +335,77 @@ struct WorkspaceReadableFileService {
 
     func readAlwaysReadableExternalFile(_ file: WorkspaceExternalReadableFile) async throws -> String {
         let path = file.absolutePath
+        let homeDirectoryPath = homeDirectoryURL.path
+        let byteLimit = Self.externalReadByteLimit
+        let chunkSize = Self.externalReadChunkSize
         let workRecorder = MCPToolWorkCountDiagnostics.readFileExternalRecorder()
-        return try await Task.detached(priority: .userInitiated) {
-            let url = URL(fileURLWithPath: path)
-            let data = try Data(contentsOf: url)
+        let beforeExternalReadOpenHook = beforeExternalReadOpenForTesting
+        try Task.checkCancellation()
+        let readTask = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let homeDirectoryURL = URL(fileURLWithPath: homeDirectoryPath)
+            let normalizedPath = AgentSupportDirectoryCatalog.normalizedPath(for: path)
+            guard normalizedPath.hasPrefix("/") else {
+                throw FileSystemError.invalidRelativePath
+            }
+
+            let canonicalPath = if FileManager.default.fileExists(atPath: normalizedPath) {
+                AgentSupportDirectoryCatalog.normalizedPath(
+                    for: URL(fileURLWithPath: normalizedPath).resolvingSymlinksInPath().standardizedFileURL.path
+                )
+            } else {
+                normalizedPath
+            }
+            let directories = AgentSupportDirectoryCatalog.effectiveAlwaysReadableDirectories(
+                homeDirectoryURL: homeDirectoryURL
+            )
+            guard directories.contains(where: {
+                AgentSupportDirectoryCatalog.contains(absolutePath: normalizedPath, in: $0)
+            }), directories.contains(where: {
+                AgentSupportDirectoryCatalog.contains(absolutePath: canonicalPath, in: $0)
+            }) else {
+                throw FileSystemError.invalidRelativePath
+            }
+            let canonicalAllowlist = directories.map {
+                Self.canonicalizedExternalReadPath($0.standardizedPath)
+            }
+            if let beforeExternalReadOpenHook {
+                try beforeExternalReadOpenHook(canonicalPath)
+            }
+
+            let handle = try FileContentFingerprintReader.openReadOnlyFileHandle(atPath: canonicalPath)
+            defer { try? handle.close() }
+            let openedPath = try Self.openedFilePath(fileDescriptor: handle.fileDescriptor)
+            let canonicalOpenedPath = Self.canonicalizedExternalReadPath(openedPath)
+            guard canonicalOpenedPath.hasPrefix("/"), canonicalAllowlist.contains(where: {
+                Self.isWithinCanonicalDirectory(canonicalOpenedPath, directoryPath: $0)
+            }) else {
+                throw FileSystemError.invalidRelativePath
+            }
+            let fingerprint = try FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)
+            try Task.checkCancellation()
+            if fingerprint.byteSize > Int64(byteLimit) {
+                return "[File too large: \(fingerprint.byteSize) bytes]"
+            }
+
+            var data = Data()
+            data.reserveCapacity(Int(fingerprint.byteSize))
+            while true {
+                try Task.checkCancellation()
+                let remaining = byteLimit - data.count
+                let next = try handle.read(upToCount: min(chunkSize, remaining + 1)) ?? Data()
+                try Task.checkCancellation()
+                if next.isEmpty { break }
+                let observedByteCount = data.count + next.count
+                if observedByteCount > byteLimit {
+                    return "[File too large: \(observedByteCount) bytes]"
+                }
+                data.append(next)
+            }
+
+            guard try FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor) == fingerprint else {
+                throw FileContentValidationError.fingerprintChanged
+            }
             let decodeStart = DispatchTime.now().uptimeNanoseconds
             let decoded: String = if let utf8 = String(data: data, encoding: .utf8) {
                 utf8
@@ -343,7 +420,12 @@ struct WorkspaceReadableFileService {
                 Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
             )
             return decoded
-        }.value
+        }
+        return try await withTaskCancellationHandler(operation: {
+            try await readTask.value
+        }, onCancel: {
+            readTask.cancel()
+        })
     }
 
     func resolveAlwaysReadableExternalFile(atAbsolutePath path: String) -> WorkspaceExternalReadableFile? {
@@ -358,6 +440,31 @@ struct WorkspaceReadableFileService {
             absolutePath: absolutePath,
             displayPath: displayPath(forExternalPath: absolutePath)
         )
+    }
+
+    private static func canonicalizedExternalReadPath(_ path: String) -> String {
+        AgentSupportDirectoryCatalog.normalizedPath(
+            for: URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        )
+    }
+
+    private static func isWithinCanonicalDirectory(_ path: String, directoryPath: String) -> Bool {
+        path == directoryPath || path.hasPrefix(directoryPath == "/" ? "/" : directoryPath + "/")
+    }
+
+    private static func openedFilePath(fileDescriptor: Int32) throws -> String {
+        #if os(macOS)
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            let result = buffer.withUnsafeMutableBufferPointer { buffer in
+                repo_get_file_descriptor_path(fileDescriptor, buffer.baseAddress, buffer.count)
+            }
+            guard result == 0 else {
+                throw FileSystemError.failedToReadFile
+            }
+            return String(cString: buffer)
+        #else
+            throw FileSystemError.failedToReadFile
+        #endif
     }
 
     private func normalizedAlwaysReadableAbsolutePath(for path: String) -> String {

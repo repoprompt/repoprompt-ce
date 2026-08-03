@@ -62,6 +62,7 @@ actor WorkspaceSearchService {
         private var debugDebounceCancellationCount = 0
         private var debugLastEntryCount = 0
         private var searchDidCaptureGenerationHandler: (@Sendable (UInt64?) async -> Void)?
+        private var automaticRebuildDidStartHandler: (@Sendable (UInt64) async -> Void)?
     #endif
 
     init(automaticIndexBuildDelayNanoseconds: UInt64 = 0) {
@@ -119,6 +120,12 @@ actor WorkspaceSearchService {
             _ handler: (@Sendable (UInt64?) async -> Void)?
         ) {
             searchDidCaptureGenerationHandler = handler
+        }
+
+        func setAutomaticRebuildDidStartHandler(
+            _ handler: (@Sendable (UInt64) async -> Void)?
+        ) {
+            automaticRebuildDidStartHandler = handler
         }
 
         static func authoritativeGlobalResultsForTesting(
@@ -397,6 +404,9 @@ actor WorkspaceSearchService {
             return
         }
 
+        #if DEBUG
+            await automaticRebuildDidStartHandler?(targetGeneration)
+        #endif
         if automaticIndexBuildDelayNanoseconds > 0 {
             try? await Task.sleep(nanoseconds: automaticIndexBuildDelayNanoseconds)
         }

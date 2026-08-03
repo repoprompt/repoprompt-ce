@@ -1092,7 +1092,9 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
             windowID: nil,
             clientPrincipal: "agent",
             providerIdentifier: "codex",
-            runPurpose: "explore"
+            runPurpose: "explore",
+            restrictedTools: ["file_actions"],
+            additionalTools: ["ask_user"]
         )
         let scope = DomainCredentialScope(
             providerIdentifier: "codex",
@@ -1135,9 +1137,11 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
             clientPrincipal: request.clientPrincipal,
             providerIdentifier: request.providerIdentifier
         )
-        guard case .accepted = accepted else {
+        guard case let .accepted(redemption) = accepted else {
             return XCTFail("Injected harness token was not accepted: \(accepted)")
         }
+        XCTAssertEqual(redemption.restrictedTools, ["file_actions"])
+        XCTAssertEqual(redemption.additionalTools, ["ask_user"])
         let replay = await runtime.routingCoordinator.redeemLaunchToken(
             material: material,
             runtimeID: runtime.identity.runtimeID,
@@ -1148,6 +1152,61 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
             providerIdentifier: request.providerIdentifier
         )
         XCTAssertEqual(replay, .alreadyConsumed)
+
+        let foreignRuntimeRequest = DomainRunLaunchReservationRequest(
+            runID: UUID(),
+            context: request.context,
+            expectedContextRevision: request.expectedContextRevision,
+            windowID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier,
+            runPurpose: "foreign-runtime"
+        )
+        let foreignRuntimeToken = try await runtime.routingCoordinator.issueLaunchToken(foreignRuntimeRequest)
+        let foreignRuntime = await runtime.routingCoordinator.redeemLaunchToken(
+            material: foreignRuntimeToken.material,
+            runtimeID: UUID(),
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier
+        )
+        XCTAssertEqual(foreignRuntime, .generationMismatch)
+        let acceptedAfterForeignAttempt = await runtime.routingCoordinator.redeemLaunchToken(
+            material: foreignRuntimeToken.material,
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier
+        )
+        guard case .accepted = acceptedAfterForeignAttempt else {
+            return XCTFail("A foreign-runtime attempt must not consume the token: \(acceptedAfterForeignAttempt)")
+        }
+
+        let expiredRequest = DomainRunLaunchReservationRequest(
+            runID: UUID(),
+            context: request.context,
+            expectedContextRevision: request.expectedContextRevision,
+            windowID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier,
+            runPurpose: "expired",
+            lifetime: .zero
+        )
+        let expiredToken = try await runtime.routingCoordinator.issueLaunchToken(expiredRequest)
+        let expiredRedemption = await runtime.routingCoordinator.redeemLaunchToken(
+            material: expiredToken.material,
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier
+        )
+        XCTAssertEqual(expiredRedemption, .expired)
         _ = await runtime.shutdown()
     }
 }
@@ -1378,11 +1437,7 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
                 "question": .string("Choose")
             ])])])
         }
-        for _ in 0 ..< 1_000 {
-            if await recorder.presentationRequestID() != nil { break }
-            await Task.yield()
-        }
-        let presentationRequestID = await recorder.presentationRequestID()
+        let presentationRequestID = await recorder.waitForPresentation(timeout: .seconds(2))
         XCTAssertNotNil(presentationRequestID)
         task.cancel()
         do {
@@ -1393,7 +1448,8 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
         } catch {
             XCTFail("Expected CancellationError, got \(error)")
         }
-        try? await Task.sleep(for: .milliseconds(20))
+        let didCancelPresentation = await recorder.waitForCancellation(timeout: .seconds(2))
+        XCTAssertTrue(didCancelPresentation)
         let snapshot = await recorder.snapshot()
         XCTAssertEqual(snapshot.cancellationRequestIDs, [presentationRequestID].compactMap { $0 })
         XCTAssertGreaterThan(snapshot.deadline?.timeIntervalSinceNow ?? 0, 800)
@@ -1440,7 +1496,7 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
     }
 
     func testLongRunningProviderCoversFrozenFamiliesAndInteractionFallbackOrder() async throws {
-        XCTAssertEqual(MCPDomainLongRunningToolProvider.migratedToolNames, [
+        XCTAssertEqual(MCPDomainLongRunningToolProvider.toolNames, [
             "oracle_utils",
             "ask_oracle",
             "oracle_send",
@@ -1502,21 +1558,30 @@ private actor InteractionAdapterRecorder {
     private var deadline: Date?
     private var presentedRequestID: UUID?
     private var cancelledRequestIDs: [UUID] = []
+    private let presentationSignal = BoundedAsyncSignal()
+    private let cancellationSignal = BoundedAsyncSignal()
 
     func recordDeadline(_ deadline: Date) {
         self.deadline = deadline
     }
 
-    func recordPresentation(requestID: UUID?) {
+    func recordPresentation(requestID: UUID?) async {
         presentedRequestID = requestID
+        await presentationSignal.signal()
     }
 
-    func recordCancellation(requestID: UUID) {
+    func recordCancellation(requestID: UUID) async {
         cancelledRequestIDs.append(requestID)
+        await cancellationSignal.signal()
     }
 
-    func presentationRequestID() -> UUID? {
-        presentedRequestID
+    func waitForPresentation(timeout: Duration) async -> UUID? {
+        guard await presentationSignal.wait(timeout: timeout) else { return nil }
+        return presentedRequestID
+    }
+
+    func waitForCancellation(timeout: Duration) async -> Bool {
+        await cancellationSignal.wait(timeout: timeout)
     }
 
     func snapshot() -> Snapshot {
@@ -1670,7 +1735,6 @@ private func makeRuntime(mode: DomainRuntimeMode) -> MCPDomainRuntime {
             eventDirectory: root.appendingPathComponent("Events"),
             temporaryDirectory: root.appendingPathComponent("Temporary"),
             externalReloadInterval: nil,
-            protectedMutationStage: .m4B
         )
     )
 }

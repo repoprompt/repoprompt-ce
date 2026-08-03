@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 
-package enum DomainReadContextRequirement: Equatable, Sendable {
+package enum DomainReadContextRequirement: Equatable {
     case workspaceIndependent
     case workspaceOptional
     case workspaceRequired
@@ -10,7 +10,7 @@ package enum DomainReadContextRequirement: Equatable, Sendable {
 /// The shared provider may execute historically unscoped reads (history, graceful tree/Git
 /// fallbacks) without manufacturing a domain identity. Scoped reads carry the exact authority
 /// handle and connection consumed by the backend.
-package struct DomainReadInvocationContext: Sendable {
+package struct DomainReadInvocationContext {
     package let invocationID: UUID
     package var handle: DomainReadContextHandle?
     package let connectionID: UUID?
@@ -29,7 +29,7 @@ package struct DomainReadInvocationContext: Sendable {
     }
 }
 
-package struct MCPDomainReadSideEffectEmitter: Sendable {
+package struct MCPDomainReadSideEffectEmitter {
     private let submitOperation: @Sendable (
         _ effectClass: DomainReadSideEffectClass,
         _ operationID: UUID,
@@ -38,7 +38,7 @@ package struct MCPDomainReadSideEffectEmitter: Sendable {
         _ operation: @Sendable @escaping () async throws -> Void
     ) async throws -> Void
 
-    init(
+    package init(
         submit: @Sendable @escaping (
             _ effectClass: DomainReadSideEffectClass,
             _ operationID: UUID,
@@ -69,7 +69,7 @@ package struct MCPDomainReadSideEffectEmitter: Sendable {
     }
 }
 
-package struct MCPDomainReadToolBackend: Sendable {
+package struct MCPDomainReadToolBackend {
     package typealias Execute = @Sendable (
         _ toolName: String,
         _ context: DomainReadInvocationContext,
@@ -88,7 +88,7 @@ package struct MCPDomainReadToolBackend: Sendable {
 ///
 /// Concrete app and standalone compositions inject physical backends, but both execute the same
 /// definitions, cancellation boundaries, scoped authority refresh, and effect revision semantics.
-package struct MCPDomainReadToolProvider: Sendable {
+package struct MCPDomainReadToolProvider {
     package typealias ResolveContext = @Sendable (
         _ toolName: String,
         _ requirement: DomainReadContextRequirement
@@ -265,19 +265,19 @@ package struct MCPDomainReadToolProvider: Sendable {
     ) -> Bool {
         switch toolName {
         case "get_code_structure":
-            return arguments["paths"] == nil
+            arguments["paths"] == nil
         case "get_file_tree":
-            return arguments["mode"]?.stringValue?.lowercased() == "selected"
+            arguments["mode"]?.stringValue?.lowercased() == "selected"
         case "workspace_context":
-            return (arguments["op"]?.stringValue ?? "snapshot").lowercased() == "snapshot"
+            (arguments["op"]?.stringValue ?? "snapshot").lowercased() == "snapshot"
         case "prompt":
-            return arguments["op"]?.stringValue?.lowercased() == "export"
+            arguments["op"]?.stringValue?.lowercased() == "export"
         case "git":
-            return arguments["op"]?.stringValue?.lowercased() == "diff"
+            arguments["op"]?.stringValue?.lowercased() == "diff"
                 && arguments["artifacts"]?.boolValue == true
                 && arguments["scope"]?.stringValue?.lowercased() == "selected"
         default:
-            return false
+            false
         }
     }
 }

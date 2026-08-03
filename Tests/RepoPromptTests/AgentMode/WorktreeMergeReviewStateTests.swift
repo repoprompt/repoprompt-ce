@@ -36,6 +36,101 @@ final class WorktreeMergeReviewStateTests: XCTestCase {
         XCTAssertEqual(endpoint.head, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     }
 
+    func testWorktreeMergeEndpointPostCheckRejectsPathOrIdentityChanges() throws {
+        let repository = GitWorktreeRepositoryIdentity(
+            repositoryID: "gitrepo_merge",
+            repoKey: "merge",
+            displayName: "merge",
+            commonGitDir: "/tmp/merge/.git",
+            mainWorktreeRoot: "/tmp/merge"
+        )
+
+        func descriptor(
+            worktreeID: String = "wt_source",
+            path: String = "/tmp/merge-source/../merge-source",
+            head: String = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ) -> GitWorktreeDescriptor {
+            GitWorktreeDescriptor(
+                worktreeID: worktreeID,
+                repository: repository,
+                path: path,
+                gitDir: "/tmp/merge/.git/worktrees/source",
+                name: "source",
+                branch: "feature",
+                head: head,
+                isMain: false,
+                isCurrent: false,
+                isDetached: false,
+                isLocked: false,
+                lockReason: nil,
+                isPrunable: false,
+                prunableReason: nil
+            )
+        }
+
+        let endpoint = try GitWorktreeMergeEndpoint(descriptor: descriptor())
+        XCTAssertEqual(endpoint.path, "/tmp/merge-source")
+        XCTAssertTrue(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor()))
+        XCTAssertFalse(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor(path: "/tmp/merge-other")))
+        XCTAssertFalse(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor(worktreeID: "wt-replaced")))
+        XCTAssertFalse(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor(head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")))
+    }
+
+    func testEndpointAuthorizationAcceptsMainAdvertisedByAuthorizedLinkedWorktree() async throws {
+        let fixture = try makeEndpointAuthorizationFixture()
+
+        let authorized = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+            for: fixture.endpoint,
+            roots: [fixture.linkedRoot],
+            resolver: fixture.resolver
+        )
+
+        XCTAssertEqual(authorized, fixture.resolvedMain)
+    }
+
+    func testEndpointAuthorizationRejectsExternalWorktreeNotAdvertisedByAuthorizedRoot() async throws {
+        let fixture = try makeEndpointAuthorizationFixture()
+        let unrelatedRoot = WorkspaceRootRef(
+            id: UUID(),
+            name: "unrelated",
+            fullPath: "/tmp/unrelated-workspace"
+        )
+
+        do {
+            _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+                for: fixture.endpoint,
+                roots: [unrelatedRoot],
+                resolver: fixture.resolver
+            )
+            XCTFail("Expected an external worktree with no authorized repository checkout to be rejected.")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("inside a loaded root or advertised by a loaded repository"),
+                String(describing: error)
+            )
+        }
+    }
+
+    func testEndpointAuthorizationRejectsResolvedHeadIdentityDrift() async throws {
+        let fixture = try makeEndpointAuthorizationFixture(
+            resolvedHead: "cccccccccccccccccccccccccccccccccccccccc"
+        )
+
+        do {
+            _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+                for: fixture.endpoint,
+                roots: [fixture.linkedRoot],
+                resolver: fixture.resolver
+            )
+            XCTFail("Expected an endpoint whose resolved HEAD changed to be rejected.")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("Worktree endpoint identity changed before authorization"),
+                String(describing: error)
+            )
+        }
+    }
+
     func testPreviewOperationUpsertAndApprovalStateAreReflectedInRunSnapshot() {
         var operations: [AgentSessionWorktreeMergeOperation] = []
         let preview = makePreview(operationID: "merge_state")
@@ -151,6 +246,74 @@ final class WorktreeMergeReviewStateTests: XCTestCase {
     private let sessionID = UUID(uuidString: "00000000-0000-0000-0000-000000000302")!
     private let reviewID = UUID(uuidString: "00000000-0000-0000-0000-000000000303")!
     private let stateNow = Date(timeIntervalSinceReferenceDate: 303)
+
+    private func makeEndpointAuthorizationFixture(
+        resolvedHead: String = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ) throws -> (
+        endpoint: GitWorktreeMergeEndpoint,
+        resolvedMain: GitWorktreeDescriptor,
+        linkedRoot: WorkspaceRootRef,
+        resolver: GitRepoTargetResolver
+    ) {
+        let mainPath = "/tmp/merge-main"
+        let linkedPath = "/tmp/merge-linked"
+        let endpointHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        let repository = GitWorktreeRepositoryIdentity(
+            repositoryID: "gitrepo_merge",
+            repoKey: "merge",
+            displayName: "merge",
+            commonGitDir: "\(mainPath)/.git",
+            mainWorktreeRoot: mainPath
+        )
+
+        func mainDescriptor(head: String) -> GitWorktreeDescriptor {
+            GitWorktreeDescriptor(
+                worktreeID: "wt_main",
+                repository: repository,
+                path: mainPath,
+                gitDir: "\(mainPath)/.git",
+                name: "merge-main",
+                branch: "main",
+                head: head,
+                isMain: true,
+                isCurrent: false,
+                isDetached: false,
+                isLocked: false,
+                lockReason: nil,
+                isPrunable: false,
+                prunableReason: nil
+            )
+        }
+
+        let linked = GitWorktreeDescriptor(
+            worktreeID: "wt_linked",
+            repository: repository,
+            path: linkedPath,
+            gitDir: "\(mainPath)/.git/worktrees/merge-linked",
+            name: "merge-linked",
+            branch: "feature/merge",
+            head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            isMain: false,
+            isCurrent: true,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
+        )
+        let endpoint = try GitWorktreeMergeEndpoint(descriptor: mainDescriptor(head: endpointHead))
+        let resolvedMain = mainDescriptor(head: resolvedHead)
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: { url in
+                url.standardizedFileURL.path == mainPath
+                    ? GitRepoDescriptor(rootURL: URL(fileURLWithPath: mainPath))
+                    : nil
+            },
+            listWorktrees: { _ in [resolvedMain, linked] }
+        ))
+        let linkedRoot = WorkspaceRootRef(id: UUID(), name: "merge-linked", fullPath: linkedPath)
+        return (endpoint, resolvedMain, linkedRoot, resolver)
+    }
 
     private func makeBinding(
         logicalRootName: String,

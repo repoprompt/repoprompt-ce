@@ -22,13 +22,13 @@ extension MCPToolAdmissionClass {
 
 enum MCPToolAdmissionPolicy {
     /// Preserve the measured app-host lane limits; M1 moves classification authority only.
-    static let exclusiveConnectionLimit = 1
-    static let controlConnectionLimit = 8
-    static let smallReadConnectionLimit = 2
-    static let smallReadPerWindowLimit = 2
-    static let gitReadConnectionLimit = 2
-    static let fileSearchConnectionLimit = 4
-    static let gitReadPerRepositoryLimit = 1
+    static let exclusiveConnectionLimit = MCPDomainToolAdmissionLimits.exclusiveConnection
+    static let controlConnectionLimit = MCPDomainToolAdmissionLimits.controlConnection
+    static let smallReadConnectionLimit = MCPDomainToolAdmissionLimits.smallReadConnection
+    static let smallReadPerWindowLimit = MCPDomainToolAdmissionLimits.smallReadPerWindow
+    static let gitReadConnectionLimit = MCPDomainToolAdmissionLimits.gitReadConnection
+    static let fileSearchConnectionLimit = MCPDomainToolAdmissionLimits.fileSearchConnection
+    static let gitReadPerRepositoryLimit = MCPDomainToolAdmissionLimits.gitReadPerRepository
 
     static let classifications = MCPDomainToolCatalog.classifications
 

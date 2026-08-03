@@ -173,9 +173,9 @@ import XCTest
                     applicationSupportRoot: applicationSupportRoot,
                     workspaceDirectoryProvider: { _ in workspaceDirectories }
                 )
-                let runtime = MCPWindowToolRuntime(windowID: 42) { name, _, arguments, implementation in
+                let runtime = MCPAppToolBinder(windowID: 42) { name, _, arguments, implementation in
                     try await implementation(
-                        MCPWindowToolContext(toolName: name, windowID: 42),
+                        MCPAppToolInvocation(toolName: name, windowID: 42),
                         arguments
                     )
                 }
@@ -2733,7 +2733,7 @@ import XCTest
                 await ToolAvailabilityStore.shared.toggle(MCPGlobalToolName.appSettings, enabled: true)
             }
 
-            let catalog = await ServiceRegistry.catalogSnapshot()
+            let catalog = await AppDomainRuntimeComposition.shared.catalogSnapshot()
             let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
             let isAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
                 $0.name == MCPGlobalToolName.appSettings
@@ -2762,7 +2762,7 @@ import XCTest
         }
 
         func assertRestored(file: StaticString = #filePath, line: UInt = #line) async {
-            let catalog = await ServiceRegistry.catalogSnapshot()
+            let catalog = await AppDomainRuntimeComposition.shared.catalogSnapshot()
             let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
             XCTAssertTrue(isRegistered, file: file, line: line)
             XCTAssertTrue(

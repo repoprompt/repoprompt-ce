@@ -488,7 +488,6 @@ private final class M4BFixture: @unchecked Sendable {
                 eventDirectory: storage.appendingPathComponent("events", isDirectory: true),
                 temporaryDirectory: storage.appendingPathComponent("tmp", isDirectory: true),
                 externalReloadInterval: nil,
-                protectedMutationStage: .m4B
             ),
             runtimeID: UUID(),
             lifecycleGeneration: 1,

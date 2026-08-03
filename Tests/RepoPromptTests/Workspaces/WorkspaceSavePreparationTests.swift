@@ -725,6 +725,18 @@ import XCTest
                 name: "Deferred persistence distractor",
                 repoPaths: ["/tmp/distractor"]
             )
+            let distractorURL = manager.workspaceFileURL(for: distractor)
+            let distractorPersistedNotification = expectation(
+                description: "distractor persistence publishes workspace list change"
+            )
+            let distractorPersistedObserver = NotificationCenter.default.addObserver(
+                forName: .workspaceListDidChange,
+                object: nil,
+                queue: .main
+            ) { _ in
+                guard FileManager.default.fileExists(atPath: distractorURL.path) else { return }
+                distractorPersistedNotification.fulfill()
+            }
             _ = try await waitForDomainWorkspace(
                 runtime,
                 workspaceID: distractor.id,
@@ -735,6 +747,8 @@ import XCTest
                 through: distractorCatalog.publicationSequence
             )
             XCTAssertTrue(distractorProjectionCompleted)
+            await fulfillment(of: [distractorPersistedNotification], timeout: 5)
+            NotificationCenter.default.removeObserver(distractorPersistedObserver)
             let renamedNotification = expectation(description: "rename publishes workspace list change after persistence")
             let renamedObserver = NotificationCenter.default.addObserver(
                 forName: .workspaceListDidChange,
@@ -791,6 +805,22 @@ import XCTest
             )
             XCTAssertEqual(renamedModel.name, "Runtime Renamed")
 
+            let hiddenNotification = expectation(description: "hidden state publishes workspace list change after persistence")
+            let hiddenObserver = NotificationCenter.default.addObserver(
+                forName: .workspaceListDidChange,
+                object: nil,
+                queue: .main
+            ) { _ in
+                guard
+                    let data = try? Data(contentsOf: authoritativeURL),
+                    let persisted = try? WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                        documentBytes: data,
+                        fileURL: authoritativeURL
+                    ),
+                    persisted.isHiddenInMenus
+                else { return }
+                hiddenNotification.fulfill()
+            }
             manager.setWorkspaceHidden(renamedModel, hidden: true)
             let hiddenTargetIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
             let hiddenDistractorIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == distractor.id })
@@ -803,6 +833,8 @@ import XCTest
             ) { snapshot in
                 snapshot.document.metadata.isHiddenInMenus
             }
+            await fulfillment(of: [hiddenNotification], timeout: 5)
+            NotificationCenter.default.removeObserver(hiddenObserver)
             XCTAssertTrue(hidden.document.metadata.isHiddenInMenus)
             let distractorAfterDeferredMutations = try await waitForDomainWorkspace(
                 runtime,

@@ -32,7 +32,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         _ securityContext: DomainToolInvocationSecurityContext
     ) async throws -> DomainChildLaunchCarrier?
 
-    package static let migratedToolNames: Set<String> = [
+    package static let toolNames: Set<String> = [
         "oracle_utils",
         "ask_oracle",
         "oracle_send",
@@ -70,7 +70,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         _ binding: MCPDomainToolBinding,
         interactionAdapter: DomainLongRunningInteractionAdapter? = nil
     ) -> MCPDomainToolBinding {
-        guard Self.migratedToolNames.contains(binding.definition.name) else { return binding }
+        guard Self.toolNames.contains(binding.definition.name) else { return binding }
         let definition = binding.definition
         return MCPDomainToolBinding(definition: definition) { arguments in
             try await execute(

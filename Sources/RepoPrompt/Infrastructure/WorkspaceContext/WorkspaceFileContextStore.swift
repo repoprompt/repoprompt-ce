@@ -3975,6 +3975,7 @@ actor WorkspaceFileContextStore {
                  .requestedWatermarkPredatesCapture, .requestedWatermarkNotYetAccepted:
                 .pendingIngressSequenceGap
             case .invalidJournalCut: .witnessGap
+            case .watcherActivationTimedOut: .watcherActivationFailure
             case .watcherAlreadyActive, .initializationAlreadyActive,
                  .initializationNotCurrent, .inventoryNotInstalled,
                  .invalidSeedInventoryPath, .replayAlreadyCompleted:

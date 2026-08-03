@@ -704,7 +704,7 @@ struct MCPSettingsView: View {
                       "mcpServers": {
                         "RepoPrompt": {
                           "command": "\(serverCommand)",
-                          "args": []
+                          "args": ["--backend", "app"]
                         }
                       }
                     }

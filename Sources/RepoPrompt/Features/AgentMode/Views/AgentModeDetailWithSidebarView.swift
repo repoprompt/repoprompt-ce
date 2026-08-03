@@ -337,7 +337,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
     let drawerStore: AgentContextDrawerUIStore
     @ObservedObject var presentationStore: AgentContextDrawerPresentationStore
     let promptManager: PromptViewModel
-    @ObservedObject var runtimeVM: AgentRuntimeSidebarViewModel
+    let runtimeVM: AgentRuntimeSidebarViewModel
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let oracleViewModel: OracleViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -363,7 +363,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
         self.drawerStore = drawerStore
         _presentationStore = ObservedObject(wrappedValue: drawerStore.presentation)
         self.promptManager = promptManager
-        _runtimeVM = ObservedObject(wrappedValue: runtimeVM)
+        self.runtimeVM = runtimeVM
         self.contextBuilderAgentVM = contextBuilderAgentVM
         self.oracleViewModel = oracleViewModel
         self.selectionCoordinator = selectionCoordinator

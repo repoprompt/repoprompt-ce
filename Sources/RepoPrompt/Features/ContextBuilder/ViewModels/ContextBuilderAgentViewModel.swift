@@ -3990,8 +3990,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let path = args["path"] as? String {
             var pathPart = (path as NSString).lastPathComponent
             if let startLine = args["start_line"] as? Int {
-                if let limit = args["limit"] as? Int {
-                    pathPart += ":\(startLine)-\(startLine + limit - 1)"
+                if let limit = args["limit"] as? Int, limit > 0 {
+                    let (endLine, overflow) = startLine.addingReportingOverflow(limit - 1)
+                    pathPart += overflow ? ":\(startLine)" : ":\(startLine)-\(endLine)"
                 } else {
                     pathPart += ":\(startLine)"
                 }

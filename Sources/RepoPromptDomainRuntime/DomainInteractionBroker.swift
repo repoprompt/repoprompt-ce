@@ -68,10 +68,48 @@ package struct DomainInteractionBrokerSnapshot: Sendable {
 }
 
 package actor DomainInteractionBroker {
+    private final class ProviderDeadlineArbiter: @unchecked Sendable {
+        struct ProviderResolution: Sendable {
+            let result: DomainInteractionResult
+            let ignoredLateResponse: Bool
+        }
+
+        private let lock = NSLock()
+        private var isResolved = false
+
+        func claimProviderCompletion(
+            at completedAt: Date,
+            deadline: Date,
+            result: DomainInteractionResult
+        ) -> ProviderResolution? {
+            lock.withLock {
+                guard !isResolved else { return nil }
+                isResolved = true
+                if case .response = result, completedAt >= deadline {
+                    return ProviderResolution(result: .timedOut, ignoredLateResponse: true)
+                }
+                return ProviderResolution(result: result, ignoredLateResponse: false)
+            }
+        }
+
+        func claimTimeout() -> Bool {
+            lock.withLock {
+                guard !isResolved else { return false }
+                isResolved = true
+                return true
+            }
+        }
+
+        func invalidate() {
+            lock.withLock { isResolved = true }
+        }
+    }
+
     private struct Pending {
         let request: DomainInteractionRequest
         let generation: UInt64
         let provider: DomainInteractionProvider
+        let arbiter: ProviderDeadlineArbiter
         let continuation: CheckedContinuation<DomainInteractionResult, Never>
         var providerTask: Task<Void, Never>?
         var timeoutTask: Task<Void, Never>?
@@ -144,33 +182,39 @@ package actor DomainInteractionBroker {
                     continuation.resume(returning: .failed("duplicate interaction request id"))
                     return
                 }
+                let arbiter = ProviderDeadlineArbiter()
                 pending[request.id] = Pending(
                     request: request,
                     generation: generation,
                     provider: provider,
+                    arbiter: arbiter,
                     continuation: continuation
                 )
                 let providerTask = Task { [weak self] in
+                    let result: DomainInteractionResult
                     do {
                         let value = try await provider.present(request)
-                        await self?.providerCompleted(
-                            requestID: request.id,
-                            generation: generation,
-                            result: .response(value, provider: provider.kind)
-                        )
+                        result = .response(value, provider: provider.kind)
                     } catch is CancellationError {
-                        await self?.providerCompleted(
-                            requestID: request.id,
-                            generation: generation,
-                            result: .cancelled
-                        )
+                        result = .cancelled
                     } catch {
-                        await self?.providerCompleted(
-                            requestID: request.id,
-                            generation: generation,
-                            result: .failed(String(describing: error))
-                        )
+                        result = .failed(String(describing: error))
                     }
+                    let resolution = arbiter.claimProviderCompletion(
+                        at: Date(),
+                        deadline: request.deadline,
+                        result: result
+                    )
+                    guard let resolution else {
+                        await self?.providerCompletionIgnored()
+                        return
+                    }
+                    await self?.providerCompleted(
+                        requestID: request.id,
+                        generation: generation,
+                        ignoredLateResponse: resolution.ignoredLateResponse,
+                        result: resolution.result
+                    )
                 }
                 let delay = max(0, request.deadline.timeIntervalSinceNow)
                 let timeoutTask = Task { [weak self] in
@@ -179,6 +223,7 @@ package actor DomainInteractionBroker {
                     } catch {
                         return
                     }
+                    guard arbiter.claimTimeout() else { return }
                     await self?.timeout(requestID: request.id, generation: generation)
                 }
                 if var record = pending[request.id], record.generation == generation {
@@ -222,6 +267,7 @@ package actor DomainInteractionBroker {
         let records = pending.values
         pending.removeAll()
         for record in records {
+            record.arbiter.invalidate()
             record.providerTask?.cancel()
             record.timeoutTask?.cancel()
             await record.provider.cancel(record.request.id)
@@ -240,13 +286,21 @@ package actor DomainInteractionBroker {
     private func providerCompleted(
         requestID: UUID,
         generation: UInt64,
+        ignoredLateResponse: Bool,
         result: DomainInteractionResult
     ) async {
         guard let record = pending[requestID], record.generation == generation else {
             ignoredLateResponseCount &+= 1
             return
         }
+        if ignoredLateResponse {
+            ignoredLateResponseCount &+= 1
+        }
         await finish(requestID: requestID, generation: generation, result: result)
+    }
+
+    private func providerCompletionIgnored() {
+        ignoredLateResponseCount &+= 1
     }
 
     private func timeout(requestID: UUID, generation: UInt64) async {
@@ -267,6 +321,7 @@ package actor DomainInteractionBroker {
             return
         }
         pending.removeValue(forKey: requestID)
+        record.arbiter.invalidate()
         record.providerTask?.cancel()
         record.timeoutTask?.cancel()
         record.continuation.resume(returning: result)

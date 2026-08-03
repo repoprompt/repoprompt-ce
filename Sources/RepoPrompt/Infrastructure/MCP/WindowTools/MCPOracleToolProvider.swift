@@ -5,15 +5,15 @@ import Ontology
 import RepoPromptDomainRuntime
 
 @MainActor
-final class MCPOracleToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .oracle
+final class MCPOracleToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .oracle
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {

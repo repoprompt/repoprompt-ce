@@ -38,6 +38,10 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         return haystack.components(separatedBy: needle).count - 1
     }
 
+    func testAppSpawnedMCPConfigurationPinsAppBackend() {
+        XCTAssertEqual(RepoPromptMCPServerConfiguration.repoPrompt.args, ["--backend", "app"])
+    }
+
     func testDiscoveryEnsureWritesBareRepoPromptCEServerHeader() throws {
         var lines: [String] = []
 
@@ -53,13 +57,13 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         let content = lines.joined(separator: "\n")
         XCTAssertTrue(content.contains(repoPromptHeader))
         XCTAssertTrue(content.contains("command = \"\(serverCommand)\""))
-        XCTAssertTrue(content.contains("args = []"))
+        XCTAssertTrue(content.contains("args = [\"--backend\", \"app\"]"))
         XCTAssertTrue(content.contains("tool_timeout_sec = 10000"))
         XCTAssertTrue(content.contains("supports_parallel_tool_calls = true"))
         XCTAssertTrue(content.contains("enabled = false"))
         XCTAssertTrue(
             content.contains(
-                "command = \"\(serverCommand)\"\nargs = []\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = true\nenabled = false"
+                "command = \"\(serverCommand)\"\nargs = [\"--backend\", \"app\"]\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = true\nenabled = false"
             )
         )
 

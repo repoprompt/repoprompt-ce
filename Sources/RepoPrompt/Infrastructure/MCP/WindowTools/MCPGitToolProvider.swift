@@ -209,11 +209,16 @@ private struct MCPGitDiffRepoOutcome {
 
 @MainActor
 final class MCPGitToolProvider {
-    private let dependencies: MCPWindowToolDependencies
+    private typealias Dependencies = (
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection
+    )
+
+    private let dependencies: Dependencies
     private var stagedAdvertisementsByInvocation: [UUID: MCPGitStagedAdvertisement] = [:]
 
-    init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
-        self.dependencies = dependencies
+    init(runtime _: MCPAppToolBinder, context: MCPAppPhysicalCapabilityAdapters.Context, selection: MCPAppPhysicalCapabilityAdapters.Selection) {
+        dependencies = (context: context, selection: selection)
     }
 
     private nonisolated static let maxConcurrentRepositories = 3
@@ -374,7 +379,7 @@ final class MCPGitToolProvider {
                 ) { [weak self] in
                     guard let self else { throw CancellationError() }
                     do {
-                        _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
+                        _ = try await dependencies.context.replaceAdvertisedGitArtifactsForCurrentTab(
                             MCPWindowToolName.git,
                             stagedAdvertisement.artifacts,
                             stagedAdvertisement.expectedSelectionRevision,
@@ -383,11 +388,11 @@ final class MCPGitToolProvider {
                     } catch let error as CancellationError {
                         throw error
                     } catch {
-                        await dependencies.invalidateAdvertisedGitArtifactsForCurrentTab(
+                        await dependencies.context.invalidateAdvertisedGitArtifactsForCurrentTab(
                             MCPWindowToolName.git,
                             appContext
                         )
-                        dependencies.logDebug(
+                        dependencies.context.logDebug(
                             "Git artifacts were published, but advertised aliases were not authorized: \(error.localizedDescription)"
                         )
                     }
@@ -447,7 +452,7 @@ final class MCPGitToolProvider {
             throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: status, diff, log, show, blame")
         }
 
-        guard let workspaceManager = dependencies.workspaceManager else {
+        guard let workspaceManager = dependencies.context.workspaceManager else {
             throw MCPError.invalidParams("Workspace manager unavailable for git tool.")
         }
         // Domain reads execute against the workspace captured at resolve time; only the legacy
@@ -470,7 +475,7 @@ final class MCPGitToolProvider {
         let metadata: MCPServerViewModel.RequestMetadata = if let appContext {
             appContext.metadata
         } else {
-            await dependencies.captureRequestMetadata()
+            await dependencies.context.captureRequestMetadata()
         }
         let hasExplicitPathspecs = !(args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             || (args["paths"]?.arrayValue?.contains { !($0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) } ?? false)
@@ -479,10 +484,9 @@ final class MCPGitToolProvider {
                                                                                                      !hasExplicitPathspecs,
                                                                                                      (args["scope"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all") == "selected"
         {
-            try appContext?.resolvedTabContext ?? dependencies.resolveTabContextSnapshot(
+            try appContext?.resolvedTabContext ?? dependencies.context.resolveTabContextSnapshot(
                 metadata,
-                MCPWindowToolName.git,
-                .allowLegacyImplicitRouting
+                MCPWindowToolName.git
             )
         } else {
             nil
@@ -490,9 +494,9 @@ final class MCPGitToolProvider {
         let lookupContext: WorkspaceLookupContext = if let appContext {
             appContext.lookupContext
         } else {
-            await dependencies.resolveFileToolLookupContext(metadata)
+            await dependencies.selection.resolveFileToolLookupContext(metadata)
         }
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
         let allRepos = await requestContext.allRepos()
         let explicitTokens = parseExplicitRepoRoots(from: args).map { tokens in
@@ -504,7 +508,7 @@ final class MCPGitToolProvider {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let hasExplicitSelector = explicitTokens != nil || !(explicitRepoKey?.isEmpty ?? true)
         let requestsArtifactPublication = args["artifacts"]?.boolValue == true
-        let frozenResolution = try await dependencies.resolveImplicitContextBuilderGitTarget(metadata)
+        let frozenResolution = try await dependencies.context.resolveImplicitContextBuilderGitTarget(metadata)
         let contextBuilderPolicy = MCPContextBuilderGitReviewPolicy()
         let contextBuilderOperation: MCPContextBuilderGitReviewOperation = switch op {
         case .status: .status
@@ -521,7 +525,7 @@ final class MCPGitToolProvider {
                 requestsArtifactPublication: requestsArtifactPublication,
                 operation: contextBuilderOperation,
                 allRepositories: allRepos,
-                store: dependencies.promptVM.workspaceFileContextStore
+                store: dependencies.context.promptVM.workspaceFileContextStore
             )
         } catch let error as MCPContextBuilderGitReviewPolicyError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -563,7 +567,7 @@ final class MCPGitToolProvider {
             } catch let error as MCPContextBuilderGitReviewPolicyError {
                 throw MCPError.invalidParams(error.localizedDescription)
             }
-            try await dependencies.validateContextBuilderGitArtifactSelection(metadata, publicationFence.target)
+            try await dependencies.context.validateContextBuilderGitArtifactSelection(metadata, publicationFence.target)
         }
 
         // Tool-level admission is keyed by every repository touched by this request. WI-9's
@@ -647,7 +651,7 @@ final class MCPGitToolProvider {
             var warningParts: [String: [String]] = [:]
             let root: WorkspaceRootRef
             do {
-                root = try await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
+                root = try await dependencies.context.ensureGitDataRootLoaded(workspace, workspaceManager)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -673,7 +677,7 @@ final class MCPGitToolProvider {
                         publishedOutcomes,
                         publishedArtifactSetCount: publishedSets.count,
                         fence: publicationFence,
-                        store: dependencies.promptVM.workspaceFileContextStore
+                        store: dependencies.context.promptVM.workspaceFileContextStore
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
                     stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
@@ -685,7 +689,7 @@ final class MCPGitToolProvider {
             }
 
             try Task.checkCancellation()
-            let ingress = await dependencies.promptVM.workspaceFileContextStore.ingressPublishedGitArtifacts(
+            let ingress = await dependencies.context.promptVM.workspaceFileContextStore.ingressPublishedGitArtifacts(
                 WorkspacePublishedGitArtifactIngressRequest(
                     root: root,
                     artifacts: publishedSets.flatMap(\.orderedArtifacts)
@@ -725,7 +729,7 @@ final class MCPGitToolProvider {
                         fingerprint: "git_primary_artifact_auto_selection"
                     ) { [weak self] in
                         guard let self else { throw CancellationError() }
-                        let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
+                        let commit = try await dependencies.context.commitPrimaryGitDiffArtifactsToCurrentTab(
                             MCPWindowToolName.git,
                             candidatesToCommit,
                             sourceSelection,
@@ -748,7 +752,7 @@ final class MCPGitToolProvider {
                             "Git artifact readiness: cataloged primary artifacts could not be committed to the canonical tab selection (\(error.localizedDescription)); autoSelected was omitted."
                         )
                     }
-                    dependencies.logDebug("Auto-select Git artifacts skipped: \(error.localizedDescription)")
+                    dependencies.context.logDebug("Auto-select Git artifacts skipped: \(error.localizedDescription)")
                 }
             }
 
@@ -1141,19 +1145,14 @@ final class MCPGitToolProvider {
                 if usesSelectedScope {
                     let resolvedContext = try preLookupSelectedPublicationContext
                         ?? appContext?.resolvedTabContext
-                        ?? dependencies.resolveTabContextSnapshot(
+                        ?? dependencies.context.resolveTabContextSnapshot(
                             metadata,
-                            MCPWindowToolName.git,
-                            .allowLegacyImplicitRouting
+                            MCPWindowToolName.git
                         )
                     let snapshotSelection = resolvedContext.snapshot.selection
-                    let stabilizedSelection: StoredSelection = if resolvedContext.usesActiveTabCompatibility {
-                        snapshotSelection
-                    } else {
-                        await dependencies.stabilizedVirtualSelection(
-                            resolvedContext.snapshot
-                        )
-                    }
+                    let stabilizedSelection = await dependencies.selection.stabilizedVirtualSelection(
+                        resolvedContext.snapshot
+                    )
                     let logicalSelection = Self.selectionHasPublishableGitDiffCandidates(stabilizedSelection)
                         ? stabilizedSelection
                         : snapshotSelection
@@ -1176,7 +1175,7 @@ final class MCPGitToolProvider {
 
                 // Multi-root artifact diff
                 if isMultiRepo {
-                    let tabID = dependencies.boundTabID(connectionID)
+                    let tabID = dependencies.context.boundTabID(connectionID)
 
                     // Group selection paths by repo
                     let pathsByRepo = usesSelectedScope ? groupAbsolutePathsByRepo(paths: allSelectedAbsolutePaths, repos: repos) : [:]
@@ -1335,7 +1334,7 @@ final class MCPGitToolProvider {
                 let normalizedResult = await requestContext.normalizeCompareSpec(compare.spec, at: repoURL)
                 let artifactDiffWarning = normalizedResult.warning
 
-                let tabID = dependencies.boundTabID(connectionID)
+                let tabID = dependencies.context.boundTabID(connectionID)
                 let manifest = try await publisher.publish(
                     workspaceDirectory: workspaceDirectory,
                     repo: primaryRepo,

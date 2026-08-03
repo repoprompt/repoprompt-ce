@@ -6,7 +6,7 @@ import XCTest
 final class MCPDomainReadToolProviderTests: XCTestCase {
     func testDefinitionsCoverM3FamiliesExactlyOnce() throws {
         let definitions = MCPDomainReadToolDefinitions.definitions
-        XCTAssertEqual(definitions.map(\.name), MCPDomainReadToolDefinitions.migratedToolNames)
+        XCTAssertEqual(definitions.map(\.name), MCPDomainReadToolDefinitions.toolNames)
         XCTAssertEqual(Set(definitions.map(\.name)).count, definitions.count)
         XCTAssertTrue(definitions.allSatisfy { $0.inputSchema.objectValue?["type"]?.stringValue == "object" })
         XCTAssertEqual(definitions.first { $0.name == "prompt" }?.annotations.readOnlyHint, false)
@@ -40,7 +40,7 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         }
 
         let invocations = await recorder.snapshot()
-        XCTAssertEqual(invocations.map(\.name), MCPDomainReadToolDefinitions.migratedToolNames)
+        XCTAssertEqual(invocations.map(\.name), MCPDomainReadToolDefinitions.toolNames)
         XCTAssertTrue(invocations.allSatisfy { $0.context.handle == handle })
     }
 

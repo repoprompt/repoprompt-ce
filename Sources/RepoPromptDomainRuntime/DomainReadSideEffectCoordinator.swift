@@ -124,7 +124,7 @@ package actor DomainReadSideEffectCoordinator {
     }
 
     /// Waits for the exact submitted operation and preserves its success/failure/cancellation.
-    /// Cancellation of the waiter cancels the not-yet-committed effect.
+    /// Cancellation of the waiter does not cancel the coordinator-owned shared effect.
     package func wait(
         handle: DomainReadContextHandle,
         receipt: DomainReadSideEffectReceipt
@@ -136,7 +136,7 @@ package actor DomainReadSideEffectCoordinator {
               state.operations[receipt.operationID]?.receipt == receipt,
               let task = state.tasks[receipt.revision]
         else { throw DomainReadSideEffectError.receiptUnavailable }
-        try await awaitCompletion(of: task, cancelUnderlyingOnCancellation: true)
+        try await awaitCompletion(of: task, cancelUnderlyingOnCancellation: false)
     }
 
     /// Waits until the lane has reached a revision. Historical effect failures are terminal and

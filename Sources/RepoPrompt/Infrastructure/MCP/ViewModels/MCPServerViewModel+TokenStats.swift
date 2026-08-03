@@ -105,16 +105,16 @@ extension MCPServerViewModel {
 
     @MainActor
     func prepareMCPTokenAccounting(
-        context: TabScopedContext,
+        context: TabContextSnapshot,
         effectiveSelection: StoredSelection,
         collections: SelectionReplyAssembler.SelectionCollections,
         resolvedContext: PromptContextResolved,
         lookupContext: WorkspaceLookupContext,
-        activeTabCompatibility: Bool,
+        presentationActiveContext: Bool,
         allowActivePublishedSnapshotRefresh: Bool = true,
         allowVirtualTokenRefresh: Bool = true
     ) async -> MCPPreparedTokenAccounting {
-        if activeTabCompatibility {
+        if presentationActiveContext {
             let publishedOverlay = publishedEntryResultsOverlay(
                 collections: collections,
                 base: [:],
@@ -366,7 +366,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func virtualTokenSignature(
-        context: TabScopedContext,
+        context: TabContextSnapshot,
         selection: StoredSelection,
         resolvedContext: PromptContextResolved,
         lookupContext: WorkspaceLookupContext,
@@ -391,7 +391,7 @@ extension MCPServerViewModel {
     @MainActor
     private func enqueueVirtualTokenRefresh(
         signature: MCPVirtualTokenSignature,
-        context: TabScopedContext,
+        context: TabContextSnapshot,
         effectiveSelection: StoredSelection,
         resolvedContext: PromptContextResolved,
         collections: SelectionReplyAssembler.SelectionCollections,

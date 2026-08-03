@@ -10,9 +10,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertFalse(MCPToolCapabilities.capabilities(for: MCPWindowToolName.manageWorktree).contains(.gitRead))
         XCTAssertTrue(MCPToolCapabilities.toolNames(for: [.worktreeManage]).contains(MCPWindowToolName.manageWorktree))
         XCTAssertTrue(DiscoverMCPToolPolicy.restrictedTools.contains(MCPWindowToolName.manageWorktree))
-        XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: MCPWindowToolName.manageWorktree))
-        XCTAssertFalse(ServerNetworkManager.shouldInjectLegacyTabIDForCompatibility(for: MCPWindowToolName.manageWorktree))
-        XCTAssertFalse(MCPWindowToolGroup.orderedToolNames.contains("merge_worktree"))
+        XCTAssertFalse(MCPAppToolGroup.orderedToolNames.contains("merge_worktree"))
         XCTAssertTrue(MCPToolCapabilities.capabilities(for: "merge_worktree").isEmpty)
     }
 

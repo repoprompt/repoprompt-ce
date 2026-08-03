@@ -1,5 +1,6 @@
 import MCP
 @testable import RepoPromptApp
+@testable import RepoPromptMCP
 import RepoPromptShared
 import XCTest
 
@@ -84,7 +85,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
 
         try Self.assertOrdered([
-            "let (resolvedContext, lookupContext) = try await dependencies.resolveMutationFileToolContext(",
+            "let (resolvedContext, lookupContext) = try await dependencies.selection.resolveMutationFileToolContext(",
             "MCPMutationRetryableFailure.unresolvedRouteFailure(",
             "return Self.retryableFailureSummary(request: request, failure: failure)",
             "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
@@ -160,6 +161,88 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertFalse(body.contains("reconcile using operation ID"))
     }
 
+    func testManageSelectionPromoteDemotePersistOnlyWhenMutationOccurs() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPSelectionToolProvider.swift")
+        let promote = try XCTUnwrap(source.slice(from: "        case \"promote\":", to: "        case \"demote\":"))
+        try Self.assertOrdered([
+            "let promoteResult = await dependencies.selection.promoteStoredSelectionPaths(",
+            "if promoteResult.validCandidateCount == 0",
+            "throw Self.invalidOnlySelectionError(",
+            "persistAndReply(",
+            "mutated: promoteResult.mutated"
+        ], in: promote)
+        XCTAssertFalse(promote.contains("if strict, !promoteResult.mutated"))
+
+        let demote = try XCTUnwrap(source.slice(from: "        case \"demote\":", to: "        case \"clear\":"))
+        try Self.assertOrdered([
+            "let demoteResult = await dependencies.selection.demoteStoredSelectionPaths(",
+            "if demoteResult.validCandidateCount == 0",
+            "throw Self.invalidOnlySelectionError(",
+            "persistAndReply(",
+            "mutated: demoteResult.mutated"
+        ], in: demote)
+        XCTAssertFalse(demote.contains("if strict, !demoteResult.mutated"))
+
+        let persistence = try XCTUnwrap(source.slice(
+            from: "    private func persistAndReply(",
+            to: "    static func requireCanonicalSelection("
+        ))
+        try Self.assertOrdered([
+            "} else if mutated {",
+            "persistResolvedTabContextSnapshot(",
+            "} else {",
+            "canonicalSelection = baseContext.selection"
+        ], in: persistence)
+        XCTAssertEqual(
+            persistence.components(separatedBy: "persistResolvedTabContextSnapshot(").count - 1,
+            1
+        )
+    }
+
+    func testPromoteDemoteInvalidOnlyDiagnosticsMapToInvalidParamsToolErrors() {
+        let error = MCPSelectionToolProvider.invalidOnlySelectionError(
+            invalidPaths: ["outside/Sources/A.swift"],
+            fallback: "unused fallback"
+        )
+        XCTAssertEqual(
+            String(describing: error),
+            "[-32602] Invalid params: Invalid selection inputs: outside/Sources/A.swift"
+        )
+
+        let fallback = MCPSelectionToolProvider.invalidOnlySelectionError(
+            invalidPaths: [],
+            fallback: "promote could not resolve any files"
+        )
+        XCTAssertEqual(
+            String(describing: fallback),
+            "[-32602] Invalid params: promote could not resolve any files"
+        )
+    }
+
+    func testCloseTabRepairsBoundNonActiveContextAfterCommit() throws {
+        let source = try Self.source("Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "        var selectedContextID: UUID?",
+            to: "    private func resolveWorkspace("
+        ))
+
+        try Self.assertOrdered([
+            "var expectedClosedBinding: DomainBinding?",
+            "closedContextID = targetID",
+            "scope.binding.ordinaryContextMatches(",
+            "let outcome = await runtime.workspaceStore.execute(",
+            "command: .replaceWorkingDocument(replacement)",
+            "try requireApplied(outcome)",
+            "compareAndSetBinding(",
+            "expectedBinding: expectedClosedBinding",
+            "repairedBinding = casResult.snapshot.binding",
+            "result[\"binding\"] = bindingValue(repairedBinding)",
+            "if action == \"create_tab\", let selectedContextID"
+        ], in: body)
+        XCTAssertFalse(body.contains("let boundContext = bindingContext(scope.binding)"))
+        XCTAssertFalse(body.contains("standaloneScopeCoordinator.unbind(scopeID: scopeID)"))
+    }
+
     func testDurableFileActionDoesNotReenterStoreForPostMutationIngress() throws {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
         let body = try XCTUnwrap(source.slice(
@@ -168,7 +251,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
         let postMutation = try XCTUnwrap(body.slice(
             from: "        // The filesystem mutation is durable.",
-            to: "        if action.lowercased() == \"create\", !resolvedContext.usesActiveTabCompatibility {"
+            to: "        var acknowledgementWarnings: [String] = []"
         ))
 
         XCTAssertTrue(postMutation.contains("let freshness = \"fresh\""))
@@ -195,7 +278,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         let body = try XCTUnwrap(source.privateFunction(named: "fileActionsTool"))
 
         try Self.assertOrdered([
-            "let acknowledgement = try await dependencies.performFileAction(action, path, content, newPath, ifExists, operationID)",
+            "let acknowledgement = try await dependencies.files.performFileAction(action, path, content, newPath, ifExists, operationID)",
             "catch let failure as MCPMutationRetryableFailure",
             "ToolResultDTOs.FileActionReply.retryableFailure(",
             "failure: failure"
@@ -206,7 +289,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
         let body = try XCTUnwrap(source.slice(
             from: "        guard let resolved else {",
-            to: "        if resolved.usesActiveTabCompatibility,"
+            to: "        if let frozenLookupContext = resolved.snapshot.frozenLookupContext"
         ))
 
         try Self.assertOrdered([

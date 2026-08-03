@@ -20,13 +20,9 @@ final class MCPReadFileAutoSelectionCoordinator {
 
     enum Route: Hashable {
         case bound(connectionID: UUID, runID: UUID?)
-        case activeTabCompatibility
 
         var diagnosticScope: String {
-            switch self {
-            case .bound: "bound"
-            case .activeTabCompatibility: "active_compatibility"
-            }
+            "bound"
         }
     }
 

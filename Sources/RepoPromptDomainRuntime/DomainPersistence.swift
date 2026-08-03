@@ -374,6 +374,18 @@ package struct DomainPersistenceCoordinator {
     private var agentSessionMetadataLockURL: URL {
         lockDirectory.appendingPathComponent("agent-sessions.lock")
     }
+    private var directSettingsURL: URL {
+        settingsDirectory.appendingPathComponent("direct-settings.json")
+    }
+    private var directSettingsLockURL: URL {
+        lockDirectory.appendingPathComponent("direct-settings.lock")
+    }
+    private var agentWorktreeBindingsURL: URL {
+        settingsDirectory.appendingPathComponent("agent-worktree-bindings.json")
+    }
+    private var agentWorktreeBindingsLockURL: URL {
+        lockDirectory.appendingPathComponent("agent-worktree-bindings.lock")
+    }
     private var legacyAgentSessionMetadataURL: URL {
         configuration.storageDirectory
             .appendingPathComponent("DomainRuntime", isDirectory: true)
@@ -473,6 +485,70 @@ package struct DomainPersistenceCoordinator {
                     throw DomainPersistenceError.externalDocumentConflict
                 }
                 try DomainPersistenceLock.atomicWrite(data, to: worker.protectedMutationJournalURL)
+            }
+        }
+    }
+
+    package func loadDirectSettingsData() async throws -> DomainPersistenceDataSnapshot {
+        try await DomainBlockingIO.run { cancellation in
+            try cancellation.check()
+            let worker = blockingWorker(cancellation)
+            let data = worker.fileManager.fileExists(atPath: worker.directSettingsURL.path)
+                ? try Data(contentsOf: worker.directSettingsURL)
+                : nil
+            return DomainPersistenceDataSnapshot(data: data)
+        }
+    }
+
+    package func compareAndSwapDirectSettingsData(
+        expectedDigest: String?,
+        data: Data
+    ) async throws {
+        try await DomainBlockingIO.run { cancellation in
+            let worker = blockingWorker(cancellation)
+            try cancellation.check()
+            try worker.withLock(at: worker.directSettingsLockURL) {
+                try cancellation.check()
+                let currentData = worker.fileManager.fileExists(atPath: worker.directSettingsURL.path)
+                    ? try Data(contentsOf: worker.directSettingsURL)
+                    : nil
+                let currentDigest = currentData.map(DomainContentDigest.sha256)
+                guard currentDigest == expectedDigest else {
+                    throw DomainPersistenceError.externalDocumentConflict
+                }
+                try DomainPersistenceLock.atomicWrite(data, to: worker.directSettingsURL)
+            }
+        }
+    }
+
+    package func loadAgentWorktreeBindingsData() async throws -> DomainPersistenceDataSnapshot {
+        try await DomainBlockingIO.run { cancellation in
+            try cancellation.check()
+            let worker = blockingWorker(cancellation)
+            let data = worker.fileManager.fileExists(atPath: worker.agentWorktreeBindingsURL.path)
+                ? try Data(contentsOf: worker.agentWorktreeBindingsURL)
+                : nil
+            return DomainPersistenceDataSnapshot(data: data)
+        }
+    }
+
+    package func compareAndSwapAgentWorktreeBindingsData(
+        expectedDigest: String?,
+        data: Data
+    ) async throws {
+        try await DomainBlockingIO.run { cancellation in
+            let worker = blockingWorker(cancellation)
+            try cancellation.check()
+            try worker.withLock(at: worker.agentWorktreeBindingsLockURL) {
+                try cancellation.check()
+                let currentData = worker.fileManager.fileExists(atPath: worker.agentWorktreeBindingsURL.path)
+                    ? try Data(contentsOf: worker.agentWorktreeBindingsURL)
+                    : nil
+                let currentDigest = currentData.map(DomainContentDigest.sha256)
+                guard currentDigest == expectedDigest else {
+                    throw DomainPersistenceError.externalDocumentConflict
+                }
+                try DomainPersistenceLock.atomicWrite(data, to: worker.agentWorktreeBindingsURL)
             }
         }
     }

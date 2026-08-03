@@ -7,12 +7,17 @@ import XCTest
 @MainActor
 final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testManageWorktreeAndAgentRunAPISmokeFlow() async throws {
+        Self.traceSmokePhase("fixture.begin")
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        Self.traceSmokePhase("fixture.ready")
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
+        Self.traceSmokePhase("window.begin")
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        Self.traceSmokePhase("window.ready")
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        Self.traceSmokePhase("tool.ready")
 
         let graphList = try await manageWorktree([
             "op": .string("list"),
@@ -21,6 +26,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "persist_visuals": .bool(true)
         ])
         try assertManageWorktreeGraphListContract(graphList)
+        Self.traceSmokePhase("list.ready")
 
         let createValue = try await manageWorktree([
             "op": .string("create"),
@@ -34,6 +40,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let createdWorktreeID = try XCTUnwrap(createdWorktree["worktree_id"]?.stringValue)
         let createdWorktreePath = try XCTUnwrap(createdWorktree["path"]?.stringValue)
         XCTAssertTrue(FileManager.default.fileExists(atPath: createdWorktreePath), createdWorktreePath)
+        Self.traceSmokePhase("create.ready")
 
         let bindSessionID = UUID()
         let bindTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -57,6 +64,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertEqual(binding["worktree_root_path"]?.stringValue, createdWorktreePath)
         XCTAssertEqual(binding["logical_root_path"]?.stringValue, fixture.repo.path)
         XCTAssertEqual(binding["visual_label"]?.stringValue, "Bound Item 12")
+        Self.traceSmokePhase("bind.ready")
 
         try await assertDiscoveryToolsReportWorktreeScope(
             window: window,
@@ -64,6 +72,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             effectiveRootPath: createdWorktreePath,
             worktreeID: createdWorktreeID
         )
+        Self.traceSmokePhase("discovery.ready")
 
         let existingStartTab = try await Self.createBackgroundTab(in: window, name: "Item 12 Existing Start")
         let existingStart = try await Self.makeAgentRunService(window: window, targetTabID: existingStartTab.id).execute(args: [
@@ -78,14 +87,18 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let existingStartBinding = try Self.firstWorktreeBinding(existingStart)
         XCTAssertEqual(existingStartBinding["worktree_id"]?.stringValue, createdWorktreeID)
         XCTAssertEqual(existingStartBinding["worktree_root_path"]?.stringValue, createdWorktreePath)
+        Self.traceSmokePhase("existing-start.ready")
         try await assertBoundSessionReadAndApplyUseWorktree(
             value: existingStart,
             window: window,
             logicalRoot: fixture.repo,
             originalTrackedFile: fixture.trackedFile
         )
+        Self.traceSmokePhase("bound-read-apply.ready")
 
+        Self.traceSmokePhase("create-start.begin")
         let createStartTab = try await Self.createBackgroundTab(in: window, name: "Item 12 Create Start")
+        Self.traceSmokePhase("create-start.tab-ready")
         let createStart = try await Self.makeAgentRunService(window: window, targetTabID: createStartTab.id).execute(args: [
             "op": .string("start"),
             "message": .string("Smoke created worktree binding"),
@@ -103,6 +116,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let createStartPath = try XCTUnwrap(createStartBinding["worktree_root_path"]?.stringValue)
         XCTAssertNotEqual(createStartPath, fixture.repo.path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: createStartPath), createStartPath)
+        Self.traceSmokePhase("create-start.ready")
 
         let formattedList = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: ["op": .string("list")], value: graphList))
         XCTAssertTrue(formattedList.contains("## Manage Worktree List"), formattedList)
@@ -112,14 +126,15 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let formattedStart = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("start")], value: createStart))
         XCTAssertTrue(formattedStart.contains("Worktree:"), formattedStart)
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
+        Self.traceSmokePhase("complete")
     }
 
     func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
 
         // Create a real linked worktree, then delete its checkout directory. Git keeps the admin
@@ -155,10 +170,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let manageSelection = try await Self.windowTool(named: MCPWindowToolName.manageSelection, in: window)
         let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
@@ -507,14 +522,14 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testContextBuilderExportUsesResolvedWorktreeContextAndIsReadableFromFreshConnection() async throws {
         #if DEBUG
             let fixture = try Self.makeGitFixture()
-            defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+            addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
             let provider = WorktreeContextBuilderImmediateCompletionProvider()
             let window = try await Self.makeWindow(
                 root: fixture.repo,
                 contextBuilderProviderFactory: { _, _, _ in provider }
             )
-            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            registerWindowTeardown(window)
             let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
             let contextBuilder = try await Self.windowTool(named: MCPWindowToolName.contextBuilder, in: window)
             let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
@@ -627,10 +642,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     func testManageWorktreeMergePreviewCleanApplyRawAndFormattedContract() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let sessionID = UUID()
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -659,6 +674,13 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "worktree_id": .string(sourceWorktreeID),
             "session_id": .string(sessionID.uuidString)
         ])
+        XCTAssertFalse(
+            GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                fixture.repo.path,
+                roots: [sourcePath]
+            ),
+            "The regression requires the loaded main target to sit outside the bound source worktree."
+        )
 
         let previewValue = try await manageWorktree([
             "op": .string("preview"),
@@ -696,6 +718,95 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let formattedApply = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: ["op": .string("apply")], value: applyValue))
         XCTAssertTrue(formattedApply.contains("## Manage Worktree Apply"), formattedApply)
         XCTAssertTrue(formattedApply.contains("Validate from target cwd"), formattedApply)
+    }
+
+    func testManageWorktreeApplyRejectsBindingRepositoryIdentityDriftBeforeMutation() async throws {
+        let fixture = try Self.makeGitFixture()
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        registerWindowTeardown(window)
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let sessionID = UUID()
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let session = window.agentModeViewModel.session(for: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/merge-binding-drift-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let created = try Self.worktreeObject(createValue, key: "created_worktree")
+        let sourceWorktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+        let sourcePath = try XCTUnwrap(created["path"]?.stringValue)
+        let sourceURL = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        try "feature\n".write(to: sourceURL.appendingPathComponent("Feature.txt"), atomically: true, encoding: .utf8)
+        try Self.runGit(["add", "Feature.txt"], cwd: sourceURL)
+        try Self.runGit(["commit", "-m", "Feature commit"], cwd: sourceURL)
+
+        _ = try await manageWorktree([
+            "op": .string("bind"),
+            "worktree_id": .string(sourceWorktreeID),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        let previewValue = try await manageWorktree([
+            "op": .string("preview"),
+            "session_id": .string(sessionID.uuidString),
+            "target": .string("@main")
+        ])
+        let operationID = try XCTUnwrap(
+            previewValue.objectValue?["merge"]?.objectValue?["operation_id"]?.stringValue
+        )
+
+        let targetHeadBefore = try Self.gitOutput(["rev-parse", "HEAD"], cwd: fixture.repo)
+        let targetStatusBefore = try Self.gitOutput(["status", "--porcelain=v1"], cwd: fixture.repo)
+        let binding = try XCTUnwrap(session.worktreeBindings.first)
+        session.worktreeBindings = [AgentSessionWorktreeBinding(
+            id: binding.id,
+            repositoryID: "gitrepo_drifted_after_preview",
+            repoKey: binding.repoKey,
+            logicalRootPath: binding.logicalRootPath,
+            logicalRootName: binding.logicalRootName,
+            worktreeID: binding.worktreeID,
+            worktreeRootPath: binding.worktreeRootPath,
+            worktreeName: binding.worktreeName,
+            branch: binding.branch,
+            head: binding.head,
+            visualLabel: binding.visualLabel,
+            visualColorHex: binding.visualColorHex,
+            boundAt: binding.boundAt,
+            source: binding.source
+        )]
+
+        do {
+            _ = try await manageWorktree([
+                "op": .string("apply"),
+                "session_id": .string(sessionID.uuidString),
+                "operation_id": .string(operationID),
+                "confirm_preview": .bool(true)
+            ])
+            XCTFail("Expected protected mutation admission to reject the drifted repository binding.")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("Worktree merge target is outside the authorized workspace roots"),
+                String(describing: error)
+            )
+        }
+        XCTAssertEqual(try Self.gitOutput(["rev-parse", "HEAD"], cwd: fixture.repo), targetHeadBefore)
+        XCTAssertEqual(try Self.gitOutput(["status", "--porcelain=v1"], cwd: fixture.repo), targetStatusBefore)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fixture.repo.appendingPathComponent("Feature.txt").path),
+            "Rejected admission must not mutate the target worktree."
+        )
+    }
+
+    private static func traceSmokePhase(_ phase: String) {
+        FileHandle.standardError.write(Data("[WorktreeAPISmoke] phase=\(phase)\n".utf8))
     }
 
     private func assertManageWorktreeGraphListContract(_ value: Value) throws {
@@ -881,6 +992,25 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return service
     }
 
+    private func registerWindowTeardown(_ window: WindowState) {
+        addTeardownBlock { @MainActor in
+            let activeTabIDs = window.agentModeViewModel.sessions.values
+                .filter { $0.agentTask != nil || $0.runState.isActive }
+                .map(\.tabID)
+            for tabID in activeTabIDs {
+                await window.agentModeViewModel.cancelAgentRun(
+                    tabID: tabID,
+                    completion: .terminalTeardownCompleted
+                )
+            }
+            let rootIDs = await window.workspaceFileContextStore.rootRefs(scope: .allLoaded).map(\.id)
+            window.beginClose()
+            await window.tearDown()
+            await window.workspaceFileContextStore.unloadRoots(ids: rootIDs)
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+    }
+
     private static func makeWindow(
         root: URL,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
@@ -936,7 +1066,55 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPromptApp.Tool {
         let tools = await window.mcpServer.windowMCPTools
-        return try XCTUnwrap(tools.first { $0.name == name })
+        let tool = try XCTUnwrap(tools.first { $0.name == name })
+        return RepoPromptApp.Tool(
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            annotations: tool.annotations,
+            isEnabledByDefault: tool.isEnabledByDefault,
+            returnsValue: { arguments in
+                if ServerNetworkManager.currentConnectionID != nil {
+                    return try await tool(arguments)
+                }
+
+                let connectionID = UUID()
+                try await MainActor.run {
+                    let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                    let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+                    try window.mcpServer.bindTabForConnection(
+                        connectionID: connectionID,
+                        clientName: "Worktree API Smoke",
+                        tabID: tabID,
+                        workspaceID: workspace.id,
+                        windowID: window.windowID,
+                        explicitlyBound: true
+                    )
+                }
+                do {
+                    let result = try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await tool(arguments)
+                    }
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: "Worktree API Smoke",
+                            windowID: window.windowID
+                        )
+                    }
+                    return result
+                } catch {
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: "Worktree API Smoke",
+                            windowID: window.windowID
+                        )
+                    }
+                    throw error
+                }
+            }
+        )
     }
 
     private struct GitFixture {
@@ -965,6 +1143,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     }
 
     private static func runGit(_ arguments: [String], cwd: URL) throws {
+        _ = try gitOutput(arguments, cwd: cwd)
+    }
+
+    private static func gitOutput(_ arguments: [String], cwd: URL) throws -> String {
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
@@ -982,6 +1164,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
+        return result.outputText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func worktreeObject(_ value: Value, key: String) throws -> [String: Value] {

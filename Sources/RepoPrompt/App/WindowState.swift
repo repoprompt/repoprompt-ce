@@ -113,7 +113,7 @@ class WindowState: ObservableObject {
     // MARK: - Shared Services
 
     /// Single shared MCP service instance across all windows
-    private static let sharedMCPService = MCPService()
+    static let sharedMCPService = MCPService()
 
     // MARK: - Window identification
 
@@ -1128,7 +1128,7 @@ class WindowState: ObservableObject {
 
     /// ------------------------------------------------------------------
     func startMCPServer() {
-        Task { try? await WindowState.sharedMCPService.join(windowID: windowID) }
+        Task { await WindowState.sharedMCPService.join(windowID: windowID) }
     }
 
     func stopMCPServer() {

@@ -5388,6 +5388,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(demoted.selection.slices.isEmpty, caseLabel)
             XCTAssertFalse(demoted.selection.codemapAutoEnabled, caseLabel)
             XCTAssertTrue(demoted.invalidPaths.isEmpty, caseLabel)
+            XCTAssertEqual(demoted.validCandidateCount, 1, caseLabel)
             XCTAssertEqual(
                 demoted.codemapUnavailable,
                 ["codemap unavailable: notes.txt"],
@@ -5400,6 +5401,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 rawPaths: [swiftURL.path]
             )
             XCTAssertTrue(promoted.mutated, caseLabel)
+            XCTAssertEqual(promoted.validCandidateCount, 1, caseLabel)
             XCTAssertEqual(Set(promoted.selection.selectedPaths), Set([swiftURL.path, textURL.path]), caseLabel)
             XCTAssertTrue(promoted.selection.slices.isEmpty, caseLabel)
             XCTAssertTrue(promoted.selection.manualCodemapPaths.isEmpty, caseLabel)
@@ -5414,6 +5416,63 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(removed.selection.selectedPaths, [textURL.path], caseLabel)
             XCTAssertFalse(removed.selection.codemapAutoEnabled, caseLabel)
         }
+    }
+
+    func testPromoteAndDemotePreserveRawPathsAndRejectOutOfScopeNoOps() async throws {
+        let root = try makeTemporaryRoot(name: "PromoteDemotePathScope")
+        let inScopeURL = root.appendingPathComponent("Sources/A.swift")
+        try write(SwiftFixtureSource.emptyStruct("A", trailingNewline: false), to: inScopeURL)
+
+        let outsideRoot = try makeTemporaryRoot(name: "PromoteDemotePathOutside")
+        let outsideURL = outsideRoot.appendingPathComponent("Sources/A.swift")
+        try write(SwiftFixtureSource.emptyStruct("Outside", trailingNewline: false), to: outsideURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let service = WorkspaceSelectionMutationService(store: store)
+        let paths = [inScopeURL.path, outsideURL.path]
+        let rawPaths = ["logical/Sources/A.swift", "outside/Sources/A.swift"]
+
+        let promoted = await service.promotePaths(
+            existing: StoredSelection(),
+            paths: paths,
+            rawPaths: rawPaths
+        )
+        XCTAssertTrue(promoted.mutated)
+        XCTAssertEqual(promoted.validCandidateCount, 1)
+        XCTAssertEqual(promoted.selection.selectedPaths, [inScopeURL.path])
+        XCTAssertEqual(promoted.invalidPaths, ["outside/Sources/A.swift"])
+
+        let invalidPromotion = await service.promotePaths(
+            existing: promoted.selection,
+            paths: [outsideURL.path],
+            rawPaths: ["outside/Sources/A.swift"]
+        )
+        XCTAssertFalse(invalidPromotion.mutated)
+        XCTAssertEqual(invalidPromotion.validCandidateCount, 0)
+        XCTAssertEqual(invalidPromotion.selection, promoted.selection)
+        XCTAssertEqual(invalidPromotion.invalidPaths, ["outside/Sources/A.swift"])
+
+        let demoted = await service.demotePaths(
+            existing: promoted.selection,
+            paths: paths,
+            rawPaths: rawPaths
+        )
+        XCTAssertTrue(demoted.mutated)
+        XCTAssertEqual(demoted.validCandidateCount, 1)
+        XCTAssertEqual(demoted.selection.selectedPaths, [])
+        XCTAssertEqual(demoted.selection.manualCodemapPaths, [inScopeURL.path])
+        XCTAssertEqual(demoted.invalidPaths, ["outside/Sources/A.swift"])
+
+        let invalidDemotion = await service.demotePaths(
+            existing: demoted.selection,
+            paths: [outsideURL.path],
+            rawPaths: ["outside/Sources/A.swift"]
+        )
+        XCTAssertFalse(invalidDemotion.mutated)
+        XCTAssertEqual(invalidDemotion.validCandidateCount, 0)
+        XCTAssertEqual(invalidDemotion.selection, demoted.selection)
+        XCTAssertEqual(invalidDemotion.invalidPaths, ["outside/Sources/A.swift"])
     }
 
     func testManageSelectionPositiveSliceMutationsPreserveFullFilesAndAddMixedSlices() async throws {
@@ -6701,6 +6760,110 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             service.resolveAlwaysReadableExternalFile(atAbsolutePath: outsideFile.path),
             "canonical outside target should not become always-readable"
         )
+    }
+
+    func testWorkspaceReadableFileServiceBoundsRevalidatesAndCancelsExternalReads() async throws {
+        let home = try makeTemporaryRoot(name: "ReadableBoundsHome")
+        let oversizedFile = home.appendingPathComponent(".agents/skills/example/Large.md")
+        try FileManager.default.createDirectory(
+            at: oversizedFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let oversizedByteCount = WorkspaceReadableFileService.externalReadByteLimit + 1
+        try Data(repeating: 120, count: oversizedByteCount).write(to: oversizedFile)
+
+        let store = WorkspaceFileContextStore()
+        let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+        let resolvedOversized = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: oversizedFile.path)
+        )
+        let oversizedContent = try await service.readAlwaysReadableExternalFile(resolvedOversized)
+        XCTAssertEqual(oversizedContent, "[File too large: \(oversizedByteCount) bytes]")
+
+        let outsideRoot = try makeTemporaryRoot(name: "ReadableBoundsOutside")
+        let outsideFile = outsideRoot.appendingPathComponent("secret.md")
+        try write("secret", to: outsideFile)
+        let forged = WorkspaceExternalReadableFile(
+            absolutePath: outsideFile.path,
+            displayPath: outsideFile.path
+        )
+        do {
+            _ = try await service.readAlwaysReadableExternalFile(forged)
+            XCTFail("An out-of-allowlist external file must not be readable")
+        } catch let error as FileSystemError {
+            guard case .invalidRelativePath = error else {
+                XCTFail("Unexpected external read error: \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Unexpected external read error: \(error)")
+        }
+
+        let smallFile = home.appendingPathComponent(".agents/skills/example/Small.md")
+        try write("small", to: smallFile)
+        let resolvedSmall = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: smallFile.path)
+        )
+        let cancelledTask = Task {
+            try await service.readAlwaysReadableExternalFile(resolvedSmall)
+        }
+        cancelledTask.cancel()
+        do {
+            _ = try await cancelledTask.value
+            XCTFail("A cancelled external read must not return content")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Unexpected cancellation error: \(error)")
+        }
+    }
+
+    func testWorkspaceReadableFileServiceRejectsIntermediateDirectorySwapAfterPrecheck() async throws {
+        let home = try makeTemporaryRoot(name: "ReadableTOCTOUHome")
+        let allowedRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+        let displacedRoot = home.appendingPathComponent(".agents/skills-original", isDirectory: true)
+        let allowedFile = allowedRoot.appendingPathComponent("example/SKILL.md")
+        try write("allowed bytes", to: allowedFile)
+
+        let outsideRoot = try makeTemporaryRoot(name: "ReadableTOCTOUOutside")
+        let outsideFile = outsideRoot.appendingPathComponent("example/SKILL.md")
+        try write("outside bytes", to: outsideFile)
+
+        let beforeOpen: @Sendable (String) throws -> Void = { _ in
+            try FileManager.default.moveItem(at: allowedRoot, to: displacedRoot)
+            try FileManager.default.createSymbolicLink(at: allowedRoot, withDestinationURL: outsideRoot)
+        }
+        let store = WorkspaceFileContextStore()
+        let service = WorkspaceReadableFileService(
+            store: store,
+            homeDirectoryURL: home,
+            beforeExternalReadOpenForTesting: beforeOpen
+        )
+        let resolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: allowedFile.path)
+        )
+        defer {
+            if FileManager.default.fileExists(atPath: allowedRoot.path) {
+                try? FileManager.default.removeItem(at: allowedRoot)
+            }
+            if FileManager.default.fileExists(atPath: displacedRoot.path) {
+                try? FileManager.default.moveItem(at: displacedRoot, to: allowedRoot)
+            }
+        }
+
+        var returnedContent: String?
+        do {
+            returnedContent = try await service.readAlwaysReadableExternalFile(resolved)
+        } catch let error as FileSystemError {
+            guard case .invalidRelativePath = error else {
+                XCTFail("Unexpected TOCTOU read error: \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Unexpected TOCTOU read error: \(error)")
+            return
+        }
+        XCTAssertNil(returnedContent, "An opened descriptor resolving outside the canonical allowlist must return no bytes")
     }
 
     @MainActor

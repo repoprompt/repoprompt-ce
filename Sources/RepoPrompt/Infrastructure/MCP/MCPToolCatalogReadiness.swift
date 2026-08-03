@@ -56,7 +56,7 @@ actor MCPToolCatalogReadiness {
 
     private init() {
         scopePresenceOperation = { requiredToolNames, scope in
-            await ServiceRegistry.scopePresence(
+            await AppDomainRuntimeComposition.shared.scopePresence(
                 requiredToolNames: requiredToolNames,
                 scope: scope
             )

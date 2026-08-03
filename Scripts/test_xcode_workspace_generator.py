@@ -117,7 +117,10 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
 
         self.assertEqual(targets["RepoPromptDomainRuntime"]["type"], "regular")
         self.assertEqual(targets["RepoPromptDomainRuntime"]["path"], "Sources/RepoPromptDomainRuntime")
-        self.assertEqual(generator._by_name_dependencies(targets["RepoPromptDomainRuntime"]), [])
+        self.assertEqual(
+            generator._by_name_dependencies(targets["RepoPromptDomainRuntime"]),
+            ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"],
+        )
         self.assertEqual(targets["RepoPromptDomainRuntimeTests"]["type"], "test")
         self.assertEqual(targets["RepoPromptDomainRuntimeTests"]["path"], "Tests/RepoPromptDomainRuntimeTests")
         self.assertEqual(

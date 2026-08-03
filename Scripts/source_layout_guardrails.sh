@@ -261,13 +261,18 @@ if domain_runtime is None:
 else:
     if domain_runtime.get("type") != "regular": errors.append("RepoPromptDomainRuntime must remain an internal regular target")
     if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime": errors.append("RepoPromptDomainRuntime target path drifted")
+    runtime_by_name = [
+        dependency["byName"][0]
+        for dependency in domain_runtime.get("dependencies", [])
+        if dependency.get("byName")
+    ]
     runtime_products = {
         (dependency["product"][0], dependency["product"][1])
         for dependency in domain_runtime.get("dependencies", [])
         if "product" in dependency
     }
-    if runtime_products != {("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 1:
-        errors.append("RepoPromptDomainRuntime must depend only on the pinned MCP SDK product")
+    if runtime_by_name != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 5:
+        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
 if domain_runtime_tests is None:
     errors.append("RepoPromptDomainRuntimeTests target missing")
 else:
@@ -465,14 +470,19 @@ PY
     fail "M5 AI/Agent contract fixture drifted or is invalid JSON"
   fi
   m3_read_tools=(
-    "get_code_structure" "get_file_tree" "read_file" "file_search"
-    "workspace_context" "prompt" "oracle_chat_log" "git" "history"
+    "get_code_structure:getCodeStructure" "get_file_tree:getFileTree" "read_file:readFile" "file_search:search"
+    "workspace_context:workspaceContext" "prompt:prompt" "oracle_chat_log:oracleChatLog" "git:git" "history:history"
   )
-  for tool in "${m3_read_tools[@]}"; do
-    if ! grep -q "name: \"$tool\"" "$domain_runtime_source_dir/MCPDomainReadToolDefinitions.swift"; then
+  for entry in "${m3_read_tools[@]}"; do
+    tool="${entry%%:*}"
+    identifier="${entry##*:}"
+    if ! grep -q "MCPWindowToolName\.$identifier" "$domain_runtime_source_dir/MCPDomainReadToolDefinitions.swift"; then
       fail "M3 shared read definition missing: $tool"
     fi
   done
+  if ! grep -q 'MCPDomainCanonicalToolDefinitions.definition(named:' "$domain_runtime_source_dir/MCPDomainReadToolDefinitions.swift"; then
+    fail "M3 shared read definitions must delegate to the canonical 27-tool schema authority"
+  fi
   print_matches \
     "RepoPromptDomainRuntime contains app/UI/provider implementation" \
     grep -R -n -E 'WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
@@ -706,6 +716,7 @@ print_matches \
 allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/compose.md"
+  "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
@@ -725,7 +736,10 @@ allowed_tracked_docs=(
   "docs/spec/headless-mcp-domain-runtime-m3-read-discovery.md"
   "docs/spec/headless-mcp-domain-runtime-m4-protected-mutations.md"
   "docs/spec/headless-mcp-domain-runtime-m5-ai-agent-interaction.md"
+  "docs/spec/headless-mcp-domain-runtime-m6-host-extraction.md"
+  "docs/spec/headless-mcp-domain-runtime-m7-cutover.md"
   "docs/spec/history-query-tools.md"
+  "docs/spec/mcp-domain-canonical-tool-definitions.generated.json"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

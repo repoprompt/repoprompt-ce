@@ -276,6 +276,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
     private var cachedModels: [AgentSelectedFilesModelIdentity: AgentContextExportModel] = [:]
     private var cachedModelOrder: [AgentSelectedFilesModelIdentity] = []
     private var completedCountSnapshots: [AgentSelectedFilesModelIdentity: AgentContextFileCodemapCountSummary] = [:]
+    private var completedEntryMetricsSnapshots: [AgentSelectedFilesModelIdentity: PromptContextEntryMetricsSnapshot] = [:]
 
     private struct VisibleFileMetricsScope: Equatable {
         let filePathDisplay: FilePathDisplay
@@ -337,8 +338,14 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
     func refreshAfterTokenMetricsCompletion(
         _ request: AgentSelectedFilesModelRequest
     ) -> AgentSelectedFilesRefreshOutcome? {
-        guard request.entryMetricsSnapshot != nil else { return nil }
+        guard let entryMetricsSnapshot = request.entryMetricsSnapshot else { return nil }
         guard displayedModelMatches(request.identity) || loadingIdentity == request.identity else { return nil }
+        if completedDisplayedModelMatches(request.identity),
+           completedEntryMetricsSnapshots[request.identity] == entryMetricsSnapshot
+        {
+            debugStats.skippedLoaded += 1
+            return .skippedLoaded
+        }
         return refresh(
             request,
             force: true,
@@ -542,6 +549,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                     canMutateDisplayedModel: true
                 )
                 completedCountSnapshots[request.identity] = resolvedRowSplit.fileCodemapCountSummary
+                completedEntryMetricsSnapshots[request.identity] = request.entryMetricsSnapshot
                 cacheModel(resolvedModel, for: request.identity)
                 loadedIdentity = request.identity
                 displayedIdentity = request.identity
@@ -731,6 +739,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             let evicted = cachedModelOrder.removeFirst()
             cachedModels[evicted] = nil
             completedCountSnapshots[evicted] = nil
+            completedEntryMetricsSnapshots[evicted] = nil
         }
     }
 

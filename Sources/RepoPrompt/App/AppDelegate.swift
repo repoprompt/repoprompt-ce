@@ -20,6 +20,7 @@ private let appDelegateLog = Logger(label: "com.repoprompt.app.delegate")
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     typealias GlobalMCPRegistrationOperation = @MainActor @Sendable () async throws -> Void
+    typealias DomainRuntimeShutdownOperation = @Sendable () async -> Void
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
@@ -29,6 +30,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private(set) var domainRuntimeStartupFailureDescription: String?
     private var globalMCPRegistrationOperation: GlobalMCPRegistrationOperation = {
         try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        try await WindowState.sharedMCPService.start()
+    }
+
+    private var domainRuntimeShutdownOperation: DomainRuntimeShutdownOperation = {
+        _ = await AppDomainRuntimeComposition.shared.runtime.shutdown()
     }
 
     // MARK: - Global references
@@ -100,6 +106,16 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         ) {
             precondition(domainRuntimeStartupTask == nil, "Registration operation must be injected before startup")
             globalMCPRegistrationOperation = operation
+        }
+
+        func setDomainRuntimeShutdownOperationForTesting(
+            _ operation: @escaping DomainRuntimeShutdownOperation
+        ) {
+            domainRuntimeShutdownOperation = operation
+        }
+
+        func shutdownDomainRuntimeForTerminationForTesting() async {
+            await shutdownDomainRuntimeForTermination()
         }
     #endif
 
@@ -201,6 +217,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
+            await shutdownDomainRuntimeForTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
 
@@ -221,6 +238,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     // MARK: - App Teardown
+
+    private func shutdownDomainRuntimeForTermination() async {
+        domainRuntimeStartupTask?.cancel()
+        await domainRuntimeShutdownOperation()
+    }
 
     func tearDown() async {
         // Put any global-level teardown logic here

@@ -554,7 +554,7 @@ import XCTest
                 createdAt: .distantPast
             )
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            let catalogHandle = try await ServiceRegistry.register(catalogService).handle
+            let catalogHandle = try await AppDomainRuntimeComposition.shared.register(catalogService).handle
             let identity = ServerNetworkManager.WindowToolDispatchIdentity(
                 windowID: window.windowID,
                 windowStateIdentity: ObjectIdentifier(window),
@@ -580,7 +580,7 @@ import XCTest
             XCTAssertFalse(didRunBody)
 
             await manager.debugRemoveConnection(connectionID)
-            await ServiceRegistry.unregister(catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(catalogService)
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
         }

@@ -510,7 +510,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
 
             let registration: MCPDomainToolRegistrationResult
             do {
-                registration = try await ServiceRegistry.register(
+                registration = try await AppDomainRuntimeComposition.shared.register(
                     window.mcpServer.windowMCPToolCatalogService
                 )
             } catch {
@@ -531,14 +531,14 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
             do {
                 let result = try await operation(window)
                 // This fixture owns the exact generation; release it before teardown can run stopServer().
-                await ServiceRegistry.unregister(registration.handle)
+                await AppDomainRuntimeComposition.shared.unregister(registration.handle)
                 window.beginClose()
                 await window.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(window)
                 return result
             } catch {
                 // This fixture owns the exact generation; release it before teardown can run stopServer().
-                await ServiceRegistry.unregister(registration.handle)
+                await AppDomainRuntimeComposition.shared.unregister(registration.handle)
                 window.beginClose()
                 await window.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(window)

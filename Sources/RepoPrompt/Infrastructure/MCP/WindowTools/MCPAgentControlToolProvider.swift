@@ -6,15 +6,15 @@ import OrderedCollections
 import RepoPromptShared
 
 @MainActor
-final class MCPAgentControlToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .agentControl
+final class MCPAgentControlToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .agentControl
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {

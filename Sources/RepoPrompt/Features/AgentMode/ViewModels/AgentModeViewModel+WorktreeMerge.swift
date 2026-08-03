@@ -163,6 +163,50 @@ enum WorktreeMergeSourceBindingResolver {
     }
 }
 
+enum WorktreeMergeEndpointValidation {
+    static func sameIdentity(
+        _ lhs: GitWorktreeMergeEndpoint,
+        _ rhs: GitWorktreeMergeEndpoint
+    ) -> Bool {
+        lhs.worktreeID == rhs.worktreeID
+            && lhs.repositoryID == rhs.repositoryID
+            && lhs.repoKey == rhs.repoKey
+            && GitRepoRootAuthorization.canonicalPath(lhs.path)
+            == GitRepoRootAuthorization.canonicalPath(rhs.path)
+            && lhs.head == rhs.head
+    }
+
+    static func matches(
+        _ endpoint: GitWorktreeMergeEndpoint,
+        descriptor: GitWorktreeDescriptor
+    ) -> Bool {
+        guard let current = try? GitWorktreeMergeEndpoint(descriptor: descriptor) else {
+            return false
+        }
+        return sameIdentity(endpoint, current)
+    }
+
+    static func resolveAuthorizedDescriptor(
+        for endpoint: GitWorktreeMergeEndpoint,
+        roots: [WorkspaceRootRef],
+        resolver: GitRepoTargetResolver = GitRepoTargetResolver()
+    ) async throws -> GitWorktreeDescriptor {
+        let repo = GitRepoDescriptor(rootURL: endpoint.url)
+        let descriptor = try await resolver.resolveWorktree(
+            selector: "@id:\(endpoint.worktreeID)",
+            repo: repo,
+            allRepos: [repo],
+            authorizedRoots: roots
+        )
+        guard matches(endpoint, descriptor: descriptor) else {
+            throw GitRepoTargetResolverError.invalidParams(
+                "Worktree endpoint identity changed before authorization: \(endpoint.path)"
+            )
+        }
+        return descriptor
+    }
+}
+
 /// Pure, MainActor-independent selectors that decide which worktree merge
 /// state should drive Agent Mode attention surfaces (blocker stack, session
 /// row badges, and root capsules). Kept side-effect-free so view-model and
@@ -365,15 +409,19 @@ extension AgentModeViewModel {
         graphLimit: Int = 24
     ) async throws -> GitWorktreeMergePreview {
         let session = try worktreeMergeSession(sessionID: sessionID)
+        let authorizedRoots = try await worktreeMergeAuthorizedRoots(for: session)
         let sourceBinding = try WorktreeMergeSourceBindingResolver.resolve(
             bindings: session.worktreeBindings,
             repoRoot: repoRoot
         )
         let source = try await worktreeMergeEndpoint(from: sourceBinding)
+        try await requireAuthorizedWorktreeMergeEndpoint(source, roots: authorizedRoots, label: "Source")
         let targetEndpoint = try await resolveWorktreeMergeTargetEndpoint(
             selector: target,
-            source: source
+            source: source,
+            authorizedRoots: authorizedRoots
         )
+        try await requireAuthorizedWorktreeMergeEndpoint(targetEndpoint, roots: authorizedRoots, label: "Target")
         let directory = workspaceDirectory
             ?? workspaceManager?.activeWorkspace?.customStoragePath
             ?? FileManager.default.temporaryDirectory
@@ -387,11 +435,15 @@ extension AgentModeViewModel {
             tabID: session.tabID,
             graphLimit: graphLimit
         ))
+        let rootsAfterPreview = try await worktreeMergeAuthorizedRoots(for: session)
+        let checkedPreview = try await revalidatedWorktreeMergePreview(preview)
+        try await requireAuthorizedWorktreeMergeEndpoint(checkedPreview.inspection.source, roots: rootsAfterPreview, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(checkedPreview.inspection.target, roots: rootsAfterPreview, label: "Target")
         upsertWorktreeMergeOperation(
-            AgentWorktreeMergeCoordinator.makeOperation(preview: preview),
+            AgentWorktreeMergeCoordinator.makeOperation(preview: checkedPreview),
             in: session
         )
-        return preview
+        return checkedPreview
     }
 
     func requestWorktreeMergeReviewAndApply(
@@ -401,35 +453,43 @@ extension AgentModeViewModel {
         commitMessage: String? = nil
     ) async throws -> GitWorktreeMergeApplyResult {
         let session = try worktreeMergeSession(sessionID: sessionID)
+        let reviewPreview = try await revalidatedAndAuthorizedWorktreeMergePreview(
+            preview,
+            session: session
+        )
         let decision = await requestWorktreeMergeReview(
-            preview: preview,
+            preview: reviewPreview,
             session: session,
             timeoutSeconds: timeoutSeconds
         )
         guard decision == .accept else {
             let reason = decision.cancelledReason ?? "Worktree merge review was rejected."
-            markWorktreeMergeOperationCancelled(operationID: preview.operationID, session: session, reason: reason)
+            markWorktreeMergeOperationCancelled(operationID: reviewPreview.operationID, session: session, reason: reason)
             throw MCPError.invalidParams(reason)
         }
 
-        try updateWorktreeMergeOperation(operationID: preview.operationID, in: session) { operation in
+        try updateWorktreeMergeOperation(operationID: reviewPreview.operationID, in: session) { operation in
             operation.status = .applying
             operation.lastError = nil
         }
         do {
             try await MCPDomainMutationCommitContext.willCommit()
+            let checkedPreview = try await revalidatedAndAuthorizedWorktreeMergePreview(
+                reviewPreview,
+                session: session
+            )
             let result = try await VCSService.shared.applyGitWorktreeMerge(.init(
-                preview: preview,
+                preview: checkedPreview,
                 commitMessage: commitMessage
             ))
-            applyWorktreeMergeResult(result, operationID: preview.operationID, session: session)
+            applyWorktreeMergeResult(result, operationID: checkedPreview.operationID, session: session)
             if result.status == .completed || result.status == .conflicted || result.status == .noOp {
                 await refreshAfterWorktreeMergeMutation(session: session, target: result.target)
             }
             return result
         } catch {
-            markWorktreeMergeOperationFailed(operationID: preview.operationID, session: session, error: error)
-            await refreshAfterWorktreeMergeMutation(session: session, target: preview.inspection.target)
+            markWorktreeMergeOperationFailed(operationID: reviewPreview.operationID, session: session, error: error)
+            await refreshAfterWorktreeMergeFailure(session: session, target: reviewPreview.inspection.target)
             throw error
         }
     }
@@ -445,6 +505,9 @@ extension AgentModeViewModel {
         guard operation.status == .previewed else {
             throw MCPError.invalidParams("apply is only valid for a previewed worktree merge operation.")
         }
+        let rootsBeforePreview = try await worktreeMergeAuthorizedRoots(for: session)
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforePreview, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforePreview, label: "Target")
         let preview = try await worktreeMergePreview(from: operation)
         return try await requestWorktreeMergeReviewAndApply(
             preview: preview,
@@ -464,6 +527,9 @@ extension AgentModeViewModel {
         guard operation.status == .previewed else {
             throw MCPError.invalidParams("apply is only valid for a previewed worktree merge operation.")
         }
+        let rootsBeforePreview = try await worktreeMergeAuthorizedRoots(for: session)
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforePreview, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforePreview, label: "Target")
         let preview = try await worktreeMergePreview(from: operation)
         try updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
             pending.status = .applying
@@ -471,8 +537,12 @@ extension AgentModeViewModel {
         }
         do {
             try await MCPDomainMutationCommitContext.willCommit()
+            let checkedPreview = try await revalidatedAndAuthorizedWorktreeMergePreview(
+                preview,
+                session: session
+            )
             let result = try await VCSService.shared.applyGitWorktreeMerge(.init(
-                preview: preview,
+                preview: checkedPreview,
                 commitMessage: commitMessage
             ))
             applyWorktreeMergeResult(result, operationID: operationID, session: session)
@@ -482,7 +552,7 @@ extension AgentModeViewModel {
             return result
         } catch {
             markWorktreeMergeOperationFailed(operationID: operationID, session: session, error: error)
-            await refreshAfterWorktreeMergeMutation(session: session, target: operation.target)
+            await refreshAfterWorktreeMergeFailure(session: session, target: operation.target)
             throw error
         }
     }
@@ -515,15 +585,23 @@ extension AgentModeViewModel {
         guard operation.status == .conflicted || operation.status == .awaitingCommit else {
             throw MCPError.invalidParams("continue is only valid for a conflicted or awaiting_commit worktree merge operation.")
         }
+        let rootsBeforeContinue = try await worktreeMergeAuthorizedRoots(for: session)
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforeContinue, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforeContinue, label: "Target")
         try updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
             pending.status = .applying
             pending.lastError = nil
         }
         do {
             try await MCPDomainMutationCommitContext.willCommit()
-            let result = try await VCSService.shared.continueGitWorktreeMerge(.init(
+            let checkedEndpoints = try await revalidatedAndAuthorizedWorktreeMergeEndpoints(
                 source: operation.source,
                 target: operation.target,
+                session: session
+            )
+            let result = try await VCSService.shared.continueGitWorktreeMerge(.init(
+                source: checkedEndpoints.source,
+                target: checkedEndpoints.target,
                 sourceHead: operation.sourceHead,
                 targetHeadBefore: operation.targetHeadBefore,
                 commitMessage: commitMessage
@@ -535,7 +613,7 @@ extension AgentModeViewModel {
             return result
         } catch {
             markWorktreeMergeOperationFailed(operationID: operationID, session: session, error: error)
-            await refreshAfterWorktreeMergeMutation(session: session, target: operation.target)
+            await refreshAfterWorktreeMergeFailure(session: session, target: operation.target)
             throw error
         }
     }
@@ -551,19 +629,26 @@ extension AgentModeViewModel {
         guard operation.status == .conflicted || operation.status == .awaitingCommit || operation.status == .applying else {
             throw MCPError.invalidParams("abort is only valid for an active worktree merge operation.")
         }
+        let rootsBeforeAbort = try await worktreeMergeAuthorizedRoots(for: session)
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforeAbort, label: "Target")
         do {
             try await MCPDomainMutationCommitContext.willCommit()
-            let result = try await VCSService.shared.abortGitWorktreeMerge(.init(target: operation.target))
+            let checkedEndpoints = try await revalidatedAndAuthorizedWorktreeMergeEndpoints(
+                source: operation.source,
+                target: operation.target,
+                session: session
+            )
+            let result = try await VCSService.shared.abortGitWorktreeMerge(.init(target: checkedEndpoints.target))
             try updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
                 AgentWorktreeMergeCoordinator.abort(result: result, operation: &pending)
             }
-            await refreshAfterWorktreeMergeMutation(session: session, target: operation.target)
+            await refreshAfterWorktreeMergeMutation(session: session, target: result.target)
             return result
         } catch {
             try? updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
                 pending.lastError = "Abort failed: \(error.localizedDescription)"
             }
-            await refreshAfterWorktreeMergeMutation(session: session, target: operation.target)
+            await refreshAfterWorktreeMergeFailure(session: session, target: operation.target)
             throw error
         }
     }
@@ -670,16 +755,24 @@ extension AgentModeViewModel {
         else {
             throw MCPError.invalidParams("Worktree merge preview fingerprints are unavailable; run manage_worktree preview again.")
         }
-        let current = try await VCSService.shared.inspectGitWorktreeMerge(.init(
+        let precheckedEndpoints = try await revalidatedWorktreeMergeEndpoints(
             source: operation.source,
             target: operation.target
+        )
+        let current = try await VCSService.shared.inspectGitWorktreeMerge(.init(
+            source: precheckedEndpoints.source,
+            target: precheckedEndpoints.target
         ))
+        let checkedEndpoints = try await revalidatedWorktreeMergeEndpoints(
+            source: current.source,
+            target: current.target
+        )
         let inspection = GitWorktreeMergeInspection(
-            source: operation.source,
-            target: operation.target,
+            source: checkedEndpoints.source,
+            target: checkedEndpoints.target,
             mergeBase: operation.mergeBase,
-            sourceHead: operation.sourceHead,
-            targetHead: operation.targetHeadBefore,
+            sourceHead: checkedEndpoints.source.head,
+            targetHead: checkedEndpoints.target.head,
             sourceFingerprint: sourceFingerprint,
             targetFingerprint: targetFingerprint,
             blockers: current.blockers,
@@ -781,32 +874,219 @@ extension AgentModeViewModel {
     }
 
     private func worktreeMergeEndpoint(from binding: AgentSessionWorktreeBinding) async throws -> GitWorktreeMergeEndpoint {
-        if let head = binding.head, !head.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return try WorktreeMergeSourceBindingResolver.endpoint(from: binding)
-        }
-        let descriptors = try await VCSService.shared.listGitWorktrees(at: URL(fileURLWithPath: binding.worktreeRootPath))
-        guard let descriptor = descriptors.first(where: { $0.worktreeID == binding.worktreeID || samePath($0.path, binding.worktreeRootPath) }) else {
+        let descriptors = try await VCSService.shared.listGitWorktrees(
+            at: URL(fileURLWithPath: binding.worktreeRootPath)
+        )
+        let bindingPath = GitRepoRootAuthorization.canonicalPath(binding.worktreeRootPath)
+        guard let descriptor = descriptors.first(where: {
+            $0.worktreeID == binding.worktreeID
+                && GitRepoRootAuthorization.canonicalPath($0.path) == bindingPath
+        }) else {
             throw MCPError.invalidParams("Source worktree binding is no longer available: \(binding.worktreeRootPath)")
         }
-        return try GitWorktreeMergeEndpoint(descriptor: descriptor)
+        let endpoint = try GitWorktreeMergeEndpoint(descriptor: descriptor)
+        guard endpoint.repositoryID == binding.repositoryID else {
+            throw MCPError.invalidParams("Source worktree binding repository identity changed: \(binding.worktreeRootPath)")
+        }
+        if let expectedHead = binding.head?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !expectedHead.isEmpty,
+           expectedHead != endpoint.head
+        {
+            throw MCPError.invalidParams("Source worktree binding HEAD changed: \(binding.worktreeRootPath)")
+        }
+        return endpoint
+    }
+
+    private func worktreeMergeAuthorizedRoots(for session: TabSession) async throws -> [WorkspaceRootRef] {
+        guard let store = promptManager?.workspaceFileContextStore else {
+            throw MCPError.invalidParams("Worktree merge requires an authorized workspace root.")
+        }
+        let lookupContext = await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
+        var roots = await store.rootRefs(scope: lookupContext.rootScope)
+        var seenPaths = Set(roots.map { GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath) })
+        for binding in session.worktreeBindings {
+            let path = GitRepoRootAuthorization.canonicalPath(binding.worktreeRootPath)
+            guard !path.isEmpty, seenPaths.insert(path).inserted else { continue }
+            let name = binding.worktreeName
+                ?? binding.logicalRootName
+                ?? binding.visualLabel
+                ?? URL(fileURLWithPath: path).lastPathComponent
+            roots.append(WorkspaceRootRef(
+                id: UUID(uuidString: binding.id) ?? UUID(),
+                name: name,
+                fullPath: path
+            ))
+        }
+        guard !roots.isEmpty else {
+            throw MCPError.invalidParams("Worktree merge requires at least one authorized workspace root.")
+        }
+        return roots
+    }
+
+    private func requireAuthorizedWorktreeMergeEndpoint(
+        _ endpoint: GitWorktreeMergeEndpoint,
+        roots: [WorkspaceRootRef],
+        label: String
+    ) async throws {
+        let rootPaths = roots.map(\.standardizedFullPath)
+        if GitRepoRootAuthorization.isPathWithinAuthorizedRoots(endpoint.path, roots: rootPaths) {
+            return
+        }
+        do {
+            _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+                for: endpoint,
+                roots: roots
+            )
+        } catch {
+            throw MCPError.invalidParams(
+                "\(label) worktree path must be inside an authorized workspace root or advertised by an authorized repository. Received: \(endpoint.path)."
+            )
+        }
+    }
+
+    private func worktreeMergeRepositories(
+        source: GitRepoDescriptor,
+        authorizedRoots: [WorkspaceRootRef]
+    ) async -> [GitRepoDescriptor] {
+        var repositories = [source]
+        var seenPaths = Set([GitRepoRootAuthorization.canonicalPath(source.rootPath)])
+        for root in authorizedRoots {
+            guard let resolved = await VCSService.shared.resolveRepo(
+                from: URL(fileURLWithPath: root.standardizedFullPath)
+            ) else { continue }
+            let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
+            let path = GitRepoRootAuthorization.canonicalPath(descriptor.rootPath)
+            if seenPaths.insert(path).inserted {
+                repositories.append(descriptor)
+            }
+        }
+        return repositories
     }
 
     private func resolveWorktreeMergeTargetEndpoint(
         selector: String?,
-        source: GitWorktreeMergeEndpoint
+        source: GitWorktreeMergeEndpoint,
+        authorizedRoots: [WorkspaceRootRef]
     ) async throws -> GitWorktreeMergeEndpoint {
         let resolver = GitRepoTargetResolver()
         let sourceRepo = GitRepoDescriptor(rootURL: source.url)
+        let repositories = await worktreeMergeRepositories(
+            source: sourceRepo,
+            authorizedRoots: authorizedRoots
+        )
         do {
             let descriptor = try await resolver.resolveWorktree(
                 selector: selector ?? "@main",
                 repo: sourceRepo,
-                allRepos: [sourceRepo]
+                allRepos: repositories,
+                authorizedRoots: authorizedRoots
             )
             return try GitWorktreeMergeEndpoint(descriptor: descriptor)
         } catch let error as GitRepoTargetResolverError {
             throw MCPError.invalidParams(error.message)
         }
+    }
+
+    private func revalidatedWorktreeMergeEndpoint(
+        _ endpoint: GitWorktreeMergeEndpoint,
+        label: String
+    ) async throws -> GitWorktreeMergeEndpoint {
+        let descriptors = try await VCSService.shared.listGitWorktrees(at: endpoint.url)
+        guard let descriptor = descriptors.first(where: {
+            WorktreeMergeEndpointValidation.matches(endpoint, descriptor: $0)
+        }) else {
+            throw MCPError.invalidParams(
+                "\(label) worktree identity or canonical path changed before it was used: \(endpoint.path)"
+            )
+        }
+        return try GitWorktreeMergeEndpoint(descriptor: descriptor)
+    }
+
+    private func revalidatedWorktreeMergeEndpoints(
+        source: GitWorktreeMergeEndpoint,
+        target: GitWorktreeMergeEndpoint
+    ) async throws -> (source: GitWorktreeMergeEndpoint, target: GitWorktreeMergeEndpoint) {
+        async let sourceEndpoint = revalidatedWorktreeMergeEndpoint(source, label: "Source")
+        async let targetEndpoint = revalidatedWorktreeMergeEndpoint(target, label: "Target")
+        return try await (source: sourceEndpoint, target: targetEndpoint)
+    }
+
+    private func revalidatedWorktreeMergePreview(
+        _ preview: GitWorktreeMergePreview
+    ) async throws -> GitWorktreeMergePreview {
+        let endpoints = try await revalidatedWorktreeMergeEndpoints(
+            source: preview.inspection.source,
+            target: preview.inspection.target
+        )
+        guard WorktreeMergeEndpointValidation.sameIdentity(preview.inspection.source, endpoints.source),
+              WorktreeMergeEndpointValidation.sameIdentity(preview.inspection.target, endpoints.target)
+        else {
+            throw MCPError.invalidParams("Worktree merge endpoints changed before preview persistence.")
+        }
+        let inspection = GitWorktreeMergeInspection(
+            source: endpoints.source,
+            target: endpoints.target,
+            mergeBase: preview.inspection.mergeBase,
+            sourceHead: endpoints.source.head,
+            targetHead: endpoints.target.head,
+            sourceFingerprint: preview.inspection.sourceFingerprint,
+            targetFingerprint: preview.inspection.targetFingerprint,
+            blockers: preview.inspection.blockers,
+            conflictPrediction: preview.inspection.conflictPrediction,
+            summary: preview.inspection.summary,
+            visualization: preview.inspection.visualization
+        )
+        return GitWorktreeMergePreview(
+            operationID: preview.operationID,
+            inspection: inspection,
+            artifacts: preview.artifacts
+        )
+    }
+
+    private func revalidatedAndAuthorizedWorktreeMergeEndpoints(
+        source: GitWorktreeMergeEndpoint,
+        target: GitWorktreeMergeEndpoint,
+        session: TabSession
+    ) async throws -> (source: GitWorktreeMergeEndpoint, target: GitWorktreeMergeEndpoint) {
+        let roots = try await worktreeMergeAuthorizedRoots(for: session)
+        let endpoints = try await revalidatedWorktreeMergeEndpoints(source: source, target: target)
+        try await requireAuthorizedWorktreeMergeEndpoint(endpoints.source, roots: roots, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(endpoints.target, roots: roots, label: "Target")
+        return endpoints
+    }
+
+    private func revalidatedAndAuthorizedWorktreeMergePreview(
+        _ preview: GitWorktreeMergePreview,
+        session: TabSession
+    ) async throws -> GitWorktreeMergePreview {
+        let roots = try await worktreeMergeAuthorizedRoots(for: session)
+        let checked = try await revalidatedWorktreeMergePreview(preview)
+        try await requireAuthorizedWorktreeMergeEndpoint(checked.inspection.source, roots: roots, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(checked.inspection.target, roots: roots, label: "Target")
+        return checked
+    }
+
+    private func refreshAfterWorktreeMergeFailure(
+        session: TabSession,
+        target: GitWorktreeMergeEndpoint
+    ) async {
+        guard let checkedTarget = try? await revalidatedAndAuthorizedWorktreeMergeTarget(
+            target,
+            session: session
+        ) else {
+            return
+        }
+        await refreshAfterWorktreeMergeMutation(session: session, target: checkedTarget)
+    }
+
+    private func revalidatedAndAuthorizedWorktreeMergeTarget(
+        _ target: GitWorktreeMergeEndpoint,
+        session: TabSession
+    ) async throws -> GitWorktreeMergeEndpoint {
+        let roots = try await worktreeMergeAuthorizedRoots(for: session)
+        let checkedTarget = try await revalidatedWorktreeMergeEndpoint(target, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(checkedTarget, roots: roots, label: "Target")
+        return checkedTarget
     }
 
     private func refreshAfterWorktreeMergeMutation(
@@ -824,10 +1104,5 @@ extension AgentModeViewModel {
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
         requestUIRefresh(tabID: session.tabID, urgent: true)
         publishMCPStateChange(for: session)
-    }
-
-    private func samePath(_ lhs: String, _ rhs: String) -> Bool {
-        ((lhs as NSString).expandingTildeInPath as NSString).standardizingPath
-            == ((rhs as NSString).expandingTildeInPath as NSString).standardizingPath
     }
 }

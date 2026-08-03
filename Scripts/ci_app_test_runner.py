@@ -26,6 +26,7 @@ XCTEST_FAILURE_RE = re.compile(r"^.*:\d+(?::\d+)?:\s+error:\s+-\[[^\]]+\]\s+:")
 XCTEST_STARTED_RE = re.compile(r"^Test Case '-\[(?P<test>[^\]]+)\]' started\.$")
 TIMEOUT_EXIT_CODE = 124
 XCTEST_BUNDLE_GLOB = "*.xctest"
+METHOD_ISOLATED_SUITES = frozenset({"RepoPromptTests.WorktreeAPISmokeHarnessTests"})
 
 
 @dataclass(frozen=True)
@@ -88,7 +89,7 @@ def parse_started_test(line: str) -> str | None:
     return match.group("test")
 
 
-def parse_suite_method_counts(list_output: str) -> dict[str, int]:
+def parse_suite_methods(list_output: str) -> dict[str, tuple[str, ...]]:
     methods_by_suite: dict[str, set[str]] = {}
     for raw_line in list_output.splitlines():
         line = raw_line.strip()
@@ -97,14 +98,21 @@ def parse_suite_method_counts(list_output: str) -> dict[str, int]:
         suite, method = line.split("/", 1)
         if not suite or not method:
             continue
-        methods_by_suite.setdefault(suite, set()).add(method)
+        methods_by_suite.setdefault(suite, set()).add(line)
     return {
-        suite: len(methods_by_suite[suite])
+        suite: tuple(sorted(methods_by_suite[suite]))
         for suite in sorted(methods_by_suite)
     }
 
 
-def list_suites(swift_binary: str, cwd: Path | None) -> dict[str, int]:
+def parse_suite_method_counts(list_output: str) -> dict[str, int]:
+    return {
+        suite: len(methods)
+        for suite, methods in parse_suite_methods(list_output).items()
+    }
+
+
+def list_suite_methods(swift_binary: str, cwd: Path | None) -> dict[str, tuple[str, ...]]:
     listed = subprocess.run(
         [swift_binary, "test", "list"],
         check=True,
@@ -112,7 +120,14 @@ def list_suites(swift_binary: str, cwd: Path | None) -> dict[str, int]:
         cwd=cwd,
         text=True,
     )
-    return parse_suite_method_counts(listed.stdout)
+    return parse_suite_methods(listed.stdout)
+
+
+def list_suites(swift_binary: str, cwd: Path | None) -> dict[str, int]:
+    return {
+        suite: len(methods)
+        for suite, methods in list_suite_methods(swift_binary, cwd).items()
+    }
 
 
 def discover_test_bundle(
@@ -682,6 +697,7 @@ def run_all_suites(
     test_bundles: dict[str, Path] | None = None,
     xctest_binary: list[str] | None = None,
     method_counts: Mapping[str, int] | None = None,
+    suite_methods: Mapping[str, Sequence[str]] | None = None,
     shard_count: int = 1,
     shard_index: int = 1,
 ) -> int:
@@ -729,9 +745,29 @@ def run_all_suites(
             )
             return 1
 
+    execution_units: list[str] = []
+    for suite in selected_suites:
+        if suite not in METHOD_ISOLATED_SUITES:
+            execution_units.append(suite)
+            continue
+        methods = tuple(suite_methods.get(suite, ())) if suite_methods is not None else ()
+        if not methods:
+            print(
+                f"::error::Method-isolated suite {suite} has no discovered methods.",
+                flush=True,
+                file=output,
+            )
+            return 1
+        print(
+            f"Method-isolating {suite}: {len(methods)} fresh XCTest processes",
+            flush=True,
+            file=output,
+        )
+        execution_units.extend(methods)
+
     passed_results: list[SuiteRunResult] = []
     failed_results: list[SuiteRunResult] = []
-    for suite in selected_suites:
+    for suite in execution_units:
         result = run_and_report_single_suite(
             suite,
             timeout_seconds=timeout_seconds,
@@ -819,7 +855,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
-        method_counts = list_suites(args.swift_binary, args.cwd)
+        suite_methods = list_suite_methods(args.swift_binary, args.cwd)
+        method_counts = {suite: len(methods) for suite, methods in suite_methods.items()}
     except subprocess.CalledProcessError as error:
         print(f"::error::swift test list failed with status {error.returncode}", flush=True)
         if error.stdout:
@@ -879,6 +916,7 @@ def main(argv: list[str]) -> int:
         test_bundles=test_bundles,
         xctest_binary=xctest_binary,
         method_counts=method_counts,
+        suite_methods=suite_methods,
         shard_count=args.shard_count,
         shard_index=args.shard_index,
     )

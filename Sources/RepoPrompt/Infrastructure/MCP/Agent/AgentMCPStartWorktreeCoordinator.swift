@@ -192,7 +192,8 @@ struct AgentMCPStartWorktreeCoordinator {
                         worktree = try await gitTargetResolver.resolveWorktree(
                             selector: selector,
                             repo: context.repo,
-                            allRepos: [context.repo]
+                            allRepos: [context.repo],
+                            authorizedRoots: context.visibleRoots
                         )
                         initializationReceipt = nil
                         initializationFallbackReason = nil

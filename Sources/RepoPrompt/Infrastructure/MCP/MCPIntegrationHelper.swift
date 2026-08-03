@@ -140,16 +140,7 @@ enum MCPIntegrationHelper {
     /// JSON snippet shown to users / copied to clipboard.
     static var jsonSnippet: String {
         (try? repoPromptMCPConfiguration.prettyPrintedWrappedSettingsJSON())
-            ?? """
-            {
-            	"mcpServers": {
-            		"\(repoPromptMCPServerName)": {
-            			"command": "\(serverCommand)",
-            			"args": []
-            		}
-            	}
-            }
-            """
+            ?? #"{"mcpServers":{"\#(repoPromptMCPServerName)":{"command":"\#(serverCommand)","args":["--backend","app"]}}}"#
     }
 
     static var isMCPServerInstalled: Bool {

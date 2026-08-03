@@ -1391,8 +1391,8 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             providerIdentifier: "fixture"
         )
         let runRegistration: DomainConnectionRegistration
-        if case let .accepted(binding) = accepted {
-            runRegistration = binding.registration
+        if case let .accepted(redemption) = accepted {
+            runRegistration = redemption.binding.registration
         } else {
             XCTFail("Launch token was not accepted: \(accepted)")
             return
@@ -1469,6 +1469,47 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             providerIdentifier: "fixture"
         )
         XCTAssertEqual(replay, .alreadyConsumed)
+
+        let foreignRuntimeToken = try await runtime.routingCoordinator.issueLaunchToken(.init(
+            runID: UUID(),
+            context: context,
+            expectedContextRevision: 0,
+            windowID: nil,
+            clientPrincipal: "test",
+            providerIdentifier: "fixture",
+            runPurpose: "foreign-runtime"
+        ))
+        let foreignRuntime = await runtime.routingCoordinator.redeemLaunchToken(
+            material: foreignRuntimeToken.material,
+            runtimeID: UUID(),
+            runtimeGeneration: 9,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: "test",
+            providerIdentifier: "fixture"
+        )
+        XCTAssertEqual(foreignRuntime, .generationMismatch)
+
+        let expiredToken = try await runtime.routingCoordinator.issueLaunchToken(.init(
+            runID: UUID(),
+            context: context,
+            expectedContextRevision: 0,
+            windowID: nil,
+            clientPrincipal: "test",
+            providerIdentifier: "fixture",
+            runPurpose: "expired",
+            lifetime: .zero
+        ))
+        let expired = await runtime.routingCoordinator.redeemLaunchToken(
+            material: expiredToken.material,
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: 9,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: "test",
+            providerIdentifier: "fixture"
+        )
+        XCTAssertEqual(expired, .expired)
     }
 
     private func allFiles(below root: URL) throws -> [URL] {

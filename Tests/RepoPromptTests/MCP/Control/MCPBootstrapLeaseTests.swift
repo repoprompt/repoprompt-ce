@@ -822,7 +822,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await MCPRoutingWaiter.cleanup(runID: runID)
                 await HeadlessAgentConnectionGate.cancelAll()
-                await ServiceRegistry.unregister(catalogService)
+                await AppDomainRuntimeComposition.shared.unregister(catalogService)
                 if let loadedRootID {
                     await window.workspaceFileContextStore.unloadRoot(id: loadedRootID)
                 }
@@ -858,7 +858,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 loadedRootID = loadedRoot.id
 
-                try await ServiceRegistry.register(catalogService)
+                try await AppDomainRuntimeComposition.shared.register(catalogService)
                 try await Self.ensureRoutingService()
 
                 let cursorAdditionalTools = AgentModeMCPPolicyInstaller.additionalTools(for: .cursor)
@@ -1260,7 +1260,7 @@ private extension MCPBootstrapLeaseTests {
     @MainActor
     static func ensureRoutingService() async throws {
         try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
-        let snapshot = await ServiceRegistry.catalogSnapshot()
+        let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
         guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
             throw MCPBootstrapLeaseTestError.routingServiceUnavailable
         }

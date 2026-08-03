@@ -1318,6 +1318,7 @@ import XCTest
                         "detach": .bool(true),
                         "timeout": .int(0)
                     ])
+                    window.mcpServer.setRequestMetadataOverrideForTesting(nil)
                     let startObject = try XCTUnwrap(startValue.objectValue)
                     let startSession = try XCTUnwrap(startObject["session"]?.objectValue)
                     let targetSessionID = try XCTUnwrap(

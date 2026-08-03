@@ -85,6 +85,17 @@ class CIAppTestRunnerTests(unittest.TestCase):
             },
         )
 
+        self.assertEqual(
+            ci_app_test_runner.parse_suite_methods(output),
+            {
+                "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                "RepoPromptTests.B": (
+                    "RepoPromptTests.B/testThree",
+                    "RepoPromptTests.B/testTwo",
+                ),
+            },
+        )
+
     def test_lpt_sharding_is_deterministic_with_stable_name_ties(self) -> None:
         method_counts = {
             "RepoPromptTests.E": 1,
@@ -674,6 +685,45 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, ["RepoPromptTests.A", "RepoPromptTests.B"])
 
+    def test_run_all_suites_method_isolates_process_global_smoke_suite(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_suite(suite, **kwargs):
+            calls.append(suite)
+            return ci_app_test_runner.SuiteRunResult(
+                suite=suite,
+                state="passed",
+                exit_code=0,
+                elapsed_seconds=0.1,
+                output_seen=True,
+                first_failure_line=None,
+                last_started_test=None,
+                timed_out_after_seconds=None,
+                attempts=1,
+            )
+
+        suite = "RepoPromptTests.WorktreeAPISmokeHarnessTests"
+        methods = (
+            f"{suite}/testContextBuilderExport",
+            f"{suite}/testManageWorktreeAndAgentRun",
+        )
+        output = io.StringIO()
+        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
+            exit_code = ci_app_test_runner.run_all_suites(
+                [suite],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+                method_counts={suite: len(methods)},
+                suite_methods={suite: methods},
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, list(methods))
+        self.assertIn("Method-isolating", output.getvalue())
+
     def test_run_all_suites_collects_failures_and_continues(self) -> None:
         calls: list[str] = []
 
@@ -817,8 +867,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch.object(ci_app_test_runner, "discover_test_bundles", return_value=bundles),
             mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
@@ -845,8 +898,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch.object(
                 ci_app_test_runner,
@@ -887,8 +943,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch.object(
                 ci_app_test_runner,
@@ -915,8 +974,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch("sys.stdout", output),
         ):
@@ -930,8 +992,8 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptWorkspaceTests.A"],
+                "list_suite_methods",
+                return_value={"RepoPromptWorkspaceTests.A": ("RepoPromptWorkspaceTests.A/testOne",)},
             ),
             mock.patch.object(ci_app_test_runner, "discover_test_bundle", return_value=None),
             mock.patch.object(ci_app_test_runner, "run_all_suites") as run_all_suites,

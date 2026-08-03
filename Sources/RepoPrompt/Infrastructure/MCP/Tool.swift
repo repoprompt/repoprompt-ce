@@ -70,6 +70,24 @@ public struct Tool: Sendable {
 }
 
 extension Tool {
+    /// Reprojects canonical schema metadata without adding another execution wrapper.
+    /// The supplied tool already owns the app `runTool` envelope.
+    init(canonicalizing implementation: Tool) throws {
+        let binding = try implementation.domainBinding()
+        let schemaData = try JSONEncoder().encode(binding.definition.inputSchema)
+        let schema = try JSONDecoder().decode(JSONSchema.self, from: schemaData)
+        self.init(
+            name: binding.definition.name,
+            description: binding.definition.description,
+            inputSchema: schema,
+            annotations: binding.definition.annotations.mcpAnnotations,
+            isEnabledByDefault: binding.definition.isEnabledByDefault,
+            returnsValue: { arguments in
+                try await implementation(arguments)
+            }
+        )
+    }
+
     init(domainBinding: MCPDomainToolBinding) throws {
         let schemaData = try JSONEncoder().encode(domainBinding.definition.inputSchema)
         let schema = try JSONDecoder().decode(JSONSchema.self, from: schemaData)
@@ -88,7 +106,7 @@ extension Tool {
     @MainActor
     init(
         domainBinding: MCPDomainToolBinding,
-        runtime: MCPWindowToolRuntime
+        runtime: MCPAppToolBinder
     ) throws {
         let schemaData = try JSONEncoder().encode(domainBinding.definition.inputSchema)
         let schema = try JSONDecoder().decode(JSONSchema.self, from: schemaData)
@@ -105,19 +123,23 @@ extension Tool {
     }
 
     func domainBinding() throws -> MCPDomainToolBinding {
-        let definition = try MCPDomainToolDefinition(
-            name: name,
-            description: description,
-            inputSchema: Value(inputSchema),
-            annotations: MCPDomainToolAnnotations(
-                title: annotations.title,
-                readOnlyHint: annotations.readOnlyHint,
-                destructiveHint: annotations.destructiveHint,
-                idempotentHint: annotations.idempotentHint,
-                openWorldHint: annotations.openWorldHint
-            ),
-            isEnabledByDefault: isEnabledByDefault
-        )
+        let definition: MCPDomainToolDefinition = if let canonical = MCPDomainCanonicalToolDefinitions.definition(named: name) {
+            canonical
+        } else {
+            try MCPDomainToolDefinition(
+                name: name,
+                description: description,
+                inputSchema: Value(inputSchema),
+                annotations: MCPDomainToolAnnotations(
+                    title: annotations.title,
+                    readOnlyHint: annotations.readOnlyHint,
+                    destructiveHint: annotations.destructiveHint,
+                    idempotentHint: annotations.idempotentHint,
+                    openWorldHint: annotations.openWorldHint
+                ),
+                isEnabledByDefault: isEnabledByDefault
+            )
+        }
         return MCPDomainToolBinding(definition: definition) { arguments in
             try await self(arguments)
         }

@@ -74,7 +74,7 @@
       "gate_4b_families": ["file_actions", "apply_edits", "manage_worktree"],
       "definition_and_registration_authority": "MCPDomainProtectedMutationToolProvider",
       "schema_parity": "wrapped_binding_definition_preserved",
-      "dual_mutation_prevention": "ServiceRegistry_wraps_each_binding_once",
+      "dual_mutation_prevention": "AppDomainRuntimeComposition_wraps_each_binding_once",
       "connection_registration": "coordinator_owned_token_reacquired_after_restart_or_reregistration",
       "principal_authority": "kernel_verified_executable_fingerprint_not_display_name",
       "policy_visibility": "versioned_snapshot_reloaded_at_admission_and_precommit",
@@ -163,7 +163,7 @@
         "behavior": "source_declares_typed_invalid_params",
         "error_type": "ApplyEditsError.invalidParams",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/ApplyEdits/ApplyEditsRequestBuilder.swift",
+          "path": "Sources/RepoPromptDomainRuntime/ApplyEdits/ApplyEditsRequestBuilder.swift",
           "marker": "Provide exactly one of: `rewrite`, `replace`, or `edits`.",
           "type_marker": "ApplyEditsError.invalidParams"
         }
@@ -317,9 +317,10 @@
     }
   },
   "dependencies": {
-    "owner": "MCPWindowToolDependencies",
-    "stored_dependency_count": 84,
-    "stored_dependencies": ["executeOracleUtils", "executeAskOracle", "executeOracleSend", "executeOracleChatLog", "executeAgentExplore", "executeAgentRun", "executeAgentManage", "requireTargetWindow", "requireCurrentTabContext", "requireAgentModeConnection", "resolveAgentModeTabID", "resolveContextBuilderTab", "bindTabForConnection", "buildTabSelectionReply", "sendStageProgress", "makeOracleExportDestination", "resolveDefaultOracleExportPath", "writeGeneratedOracleExportFile", "beforeContextBuilderFinalReviewAuthorization", "didFinalizeContextBuilderReview", "runMCPPlanOrQuestion", "windowID", "promptVM", "workspaceManager", "selectionCoordinator", "applyEditsApprovalStore", "captureRequestMetadata", "resolveImplicitContextBuilderGitTarget", "validateContextBuilderGitArtifactSelection", "resolveTabContextSnapshot", "updateCurrentTabContext", "selectedRecordsForCurrentTabContext", "physicalSelectionForCurrentTabContext", "resolveSelectedFilesForCodeStructure", "boundTabID", "mapFileManagerErrorToMCP", "ensureGitDataRootLoaded", "logDebug", "commitPrimaryGitDiffArtifactsToCurrentTab", "replaceAdvertisedGitArtifactsForCurrentTab", "invalidateAdvertisedGitArtifactsForCurrentTab", "workspaceSearch", "parseManageSelectionInputs", "resolveFileToolLookupContext", "resolveMutationFileToolContext", "stabilizedVirtualSelection", "freezePromptGitReviewContext", "buildCurrentSelectionReply", "buildSelectionPreviewReply", "buildSelectionMutationReply", "buildManageSelectionSetSelection", "resolveManageSelectionArtifactInputs", "validateManageSelectionArtifactFence", "mutatePreResolvedFullFilePaths", "commitManageSelectionArtifactMutation", "addStoredSelectionPaths", "removeStoredSelectionPaths", "promoteStoredSelectionPaths", "demoteStoredSelectionPaths", "computeSelectionSlicesVirtual", "persistResolvedTabContextSnapshot", "makeSelectionHintError", "performFileAction", "buildCodeStructureDTO", "resolveFilesForCodeStructure", "buildStoreBackedFileTreeResult", "readSelectedAuthorizedGitArtifact", "readFile", "enqueueReadFileAutoSelection", "drainReadFileAutoSelection", "enqueueFileSearchAutoSelection", "workspaceContextMessage", "parseCopyPresetSelector", "resolveCopyPreset", "buildTabWorkspaceContext", "selectedFilesWithStats", "selectionCollectionsForCurrentTabContext", "buildCopyPresetContextDTO", "buildCopyPresetsListDTO", "copyPresetDescriptorDTO", "buildExportSelectedFileInfos", "buildTabClipboardContent", "writePromptExportFile", "latestTokenBreakdown"]
+    "owner": "MCPAppPhysicalCapabilityAdapters",
+    "family_count": 5,
+    "families": ["Execution", "Context", "Selection", "Files", "Prompt"],
+    "storage_contract": "namespace-only typed physical capability families; providers receive only their required families"
   },
   "approval": {
     "workspace_operations": ["create_workspace", "delete_workspace", "add_folder", "remove_folder"],
@@ -524,19 +525,19 @@
         "symbol": "MCPSelectionToolProvider"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppToolCatalogRegistration.swift",
         "kind": "class",
-        "symbol": "MCPWindowToolCatalogService"
+        "symbol": "MCPAppToolCatalogRegistration"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppToolCatalogRegistration.swift",
         "kind": "protocol",
-        "symbol": "MCPWindowToolProviding"
+        "symbol": "MCPAppToolProviding"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolRuntime.swift",
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppToolBinder.swift",
         "kind": "class",
-        "symbol": "MCPWindowToolRuntime"
+        "symbol": "MCPAppToolBinder"
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWorktreeToolProvider+Merge.swift",
@@ -617,30 +618,30 @@
       "app_settings": ["GlobalSettingsStore"],
       "bind_context": ["WindowRoutingService"],
       "manage_workspaces": ["WindowRoutingService"],
-      "manage_selection": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPSelectionToolProvider"],
-      "file_actions": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
-      "get_code_structure": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "MCPFileToolProvider"],
-      "get_file_tree": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "MCPFileToolProvider"],
-      "read_file": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPFileToolProvider"],
-      "file_search": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPFileToolProvider"],
-      "workspace_context": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "MCPPromptContextToolProvider"],
-      "prompt": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "MCPPromptContextToolProvider"],
-      "apply_edits": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPApplyEditsToolProvider"],
-      "oracle_utils": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "ask_oracle": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "oracle_send": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "oracle_chat_log": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "MCPOracleToolProvider"],
-      "git": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPGitToolProvider"],
-      "manage_worktree": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPWorktreeToolProvider"],
-      "context_builder": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPContextBuilderToolProvider"],
-      "ask_user": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAskUserToolProvider"],
-      "agent_explore": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
-      "agent_run": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
-      "agent_manage": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
-      "share_thoughts": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
-      "set_status": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
-      "wait_for_next_user_instruction": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
-      "history": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPDomainReadToolProvider", "MCPHistoryToolProvider"]
+      "manage_selection": ["MCPServerViewModel", "MCPAppToolBinder", "MCPSelectionToolProvider"],
+      "file_actions": ["MCPServerViewModel", "MCPAppToolBinder", "MCPFileToolProvider"],
+      "get_code_structure": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPFileToolProvider"],
+      "get_file_tree": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPFileToolProvider"],
+      "read_file": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPFileToolProvider"],
+      "file_search": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPFileToolProvider"],
+      "workspace_context": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPPromptContextToolProvider"],
+      "prompt": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPPromptContextToolProvider"],
+      "apply_edits": ["MCPServerViewModel", "MCPAppToolBinder", "MCPApplyEditsToolProvider"],
+      "oracle_utils": ["MCPServerViewModel", "MCPAppToolBinder", "MCPOracleToolProvider"],
+      "ask_oracle": ["MCPServerViewModel", "MCPAppToolBinder", "MCPOracleToolProvider"],
+      "oracle_send": ["MCPServerViewModel", "MCPAppToolBinder", "MCPOracleToolProvider"],
+      "oracle_chat_log": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPOracleToolProvider"],
+      "git": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPGitToolProvider"],
+      "manage_worktree": ["MCPServerViewModel", "MCPAppToolBinder", "MCPWorktreeToolProvider"],
+      "context_builder": ["MCPServerViewModel", "MCPAppToolBinder", "MCPContextBuilderToolProvider"],
+      "ask_user": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAskUserToolProvider"],
+      "agent_explore": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "agent_run": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "agent_manage": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "share_thoughts": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
+      "set_status": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
+      "wait_for_next_user_instruction": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
+      "history": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPHistoryToolProvider"]
     },
     "reviewed_delegated_hops": {
       "evidence_status": "reviewed_non_executable_inventory",

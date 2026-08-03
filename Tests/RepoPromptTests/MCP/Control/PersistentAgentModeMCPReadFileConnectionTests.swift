@@ -1947,15 +1947,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     )
                     let independentSelectionText = try Self.readFileText(from: independentGet, id: 4)
                     XCTAssertTrue(
-                        independentSelectionText.contains(fixture.liveFileURL.path),
+                        independentSelectionText.contains(Fixture.liveRelativePath),
                         independentSelectionText
                     )
                     XCTAssertTrue(
-                        independentSelectionText.contains(fixture.worktreeOnlyLogicalURL.path),
+                        independentSelectionText.contains(Fixture.worktreeOnlyRelativePath),
                         independentSelectionText
                     )
                     XCTAssertTrue(
-                        independentSelectionText.contains("\"full_count\":1"),
+                        independentSelectionText.contains("\"full_count\":2"),
                         independentSelectionText
                     )
                 } catch {
@@ -2873,7 +2873,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var auxiliaryRootID: UUID?
         private var peerRootID: UUID?
         private var peerTargetStateVersionBeforeSelection: Int?
-        private var peerCatalogRegistrationHandle: MCPDomainToolRegistrationHandle?
         private var cleanedUp = false
 
         private init(
@@ -3053,7 +3052,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
-                let catalogRegistration = try await ServiceRegistry.register(resolvedCatalogService)
+                let catalogRegistration = try await AppDomainRuntimeComposition.shared.register(resolvedCatalogService)
                 guard catalogRegistration.disposition == .inserted else {
                     throw ClientFixtureError.windowCatalogRegistrationWasNotOwned(
                         String(describing: catalogRegistration.disposition)
@@ -3212,7 +3211,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 )
                 if let catalogRegistrationHandle {
                     // The fixture owns this exact generation; release it before teardown runs stopServer().
-                    await ServiceRegistry.unregister(catalogRegistrationHandle)
+                    await AppDomainRuntimeComposition.shared.unregister(catalogRegistrationHandle)
                 }
                 await window.tearDown()
                 await routingGuardWindow.tearDown()
@@ -3650,19 +3649,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         ) async throws -> IndependentConnection {
             let independentConnectionID = UUID()
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
-            let snapshot = await ServiceRegistry.catalogSnapshot()
+            let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
             guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
                 throw ClientFixtureError.routingServiceUnavailable
-            }
-            if peerCatalogRegistrationHandle == nil {
-                let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
-                let registration = try await ServiceRegistry.register(service)
-                guard registration.disposition == .inserted else {
-                    throw ClientFixtureError.windowCatalogRegistrationWasNotOwned(
-                        String(describing: registration.disposition)
-                    )
-                }
-                peerCatalogRegistrationHandle = registration.handle
             }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3737,7 +3726,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                         "name": MCPGlobalToolName.bindContext,
                         "arguments": [
                             "op": "bind",
-                            "window_id": routingGuardWindow.windowID
+                            "window_id": window.windowID,
+                            "context_id": tabID.uuidString
                         ]
                     ]
                 )
@@ -4033,10 +4023,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 runID: runID
             )
             // These exact generations are fixture-owned and must be released before window teardown.
-            await ServiceRegistry.unregister(catalogRegistrationHandle)
-            if let peerCatalogRegistrationHandle {
-                await ServiceRegistry.unregister(peerCatalogRegistrationHandle)
-            }
+            await AppDomainRuntimeComposition.shared.unregister(catalogRegistrationHandle)
             await window.tearDown()
             await routingGuardWindow.tearDown()
             await window.workspaceFileContextStore.unloadRoot(id: rootID)

@@ -44,6 +44,7 @@ package enum MCPWindowToolName {
 package enum MCPDomainToolScopeKind: String, CaseIterable, Sendable {
     case application
     case window
+    case standalone
 }
 
 package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
@@ -89,6 +90,15 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
     package let scope: MCPDomainToolScopeKind
     package let capability: MCPToolCapability
     package let admissionClass: MCPToolAdmissionClass
+
+    package func supports(registrationScope: MCPDomainToolRegistrationScope) -> Bool {
+        switch (scope, registrationScope) {
+        case (.application, .application), (.window, .window), (.window, .standalone):
+            true
+        default:
+            false
+        }
+    }
 }
 
 package enum MCPDomainToolCatalog {

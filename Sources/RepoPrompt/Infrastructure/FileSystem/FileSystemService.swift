@@ -277,6 +277,8 @@ actor FileSystemService {
     /// Retained FSEvent callback context. The context holds the service weakly so an
     /// un-stopped stream cannot keep the actor alive forever.
     var fseventCallbackContextPointer: UnsafeMutableRawPointer?
+    var seedWatcherActivationFlushInProgress = false
+    var seedWatcherActivationStopRequested = false
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules

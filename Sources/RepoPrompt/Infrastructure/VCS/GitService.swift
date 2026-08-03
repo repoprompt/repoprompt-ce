@@ -1940,6 +1940,41 @@ actor GitService {
         }
     }
 
+    /// Apply a preview whose endpoint identities are revalidated inside the mutation boundary.
+    func applyAndCommitWorktreeMerge(
+        sourceEndpoint: GitWorktreeMergeEndpoint,
+        targetEndpoint: GitWorktreeMergeEndpoint,
+        sourceHead: String,
+        message: String
+    ) async throws -> (state: GitWorktreeMergeState, commit: String?) {
+        try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeApply) {
+            try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge apply")
+                }
+                try await validateCurrentEndpoint(sourceEndpoint, label: "Source")
+                try await validateCurrentEndpoint(targetEndpoint, label: "Target")
+                let (_, stderr, exitCode) = try await runGit(
+                    ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
+                    at: targetEndpoint.url
+                )
+                if exitCode == 0 || exitCode == 1 {
+                    let state = try await inspectMergeState(at: targetEndpoint.url)
+                    guard state.conflictFiles.isEmpty else { return (state: state, commit: nil) }
+                    guard state.inProgress else { return (state: state, commit: nil) }
+                    let commit = try await commitCurrentMergeWithoutLock(
+                        message: message,
+                        at: targetEndpoint.url,
+                        sourceEndpoint: sourceEndpoint,
+                        targetEndpoint: targetEndpoint
+                    )
+                    return (state: state, commit: commit)
+                }
+                throw GitError(message: "git merge --no-commit failed: \(stderr)")
+            }
+        }
+    }
+
     func commitWorktreeMerge(message: String, at targetRepoURL: URL) async throws -> String {
         try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeCommit) {
             try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
@@ -1979,13 +2014,64 @@ actor GitService {
         }
     }
 
-    private func commitCurrentMergeWithoutLock(message: String, at targetRepoURL: URL) async throws -> String {
+    func continueWorktreeMerge(
+        sourceEndpoint: GitWorktreeMergeEndpoint,
+        targetEndpoint: GitWorktreeMergeEndpoint,
+        message: String
+    ) async throws -> String {
+        try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeContinue) {
+            try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge continue")
+                }
+                try await validateCurrentEndpoint(sourceEndpoint, label: "Source")
+                try await validateCurrentEndpoint(targetEndpoint, label: "Target")
+                return try await commitCurrentMergeWithoutLock(
+                    message: message,
+                    at: targetEndpoint.url,
+                    sourceEndpoint: sourceEndpoint,
+                    targetEndpoint: targetEndpoint
+                )
+            }
+        }
+    }
+
+    func abortWorktreeMerge(targetEndpoint: GitWorktreeMergeEndpoint) async throws -> Bool {
+        try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeAbort) {
+            try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge abort")
+                }
+                let state = try await inspectMergeState(at: targetEndpoint.url)
+                guard state.inProgress else { return false }
+                try await validateCurrentEndpoint(targetEndpoint, label: "Target")
+                let (_, stderr, exitCode) = try await runGit(["merge", "--abort"], at: targetEndpoint.url)
+                guard exitCode == 0 else {
+                    throw GitError(message: "git merge --abort failed: \(stderr)")
+                }
+                return true
+            }
+        }
+    }
+
+    private func commitCurrentMergeWithoutLock(
+        message: String,
+        at targetRepoURL: URL,
+        sourceEndpoint: GitWorktreeMergeEndpoint? = nil,
+        targetEndpoint: GitWorktreeMergeEndpoint? = nil
+    ) async throws -> String {
         let state = try await inspectMergeState(at: targetRepoURL)
         guard state.inProgress else {
             throw GitError(message: "No Git merge is in progress at \(targetRepoURL.path)")
         }
         guard state.conflictFiles.isEmpty else {
             throw GitError(message: "Cannot commit merge with unresolved conflicts: \(state.conflictFiles.joined(separator: ", "))")
+        }
+        if let sourceEndpoint {
+            try await validateCurrentEndpoint(sourceEndpoint, label: "Source")
+        }
+        if let targetEndpoint {
+            try await validateCurrentEndpoint(targetEndpoint, label: "Target")
         }
         let (_, stderr, exitCode) = try await runGit(
             ["commit", "--no-gpg-sign", "-m", message],
@@ -2006,8 +2092,10 @@ actor GitService {
 
     private func validateCurrentEndpoint(_ endpoint: GitWorktreeMergeEndpoint, label: String) async throws {
         let worktrees = try await listWorktrees(at: endpoint.url)
-        let standardizedPath = endpoint.url.standardizedFileURL.path
-        guard let current = worktrees.first(where: { $0.path == standardizedPath }) else {
+        let canonicalPath = GitRepoRootAuthorization.canonicalPath(endpoint.path)
+        guard let current = worktrees.first(where: {
+            GitRepoRootAuthorization.canonicalPath($0.path) == canonicalPath
+        }) else {
             throw GitError(message: "\(label) worktree is unavailable: \(endpoint.path)")
         }
         guard current.worktreeID == endpoint.worktreeID else {

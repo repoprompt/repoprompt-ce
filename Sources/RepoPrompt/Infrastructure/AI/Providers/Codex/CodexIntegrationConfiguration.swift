@@ -32,6 +32,11 @@ enum CodexIntegrationConfiguration {
         repoPromptMCPConfiguration.command
     }
 
+    private static var serverArgumentsTOML: String {
+        let values = repoPromptMCPConfiguration.args.map { "\"\($0)\"" }
+        return "[\(values.joined(separator: ", "))]"
+    }
+
     struct ServerEntry {
         let rawName: String
         let normalizedName: String
@@ -1026,7 +1031,7 @@ enum CodexIntegrationConfiguration {
         if ensureKey("command", value: "\"\(serverCommand)\"", in: &lines, blockRange: &block, force: true) {
             changed = true
         }
-        if ensureKey("args", value: "[]", in: &lines, blockRange: &block, afterKey: "command", force: true) {
+        if ensureKey("args", value: serverArgumentsTOML, in: &lines, blockRange: &block, afterKey: "command", force: true) {
             changed = true
         }
         if ensureRepoPromptPolicyKeys(in: &lines, blockRange: &block) {
@@ -1250,7 +1255,7 @@ enum CodexIntegrationConfiguration {
         var lines = [
             "[mcp_servers.\(cliPathComponent(forNormalizedServerName: repoPromptMCPServerName))]",
             "command = \"\(serverCommand)\"",
-            "args = []",
+            "args = \(serverArgumentsTOML)",
             "tool_timeout_sec = \(desiredToolTimeoutSeconds)",
             "supports_parallel_tool_calls = \(desiredSupportsParallelToolCalls)"
         ]

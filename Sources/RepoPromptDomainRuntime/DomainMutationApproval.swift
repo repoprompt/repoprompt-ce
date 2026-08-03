@@ -74,10 +74,18 @@ package actor DomainMutationApprovalBroker {
     private var presenterGeneration: UInt64 = 0
     private var active: Pending?
     private var queue: [Pending] = []
+    private let waitForDeadline: @Sendable (Date) async throws -> Void
     private var timeoutTask: Task<Void, Never>?
     private var isShuttingDown = false
 
-    package init() {}
+    package init(
+        waitForDeadline: @escaping @Sendable (Date) async throws -> Void = { deadline in
+            let delay = max(0, deadline.timeIntervalSinceNow)
+            try await Task.sleep(for: .seconds(delay))
+        }
+    ) {
+        self.waitForDeadline = waitForDeadline
+    }
 
     package func registerPresenter(_ presenter: DomainMutationApprovalPresenter) {
         guard !isShuttingDown else { return }
@@ -174,11 +182,10 @@ package actor DomainMutationApprovalBroker {
             return
         }
         let generation = presenterGeneration
-        let delay = max(0, pending.request.deadline.timeIntervalSinceNow)
         timeoutTask?.cancel()
-        timeoutTask = Task { [weak self] in
+        timeoutTask = Task { [weak self, waitForDeadline] in
             do {
-                try await Task.sleep(for: .seconds(delay))
+                try await waitForDeadline(pending.request.deadline)
             } catch {
                 return
             }

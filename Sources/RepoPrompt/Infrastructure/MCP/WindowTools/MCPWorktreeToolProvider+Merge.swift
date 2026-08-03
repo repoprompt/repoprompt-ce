@@ -34,7 +34,7 @@ extension MCPWorktreeToolProvider {
         let target = try targetSelector(args)
         let includeGraph = parseBool(args["include_graph"]) ?? true
         let graphLimit = graphLimit(args["graph_limit"])
-        let preview = try await dependencies.requireTargetWindow().agentModeViewModel.previewWorktreeMerge(
+        let preview = try await dependencies.execution.requireTargetWindow().agentModeViewModel.previewWorktreeMerge(
             sessionID: session.sessionID,
             repoRoot: trimmedString(args["repo_root"]),
             target: target,
@@ -62,7 +62,7 @@ extension MCPWorktreeToolProvider {
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let operationID = try requiredOperationID(args)
-        let pending = try dependencies.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
+        let pending = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
             sessionID: session.sessionID,
             operationID: operationID
         )
@@ -73,13 +73,13 @@ extension MCPWorktreeToolProvider {
             guard parseBool(args["confirm_preview"]) != true else {
                 throw MCPError.invalidParams("Routed Agent Mode apply must use the worktree merge approval flow, not confirm_preview=true.")
             }
-            result = try await dependencies.requireTargetWindow().agentModeViewModel.requestWorktreeMergeReviewAndApply(
+            result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.requestWorktreeMergeReviewAndApply(
                 sessionID: session.sessionID,
                 operationID: operationID,
                 commitMessage: commitMessage
             )
         } else if parseBool(args["confirm_preview"]) == true {
-            result = try await dependencies.requireTargetWindow().agentModeViewModel.applyConfirmedWorktreeMerge(
+            result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.applyConfirmedWorktreeMerge(
                 sessionID: session.sessionID,
                 operationID: operationID,
                 commitMessage: commitMessage
@@ -102,7 +102,7 @@ extension MCPWorktreeToolProvider {
         args: [String: Value],
         session: SessionResolution
     ) throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let operation = try dependencies.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
+        let operation = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
             sessionID: session.sessionID,
             operationID: trimmedString(args["operation_id"])
         )
@@ -120,7 +120,7 @@ extension MCPWorktreeToolProvider {
         args: [String: Value],
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let operation = try dependencies.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
+        let operation = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
             sessionID: session.sessionID,
             operationID: trimmedString(args["operation_id"])
         )
@@ -129,7 +129,7 @@ extension MCPWorktreeToolProvider {
             throw MCPError.invalidParams("continue requires confirm=true for plain MCP callers.")
         }
         try await admitMergePhysicalTargets(operation, sessionID: session.sessionID)
-        let result = try await dependencies.requireTargetWindow().agentModeViewModel.continueWorktreeMerge(
+        let result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.continueWorktreeMerge(
             sessionID: session.sessionID,
             operationID: operation.id,
             confirmed: true,
@@ -150,7 +150,7 @@ extension MCPWorktreeToolProvider {
         args: [String: Value],
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let operation = try dependencies.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
+        let operation = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
             sessionID: session.sessionID,
             operationID: trimmedString(args["operation_id"])
         )
@@ -159,7 +159,7 @@ extension MCPWorktreeToolProvider {
             throw MCPError.invalidParams("abort requires confirm=true for plain MCP callers.")
         }
         try await admitMergePhysicalTargets(operation, sessionID: session.sessionID)
-        let result = try await dependencies.requireTargetWindow().agentModeViewModel.abortWorktreeMerge(
+        let result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.abortWorktreeMerge(
             sessionID: session.sessionID,
             operationID: operation.id,
             confirmed: true
@@ -194,18 +194,58 @@ extension MCPWorktreeToolProvider {
         sessionID: UUID
     ) async throws {
         let paths = [operation.source.path, operation.target.path]
-        let bindings = try dependencies.requireTargetWindow().agentModeViewModel
+        let metadata = await dependencies.context.captureRequestMetadata()
+        let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
+        var mappings = await lookupContext.domainMutationPhysicalRootMappings(
+            store: dependencies.context.promptVM.workspaceFileContextStore
+        )
+        let bindings = try dependencies.execution.requireTargetWindow().agentModeViewModel
             .worktreeBindings(forAgentSessionID: sessionID)
-        var mappings = bindings.map {
+        mappings.append(contentsOf: bindings.map {
             DomainMutationPhysicalRootMapping(
                 canonicalRoot: $0.logicalRootPath,
                 physicalRoot: $0.worktreeRootPath
             )
+        })
+        let targetIsMapped = mappings.contains { mapping in
+            GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                operation.target.path,
+                roots: [mapping.physicalRoot]
+            )
         }
-        for path in paths where !mappings.contains(where: {
-            path == $0.physicalRoot || path.hasPrefix($0.physicalRoot + "/")
-        }) {
-            mappings.append(.init(canonicalRoot: path, physicalRoot: path))
+        if !targetIsMapped {
+            guard let targetBinding = bindings.first(where: {
+                $0.repositoryID == operation.target.repositoryID
+                    && $0.repoKey == operation.target.repoKey
+            }) else {
+                throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
+            }
+            let authorizedRoots = mappings.enumerated().map { index, mapping in
+                WorkspaceRootRef(
+                    id: UUID(),
+                    name: "worktree-merge-root-\(index)",
+                    fullPath: mapping.physicalRoot
+                )
+            }
+            do {
+                _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+                    for: operation.target,
+                    roots: authorizedRoots
+                )
+            } catch {
+                throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
+            }
+            mappings.append(DomainMutationPhysicalRootMapping(
+                canonicalRoot: targetBinding.logicalRootPath,
+                physicalRoot: operation.target.path
+            ))
+        }
+        guard paths.allSatisfy({ path in
+            mappings.contains { mapping in
+                GitRepoRootAuthorization.isPathWithinAuthorizedRoots(path, roots: [mapping.physicalRoot])
+            }
+        }) else {
+            throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
         }
         try await MCPDomainMutationCommitContext.admitPhysicalTargets(
             paths,
@@ -214,13 +254,12 @@ extension MCPWorktreeToolProvider {
     }
 
     private func resolveMergeSession(args: [String: Value]) async throws -> SessionResolution {
-        let metadata = await dependencies.captureRequestMetadata()
-        let resolved = try dependencies.resolveTabContextSnapshot(
+        let metadata = await dependencies.context.captureRequestMetadata()
+        let resolved = try dependencies.context.resolveTabContextSnapshot(
             metadata,
-            MCPWindowToolName.manageWorktree,
-            .allowLegacyImplicitRouting
+            MCPWindowToolName.manageWorktree
         )
-        let isRoutedAgentMode = await (try? dependencies.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
+        let isRoutedAgentMode = await (try? dependencies.execution.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
 
         if let raw = trimmedString(args["session_id"]) {
             guard let uuid = UUID(uuidString: raw) else {

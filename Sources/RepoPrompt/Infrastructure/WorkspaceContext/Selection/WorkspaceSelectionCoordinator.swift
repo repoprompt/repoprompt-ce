@@ -763,7 +763,8 @@ final class WorkspaceSelectionCoordinator {
                 selection: StoredSelection(),
                 invalidPaths: [],
                 codemapUnavailable: [],
-                mutated: false
+                mutated: false,
+                validCandidateCount: 0
             )
         }
         let currentSelection = activeSelectionSnapshot(flushPendingUI: true).selection
@@ -799,7 +800,8 @@ final class WorkspaceSelectionCoordinator {
                 selection: logicalSelection,
                 invalidPaths: result.invalidPaths,
                 codemapUnavailable: result.codemapUnavailable,
-                mutated: false
+                mutated: false,
+                validCandidateCount: result.validCandidateCount
             )
         }
         let persistenceResult = await persistSelectionResult(
@@ -818,7 +820,8 @@ final class WorkspaceSelectionCoordinator {
             selection: outcome.selection,
             invalidPaths: result.invalidPaths,
             codemapUnavailable: result.codemapUnavailable,
-            mutated: outcome.mutated
+            mutated: outcome.mutated,
+            validCandidateCount: result.validCandidateCount
         )
     }
 

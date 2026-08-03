@@ -128,10 +128,16 @@ let package = Package(
         .target(
             name: "RepoPromptDomainRuntime",
             dependencies: [
+                "RepoPromptShared",
+                "RepoPromptC",
+                "RepoPromptCodeMapCore",
+                .product(name: "Logging", package: "swift-log"),
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Sources/RepoPromptDomainRuntime",
-            swiftSettings: swift6LanguageMode
+            swiftSettings: swift6LanguageMode + [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
         ),
         .target(
             name: "RepoPromptWorkspaceCore",
@@ -175,7 +181,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),

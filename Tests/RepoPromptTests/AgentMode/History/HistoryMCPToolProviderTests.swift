@@ -18,8 +18,8 @@ final class HistoryMCPToolProviderTests: XCTestCase {
         try fixture.install([spec], in: workspace)
         let scanner = fixture.makeScanner()
 
-        let runtime = MCPWindowToolRuntime(windowID: 42) { _, _, arguments, implementation in
-            try await implementation(MCPWindowToolContext(toolName: MCPWindowToolName.history, windowID: 42), arguments)
+        let runtime = MCPAppToolBinder(windowID: 42) { _, _, arguments, implementation in
+            try await implementation(MCPAppToolInvocation(toolName: MCPWindowToolName.history, windowID: 42), arguments)
         }
         let provider = MCPHistoryToolProvider(runtime: runtime, scannerFactory: { scanner })
         let context = Self.makeDomainContext()

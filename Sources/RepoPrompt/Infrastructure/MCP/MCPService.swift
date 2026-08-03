@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import Logging
 import RepoPromptShared
 import SwiftUI
 
@@ -19,8 +18,6 @@ import SwiftUI
 #else
     private func mcpServiceLog(_ message: @autoclosure () -> String) {}
 #endif
-
-private let mcpServiceLogger = Logger(label: "com.repoprompt.mcp.service")
 
 /// Background actor that manages the single MCP server instance and handles all networking/file I/O operations.
 /// This actor ensures that no long-running network or file-system work ever executes on @MainActor.
@@ -80,8 +77,8 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     private let controller = ServerController.shared
+    private let hostBootstrapOperation: @Sendable () async -> Void
     private let controllerStartOperation: @Sendable () async throws -> Void
-    private let controllerStopOperation: @Sendable () async -> Void
     private let controllerFullShutdownOperation: @Sendable () async -> Void
 
     private struct StartAttempt {
@@ -95,20 +92,14 @@ actor MCPService: Sendable {
         let task: Task<Void, Never>
     }
 
-    private struct Participation {
-        let token: UUID
-    }
-
     private enum LifecycleError: Error {
         case startSuperseded
     }
 
-    /// Tracks the newest participation claim for each window. Tokens prevent a
-    /// superseded join from removing a later rejoin for the same window ID.
-    private var participatingWindows: [Int: Participation] = [:]
     private var lifecycleGeneration: UInt64 = 0
     private var activeStartAttempt: StartAttempt?
     private var activeTeardownAttempt: TeardownAttempt?
+    private var joinedWindowIDs = Set<Int>()
     #if DEBUG
         private var teardownRequestCount = 0
     #endif
@@ -118,18 +109,19 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     init(
+        hostBootstrapOperation: @escaping @Sendable () async -> Void = {
+            // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
+            _ = MCPIntegrationHelper.ensureCodexToolTimeout()
+        },
         controllerStartOperation: @escaping @Sendable () async throws -> Void = {
             try await ServerController.shared.startServer()
-        },
-        controllerStopOperation: @escaping @Sendable () async -> Void = {
-            await ServerController.shared.stopServer()
         },
         controllerFullShutdownOperation: @escaping @Sendable () async -> Void = {
             await ServerController.shared.fullShutdown()
         }
     ) {
+        self.hostBootstrapOperation = hostBootstrapOperation
         self.controllerStartOperation = controllerStartOperation
-        self.controllerStopOperation = controllerStopOperation
         self.controllerFullShutdownOperation = controllerFullShutdownOperation
         // Set up the approval request callback
         Task {
@@ -167,10 +159,10 @@ actor MCPService: Sendable {
         } else {
             lifecycleGeneration &+= 1
             let generation = lifecycleGeneration
+            let bootstrap = hostBootstrapOperation
             let operation = controllerStartOperation
             let task = Task {
-                // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
-                _ = MCPIntegrationHelper.ensureCodexToolTimeout()
+                await bootstrap()
                 mcpServiceLog("Starting MCP listener")
                 try await operation()
             }
@@ -205,12 +197,6 @@ actor MCPService: Sendable {
         updates.continuation.yield(state)
     }
 
-    private func stop() async {
-        guard state.isRunning || activeStartAttempt != nil else { return }
-        mcpServiceLog("Stopping MCP listener")
-        await performTeardown(operation: controllerStopOperation)
-    }
-
     private func performTeardown(
         operation: @escaping @Sendable () async -> Void
     ) async {
@@ -237,48 +223,17 @@ actor MCPService: Sendable {
         }
     }
 
-    func join(windowID: Int) async throws {
-        let token = UUID()
-        let replacedExistingClaim = participatingWindows.updateValue(
-            Participation(token: token),
-            forKey: windowID
-        ) != nil
-        mcpServiceLog(
-            "Window \(windowID) joining MCP (replaced: \(replacedExistingClaim), total: \(participatingWindows.count))"
-        )
-
-        do {
-            try Task.checkCancellation()
-            if !state.isRunning {
-                try await start() // start() already yields
-            }
-            try Task.checkCancellation()
-        } catch {
-            await rollbackParticipation(windowID: windowID, token: token)
-            throw error
-        }
-
-        // Always re-broadcast so newly-joined windows get an up-to-date snapshot
+    /// Attach presentation state only. Process transport ownership belongs to app startup
+    /// and explicit lifecycle actions; opening a window must never resurrect a stopped server.
+    func join(windowID: Int) async {
+        joinedWindowIDs.insert(windowID)
+        mcpServiceLog("Window \(windowID) attached to process-owned MCP presentation")
         updates.continuation.yield(state)
     }
 
-    private func rollbackParticipation(windowID: Int, token: UUID) async {
-        guard participatingWindows[windowID]?.token == token else { return }
-        participatingWindows.removeValue(forKey: windowID)
-        if participatingWindows.isEmpty, state.isRunning {
-            await stop()
-        }
-    }
-
     func leave(windowID: Int) async {
-        let removed = participatingWindows.removeValue(forKey: windowID) != nil
-        mcpServiceLog("Window \(windowID) leaving MCP (removed: \(removed), remaining: \(participatingWindows.count))")
-
-        if participatingWindows.isEmpty {
-            await stop() // stop() already yields
-        }
-
-        // Broadcast even if nothing else changed so UI stays in sync
+        joinedWindowIDs.remove(windowID)
+        mcpServiceLog("Window \(windowID) detached from process-owned MCP presentation")
         updates.continuation.yield(state)
     }
 
@@ -312,31 +267,16 @@ actor MCPService: Sendable {
 
     func fullShutdown() async {
         mcpServiceLog("Performing full MCP server shutdown")
-        participatingWindows.removeAll()
         await performTeardown(operation: controllerFullShutdownOperation)
-
-        // Joins admitted while shutdown was suspended wait on the shared teardown
-        // barrier, then coalesce through the ordinary single-flight start attempt.
-        guard !participatingWindows.isEmpty else { return }
-        let restartParticipants = participatingWindows.keys.sorted()
-        do {
-            try await ensureTransportRunning()
-        } catch {
-            state.isRunning = false
-            updates.continuation.yield(state)
-            mcpServiceLogger.error(
-                "Failed to restart MCP server after superseding participation; owner=fullShutdown windows=\(restartParticipants) error=\(String(reflecting: error))"
-            )
-        }
     }
 
     #if DEBUG
-        func participatingWindowIDsForTesting() -> Set<Int> {
-            Set(participatingWindows.keys)
-        }
-
         func teardownRequestCountForTesting() -> Int {
             teardownRequestCount
+        }
+
+        func joinedWindowIDsForTesting() -> Set<Int> {
+            joinedWindowIDs
         }
     #endif
 

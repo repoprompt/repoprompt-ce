@@ -2,6 +2,7 @@ import Foundation
 
 package enum DomainClientPrincipalKind: String, Codable, CaseIterable, Sendable {
     case appProxy = "app_proxy"
+    case directStdio = "direct_stdio"
     case runScoped = "run_scoped"
     case ttyAdministrator = "tty_administrator"
 }
@@ -82,6 +83,8 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
     /// False when no authoritative routing registration/context could be resolved.
     package let hasAuthoritativeRoutingContext: Bool
     package let ephemeralGrantedToolNames: Set<String>
+    /// Exact `tool.action` grants for invocation classes whose safe defaults are narrower than a whole tool.
+    package let ephemeralGrantedOperations: Set<String>
 
     package init(
         principal: DomainClientPrincipal,
@@ -94,7 +97,8 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         workspaceRevision: UInt64? = nil,
         authorizedCanonicalRoots: Set<String> = [],
         hasAuthoritativeRoutingContext: Bool = true,
-        ephemeralGrantedToolNames: Set<String>
+        ephemeralGrantedToolNames: Set<String>,
+        ephemeralGrantedOperations: Set<String> = []
     ) {
         self.principal = principal
         self.connectionID = connectionID
@@ -112,6 +116,7 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         self.authorizedCanonicalRoots = authorizedCanonicalRoots
         self.hasAuthoritativeRoutingContext = hasAuthoritativeRoutingContext
         self.ephemeralGrantedToolNames = ephemeralGrantedToolNames
+        self.ephemeralGrantedOperations = ephemeralGrantedOperations
     }
 
     #if DEBUG

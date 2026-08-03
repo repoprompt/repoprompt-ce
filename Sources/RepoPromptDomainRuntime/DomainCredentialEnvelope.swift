@@ -432,6 +432,9 @@ package struct DomainChildLaunchCarrier: Sendable {
     package static let endpointEnvironmentKey = "REPOPROMPT_MCP_PRIVATE_ENDPOINT"
     package static let launchTokenEnvironmentKey = "REPOPROMPT_MCP_LAUNCH_TOKEN"
     package static let credentialEnvelopeEnvironmentKey = "REPOPROMPT_MCP_CREDENTIAL_ENVELOPE"
+    package static let clientPrincipalEnvironmentKey = "REPOPROMPT_MCP_CLIENT_PRINCIPAL"
+    package static let providerIdentifierEnvironmentKey = "REPOPROMPT_MCP_PROVIDER_IDENTIFIER"
+    package static let runIDEnvironmentKey = "REPOPROMPT_MCP_RUN_ID"
 
     package let runID: UUID
     package let launchTokenID: UUID
@@ -483,7 +486,10 @@ package struct DomainPrivateChildLaunchHarness: Sendable {
         }
         var environment = [
             DomainChildLaunchCarrier.endpointEnvironmentKey: endpointDescriptor,
-            DomainChildLaunchCarrier.launchTokenEnvironmentKey: token.material
+            DomainChildLaunchCarrier.launchTokenEnvironmentKey: token.material,
+            DomainChildLaunchCarrier.clientPrincipalEnvironmentKey: request.clientPrincipal,
+            DomainChildLaunchCarrier.providerIdentifierEnvironmentKey: request.providerIdentifier,
+            DomainChildLaunchCarrier.runIDEnvironmentKey: request.runID.uuidString
         ]
         if let descriptor {
             environment[DomainChildLaunchCarrier.credentialEnvelopeEnvironmentKey] =

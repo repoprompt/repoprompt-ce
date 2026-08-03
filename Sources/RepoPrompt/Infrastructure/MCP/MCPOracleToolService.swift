@@ -5,7 +5,7 @@ import MCP
 struct MCPOracleToolService {
     typealias RequestMetadata = MCPServerViewModel.RequestMetadata
     typealias ResolvedTabContextSnapshot = MCPServerViewModel.ResolvedTabContextSnapshot
-    typealias TabScopedContext = MCPServerViewModel.TabScopedContext
+    typealias TabContextSnapshot = MCPServerViewModel.TabContextSnapshot
     typealias ChatSendOperation = @Sendable () async throws -> [String: Value]
     typealias SendChat = @MainActor @Sendable (
         _ args: [String: Value],
@@ -14,8 +14,8 @@ struct MCPOracleToolService {
     ) async throws -> [String: Value]
     typealias ExportOracleResponse = @MainActor @Sendable (OracleExportRequest) async throws -> OracleExportFile
     typealias StabilizedVirtualContext = @MainActor @Sendable (
-        _ context: TabScopedContext
-    ) async -> TabScopedContext
+        _ context: TabContextSnapshot
+    ) async -> TabContextSnapshot
     typealias ResolveDelegatedReviewPackaging = @MainActor @Sendable (
         _ conversationTabID: UUID,
         _ conversationWorkspaceID: UUID?,
@@ -30,7 +30,7 @@ struct MCPOracleToolService {
     let oracleVM: OracleViewModel
     let captureRequestMetadata: () async -> RequestMetadata
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
-    let requireCurrentTabContext: (String) async throws -> TabScopedContext
+    let requireCurrentTabContext: (String) async throws -> TabContextSnapshot
     let stabilizedVirtualContext: StabilizedVirtualContext
     let resolveDelegatedReviewPackaging: ResolveDelegatedReviewPackaging
     let rebindChatSessionIfNeeded: (_ metadata: RequestMetadata, _ chatIDString: String) throws -> Void
@@ -91,7 +91,7 @@ struct MCPOracleToolService {
 
         let hasExplicitTabID = rawExplicitTabID(args) != nil
         let tabID: UUID
-        let tabContext: TabScopedContext?
+        let tabContext: TabContextSnapshot?
         if hasExplicitTabID {
             tabID = try await resolveTabIDForAgentMode(args, connectionID)
             let requestContext = try? await requireCurrentTabContext(oracleChatLogToolName)
@@ -297,30 +297,28 @@ struct MCPOracleToolService {
         let resolvedContext = try resolveTabContextSnapshot(metadata)
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 
-        if !resolvedContext.usesActiveTabCompatibility {
-            if runPurpose != .agentModeRun,
-               let chatIDString = args["chat_id"]?.stringValue,
-               !chatIDString.isEmpty
-            {
-                try rebindChatSessionIfNeeded(metadata, chatIDString)
-            }
+        if runPurpose != .agentModeRun,
+           let chatIDString = args["chat_id"]?.stringValue,
+           !chatIDString.isEmpty
+        {
+            try rebindChatSessionIfNeeded(metadata, chatIDString)
+        }
 
-            let context = try await requireCurrentTabContext(oracleSendToolName)
-            if runPurpose == .agentModeRun, let targetWindow {
-                let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
-                tabContext = try await oracleSendTabContext(
-                    from: context,
-                    owner: owner,
-                    origin: .oracleSend,
-                    mode: modeRaw
-                )
-            } else {
-                tabContext = try await oracleSendTabContext(
-                    from: context,
-                    origin: .oracleSend,
-                    mode: modeRaw
-                )
-            }
+        let context = try await requireCurrentTabContext(oracleSendToolName)
+        if runPurpose == .agentModeRun, let targetWindow {
+            let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
+            tabContext = try await oracleSendTabContext(
+                from: context,
+                owner: owner,
+                origin: .oracleSend,
+                mode: modeRaw
+            )
+        } else {
+            tabContext = try await oracleSendTabContext(
+                from: context,
+                origin: .oracleSend,
+                mode: modeRaw
+            )
         }
 
         let exportDestination: OracleExportDestination? = if exportResponse, let targetWindow {
@@ -529,7 +527,7 @@ struct MCPOracleToolService {
     private func resolveAgentOracleOwner(
         tabID: UUID,
         targetWindow: WindowState,
-        tabContext: TabScopedContext?
+        tabContext: TabContextSnapshot?
     ) async -> AgentOracleOwner {
         let agentModeViewModel = targetWindow.agentModeViewModel
         let storedSessionID = tabContext?.activeAgentSessionID
@@ -561,7 +559,7 @@ struct MCPOracleToolService {
         )
     }
 
-    private func oraclePackagingLookupContext(for context: TabScopedContext) async throws -> WorkspaceLookupContext {
+    private func oraclePackagingLookupContext(for context: TabContextSnapshot) async throws -> WorkspaceLookupContext {
         if let frozenLookupContext = context.frozenLookupContext {
             return frozenLookupContext
         }
@@ -596,7 +594,7 @@ struct MCPOracleToolService {
     }
 
     private func oracleSendTabContext(
-        from context: TabScopedContext,
+        from context: TabContextSnapshot,
         owner: AgentOracleOwner = AgentOracleOwner(
             agentSessionID: nil,
             runID: nil,

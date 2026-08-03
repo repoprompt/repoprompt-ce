@@ -208,8 +208,10 @@ package actor DomainMutationPolicyStore {
         guard context.hasAuthoritativeRoutingContext else {
             throw DomainMutationPolicyError.routingContextUnavailable
         }
+        let hasEphemeralGrant = context.ephemeralGrantedToolNames.contains(toolName)
+            || context.ephemeralGrantedOperations.contains(operation)
         if context.principal.kind == .runScoped,
-           context.ephemeralGrantedToolNames.contains(toolName),
+           hasEphemeralGrant,
            Self.roots(canonicalRoots, areCoveredBy: context.authorizedCanonicalRoots),
            context.principal.assurance == .verifiedProcess || context.principal.assurance == .hostLaunchToken
         {

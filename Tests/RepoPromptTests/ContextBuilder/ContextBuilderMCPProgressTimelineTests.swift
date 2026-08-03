@@ -364,6 +364,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
+            let connectionID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "context-builder-provider-timeline-test",
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID
+            )
             var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
             tab.promptText = "Provider-path follow-up prompt"
             window.workspaceManager.updateComposeTab(tab, markDirty: false)
@@ -419,11 +427,13 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 tools.first { $0.name == MCPWindowToolName.contextBuilder }
             )
             let resultTask = Task { @MainActor in
-                try await contextBuilder([
-                    "instructions": .string("Inspect the test workspace."),
-                    "response_type": .string("plan"),
-                    "context_id": .string(tabID.uuidString)
-                ])
+                try await ServerNetworkManager.withConnectionID(connectionID) {
+                    try await contextBuilder([
+                        "instructions": .string("Inspect the test workspace."),
+                        "response_type": .string("plan"),
+                        "context_id": .string(tabID.uuidString)
+                    ])
+                }
             }
             _ = await commitGate.waitUntilArrived()
             await fileContextStore.resetScopedIngressBarrierDiagnosticsForTesting(rootID: rootRecord.id)
@@ -580,6 +590,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
+            let connectionID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "context-builder-provider-prompt-test",
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID
+            )
             let tabIdentity = WorkspaceSelectionIdentity(
                 workspaceID: activeWorkspace.id,
                 tabID: tabID
@@ -646,11 +664,13 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             )
             let result = try await {
                 do {
-                    return try await contextBuilder([
-                        "instructions": .string(instructions),
-                        "response_type": .string("plan"),
-                        "context_id": .string(tabID.uuidString)
-                    ])
+                    return try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await contextBuilder([
+                            "instructions": .string(instructions),
+                            "response_type": .string("plan"),
+                            "context_id": .string(tabID.uuidString)
+                        ])
+                    }
                 } catch {
                     let stages = await stageRecorder.snapshot().map(\.stage)
                     XCTFail("Context Builder failed after stages \(stages): \(error)")
@@ -732,6 +752,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
+            let connectionID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "context-builder-post-commit-cancellation-test",
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID
+            )
             let identity = WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: tabID)
             var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
             initialTab.promptText = "Initial prompt"
@@ -795,11 +823,13 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 tools.first { $0.name == MCPWindowToolName.contextBuilder }
             )
             let resultTask = Task { @MainActor in
-                try await contextBuilder([
-                    "instructions": .string("Inspect the committed selection."),
-                    "response_type": .string("plan"),
-                    "context_id": .string(tabID.uuidString)
-                ])
+                try await ServerNetworkManager.withConnectionID(connectionID) {
+                    try await contextBuilder([
+                        "instructions": .string("Inspect the committed selection."),
+                        "response_type": .string("plan"),
+                        "context_id": .string(tabID.uuidString)
+                    ])
+                }
             }
 
             let runID = await commitGate.waitUntilArrived()
@@ -884,8 +914,15 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
+            let connectionID = UUID()
             let identity = WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: tabID)
             let initialSelection = StoredSelection(selectedPaths: [selectedFile.path])
+            _ = await window.selectionCoordinator.persistSelection(
+                initialSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: true
+            )
             var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
             initialTab.promptText = "Immutable initial prompt"
             initialTab.selection = initialSelection
@@ -893,13 +930,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 initialTab,
                 inWorkspaceID: activeWorkspace.id
             ))
-            _ = await window.selectionCoordinator.persistSelection(
-                initialSelection,
-                for: identity,
-                source: .mcpTabContext,
-                mirrorToUIIfActive: true
-            )
             window.promptManager.promptText = initialTab.promptText
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "context-builder-pre-commit-cancellation-test",
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID
+            )
 
             let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
             let selectionReplyRecorder = ContextBuilderSelectionReplyRecorder()
@@ -930,11 +968,13 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             await fileContextStore.setScopedIngressBarrierWillFlushHandler { rootID in
                 await barrierFlushRecorder.record(rootID: rootID)
             }
-            let result = try await contextBuilder([
-                "instructions": .string("Inspect the initial selection."),
-                "response_type": .string("plan"),
-                "context_id": .string(tabID.uuidString)
-            ])
+            let result = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await contextBuilder([
+                    "instructions": .string("Inspect the initial selection."),
+                    "response_type": .string("plan"),
+                    "context_id": .string(tabID.uuidString)
+                ])
+            }
             await fileContextStore.setScopedIngressBarrierWillFlushHandler(nil)
             guard case let .object(resultObject) = result else {
                 return XCTFail("Expected Context Builder object result")

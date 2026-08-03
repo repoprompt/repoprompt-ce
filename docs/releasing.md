@@ -17,6 +17,26 @@ packaged Mach-O architecture sets before and after signing and after ZIP
 extraction. Debug packages and local self-signed production packages remain
 host-native.
 
+The packaged `repoprompt-mcp` exposes one final backend selector:
+`--backend app|headless|auto`. **`app` remains the release default.** Explicit
+`auto` performs one bounded, connect-only probe of the well-known app socket
+before reading the MCP `initialize` request. A successful probe selects the app
+proxy; an unavailable socket selects the direct headless runtime. That choice is
+immutable for the process lifetime—release validation must reject any
+implementation that falls back or switches backends after initialization.
+Interactive and one-shot exec modes remain app-backed and reject headless/auto.
+
+A future default cutover to `auto` requires separately reviewed live and release
+evidence. Release-candidate validation must exercise all three explicit MCP
+selections: an app-backed smoke against a running packaged app, a headless smoke
+with no app dependency, and an `auto` smoke in each availability state. It must
+also prove immutable selection across app-socket availability changes and
+app/headless contract parity for every advertised tool. These checks complement
+the package architecture/signature verification; they do not permit a release
+job to launch or replace a developer's visible app implicitly. Until that
+evidence is accepted, release scripts, package metadata, installers, provider
+emitters, and documentation must preserve `app` as the default.
+
 RepoPrompt CE starts a new public release line at `1.0.0 (1)`. Its separate
 bundle identifier, Sparkle key pair, and appcast intentionally do not inherit
 the closed app's version history.

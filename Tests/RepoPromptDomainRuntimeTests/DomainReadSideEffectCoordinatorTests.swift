@@ -231,6 +231,42 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         try await coordinator.wait(handle: handle, receipt: receipt)
     }
 
+    func testCancellingWaitDoesNotCancelSharedEffect() async throws {
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let coordinator = DomainReadSideEffectCoordinator(identity: identity)
+        let gate = AsyncGate()
+        let receipt = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: UUID(),
+            fingerprint: "wait-shared"
+        ) {
+            try await gate.wait()
+        }
+        while !(await gate.hasEntered()) { await Task.yield() }
+
+        let waiter = Task {
+            try await coordinator.wait(handle: handle, receipt: receipt)
+        }
+        await Task.yield()
+        waiter.cancel()
+        do {
+            try await waiter.value
+            XCTFail("Expected exact wait cancellation")
+        } catch is CancellationError {}
+
+        for _ in 0 ..< 32 {
+            if await gate.wasCancelled() { break }
+            await Task.yield()
+        }
+        let sharedEffectWasCancelled = await gate.wasCancelled()
+        XCTAssertFalse(sharedEffectWasCancelled, "waiter cancellation must not cancel shared work")
+
+        await gate.release()
+        try await coordinator.wait(handle: handle, receipt: receipt)
+    }
+
     func testShutdownRejectsNewEffectsAndCancelsPendingWork() async throws {
         let identity = makeIdentity()
         let handle = makeHandle(identity: identity)
@@ -297,6 +333,7 @@ private actor EffectRecorder {
 private actor AsyncGate {
     private var continuation: CheckedContinuation<Void, Error>?
     private var entered = false
+    private var cancelled = false
 
     func wait() async throws {
         entered = true
@@ -311,12 +348,17 @@ private actor AsyncGate {
 
     func hasEntered() -> Bool { entered }
 
+    func wasCancelled() -> Bool {
+        cancelled
+    }
+
     func release() {
         continuation?.resume()
         continuation = nil
     }
 
     private func cancel() {
+        cancelled = true
         continuation?.resume(throwing: CancellationError())
         continuation = nil
     }

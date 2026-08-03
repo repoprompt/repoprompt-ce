@@ -319,6 +319,14 @@
                 nowUptimeNanoseconds: 60_000_000_001
             )
             XCTAssertEqual(maximumRecoveryDisposition, .restarted)
+            await fixture.engine.debugSimulateGraphIndexWorkerExitForTesting(
+                rootEpoch: fixture.rootEpoch,
+                reason: .admissionUnavailable
+            )
+            let installedRunningAtMaximum = await fixture.engine.debugInstallNonCooperativeGraphIndexWorkerForTesting(
+                rootEpoch: fixture.rootEpoch
+            )
+            XCTAssertTrue(installedRunningAtMaximum)
             let runningAtMaximumState = await fixture.engine.debugGraphIndexWorkerRecoveryStateForTesting(
                 rootEpoch: fixture.rootEpoch
             )
