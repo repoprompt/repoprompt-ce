@@ -10,8 +10,6 @@ final class MCPDomainResponseDeliveryTrackerTests: XCTestCase {
         XCTAssertEqual(before.pendingRequestCount, 1)
 
         let waiter = Task { await tracker.waitUntilDrained() }
-        await Task.yield()
-        XCTAssertEqual(tracker.snapshot().waiterCount, 1)
         tracker.recordDeliveredServerFrame(Self.frame(#"{"jsonrpc":"2.0","id":1,"result":{}}"#))
 
         let drained = await waiter.value

@@ -934,10 +934,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
+            startRun: { target, _, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Smoke start target did not resolve a session ID.")
                 }
+                try await agentModeVM.mcpActivateControlContext(
+                    forTabID: target.tabID,
+                    sessionID: sessionID,
+                    originatingConnectionID: metadata.connectionID,
+                    taskLabelKind: taskLabelKind,
+                    startPending: true
+                )
                 let bindings = agentModeVM.worktreeBindings(forAgentSessionID: sessionID, tabID: target.tabID)
                 let snapshot = AgentRunMCPSnapshot(
                     sessionID: sessionID,

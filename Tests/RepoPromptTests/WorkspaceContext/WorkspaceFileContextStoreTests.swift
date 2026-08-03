@@ -3836,13 +3836,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let barrier = Task {
                 await store.awaitAppliedIngressForAllRoots()
             }
-            for _ in 0 ..< 1000 {
-                if await flushGate.startCount() >= 8 { break }
-                await Task.yield()
-            }
-            for _ in 0 ..< 50 {
-                await Task.yield()
-            }
+            await flushGate.waitUntilStartedCount(8)
             let startsBeforeRelease = await flushGate.startCount()
             XCTAssertEqual(startsBeforeRelease, 8)
 
@@ -8463,6 +8457,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 guard !started else { return }
                 await withCheckedContinuation { continuation in
                     startWaiters.append(continuation)
+                }
+            }
+
+            func waitUntilStartedCount(_ expectedCount: Int) async {
+                while startedCount < expectedCount {
+                    await withCheckedContinuation { continuation in
+                        startWaiters.append(continuation)
+                    }
                 }
             }
 

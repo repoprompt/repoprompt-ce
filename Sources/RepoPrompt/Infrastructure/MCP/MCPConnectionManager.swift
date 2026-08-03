@@ -415,7 +415,9 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
 typealias MCPConnectionCallLane = MCPDomainConnectionCallLane
 typealias MCPConnectionCallLimiters = MCPDomainConnectionCallLimiters
 typealias MCPConnectionCallLimiterWatchdogDiagnostics = MCPDomainConnectionCallLimiterWatchdogDiagnostics
-typealias MCPConnectionCallLimiterDebugSnapshot = MCPDomainConnectionCallLimiterDebugSnapshot
+#if DEBUG
+    typealias MCPConnectionCallLimiterDebugSnapshot = MCPDomainConnectionCallLimiterDebugSnapshot
+#endif
 typealias AsyncLimiter = MCPDomainAsyncLimiter
 
 enum MCPRunRouteAuthorityDecision: Equatable {
