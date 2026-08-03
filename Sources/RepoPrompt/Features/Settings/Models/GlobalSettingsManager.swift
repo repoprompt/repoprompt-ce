@@ -33,6 +33,10 @@ enum SettingKeys {
 
     /// App-wide UI font scale preset body size.
     static let fontPresetBodySize = "fontPresetBodySize"
+
+    /// Whether Agent Chats includes open Compose tabs without Agent sessions.
+    /// Referenced by Agent Mode Overview and the Agent Chats list.
+    static let agentModeShowComposeTabsWithoutAgentSessions = "agentModeShowComposeTabsWithoutAgentSessions"
 }
 
 extension Notification.Name {

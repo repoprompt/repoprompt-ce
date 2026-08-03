@@ -636,6 +636,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// first forced refresh so the initial request always publishes.
     var lastSidebarContentFingerprint: AgentSessionSidebarContentFingerprint?
     var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
+    var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
     var tabDraftText: [UUID: String] = [:]
@@ -16152,16 +16153,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         promptManager?.renameComposeTab(tabID, to: validatedName)
 
-        let sessionID = boundSessionID(for: tabID)
-        if let sessionID,
-           var entry = ownerValidatedSessionIndex[sessionID]
-        {
+        guard let sessionID = boundSessionID(for: tabID) else { return }
+        if var entry = ownerValidatedSessionIndex[sessionID] {
             entry.name = validatedName
             applyLocalSessionIndexUpsert(entry)
         }
 
         if let session = sessions[tabID] {
-            if session.activeAgentSessionID == nil, let sessionID {
+            if session.activeAgentSessionID == nil {
                 _ = installPersistentSessionBinding(
                     sessionID: sessionID,
                     on: session,
@@ -16178,9 +16177,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 explicitThreadID: session.codexConversationID,
                 source: "renameSession"
             )
-        } else if let sessionID,
-                  let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
-        {
+        } else if let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot {
             Task { [dataService] in
                 try? await dataService.renameAgentSession(
                     id: sessionID,

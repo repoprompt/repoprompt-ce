@@ -802,14 +802,16 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: stashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         _ = viewModel.sidebarListProjection(
             composeTabs: composeTabs,
             stashedTabs: stashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         XCTAssertEqual(initialProjection.sortedArchivedSessionTabsForRows.map(\.id), [stashedTabs[1].id, stashedTabs[0].id])
         XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 1)
@@ -829,7 +831,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: unrelatedStashedChurn,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         _ = viewModel.sidebarSessions(for: unrelatedComposeChurn)
         XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 1)
@@ -842,7 +845,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: rawRenamedStashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         XCTAssertEqual(
             rawRenamedProjection.sortedArchivedSessionTabsForRows.first(where: { $0.id == stashedTabs[0].id })?.tab.name,
@@ -858,7 +862,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: pinnedStashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         XCTAssertEqual(pinnedProjection.sortedArchivedSessionTabsForRows.first?.id, stashedTabs[0].id)
         XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 1)
@@ -871,7 +876,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: restashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         XCTAssertEqual(restashedProjection.sortedArchivedSessionTabsForRows.first?.id, stashedTabs[0].id)
         XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 1)
@@ -884,7 +890,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: restashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         XCTAssertEqual(
             renamedProjection.filteredSessions.first(where: { $0.tabID == renamedTabs[0].id })?.title,
@@ -899,10 +906,185 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             stashedTabs: restashedTabs,
             currentTabID: composeTabs.first?.id,
             sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
-            archivedSessionsExpanded: true
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
         )
         XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 3)
         XCTAssertEqual(viewModel.test_sidebarListProjectionBuildCount, 6)
+    }
+
+    func testAgentChatsProjectionShowsSessionlessTabsWithoutThrashingSessionRows() {
+        let viewModel = makeViewModel()
+        let linkedTabID = UUID()
+        let linkedSessionID = UUID()
+        let sessionlessTabID = UUID()
+        let linkedTab = ComposeTabState(
+            id: linkedTabID,
+            name: "Linked",
+            lastModified: Date(timeIntervalSince1970: 100),
+            activeAgentSessionID: linkedSessionID
+        )
+        let sessionlessTab = ComposeTabState(
+            id: sessionlessTabID,
+            name: "MCP Audit",
+            lastModified: Date(timeIntervalSince1970: 200)
+        )
+        let composeTabs = [linkedTab, sessionlessTab]
+        let stashedSessionlessTab = StashedTab(tab: sessionlessTab)
+        var workspace = makeWorkspace(
+            name: "Sessionless Agent Chats",
+            tabs: composeTabs,
+            activeTabID: sessionlessTabID
+        )
+        workspace.stashedTabs = [stashedSessionlessTab]
+        let manager = makeWorkspaceManager(workspaces: [workspace])
+        manager.activeWorkspace = workspace
+        viewModel.workspaceManager = manager
+        let snapshot = viewModel.ui.sessionSidebar.snapshot
+
+        let hiddenProjection = viewModel.sidebarListProjection(
+            composeTabs: composeTabs,
+            stashedTabs: workspace.stashedTabs,
+            currentTabID: sessionlessTabID,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
+        )
+        XCTAssertEqual(hiddenProjection.filteredSessions.map(\.tabID), [linkedTabID])
+
+        let visibleProjection = viewModel.sidebarListProjection(
+            composeTabs: composeTabs,
+            stashedTabs: workspace.stashedTabs,
+            currentTabID: sessionlessTabID,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: true
+        )
+        XCTAssertEqual(Set(visibleProjection.filteredSessions.map(\.tabID)), Set([linkedTabID, sessionlessTabID]))
+        XCTAssertNil(visibleProjection.filteredSessions.first(where: { $0.tabID == sessionlessTabID })?.sessionID)
+        XCTAssertTrue(visibleProjection.archivedSessionTabsForHeader.isEmpty)
+        XCTAssertTrue(visibleProjection.sortedArchivedSessionTabsForRows.isEmpty)
+        XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 2)
+        XCTAssertEqual(viewModel.test_sidebarListProjectionBuildCount, 2)
+
+        XCTAssertEqual(viewModel.sidebarSessions(for: composeTabs).map(\.tabID), [linkedTabID])
+        XCTAssertEqual(
+            Set(viewModel.agentChatsSidebarSessions(for: composeTabs).map(\.tabID)),
+            Set([linkedTabID, sessionlessTabID])
+        )
+        XCTAssertEqual(viewModel.test_sidebarSessionRowsBuildCount, 2)
+    }
+
+    func testRenameSessionlessComposeTabDoesNotBindOrDirtyAgentSession() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let workspace = makeWorkspace(
+            name: "Sessionless rename",
+            tabs: [ComposeTabState(id: tabID, name: "Before")],
+            activeTabID: tabID
+        )
+        let fixture = makeWorkspaceFixture(workspaces: [workspace])
+        fixture.manager.activeWorkspace = workspace
+        viewModel.test_setSidebarAutoArchiveDependencies(
+            promptManager: fixture.prompt,
+            workspaceManager: fixture.manager
+        )
+        let liveSession = AgentModeViewModel.TabSession(tabID: tabID)
+        viewModel.test_installLiveSession(liveSession)
+        let bindingIdentityBefore = liveSession.persistentSessionBindingIdentity
+        let bindingGenerationBefore = liveSession.bindingTransitionGeneration
+        let saveGenerationBefore = liveSession.saveRequestGeneration
+
+        viewModel.renameSession(tabID: tabID, to: "After")
+
+        XCTAssertEqual(fixture.manager.activeWorkspace?.composeTabs.first?.name, "After")
+        XCTAssertNil(liveSession.activeAgentSessionID)
+        XCTAssertEqual(liveSession.persistentSessionBindingIdentity, bindingIdentityBefore)
+        XCTAssertEqual(liveSession.bindingTransitionGeneration, bindingGenerationBefore)
+        XCTAssertEqual(liveSession.saveRequestGeneration, saveGenerationBefore)
+        XCTAssertFalse(liveSession.isDirty)
+        XCTAssertTrue(viewModel.test_ownerValidatedSessionIndex.isEmpty)
+    }
+
+    func testSessionlessSidebarRowPromotesWithStableIdentity() throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let workspace = makeWorkspace(
+            name: "Sessionless promotion",
+            tabs: [ComposeTabState(id: tabID, name: "Promote me")],
+            activeTabID: tabID
+        )
+        let manager = makeWorkspaceManager(workspaces: [workspace])
+        manager.activeWorkspace = workspace
+        viewModel.workspaceManager = manager
+        let snapshot = viewModel.ui.sessionSidebar.snapshot
+        let initialProjection = viewModel.sidebarListProjection(
+            composeTabs: workspace.composeTabs,
+            stashedTabs: [],
+            currentTabID: tabID,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: false,
+            showComposeTabsWithoutAgentSessions: true
+        )
+        let initialRow = try XCTUnwrap(initialProjection.filteredSessions.first(where: { $0.tabID == tabID }))
+        XCTAssertNil(initialRow.sessionID)
+        XCTAssertTrue(viewModel.sidebarSessions(for: workspace.composeTabs).isEmpty)
+
+        let sessionID = UUID()
+        let liveSession = AgentModeViewModel.TabSession(tabID: tabID)
+        viewModel.test_installLiveSession(liveSession)
+        _ = viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: liveSession,
+            updateWorkspaceMetadata: true
+        )
+        let promotedTabs = try XCTUnwrap(manager.activeWorkspace?.composeTabs)
+        let promotedProjection = viewModel.sidebarListProjection(
+            composeTabs: promotedTabs,
+            stashedTabs: [],
+            currentTabID: tabID,
+            sidebarSnapshot: snapshot,
+            archivedSessionsExpanded: false,
+            showComposeTabsWithoutAgentSessions: true
+        )
+        let promotedRows = promotedProjection.filteredSessions.filter { $0.tabID == tabID }
+        let promotedRow = try XCTUnwrap(promotedRows.first)
+
+        XCTAssertEqual(promotedRows.count, 1)
+        XCTAssertEqual(promotedRow.id, initialRow.id)
+        XCTAssertEqual(promotedRow.tabID, initialRow.tabID)
+        XCTAssertEqual(promotedRow.sessionID, sessionID)
+        XCTAssertEqual(viewModel.sidebarSessions(for: promotedTabs).map(\.tabID), [tabID])
+        XCTAssertTrue(viewModel.hasAgentSession(for: tabID))
+    }
+
+    func testSessionlessActiveTabDoesNotExposeUnboundWorktreeOrMergeIndicators() {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let workspace = makeWorkspace(
+            name: "Sessionless worktree indicators",
+            tabs: [ComposeTabState(id: tabID)],
+            activeTabID: tabID
+        )
+        let manager = makeWorkspaceManager(workspaces: [workspace])
+        manager.activeWorkspace = workspace
+        viewModel.workspaceManager = manager
+        let liveSession = AgentModeViewModel.TabSession(tabID: tabID)
+        liveSession.worktreeBindings = [makeWorktreeBinding()]
+        liveSession.worktreeMergeOperations = [makeWorktreeMergeOperation()]
+        viewModel.test_installLiveSession(liveSession)
+
+        XCTAssertTrue(viewModel.worktreeIndicators(forTabID: tabID).isEmpty)
+        XCTAssertTrue(viewModel.worktreeMergeAttentionsByLogicalRootPath(forTabID: tabID).isEmpty)
+
+        _ = viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(),
+            on: liveSession,
+            updateWorkspaceMetadata: true
+        )
+
+        XCTAssertEqual(viewModel.worktreeIndicators(forTabID: tabID).count, 1)
+        XCTAssertFalse(viewModel.worktreeMergeAttentionsByLogicalRootPath(forTabID: tabID).isEmpty)
     }
 
     func testBatchWorktreeBindingStatesBuildsAuthoritySnapshotOnceAtScale() {
@@ -1091,6 +1273,46 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
         let requestCountAfterStaleHandler = await harness.currentRequestCount()
         XCTAssertEqual(requestCountAfterStaleHandler, requestCountBeforeStaleHandler)
+    }
+
+    func testSidebarAutoArchiveIgnoresDisplayedSessionlessComposeTabs() async {
+        let tabs = (0 ... AgentModeViewModel.sessionSidebarPageSize + 10).map { offset in
+            ComposeTabState(
+                id: UUID(),
+                name: "Sessionless \(offset)",
+                lastModified: Date(timeIntervalSince1970: TimeInterval(offset + 1))
+            )
+        }
+        let activeTabID = tabs.last?.id
+        let workspace = makeWorkspace(
+            name: "Displayed sessionless tabs",
+            tabs: tabs,
+            activeTabID: activeTabID
+        )
+        let fixture = makeWorkspaceFixture(workspaces: [workspace])
+        fixture.manager.activeWorkspace = workspace
+        fixture.prompt.loadComposeTabsFromWorkspace(workspace)
+        let viewModel = makeViewModel()
+        viewModel.test_setSidebarAutoArchiveDependencies(
+            promptManager: fixture.prompt,
+            workspaceManager: fixture.manager
+        )
+        viewModel.test_setSidebarAutoArchiveActive(true)
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            [:],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+
+        let displayedRows = viewModel.agentChatsSidebarSessions(for: tabs)
+        let archivedTabIDs = await viewModel.performSidebarAutoArchiveIfNeeded(reason: .explicitTest)
+
+        XCTAssertEqual(displayedRows.count, tabs.count)
+        XCTAssertTrue(archivedTabIDs.isEmpty)
+        XCTAssertEqual(fixture.prompt.currentComposeTabs.count, tabs.count)
+        XCTAssertTrue(fixture.prompt.currentStashedTabs.isEmpty)
     }
 
     func testAutoArchiveSkipsMutationAfterSameWorkspaceReactivation() async {
@@ -1793,6 +2015,58 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         AgentSessionSidebarBuildBatch(
             entriesBySessionID: Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
             preferredSessionIDByTabID: Dictionary(uniqueKeysWithValues: entries.map { ($0.tabID, $0.id) })
+        )
+    }
+
+    private func makeWorktreeBinding() -> AgentSessionWorktreeBinding {
+        AgentSessionWorktreeBinding(
+            id: "sessionless-binding",
+            repositoryID: "sessionless-repository",
+            repoKey: "sessionless-repo",
+            logicalRootPath: "/tmp/sessionless-repo",
+            logicalRootName: "sessionless-repo",
+            worktreeID: "sessionless-worktree",
+            worktreeRootPath: "/tmp/sessionless-worktree",
+            worktreeName: "sessionless-worktree",
+            branch: "feature/sessionless",
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            boundAt: Date(timeIntervalSinceReferenceDate: 1),
+            source: "test"
+        )
+    }
+
+    private func makeWorktreeMergeOperation() -> AgentSessionWorktreeMergeOperation {
+        let source = GitWorktreeMergeEndpoint(
+            worktreeID: "sessionless-source",
+            repositoryID: "sessionless-repository",
+            repoKey: "sessionless-repo",
+            path: "/tmp/sessionless-worktree",
+            name: "feature",
+            branch: "feature/sessionless",
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            isMain: false
+        )
+        let target = GitWorktreeMergeEndpoint(
+            worktreeID: "sessionless-target",
+            repositoryID: "sessionless-repository",
+            repoKey: "sessionless-repo",
+            path: "/tmp/sessionless-target",
+            name: "main",
+            branch: "main",
+            head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            isMain: true
+        )
+        return AgentSessionWorktreeMergeOperation(
+            id: "sessionless-merge",
+            source: source,
+            target: target,
+            mergeBase: "cccccccccccccccccccccccccccccccccccccccc",
+            sourceHead: source.head,
+            targetHeadBefore: target.head,
+            status: .conflicted,
+            conflictFiles: ["Conflict.swift"],
+            createdAt: Date(timeIntervalSinceReferenceDate: 1),
+            updatedAt: Date(timeIntervalSinceReferenceDate: 2)
         )
     }
 

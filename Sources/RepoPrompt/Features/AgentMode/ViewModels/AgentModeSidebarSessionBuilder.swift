@@ -6,7 +6,7 @@ struct AgentModeSidebarSessionBuilder {
     typealias TabSession = AgentModeViewModel.TabSession
 
     let allTabs: [ComposeTabState]
-    let linkedTabs: [ComposeTabState]
+    let rowTabs: [ComposeTabState]
     let sessions: [UUID: TabSession]
     let authoritativeSessionIDByTabID: [UUID: UUID]
     let sessionIndex: [UUID: AgentSessionIndexEntry]
@@ -20,7 +20,7 @@ struct AgentModeSidebarSessionBuilder {
         let tabNameByID: [UUID: String]
         let tabOrder: [UUID: Int]
         let sortDateByTabID: [UUID: Date]
-        let explicitSessionIDByTabID: [UUID: UUID]
+        let resolvedSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
         let useFrozenRestoreOrder: Bool
     }
@@ -30,7 +30,7 @@ struct AgentModeSidebarSessionBuilder {
             let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let context = makeBuildContext()
-        let rows = linkedTabs.map { tab in
+        let rows = rowTabs.map { tab in
             sidebarRow(for: tab, context: context)
         }
         let baseSortedSessions = sortedSidebarRows(rows, context: context)
@@ -44,9 +44,10 @@ struct AgentModeSidebarSessionBuilder {
                 fields: [
                     "allTabCount": String(allTabs.count),
                     "hasParentMetadata": String(hasParentMetadata),
-                    "linkedTabCount": String(linkedTabs.count),
                     "mcpControlledCount": String(mcpControlledTabIDs.count),
                     "resultCount": String(result.count),
+                    "rowTabCount": String(rowTabs.count),
+                    "sessionlessRowCount": String(result.count(where: { $0.sessionID == nil })),
                     "sessionCount": String(sessions.count),
                     "sessionIndexCount": String(sessionIndex.count),
                     "sortDateCount": String(sessionListSortDates.count)
@@ -77,10 +78,10 @@ struct AgentModeSidebarSessionBuilder {
         for tab in allTabs where tabByID[tab.id] == nil {
             tabByID[tab.id] = tab
         }
-        let tabNameByID = sidebarTabNameLookup(for: linkedTabs)
-        let tabOrder = sidebarTabOrder(for: linkedTabs)
+        let tabNameByID = sidebarTabNameLookup(for: rowTabs)
+        let tabOrder = sidebarTabOrder(for: rowTabs)
         let explicitSessionIDByTabID = authoritativeSessionIDByTabID.filter { tabID, _ in
-            linkedTabs.contains(where: { $0.id == tabID })
+            rowTabs.contains(where: { $0.id == tabID })
         }
         let explicitTabIDBySessionID = Dictionary(
             explicitSessionIDByTabID.map { ($0.value, $0.key) },
@@ -88,16 +89,21 @@ struct AgentModeSidebarSessionBuilder {
         )
         let indexEntriesByTabID = Dictionary(grouping: sessionIndex.values, by: \.tabID)
         let bestEntryByTabID = sidebarEntryMap(
-            for: linkedTabs,
+            for: rowTabs,
             tabNameByID: tabNameByID,
             explicitSessionIDByTabID: explicitSessionIDByTabID,
             explicitTabIDBySessionID: explicitTabIDBySessionID,
             indexEntriesBySessionID: sessionIndex,
             indexEntriesByTabID: indexEntriesByTabID
         )
+        let resolvedSessionIDByTabID = Dictionary(
+            uniqueKeysWithValues: rowTabs.compactMap { tab in
+                (explicitSessionIDByTabID[tab.id] ?? bestEntryByTabID[tab.id]?.id).map { (tab.id, $0) }
+            }
+        )
         let sortDateByTabID = sidebarSortDateLookup(
-            for: linkedTabs,
-            explicitSessionIDByTabID: explicitSessionIDByTabID,
+            for: rowTabs,
+            resolvedSessionIDByTabID: resolvedSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID
         )
         return BuildContext(
@@ -105,9 +111,12 @@ struct AgentModeSidebarSessionBuilder {
             tabNameByID: tabNameByID,
             tabOrder: tabOrder,
             sortDateByTabID: sortDateByTabID,
-            explicitSessionIDByTabID: explicitSessionIDByTabID,
+            resolvedSessionIDByTabID: resolvedSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID,
-            useFrozenRestoreOrder: shouldFreezeSidebarOrdering(for: linkedTabs)
+            useFrozenRestoreOrder: shouldFreezeSidebarOrdering(
+                for: rowTabs,
+                resolvedSessionIDByTabID: resolvedSessionIDByTabID
+            )
         )
     }
 
@@ -129,13 +138,14 @@ struct AgentModeSidebarSessionBuilder {
 
     private func sidebarSortDateLookup(
         for tabs: [ComposeTabState],
-        explicitSessionIDByTabID: [UUID: UUID],
+        resolvedSessionIDByTabID: [UUID: UUID],
         bestEntryByTabID: [UUID: AgentSessionIndexEntry]
     ) -> [UUID: Date] {
         var sortDateByTabID: [UUID: Date] = [:]
         for tab in tabs where sortDateByTabID[tab.id] == nil {
+            guard let resolvedSessionID = resolvedSessionIDByTabID[tab.id] else { continue }
             let liveSession: TabSession? = if let session = sessions[tab.id],
-                                              session.activeAgentSessionID == explicitSessionIDByTabID[tab.id],
+                                              session.activeAgentSessionID == resolvedSessionID,
                                               session.hasLoadedPersistedState
             {
                 session
@@ -153,13 +163,14 @@ struct AgentModeSidebarSessionBuilder {
         return sortDateByTabID
     }
 
-    private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
+    private func shouldFreezeSidebarOrdering(
+        for tabs: [ComposeTabState],
+        resolvedSessionIDByTabID: [UUID: UUID]
+    ) -> Bool {
         guard !sessionListCacheReady, !sidebarRestoreFrozenOrderByTabID.isEmpty else { return false }
-        return tabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
-    }
-
-    private func frozenSidebarOrderIndex(for tabID: UUID, fallback: Int) -> Int {
-        sidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
+        let sessionBackedTabs = tabs.filter { resolvedSessionIDByTabID[$0.id] != nil }
+        guard !sessionBackedTabs.isEmpty else { return false }
+        return sessionBackedTabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
     }
 
     private func sidebarEntryMap(
@@ -243,10 +254,10 @@ struct AgentModeSidebarSessionBuilder {
         for tab: ComposeTabState,
         context: BuildContext
     ) -> SidebarSession {
-        let authoritativeSessionID = context.explicitSessionIDByTabID[tab.id]
-            ?? context.bestEntryByTabID[tab.id]?.id
-        let boundLiveSession: TabSession? = if let session = sessions[tab.id],
-                                               session.activeAgentSessionID == authoritativeSessionID
+        let resolvedSessionID = context.resolvedSessionIDByTabID[tab.id]
+        let boundLiveSession: TabSession? = if let resolvedSessionID,
+                                               let session = sessions[tab.id],
+                                               session.activeAgentSessionID == resolvedSessionID
         {
             session
         } else {
@@ -268,7 +279,6 @@ struct AgentModeSidebarSessionBuilder {
         )
         let savedAt = sidebarSavedAt(for: tab, liveSession: metadataLiveSession, indexEntry: entry)
         let activityDate = Self.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
-        let resolvedSessionID = authoritativeSessionID ?? entry?.id
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
@@ -403,13 +413,18 @@ struct AgentModeSidebarSessionBuilder {
         context: BuildContext
     ) -> [SidebarSession] {
         rows.sorted { lhs, rhs in
-            let lhsIndex = context.tabOrder[lhs.tabID] ?? Int.max
-            let rhsIndex = context.tabOrder[rhs.tabID] ?? Int.max
             if context.useFrozenRestoreOrder {
-                let lhsFrozenIndex = frozenSidebarOrderIndex(for: lhs.tabID, fallback: lhsIndex)
-                let rhsFrozenIndex = frozenSidebarOrderIndex(for: rhs.tabID, fallback: rhsIndex)
-                if lhsFrozenIndex != rhsFrozenIndex {
-                    return lhsFrozenIndex < rhsFrozenIndex
+                let lhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[lhs.tabID]
+                let rhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[rhs.tabID]
+                switch (lhsFrozenIndex, rhsFrozenIndex) {
+                case let (.some(lhsIndex), .some(rhsIndex)) where lhsIndex != rhsIndex:
+                    return lhsIndex < rhsIndex
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                default:
+                    break
                 }
             }
             return sidebarRowPrecedes(lhs, rhs, tabOrder: context.tabOrder)
