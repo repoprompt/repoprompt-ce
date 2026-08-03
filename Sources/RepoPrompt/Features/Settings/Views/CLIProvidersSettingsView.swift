@@ -679,7 +679,7 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
-    private func claudeCompatibleBackendPrerequisiteRow() -> some View {
+    @ViewBuilder private func claudeCompatibleBackendPrerequisiteRow() -> some View {
         if viewModel.claudeCodeCLIStatus.isKnownMissing {
             claudeCompatibleBackendPrerequisiteRowContent(
                 title: "Claude CLI",
