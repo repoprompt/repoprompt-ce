@@ -49,7 +49,7 @@ final class AppDomainRuntimeComposition: Sendable {
             if let data = defaults.data(forKey: key) {
                 legacyRuntimeDefaults[key] = data
             } else if defaults.object(forKey: key) != nil,
-                      let data = try? JSONSerialization.data(withJSONObject: defaults.object(forKey: key) as Any)
+                      let data = try? JSONSerialization.data(withJSONObject: defaults.object(forKey: key) as Any, options: [.fragmentsAllowed])
             {
                 legacyRuntimeDefaults[key] = data
             }
