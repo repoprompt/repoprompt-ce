@@ -16,7 +16,10 @@ struct AgentContextDrawerTokenEstimatePill: View {
     }
 
     var body: some View {
-        let snapshot = tokenCounter.latestPublishedTokenSnapshot(for: tokenBlankingSelection)
+        let snapshot = tokenCounter.latestPublishedTokenSnapshot(
+            for: tokenBlankingSelection,
+            scheduleRefreshIfNeeded: false
+        )
         let contextWindowTokenBudget = contextWindowTokens
         let isWaiting = isWaitingForExpectedSelection(snapshot)
 
