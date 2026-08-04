@@ -135,6 +135,19 @@ extension AgentModeViewModel {
         case ambiguous(tabIDs: [UUID])
     }
 
+    /// Immutable authority inputs shared by a batch of persistent-session lookups.
+    /// Building these maps is the expensive part: it walks every live, compose, and
+    /// stashed tab. Individual resolutions remain session-specific and preserve the
+    /// same ambiguity and indexed-fallback rules as the scalar lookup.
+    struct PersistentBindingResolutionSnapshot {
+        let liveClaimsByTabID: [UUID: UUID]
+        let workspaceClaimsByTabID: [UUID: Set<UUID>]
+        let claimedTabIDsBySessionID: [UUID: Set<UUID>]
+        let conflictingTabIDsBySessionID: [UUID: Set<UUID>]
+        let indexedTabIDBySessionID: [UUID: UUID]
+        let composeTabIDs: Set<UUID>
+    }
+
     enum PersistentBindingMutationError: Error, Equatable {
         case staleTransition
         case blockedByOwnership
@@ -158,6 +171,39 @@ extension AgentModeViewModel {
         case explicit
     }
 
+    struct SidebarSessionRowsCacheKey: Equatable {
+        let workspaceID: UUID?
+        let sidebarRevision: Int
+        let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
+    }
+
+    struct SidebarListProjectionCacheKey: Equatable {
+        let workspaceID: UUID?
+        let sidebarSnapshot: AgentSessionSidebarSnapshot
+        let currentTabID: UUID?
+        let composeTabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
+        let stashedTabSignatures: [AgentSessionSidebarStashedTabSignature]
+        let archivedSessionsExpanded: Bool
+    }
+
+    struct SidebarListProjection {
+        let filteredSessions: [SidebarSession]
+        let pagedSessions: [SidebarSession]
+        let effectiveVisibleSessionCount: Int
+        let archivedSessionTabsForHeader: [StashedTab]
+        let sortedArchivedSessionTabsForRows: [StashedTab]
+        let archivedDateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
+
+        var hasMoreSessions: Bool {
+            filteredSessions.count > effectiveVisibleSessionCount
+        }
+
+        var remainingSessionCount: Int {
+            max(0, filteredSessions.count - effectiveVisibleSessionCount)
+        }
+    }
+
     /// Signature of a compose tab's sidebar-rendered metadata. Captured separately
     /// from live `TabSession` state because sidebar rows resolve titles, pinned
     /// grouping, explicit session IDs, workspace order, and fallback activity dates
@@ -169,6 +215,16 @@ extension AgentModeViewModel {
         let activeAgentSessionID: UUID?
         let isPinned: Bool
         let lastModified: Date
+    }
+
+    /// Signature of a stashed tab's archived-sidebar projection inputs and the
+    /// fields read from cached `StashedTab` row values. Full compose state is
+    /// intentionally excluded because restore/delete resolve the current tab by ID.
+    struct AgentSessionSidebarStashedTabSignature: Equatable {
+        let stashedTabID: UUID
+        let stashedAt: Date
+        let rawTabName: String
+        let tabMetadata: AgentSessionSidebarTabMetadataSignature
     }
 
     /// Signature of a single `TabSession`'s sidebar-relevant state. Captured into a
@@ -318,10 +374,17 @@ extension AgentModeViewModel {
     }
 
     struct MCPInteractionResponsePayload: Equatable {
+        enum ResponseArgument: Equatable {
+            case missing
+            case scalar(String)
+            case nonScalar
+        }
+
         let text: String?
         let skip: Bool
         let explicitSkip: Bool
-        let decisionRaw: String?
+        let responseArgument: ResponseArgument
+        let containsDecisionArgument: Bool
         let amendment: String?
         let answersByQuestionID: [String: [String]]
         let askUserAnswersByQuestionID: [String: AgentAskUserAnswer]
@@ -334,7 +397,8 @@ extension AgentModeViewModel {
             text: String?,
             skip: Bool,
             explicitSkip: Bool = false,
-            decisionRaw: String?,
+            responseArgument: ResponseArgument,
+            containsDecisionArgument: Bool,
             amendment: String?,
             answersByQuestionID: [String: [String]],
             askUserAnswersByQuestionID: [String: AgentAskUserAnswer] = [:],
@@ -346,7 +410,8 @@ extension AgentModeViewModel {
             self.text = text
             self.skip = skip
             self.explicitSkip = explicitSkip
-            self.decisionRaw = decisionRaw
+            self.responseArgument = responseArgument
+            self.containsDecisionArgument = containsDecisionArgument
             self.amendment = amendment
             self.answersByQuestionID = answersByQuestionID
             self.askUserAnswersByQuestionID = askUserAnswersByQuestionID
@@ -452,11 +517,19 @@ extension AgentModeViewModel {
 
     struct CodexWatchdogState: Equatable {
         var lastProgressAt: Date?
+        var progressGeneration: UInt64 = 0
         var suppressUntil: Date?
+        /// Bounded, in-memory identity for the last ambiguous upstream probe.
+        /// Never logged or persisted; real provider/tool progress clears it.
+        var lastAmbiguousProbeKind: String?
+        var lastAmbiguousProbeFingerprint: String?
         var ambiguousActiveProbeCount: Int = 0
-        var isPausedAfterWarning: Bool = false
-        var warnedSinceLastProgress: Bool = false
-        var requiresColdTeardownOnCancel: Bool = false
+    }
+
+    enum CodexNativeStartupDisposition: Equatable {
+        case fresh
+        case resumed
+        case resumeFellBackToFresh
     }
 
     struct CodexResumeTimeoutState: Equatable {
@@ -473,6 +546,7 @@ extension AgentModeViewModel {
 
         struct Execution: Equatable {
             let toolName: String
+            let turnID: String?
             let startedAt: Date
             var lastSignalAt: Date
             var processID: String?
@@ -855,6 +929,7 @@ extension AgentModeViewModel {
         let text: String
         let message: String
         let strategy: AgentModeRunService.DraftRestorationStrategy
+        let operation: AgentComposerDraftRestorationOperation?
     }
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.

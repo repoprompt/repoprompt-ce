@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 @MainActor
@@ -109,10 +110,12 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
         )
         let staleResult = PromptEntriesEvaluation.EntryResult(
             fileID: codemapEntry.file.id,
+            renderedDisplayPath: "Nested/Frozen.swift",
             renderMode: .codemap,
             displayTokens: 1,
             fullTokens: 1,
-            codemapTokens: 1
+            codemapTokens: 1,
+            displayLineCount: 1
         )
         let filesReply = await MCPServerViewModel.SelectionReplyAssembler.buildSelectedFilesReply(
             collections: collections,

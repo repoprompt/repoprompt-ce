@@ -1829,6 +1829,7 @@ private final class BridgeTaskResultBox: @unchecked Sendable {
                     connectionID: connectionID,
                     sessionToken: sessionToken,
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: Int(getpid()),
                     clientName: clientName,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,
@@ -1845,7 +1846,8 @@ private final class BridgeTaskResultBox: @unchecked Sendable {
                 connectionID: connectionID,
                 connection: connectionManager,
                 clientName: clientName,
-                sessionToken: sessionToken
+                sessionToken: sessionToken,
+                bootstrapPeerPID: Int(getpid())
             )
 
             let traces = BridgeTraceRecorder()

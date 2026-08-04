@@ -552,7 +552,8 @@ func contextBuilderOraclePopoverUserInfo(
 ) -> [AnyHashable: Any]? {
     AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
-        chatID: chatID
+        chatID: chatID,
+        presentation: .generatedAnswerReadOnly
     )
 }
 

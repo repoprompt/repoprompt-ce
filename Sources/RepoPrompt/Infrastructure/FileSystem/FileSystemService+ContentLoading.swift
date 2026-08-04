@@ -99,6 +99,12 @@ struct FileContentPrefix {
     let truncated: Bool
 }
 
+struct ResolvedFileContentLocation: Equatable, Hashable {
+    let resolvedRootURL: URL
+    let resolvedFileURL: URL
+    let relativePath: String
+}
+
 private struct ValidatedContentFile {
     let url: URL
     let fileSize: Int64
@@ -220,9 +226,14 @@ actor ContentReadAsyncLimiter {
         self.retryAfterMilliseconds = retryAfterMilliseconds
         self.agePromotionNanoseconds = agePromotionNanoseconds
         self.maxConsecutiveInteractiveGrants = maxConsecutiveInteractiveGrants
-        backgroundPermitLimit = capacity > 1 ? capacity - 1 : 1
+        backgroundPermitLimit = Self.bulkPermitLimit(forCapacity: capacity)
         self.nowUptimeNanoseconds = nowUptimeNanoseconds
         availablePermits = capacity
+    }
+
+    static func bulkPermitLimit(forCapacity capacity: Int) -> Int {
+        precondition(capacity > 0)
+        return capacity > 1 ? capacity - 1 : 1
     }
 
     func beginForegroundActivity(
@@ -766,11 +777,19 @@ actor ContentReadAsyncLimiter {
 }
 
 extension FileSystemService {
+    private static let defaultContentReadChunkSize = 1_048_576
+    private static let defaultContentReadFileSizeLimit: Int64 = 10_000_000
     private static let contentReadWorkerLimit = max(2, min(4, ProcessInfo.processInfo.activeProcessorCount))
     private static let contentReadWorkerLimiter = ContentReadAsyncLimiter(
         capacity: contentReadWorkerLimit,
         maxQueuedWaiterCount: 512
     )
+
+    /// Maximum CodeMap bulk permits when no foreground activity is registered.
+    /// Foreground activity temporarily suppresses all CodeMap permit grants.
+    nonisolated static var codeMapArtifactBuildBulkPermitLimit: Int {
+        ContentReadAsyncLimiter.bulkPermitLimit(forCapacity: contentReadWorkerLimit)
+    }
 
     nonisolated static func withContentReadForegroundActivity<T>(
         kind: ContentReadForegroundActivityKind,
@@ -789,6 +808,42 @@ extension FileSystemService {
             priority: priority,
             operation: operation
         )
+    }
+
+    nonisolated static func loadEntireFileContentOptimized(
+        at location: ResolvedFileContentLocation,
+        workloadClass: ContentReadWorkloadClass
+    ) async throws -> String? {
+        try Task.checkCancellation()
+        let rootPath = StandardizedPath.absolute(location.resolvedRootURL.path)
+        let filePath = StandardizedPath.absolute(location.resolvedFileURL.path)
+        let relativePath = StandardizedPath.relative(location.relativePath)
+        guard !relativePath.isEmpty,
+              relativePath != "..",
+              !relativePath.hasPrefix("../"),
+              StandardizedPath.join(
+                  standardizedRoot: rootPath,
+                  standardizedRelativePath: relativePath
+              ) == filePath
+        else {
+            throw FileSystemError.invalidRelativePath
+        }
+        let request = assembleContentReadRequest(
+            cacheKey: relativePath,
+            relativePath: relativePath,
+            absolutePath: filePath,
+            standardizedRootPath: rootPath,
+            canonicalRootPath: rootPath,
+            skipSymlinks: true,
+            chunkSize: defaultContentReadChunkSize,
+            fileSizeLimit: defaultContentReadFileSizeLimit,
+            mode: .automatic,
+            workloadClass: workloadClass,
+            schedulerOwnerID: UUID()
+        )
+        let result = try await performContentReadOffActor(request)
+        try Task.checkCancellation()
+        return result.content
     }
 
     #if DEBUG
@@ -949,8 +1004,8 @@ extension FileSystemService {
         do {
             request = try makeContentReadRequest(
                 cacheKey: relativePath,
-                chunkSize: 1_048_576,
-                fileSizeLimit: 10_000_000,
+                chunkSize: Self.defaultContentReadChunkSize,
+                fileSizeLimit: Self.defaultContentReadFileSizeLimit,
                 mode: .automatic,
                 workloadClass: workloadClass
             )
@@ -1166,7 +1221,7 @@ extension FileSystemService {
             throw FileSystemError.invalidRelativePath
         }
         #if DEBUG
-            return ContentReadRequest(
+            return Self.assembleContentReadRequest(
                 cacheKey: cacheKey,
                 relativePath: relativePath,
                 absolutePath: absolutePath,
@@ -1181,7 +1236,7 @@ extension FileSystemService {
                 chunkReadHandler: contentReadChunkHandler
             )
         #else
-            return ContentReadRequest(
+            return Self.assembleContentReadRequest(
                 cacheKey: cacheKey,
                 relativePath: relativePath,
                 absolutePath: absolutePath,
@@ -1196,6 +1251,66 @@ extension FileSystemService {
             )
         #endif
     }
+
+    #if DEBUG
+        private nonisolated static func assembleContentReadRequest(
+            cacheKey: String,
+            relativePath: String,
+            absolutePath: String,
+            standardizedRootPath: String,
+            canonicalRootPath: String,
+            skipSymlinks: Bool,
+            chunkSize: Int,
+            fileSizeLimit: Int64,
+            mode: ContentReadMode,
+            workloadClass: ContentReadWorkloadClass,
+            schedulerOwnerID: UUID,
+            chunkReadHandler: (@Sendable (String) async -> Void)? = nil
+        ) -> ContentReadRequest {
+            ContentReadRequest(
+                cacheKey: cacheKey,
+                relativePath: relativePath,
+                absolutePath: absolutePath,
+                standardizedRootPath: standardizedRootPath,
+                canonicalRootPath: canonicalRootPath,
+                skipSymlinks: skipSymlinks,
+                chunkSize: chunkSize,
+                fileSizeLimit: fileSizeLimit,
+                mode: mode,
+                workloadClass: workloadClass,
+                schedulerOwnerID: schedulerOwnerID,
+                chunkReadHandler: chunkReadHandler
+            )
+        }
+    #else
+        private nonisolated static func assembleContentReadRequest(
+            cacheKey: String,
+            relativePath: String,
+            absolutePath: String,
+            standardizedRootPath: String,
+            canonicalRootPath: String,
+            skipSymlinks: Bool,
+            chunkSize: Int,
+            fileSizeLimit: Int64,
+            mode: ContentReadMode,
+            workloadClass: ContentReadWorkloadClass,
+            schedulerOwnerID: UUID
+        ) -> ContentReadRequest {
+            ContentReadRequest(
+                cacheKey: cacheKey,
+                relativePath: relativePath,
+                absolutePath: absolutePath,
+                standardizedRootPath: standardizedRootPath,
+                canonicalRootPath: canonicalRootPath,
+                skipSymlinks: skipSymlinks,
+                chunkSize: chunkSize,
+                fileSizeLimit: fileSizeLimit,
+                mode: mode,
+                workloadClass: workloadClass,
+                schedulerOwnerID: schedulerOwnerID
+            )
+        }
+    #endif
 
     private func performMeasuredContentReadOffActor(
         _ request: ContentReadRequest,

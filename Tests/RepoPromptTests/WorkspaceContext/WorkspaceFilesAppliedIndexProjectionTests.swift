@@ -810,6 +810,99 @@ import XCTest
             XCTAssertFalse(hidden.hasLifetimeMapping)
         }
 
+        func testHiddenSessionMultiFileBatchPrefiltersTabsAndInvokesBindingProviderOnce() async throws {
+            let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexHiddenSessionBatch")
+            for name in ["One.swift", "Two.swift", "Three.swift"] {
+                try "let value = true\n".write(
+                    to: rootURL.appendingPathComponent(name),
+                    atomically: false,
+                    encoding: .utf8
+                )
+            }
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path, kind: .sessionWorktree)
+            let rootLifetimeID = try await store.rootLifetimeIDForTesting(rootID: root.id)
+            let files = await store.files(inRoot: root.id)
+            XCTAssertEqual(files.count, 3)
+
+            let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            let keyManager = KeyManager(
+                secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+            )
+            let apiSettings = APISettingsViewModel(
+                aiQueriesService: AIQueriesService(keyManager: keyManager),
+                keyManager: keyManager,
+                loadStoredDataOnInit: false
+            )
+            let prompt = PromptViewModel(
+                fileManager: fileManager,
+                apiSettingsViewModel: apiSettings,
+                windowID: -1,
+                settingsManager: WindowSettingsManager(windowID: -1)
+            )
+            let workspaceManager = WorkspaceManagerViewModel(
+                fileManager: fileManager,
+                promptViewModel: prompt,
+                performInitialWorkspaceActivation: false
+            )
+            let eligibleSessionID = UUID()
+            var tabs = (0 ..< 500).map { index in
+                ComposeTabState(
+                    id: UUID(),
+                    name: "Unrelated \(index)",
+                    activeAgentSessionID: UUID()
+                )
+            }
+            tabs.append(ComposeTabState(
+                id: UUID(),
+                name: "Eligible",
+                activeAgentSessionID: eligibleSessionID,
+                selection: StoredSelection(
+                    selectedPaths: ["/logical/One.swift"],
+                    slices: ["/logical/One.swift": [LineRange(start: 1, end: 1)]],
+                    codemapAutoEnabled: false
+                )
+            ))
+            let workspace = WorkspaceModel(
+                name: "Hidden batch",
+                repoPaths: [rootURL.path],
+                ephemeralFlag: true,
+                composeTabs: tabs,
+                activeComposeTabID: tabs.last?.id
+            )
+            workspaceManager.workspaces = [workspace]
+            workspaceManager.activeWorkspace = workspace
+            fileManager.setWorkspaceManager(workspaceManager)
+
+            var providerInvocationCount = 0
+            var requestedSessionIDs = Set<UUID>()
+            fileManager.setSessionWorktreeBindingStatesProvider { sessionIDs in
+                providerInvocationCount &+= 1
+                requestedSessionIDs = sessionIDs
+                return Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, .unavailable) })
+            }
+
+            await fileManager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 1,
+                rootLifetimeID: rootLifetimeID,
+                modifiedFileIDs: files.map(\.id)
+            ))
+
+            XCTAssertEqual(providerInvocationCount, 1)
+            XCTAssertEqual(requestedSessionIDs, [eligibleSessionID])
+            for file in files {
+                let debug = fileManager.hiddenSessionSliceRebaseDebugSnapshotForTesting(
+                    fullPath: file.standardizedFullPath,
+                    rootID: root.id,
+                    rootLifetimeID: rootLifetimeID
+                )
+                XCTAssertEqual(debug.handledGeneration, 1)
+                XCTAssertFalse(debug.hasPendingTask)
+            }
+        }
+
         func testValidRootUnloadClearsUUIDPathIndexesAndHandledGeneration() async throws {
             let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexValidUnload")
             let store = WorkspaceFileContextStore()

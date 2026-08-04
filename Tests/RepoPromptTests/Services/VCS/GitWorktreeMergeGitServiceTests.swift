@@ -119,6 +119,82 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
         XCTAssertTrue(dirtyPreview.inspection.blockers.contains { $0.code == .sourceDirty })
     }
 
+    func testEndpointAwareMergeMutationsRejectPreviewEndpointOutsideSymlink() async throws {
+        do {
+            let fixture = try GitMergeFixture()
+            defer { fixture.cleanup() }
+            try fixture.commitFile("Source.txt", contents: "source\n", message: "Source change", cwd: fixture.repo)
+            let git = GitService()
+            let source = try await fixture.endpoint(for: fixture.repo, using: git)
+            let target = try await fixture.endpoint(for: fixture.source, using: git)
+            let outside = fixture.sandbox.appendingPathComponent("outside-apply", isDirectory: true)
+            let sentinel = outside.appendingPathComponent("sentinel.txt")
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            try "untouched\n".write(to: sentinel, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: fixture.source)
+            try FileManager.default.createSymbolicLink(at: fixture.source, withDestinationURL: outside)
+
+            do {
+                _ = try await git.applyAndCommitWorktreeMerge(
+                    sourceEndpoint: source,
+                    targetEndpoint: target,
+                    sourceHead: source.head,
+                    message: "must not apply"
+                )
+                XCTFail("Expected apply to reject an endpoint replaced by an outside symlink")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("worktree"), String(describing: error))
+            }
+            XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "untouched\n")
+        }
+
+        do {
+            let fixture = try GitMergeFixture()
+            defer { fixture.cleanup() }
+            try fixture.commitFile("Source.txt", contents: "source\n", message: "Source change", cwd: fixture.repo)
+            let git = GitService()
+            let source = try await fixture.endpoint(for: fixture.repo, using: git)
+            let target = try await fixture.endpoint(for: fixture.source, using: git)
+            _ = try await git.applyNoCommitWorktreeMerge(sourceHead: source.head, at: fixture.source)
+            let outside = fixture.sandbox.appendingPathComponent("outside-continue", isDirectory: true)
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            try FileManager.default.removeItem(at: fixture.source)
+            try FileManager.default.createSymbolicLink(at: fixture.source, withDestinationURL: outside)
+
+            do {
+                _ = try await git.continueWorktreeMerge(
+                    sourceEndpoint: source,
+                    targetEndpoint: target,
+                    message: "must not continue"
+                )
+                XCTFail("Expected continue to reject an endpoint replaced by an outside symlink")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("worktree"), String(describing: error))
+            }
+        }
+
+        do {
+            let fixture = try GitMergeFixture()
+            defer { fixture.cleanup() }
+            try fixture.commitFile("Source.txt", contents: "source\n", message: "Source change", cwd: fixture.repo)
+            let git = GitService()
+            let source = try await fixture.endpoint(for: fixture.repo, using: git)
+            let target = try await fixture.endpoint(for: fixture.source, using: git)
+            _ = try await git.applyNoCommitWorktreeMerge(sourceHead: source.head, at: fixture.source)
+            let outside = fixture.sandbox.appendingPathComponent("outside-abort", isDirectory: true)
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            try FileManager.default.removeItem(at: fixture.source)
+            try FileManager.default.createSymbolicLink(at: fixture.source, withDestinationURL: outside)
+
+            do {
+                _ = try await git.abortWorktreeMerge(targetEndpoint: target)
+                XCTFail("Expected abort to reject an endpoint replaced by an outside symlink")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("worktree"), String(describing: error))
+            }
+        }
+    }
+
     func testPreviewRejectsEndpointHeadChangedBeforeInspection() async throws {
         let fixture = try GitMergeFixture()
         defer { fixture.cleanup() }

@@ -189,7 +189,13 @@ extension AgentModeViewModel {
     }
 
     func expandAllSidebarThreads(for tabs: [ComposeTabState], currentTabID: UUID?) {
-        ui.sessionSidebar.clearCollapsedThreads()
+        let keys = collapsibleSidebarThreadKeys(
+            for: tabs,
+            currentTabID: currentTabID,
+            searchText: "",
+            diagnosticSource: "collapseAllButton.applyExpand"
+        )
+        ui.sessionSidebar.expandAllSidebarThreads(eligibleKeys: keys)
     }
 
     func isSidebarThreadCollapsed(_ key: AgentSidebarThreadKey) -> Bool {
@@ -202,6 +208,11 @@ extension AgentModeViewModel {
 
     func toggleSidebarThreadCollapse(_ key: AgentSidebarThreadKey) {
         ui.sessionSidebar.toggleThreadCollapse(key)
+    }
+
+    func requestSidebarThreadDisclosureToggle(for row: SidebarSession) {
+        guard row.hasThreadChildren, let key = row.threadKey else { return }
+        ui.sessionSidebar.setThreadCollapsed(!row.isThreadCollapsed, for: key)
     }
 
     // MARK: - Sidebar run-state attention
@@ -297,6 +308,30 @@ extension AgentModeViewModel {
         _ = ui.sessionSidebar.clearRunStateAttention(for: tabIDs)
     }
 
+    /// Captures the compact compose-tab metadata that can affect sidebar rows.
+    /// This is the shared authority for refresh fingerprints and projection caches.
+    func makeSessionSidebarTabMetadataSignature(
+        for tab: ComposeTabState,
+        order: Int
+    ) -> AgentSessionSidebarTabMetadataSignature {
+        AgentSessionSidebarTabMetadataSignature(
+            tabID: tab.id,
+            order: order,
+            normalizedName: AgentSessionRestoreSupport.normalizedSessionTitle(tab.name),
+            activeAgentSessionID: tab.activeAgentSessionID,
+            isPinned: tab.isPinned,
+            lastModified: tab.lastModified
+        )
+    }
+
+    func makeSessionSidebarTabMetadataSignatures(
+        for tabs: [ComposeTabState]
+    ) -> [AgentSessionSidebarTabMetadataSignature] {
+        tabs.enumerated().map { index, tab in
+            makeSessionSidebarTabMetadataSignature(for: tab, order: index)
+        }
+    }
+
     /// Captures the current VM-level sidebar inputs (compose tab titles/metadata,
     /// sessions, sessionIndex, sort dates, badges, tree state, current tab, etc.)
     /// into a value-type fingerprint. Snapshotting every `TabSession` into
@@ -304,18 +339,7 @@ extension AgentModeViewModel {
     /// independent of class identity.
     func makeSessionSidebarContentFingerprint(for sidebarTabs: [ComposeTabState]? = nil) -> AgentSessionSidebarContentFingerprint {
         let tabs = sidebarTabs ?? sidebarContentFingerprintTabs
-        let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature] = tabs
-            .enumerated()
-            .map { index, tab in
-                AgentSessionSidebarTabMetadataSignature(
-                    tabID: tab.id,
-                    order: index,
-                    normalizedName: AgentSessionRestoreSupport.normalizedSessionTitle(tab.name),
-                    activeAgentSessionID: tab.activeAgentSessionID,
-                    isPinned: tab.isPinned,
-                    lastModified: tab.lastModified
-                )
-            }
+        let tabMetadataSignatures = makeSessionSidebarTabMetadataSignatures(for: tabs)
         let signatures: [AgentSessionSidebarTabSignature] = sessions
             .keys
             .sorted { $0.uuidString < $1.uuidString }

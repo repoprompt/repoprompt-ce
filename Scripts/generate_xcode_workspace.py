@@ -112,7 +112,15 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
+        "RepoPromptWorkspaceCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptRegexCore",
+        "RepoPromptCodeMapCore",
         "TreeSitterScannerSupport",
+        "RepoPromptWorkspaceCoreTests",
+        "RepoPromptDomainRuntimeTests",
+        "RepoPromptRegexCoreTests",
+        "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
     )
     for name in required_targets:
@@ -147,15 +155,50 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
-    expected_test_dependencies = {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"}
+    expected_test_dependencies = {
+        "RepoPromptApp",
+        "RepoPromptCodeMapCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptMCP",
+        "RepoPromptShared",
+    }
     repo_prompt_tests = targets["RepoPromptTests"]
+    if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
+        raise GeneratorError(
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
+            "RepoPromptDomainRuntime, RepoPromptMCP, and RepoPromptShared"
+        )
+
+    domain_runtime = targets["RepoPromptDomainRuntime"]
+    if domain_runtime.get("type") != "regular":
+        raise GeneratorError("RepoPromptDomainRuntime must remain an internal regular target")
+    if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime":
+        raise GeneratorError("RepoPromptDomainRuntime target path drifted")
+    domain_runtime_products = {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in domain_runtime.get("dependencies", [])
+        if dependency.get("product")
+    }
     if (
-        len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
-        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
+        _by_name_dependencies(domain_runtime)
+        != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"]
+        or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
+        or len(domain_runtime.get("dependencies", [])) != 5
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, "
+            "RepoPromptCodeMapCore, Logging, and pinned MCP"
         )
+
+    domain_runtime_tests = targets["RepoPromptDomainRuntimeTests"]
+    if domain_runtime_tests.get("type") != "test":
+        raise GeneratorError("RepoPromptDomainRuntimeTests must remain a test target")
+    if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests":
+        raise GeneratorError("RepoPromptDomainRuntimeTests target path drifted")
+    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime"]:
+        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime")
+    if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
+        raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 
     unsafe_flags: list[list[str]] = []
     for setting in repo_prompt_app.get("settings", []):
@@ -174,7 +217,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
         )
 
-    expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
+    expected_resources = {("Fixtures", True), ("Goldens", True)}
     test_targets_with_codemap_resources = []
     for target in targets.values():
         if target.get("type") != "test":
@@ -185,9 +228,10 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         }
         if expected_resources.issubset(resources):
             test_targets_with_codemap_resources.append(target.get("name"))
-    if len(test_targets_with_codemap_resources) != 1:
+    if test_targets_with_codemap_resources != ["RepoPromptCodeMapCoreTests"]:
         raise GeneratorError(
-            "Exactly one SwiftPM test target must copy CodeMap/Fixtures and CodeMap/Goldens"
+            "RepoPromptCodeMapCoreTests must be the sole SwiftPM test target "
+            "that copies Fixtures and Goldens"
         )
 
     expected_scanners = ["src/javascript/scanner.c", "src/python/scanner.c"]
@@ -876,7 +920,12 @@ def validate_xcodebuild_list(destination: Path) -> None:
     workspace = destination / WORKSPACE_NAME
     command = ["xcodebuild", "-list", "-json", "-workspace", str(workspace)]
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     except FileNotFoundError as error:
         raise GeneratorError("xcodebuild is required; install/select Xcode") from error
     if result.returncode != 0:

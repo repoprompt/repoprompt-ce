@@ -249,12 +249,119 @@ extension AIProviderError: LocalizedError {
     }
 }
 
+public enum ProviderConversationCleanupAction: String, Codable, Equatable, CaseIterable {
+    case archive
+    case delete
+}
+
+enum ProviderConversationCleanupOutcome: Equatable {
+    case succeeded(message: String? = nil)
+    case unsupported(message: String? = nil)
+    case failed(message: String)
+    case cancelled(message: String? = nil)
+
+    var isSupported: Bool {
+        switch self {
+        case .succeeded, .failed, .cancelled:
+            true
+        case .unsupported:
+            false
+        }
+    }
+
+    var isCancelled: Bool {
+        if case .cancelled = self {
+            return true
+        }
+        return false
+    }
+
+    var status: String {
+        switch self {
+        case .succeeded:
+            "succeeded"
+        case .unsupported:
+            "unsupported"
+        case .failed:
+            "failed"
+        case .cancelled:
+            "cancelled"
+        }
+    }
+
+    var message: String? {
+        switch self {
+        case let .succeeded(message), let .unsupported(message), let .cancelled(message):
+            message
+        case let .failed(message):
+            message
+        }
+    }
+}
+
+public struct ProviderConversationCleanupHandle: Codable, Equatable {
+    public let provider: String
+    public let conversationID: String?
+    public let sessionID: String?
+    public let rolloutPath: String?
+
+    public init(
+        provider: String,
+        conversationID: String? = nil,
+        sessionID: String? = nil,
+        rolloutPath: String? = nil
+    ) {
+        self.provider = provider
+        self.conversationID = conversationID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.rolloutPath = rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    public var hasProviderIdentifier: Bool {
+        conversationID != nil || sessionID != nil || rolloutPath != nil
+    }
+
+    static func resolved(
+        provider: String,
+        explicit: ProviderConversationCleanupHandle?,
+        providerSessionID: String?,
+        codexConversationID: String?,
+        codexRolloutPath: String?
+    ) -> ProviderConversationCleanupHandle? {
+        if let explicit, explicit.hasProviderIdentifier {
+            return explicit
+        }
+        let handle = ProviderConversationCleanupHandle(
+            provider: provider,
+            conversationID: codexConversationID,
+            sessionID: providerSessionID,
+            rolloutPath: codexRolloutPath
+        )
+        return handle.hasProviderIdentifier ? handle : nil
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+}
+
+enum AIProviderCompletionOutcome: Equatable {
+    case completed
+    case incomplete(reason: String)
+}
+
 /// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
 struct AIStreamResult {
     /// Standard type strings for stream results
     static let lifecycleType = "lifecycle"
+    /// Transport-level activity with no semantic assistant payload.
+    static let transportActivityType = "transport_activity"
+    /// Provider-reported terminal state that preserves partial output without declaring success.
+    static let incompleteType = "message_incomplete"
 
-    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle"
+    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle", "transport_activity"
     let text: String? // normal content (like streaming tokens)
     let reasoning: String? // optional reasoning content
     let promptTokens: Int? // token usage
@@ -279,6 +386,8 @@ struct AIStreamResult {
     /// Stable provider message identifier for content chunks when available.
     /// Used by lightweight aggregators to separate whole-message chunks without affecting token deltas.
     let contentMessageID: String?
+    /// Optional provider conversation cleanup handle, used for best-effort Oracle cleanup.
+    let cleanupHandle: ProviderConversationCleanupHandle?
 
     init(
         type: String,
@@ -298,7 +407,8 @@ struct AIStreamResult {
         stopReason: String? = nil,
         modelContextWindow: Int? = nil,
         contextUsedTokens: Int? = nil,
-        contentMessageID: String? = nil
+        contentMessageID: String? = nil,
+        cleanupHandle: ProviderConversationCleanupHandle? = nil
     ) {
         self.type = type
         self.text = text
@@ -318,6 +428,7 @@ struct AIStreamResult {
         self.modelContextWindow = modelContextWindow
         self.contextUsedTokens = contextUsedTokens
         self.contentMessageID = contentMessageID
+        self.cleanupHandle = cleanupHandle
     }
 }
 
@@ -327,18 +438,27 @@ struct AICompletionResult {
     let promptTokens: Int?
     let completionTokens: Int?
     let cost: Double?
+    let completionOutcome: AIProviderCompletionOutcome
 
-    init(text: String, promptTokens: Int? = nil, completionTokens: Int? = nil, cost: Double? = nil) {
+    init(
+        text: String,
+        promptTokens: Int? = nil,
+        completionTokens: Int? = nil,
+        cost: Double? = nil,
+        completionOutcome: AIProviderCompletionOutcome = .completed
+    ) {
         self.text = text
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.cost = cost
+        self.completionOutcome = completionOutcome
     }
 }
 
 protocol AIProvider {
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error>
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func dispose() async
 }
 
@@ -354,6 +474,10 @@ extension AIProvider {
 
     func completeMessage(_ aiMessage: AIMessage, model: AIModel) async throws -> AICompletionResult {
         try await completeMessage(aiMessage, model: model, maxTokens: nil)
+    }
+
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+        .unsupported(message: "Provider has no local API for \(action.rawValue) cleanup of conversations.")
     }
 
     func dispose() async {}

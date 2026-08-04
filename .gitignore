@@ -28,7 +28,6 @@ dist/
 *.trace
 *.xcresult/
 *.profraw
-docs/test-suite-optimizer/raw-logs/
 
 # Agent-authored working documents
 docs/analysis/

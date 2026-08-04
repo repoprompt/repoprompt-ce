@@ -5,15 +5,15 @@ import Ontology
 import RepoPromptShared
 
 @MainActor
-final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .agentSessionControl
+final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .agentSessionControl
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {
@@ -128,7 +128,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
 
     private static func executeShareThoughts(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         guard let thoughts = args["thoughts"]?.stringValue else {
             throw MCPError.invalidParams("thoughts is required")
@@ -152,7 +152,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
 
     private static func executeSetStatus(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.setStatus)
         let trimmedSessionName = args["session_name"]?.stringValue?
@@ -190,7 +190,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
 
     private static func executeWaitForNextInstruction(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         let prompt = args["prompt"]?.stringValue
         let timeout = try resolvedInstructionWaitTimeoutSeconds(args["timeout_seconds"])

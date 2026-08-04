@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptDomainRuntime
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///
@@ -8,6 +9,8 @@ import MCP
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
     static let toolName = MCPGlobalToolName.appSettings
+
+    let domainRegistrationID = MCPDomainToolRegistrationID()
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter
@@ -681,16 +684,10 @@ private enum AppSettingsMCPRegistry {
             read: { stringOrNull($0.preferredComposeModelRaw()) },
             write: { try $0.setPreferredComposeModelRaw(
                 optionalString(from: $1),
-                reason: "app_settings.models.preferred_compose_model"
+                reason: "app_settings.models.preferred_compose_model",
+                honorSync: true
             ) },
-            afterWrite: { store, value, notificationCenter in
-                postModelRawDidWrite(
-                    store: store,
-                    siblingKey: "models.planning_model",
-                    valueJustWritten: value,
-                    notificationCenter: notificationCenter
-                )
-            },
+            afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
         optionalModelRawSetting(
@@ -701,16 +698,10 @@ private enum AppSettingsMCPRegistry {
             read: { stringOrNull($0.planningModelRaw()) },
             write: { try $0.setPlanningModelRaw(
                 optionalString(from: $1),
-                reason: "app_settings.models.planning_model"
+                reason: "app_settings.models.planning_model",
+                honorSync: true
             ) },
-            afterWrite: { store, value, notificationCenter in
-                postModelRawDidWrite(
-                    store: store,
-                    siblingKey: "models.preferred_compose_model",
-                    valueJustWritten: value,
-                    notificationCenter: notificationCenter
-                )
-            },
+            afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
         boolSetting(
@@ -722,8 +713,7 @@ private enum AppSettingsMCPRegistry {
             write: {
                 try $0.setSyncChatModelWithOracle(
                     requiredBool(from: $1),
-                    reason: "app_settings.models.sync_chat_model_with_oracle",
-                    snapOnEnableToPlanning: true
+                    reason: "app_settings.models.sync_chat_model_with_oracle"
                 )
             },
             afterWrite: postRecommendationsDidApply
@@ -846,6 +836,21 @@ private enum AppSettingsMCPRegistry {
             description: "Whether Codex Agent Mode app-server threads request Codex model reasoning summaries. Defaults off; when disabled RepoPrompt sends model_reasoning_summary=none in Codex thread/start and thread/resume config. Does not affect Chat/Oracle model preferences, reasoning effort selection, or non-Agent Mode Codex runs.",
             read: { .bool($0.codexReasoningSummariesEnabled()) },
             write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
+        ),
+        stringEnumSetting(
+            key: "agent_mode.provider_conversation_cleanup_action",
+            group: "agent_mode",
+            label: "Provider Conversation Cleanup",
+            description: "Controls best-effort provider-side Agent Mode conversation cleanup when deleting supported sessions. Archive is safer and is the default; delete asks supported providers to remove the conversation.",
+            allowedValues: ProviderConversationCleanupAction.allCases.map(\.rawValue),
+            read: { .string($0.providerConversationCleanupAction().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let action = ProviderConversationCleanupAction(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid provider cleanup action '\(raw)'.")
+                }
+                store.setProviderConversationCleanupAction(action)
+            }
         ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
@@ -1317,70 +1322,6 @@ private enum AppSettingsMCPRegistry {
         { store, _, notificationCenter in
             store.postFileSystemPreferencesDidChange(key: key, notificationCenter: notificationCenter)
         }
-    }
-
-    /// Post-write hook for `models.planning_model` / `models.preferred_compose_model`.
-    ///
-    /// When `GlobalSettingsStore.syncChatModelWithOracle()` is true, mirrors the
-    /// freshly-written value to the sibling model-raw key via the direct store setter
-    /// (which does NOT re-enter `afterWrite`), then posts `.recommendationsDidApply`
-    /// exactly once so UI layers (`AgentModelsSettingsViewModel`,
-    /// `ContextBuilderAgentViewModel`, `PromptViewModel`, `RecommendationWizardViewModel`,
-    /// `MCPServerToggleView`, `MCPSettingsView`) rebuild their derived state.
-    ///
-    /// Mirror-skip cases:
-    /// - sync disabled
-    /// - sibling already holds the same value (avoids spurious disk writes and
-    ///   ensures a single notification fires per MCP write)
-    /// A real model write is mirrored to the sibling. A null/blank clear of the chat model is
-    /// NOT mirrored into the Oracle `models.planning_model` (which is never auto-healed) —
-    /// matching the GUI sync guard; clearing the Oracle stays an explicit
-    /// `models.planning_model = null` write. A null clear of planning still mirrors to compose.
-    @MainActor
-    private static func postModelRawDidWrite(
-        store: GlobalSettingsStore,
-        siblingKey: String,
-        valueJustWritten: Value,
-        notificationCenter: NotificationCenter
-    ) {
-        if store.syncChatModelWithOracle() {
-            let newValue: String? = switch valueJustWritten {
-            case let .string(raw):
-                raw
-            case .null:
-                nil
-            default:
-                nil
-            }
-
-            let siblingCurrent: String? = switch siblingKey {
-            case "models.planning_model":
-                store.planningModelRaw()
-            case "models.preferred_compose_model":
-                store.preferredComposeModelRaw()
-            default:
-                nil
-            }
-
-            if siblingCurrent != newValue {
-                switch siblingKey {
-                case "models.planning_model":
-                    // Symmetric with the GUI sync fix (GlobalSettingsStore.setPreferredComposeModelRaw):
-                    // a blank/nil chat model must NOT be mirrored into the Oracle planningModel,
-                    // which is deliberately never auto-healed and would otherwise persist as
-                    // "Oracle reset to nothing". Clearing the Oracle stays an explicit
-                    // `app_settings models.planning_model = null` action, not a sync side effect.
-                    if let newValue, !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        store.setPlanningModelRaw(newValue, reason: "app_settings.models.sync_sibling")
-                    }
-                case "models.preferred_compose_model":
-                    store.setPreferredComposeModelRaw(newValue, reason: "app_settings.models.sync_sibling")
-                default:
-                    break
-                }
-            }
-        }
-        notificationCenter.post(name: .recommendationsDidApply, object: nil)
     }
 
     // MARK: - Candidate Providers

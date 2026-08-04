@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -63,6 +64,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
                 try await runCheckpoint(fixture: fixture, scenario: .agentOwnedExplicitSetIndependentLookup)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testPersistentFixturePeerIdentitySeparatesVerifiedLocalAuthorizationFromDefaultDeny() async throws {
+        #if DEBUG
+            for peerIdentity in [Fixture.PeerIdentity.verifiedLocalProcess, .unverified] {
+                try await withFixture(agentOwned: true, peerIdentity: peerIdentity) { fixture in
+                    try await runCheckpoint(fixture: fixture, scenario: .protectedSelectionIdentity)
+                }
             }
         #else
             throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
@@ -229,6 +242,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case agentOwnedCanonicalSelection
             case agentOwnedSequentialReadUnion
             case agentOwnedExplicitSetIndependentLookup
+            case protectedSelectionIdentity
             case agentOwnedNoRangeNonEmptyWorktreeFile
             case manageSelectionGetCanonicalHandover
             case worktreeCoverageCertificateRepeats
@@ -241,7 +255,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             var requiresSerialReadPrelude: Bool {
                 switch self {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
-                     .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
+                     .protectedSelectionIdentity, .manageSelectionGetCanonicalHandover,
+                     .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
                      .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase:
                     false
@@ -255,25 +270,32 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             agentOwned: Bool = false,
             inactiveAgentTab: Bool = false,
             gitBacked: Bool = false,
+            peerIdentity: Fixture.PeerIdentity = .verifiedLocalProcess,
             _ operation: (Fixture) async throws -> Void
         ) async throws {
-            let fixture = try await Fixture.make(
-                agentOwned: agentOwned,
-                inactiveAgentTab: inactiveAgentTab,
-                gitBacked: gitBacked
-            )
-            do {
-                try await operation(fixture)
-                await fixture.cleanup()
-                let pendingAfterCleanup = await fixture.networkManager.debugPendingPolicySnapshot(
-                    for: AgentProviderKind.codexMCPClientID
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await ServerNetworkManager.shared.setEnabled(true)
+
+                let fixture = try await Fixture.make(
+                    agentOwned: agentOwned,
+                    inactiveAgentTab: inactiveAgentTab,
+                    gitBacked: gitBacked,
+                    peerIdentity: peerIdentity
                 )
-                XCTAssertFalse(pendingAfterCleanup.contains { $0.runID == Fixture.runID })
-                let runPolicyAfterCleanup = await fixture.networkManager.debugRunPolicyState(for: Fixture.runID)
-                XCTAssertNil(runPolicyAfterCleanup)
-            } catch {
-                await fixture.cleanup()
-                throw error
+                do {
+                    try await operation(fixture)
+                    await fixture.cleanup()
+                    let pendingAfterCleanup = await fixture.networkManager.debugPendingPolicySnapshot(
+                        for: AgentProviderKind.codexMCPClientID
+                    )
+                    XCTAssertFalse(pendingAfterCleanup.contains { $0.runID == fixture.runID })
+                    let runPolicyAfterCleanup = await fixture.networkManager.debugRunPolicyState(for: fixture.runID)
+                    XCTAssertNil(runPolicyAfterCleanup)
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
             }
         }
 
@@ -296,8 +318,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             XCTAssertEqual(pendingBeforeInitialize.count, 1)
             XCTAssertEqual(pendingBeforeInitialize.first?.windowID, fixture.windowID)
-            XCTAssertEqual(pendingBeforeInitialize.first?.tabID, Fixture.tabID)
-            XCTAssertEqual(pendingBeforeInitialize.first?.runID, Fixture.runID)
+            XCTAssertEqual(pendingBeforeInitialize.first?.tabID, fixture.tabID)
+            XCTAssertEqual(pendingBeforeInitialize.first?.runID, fixture.runID)
             XCTAssertEqual(pendingBeforeInitialize.first?.oneShot, true)
             XCTAssertEqual(pendingBeforeInitialize.first?.purpose, .agentModeRun)
 
@@ -310,7 +332,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     let admission = await networkManager.debugAgentPolicyAdmissionStatus(
                         clientName: AgentProviderKind.codexMCPClientID,
                         bootstrapClientName: AgentProviderKind.codexMCPClientID,
-                        connectionID: Fixture.connectionID,
+                        connectionID: fixture.connectionID,
                         sessionKey: Fixture.sessionToken,
                         clientPid: Int(getpid())
                     )
@@ -319,7 +341,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
                     let applied = await networkManager.debugApplyPendingPolicy(
                         clientName: AgentProviderKind.codexMCPClientID,
-                        connectionID: Fixture.connectionID,
+                        connectionID: fixture.connectionID,
                         clientPid: Int(getpid()),
                         bootstrapClientName: AgentProviderKind.codexMCPClientID
                     )
@@ -368,6 +390,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let routed = await fixture.lease.releaseWhenRouted(timeoutMs: 1000)
             XCTAssertTrue(routed)
+            try await fixture.assertAuthoritativeDomainRoutingThroughAppSeam()
 
             let baseline = await fixture.retainedConnectionSnapshot()
             Self.assertStableAgentModeSnapshot(baseline, fixture: fixture)
@@ -427,6 +450,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertAgentOwnedSequentialReadUnion(fixture: fixture)
             case .agentOwnedExplicitSetIndependentLookup:
                 try await assertAgentOwnedExplicitSetIndependentLookup(fixture: fixture)
+            case .protectedSelectionIdentity:
+                try await assertProtectedSelectionIdentity(fixture: fixture)
             case .agentOwnedNoRangeNonEmptyWorktreeFile:
                 try await assertAgentOwnedNoRangeNonEmptyWorktreeFile(fixture: fixture)
             case .manageSelectionGetCanonicalHandover:
@@ -479,7 +504,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 LineRange(start: 6400, end: 6409)
             ]
             var selection = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, targetLogicalPath]))
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
@@ -490,6 +515,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 25).map { "middle-insert-\($0)" }, at: 3039)
             editedLines.removeSubrange(5064 ..< 5084)
             let physicalURL = try fixture.worktreeLargeFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -526,7 +552,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 LineRange(start: 6445, end: 6454)
             ]
             selection = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, targetLogicalPath]))
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
@@ -538,7 +564,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             // accepting the empty visible projection as a newer selection.
             fixture.window.selectionCoordinator.flushPendingUISelectionToActiveTab()
             selection = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, targetLogicalPath]))
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
@@ -560,6 +586,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting(nil)
                 Task { await staleCommitGate.release() }
             }
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree()
             let staleReplacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SessionWorktree6500.swift.stale-\(UUID().uuidString)")
             let staleReplacementText = try String(contentsOf: physicalURL, encoding: .utf8)
@@ -587,7 +614,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let identity = WorkspaceSelectionIdentity(
                 workspaceID: fixture.workspaceID,
-                tabID: Fixture.tabID
+                tabID: fixture.tabID
             )
             let currentSelection = try XCTUnwrap(
                 fixture.window.workspaceManager.composeTab(for: identity)?.selection
@@ -606,7 +633,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(persisted, removedTargetSelection)
             let partitionScope = PartitionScope(
                 workspaceID: fixture.workspaceID,
-                tabID: Fixture.tabID
+                tabID: fixture.tabID
             )
             try await fixture.window.workspaceFilesViewModel._testPersistSlicesForScope(
                 rootPath: physicalRootPath,
@@ -655,7 +682,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             await assertReadFileAutoSelectionSettled(fixture: fixture)
             let preservedFull = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(preservedFull.selectedPaths, [targetLogicalPath])
             XCTAssertNil(preservedFull.slices[targetLogicalPath])
@@ -683,6 +710,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try Self.assertSuccessfulResponse(fullSet, id: 4)
 
             let physicalURL = try fixture.worktreeSearchCreatedFileURL
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             var originalLines = (1 ... 29).map { "search-line-\($0)" }
             originalLines[3] = "WATCHER_BEGIN_ANCHOR_9F3A7C"
             originalLines[14] = "WATCHER_MIDDLE_ANCHOR_9F3A7C"
@@ -743,7 +773,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 LineRange(start: 25, end: 29)
             ]
             var selection = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, matchingLogicalPath]))
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
@@ -753,6 +783,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             editedLines.insert(contentsOf: (1 ... 4).map { "top-insert-\($0)" }, at: 0)
             editedLines.insert(contentsOf: (1 ... 3).map { "middle-insert-\($0)" }, at: 13)
             editedLines.removeSubrange(26 ... 27)
+            try await fixture.useOnlySyntheticWatcherIngressForInstalledWorktree(
+                qualifyCachedSearchContent: true
+            )
             let replacementURL = physicalURL.deletingLastPathComponent()
                 .appendingPathComponent(".SearchCreated.swift.atomic-\(UUID().uuidString)")
             try (editedLines.joined(separator: "\n") + "\n").write(
@@ -789,7 +822,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 LineRange(start: 30, end: 34)
             ]
             selection = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, matchingLogicalPath]))
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
@@ -797,7 +830,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             fixture.window.selectionCoordinator.flushPendingUISelectionToActiveTab()
             selection = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, matchingLogicalPath]))
             XCTAssertNil(selection.slices[unrelatedLogicalPath])
@@ -833,7 +866,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try Self.assertSuccessfulResponse(repeatSearch, id: 7)
             await assertReadFileAutoSelectionSettled(fixture: fixture)
             let preservedFull = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             )
             XCTAssertEqual(preservedFull.selectedPaths, [matchingLogicalPath])
             XCTAssertNil(preservedFull.slices[matchingLogicalPath])
@@ -884,23 +917,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 params: [
                     "name": MCPWindowToolName.getCodeStructure,
                     "arguments": [
-                        "scope": "paths",
                         "paths": [nonGitFile.path]
                     ]
                 ]
             )
             let structureText = try Self.readFileText(from: structureResponse, id: 15)
-            XCTAssertTrue(structureText.contains("- **Status**: `unavailable`"), structureText)
-            XCTAssertTrue(structureText.contains("`git_root_unavailable`"), structureText)
+            XCTAssertTrue(
+                structureText.contains("## Code Structure ❌ unavailable — requested root is unavailable"),
+                structureText
+            )
+            XCTAssertTrue(structureText.contains("- Resolve the reported root issue, then retry."), structureText)
+            XCTAssertFalse(structureText.contains("git_root_unavailable"), structureText)
             let work = MCPToolWorkCountDiagnostics.debugSnapshots().git
             XCTAssertEqual(work.count, 1)
             XCTAssertEqual(work.first?.operation, MCPWindowToolName.getCodeStructure)
             let gitCommands = work.first?.commands ?? []
-            XCTAssertEqual(work.first?.commandCount, 3, gitCommands.joined(separator: "\n"))
-            XCTAssertTrue(
-                gitCommands.contains { $0.contains("rev-parse --show-toplevel") },
-                gitCommands.joined(separator: "\n")
-            )
+            XCTAssertEqual(work.first?.commandCount, 0, gitCommands.joined(separator: "\n"))
+            XCTAssertTrue(gitCommands.isEmpty)
             XCTAssertEqual(work.first?.outcome, "success")
         }
 
@@ -1003,7 +1036,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertNil(try fixture.readFileAutoSelectionCoverageCertificate())
 
             var selectionAdvancedAfterIngressSnapshot = try XCTUnwrap(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)
             )
             selectionAdvancedAfterIngressSnapshot.selection = StoredSelection(
                 selectedPaths: [
@@ -1020,7 +1053,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             let selectionAdvanceIdentity = WorkspaceSelectionIdentity(
                 workspaceID: fixture.workspaceID,
-                tabID: Fixture.tabID
+                tabID: fixture.tabID
             )
             let persistedSelectionAdvance = try await fixture.window.selectionCoordinator.persistSelection(
                 selectionAdvancedAfterIngressSnapshot.selection,
@@ -1068,8 +1101,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let probeArguments: [String: Value] = [
                 "window_id": .int(fixture.windowID),
-                "target_connection_id": .string(Fixture.connectionID.uuidString),
-                "expected_run_id": .string(Fixture.runID.uuidString),
+                "target_connection_id": .string(fixture.connectionID.uuidString),
+                "expected_run_id": .string(fixture.runID.uuidString),
                 "force_authoritative": .bool(true),
                 "expiry_ms": .int(10000)
             ]
@@ -1227,7 +1260,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
             )
             XCTAssertEqual(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection.selectedPaths,
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection.selectedPaths,
                 [fixture.fileURL.path, fixture.liveFileURL.path],
                 readFileAutoSelectionBoundaryFailureContext(fixture: fixture)
             )
@@ -1250,7 +1283,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func persistCertificateBoundaryFinalSelectionAdvance(fixture: Fixture) async throws {
             let identity = WorkspaceSelectionIdentity(
                 workspaceID: fixture.workspaceID,
-                tabID: Fixture.tabID
+                tabID: fixture.tabID
             )
             let currentSelection = try XCTUnwrap(
                 fixture.window.workspaceManager.composeTab(for: identity)?.selection,
@@ -1279,7 +1312,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func readFileAutoSelectionBoundaryFailureContext(fixture: Fixture) -> String {
             let identity = WorkspaceSelectionIdentity(
                 workspaceID: fixture.workspaceID,
-                tabID: Fixture.tabID
+                tabID: fixture.tabID
             )
             let diagnostics = fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
             let contextSnapshot = (try? fixture.readFileAutoSelectionContextSnapshot()).map(String.init(describing:))
@@ -1287,8 +1320,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let certificate = (try? fixture.readFileAutoSelectionCoverageCertificate()).map(String.init(describing:))
                 ?? "<nil>"
             let canonicalSelection = fixture.window.workspaceManager.composeTab(for: identity)?.selection
-            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
-            let boundRevision = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selectionRevision
+            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?.selection
+            let boundRevision = fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?.selectionRevision
             return "readFileAutoSelectionBoundary diagnostics=\(diagnostics) context=\(contextSnapshot) certificate=\(certificate) canonicalRevision=\(fixture.canonicalSelectionRevision()) canonicalSelection=\(String(describing: canonicalSelection)) boundSelection=\(String(describing: boundSelection)) boundRevision=\(String(describing: boundRevision))"
         }
 
@@ -1470,7 +1503,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             // Reproduce the production failure boundary: routing/handoff/mirror state may retain
             // an older working snapshot even though canonical persistence and its mirror completed.
             // The next additive read must merge from canonical storage, never this cache.
-            fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection = StoredSelection()
+            fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?.selection = StoredSelection()
 
             let slicedRead = try await fixture.socketClient.request(
                 id: 5,
@@ -1528,7 +1561,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 [fixture.liveFileURL.path]
             )
 
-            let independent = try await fixture.makeIndependentPeerConnection()
+            let independent = try await fixture.makeIndependentPeerConnection(peerIdentity: .verifiedLocalProcess)
             do {
                 let independentGet = try await independent.socketClient.request(
                     id: 4,
@@ -1553,11 +1586,37 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             await independent.cleanup()
         }
 
+        func assertProtectedSelectionIdentity(fixture: Fixture) async throws {
+            // Read-side routing mirrors production composition before the protected mutation.
+            _ = try await readFile(fixture: fixture, id: 3, path: fixture.fileURL.path)
+            let response = try await fixture.socketClient.request(
+                id: 4,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "clear"]
+                ]
+            )
+            let object = try Self.responseObject(from: response, id: 4)
+            XCTAssertNil(object["error"])
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+            let text = content.compactMap { $0["text"] as? String }.joined()
+            switch fixture.peerIdentity {
+            case .verifiedLocalProcess:
+                XCTAssertNotEqual(result["isError"] as? Bool, true, text)
+                XCTAssertFalse(text.contains("principalUnverified"), text)
+            case .unverified:
+                XCTAssertEqual(result["isError"] as? Bool, true, text)
+                XCTAssertTrue(text.contains("principalUnverified"), text)
+            }
+        }
+
         func assertManageSelectionGetCanonicalHandover(fixture: Fixture) async throws {
             try await clearSelection(fixture: fixture, id: 3)
             let revisionAfterClear = fixture.canonicalSelectionRevision()
             let predecessorGeneration = try XCTUnwrap(
-                fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?
+                fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?
                     .readFileAutoSelectionGeneration
             )
             let canonicalGate = PersistentAsyncGate()
@@ -1591,7 +1650,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try await requireGateStarted(canonicalGate)
             XCTAssertEqual(fixture.canonicalSelectionRevision(), revisionAfterClear)
 
-            let handover = try await fixture.makeHandoverConnection()
+            let handover = try await fixture.makeHandoverConnection(peerIdentity: .verifiedLocalProcess)
             do {
                 let replacementContext = try XCTUnwrap(
                     fixture.window.mcpServer.tabContextByConnectionID[handover.connectionID]
@@ -1601,7 +1660,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     fixture.window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
                         connectionID: handover.connectionID
                     ),
-                    [Fixture.connectionID]
+                    [fixture.connectionID]
                 )
 
                 let predecessorWaiterRegistered = expectation(
@@ -1728,7 +1787,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try await clearSelection(fixture: fixture, id: 11)
             let revisionAfterClear = fixture.canonicalSelectionRevision()
             let predecessorGeneration = try XCTUnwrap(
-                fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?
+                fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?
                     .readFileAutoSelectionGeneration
             )
             let gate = PersistentAsyncGate()
@@ -1761,23 +1820,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 1
             )
 
-            let handover = try await fixture.makeHandoverConnection()
+            let handover = try await fixture.makeHandoverConnection(peerIdentity: .verifiedLocalProcess)
             do {
                 let replacementContext = try XCTUnwrap(
                     fixture.window.mcpServer.tabContextByConnectionID[handover.connectionID]
                 )
-                XCTAssertEqual(replacementContext.runID, Fixture.runID)
-                XCTAssertEqual(replacementContext.tabID, Fixture.tabID)
+                XCTAssertEqual(replacementContext.runID, fixture.runID)
+                XCTAssertEqual(replacementContext.tabID, fixture.tabID)
                 XCTAssertEqual(replacementContext.workspaceID, fixture.workspaceID)
                 XCTAssertGreaterThan(replacementContext.readFileAutoSelectionGeneration, predecessorGeneration)
                 XCTAssertEqual(
                     fixture.window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
                         connectionID: handover.connectionID
                     ),
-                    [Fixture.connectionID]
+                    [fixture.connectionID]
                 )
-                XCTAssertEqual(fixture.window.mcpServer.connectionID(forRunID: Fixture.runID), handover.connectionID)
-                XCTAssertNil(fixture.window.mcpServer.connectionIDToRunID[Fixture.connectionID])
+                XCTAssertEqual(fixture.window.mcpServer.connectionID(forRunID: fixture.runID), handover.connectionID)
+                XCTAssertNil(fixture.window.mcpServer.connectionIDToRunID[fixture.connectionID])
 
                 let predecessorDrainWaiterRegistered = expectation(
                     description: "replacement manage_selection registered predecessor drain waiter"
@@ -1837,7 +1896,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     Set(fixture.window.workspaceManager.composeTab(
                         for: WorkspaceSelectionIdentity(
                             workspaceID: fixture.workspaceID,
-                            tabID: Fixture.tabID
+                            tabID: fixture.tabID
                         )
                     )?.selection.selectedPaths ?? []),
                     Set(expectedPeerSelection.selectedPaths)
@@ -1847,7 +1906,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 // Match the completed child lifecycle: terminal cleanup drops run affinity,
                 // then the provider-owned connection tears down without a Context Builder commit.
                 await fixture.networkManager.cleanupRunRoutingState(
-                    for: Fixture.runID,
+                    for: fixture.runID,
                     windowID: fixture.windowID
                 )
                 await handover.cleanup()
@@ -1864,14 +1923,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     Set(fixture.window.workspaceManager.composeTab(
                         for: WorkspaceSelectionIdentity(
                             workspaceID: fixture.workspaceID,
-                            tabID: Fixture.tabID
+                            tabID: fixture.tabID
                         )
                     )?.selection.selectedPaths ?? []),
                     Set(completedSelection.selectedPaths)
                 )
                 fixture.assertPeerIsolationAndLifecycle(expectedSelection: completedSelection)
 
-                let independent = try await fixture.makeIndependentPeerConnection()
+                let independent = try await fixture.makeIndependentPeerConnection(peerIdentity: .verifiedLocalProcess)
                 do {
                     let independentGet = try await independent.socketClient.request(
                         id: 4,
@@ -1888,15 +1947,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     )
                     let independentSelectionText = try Self.readFileText(from: independentGet, id: 4)
                     XCTAssertTrue(
-                        independentSelectionText.contains(fixture.liveFileURL.path),
+                        independentSelectionText.contains(Fixture.liveRelativePath),
                         independentSelectionText
                     )
                     XCTAssertTrue(
-                        independentSelectionText.contains(fixture.worktreeOnlyLogicalURL.path),
+                        independentSelectionText.contains(Fixture.worktreeOnlyRelativePath),
                         independentSelectionText
                     )
                     XCTAssertTrue(
-                        independentSelectionText.contains("\"full_count\":1"),
+                        independentSelectionText.contains("\"full_count\":2"),
                         independentSelectionText
                     )
                 } catch {
@@ -1914,11 +1973,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func assertAgentOwnedCanonicalSelection(fixture: Fixture) async throws {
             XCTAssertEqual(fixture.spec.taskLabelKind, .pair)
             XCTAssertEqual(
-                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.activeAgentSessionID,
+                fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.activeAgentSessionID,
                 Fixture.agentSessionID
             )
             XCTAssertEqual(
-                fixture.window.promptManager.currentComposeTabs.first(where: { $0.id == Fixture.tabID })?.activeAgentSessionID,
+                fixture.window.promptManager.currentComposeTabs.first(where: { $0.id == fixture.tabID })?.activeAgentSessionID,
                 Fixture.agentSessionID
             )
 
@@ -2014,11 +2073,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
 
             let committed = await fixture.window.mcpServer.commitAndClearTabContext(
-                connectionID: Fixture.connectionID,
-                expectedRunID: Fixture.runID
+                connectionID: fixture.connectionID,
+                expectedRunID: fixture.runID
             )
             XCTAssertTrue(committed)
-            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID])
+            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID])
             assertCanonicalSelection(
                 fixture: fixture,
                 selectedPaths: [fixture.fileURL.path],
@@ -2032,12 +2091,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             slices: [String: [LineRange]],
             expectHeaderMirror: Bool = true
         ) {
-            let stored = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)
+            let stored = fixture.window.workspaceManager.composeTab(with: fixture.tabID)
             XCTAssertEqual(stored?.selection.selectedPaths, selectedPaths)
             XCTAssertEqual(stored?.selection.slices, slices)
             XCTAssertEqual(stored?.activeAgentSessionID, Fixture.agentSessionID)
 
-            let header = fixture.window.promptManager.currentComposeTabs.first { $0.id == Fixture.tabID }
+            let header = fixture.window.promptManager.currentComposeTabs.first { $0.id == fixture.tabID }
             if expectHeaderMirror {
                 let failureContext = "canonical=\(String(describing: stored?.selection)); header=\(String(describing: header?.selection)); "
                     + "readAutoSelection=\(fixture.window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot())"
@@ -2182,10 +2241,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             await Task.yield()
 
-            let finalSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            let finalSelection = fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?.selection
             XCTAssertEqual(finalSelection?.selectedPaths, [])
             XCTAssertEqual(finalSelection?.slices, [:])
-            let storedSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            let storedSelection = fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             XCTAssertEqual(storedSelection?.selectedPaths, [])
             XCTAssertEqual(storedSelection?.slices, [:])
             let current = await fixture.retainedConnectionSnapshot()
@@ -2219,8 +2278,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let finishCompleted = PersistentAsyncSignal()
             let finishTask = Task { @MainActor in
                 await fixture.window.mcpServer.commitAndClearTabContext(
-                    connectionID: Fixture.connectionID,
-                    expectedRunID: Fixture.runID
+                    connectionID: fixture.connectionID,
+                    expectedRunID: fixture.runID
                 )
                 await finishCompleted.mark()
             }
@@ -2230,9 +2289,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             await gate.release()
             await finishTask.value
-            let storedSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            let storedSelection = fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             XCTAssertEqual(storedSelection?.selectedPaths, [fixture.fileURL.path])
-            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID])
+            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID])
         }
 
         func assertSearchWorkspaceContextDrain(fixture: Fixture) async throws {
@@ -2315,7 +2374,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let contextResponse = try await contextTask.value
             try Self.assertSuccessfulResponse(contextResponse, id: 7)
             XCTAssertTrue(contextResponse.contains("PersistentAgentModeFixture.swift"), contextResponse)
-            let searchSliceSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            let searchSliceSelection = fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             XCTAssertEqual(
                 searchSliceSelection?.slices[fixture.fileURL.path],
                 [LineRange(start: 3, end: 7)]
@@ -2350,7 +2409,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             try Self.assertSuccessfulResponse(repeatSearch, id: 9)
             await assertReadFileAutoSelectionSettled(fixture: fixture)
-            let preservedFullSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            let preservedFullSelection = fixture.window.workspaceManager.composeTab(with: fixture.tabID)?.selection
             XCTAssertEqual(preservedFullSelection?.selectedPaths, [fixture.fileURL.path])
             XCTAssertNil(preservedFullSelection?.slices[fixture.fileURL.path])
         }
@@ -2374,8 +2433,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
             let originalWorkspace = manager.workspaces[workspaceIndex]
             var workspaceWithoutTab = originalWorkspace
-            workspaceWithoutTab.composeTabs.removeAll { $0.id == Fixture.tabID }
-            if workspaceWithoutTab.activeComposeTabID == Fixture.tabID {
+            workspaceWithoutTab.composeTabs.removeAll { $0.id == fixture.tabID }
+            if workspaceWithoutTab.activeComposeTabID == fixture.tabID {
                 workspaceWithoutTab.activeComposeTabID = workspaceWithoutTab.composeTabs.first?.id
             }
             manager.workspaces[workspaceIndex] = workspaceWithoutTab
@@ -2383,7 +2442,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             await gate.release()
             let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
             XCTAssertTrue(settled)
-            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            let boundSelection = fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]?.selection
             XCTAssertEqual(boundSelection?.selectedPaths, [])
             XCTAssertEqual(boundSelection?.slices, [:])
 
@@ -2421,7 +2480,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertTrue(settled)
             let storedSelection = manager.workspaces
                 .first(where: { $0.id == fixture.workspaceID })?
-                .composeTabs.first(where: { $0.id == Fixture.tabID })?
+                .composeTabs.first(where: { $0.id == fixture.tabID })?
                 .selection
             XCTAssertEqual(storedSelection?.selectedPaths, [fixture.fileURL.path])
             XCTAssertEqual(storedSelection?.slices, [:])
@@ -2450,23 +2509,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try await assertReadReplyReturned(read, gate: gate, id: 7)
 
             try fixture.window.mcpServer.bindTabForConnection(
-                connectionID: Fixture.connectionID,
+                connectionID: fixture.connectionID,
                 clientName: AgentProviderKind.codexMCPClientID,
                 tabID: replacementTabID,
                 workspaceID: fixture.workspaceID,
                 windowID: fixture.windowID,
-                runID: Fixture.runID,
+                runID: fixture.runID,
                 explicitlyBound: false
             )
             await gate.release()
             let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
             XCTAssertTrue(settled)
 
-            let replacementBinding = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]
+            let replacementBinding = fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID]
             XCTAssertEqual(replacementBinding?.tabID, replacementTabID)
             XCTAssertEqual(replacementBinding?.selection.selectedPaths, [])
             XCTAssertEqual(replacementBinding?.selection.slices, [:])
-            let originalSelection = manager.composeTab(with: Fixture.tabID)?.selection
+            let originalSelection = manager.composeTab(with: fixture.tabID)?.selection
             XCTAssertEqual(originalSelection?.selectedPaths, [])
             XCTAssertEqual(originalSelection?.slices, [:])
         }
@@ -2557,13 +2616,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         static func assertStableAgentModeSnapshot(_ snapshot: RetainedConnectionSnapshot, fixture: Fixture) {
-            XCTAssertEqual(snapshot.connectionID, Fixture.connectionID)
+            XCTAssertEqual(snapshot.connectionID, fixture.connectionID)
             XCTAssertEqual(snapshot.capabilityToken, Fixture.sessionToken)
             XCTAssertEqual(snapshot.managerState, .ready)
             XCTAssertTrue(snapshot.managerViable)
-            XCTAssertEqual(snapshot.peerPID, Int(getpid()))
+            XCTAssertEqual(snapshot.peerPID, fixture.peerIdentity.bootstrapPeerPID)
             XCTAssertEqual(snapshot.runPurpose, .agentModeRun)
-            XCTAssertEqual(snapshot.runID, Fixture.runID)
+            XCTAssertEqual(snapshot.runID, fixture.runID)
             XCTAssertEqual(snapshot.connectionPolicy.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
             XCTAssertEqual(
                 snapshot.connectionPolicy.additionalTools,
@@ -2582,11 +2641,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(snapshot.pendingPolicyCount, 0)
             XCTAssertEqual(snapshot.binding.bindingKind, .tabContext)
             XCTAssertEqual(snapshot.binding.windowID, fixture.windowID)
-            XCTAssertEqual(snapshot.binding.tabID, Fixture.tabID)
+            XCTAssertEqual(snapshot.binding.tabID, fixture.tabID)
             XCTAssertEqual(snapshot.binding.workspaceID, fixture.workspaceID)
             XCTAssertEqual(snapshot.binding.repoPaths, [fixture.rootURL.path])
-            XCTAssertEqual(snapshot.binding.runID, Fixture.runID)
-            XCTAssertEqual(snapshot.mappedConnectionID, Fixture.connectionID)
+            XCTAssertEqual(snapshot.binding.runID, fixture.runID)
+            XCTAssertEqual(snapshot.mappedConnectionID, fixture.connectionID)
             XCTAssertEqual(snapshot.handshake.initializeCount, 1)
             XCTAssertEqual(snapshot.handshake.clientName, AgentProviderKind.codexMCPClientID)
             XCTAssertEqual(snapshot.handshake.admissionStatus, "ready")
@@ -2649,6 +2708,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     @MainActor
     private final class HandoverConnection {
         let connectionID: UUID
+        let runID: UUID
         let socketClient: SocketPairJSONRPCClient
         let manager: BootstrapSocketConnectionManager
         let networkManager: ServerNetworkManager
@@ -2657,12 +2717,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
         init(
             connectionID: UUID,
+            runID: UUID,
             socketClient: SocketPairJSONRPCClient,
             manager: BootstrapSocketConnectionManager,
             networkManager: ServerNetworkManager,
             window: WindowState
         ) {
             self.connectionID = connectionID
+            self.runID = runID
             self.socketClient = socketClient
             self.manager = manager
             self.networkManager = networkManager
@@ -2675,11 +2737,20 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             socketClient.close()
             await manager.stop()
             await networkManager.debugRemoveConnection(connectionID)
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            if let registration = try? await runtime.routingCoordinator.currentRegistration(
+                connectionID: connectionID
+            ) {
+                _ = await runtime.routingCoordinator.unregisterConnection(
+                    registration,
+                    operationID: UUID()
+                )
+            }
             window.mcpServer.removeTabContext(
                 forConnectionID: connectionID,
                 clientName: AgentProviderKind.codexMCPClientID,
                 windowID: window.windowID,
-                runID: Fixture.runID
+                runID: runID
             )
         }
     }
@@ -2710,18 +2781,33 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             socketClient.close()
             await manager.stop()
             await networkManager.debugRemoveConnection(connectionID)
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            if let registration = try? await runtime.routingCoordinator.currentRegistration(
+                connectionID: connectionID
+            ) {
+                _ = await runtime.routingCoordinator.unregisterConnection(
+                    registration,
+                    operationID: UUID()
+                )
+            }
         }
     }
 
     @MainActor
     private final class Fixture {
-        static let runID = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
-        static let tabID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
-        static let activeTabID = UUID(uuidString: "22222222-2222-4222-8222-333333333333")!
+        enum PeerIdentity: CaseIterable {
+            case verifiedLocalProcess
+            case unverified
+
+            var bootstrapPeerPID: Int? {
+                switch self {
+                case .verifiedLocalProcess: Int(getpid())
+                case .unverified: nil
+                }
+            }
+        }
+
         static let gateID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
-        static let connectionID = UUID(uuidString: "44444444-4444-4444-8444-444444444444")!
-        static let handoverConnectionID = UUID(uuidString: "44444444-4444-4444-8444-555555555555")!
-        static let independentConnectionID = UUID(uuidString: "44444444-4444-4444-8444-666666666666")!
         static let peerUnrelatedWorkspaceID = UUID(uuidString: "88888888-8888-4888-8888-888888888888")!
         static let parentRunID = UUID(uuidString: "55555555-5555-4555-8555-555555555555")!
         static let parentConnectionID = UUID(uuidString: "66666666-6666-4666-8666-666666666666")!
@@ -2758,6 +2844,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         let networkManager = ServerNetworkManager.shared
+        let connectionID: UUID
+        let runID: UUID
+        let tabID: UUID
         let rootURL: URL
         let fileURL: URL
         let liveFileURL: URL
@@ -2766,7 +2855,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let routingGuardWindow: WindowState
         let windowID: Int
         let workspaceID: UUID
-        let catalogService: MCPWindowToolCatalogService
+        let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
         let socketClient: SocketPairJSONRPCClient
         let connectionManager: BootstrapSocketConnectionManager
         let handshakeRecorder = HandshakeRecorder()
@@ -2774,6 +2863,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let lease: MCPBootstrapLease
         let agentOwned: Bool
         let gitBacked: Bool
+        let peerIdentity: PeerIdentity
         private var worktreeRootURL: URL?
         private var worktreeRootID: UUID?
         private var retiredWorktreeRootURLs: [URL] = []
@@ -2783,11 +2873,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var auxiliaryRootID: UUID?
         private var peerRootID: UUID?
         private var peerTargetStateVersionBeforeSelection: Int?
-        private var peerCatalogService: MCPWindowToolCatalogService?
-        private var ownedRoutingService: WindowRoutingService?
         private var cleanedUp = false
 
         private init(
+            connectionID: UUID,
+            runID: UUID,
+            tabID: UUID,
             rootURL: URL,
             fileURL: URL,
             liveFileURL: URL,
@@ -2795,14 +2886,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             window: WindowState,
             routingGuardWindow: WindowState,
             workspaceID: UUID,
-            catalogService: MCPWindowToolCatalogService,
+            catalogRegistrationHandle: MCPDomainToolRegistrationHandle,
             socketClient: SocketPairJSONRPCClient,
             connectionManager: BootstrapSocketConnectionManager,
             spec: MCPBootstrapLeaseSpec,
             lease: MCPBootstrapLease,
             agentOwned: Bool,
-            gitBacked: Bool
+            gitBacked: Bool,
+            peerIdentity: PeerIdentity
         ) {
+            self.connectionID = connectionID
+            self.runID = runID
+            self.tabID = tabID
             self.rootURL = rootURL
             self.fileURL = fileURL
             self.liveFileURL = liveFileURL
@@ -2811,20 +2906,26 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.routingGuardWindow = routingGuardWindow
             windowID = window.windowID
             self.workspaceID = workspaceID
-            self.catalogService = catalogService
+            self.catalogRegistrationHandle = catalogRegistrationHandle
             self.socketClient = socketClient
             self.connectionManager = connectionManager
             self.spec = spec
             self.lease = lease
             self.agentOwned = agentOwned
             self.gitBacked = gitBacked
+            self.peerIdentity = peerIdentity
         }
 
         static func make(
             agentOwned: Bool = false,
             inactiveAgentTab: Bool = false,
-            gitBacked: Bool = false
+            gitBacked: Bool = false,
+            peerIdentity: PeerIdentity = .verifiedLocalProcess
         ) async throws -> Fixture {
+            let connectionID = UUID()
+            let runID = UUID()
+            let tabID = UUID()
+            let activeTabID = UUID()
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2866,13 +2967,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let window = WindowState()
-            let routingGuardWindow = WindowState()
+            let domainRuntime = AppDomainRuntimeComposition.shared.runtime
+            let window = WindowState(domainRuntime: domainRuntime)
+            let routingGuardWindow = WindowState(domainRuntime: domainRuntime)
             await window.workspaceManager.awaitInitialized()
             await routingGuardWindow.workspaceManager.awaitInitialized()
             if agentOwned {
-                window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
-                    guard sessionID == agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
+                window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, requestedTabID in
+                    guard sessionID == agentSessionID, requestedTabID == tabID else { return .hydrated([]) }
                     return .hydrated([])
                 }
             }
@@ -2883,7 +2985,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
             var rootID: UUID?
-            var catalogService: MCPWindowToolCatalogService?
+            var catalogRegistrationHandle: MCPDomainToolRegistrationHandle?
             var socketClient: SocketPairJSONRPCClient?
             var connectionManager: BootstrapSocketConnectionManager?
             var lease: MCPBootstrapLease?
@@ -2950,8 +3052,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
-                catalogService = resolvedCatalogService
-                ServiceRegistry.register(resolvedCatalogService)
+                let catalogRegistration = try await AppDomainRuntimeComposition.shared.register(resolvedCatalogService)
+                guard catalogRegistration.disposition == .inserted else {
+                    throw ClientFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: catalogRegistration.disposition)
+                    )
+                }
+                catalogRegistrationHandle = catalogRegistration.handle
 
                 var socketFDs = [Int32](repeating: -1, count: 2)
                 guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -2976,6 +3083,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionID: connectionID,
                     sessionToken: sessionToken,
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: peerIdentity.bootstrapPeerPID,
                     clientName: AgentProviderKind.codexMCPClientID,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,
@@ -2987,7 +3095,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionID: connectionID,
                     connection: resolvedConnectionManager,
                     clientName: AgentProviderKind.codexMCPClientID,
-                    sessionToken: sessionToken
+                    sessionToken: sessionToken,
+                    bootstrapPeerPID: peerIdentity.bootstrapPeerPID
                 )
                 if agentOwned {
                     // A capability token is pinned to one run for that run's lifetime.
@@ -3045,6 +3154,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 )
 
                 return Fixture(
+                    connectionID: connectionID,
+                    runID: runID,
+                    tabID: tabID,
                     rootURL: rootURL,
                     fileURL: fileURL,
                     liveFileURL: liveFileURL,
@@ -3052,13 +3164,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     window: window,
                     routingGuardWindow: routingGuardWindow,
                     workspaceID: activeWorkspace.id,
-                    catalogService: resolvedCatalogService,
+                    catalogRegistrationHandle: catalogRegistration.handle,
                     socketClient: resolvedSocketClient,
                     connectionManager: resolvedConnectionManager,
                     spec: spec,
                     lease: resolvedLease,
                     agentOwned: agentOwned,
-                    gitBacked: gitBacked
+                    gitBacked: gitBacked,
+                    peerIdentity: peerIdentity
                 )
             } catch {
                 await connectionManager?.stop()
@@ -3096,11 +3209,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     windowID: window.windowID,
                     runID: runID
                 )
+                if let catalogRegistrationHandle {
+                    // The fixture owns this exact generation; release it before teardown runs stopServer().
+                    await AppDomainRuntimeComposition.shared.unregister(catalogRegistrationHandle)
+                }
                 await window.tearDown()
                 await routingGuardWindow.tearDown()
-                if let catalogService {
-                    ServiceRegistry.unregister(catalogService)
-                }
                 if let rootID {
                     await window.workspaceFileContextStore.unloadRoot(id: rootID)
                 }
@@ -3108,6 +3222,48 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 WindowStatesManager.shared.unregisterWindowState(window)
                 try? FileManager.default.removeItem(at: rootURL)
                 throw error
+            }
+        }
+
+        func assertAuthoritativeDomainRoutingThroughAppSeam() async throws {
+            let requestID = 9001
+            let response = try await socketClient.request(
+                id: requestID,
+                method: "tools/call",
+                params: [
+                    "name": "get_file_tree",
+                    "arguments": ["type": "roots"]
+                ]
+            )
+            let object = try PersistentAgentModeMCPReadFileConnectionTests.responseObject(
+                from: response,
+                id: requestID
+            )
+            XCTAssertNil(object["error"])
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            XCTAssertNotEqual(result["isError"] as? Bool, true)
+
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            let registration = try await runtime.routingCoordinator.currentRegistration(
+                connectionID: connectionID
+            )
+            let resolved = try await runtime.routingCoordinator.resolveReadContext(
+                connection: registration
+            )
+            XCTAssertEqual(resolved.context.workspaceID, workspaceID)
+            XCTAssertEqual(resolved.context.contextID, tabID)
+            let unchanged = await runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: workspaceID, contextID: tabID)
+                ),
+                operationID: UUID()
+            )
+            guard unchanged.disposition == .unchanged else {
+                throw ClientFixtureError.domainRoutingProjectionMissing(
+                    unchanged.diagnostic ?? String(describing: unchanged.disposition)
+                )
             }
         }
 
@@ -3210,8 +3366,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         private func installWorktreeBindingProvider(_ binding: AgentSessionWorktreeBinding) {
-            window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
-                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
+            let expectedTabID = tabID
+            window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, requestedTabID in
+                guard sessionID == Self.agentSessionID, requestedTabID == expectedTabID else { return .hydrated([]) }
                 return .hydrated([binding])
             }
         }
@@ -3219,6 +3376,29 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         var installedWorktreeRootID: UUID {
             get throws {
                 try XCTUnwrap(worktreeRootID)
+            }
+        }
+
+        func useOnlySyntheticWatcherIngressForInstalledWorktree(
+            qualifyCachedSearchContent: Bool = false
+        ) async throws {
+            let rootID = try installedWorktreeRootID
+            let store = window.workspaceFileContextStore
+            let maybeService = await store.fileSystemServiceForTesting(rootID: rootID)
+            let service = try XCTUnwrap(maybeService)
+            await service.stopWatchingForChanges()
+            let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(
+                rootID: rootID
+            )
+            guard attachedPublisherIngress else {
+                throw ClientFixtureError.syntheticWatcherPublisherIngressUnavailable(rootID)
+            }
+            let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            guard !watcherIsActive else {
+                throw ClientFixtureError.syntheticWatcherStillActive(rootID)
+            }
+            if qualifyCachedSearchContent {
+                try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: rootID, true)
             }
         }
 
@@ -3265,22 +3445,22 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         func readFileAutoSelectionContextKey() throws -> MCPReadFileAutoSelectionCoordinator.ContextKey {
-            let context = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[Self.connectionID])
+            let context = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
             return MCPReadFileAutoSelectionCoordinator.ContextKey(
                 windowID: context.windowID,
                 workspaceID: context.workspaceID,
                 tabID: context.tabID,
-                route: .bound(connectionID: Self.connectionID, runID: context.runID),
+                route: .bound(connectionID: connectionID, runID: context.runID),
                 bindingGeneration: context.readFileAutoSelectionGeneration
             )
         }
 
         func readFileAutoSelectionTarget() throws -> MCPServerViewModel.DebugReadFileAutoSelectionTarget {
             let targets = window.mcpServer.debugResolveReadFileAutoSelectionTargets(
-                targetConnectionID: Self.connectionID,
+                targetConnectionID: connectionID,
                 agentSessionID: nil,
                 tabID: nil,
-                expectedRunID: Self.runID
+                expectedRunID: runID
             )
             XCTAssertEqual(targets.count, 1)
             return try XCTUnwrap(targets.first)
@@ -3312,11 +3492,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             worktreeBinding = replacement
             installWorktreeBindingProvider(replacement)
-            guard var context = window.mcpServer.tabContextByConnectionID[Self.connectionID] else {
+            guard var context = window.mcpServer.tabContextByConnectionID[connectionID] else {
                 return XCTFail("Missing bound context")
             }
             context.worktreeBindingState = .hydrated([replacement])
-            window.mcpServer.tabContextByConnectionID[Self.connectionID] = context
+            window.mcpServer.tabContextByConnectionID[connectionID] = context
         }
 
         func rebindToReplacementPhysicalWorktree() async throws {
@@ -3389,23 +3569,24 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
         func rebindCurrentConnection() throws {
             try window.mcpServer.bindTabForConnection(
-                connectionID: Self.connectionID,
+                connectionID: connectionID,
                 clientName: AgentProviderKind.codexMCPClientID,
-                tabID: Self.tabID,
+                tabID: tabID,
                 workspaceID: workspaceID,
                 windowID: windowID,
-                runID: Self.runID,
+                runID: runID,
                 explicitlyBound: false
             )
         }
 
         func installPeerWindowLookupSnapshot() async throws {
-            routingGuardWindow.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
-                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .unavailable }
+            let expectedTabID = tabID
+            routingGuardWindow.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, requestedTabID in
+                guard sessionID == Self.agentSessionID, requestedTabID == expectedTabID else { return .unavailable }
                 return .hydrated([])
             }
             var peerWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            peerWorkspace.activeComposeTabID = Self.tabID
+            peerWorkspace.activeComposeTabID = tabID
             let unrelatedSelection = StoredSelection(selectedPaths: ["/tmp/unrelated-workspace.swift"])
             let unrelatedWorkspace = WorkspaceModel(
                 id: Self.peerUnrelatedWorkspaceID,
@@ -3414,12 +3595,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ephemeralFlag: true,
                 composeTabs: [
                     ComposeTabState(
-                        id: Self.tabID,
+                        id: tabID,
                         name: "Unrelated Duplicate Tab",
                         selection: unrelatedSelection
                     )
                 ],
-                activeComposeTabID: Self.tabID
+                activeComposeTabID: tabID
             )
             routingGuardWindow.workspaceManager.workspaces.append(unrelatedWorkspace)
             routingGuardWindow.workspaceManager.workspaces.append(peerWorkspace)
@@ -3434,7 +3615,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             let unrelatedIdentity = WorkspaceSelectionIdentity(
                 workspaceID: Self.peerUnrelatedWorkspaceID,
-                tabID: Self.tabID
+                tabID: tabID
             )
             var unrelatedTab = try XCTUnwrap(
                 routingGuardWindow.workspaceManager.composeTab(for: unrelatedIdentity)
@@ -3452,7 +3633,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             peerTargetStateVersionBeforeSelection = routingGuardWindow.workspaceManager
                 .debugStateVersionForWorkspace(workspaceID)
 
-            let targetIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
+            let targetIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
             XCTAssertNotNil(window.workspaceManager.composeTab(for: targetIdentity))
             XCTAssertNotNil(routingGuardWindow.workspaceManager.composeTab(for: targetIdentity))
             XCTAssertEqual(
@@ -3460,24 +3641,17 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 unrelatedSelection
             )
             XCTAssertEqual(routingGuardWindow.workspaceManager.activeWorkspace?.id, workspaceID)
-            XCTAssertEqual(routingGuardWindow.workspaceManager.activeWorkspace?.activeComposeTabID, Self.tabID)
+            XCTAssertEqual(routingGuardWindow.workspaceManager.activeWorkspace?.activeComposeTabID, tabID)
         }
 
-        func makeIndependentPeerConnection() async throws -> IndependentConnection {
-            let routingService = WindowRoutingService(windowStates: .shared, networkMgr: networkManager)
-            ownedRoutingService = routingService
-            for _ in 0 ..< 100 {
-                let registered = ServiceRegistry.services.contains {
-                    $0 as AnyObject === routingService as AnyObject
-                }
-                let names = await routingService.tools.map(\.name)
-                if registered, names.contains(MCPGlobalToolName.bindContext) { break }
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            if peerCatalogService == nil {
-                let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
-                peerCatalogService = service
-                ServiceRegistry.register(service)
+        func makeIndependentPeerConnection(
+            peerIdentity: PeerIdentity
+        ) async throws -> IndependentConnection {
+            let independentConnectionID = UUID()
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
+            guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
+                throw ClientFixtureError.routingServiceUnavailable
             }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3501,9 +3675,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let manager: BootstrapSocketConnectionManager
             do {
                 manager = try BootstrapSocketConnectionManager(
-                    connectionID: Self.independentConnectionID,
+                    connectionID: independentConnectionID,
                     sessionToken: Self.sessionToken + "-independent",
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: peerIdentity.bootstrapPeerPID,
                     clientName: "RepoPrompt Independent Selection Test",
                     purpose: .unknown,
                     codeMapsDisabled: false,
@@ -3516,10 +3691,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 throw error
             }
             await networkManager.debugRegisterConnectionForSocketFixture(
-                connectionID: Self.independentConnectionID,
+                connectionID: independentConnectionID,
                 connection: manager,
                 clientName: "RepoPrompt Independent Selection Test",
-                sessionToken: Self.sessionToken + "-independent"
+                sessionToken: Self.sessionToken + "-independent",
+                bootstrapPeerPID: peerIdentity.bootstrapPeerPID
             )
             let startTask = Task {
                 try await manager.start { _ in true }
@@ -3550,13 +3726,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                         "name": MCPGlobalToolName.bindContext,
                         "arguments": [
                             "op": "bind",
-                            "window_id": routingGuardWindow.windowID
+                            "window_id": window.windowID,
+                            "context_id": tabID.uuidString
                         ]
                     ]
                 )
                 try PersistentAgentModeMCPReadFileConnectionTests.assertSuccessfulResponse(bind, id: 3)
                 return IndependentConnection(
-                    connectionID: Self.independentConnectionID,
+                    connectionID: independentConnectionID,
                     socketClient: socketClient,
                     manager: manager,
                     networkManager: networkManager
@@ -3565,7 +3742,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 startTask.cancel()
                 socketClient.close()
                 await manager.stop()
-                await networkManager.debugRemoveConnection(Self.independentConnectionID)
+                await networkManager.debugRemoveConnection(independentConnectionID)
                 _ = try? await startTask.value
                 throw error
             }
@@ -3577,7 +3754,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
         func peerCanonicalSelection() -> StoredSelection? {
             routingGuardWindow.workspaceManager.composeTab(
-                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
             )?.selection
         }
 
@@ -3585,7 +3762,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             routingGuardWindow.workspaceManager.composeTab(
                 for: WorkspaceSelectionIdentity(
                     workspaceID: Self.peerUnrelatedWorkspaceID,
-                    tabID: Self.tabID
+                    tabID: tabID
                 )
             )?.selection
         }
@@ -3604,7 +3781,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertNotNil(WindowStatesManager.shared.window(withID: routingGuardWindow.windowID))
             XCTAssertNotNil(
                 routingGuardWindow.workspaceManager.composeTab(
-                    for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
+                    for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
                 )
             )
             if let peerTargetStateVersionBeforeSelection {
@@ -3618,11 +3795,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         func canonicalSelectionRevision() -> UInt64 {
             window.workspaceManager.selectionRevisionForMCP(
                 workspaceID: workspaceID,
-                tabID: Self.tabID
+                tabID: tabID
             )
         }
 
-        func makeHandoverConnection() async throws -> HandoverConnection {
+        func makeHandoverConnection(
+            peerIdentity: PeerIdentity
+        ) async throws -> HandoverConnection {
+            let handoverConnectionID = UUID()
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
                 throw SocketPairJSONRPCClient.ClientError.posix(operation: "socketpair", code: errno)
@@ -3644,9 +3824,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let manager: BootstrapSocketConnectionManager
             do {
                 manager = try BootstrapSocketConnectionManager(
-                    connectionID: Self.handoverConnectionID,
+                    connectionID: handoverConnectionID,
                     sessionToken: Self.sessionToken + "-handover",
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: peerIdentity.bootstrapPeerPID,
                     clientName: AgentProviderKind.codexMCPClientID,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,
@@ -3659,15 +3840,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 throw error
             }
             await networkManager.debugRegisterConnectionForSocketFixture(
-                connectionID: Self.handoverConnectionID,
+                connectionID: handoverConnectionID,
                 connection: manager,
                 clientName: AgentProviderKind.codexMCPClientID,
-                sessionToken: Self.sessionToken + "-handover"
+                sessionToken: Self.sessionToken + "-handover",
+                bootstrapPeerPID: peerIdentity.bootstrapPeerPID
             )
             let replacementScheduleCountBefore = await networkManager.debugPendingPolicyReplacementScheduleCount(
-                existing: Self.connectionID,
-                replacement: Self.handoverConnectionID,
-                runID: Self.runID
+                existing: connectionID,
+                replacement: handoverConnectionID,
+                runID: runID
             )
             await networkManager.installClientConnectionPolicy(
                 for: AgentProviderKind.codexMCPClientID,
@@ -3676,8 +3858,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 oneShot: true,
                 reason: "Persistent read-file real pending-policy handover",
                 ttl: 10,
-                tabID: Self.tabID,
-                runID: Self.runID,
+                tabID: tabID,
+                runID: runID,
                 additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec),
                 purpose: .agentModeRun,
                 taskLabelKind: .pair,
@@ -3686,23 +3868,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             let policyApplication = await networkManager.debugApplyPendingPolicy(
                 clientName: AgentProviderKind.codexMCPClientID,
-                connectionID: Self.handoverConnectionID,
+                connectionID: handoverConnectionID,
                 clientPid: Int(getpid()),
                 bootstrapClientName: AgentProviderKind.codexMCPClientID,
                 sessionKey: Self.sessionToken + "-handover",
                 pidGateTimeout: 0.25,
                 requireRunRouting: true
             )
-            guard policyApplication.outcome == "applied", policyApplication.runID == Self.runID else {
+            guard policyApplication.outcome == "applied", policyApplication.runID == runID else {
                 socketClient.close()
                 await manager.stop()
-                await networkManager.debugRemoveConnection(Self.handoverConnectionID)
+                await networkManager.debugRemoveConnection(handoverConnectionID)
                 throw ClientFixtureError.handoverPolicyApplicationFailed(policyApplication.outcome)
             }
             let replacementScheduleCount = await networkManager.debugPendingPolicyReplacementScheduleCount(
-                existing: Self.connectionID,
-                replacement: Self.handoverConnectionID,
-                runID: Self.runID
+                existing: connectionID,
+                replacement: handoverConnectionID,
+                runID: runID
             )
             XCTAssertEqual(replacementScheduleCount, replacementScheduleCountBefore + 1)
             let startTask = Task {
@@ -3729,7 +3911,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 let tools = try await socketClient.request(id: 2, method: "tools/list", params: [:])
                 XCTAssertTrue(try PersistentAgentModeMCPReadFileConnectionTests.toolNames(from: tools).contains(MCPWindowToolName.manageSelection))
                 return HandoverConnection(
-                    connectionID: Self.handoverConnectionID,
+                    connectionID: handoverConnectionID,
+                    runID: runID,
                     socketClient: socketClient,
                     manager: manager,
                     networkManager: networkManager,
@@ -3739,11 +3922,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 startTask.cancel()
                 socketClient.close()
                 await manager.stop()
-                await networkManager.debugRemoveConnection(Self.handoverConnectionID)
+                await networkManager.debugRemoveConnection(handoverConnectionID)
                 await networkManager.clearClientConnectionPolicy(
                     for: AgentProviderKind.codexMCPClientID,
                     windowID: windowID,
-                    runID: Self.runID
+                    runID: runID
                 )
                 _ = try? await startTask.value
                 throw error
@@ -3751,22 +3934,22 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         func retainedConnectionSnapshot() async -> RetainedConnectionSnapshot {
-            let connectionPolicy = await networkManager.debugConnectionPolicyState(for: Self.connectionID)
-            let runPolicy = await networkManager.debugRunPolicyState(for: Self.runID)
+            let connectionPolicy = await networkManager.debugConnectionPolicyState(for: connectionID)
+            let runPolicy = await networkManager.debugRunPolicyState(for: runID)
             let pendingPolicyCount = await networkManager.debugPendingPolicySnapshot(
                 for: AgentProviderKind.codexMCPClientID
             ).count
             let limiter = await networkManager.connectionLimiterSnapshotForTesting(
-                connectionID: Self.connectionID
+                connectionID: connectionID
             )
             return await RetainedConnectionSnapshot(
-                connectionID: Self.connectionID,
+                connectionID: connectionID,
                 capabilityToken: connectionManager.capabilityToken,
                 managerState: connectionManager.connectionState(),
                 managerViable: connectionManager.isViableForRetention(),
                 peerPID: connectionManager.peerPID(),
-                runPurpose: networkManager.runPurpose(for: Self.connectionID),
-                runID: networkManager.runIDForConnection(Self.connectionID),
+                runPurpose: networkManager.runPurpose(for: connectionID),
+                runID: networkManager.runIDForConnection(connectionID),
                 connectionPolicy: ConnectionPolicySnapshot(
                     restrictedTools: connectionPolicy.restrictedTools,
                     additionalTools: connectionPolicy.additionalTools,
@@ -3783,8 +3966,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     )
                 },
                 pendingPolicyCount: pendingPolicyCount,
-                binding: window.mcpServer.connectionBindingSnapshot(forConnection: Self.connectionID),
-                mappedConnectionID: window.mcpServer.connectionID(forRunID: Self.runID),
+                binding: window.mcpServer.connectionBindingSnapshot(forConnection: connectionID),
+                mappedConnectionID: window.mcpServer.connectionID(forRunID: runID),
                 handshake: handshakeRecorder.snapshot(),
                 limiter: limiter
             )
@@ -3798,22 +3981,31 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             socketClient.close()
             window.beginClose()
             routingGuardWindow.beginClose()
-            await networkManager.removeConnection(Self.connectionID)
+            await networkManager.removeConnection(connectionID)
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            if let registration = try? await runtime.routingCoordinator.currentRegistration(
+                connectionID: connectionID
+            ) {
+                _ = await runtime.routingCoordinator.unregisterConnection(
+                    registration,
+                    operationID: UUID()
+                )
+            }
             let limiterAfterRemoval = await networkManager.connectionLimiterSnapshotForTesting(
-                connectionID: Self.connectionID
+                connectionID: connectionID
             )
             XCTAssertNil(limiterAfterRemoval)
             await networkManager.clearExpectedAgentPID(
                 getpid(),
                 for: AgentProviderKind.codexMCPClientID,
-                runID: Self.runID
+                runID: runID
             )
             await networkManager.clearClientConnectionPolicy(
                 for: AgentProviderKind.codexMCPClientID,
                 windowID: windowID,
-                runID: Self.runID
+                runID: runID
             )
-            await networkManager.cleanupRunRoutingState(for: Self.runID, windowID: windowID)
+            await networkManager.cleanupRunRoutingState(for: runID, windowID: windowID)
             if agentOwned {
                 await networkManager.removeConnection(Self.parentConnectionID)
                 await networkManager.clearClientConnectionPolicy(
@@ -3825,20 +4017,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
             await lease.cancelAndCleanup()
             window.mcpServer.removeTabContext(
-                forConnectionID: Self.connectionID,
+                forConnectionID: connectionID,
                 clientName: AgentProviderKind.codexMCPClientID,
                 windowID: windowID,
-                runID: Self.runID
+                runID: runID
             )
+            // These exact generations are fixture-owned and must be released before window teardown.
+            await AppDomainRuntimeComposition.shared.unregister(catalogRegistrationHandle)
             await window.tearDown()
             await routingGuardWindow.tearDown()
-            ServiceRegistry.unregister(catalogService)
-            if let peerCatalogService {
-                ServiceRegistry.unregister(peerCatalogService)
-            }
-            if let ownedRoutingService {
-                ServiceRegistry.unregister(ownedRoutingService)
-            }
             await window.workspaceFileContextStore.unloadRoot(id: rootID)
             if let peerRootID {
                 await routingGuardWindow.workspaceFileContextStore.unloadRoot(id: peerRootID)
@@ -3870,10 +4057,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case exactAbsoluteCatalogMiss
         case leaseAcquisitionFailed
+        case routingServiceUnavailable
         case parentAffinitySeedFailed(String)
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case windowCatalogRegistrationWasNotOwned(String)
+        case domainRoutingProjectionMissing(String)
+        case syntheticWatcherPublisherIngressUnavailable(UUID)
+        case syntheticWatcherStillActive(UUID)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {
@@ -3881,7 +4073,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let capabilityToken: String?
         let managerState: ConnectionStateSnapshot
         let managerViable: Bool
-        let peerPID: Int
+        let peerPID: Int?
         let runPurpose: MCPRunPurpose
         let runID: UUID?
         let connectionPolicy: ConnectionPolicySnapshot

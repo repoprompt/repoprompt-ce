@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
@@ -9,7 +10,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.0.28"
+let CLI_VERSION = "1.2.0"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -779,6 +780,46 @@ enum MCPServiceProxyTaskGroupPolicy {
             serviceTaskIsCancelled ? .hostDisconnected(.taskCancelled) : nil
         case .killSignalWaitCancelled, .ppidWatchdogCancelled:
             .hostDisconnected(.taskCancelled)
+        }
+    }
+}
+
+private final class MCPServiceProxySettlementState: @unchecked Sendable {
+    enum Outcome {
+        case completed(Result<MCPServiceProxyTaskOutcome, Error>)
+        case callerCancelled
+    }
+
+    private let lock = NSLock()
+    private var outcome: Outcome?
+    private var continuation: CheckedContinuation<Outcome, Never>?
+
+    func claim(_ candidate: Outcome) -> Bool {
+        lock.lock()
+        guard outcome == nil else {
+            lock.unlock()
+            return false
+        }
+        outcome = candidate
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+
+        continuation?.resume(returning: candidate)
+        return true
+    }
+
+    func finish() async -> Outcome {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let outcome {
+                lock.unlock()
+                continuation.resume(returning: outcome)
+            } else {
+                precondition(self.continuation == nil)
+                self.continuation = continuation
+                lock.unlock()
+            }
         }
     }
 }
@@ -2100,6 +2141,60 @@ actor MCPService: Service {
         killSignalContinuation = nil
     }
 
+    static func awaitFirstProxyOutcome(
+        killSignal: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome,
+        watchdog: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome,
+        transport: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome
+    ) async throws -> MCPServiceProxyTaskOutcome {
+        let settlement = MCPServiceProxySettlementState()
+        let outcome = await withTaskCancellationHandler {
+            guard !Task.isCancelled else {
+                _ = settlement.claim(.callerCancelled)
+                return await settlement.finish()
+            }
+
+            let killSignalTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(killSignal())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+            let watchdogTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(watchdog())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+            let transportTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(transport())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+
+            let outcome = await settlement.finish()
+            killSignalTask.cancel()
+            watchdogTask.cancel()
+            transportTask.cancel()
+            await killSignalTask.value
+            await watchdogTask.value
+            await transportTask.value
+            return outcome
+        } onCancel: {
+            _ = settlement.claim(.callerCancelled)
+        }
+
+        switch outcome {
+        case let .completed(result):
+            return try result.get()
+        case .callerCancelled:
+            throw CancellationError()
+        }
+    }
+
     func run() async throws {
         // Set up kill signal watcher before starting transport
         setupKillSignalWatcher()
@@ -2110,9 +2205,8 @@ actor MCPService: Service {
 
         do {
             // Race between transport loop, kill signal, and PPID watchdog
-            try await withThrowingTaskGroup(of: MCPServiceProxyTaskOutcome.self) { group in
-                // Kill signal monitor task
-                group.addTask {
+            let outcome = try await Self.awaitFirstProxyOutcome(
+                killSignal: {
                     guard let signal = await self.waitForKillSignal() else {
                         return .killSignalWaitCancelled
                     }
@@ -2120,38 +2214,21 @@ actor MCPService: Service {
                         reason: signal.reason,
                         message: signal.message ?? CLIKillSignal.messageForReason(signal.reason)
                     ))
-                }
-
-                // PPID watchdog - detect orphaned CLI when parent dies
-                group.addTask {
+                },
+                watchdog: {
                     try await self.runPPIDWatchdog(initialPPID: initialPPID)
                     return .ppidWatchdogCancelled
-                }
-
-                // Main transport task
-                group.addTask {
+                },
+                transport: {
                     try await self.runTransport()
                     return .transportCompleted
                 }
-
-                // Wait for first to complete (either kill signal, orphan detection, or transport exit),
-                // then stop the watcher tasks so a clean transport exit can return promptly.
-                do {
-                    guard let outcome = try await group.next() else {
-                        group.cancelAll()
-                        throw CancellationError()
-                    }
-                    group.cancelAll()
-                    if let runtimeError = MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
-                        firstCompletedOutcome: outcome,
-                        serviceTaskIsCancelled: Task.isCancelled
-                    ) {
-                        throw runtimeError
-                    }
-                } catch {
-                    group.cancelAll()
-                    throw error
-                }
+            )
+            if let runtimeError = MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
+                firstCompletedOutcome: outcome,
+                serviceTaskIsCancelled: Task.isCancelled
+            ) {
+                throw runtimeError
             }
             try Task.checkCancellation()
             await persistProxyTerminalRecord(
@@ -2197,7 +2274,7 @@ actor MCPService: Service {
     private func runPPIDWatchdog(initialPPID: pid_t) async throws {
         // Check every 5 seconds - balance between responsiveness and CPU usage
         while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(5))
+            try await MCPCompatibilitySleep.sleep(.seconds(5))
 
             let currentPPID = getppid()
             if currentPPID != initialPPID {
@@ -2313,7 +2390,7 @@ actor MCPService: Service {
                 log.warning("Bootstrap connection lost (\(err)). Retrying in \(String(format: "%.1f", delay))s (attempt \(attempt), elapsed \(String(format: "%.0f", elapsedSinceFirstFailure))s)")
 
                 do {
-                    try await Task.sleep(for: .seconds(delay))
+                    try await MCPCompatibilitySleep.sleep(.seconds(delay))
                 } catch is CancellationError {
                     // Cancelled by kill signal or PPID watchdog
                     throw CLIRuntimeError.hostDisconnected(.taskCancelled)
@@ -2462,9 +2539,10 @@ func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
 
 /// CLI operating mode
 enum CLIMode {
-    case proxy
+    case proxy(MCPBackend)
     case interactive(InteractiveOptions)
     case exec(ExecOptions)
+    case policyAdministration([String])
 }
 
 private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
@@ -2477,18 +2555,50 @@ private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
 /// Parses command line arguments to determine CLI mode
 func parseCLIMode() -> CLIMode {
     let args = CommandLine.arguments.dropFirst() // Skip executable name
-    let hasUserArgs = !args.isEmpty
+    var hasNonBackendUserArgs = false
+    if args.first == "policy" {
+        return .policyAdministration(Array(args.dropFirst()))
+    }
     var interactiveOptions = InteractiveOptions()
     var execOptions = ExecOptions()
     var isInteractive = false
     var isExec = false
+    var backend = MCPBackend.app
+    var backendOptionWasExplicit = false
 
     var i = args.startIndex
     while i < args.endIndex {
         let arg = args[i]
 
         switch arg {
+        case "--backend":
+            guard !backendOptionWasExplicit else {
+                fputs("Error: --backend may be specified only once.\n", stderr)
+                exit(2)
+            }
+            i = args.index(after: i)
+            guard i < args.endIndex, let parsed = MCPBackend(rawValue: args[i].lowercased()) else {
+                fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
+                exit(2)
+            }
+            backend = parsed
+            backendOptionWasExplicit = true
+
+        case let value where value.hasPrefix("--backend="):
+            guard !backendOptionWasExplicit else {
+                fputs("Error: --backend may be specified only once.\n", stderr)
+                exit(2)
+            }
+            let raw = String(value.dropFirst("--backend=".count)).lowercased()
+            guard let parsed = MCPBackend(rawValue: raw) else {
+                fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
+                exit(2)
+            }
+            backend = parsed
+            backendOptionWasExplicit = true
+
         case "--raw-json":
+            hasNonBackendUserArgs = true
             interactiveOptions.rawJSON = true
             execOptions.rawJSON = true
 
@@ -2766,7 +2876,15 @@ func parseCLIMode() -> CLIMode {
             }
         }
 
+        if !arg.hasPrefix("--backend="), arg != "--backend" {
+            hasNonBackendUserArgs = true
+        }
         i = args.index(after: i)
+    }
+
+    if backendOptionWasExplicit, backend != .app, isExec || isInteractive {
+        fputs("Error: --backend \(backend.rawValue) is available only for MCP stdio server mode; interactive and exec remain app-backed.\n", stderr)
+        exit(2)
     }
 
     // Exec mode takes precedence if any exec flags were used
@@ -2779,14 +2897,14 @@ func parseCLIMode() -> CLIMode {
 
     // Proxy mode is reserved for MCP hosts launching the binary with no CLI args.
     // Any explicit args that don't select exec/interactive are invalid user input.
-    if hasUserArgs {
+    if hasNonBackendUserArgs {
         fputs("Error: no command or mode specified.\n", stderr)
         fputs("Use -e/--exec for commands, -i for REPL, or --help for usage.\n\n", stderr)
         printUsage()
         exit(2)
     }
 
-    return .proxy
+    return .proxy(backend)
 }
 
 /// Returns true when stdin is suitable for MCP host stdio transport.
@@ -2909,10 +3027,10 @@ func printUsage() {
           tree src/                                    Tree from specific path
           get_file_tree type=files mode=selected       Show only selected files
 
-        get_code_structure (structure, map) - Get function/type signatures
-          structure src/auth/                          Codemaps for directory (default considers up to 10 files)
-          structure --scope selected                   Codemaps for selection (~6k token cap still applies)
-          get_code_structure paths=["src/"] max_results=50   Opt in to consider more files (response still capped)
+        get_code_structure (structure, map) - Traverse root-local code graphs
+          structure                                   Current selection, seed nodes only
+          structure src/auth/ --expand uses --depth 2  Traverse referenced definitions
+          get_code_structure paths=["src/"] signatures=false size=large
 
         workspace_context (context) - Get workspace snapshot
           context                                      Default snapshot
@@ -3477,6 +3595,62 @@ signal(SIGPIPE, SIG_IGN)
 /// Parse CLI mode
 let mode = parseCLIMode()
 
+if case let .policyAdministration(arguments) = mode {
+    await exit(RuntimePolicyAdministration.run(arguments: arguments))
+}
+
+if DirectHeadlessChildBridge.isRequested() {
+    do {
+        try await DirectHeadlessChildBridge.run()
+        exit(MCPCLIExitCode.ok.rawValue)
+    } catch {
+        fputs("RepoPrompt MCP private child bridge: \(error)\n", stderr)
+        exit(MCPCLIExitCode.connectionFailed.rawValue)
+    }
+}
+
+if case .proxy = mode {
+    // Proxy/direct MCP mode is for a host-owned pipe or socket. Keep the ordinary terminal
+    // help behavior independent of the selected backend, including an explicit `auto` path.
+    // Do not use a positive-timeout stdin probe here: hosts may send initialize later.
+    let stdinIsTTY = isatty(STDIN_FILENO) != 0
+    let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
+    let hasNoUserArgs = CommandLine.arguments.count <= 1
+    if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
+        let usage = """
+        RepoPrompt MCP CLI
+
+        This command is designed to be used as an MCP server by host applications
+        (Claude Desktop, Cursor, etc.) or with explicit mode flags.
+
+        Quick start:
+          __RPCE_CLI__ -l                    # List available tools
+          __RPCE_CLI__ -e 'tree'             # Execute a command
+          __RPCE_CLI__ -i                    # Interactive REPL
+          __RPCE_CLI__ --help                # Full help
+
+        """.replacingOccurrences(of: "__RPCE_CLI__", with: cliDisplayCommand())
+        fputs(usage, stderr)
+        exit(0)
+    }
+}
+
+let resolvedBackend: MCPResolvedBackend? = if case let .proxy(requestedBackend) = mode {
+    MCPBackendSelection.resolve(requested: requestedBackend)
+} else {
+    nil
+}
+
+if let resolvedBackend {
+    log.debug(
+        "Selected MCP backend before initialize",
+        metadata: [
+            "requested": "\(String(describing: mode))",
+            "selected": "\(resolvedBackend.rawValue)"
+        ]
+    )
+}
+
 // Exec mode is a bounded one-shot command runner. Run it directly instead of
 // through ServiceGroup so completion exits deterministically.
 if case let .exec(options) = mode {
@@ -3506,40 +3680,30 @@ if case let .exec(options) = mode {
     }
 }
 
+if resolvedBackend == .headless {
+    do {
+        try await DirectHeadlessMCPService(logger: log).run()
+        exit(MCPCLIExitCode.ok.rawValue)
+    } catch {
+        fputs("RepoPrompt MCP headless: \(error)\n", stderr)
+        exit(MCPCLIExitCode.unknownError.rawValue)
+    }
+}
+
 /// Create appropriate service based on mode
 let service: any Service
 switch mode {
 case .proxy:
-    // In proxy mode, only show help when directly launched from a terminal.
-    // IMPORTANT: Do not infer "user mode" from a short stdin poll timeout.
-    // MCP hosts can legitimately take >200ms before sending initialize, and
-    // timing-based detection causes false exits during startup races.
-    let stdinIsTTY = isatty(STDIN_FILENO) != 0
-    let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
-    let hasNoUserArgs = CommandLine.arguments.count <= 1
-
-    if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
-        let usage = """
-        RepoPrompt MCP CLI
-
-        This command is designed to be used as an MCP server by host applications
-        (Claude Desktop, Cursor, etc.) or with explicit mode flags.
-
-        Quick start:
-          __RPCE_CLI__ -l                    # List available tools
-          __RPCE_CLI__ -e 'tree'             # Execute a command
-          __RPCE_CLI__ -i                    # Interactive REPL
-          __RPCE_CLI__ --help                # Full help
-
-        """.replacingOccurrences(of: "__RPCE_CLI__", with: cliDisplayCommand())
-        fputs(usage, stderr)
-        exit(0)
+    guard resolvedBackend == .app else {
+        fatalError("Headless direct service exits before app service composition")
     }
     service = MCPService()
 case let .interactive(options):
     service = InteractiveMCPService(options: options, logger: log)
 case let .exec(options):
     service = ExecMCPService(options: options, logger: log)
+case .policyAdministration:
+    fatalError("Policy administration exits before service composition")
 }
 
 /// Use a quiet logger for ServiceLifecycle to suppress internal debug output

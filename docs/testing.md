@@ -13,12 +13,23 @@ Add a test only when all four answers are concrete:
 
 Search existing direct and outcome-level coverage first. Prefer a test that fails against known-bad behavior. Do not add invocation-only, no-crash, non-nil-only, source-shape, symbol-presence, constant-restatement, arbitrary-sleep, or coverage-driven tests unless that fact is itself the contract and no stronger oracle exists.
 
-## Add a root or provider XCTest
+## Choose the lowest faithful layer
+
+- **Isolated core:** deterministic decisions, transformations, parsers, state machines, policy, invariants, and failure semantics.
+- **Provider package:** provider protocol, codec, translation, launch arguments, and model mapping under `Packages/RepoPromptAgentProviders/Tests`.
+- **Root SwiftPM:** module behavior without a GUI, including actors, persistence, fixtures, subprocess adapters, in-process MCP, and deterministic concurrency under `Tests/RepoPromptTests`.
+- **Runtime diagnostics:** assembled-app-only rendering, restoration, routing instrumentation, churn, or resource investigations. Require a bounded scenario, privacy-safe machine-readable evidence, entry point, and cleanup path.
+- **Live/packaged smoke:** real app/MCP wiring, bundle layout, embedded helpers, ownership, signing, provenance, and a few critical journeys.
+- **Structural guard:** last resort when executable behavior, compiler boundaries, lint, or guardrails cannot cheaply enforce a narrow constraint.
+
+Do not use smoke as the only protection for deterministic logic. Without a predeclared acceptance threshold, a benchmark is diagnostics rather than executable contract coverage.
+
+## Add and run root or provider XCTest coverage
 
 - **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests` and validate with `make dev-test`.
 - **Provider target:** place provider protocol, codec, translation, launch-argument, or model-mapping tests under `Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests` and validate with `make dev-provider-test`.
 - Keep one coherent contract per method. Labeled tables are appropriate when cases differ only by input, boundary, or expected outcome.
-- Control time, randomness, environment, resources, ordering, and concurrency. Prefer gates, clocks, or continuations over sleeps, and verify meaningful cleanup or ownership.
+- Control time, randomness, locale, environment, resources, ordering, and concurrency. Prefer gates, clocks, or continuations over sleeps, and verify meaningful cleanup or ownership.
 
 Focused daemon-coordinated examples:
 
@@ -29,29 +40,16 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests/testBehavior
 ```
 
-Use the narrowest relevant filter, then broaden only for the affected boundary.
-
-### Impacted local feedback lane
-
-For ordinary iteration, prefer the impacted lane over a full root run:
+Use the narrowest relevant filter while iterating. Broaden to the affected target or full suite when the change crosses shared infrastructure, package boundaries, generated surfaces, test harness behavior, or many unrelated suites:
 
 ```bash
-make dev-test-impacted RANGE=origin/main...HEAD
+make dev-test
+make dev-provider-test
 ```
 
-This calls `Scripts/test_suite_optimizer.py impacted` with the curated ledger, obtains changed files from `git diff --name-only`, prints exact selected XCTest IDs with reasons, includes a small smoke-floor suite set, reports heavy/opt-in tests skipped by `execution_tier`, and then invokes conductor with an exact XCTest filter. The selector is conservative: broad build/tooling/package/ledger boundaries report `full_root_required=true` instead of pretending a narrow subset is sufficient. Set `INCLUDE_HEAVY=1` only when intentionally running selected `codemap_e2e`, `scale`, `diagnostic`, `live_smoke`, or `release` rows and after setting any required environment gate.
+A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted app-test workflow discovers current methods through `swift test list`, counts methods per suite, assigns suites to four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. That CI mechanism is not a contributor-maintained registry.
 
-Full root `make dev-test` remains the explicit PR-ready/full local lane, nightly/merge/release lane, or fallback for broad changes. Do not use a green impacted run as evidence that broad package, build graph, conductor, ledger-schema, or generated-workspace changes are fully validated.
-
-For planning the remaining full root lane, generate runtime-balanced shards from ledger timing metadata:
-
-```bash
-make dev-test-shard-plan SHARDS=4
-```
-
-Shard plans use estimated `runtime_seconds`, not method count. Rows with heavy/opt-in tiers are excluded unless `INCLUDE_HEAVY=1` is supplied, and tests with shared-state tags still need isolation review before parallel execution.
-
-### Codemap-sensitive changes
+## Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
 
@@ -62,11 +60,11 @@ RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=ContextBuilderWorktreeInheritanceTes
 touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilderWorktreeInheritanceTests ; rm /tmp/RepoPromptCE-codemap-e2e-opt-in
 ```
 
-Run this strict gate when changes touch `Sources/RepoPrompt/Features/CodeMap/`, codemap paths in `Sources/RepoPrompt/Infrastructure/WorkspaceContext/`, `Sources/RepoPrompt/Infrastructure/SyntaxParsing/`, or `Sources/TreeSitterScannerSupport/`. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
+Run this strict gate when changes touch CodeMap generation, syntax parsing, or Tree-sitter support. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
 
-### Scale-sensitive contract gates
+## Scale-sensitive contract gates
 
-Routine root tests should use lower-cost boundary variants when they still exercise the same spill, merge, streaming, or retained-reader path. The 100K scale contracts that are intentionally retained for Git authority evidence, target seed plan manifests, namespace manifests, and accepted-ingress seeded replay are opt-in:
+Routine root tests should use lower-cost boundary variants when they still exercise the same spill, merge, streaming, or retained-reader path. High-cardinality contracts remain explicit opt-ins:
 
 ```bash
 RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.GitLoadedRootAuthorityEvidenceTests/testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBoundedWhenEnabled
@@ -75,191 +73,13 @@ RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespac
 RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.FileSystemAcceptedIngressBarrierTests/testSyntheticHundredThousandPathReplayWhenEnabled
 ```
 
-Use direct `swift test` for these explicit opt-in scale checks so the environment gate reaches the XCTest process. Prefer `make dev-test` for the lower-cost routine variants and ordinary focused validation.
+Use direct `swift test` only for these explicit environment-gated scale checks so the gate reaches the XCTest process. Prefer `make dev-test` for lower-cost routine variants and ordinary focused validation.
 
-Existing higher-scale overrides remain separate opt-ins, such as `RPCE_RUN_MILLION_RECORD_GIT_AUTHORITY_TESTS=1`, `RPCE_RUN_MILLION_ENTRY_TESTS=1`, and `REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=<count>`.
+## Performance and optimization evidence
 
-## Authoritative executable IDs
+Define the workload, acceptance threshold, comparable environment, sample count, warmup policy, source-state controls, invalid-sample rules, and retained evidence before measuring. Keep root and provider timings separate unless a derived serial estimate is clearly labeled. Diagnostic and wake-probe runs are lifecycle evidence, not valid timing samples.
 
-Never derive the executable census from source text or a stale build. Use:
-
-```bash
-make dev-test-list
-make dev-provider-test-list
-```
-
-Listed XCTest IDs have these shapes:
-
-```text
-RepoPromptTests.<Suite>/testMethod
-RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
-```
-
-The curated ledger prefixes the target:
-
-```text
-root/RepoPromptTests.<Suite>/testMethod
-provider/RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
-```
-
-Treat these strings as exact, case-sensitive identifiers.
-
-## Maintain the contract ledger surgically
-
-Every executable add, rename, consolidation, or removal requires an atomic, surgical update to `Scripts/Fixtures/test-suite-contract-ledger.tsv`. Never regenerate or overwrite the curated ledger. In particular, do not point `inventory --force` at it.
-
-The TSV header order is fixed. Every live row carries identity/location fields (`method_id`, `target`, `file`, `suite`, `method`, `domain`, `layer`, `execution_tier`), contract fields (`primary_contract_id`, `secondary_contract_tags`, `validation_class`, `scenario_count`, `fixture_ids`, `observable_oracle`, `failure_risk`), cost/ownership fields (`runtime_seconds`, `resource_cost_tags`, `shared_state_tags`, `lifecycle_owner`), and disposition fields (`current_disposition`, `replacement_method_id`, `preserved_scenario_delta`, `notes`).
-
-`execution_tier` is one of:
-
-- `fast` — cheap deterministic checks suitable for every impacted run;
-- `routine` — ordinary root SwiftPM checks selected by changed files/domains plus the smoke floor;
-- `integration` — higher-cost in-process integration checks, selected when directly impacted or explicitly requested;
-- `codemap_e2e` — strict codemap generation/ready-state coverage that requires the local codemap E2E opt-in gate;
-- `scale` — 100K/million or otherwise high-cardinality contracts that require explicit scale env gates;
-- `diagnostic` — benchmark, report-only, wake-probe, or investigative checks, never routine timing evidence;
-- `live_smoke` — packaged/running-app smoke coverage;
-- `release` — release/signing/artifact-sensitive validation.
-
-For every new or touched row:
-
-- use reviewed, specific contract, oracle, risk, validation-class, and lifecycle values rather than `unreviewed`;
-- set optional fixture/resource/shared-state tags when applicable and leave them blank only when none apply;
-- use `current_disposition=retain` for a new independent test or a reviewed retained test;
-- use `current_disposition=consolidated_replacement` for a live method replacing multiple old methods;
-- do not introduce `retain_pending_review`; it is initial-scaffold debt;
-- keep `replacement_method_id` blank on live rows because stale removed rows cannot remain in an exact-ID ledger;
-- use `preserved_scenario_delta=0` when scenarios are preserved, including table consolidation; justify any nonzero delta in `notes` and the handoff.
-
-### Scenario count
-
-`scenario_count` is the number of distinct input, boundary, outcome, fixture, or lifecycle scenarios protected by the method. It is **not** the assertion count. Consolidating methods into a table lowers executable method count without lowering scenario count unless coverage is deliberately removed.
-
-### Atomic rename, consolidation, and removal workflow
-
-1. Before editing, capture the authoritative target list, the exact old IDs, and scenario totals.
-2. Change the XCTest declarations and ledger rows in the same patch.
-3. **Rename:** replace the old live row with the new exact ID and record `old ID -> new ID` in `notes` and the handoff.
-4. **Consolidate:** delete every obsolete row, add the live replacement row(s), set each replacement's `scenario_count` to the preserved scenario total, and enumerate every exact old ID in `notes`. Record the complete `old IDs -> new ID` mapping in the handoff.
-5. **Remove without replacement:** delete the stale row and record `old ID -> removed` plus the duplicate, obsolete/non-contractual, or intentionally-unprotected rationale in the handoff. Campaign removals also go in the append-only scoreboard.
-6. Re-list, recount, and verify. No obsolete ID may remain, and no new ID may be absent.
-
-## Verify exact-ID reconciliation
-
-Run:
-
-```bash
-python3 Scripts/test_suite_optimizer.py verify-ledger \
-  --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv
-```
-
-This command validates the exact header schema, duplicate ledger IDs, and equality between live root/provider executable IDs and ledger IDs. It **does not** validate scenario totals, contract metadata completeness, disposition correctness, replacement mappings, or the truth of any descriptive field. Review those manually.
-
-## Summarize scenario totals
-
-Run this before and after a consolidation. Set `SUITES` to a comma-separated list of affected fully qualified suites. Save both outputs and report affected-suite and repository target totals.
-
-```bash
-SUITES='RepoPromptTests.ExampleTests' python3 - <<'PY'
-import csv, os
-from collections import Counter
-
-path = "Scripts/Fixtures/test-suite-contract-ledger.tsv"
-wanted = {s for s in os.environ.get("SUITES", "").split(",") if s}
-by_target, by_suite = Counter(), Counter()
-with open(path, encoding="utf-8", newline="") as handle:
-    for row in csv.DictReader(handle, delimiter="\t"):
-        count = int(row["scenario_count"])
-        by_target[row["target"]] += count
-        by_suite[(row["target"], row["suite"])] += count
-for target in sorted(by_target):
-    print(f"target\t{target}\t{by_target[target]}")
-print(f"repository\ttotal\t{sum(by_target.values())}")
-for (target, suite), count in sorted(by_suite.items()):
-    if not wanted or suite in wanted:
-        print(f"suite\t{target}\t{suite}\t{count}")
-PY
-```
-
-For consolidations, a zero repository and affected-suite scenario delta is the default acceptance criterion. Any intentional delta requires explicit contract-level justification.
-
-## Evidence tiers
-
-### Ordinary test changes
-
-At minimum, provide:
-
-1. the focused root or provider test command and result;
-2. the affected target's authoritative list command and result;
-3. the `verify-ledger` command and result;
-4. required style/guardrail validation from `AGENTS.md` when applicable.
-
-Default `.agents/skills/rpce-contribution-check/scripts/preflight.sh push` is a safety-only gate; test changes still need the smallest focused daemon tests, authoritative list commands, and ledger verification above. Use `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` for computed-outgoing-range path-selected local evidence, not routine iteration.
-
-Ordinary additions, fixes, renames, and removals do not need timing artifacts merely because the harness exists.
-
-### Optimization or performance campaigns
-
-In addition to ordinary evidence, create new append-only inventory, baseline, focused, and full-root artifacts under `docs/test-suite-optimizer/`. The active append-only scoreboard is `docs/test-suite-optimizer/scoreboard.md`, and committed optimizer JSON artifacts live under `docs/test-suite-optimizer/artifacts/`. Raw logs and copied conductor logs stay local/uncommitted; use ignored local scratch such as `docs/test-suite-optimizer/raw-logs/` when needed.
-
-Collect 3–5 comparable normal timing samples per measured series. Root and provider timings remain separate; report any root+provider value only as a derived secondary serial estimate. Use a fresh temporary generated ledger path when creating the append-only inventory artifact; never use the curated ledger as inventory output:
-
-```bash
-label=example-campaign
-campaign_dir="docs/test-suite-optimizer"
-artifact_dir="$campaign_dir/artifacts"
-scoreboard="$campaign_dir/scoreboard.md"
-inventory="$artifact_dir/test-suite-inventory-${label}.json"
-root_baseline="$artifact_dir/test-suite-baseline-root-${label}.json"
-provider_baseline="$artifact_dir/test-suite-baseline-provider-${label}.json"
-mkdir -p "$artifact_dir"
-tmpdir="$(mktemp -d)"
-python3 Scripts/test_suite_optimizer.py inventory \
-  --ledger "$tmpdir/generated-ledger.tsv" \
-  --output "$inventory"
-rm -rf "$tmpdir"
-
-python3 Scripts/test_suite_optimizer.py baseline \
-  --target root \
-  --samples 5 \
-  --label "$label" \
-  --inventory "$inventory" \
-  --scoreboard "$scoreboard" \
-  --output "$root_baseline" \
-  --source-change-guard metadata
-
-python3 Scripts/test_suite_optimizer.py baseline \
-  --target provider \
-  --samples 5 \
-  --label "$label" \
-  --inventory "$inventory" \
-  --scoreboard "$scoreboard" \
-  --output "$provider_baseline" \
-  --source-change-guard metadata
-```
-
-`--source-change-guard metadata` records path, size, and mtime metadata before and after each sample instead of hashing every source byte. It reduces measurement-tool overhead and cache perturbation but does not itself count as a suite-speed improvement; use the default content guard when strict byte-level immutability matters more than campaign overhead.
-
-During `baseline`, `Scripts/test_suite_optimizer.py` emits `test_suite_optimizer.progress {...}` lines to stderr at each sample start and end. These lines are live progress only; stdout remains the final JSON payload, and the written artifact plus scoreboard remain the authoritative timing evidence.
-
-Focused before/after evidence uses the same artifact path and append-only scoreboard, but is not the primary root metric unless followed by a complete root baseline:
-
-```bash
-focused="$artifact_dir/test-suite-focused-root-${label}-example.json"
-python3 Scripts/test_suite_optimizer.py baseline \
-  --target root \
-  --filter RepoPromptTests.ExampleTests \
-  --samples 5 \
-  --label "${label}-focused-example" \
-  --inventory "$inventory" \
-  --scoreboard "$scoreboard" \
-  --output "$focused" \
-  --source-change-guard metadata
-```
-
-Filtered baseline artifacts are marked `primary_metric_eligible=false` and include per-method `slowest_tests` rankings. `combine-baselines` accepts only comparable artifacts with the same target, scope, filter, and source-change guard, so complete and focused series cannot be pooled accidentally.
-
-Normal timing samples must not enable XCTest stall diagnostics or wake probes. Diagnostic/wake-probe runs are invalid timing samples and may be retained only as separate lifecycle evidence. The scoreboard must report median, observed p95, relative MAD/noise class, method/contract/scenario deltas, exact replacement/removal mappings, comparable sample counts, focused/full-root outcomes, provider outcomes when relevant, artifact paths, and sample validity.
+Use focused before/after measurements to attribute a change, then exercise the full affected boundary before making repository-wide performance claims. Store durable evidence only when it has continuing review value; otherwise keep raw logs and machine-specific samples local. Do not create a replacement executable registry, method census, append-only repository scoreboard, or mandatory artifact hierarchy merely to track test counts.
 
 ## Live Agent Mode file-tool performance diagnostic
 
@@ -301,8 +121,8 @@ requires a separately approved relaunch before invoking the script; label a run
 minimum existing Agent Mode session count and keeps aged and warm samples in
 separate distributions.
 
-This is a runtime diagnostic, not XCTest coverage. It does not add executable
-test IDs and must not change the curated test ledger.
+This is a runtime diagnostic, not XCTest coverage. It does not replace focused
+behavioral tests or the broader suite validation required by the changed boundary.
 
 ### Interactive-readiness iteration 0 campaign
 
@@ -1004,8 +824,7 @@ python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
 
 - Protected contract, plausible defect, chosen layer, and observable oracle.
 - Added/renamed/consolidated/removed exact IDs, including complete `old -> new/removed` mappings.
-- Surgical ledger update confirmed; curated ledger was not regenerated or overwritten.
-- `scenario_count` rationale and before/after affected-suite plus root/provider/repository totals for consolidations.
-- Exact focused test, list, ledger verification, style, and guardrail commands with exit results.
-- For campaigns only: append-only inventory/baseline/focused/root artifact paths, scoreboard entry, sample validity, and timing comparison.
+- Exact focused and broader validation commands with results appropriate to the changed boundary.
+- Style, guardrail, build, smoke, or packaging evidence when applicable.
+- For performance work: measurement protocol, retained evidence, sample validity, and timing comparison.
 - Any coverage deliberately omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.

@@ -34,30 +34,27 @@ Commit only when the test protects a current contract with plausible impact, fai
 
 Redesign or omit invocation-only, no-crash, non-nil-only, source-shape, symbol-presence, constant-restatement, report-only, arbitrary-sleep, coverage-driven, and omnibus tests unless that fact is the explicit contract and no stronger oracle exists.
 
-## Use the XCTest Harness
-
-- List authoritative executable IDs with `make dev-test-list` and `make dev-provider-test-list`.
-- Use exact ledger IDs shaped as `root/RepoPromptTests.<Suite>/testMethod` or `provider/RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod`.
-- For every executable add, rename, consolidation, or removal, edit `Scripts/Fixtures/test-suite-contract-ledger.tsv` surgically in the same patch. Never regenerate or overwrite the curated ledger.
-- Count `scenario_count` as distinct input, boundary, outcome, fixture, or lifecycle scenarios—not assertions. Preserve affected-suite and repository scenario totals across consolidation unless removal is explicitly justified.
-- Use reviewed metadata and `current_disposition=retain` for new/retained rows or `consolidated_replacement` for live replacements. Delete stale old rows, keep live-row `replacement_method_id` blank, and record exact old-to-new/removed mappings in replacement notes and the handoff.
-- Run `python3 Scripts/test_suite_optimizer.py verify-ledger --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv`. It checks schema, duplicates, and exact live-ID reconciliation only; it does not validate scenario totals or metadata completeness.
-
 ## Author and Validate
 
 Assert exact outcomes and negative boundaries. Keep one coherent contract per test; use labeled tables only for equivalent cases. Control time, randomness, locale, environment, resources, ordering, and concurrency; use gates, clocks, or continuations instead of sleeps. Use temporary resources and verify important cleanup or ownership. Add production seams only when narrow, deterministic, behavior-preserving, and justified.
 
-For ordinary changes, run the smallest focused daemon test, the affected target's authoritative list command, and ledger verification; follow repository style/guardrails as applicable. Do not launch the app for ordinary logic.
+Use exact XCTest filters shaped as `RepoPromptTests.<Suite>/testMethod` or `RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod`. For ordinary changes, run the smallest focused daemon test first:
 
-For optimization/performance campaigns, additionally preserve append-only inventory, baseline, focused, and full-root artifacts plus the scoreboard. Use 3–5 comparable normal samples; never count diagnostic or wake-probe runs as timing samples.
+```bash
+make dev-test FILTER=RepoPromptTests.<Suite>/testMethod
+make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
+```
+
+Broaden to the affected target or full suite when the change crosses shared infrastructure, package boundaries, generated surfaces, or test harness behavior. Follow repository style and guardrails as applicable. Do not launch the app for ordinary logic.
+
+For optimization or performance work, define the workload, acceptance threshold, comparable environment, sample validity rules, and retained evidence before measuring. Keep diagnostic and wake-probe runs separate from performance samples. Do not create a replacement test registry, executable census, or repository-wide scoreboard merely to track method counts.
 
 ## Required Handoff
 
 Report:
 
 - protected contract, plausible defect, layer, and oracle;
-- exact added/renamed/consolidated/removed IDs and old-to-new/removed mappings;
-- scenario-count rationale and before/after affected-suite plus repository totals for consolidations;
-- surgical ledger update and exact validation commands/results;
-- campaign artifact paths, scoreboard entry, and sample validity when applicable;
+- exact added, renamed, consolidated, or removed test IDs and mappings;
+- focused and broader validation commands/results appropriate to the changed boundary;
+- measurement protocol and sample validity when performance evidence is applicable;
 - coverage omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.

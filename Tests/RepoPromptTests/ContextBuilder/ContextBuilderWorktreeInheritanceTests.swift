@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
@@ -276,8 +277,11 @@ import XCTest
                         }
 
                     let runCodemapE2E = CodemapE2ETestGate.isEnabled
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: logicalFile.path,
                         searchPattern: worktreeSentinel,
                         probeCodeStructure: runCodemapE2E
@@ -641,12 +645,25 @@ import XCTest
                         fixture: fixture,
                         bindContext: false
                     )
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: logicalBranchOnly.path,
                         searchPattern: "DeferredOnlyAgentRoute",
                         probeCodeStructure: false
                     )
+
+                    let progressRecorder = ContextBuilderReviewProgressRecorder()
+                    fixture.contextA.window.mcpServer.installStageProgressSinkForTesting {
+                        _, tool, stage, message in
+                        guard tool == MCPWindowToolName.contextBuilder else { return }
+                        await progressRecorder.record(stage: stage, message: message)
+                    }
+                    defer {
+                        fixture.contextA.window.mcpServer.installStageProgressSinkForTesting(nil)
+                    }
 
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
                         _, _, routedSessionID, routedRunID, mode, _, selection, lookupContext, _, finalReviewAuthorization, _, _ in
@@ -690,6 +707,42 @@ import XCTest
                     )
                     let text = try toolResultText(response)
                     XCTAssertTrue(text.contains("generated deferred review"), text)
+
+                    let progress = await progressRecorder.snapshot()
+                    let runFinalizationCompleted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.runFinalization.displayName) completed"
+                        )
+                    })
+                    let selectionRenderingStarted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.selectionReplyRendering.displayName) started"
+                        )
+                    })
+                    let selectionRenderingCompleted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.selectionReplyRendering.displayName) completed"
+                        )
+                    })
+                    let reviewAuthorizationStarted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.reviewSelectionAuthorization.displayName) started"
+                        )
+                    })
+                    let reviewAuthorizationCompleted = try XCTUnwrap(progress.firstIndex {
+                        $0.message.contains(
+                            "\(ContextBuilderMCPProgressPhase.reviewSelectionAuthorization.displayName) completed"
+                        )
+                    })
+                    let generationStarted = try XCTUnwrap(progress.firstIndex {
+                        $0.stage == "generating" && $0.message == "Generating review..."
+                    })
+                    XCTAssertLessThan(runFinalizationCompleted, selectionRenderingStarted)
+                    XCTAssertLessThan(selectionRenderingStarted, selectionRenderingCompleted)
+                    XCTAssertLessThan(selectionRenderingCompleted, reviewAuthorizationStarted)
+                    XCTAssertLessThan(reviewAuthorizationStarted, reviewAuthorizationCompleted)
+                    XCTAssertLessThan(reviewAuthorizationCompleted, generationStarted)
+
                     XCTAssertEqual(state.providerCreationCount, 1)
                     XCTAssertEqual(state.followUps.count, 1)
                     XCTAssertEqual(
@@ -921,8 +974,11 @@ import XCTest
                     )
                     let endpoint = try fixture.endpointA()
                     try await configureAgentModeEndpoint(endpoint, context: frozenContext, fixture: fixture)
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: fixture.contextA.fileURL.path,
                         searchPattern: canonicalSentinel
                     )
@@ -1038,8 +1094,11 @@ import XCTest
                         context: frozenContext,
                         fixture: fixture
                     )
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: ceFile.path,
                         searchPattern: ceMarker,
                         publishImplicitGitArtifacts: true,
@@ -1248,8 +1307,11 @@ import XCTest
                         ),
                         seededSelectionRevision
                     )
+                    try await fixture.registerDomainWorkspace(fixture.contextA)
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextA.workspaceID,
+                        contextID: fixture.contextA.tabID,
                         logicalFilePath: fixture.contextA.fileURL.path,
                         searchPattern: canonicalSentinel
                     )
@@ -1812,18 +1874,54 @@ import XCTest
                     lease: lease,
                     contextBuilderProviderFactory: factory.makeProvider
                 )
+                let authorityRuntimeRoot = fixture.rootURL.appendingPathComponent(
+                    "inactive-workspace-domain-runtime",
+                    isDirectory: true
+                )
+                let authorityRuntime = MCPDomainRuntime(configuration: .init(
+                    mode: .standalone,
+                    profileIdentifier: "inactive-workspace-fixture-\(UUID().uuidString)",
+                    storageDirectory: authorityRuntimeRoot,
+                    workspaceStorageDirectory: authorityRuntimeRoot.appendingPathComponent("Workspaces", isDirectory: true),
+                    eventDirectory: authorityRuntimeRoot.appendingPathComponent("events", isDirectory: true),
+                    temporaryDirectory: authorityRuntimeRoot.appendingPathComponent("tmp", isDirectory: true),
+                    externalReloadInterval: nil
+                ))
                 let settings = GlobalSettingsStore.shared
                 let previousPresetSetting = settings.mcpShowModelPresets()
                 settings.setMCPShowModelPresets(false, commit: false)
                 defer { settings.setMCPShowModelPresets(previousPresetSetting, commit: false) }
 
                 do {
+                    try await authorityRuntime.start()
                     try await activateWorkspace(fixture.contextA)
                     let window = fixture.contextA.window
-                    let sourceWorkspaceB = try XCTUnwrap(
+                    var sourceWorkspaceB = try XCTUnwrap(
                         fixture.contextB.window.workspaceManager.workspaces.first {
                             $0.id == fixture.contextB.workspaceID
                         }
+                    )
+                    let authorityDirectory = fixture.rootURL.appendingPathComponent(
+                        "inactive-workspace-authority-\(fixture.contextB.workspaceID.uuidString)",
+                        isDirectory: true
+                    )
+                    sourceWorkspaceB.customStoragePath = authorityDirectory
+                    let authorityURL = authorityDirectory.appendingPathComponent("workspace.json")
+                    let authorityClient = DomainWorkspaceAuthorityClient(
+                        store: authorityRuntime.workspaceStore,
+                        windowID: -643
+                    )
+                    let authorityCreate = try await authorityClient.create(
+                        sourceWorkspaceB,
+                        fileURL: authorityURL
+                    )
+                    XCTAssertTrue(
+                        [.applied, .unchanged, .deduplicated].contains(authorityCreate.disposition)
+                    )
+                    XCTAssertEqual(authorityCreate.workspace?.document.fileURL, authorityURL)
+                    XCTAssertEqual(
+                        try Data(contentsOf: authorityURL),
+                        authorityCreate.workspace?.document.documentBytes
                     )
                     fixture.contextB.window.workspaceManager.workspaces.removeAll {
                         $0.id == fixture.contextB.workspaceID
@@ -1904,8 +2002,15 @@ import XCTest
                     await Task.yield()
 
                     let gate = cancelDuringRun ? ContextBuilderProbeGate() : nil
+                    try await fixture.registerDomainWorkspace(
+                        sourceWorkspaceB,
+                        rootURL: fixture.contextB.rootURL,
+                        windowID: window.windowID
+                    )
                     factory.configure(
                         networkManager: fixture.networkManager,
+                        workspaceID: fixture.contextB.workspaceID,
+                        contextID: fixture.contextB.tabID,
                         logicalFilePath: fixture.contextB.fileURL.path,
                         searchPattern: fixture.contextB.sentinel,
                         probeCodeStructure: false,
@@ -2171,8 +2276,11 @@ import XCTest
                             visibleOracleSessionIDs.union([persisted.session.id])
                         )
                     }
+                    _ = await authorityRuntime.shutdown()
                     await fixture.cleanup()
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: authorityDirectory.path))
                 } catch {
+                    _ = await authorityRuntime.shutdown()
                     await fixture.cleanup()
                     throw error
                 }
@@ -2180,14 +2288,24 @@ import XCTest
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
+            await context.window.workspaceManager.awaitInitialized()
             let workspace = try XCTUnwrap(
                 context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
             )
-            await context.window.workspaceManager.switchWorkspace(
+            let switchResult = await context.window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
                 reason: "ContextBuilderWorktreeInheritanceTests"
             )
+            guard switchResult.didSwitch, context.window.workspaceManager.activeWorkspaceID == workspace.id else {
+                throw NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: switchResult.message ?? "Project workspace did not become active"
+                    ]
+                )
+            }
             let activeWorkspace = try XCTUnwrap(context.window.workspaceManager.activeWorkspace)
             context.window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
 
@@ -2203,6 +2321,10 @@ import XCTest
             fixture: PersistentMCPTestFixture,
             bindContext: Bool = true
         ) async throws {
+            let fixtureContext = context.workspaceID == fixture.contextB.workspaceID
+                ? fixture.contextB
+                : fixture.contextA
+            try await fixture.registerDomainWorkspace(fixtureContext)
             if bindContext {
                 _ = try await endpoint.callTool(
                     name: "bind_context",
@@ -2210,17 +2332,61 @@ import XCTest
                 )
             }
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
-            try await fixture.networkManager.debugSeedConnectionRunRouting(
+            let runID = try XCTUnwrap(context.runID)
+            await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
-                runID: XCTUnwrap(context.runID),
+                runID: runID,
                 purpose: .agentModeRun,
                 windowID: context.windowID
+            )
+            if !bindContext {
+                _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.registerConnection(
+                    connectionID: endpoint.connectionID,
+                    operationID: UUID()
+                )
+            }
+            let registration = try await AppDomainRuntimeComposition.shared.runtime
+                .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
+            let workspaceID = try XCTUnwrap(context.workspaceID)
+            _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: workspaceID, contextID: context.tabID)
+                ),
+                operationID: UUID()
             )
             fixture.contextA.window.mcpServer.installFrozenTabContext(
                 clientID: endpoint.connectionID.uuidString,
                 clientName: endpoint.clientName,
                 context: context
             )
+            if !bindContext {
+                let runtime = AppDomainRuntimeComposition.shared.runtime
+                var registration = try? await runtime.routingCoordinator.currentRegistration(
+                    connectionID: endpoint.connectionID
+                )
+                if registration == nil {
+                    _ = await runtime.routingCoordinator.registerConnection(
+                        connectionID: endpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    registration = try await runtime.routingCoordinator.currentRegistration(
+                        connectionID: endpoint.connectionID
+                    )
+                }
+                _ = try await runtime.routingCoordinator.bind(
+                    connection: XCTUnwrap(registration),
+                    binding: .runScoped(
+                        runID: XCTUnwrap(context.runID),
+                        context: .init(
+                            workspaceID: workspaceID,
+                            contextID: context.tabID
+                        )
+                    ),
+                    operationID: UUID()
+                )
+            }
         }
 
         private func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {
@@ -2328,6 +2494,8 @@ import XCTest
     private final class ContextBuilderWorktreeProbeFactory {
         private struct Configuration {
             let networkManager: ServerNetworkManager
+            let workspaceID: UUID
+            let contextID: UUID
             let logicalFilePath: String
             let searchPattern: String
             let publishImplicitGitArtifacts: Bool
@@ -2345,6 +2513,8 @@ import XCTest
 
         func configure(
             networkManager: ServerNetworkManager,
+            workspaceID: UUID,
+            contextID: UUID,
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool = false,
@@ -2354,6 +2524,8 @@ import XCTest
         ) {
             configuration = Configuration(
                 networkManager: networkManager,
+                workspaceID: workspaceID,
+                contextID: contextID,
                 logicalFilePath: logicalFilePath,
                 searchPattern: searchPattern,
                 publishImplicitGitArtifacts: publishImplicitGitArtifacts,
@@ -2378,6 +2550,8 @@ import XCTest
             return ContextBuilderWorktreeProbeProvider(
                 state: state,
                 networkManager: configuration.networkManager,
+                workspaceID: configuration.workspaceID,
+                contextID: configuration.contextID,
                 logicalFilePath: configuration.logicalFilePath,
                 searchPattern: configuration.searchPattern,
                 publishImplicitGitArtifacts: configuration.publishImplicitGitArtifacts,
@@ -2393,6 +2567,8 @@ import XCTest
     private final class ContextBuilderWorktreeProbeProvider: HeadlessAgentProvider {
         private let state: ContextBuilderWorktreeProbeState
         private let networkManager: ServerNetworkManager
+        private let workspaceID: UUID
+        private let contextID: UUID
         private let logicalFilePath: String
         private let searchPattern: String
         private let publishImplicitGitArtifacts: Bool
@@ -2407,6 +2583,8 @@ import XCTest
         init(
             state: ContextBuilderWorktreeProbeState,
             networkManager: ServerNetworkManager,
+            workspaceID: UUID,
+            contextID: UUID,
             logicalFilePath: String,
             searchPattern: String,
             publishImplicitGitArtifacts: Bool,
@@ -2418,6 +2596,8 @@ import XCTest
         ) {
             self.state = state
             self.networkManager = networkManager
+            self.workspaceID = workspaceID
+            self.contextID = contextID
             self.logicalFilePath = logicalFilePath
             self.searchPattern = searchPattern
             self.publishImplicitGitArtifacts = publishImplicitGitArtifacts
@@ -2455,6 +2635,29 @@ import XCTest
                 ]
             )
             self.endpoint = endpoint
+
+            _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator
+                .registerConnection(connectionID: endpoint.connectionID, operationID: UUID())
+            let registration = try await AppDomainRuntimeComposition.shared.runtime.routingCoordinator
+                .currentRegistration(connectionID: endpoint.connectionID)
+            let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: workspaceID, contextID: contextID)
+                ),
+                operationID: UUID()
+            )
+            guard routingOutcome.disposition == .applied || routingOutcome.disposition == .unchanged else {
+                throw NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: routingOutcome.diagnostic
+                            ?? "Domain run routing was not established for the probe endpoint"
+                    ]
+                )
+            }
 
             let selectionBeforeRead = try await selectionObservation(endpoint.callTool(
                 name: MCPWindowToolName.manageSelection,
@@ -2743,6 +2946,23 @@ import XCTest
                 selection: selection,
                 lookupContext: lookupContext
             ))
+        }
+    }
+
+    private actor ContextBuilderReviewProgressRecorder {
+        struct Entry {
+            let stage: String
+            let message: String
+        }
+
+        private var entries: [Entry] = []
+
+        func record(stage: String, message: String) {
+            entries.append(Entry(stage: stage, message: message))
+        }
+
+        func snapshot() -> [Entry] {
+            entries
         }
     }
 

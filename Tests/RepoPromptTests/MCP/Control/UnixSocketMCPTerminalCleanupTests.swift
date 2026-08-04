@@ -154,6 +154,7 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                 connectionID: UUID(),
                 sessionToken: "startup-close-snapshot-test",
                 clientPid: Int(getpid()),
+                observedKernelPeerPID: Int(getpid()),
                 clientName: "startup-close-snapshot-test",
                 purpose: .unknown,
                 codeMapsDisabled: false,

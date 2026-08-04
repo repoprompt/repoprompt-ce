@@ -39,6 +39,7 @@ struct AgentInputBar: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     let oracleViewModel: OracleViewModel
     let promptManager: PromptViewModel
     let workspaceSearchService: WorkspaceSearchService
@@ -164,6 +165,7 @@ struct AgentInputBar: View {
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
             statusPillsUI: statusPillsUI,
+            openContextDrawerFiles: openContextDrawerFiles,
             oracleViewModel: oracleViewModel,
             promptManager: promptManager,
             selectionCoordinator: selectionCoordinator,
@@ -253,6 +255,7 @@ struct AgentComposerView: View, Equatable {
 
     @State private var localInputText: String = ""
     @State private var submissionLatch = AgentComposerSubmissionLatch()
+    @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -514,7 +517,18 @@ struct AgentComposerView: View, Equatable {
                 } else {
                     restoredText = event.text + "\n" + existing
                 }
+            case .replaceAlways:
+                if let operation = event.operation {
+                    restoredText = AgentComposerDraftRestorationReducer.apply(
+                        operation,
+                        to: localInputText,
+                        lastAppliedRestorationEventID: lastAppliedDraftRestorationEventIDByTab[event.tabID]
+                    )
+                } else {
+                    restoredText = event.text
+                }
             }
+            lastAppliedDraftRestorationEventIDByTab[event.tabID] = event.id
             setLocalInputText(restoredText, forceRevision: true)
             actions.storeDraft(event.tabID, restoredText)
             DispatchQueue.main.async {
@@ -644,7 +658,7 @@ struct AgentComposerView: View, Equatable {
                 transaction.animation = nil
             }
 
-            // Right side: Attach + Context indicator + Send/Cancel button
+            // Right side: Attach + Send/Cancel button
             HStack(spacing: 8) {
                 Button(action: pickImages) {
                     Image(systemName: "photo.badge.plus")
@@ -1257,13 +1271,21 @@ struct AgentComposerView: View, Equatable {
                         }
                     ))
                     .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
+
+                    Toggle("Local Memories", isOn: Binding(
+                        get: { codexTools.memoriesEnabled },
+                        set: { newValue in
+                            actions.applyCodexToolSettingMutation(.memories(enabled: newValue))
+                        }
+                    ))
+                    .hoverTooltip("Let Codex generate and reuse local memories across Agent Mode chats. Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.")
                 } header: {
                     Text("Tools")
                 }
 
                 Section {
                     if codexTools.mcpServerEntries.isEmpty {
-                        Text("No servers in ~/.codex/config.toml")
+                        Text("No servers in RepoPrompt's isolated Codex config")
                             .foregroundStyle(.tertiary)
                     } else {
                         ForEach(codexTools.mcpServerEntries, id: \.normalizedName) { entry in

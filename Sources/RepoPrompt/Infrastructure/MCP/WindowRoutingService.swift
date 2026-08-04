@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 import SwiftUI
 
 #if DEBUG
@@ -297,6 +298,8 @@ private extension Array {
 
 @MainActor
 final class WindowRoutingService: Service {
+    let domainRegistrationID = MCPDomainToolRegistrationID()
+
     nonisolated static func validateAddFolderWorkspace(_ workspace: WorkspaceModel) throws {
         guard workspace.isSystemWorkspace == false else {
             throw MCPError.invalidParams("Cannot add folders to system workspace '\(workspace.name)'. Create or switch to a regular workspace first.")
@@ -322,14 +325,10 @@ final class WindowRoutingService: Service {
     // ---------------------------------------------------------------------
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
-    private var previousDisabledTools: Set<String>
 
-    /// Thread-safe tools storage
+    /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
+    /// filtering and window selection are applied from live state outside this cache.
     private let toolsCache = ToolsCache()
-
-    // NotificationCenter observer tokens for cleanup
-    private var userDefaultsObserver: NSObjectProtocol?
-    private var windowCountObserver: NSObjectProtocol?
 
     // ---------------------------------------------------------------------
 
@@ -342,102 +341,23 @@ final class WindowRoutingService: Service {
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
-        previousDisabledTools = Set(UserDefaults.standard.stringArray(forKey: "mcp.disabledTools") ?? [])
-
-        // Initialize cached tools and register service
-        Task {
-            await updateCachedTools()
-
-            // Register only after tools are cached
-            ServiceRegistry.register(self)
-        }
-
-        // Listen for changes to relevant MCP settings
-        userDefaultsObserver = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-
-                let currentDisabledTools = Set(UserDefaults.standard.stringArray(forKey: "mcp.disabledTools") ?? [])
-
-                guard currentDisabledTools != self.previousDisabledTools else { return }
-                self.previousDisabledTools = currentDisabledTools
-
-                let previousTools = await self.tools
-                let previousToolNames = Set(previousTools.map(\.name))
-
-                await self.updateCachedTools()
-
-                let newTools = await self.tools
-                let newToolNames = Set(newTools.map(\.name))
-
-                let addedTools = newTools.filter { !previousToolNames.contains($0.name) }
-                if !addedTools.isEmpty {
-                    ToolAvailabilityStore.shared.registerTools(addedTools)
-                }
-
-                let removedToolNames = previousToolNames.subtracting(newToolNames)
-                if !removedToolNames.isEmpty {
-                    ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
-                }
-
-                await networkMgr.broadcastToolListChanged()
-            }
-        }
-
-        // Listen for window count changes
-        windowCountObserver = NotificationCenter.default.addObserver(
-            forName: .windowCountDidChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-
-                let previousTools = await self.tools
-                let previousToolNames = Set(previousTools.map(\.name))
-
-                // Update cached tools based on new window count
-                await self.updateCachedTools()
-
-                // Update tool availability store
-                let newTools = await self.tools
-                let newToolNames = Set(newTools.map(\.name))
-
-                // Register newly available tools
-                let addedTools = newTools.filter { !previousToolNames.contains($0.name) }
-                if !addedTools.isEmpty {
-                    ToolAvailabilityStore.shared.registerTools(addedTools)
-                }
-
-                // Unregister tools that are no longer available
-                let removedToolNames = previousToolNames.subtracting(newToolNames)
-                if !removedToolNames.isEmpty {
-                    ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
-                }
-
-                // Notify connected clients that the tool list has changed
-                await networkMgr.broadcastToolListChanged()
-            }
-        }
     }
 
-    // ---------------------------------------------------------------------
+    /// Materializes the static M1 routing definitions without publishing them.
+    /// The process composition batches this service with the other application
+    /// service so registration and availability become visible atomically.
+    @MainActor
+    func prepareDomainTools() async {
+        await updateCachedTools()
+    }
 
-    // MARK: Cleanup
-
-    /// ---------------------------------------------------------------------
-    deinit {
-        // Remove NotificationCenter observers to prevent crashes
-        if let observer = userDefaultsObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        if let observer = windowCountObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+    /// Materializes and registers the static M1 routing definitions. The process
+    /// composition owns the returned handle; constructing a service is inert.
+    @MainActor
+    @discardableResult
+    func registerDomainTools() async throws -> MCPDomainToolRegistrationResult {
+        await prepareDomainTools()
+        return try await AppDomainRuntimeComposition.shared.register(self)
     }
 
     // ---------------------------------------------------------------------
@@ -935,8 +855,6 @@ final class WindowRoutingService: Service {
         switch kind {
         case .tabContext:
             "tab_context"
-        case .windowOnly:
-            "window"
         case .unbound:
             "unbound"
         }
@@ -1903,10 +1821,33 @@ final class WindowRoutingService: Service {
         try await networkMgr.setActiveWindowForCurrentConnection(target.windowID)
     }
 
-    private func bindWindowOnly(windowID: Int, connectionID: UUID) async throws {
-        _ = try resolveWindowForBinding(windowID: windowID)
-        clearNonRunScopedBindingsAcrossWindows(for: connectionID)
-        try await networkMgr.setActiveWindowForCurrentConnection(windowID)
+    private func resolveActiveTabBindTarget(
+        windowID: Int,
+        expectedWorkspaceID: UUID? = nil,
+        matchedBy: String,
+        normalizedWorkingDirs: [String]? = nil
+    ) throws -> ResolvedBindTarget {
+        let window = try resolveWindowForBinding(windowID: windowID)
+        guard let workspace = window.workspaceManager.activeWorkspace,
+              expectedWorkspaceID == nil || workspace.id == expectedWorkspaceID,
+              let tab = workspace.composeTabs.first(where: { $0.id == workspace.activeComposeTabID })
+              ?? workspace.composeTabs.first
+        else {
+            throw MCPError.invalidParams(
+                "Window \(windowID) does not have the requested active workspace/tab context. Use bind_context op=list to discover available context_id values."
+            )
+        }
+        return ResolvedBindTarget(
+            windowID: window.windowID,
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            tabID: tab.id,
+            tabName: tab.name,
+            repoPaths: workspace.repoPaths,
+            matchedBy: matchedBy,
+            createdTab: false,
+            normalizedWorkingDirs: normalizedWorkingDirs
+        )
     }
 
     private func listBindContextWindows(
@@ -1979,13 +1920,14 @@ final class WindowRoutingService: Service {
                 - op: "list" | "status" | "bind" (required)
                 - working_dirs: string | string[]         (for bind: preferred — absolute workspace roots; exact match first, repo_paths superset fallback)
                 - context_id: string                      (for bind: canonical compose-tab context UUID from a previous list)
-                - window_id: integer                      (for list: filter to one window; for bind with working_dirs: disambiguate when multiple workspaces match; for bind alone: set window affinity)
+                - window_id: integer                      (for list: filter to one window; for bind: capture and explicitly bind that window's current workspace/tab context)
                 - create_if_missing: boolean              (for bind with working_dirs; create a new workspace after approval when no exact or superset workspace matches)
                 - tab_name: string                        (optional workspace name hint when creating via working_dirs + create_if_missing)
 
-                **Binding modes:**
-                - **Window affinity** (from working_dirs or window_id): routes tool calls to whichever tab is currently active in that window. Most agents should use this.
-                - **Tab binding** (from context_id): pins tool calls to a specific compose tab, even if you switch to another tab. Use when you need a stable context that won't change.
+                **Binding semantics:**
+                - working_dirs and window_id resolve the presentation target once, then explicitly bind the captured compose-tab context.
+                - context_id binds that exact compose tab directly.
+                - switching the visible tab later never redirects an existing binding.
 
                 **Discovery:**
                 - Use `bind_context list` to see what's currently open (windows, active workspaces, tabs, context_ids)
@@ -1994,7 +1936,7 @@ final class WindowRoutingService: Service {
                 inputSchema: .object(
                     properties: [
                         "op": .string(description: "Operation: 'list', 'status', or 'bind'", enum: ["list", "status", "bind"]),
-                        "window_id": .integer(description: "For list: filter to one window. For bind with working_dirs: disambiguate when multiple workspaces match. For bind alone: set window affinity."),
+                        "window_id": .integer(description: "For list: filter to one window. For bind: capture and explicitly bind that window's current workspace/tab context."),
                         "context_id": .string(description: "For bind: canonical compose-tab context UUID"),
                         "working_dirs": .string(description: "For bind: comma-separated absolute workspace root paths; exact match first, then repo_paths superset fallback"),
                         "create_if_missing": .boolean(description: "For bind with working_dirs: create a new workspace after approval if no exact or superset workspace matches"),
@@ -2078,14 +2020,23 @@ final class WindowRoutingService: Service {
                             connectionID: connectionID
                         )
 
-                        let unchanged = previousBinding.bindingKind == "window"
-                            && previousBinding.windowID == target.windowID
-                            && previousBinding.contextID == nil
+                        let tabTarget = try await MainActor.run {
+                            try self.resolveActiveTabBindTarget(
+                                windowID: target.windowID,
+                                expectedWorkspaceID: target.workspaceID,
+                                matchedBy: target.matchedBy,
+                                normalizedWorkingDirs: target.normalizedWorkingDirs
+                            )
+                        }
+                        let unchanged = previousBinding.bindingKind == "tab_context"
+                            && previousBinding.windowID == tabTarget.windowID
+                            && previousBinding.contextID == tabTarget.tabID
+                            && previousBinding.explicit
                             && !previousBinding.runScoped
                         if !unchanged {
-                            try await bindWindowOnly(windowID: target.windowID, connectionID: connectionID)
+                            try await bindTarget(tabTarget, connectionID: connectionID, clientName: clientName)
                         } else {
-                            try await networkMgr.setActiveWindowForCurrentConnection(target.windowID)
+                            try await networkMgr.setActiveWindowForCurrentConnection(tabTarget.windowID)
                         }
 
                         let binding = await currentBindingSummary(for: connectionID)
@@ -2101,13 +2052,20 @@ final class WindowRoutingService: Service {
                         )
                     case .windowID:
                         let windowID = request.windowID!
-                        let unchanged = previousBinding.bindingKind == "window"
-                            && previousBinding.windowID == windowID
-                            && previousBinding.contextID == nil
+                        let target = try await MainActor.run {
+                            try self.resolveActiveTabBindTarget(
+                                windowID: windowID,
+                                matchedBy: BindContextRequest.MatchKind.windowID.rawValue
+                            )
+                        }
+                        let unchanged = previousBinding.bindingKind == "tab_context"
+                            && previousBinding.windowID == target.windowID
+                            && previousBinding.contextID == target.tabID
+                            && previousBinding.explicit
                             && !previousBinding.runScoped
 
                         if !unchanged {
-                            try await bindWindowOnly(windowID: windowID, connectionID: connectionID)
+                            try await bindTarget(target, connectionID: connectionID, clientName: clientName)
                         } else {
                             try await networkMgr.setActiveWindowForCurrentConnection(windowID)
                         }

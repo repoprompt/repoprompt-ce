@@ -59,6 +59,33 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertEqual(window.promptManager.gitViewModel.test_pendingWindowCloseTaskCount, 0)
     }
 
+    func testPeriodicGitContextRefreshLoopCancelsAndDrainsOwnedDelay() async throws {
+        let refreshProbe = GitContextRefreshInvocationProbe()
+        let viewModel = GitViewModel(
+            gitContextRefreshIntervalNanoseconds: 5_000_000_000,
+            refreshGitContexts: { rootPaths in
+                await refreshProbe.record(rootPaths: rootPaths)
+                return []
+            }
+        )
+        let root = FolderViewModel(
+            folder: Folder(name: "root", path: "/tmp/git-refresh-owned-delay", modificationDate: Date()),
+            rootPath: "/tmp/git-refresh-owned-delay"
+        )
+        viewModel.updateRootFolders([root])
+        let refreshTask = try XCTUnwrap(viewModel.test_gitContextRefreshTask)
+        await Task.yield()
+
+        viewModel.prepareForWindowClose()
+        await viewModel.shutdownForWindowClose()
+
+        XCTAssertTrue(refreshTask.isCancelled)
+        XCTAssertFalse(viewModel.test_hasGitContextRefreshTask)
+        XCTAssertEqual(viewModel.test_pendingWindowCloseTaskCount, 0)
+        let invocationCount = await refreshProbe.invocationCount
+        XCTAssertEqual(invocationCount, 0)
+    }
+
     func testSuspendedGitContextRefreshDoesNotRetainViewModel() async throws {
         let refreshGate = GitContextRefreshGate()
         var viewModel: GitViewModel? = GitViewModel(
@@ -524,6 +551,14 @@ private actor APISettingsProviderValidationProbe {
 
     func recordStart() {
         startCount += 1
+    }
+}
+
+private actor GitContextRefreshInvocationProbe {
+    private(set) var invocationCount = 0
+
+    func record(rootPaths _: [String]) {
+        invocationCount += 1
     }
 }
 

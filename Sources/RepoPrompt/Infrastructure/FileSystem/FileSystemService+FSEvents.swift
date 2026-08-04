@@ -406,6 +406,11 @@ extension FileSystemService {
     }
 
     func stopFSEventStream() {
+        if seedWatcherActivationFlushInProgress {
+            seedWatcherActivationStopRequested = true
+            resetWatcherIngressState()
+            return
+        }
         if let stream = fseventStreamRef {
             nextFSEventStreamStartEventID = max(
                 nextFSEventStreamStartEventID,

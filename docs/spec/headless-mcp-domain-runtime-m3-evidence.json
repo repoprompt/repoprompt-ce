@@ -1,0 +1,113 @@
+{
+  "milestone": "M3",
+  "stack_base": "feature/headless-runtime-m2-context-authority",
+  "shared_provider": "MCPDomainReadToolProvider",
+  "shared_definition_source": "Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift",
+  "tools": [
+    "get_code_structure",
+    "get_file_tree",
+    "read_file",
+    "file_search",
+    "workspace_context",
+    "prompt",
+    "oracle_chat_log",
+    "git",
+    "history"
+  ],
+  "context_contract": {
+    "type": "DomainReadInvocationContext",
+    "contains_window_identity": false,
+    "workspace_independent": ["history", "oracle_chat_log"],
+    "workspace_optional": ["get_file_tree", "git"],
+    "workspace_required": ["get_code_structure", "read_file", "file_search", "workspace_context", "prompt"],
+    "awaited_transient_authority_registration": true,
+    "transient_registration_persists_catalog": false,
+    "required_context_allows_nil_handle": false,
+    "direct_test_fallback_uses_registered_domain_handle": true,
+    "app_execution_snapshot_registered_and_released_per_invocation": true,
+    "backend_consumes_captured_routing_and_lookup_snapshot": true,
+    "post_drain_selection_refresh_scope": "bound_workspace_tab_selection_and_revision_only",
+    "main_actor_capture_per_scoped_invocation": 1,
+    "main_actor_capture_per_independent_invocation": 0,
+    "read_mutates_presentation_descriptor": false,
+    "consumed_fences": [
+      "runtime_generation",
+      "connection_generation",
+      "bound_entity_identity",
+      "workspace_revision",
+      "context_revision"
+    ],
+    "ignored_unrelated_fences": [
+      "global_routing_revision",
+      "unrelated_window_presentation_revision"
+    ]
+  },
+  "side_effect_contract": {
+    "owner": "DomainReadSideEffectCoordinator",
+    "revision_scope": "domain_context_identity_and_effect_class",
+    "effect_classes": ["selection", "git_artifacts"],
+    "same_class_same_context_serialized": true,
+    "independent_effect_classes_serialized": false,
+    "exact_retry_deduplicated": true,
+    "collision_fails_closed": true,
+    "earlier_failure_poisoning": false,
+    "exact_submitter_observes_failure": true,
+    "caller_cancellation_propagated": true,
+    "shutdown_cancels_pending": true,
+    "operation_ledger_bounded": true,
+    "expired_receipt_ledger_bounded": true,
+    "expired_exact_wait_fails_closed": true,
+    "drain_cancellation_does_not_cancel_shared_effect": true,
+    "read_search_queue_admitted_before_response": true,
+    "git_artifacts_committed_before_response": true
+  },
+  "catalog_parity": {
+    "golden_changed": false,
+    "test": "RepoPromptTests.ToolCatalogSnapshotTests/testWindowToolCatalogSignatureMatchesGolden"
+  },
+  "latency_contention_evidence": {
+    "measurement_kind": "bounded_in_process_same_backend_comparison",
+    "test": "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testDirectBackendVersusM3ProviderWrapperLatencyIsBounded",
+    "iterations": 1000,
+    "direct_backend_total_nanoseconds": 110625,
+    "provider_wrapper_total_nanoseconds": 709083,
+    "provider_wrapper_overhead_per_call_nanoseconds": 598,
+    "asserted_maximum_overhead_per_call_nanoseconds": 100000,
+    "comparable_scope": "provider orchestration only; same no-I/O injected backend; not an M0 EditFlowPerf sample",
+    "not_comparable_to_m0_editflowperf_json": true,
+    "live_relaunch_performed": false,
+    "contention_tests": [
+      "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testSameContextSerializesSelectionButDoesNotBlockGitArtifacts",
+      "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testIndependentReadBackendsDoNotContendOnSideEffectCoordinator"
+    ]
+  },
+  "validation": {
+    "owner_tests": {
+      "MCPDomainReadToolProviderTests": {"executed": 9, "failures": 0},
+      "DomainReadSideEffectCoordinatorTests": {"executed": 7, "failures": 0},
+      "DomainWorkspaceContextAuthorityTests": {"executed": 12, "failures": 0}
+    },
+    "review_reproduction_suites": {
+      "MCPCodeStructureWorktreeTests": {"executed": 9, "failures": 0},
+      "WorktreeAPISmokeHarnessTests": {"executed": 5, "failures": 0}
+    },
+    "broad_app_parity": {
+      "executed": 102,
+      "failures": 0,
+      "families": ["read", "search", "history", "git_artifacts", "oracle_worktree", "watchdog", "persistent_connections"]
+    }
+  },
+  "cancellation_evidence": [
+    "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testCancellationPropagatesWithoutSuccessNormalization",
+    "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testShutdownRejectsNewEffectsAndCancelsPendingWork",
+    "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testCancellingDrainDoesNotWaitForOrCancelSharedEffect"
+  ],
+  "excluded": [
+    "protected_mutation_policy",
+    "ai_sends",
+    "agent_execution",
+    "context_builder_execution",
+    "direct_stdio_host_backend",
+    "m4_plus"
+  ]
+}

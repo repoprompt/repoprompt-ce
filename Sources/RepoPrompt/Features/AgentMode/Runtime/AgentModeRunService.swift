@@ -31,6 +31,7 @@ final class AgentModeRunService {
     enum CancellationIntent {
         case userStop
         case executionLocationChange
+        case runtimeShutdown
     }
 
     enum CancellationCompletion: Equatable {
@@ -46,6 +47,10 @@ final class AgentModeRunService {
         case replaceIfEmpty
         /// Always prepend the restored text, even if the user has started typing.
         case prependAlways
+        /// Replace the composer content with the restored text. Used when the
+        /// caller has already composed the restored draft together with any
+        /// newer typing, so applying the event again must not re-prepend.
+        case replaceAlways
     }
 
     struct Hooks {
@@ -994,6 +999,8 @@ final class AgentModeRunService {
             restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
         case .executionLocationChange:
             restoreAllQueuedDraftsForExecutionLocationChange(tabID: tabID, session: session, strategy: .prependAlways)
+        case .runtimeShutdown:
+            break
         }
 
         let hadPendingTokenQueue = !session.pendingNonCodexUserInputTokenQueue.isEmpty
@@ -1014,9 +1021,14 @@ final class AgentModeRunService {
         }
 
         // Cancel all active MCP tool executions for this run (all providers) before stopping providers.
+        let cancellationReason = switch intent {
+        case .userStop: "user_stop"
+        case .executionLocationChange: "execution_location_change"
+        case .runtimeShutdown: "runtime_shutdown"
+        }
         cancelToolsBeforeStoppingProvider(
             session: session,
-            reason: intent == .executionLocationChange ? "execution_location_change" : "user_stop"
+            reason: cancellationReason
         )
 
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.cancel")

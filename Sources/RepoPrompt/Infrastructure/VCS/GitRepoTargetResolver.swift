@@ -102,13 +102,48 @@ struct GitRepoTargetResolver {
     func resolveWorktree(
         selector rawSelector: String?,
         repo: GitRepoDescriptor,
-        allRepos: [GitRepoDescriptor]
+        allRepos: [GitRepoDescriptor],
+        authorizedRoots: [WorkspaceRootRef]? = nil
     ) async throws -> GitWorktreeDescriptor {
         let worktree = try await resolveWorktreeDescriptor(
             selector: rawSelector,
             repo: repo,
             allRepos: allRepos
         )
+        if let authorizedRoots {
+            let rootPaths = authorizedRoots.map(\.standardizedFullPath)
+            let isInsideLoadedRoot = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                worktree.path,
+                roots: rootPaths
+            )
+            // `worktree` was just obtained from `git worktree list`; authorize its external
+            // checkout path only when another checkout of the same repository is loaded and
+            // the target independently resolves as that exact repository root.
+            let mainRepositoryIsLoaded = worktree.repository.mainWorktreeRoot.map {
+                GitRepoRootAuthorization.isPathWithinAuthorizedRoots($0, roots: rootPaths)
+            } ?? false
+            let loadedRepositoryWorktrees = await mainRepositoryIsLoaded
+                ? []
+                : (try? dependencies.listWorktrees(repo)) ?? []
+            let matchingLinkedRepositoryIsLoaded = loadedRepositoryWorktrees.contains { candidate in
+                GitRepoRootAuthorization.isPathWithinAuthorizedRoots(candidate.path, roots: rootPaths)
+                    && candidate.repository.repositoryID == worktree.repository.repositoryID
+                    && samePath(candidate.repository.commonGitDir, worktree.repository.commonGitDir)
+            }
+            let advertisingRepositoryIsLoaded = mainRepositoryIsLoaded || matchingLinkedRepositoryIsLoaded
+            let resolvedWorktree = !isInsideLoadedRoot && advertisingRepositoryIsLoaded
+                ? await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path))
+                : nil
+            let isVerifiedLinkedWorktree = resolvedWorktree.map {
+                samePath($0.rootPath, worktree.path)
+            } ?? false
+            guard isInsideLoadedRoot || isVerifiedLinkedWorktree else {
+                let rootsList = rootPaths.joined(separator: ", ")
+                throw GitRepoTargetResolverError.invalidParams(
+                    "worktree path must be inside a loaded root or advertised by a loaded repository. Received: \(worktree.path). Loaded roots: \(rootsList)"
+                )
+            }
+        }
         // Fail closed on stale/prunable worktrees. Git reports a worktree as prunable when its
         // gitdir points to a non-existent location (the checkout was removed or left incomplete).
         // Binding a session to such a worktree, or operating on it, would crawl and search an
@@ -219,8 +254,9 @@ struct GitRepoTargetResolver {
                 trimmed,
                 in: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
                 selectorKind: .path
-            ) {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+            ), let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path)),
+            samePath(resolved.rootPath, worktree.path) {
+                return resolved
             }
 
             let rootsList = visibleRootPaths.joined(separator: ", ")

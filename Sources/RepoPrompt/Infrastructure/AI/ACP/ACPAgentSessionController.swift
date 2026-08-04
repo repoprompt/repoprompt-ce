@@ -1904,7 +1904,9 @@ actor ACPAgentSessionController {
                 enableDebugLogging: launchConfiguration.enableDebugLogging
             )
         )
-        return result.environment
+        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(
+            into: result.environment
+        )
     }
 
     private func beginOpeningSessionConfiguration() {

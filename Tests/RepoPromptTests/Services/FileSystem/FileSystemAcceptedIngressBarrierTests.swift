@@ -607,6 +607,67 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         ])
     }
 
+    func testSeedWatcherFlushRunnerCompletesBeforeDeadline() async {
+        let runner = FileSystemSeedWatcherFlushRunner(
+            label: "com.repoprompt.tests.seed-watcher-flush-completes"
+        )
+
+        let attempt = await runner.run(timeoutNanoseconds: NSEC_PER_SEC) {}
+
+        XCTAssertTrue(attempt.completedBeforeDeadline)
+        await attempt.completion.value
+    }
+
+    func testSeedWatcherFlushRunnerRejectsConcurrentOperationAfterTimeout() async {
+        let runner = FileSystemSeedWatcherFlushRunner(
+            label: "com.repoprompt.tests.seed-watcher-flush-admission"
+        )
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let unexpectedStart = DispatchSemaphore(value: 0)
+
+        let first = await runner.run(timeoutNanoseconds: 20 * NSEC_PER_MSEC) {
+            started.signal()
+            release.wait()
+        }
+        XCTAssertFalse(first.completedBeforeDeadline)
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+
+        let secondStart = DispatchTime.now().uptimeNanoseconds
+        let second = await runner.run(timeoutNanoseconds: NSEC_PER_SEC) {
+            unexpectedStart.signal()
+        }
+        let secondElapsed = DispatchTime.now().uptimeNanoseconds - secondStart
+
+        XCTAssertFalse(second.completedBeforeDeadline)
+        XCTAssertLessThan(secondElapsed, 100 * NSEC_PER_MSEC)
+        XCTAssertEqual(unexpectedStart.wait(timeout: .now()), .timedOut)
+        release.signal()
+        await first.completion.value
+        await second.completion.value
+    }
+
+    func testSeedWatcherFlushRunnerTimesOutWithoutBlockingCaller() async {
+        let runner = FileSystemSeedWatcherFlushRunner(
+            label: "com.repoprompt.tests.seed-watcher-flush-timeout"
+        )
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let start = DispatchTime.now().uptimeNanoseconds
+
+        let attempt = await runner.run(timeoutNanoseconds: 20 * NSEC_PER_MSEC) {
+            started.signal()
+            release.wait()
+        }
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+
+        XCTAssertFalse(attempt.completedBeforeDeadline)
+        XCTAssertLessThan(elapsed, 500 * NSEC_PER_MSEC)
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+        release.signal()
+        await attempt.completion.value
+    }
+
     private func makeService(
         root: URL,
         maxPendingWatcherIngressEntries: Int? = nil

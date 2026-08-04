@@ -25,9 +25,11 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 chatID: session.id.uuidString.lowercased(),
                 workspaceID: workspaceID,
                 tabID: tabID,
-                generation: 4
+                generation: 4,
+                presentation: .generatedAnswerReadOnly
             )
         )
+        XCTAssertEqual(request.presentation, .generatedAnswerReadOnly)
         XCTAssertTrue(
             AgentOraclePillLogic.shouldPresent(
                 session: session,
@@ -80,6 +82,17 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 currentWorkspaceID: UUID(),
                 currentTabID: tabID
             )
+        )
+    }
+
+    func testTranscriptActionPolicyMatchesPopoverPresentation() {
+        XCTAssertEqual(
+            AgentOraclePillLogic.transcriptActionPolicy(for: .standard),
+            .standard
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.transcriptActionPolicy(for: .generatedAnswerReadOnly),
+            .nonMutating
         )
     }
 

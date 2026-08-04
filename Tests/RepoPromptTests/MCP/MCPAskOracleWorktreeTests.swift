@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
@@ -15,11 +16,29 @@ import XCTest
             try await super.tearDown()
         }
 
+        func testOracleCleanupHelperInvokesAIQueriesServiceDelete() async {
+            let recorder = OracleCleanupRecorder()
+            let oracle = makeOracleViewModel(cleanupRecorder: recorder)
+            let handle = ProviderConversationCleanupHandle(
+                provider: "test-provider",
+                conversationID: "oracle-thread"
+            )
+
+            await oracle.cleanupOracleProviderConversation(handle, model: .claude4Sonnet)
+
+            let calls = recorder.calls()
+            XCTAssertEqual(calls.count, 1)
+            XCTAssertEqual(calls.first?.handle, handle)
+            XCTAssertEqual(calls.first?.model, .claude4Sonnet)
+            XCTAssertEqual(calls.first?.action, .delete)
+        }
+
         func testExplicitWindowProvenanceEndsBeforePostProviderHooks() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 try await activateWorkspace(fixture.contextA)
-                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                let serverStarted = await fixture.contextA.window.mcpServer.startServer()
+                XCTAssertTrue(serverStarted)
                 WindowStatesManager.shared.registerWindowState(fixture.contextA.window)
                 let manager = fixture.networkManager
                 let capture = ExplicitWindowRoutingHintCapture()
@@ -778,7 +797,7 @@ import XCTest
                     XCTAssertTrue(previewResponse.rawJSON.contains("MAP.txt"))
                     XCTAssertTrue(previewResponse.rawJSON.contains("all.patch"))
 
-                    _ = try await endpoint.callTool(
+                    let removeResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.manageSelection,
                         arguments: [
                             "op": "remove",
@@ -788,6 +807,7 @@ import XCTest
                         ],
                         timeoutSeconds: 20
                     )
+                    XCTAssertFalse(removeResponse.rawJSON.contains("\"isError\":true"), removeResponse.rawJSON)
                     let removedSelection = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(
                             with: fixture.contextA.tabID
@@ -805,6 +825,7 @@ import XCTest
                         ],
                         timeoutSeconds: 20
                     )
+                    XCTAssertFalse(readdedResponse.rawJSON.contains("\"isError\":true"), readdedResponse.rawJSON)
                     XCTAssertTrue(readdedResponse.rawJSON.contains("MAP.txt"))
                     XCTAssertTrue(readdedResponse.rawJSON.contains("all.patch"))
                     _ = try await endpoint.callTool(
@@ -1297,6 +1318,7 @@ import XCTest
                         "detach": .bool(true),
                         "timeout": .int(0)
                     ])
+                    window.mcpServer.setRequestMetadataOverrideForTesting(nil)
                     let startObject = try XCTUnwrap(startValue.objectValue)
                     let startSession = try XCTUnwrap(startObject["session"]?.objectValue)
                     let targetSessionID = try XCTUnwrap(
@@ -2147,10 +2169,12 @@ import XCTest
                             )
                         }
                         if bindings.isEmpty {
+                            window.mcpServer.setRequestMetadataOverrideForTesting(nil)
                             try await configureAgentModeEndpoint(
                                 endpoint,
                                 context: childContext,
-                                fixture: fixture
+                                fixture: fixture,
+                                permitImmutableRunBindingForEndpointReuse: true
                             )
                         } else {
                             let childOracleClientName = "linked-public-child-oracle"
@@ -2213,10 +2237,25 @@ import XCTest
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> {
                                 continuation in
                                 continuation.yield(ChatStreamOutput(
+                                    text: "ignored transport activity",
+                                    reasoning: "ignored transport reasoning",
+                                    tokens: ChatTokenInfo(
+                                        promptTokens: 91,
+                                        completionTokens: 92,
+                                        cost: 93
+                                    ),
+                                    terminalOutcome: .completed,
+                                    cleanupHandle: ProviderConversationCleanupHandle(
+                                        provider: "ignored",
+                                        conversationID: "ignored"
+                                    ),
+                                    isTransportActivity: true
+                                ))
+                                continuation.yield(ChatStreamOutput(
                                     text: "transported oracle response",
                                     reasoning: nil,
                                     tokens: ChatTokenInfo(),
-                                    isFinal: true
+                                    terminalOutcome: .completed
                                 ))
                                 continuation.finish()
                             }
@@ -2252,6 +2291,10 @@ import XCTest
                             freshValue.objectValue?["response"]?.stringValue?
                                 .contains("transported oracle response") == true
                         )
+                        XCTAssertFalse(
+                            freshValue.objectValue?["response"]?.stringValue?
+                                .contains("ignored transport activity") == true
+                        )
                     } else {
                         let freshResponse = try await endpoint.callTool(
                             name: MCPWindowToolName.askOracle,
@@ -2261,11 +2304,9 @@ import XCTest
                             ],
                             timeoutSeconds: 30
                         )
-                        XCTAssertTrue(
-                            try toolResultText(freshResponse).contains(
-                                "transported oracle response"
-                            )
-                        )
+                        let freshText = try toolResultText(freshResponse)
+                        XCTAssertTrue(freshText.contains("transported oracle response"))
+                        XCTAssertFalse(freshText.contains("ignored transport activity"))
                     }
                     let sessionDescriptions = oracleViewModel.sessions.map {
                         "tab=\($0.composeTabID) session=\(String(describing: $0.agentModeSessionID)) run=\(String(describing: $0.agentModeRunID))"
@@ -2297,6 +2338,10 @@ import XCTest
                             continuingValue.objectValue?["response"]?.stringValue?
                                 .contains("transported oracle response") == true
                         )
+                        XCTAssertFalse(
+                            continuingValue.objectValue?["response"]?.stringValue?
+                                .contains("ignored transport activity") == true
+                        )
                     } else {
                         let continuingResponse = try await endpoint.callTool(
                             name: MCPWindowToolName.askOracle,
@@ -2307,11 +2352,9 @@ import XCTest
                             ],
                             timeoutSeconds: 30
                         )
-                        XCTAssertTrue(
-                            try toolResultText(continuingResponse).contains(
-                                "transported oracle response"
-                            )
-                        )
+                        let continuingText = try toolResultText(continuingResponse)
+                        XCTAssertTrue(continuingText.contains("transported oracle response"))
+                        XCTAssertFalse(continuingText.contains("ignored transport activity"))
                     }
                     let continuingSessionIDs = Set(
                         oracleViewModel.sessions.compactMap { session in
@@ -2739,18 +2782,43 @@ import XCTest
         private func configureAgentModeEndpoint(
             _ endpoint: PersistentMCPTestEndpoint,
             context: MCPServerViewModel.TabContextSnapshot,
-            fixture: PersistentMCPTestFixture
+            fixture: PersistentMCPTestFixture,
+            permitImmutableRunBindingForEndpointReuse: Bool = false
         ) async throws {
-            _ = try await endpoint.callTool(
+            try await fixture.registerDomainWorkspace(fixture.contextA)
+            let bindResponse = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
             )
+            XCTAssertFalse(bindResponse.rawJSON.contains("\"isError\":true"), bindResponse.rawJSON)
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+            let runID = try XCTUnwrap(context.runID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
-                runID: XCTUnwrap(context.runID),
+                runID: runID,
                 purpose: .agentModeRun,
                 windowID: context.windowID
+            )
+            let registration = try await AppDomainRuntimeComposition.shared.runtime
+                .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
+            let workspaceID = try XCTUnwrap(context.workspaceID)
+            let routingOutcome = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                connection: registration,
+                binding: .runScoped(
+                    runID: runID,
+                    context: .init(workspaceID: workspaceID, contextID: context.tabID)
+                ),
+                operationID: UUID()
+            )
+            let routingEstablished = routingOutcome.disposition == .applied
+                || routingOutcome.disposition == .unchanged
+                || (
+                    permitImmutableRunBindingForEndpointReuse
+                        && routingOutcome.diagnostic == "run_scoped_binding_is_immutable"
+                )
+            XCTAssertTrue(
+                routingEstablished,
+                routingOutcome.diagnostic ?? "Domain run routing was not established"
             )
             await fixture.networkManager.debugSetAdditionalTools(
                 for: endpoint.connectionID,
@@ -2766,6 +2834,21 @@ import XCTest
                 clientName: endpoint.clientName,
                 context: context
             )
+            for _ in 0 ..< 200 {
+                let securityContext = await fixture.networkManager
+                    .debugDomainInvocationSecurityContextForTesting(
+                        connectionID: endpoint.connectionID,
+                        toolName: MCPWindowToolName.askOracle
+                    )
+                if securityContext.hasAuthoritativeRoutingContext,
+                   securityContext.workspaceID == workspaceID,
+                   !securityContext.authorizedCanonicalRoots.isEmpty
+                {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTFail("Oracle test routing context did not become authoritative")
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
@@ -3222,6 +3305,71 @@ import XCTest
             for waiter in waiters {
                 waiter.resume()
             }
+        }
+    }
+
+    @MainActor
+    private func makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder) -> OracleViewModel {
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let aiQueriesService = AIQueriesService(
+            keyManager: keyManager,
+            cleanupProviderConversationOverride: { handle, model, action in
+                cleanupRecorder.record(handle: handle, model: model, action: action)
+                return .succeeded(message: "oracle cleanup")
+            }
+        )
+        let fileManager = WorkspaceFilesViewModel()
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -298,
+            settingsManager: WindowSettingsManager(windowID: -298)
+        )
+        let workspaceManager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        return OracleViewModel(
+            aiQueriesService: aiQueriesService,
+            promptViewModel: prompt,
+            workspaceManager: workspaceManager,
+            chatData: ChatDataService()
+        )
+    }
+
+    private final class OracleCleanupRecorder: @unchecked Sendable {
+        struct Call {
+            let handle: ProviderConversationCleanupHandle
+            let model: AIModel
+            let action: ProviderConversationCleanupAction
+        }
+
+        private let lock = NSLock()
+        private var recordedCalls: [Call] = []
+
+        func record(
+            handle: ProviderConversationCleanupHandle,
+            model: AIModel,
+            action: ProviderConversationCleanupAction
+        ) {
+            lock.lock()
+            recordedCalls.append(.init(handle: handle, model: model, action: action))
+            lock.unlock()
+        }
+
+        func calls() -> [Call] {
+            lock.lock()
+            let calls = recordedCalls
+            lock.unlock()
+            return calls
         }
     }
 #endif

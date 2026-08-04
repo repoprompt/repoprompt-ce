@@ -1,6 +1,18 @@
 import Foundation
 import MCP // <- required for `Value`
 
+private actor OracleProviderCleanupHandleBox {
+    private var handle: ProviderConversationCleanupHandle?
+
+    func update(_ handle: ProviderConversationCleanupHandle) {
+        self.handle = handle
+    }
+
+    func current() -> ProviderConversationCleanupHandle? {
+        handle
+    }
+}
+
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
 extension OracleViewModel {
@@ -1185,33 +1197,28 @@ extension OracleViewModel {
                 reviewGitContextOverride: reviewGitContextOverride
             )
         }
+        let queryId: UUID?
         #if DEBUG
             let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
                 tabContext: tabContext,
                 observer: oracleReviewPackagingTraceObserverForTesting
             )
-            await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
+            queryId = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
         #else
-            await send()
+            queryId = await send()
         #endif
-        let queryId = activeQueryId(for: chatID) ?? currentQueryId
-
-        if let q = queryId {
-            try await waitUntilMessageFinalised(q)
+        guard let queryId else {
+            throw OracleContextBuilderCompletionError.missingExactQuery
         }
+        let response = try await waitForContextBuilderCompletion(queryId)
 
         // ────────── 6. Build typed reply ──────────
-        let errors: [String] = []
-        let aiMsg = queryId.flatMap { id in
-            getChatMessage(withId: id)
-        }.flatMap { $0.isUser ? nil : $0 }
-
         let replyObj = ChatSendReply(
             chatId: chatID,
             shortId: sessions.first(where: { $0.id == chatID })?.shortID ?? "",
             mode: mode,
-            response: aiMsg?.content,
-            errors: errors.isEmpty ? nil : errors
+            response: response,
+            errors: nil
         )
 
         // Serialise to MCP Value → dictionary
@@ -1571,6 +1578,7 @@ extension OracleViewModel {
         finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        completionPolicy: OracleResponseCompletionPolicy = .interactive,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> ChatSendReply {
         // Check cancellation at entry
@@ -1634,6 +1642,15 @@ extension OracleViewModel {
 
         // 4) Stream via AIQueriesService WITHOUT touching OracleViewModel.messages
         let (streamID, stream) = try await aiQueriesService.sendPrompt(aiMessage, model: model)
+        let cleanupHandleBox = OracleProviderCleanupHandleBox()
+        var didScheduleProviderCleanup = false
+        defer {
+            if !didScheduleProviderCleanup {
+                Task {
+                    await self.cleanupOracleProviderConversation(cleanupHandleBox.current(), model: model)
+                }
+            }
+        }
 
         // Register this headless stream by tab ID so Discover can cancel it.
         headlessStreamsByTabID[tabID] = streamID
@@ -1646,8 +1663,8 @@ extension OracleViewModel {
         // (One Task.sleep for entire stream, not per-chunk - avoids CPU churn)
         let timeout: Duration = .seconds(4 * 60 * 60)
 
-        let (finalText, finalReasoning, finalTokenInfo) = try await withThrowingTaskGroup(
-            of: (String, String, ChatTokenInfo).self
+        let (finalText, _, finalTokenInfo, providerCleanupHandle, terminalOutcome) = try await withThrowingTaskGroup(
+            of: (String, String, ChatTokenInfo, ProviderConversationCleanupHandle?, ChatStreamTerminalOutcome?).self
         ) { group in
             // Timeout task - throws after 4 hours
             group.addTask {
@@ -1656,10 +1673,12 @@ extension OracleViewModel {
             }
 
             // Streaming task - accumulates locally, returns result
-            group.addTask { [stream, onProgress] in
+            group.addTask { [stream, onProgress, cleanupHandleBox] in
                 var accText = ""
                 var accReasoning = ""
                 var tokens = ChatTokenInfo()
+                var cleanupHandle: ProviderConversationCleanupHandle?
+                var terminalOutcome: ChatStreamTerminalOutcome?
                 var iterator = stream.makeAsyncIterator()
 
                 while let chunk = try await iterator.next() {
@@ -1674,14 +1693,22 @@ extension OracleViewModel {
                     {
                         tokens = chunk.tokens
                     }
+                    if let handle = chunk.cleanupHandle {
+                        cleanupHandle = handle
+                        await cleanupHandleBox.update(handle)
+                    }
                     // Only hop to MainActor for progress callback
                     if let onProgress {
                         let text = accText
                         let reasoning = accReasoning.isEmpty ? nil : accReasoning
                         await MainActor.run { onProgress(text, reasoning) }
                     }
+                    if let outcome = chunk.terminalOutcome {
+                        terminalOutcome = outcome
+                        break
+                    }
                 }
-                return (accText, accReasoning, tokens)
+                return (accText, accReasoning, tokens, cleanupHandle, terminalOutcome)
             }
 
             // Wait for stream to complete or timeout to fire
@@ -1690,8 +1717,22 @@ extension OracleViewModel {
             return result
         }
 
+        if completionPolicy == .contextBuilderStrict {
+            switch terminalOutcome {
+            case .completed:
+                break
+            case let .incomplete(reason):
+                throw OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
+            case nil:
+                throw OracleContextBuilderCompletionError.streamEndedWithoutProviderCompletion
+            }
+        }
+
         let trimmedResponse = finalText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !trimmedResponse.isEmpty else {
+            if completionPolicy == .contextBuilderStrict {
+                throw OracleContextBuilderCompletionError.emptyProcessedContent
+            }
             throw ChatToolError.internalError("Request produced no content.")
         }
 
@@ -1709,6 +1750,9 @@ extension OracleViewModel {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID
         )
+
+        didScheduleProviderCleanup = true
+        Task { await cleanupOracleProviderConversation(providerCleanupHandle, model: model) }
 
         // 6) Return ChatSendReply
         return ChatSendReply(

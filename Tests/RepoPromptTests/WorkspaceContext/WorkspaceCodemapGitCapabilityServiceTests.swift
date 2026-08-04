@@ -70,12 +70,18 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             named: "submodule-source",
             files: ["Sources/Submodule.swift": SwiftFixtureSource.emptyStruct("Submodule")]
         )
+        let submodule = canonical.appendingPathComponent("Vendor/Sub", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: submodule.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(at: submoduleSource, to: submodule)
+        let submoduleOID = try fixture.head(at: submoduleSource)
         _ = try fixture.runGit(
-            ["-c", "protocol.file.allow=always", "submodule", "add", submoduleSource.path, "Vendor/Sub"],
+            ["update-index", "--add", "--cacheinfo", "160000,\(submoduleOID),Vendor/Sub"],
             at: canonical
         )
         try fixture.commit("Add submodule", at: canonical)
-        let submodule = canonical.appendingPathComponent("Vendor/Sub", isDirectory: true)
 
         let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
         let canonicalCapability = try await capability(
@@ -601,6 +607,209 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         XCTAssertNotEqual(afterNestedAttributes.candidateAttributeGeneration, accepted.candidateAttributeGeneration)
     }
 
+    func testSourceAuthoritySurvivesRootWideGitChurn() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        let path = "Sources/Feature.swift"
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let rootCapability = try await capability(service.resolve(root: request(for: root, seed: 56)))
+        let pathFingerprint = try fingerprint(at: root.appendingPathComponent(path))
+
+        let acceptedCandidate = await sourceAuthority(
+            service: service,
+            capability: rootCapability,
+            path: path
+        )
+        let accepted = try XCTUnwrap(acceptedCandidate)
+        XCTAssertEqual(accepted.acceptedPostPathFingerprint, pathFingerprint)
+
+        let indexURL = root.appendingPathComponent(".git/index")
+        let beforeIndexDescriptorUpdate = try fingerprint(at: indexURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 3600)],
+            ofItemAtPath: indexURL.path
+        )
+        let afterIndexDescriptorUpdateFingerprint = try fingerprint(at: indexURL)
+        XCTAssertNotEqual(afterIndexDescriptorUpdateFingerprint, beforeIndexDescriptorUpdate)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        _ = try fixture.runGit(["status", "--porcelain=v1", "--untracked-files=all"], at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        try fixture.write("let unrelatedCommit = true\n", to: "Sources/UnrelatedCommit.swift", at: root)
+        try fixture.stage("Sources/UnrelatedCommit.swift", at: root)
+        try fixture.commit("Unrelated source authority churn", at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        _ = try fixture.runGit(["checkout", "-b", "source-authority-branch"], at: root)
+        _ = try fixture.runGit(["checkout", "main"], at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        _ = try fixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        try fixture.write("let untrackedChurn = true\n", to: "Sources/UntrackedChurn.swift", at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        try fixture.write("*.swift text eol=lf\n", to: ".git/info/attributes", at: root)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        let configuredAttributes = root.appendingPathComponent("source-authority.attributes")
+        try "*.swift text eol=lf\n".write(to: configuredAttributes, atomically: true, encoding: .utf8)
+        _ = try fixture.runGit(["config", "core.attributesFile", configuredAttributes.path], at: root)
+        try "*.swift text eol=crlf\n".write(to: configuredAttributes, atomically: true, encoding: .utf8)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        let relativeAttributes = root.appendingPathComponent("relative-source-authority.attributes")
+        try "*.swift text eol=lf\n".write(to: relativeAttributes, atomically: true, encoding: .utf8)
+        _ = try fixture.runGit(["config", "core.attributesFile", "relative-source-authority.attributes"], at: root)
+        try "*.swift text eol=crlf\n".write(to: relativeAttributes, atomically: true, encoding: .utf8)
+        await assertSourceAuthorityAvailable(service: service, capability: rootCapability, path: path)
+
+        let revalidatedAfterRootWideChurn = await service.revalidateSourceAuthorities(
+            capability: rootCapability,
+            tokens: [accepted]
+        )
+        XCTAssertTrue(revalidatedAfterRootWideChurn)
+    }
+
+    func testSourceAuthorityRejectsGlobalAttributeMutationDuringIssuance() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+
+        let infoRaceRoot = try fixture.makeRepository(named: "info-attributes-race")
+        let infoAttributes = infoRaceRoot.appendingPathComponent(".git/info/attributes").standardizedFileURL
+        let infoAttributesReplacement = AuthorityEvidenceLeafReplacement(
+            target: infoAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let infoRaceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { infoAttributesReplacement.replaceIfTarget($0) }
+            )
+        )
+        let infoRaceCapability = try await capability(
+            infoRaceService.resolve(root: request(for: infoRaceRoot, seed: 57))
+        )
+        try "*.swift text\n".write(to: infoAttributes, atomically: true, encoding: .utf8)
+        await assertNil(sourceAuthority(
+            service: infoRaceService,
+            capability: infoRaceCapability,
+            path: "Sources/Feature.swift"
+        ))
+
+        let configuredRaceRoot = try fixture.makeRepository(named: "configured-attributes-race")
+        let configuredRaceAttributes = configuredRaceRoot
+            .appendingPathComponent("source-authority-race.attributes")
+            .standardizedFileURL
+        _ = try fixture.runGit(["config", "core.attributesFile", configuredRaceAttributes.path], at: configuredRaceRoot)
+        let configuredRaceReplacement = AuthorityEvidenceLeafReplacement(
+            target: configuredRaceAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let configuredRaceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { configuredRaceReplacement.replaceIfTarget($0) }
+            )
+        )
+        let configuredRaceCapability = try await capability(
+            configuredRaceService.resolve(root: request(for: configuredRaceRoot, seed: 58))
+        )
+        try "*.swift text\n".write(to: configuredRaceAttributes, atomically: true, encoding: .utf8)
+        await assertNil(sourceAuthority(
+            service: configuredRaceService,
+            capability: configuredRaceCapability,
+            path: "Sources/Feature.swift"
+        ))
+
+        let relativeRaceRoot = try fixture.makeRepository(named: "relative-attributes-race")
+        let relativeRaceAttributes = relativeRaceRoot
+            .appendingPathComponent("relative-source-authority-race.attributes")
+            .standardizedFileURL
+        _ = try fixture.runGit(
+            ["config", "core.attributesFile", "relative-source-authority-race.attributes"],
+            at: relativeRaceRoot
+        )
+        let relativeRaceReplacement = AuthorityEvidenceLeafReplacement(
+            target: relativeRaceAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let relativeRaceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { relativeRaceReplacement.replaceIfTarget($0) }
+            )
+        )
+        let relativeRaceCapability = try await capability(
+            relativeRaceService.resolve(root: request(for: relativeRaceRoot, seed: 59))
+        )
+        try "*.swift text\n".write(to: relativeRaceAttributes, atomically: true, encoding: .utf8)
+        await assertNil(sourceAuthority(
+            service: relativeRaceService,
+            capability: relativeRaceCapability,
+            path: "Sources/Feature.swift"
+        ))
+    }
+
+    func testSourceAuthorityRejectsGlobalAttributeMutationDuringRevalidation() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        let infoAttributes = root.appendingPathComponent(".git/info/attributes").standardizedFileURL
+        let replacement = AuthorityEvidenceLeafReplacement(
+            target: infoAttributes,
+            replacementContents: Data("*.swift -text\n".utf8)
+        )
+        let service = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { replacement.replaceIfTarget($0) }
+            )
+        )
+        let rootCapability = try await capability(service.resolve(root: request(for: root, seed: 60)))
+        let tokenCandidate = await sourceAuthority(
+            service: service,
+            capability: rootCapability,
+            path: "Sources/Feature.swift"
+        )
+        let token = try XCTUnwrap(tokenCandidate)
+
+        try "*.swift text\n".write(to: infoAttributes, atomically: true, encoding: .utf8)
+        let revalidatedRace = await service.revalidateSourceAuthorities(
+            capability: rootCapability,
+            tokens: [token]
+        )
+        XCTAssertFalse(revalidatedRace)
+    }
+
+    private func assertSourceAuthorityAvailable(
+        service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        path: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let authority = await sourceAuthority(service: service, capability: capability, path: path)
+        XCTAssertNotNil(authority, file: file, line: line)
+    }
+
+    private func sourceAuthority(
+        service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        path: String
+    ) async -> WorkspaceCodemapSourceAuthorityToken? {
+        await service.makeSourceAuthority(
+            capability: capability,
+            observedRootEpoch: capability.rootEpoch,
+            observedRepositoryAuthority: capability.repositoryAuthority,
+            candidateRepositoryRelativePath: path,
+            observedPathGeneration: 7,
+            currentPathGeneration: 7,
+            observedIngressGeneration: 11,
+            currentIngressGeneration: 11
+        )
+    }
+
     func testSourceAuthorityNoFollowFingerprintRejectsSymlinkAndMutation() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try fixture.makeRepository(named: "repository")
@@ -626,6 +835,156 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         )
         XCTAssertNotNil(authority)
         XCTAssertEqual(recorder.snapshot(), .init(callCount: 2, allPathsMatched: true))
+
+        let unaffectedPaths = ["Sources/Alpha.swift", "Sources/Beta.swift"]
+        for unaffectedPath in unaffectedPaths {
+            try fixture.write("let value = true\n", to: unaffectedPath, at: root)
+        }
+        let batchMutation = SourcePathMutation(url: candidateURL)
+        let batchService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { await batchMutation.mutateOnce() }
+            )
+        )
+        let batchCapability = try await capability(
+            batchService.resolve(root: request(for: root, seed: 52))
+        )
+        let capturesBeforeBatch = await batchService.snapshotForTesting().authorityCaptureCount
+        let batchAuthorities = await batchService.makeSourceAuthorities(
+            capability: batchCapability,
+            observedRootEpoch: batchCapability.rootEpoch,
+            observedRepositoryAuthority: batchCapability.repositoryAuthority,
+            candidates: ([path] + unaffectedPaths).map {
+                WorkspaceCodemapSourceAuthorityRequest(
+                    candidateRepositoryRelativePath: $0,
+                    observedPathGeneration: 1,
+                    currentPathGeneration: 1,
+                    observedIngressGeneration: 1,
+                    currentIngressGeneration: 1
+                )
+            }
+        )
+        let capturesAfterBatch = await batchService.snapshotForTesting().authorityCaptureCount
+        XCTAssertEqual(capturesAfterBatch - capturesBeforeBatch, 2)
+        XCTAssertNil(batchAuthorities[0])
+        XCTAssertNotNil(batchAuthorities[1])
+        XCTAssertNotNil(batchAuthorities[2])
+
+        let postPathRoot = try fixture.makeRepository(named: "post-path-authority")
+        try fixture.write("let value = true\n", to: path, at: postPathRoot)
+        let postPathMutation = AuthorityFileMutationOnInvocation(
+            url: postPathRoot.appendingPathComponent(".git/index"),
+            targetInvocation: 2
+        )
+        let postPathService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: {
+                    await postPathMutation.mutateOnTargetInvocation()
+                }
+            )
+        )
+        let postPathCapability = try await capability(
+            postPathService.resolve(root: request(for: postPathRoot, seed: 53))
+        )
+        let postPathCapturesBefore = await postPathService.snapshotForTesting().authorityCaptureCount
+        let postPathAuthorities = await postPathService.makeSourceAuthorities(
+            capability: postPathCapability,
+            observedRootEpoch: postPathCapability.rootEpoch,
+            observedRepositoryAuthority: postPathCapability.repositoryAuthority,
+            candidates: [WorkspaceCodemapSourceAuthorityRequest(
+                candidateRepositoryRelativePath: path,
+                observedPathGeneration: 1,
+                currentPathGeneration: 1,
+                observedIngressGeneration: 1,
+                currentIngressGeneration: 1
+            )]
+        )
+        let postPathCapturesAfter = await postPathService.snapshotForTesting().authorityCaptureCount
+        XCTAssertEqual(postPathCapturesAfter - postPathCapturesBefore, 2)
+        let postPathFingerprintCaptureCount = await postPathMutation.invocationCount()
+        XCTAssertEqual(postPathFingerprintCaptureCount, 2)
+        XCTAssertNil(postPathAuthorities[0])
+
+        for (offset, evidenceKind) in ["index", "config", "ref"].enumerated() {
+            let mutationRoot = try fixture.makeRepository(named: "authority-\(evidenceKind)")
+            try fixture.write("let a = true\n", to: "Sources/A.swift", at: mutationRoot)
+            try fixture.write("let b = true\n", to: "Sources/B.swift", at: mutationRoot)
+            let mutationURL: URL
+            switch evidenceKind {
+            case "index":
+                mutationURL = mutationRoot.appendingPathComponent(".git/index")
+            case "config":
+                mutationURL = mutationRoot.appendingPathComponent(".git/config")
+            default:
+                let head = try String(contentsOf: mutationRoot.appendingPathComponent(".git/HEAD"))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                mutationURL = mutationRoot.appendingPathComponent(".git/\(head.dropFirst("ref: ".count))")
+            }
+            let authorityMutation = AuthorityFileMutation(url: mutationURL)
+            let mutationService = WorkspaceCodemapGitCapabilityService(
+                namespaceSalt: namespaceSalt,
+                hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                    afterFirstAuthorityCapture: { await authorityMutation.mutateIfArmed() }
+                )
+            )
+            let mutationCapability = try await capability(
+                mutationService.resolve(root: request(for: mutationRoot, seed: UInt8(54 + offset)))
+            )
+            await authorityMutation.arm()
+            let mutationCapturesBefore = await mutationService.snapshotForTesting().authorityCaptureCount
+            let mutationAuthorities = await mutationService.makeSourceAuthorities(
+                capability: mutationCapability,
+                observedRootEpoch: mutationCapability.rootEpoch,
+                observedRepositoryAuthority: mutationCapability.repositoryAuthority,
+                candidates: ["Sources/A.swift", "Sources/B.swift"].map {
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: $0,
+                        observedPathGeneration: 1,
+                        currentPathGeneration: 1,
+                        observedIngressGeneration: 1,
+                        currentIngressGeneration: 1
+                    )
+                }
+            )
+            let mutationCapturesAfter = await mutationService.snapshotForTesting().authorityCaptureCount
+            XCTAssertEqual(mutationCapturesAfter - mutationCapturesBefore, 2)
+            XCTAssertTrue(mutationAuthorities.allSatisfy { $0 == nil })
+        }
+
+        let cancellationGate = AuthorityBatchCancellationGate()
+        let cancellationService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterFirstAuthorityCapture: { await cancellationGate.pauseIfArmed() }
+            )
+        )
+        let cancellationCapability = try await capability(
+            cancellationService.resolve(root: request(for: root, seed: 58))
+        )
+        await cancellationGate.arm()
+        let cancellationTask = Task {
+            await cancellationService.makeSourceAuthorities(
+                capability: cancellationCapability,
+                observedRootEpoch: cancellationCapability.rootEpoch,
+                observedRepositoryAuthority: cancellationCapability.repositoryAuthority,
+                candidates: unaffectedPaths.map {
+                    WorkspaceCodemapSourceAuthorityRequest(
+                        candidateRepositoryRelativePath: $0,
+                        observedPathGeneration: 1,
+                        currentPathGeneration: 1,
+                        observedIngressGeneration: 1,
+                        currentIngressGeneration: 1
+                    )
+                }
+            )
+        }
+        await cancellationGate.waitUntilPaused()
+        cancellationTask.cancel()
+        await cancellationGate.resume()
+        let cancelledAuthorities = await cancellationTask.value
+        XCTAssertTrue(cancelledAuthorities.allSatisfy { $0 == nil })
 
         let symlinkTarget = root.appendingPathComponent("Sources/Target.swift")
         try "let target = true\n".write(to: symlinkTarget, atomically: true, encoding: .utf8)
@@ -1126,6 +1485,85 @@ private final class ExactPathFingerprintRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(callCount: callCount, allPathsMatched: allPathsMatched)
+    }
+}
+
+private actor AuthorityFileMutationOnInvocation {
+    private let url: URL
+    private let targetInvocation: Int
+    private var invocations = 0
+
+    init(url: URL, targetInvocation: Int) {
+        self.url = url
+        self.targetInvocation = targetInvocation
+    }
+
+    func mutateOnTargetInvocation() {
+        invocations += 1
+        guard invocations == targetInvocation else { return }
+        let data = (try? Data(contentsOf: url)) ?? Data()
+        try? (data + Data("\n# post-path authority mutation\n".utf8)).write(to: url, options: .atomic)
+    }
+
+    func invocationCount() -> Int {
+        invocations
+    }
+}
+
+private actor AuthorityFileMutation {
+    private let url: URL
+    private var armed = false
+    private var didMutate = false
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func arm() {
+        armed = true
+    }
+
+    func mutateIfArmed() {
+        guard armed, !didMutate else { return }
+        didMutate = true
+        let data = (try? Data(contentsOf: url)) ?? Data()
+        try? (data + Data("\n# authority mutation\n".utf8)).write(to: url, options: .atomic)
+    }
+}
+
+private actor AuthorityBatchCancellationGate {
+    private var armed = false
+    private var paused = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+    func arm() {
+        armed = true
+    }
+
+    func pauseIfArmed() async {
+        guard armed else { return }
+        paused = true
+        let waiters = pauseWaiters
+        pauseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            resumeContinuation = continuation
+        }
+    }
+
+    func waitUntilPaused() async {
+        if paused { return }
+        await withCheckedContinuation { continuation in
+            pauseWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        resumeContinuation?.resume()
+        resumeContinuation = nil
     }
 }
 

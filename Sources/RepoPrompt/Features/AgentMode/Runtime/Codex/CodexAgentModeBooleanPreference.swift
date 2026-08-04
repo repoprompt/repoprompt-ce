@@ -5,6 +5,7 @@ import Foundation
 enum CodexAgentModeBooleanPreference {
     case goalSupport
     case reasoningSummaries
+    case memories
 
     @MainActor
     func isEnabled(defaults: UserDefaults) -> Bool {
@@ -16,6 +17,8 @@ enum CodexAgentModeBooleanPreference {
             return CodexGoalSupport.isEnabled(defaults: defaults)
         case .reasoningSummaries:
             return CodexReasoningSummaries.isEnabled(defaults: defaults)
+        case .memories:
+            return CodexMemories.isEnabled(defaults: defaults)
         }
     }
 
@@ -30,6 +33,8 @@ enum CodexAgentModeBooleanPreference {
             CodexGoalSupport.setEnabled(enabled, defaults: defaults)
         case .reasoningSummaries:
             CodexReasoningSummaries.setEnabled(enabled, defaults: defaults)
+        case .memories:
+            CodexMemories.setEnabled(enabled, defaults: defaults)
         }
     }
 
@@ -40,6 +45,8 @@ enum CodexAgentModeBooleanPreference {
             GlobalSettingsStore.shared.codexGoalSupportEnabled()
         case .reasoningSummaries:
             GlobalSettingsStore.shared.codexReasoningSummariesEnabled()
+        case .memories:
+            GlobalSettingsStore.shared.codexMemoriesEnabled()
         }
     }
 
@@ -50,6 +57,8 @@ enum CodexAgentModeBooleanPreference {
             GlobalSettingsStore.shared.setCodexGoalSupportEnabled(enabled)
         case .reasoningSummaries:
             GlobalSettingsStore.shared.setCodexReasoningSummariesEnabled(enabled)
+        case .memories:
+            GlobalSettingsStore.shared.setCodexMemoriesEnabled(enabled)
         }
     }
 }

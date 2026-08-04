@@ -41,12 +41,14 @@ enum AgentOracleToolRouting {
     static func operationPopoverUserInfo(
         openContext: AgentOracleOpenContext?,
         chatID: String?,
-        tabID: UUID? = nil
+        tabID: UUID? = nil,
+        presentation: AgentOraclePopoverPresentation = .standard
     ) -> [AnyHashable: Any]? {
         AgentOraclePopoverRoute(
             openContext: openContext,
             chatID: chatID,
-            tabID: tabID
+            tabID: tabID,
+            presentation: presentation
         )?.notificationUserInfo
     }
 
@@ -324,12 +326,16 @@ private enum ToolCardSubtitleBuilder {
             }
         case "get_code_structure":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: argsJSON) {
-                if args.scope == "selected" {
-                    return "selected"
+                let target = if let count = args.paths?.count, count > 0 {
+                    "\(count) path\(count == 1 ? "" : "s")"
+                } else {
+                    "selection"
                 }
-                if let count = args.paths?.count, count > 0 {
-                    return "\(count) path\(count == 1 ? "" : "s")"
+                if let expand = args.expand {
+                    let depth = args.depth ?? 1
+                    return "\(target) • \(expand), depth \(depth)"
                 }
+                return target
             }
         case "file_actions":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.FileActionsArgs.self, from: argsJSON),

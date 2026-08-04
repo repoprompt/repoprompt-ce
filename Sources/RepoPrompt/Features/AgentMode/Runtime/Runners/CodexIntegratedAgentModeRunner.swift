@@ -43,10 +43,20 @@ final class CodexIntegratedAgentModeRunner {
             #if DEBUG || EDIT_FLOW_PERF
                 let codexTurnMCPServerEnableState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable)
             #endif
-            await mcpServerEnabler()
+            let mcpServerReady = await mcpServerEnabler()
             #if DEBUG || EDIT_FLOW_PERF
                 EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable, codexTurnMCPServerEnableState)
             #endif
+            guard mcpServerReady else {
+                let outcome = CodexAgentModeCoordinator.NativeSendOutcome.failed(
+                    message: "MCP catalog registration failed before Agent launch."
+                )
+                hooks.recordPendingHandoffSendOutcome(session, false)
+                if createdOwnership {
+                    session.endRunAttempt(ifCurrent: ownership, source: "codex.mcpBootstrapRejected")
+                }
+                return outcome
+            }
 
             let outcome = await codexCoordinator.sendCodexNativeMessage(
                 session: session,
@@ -60,7 +70,7 @@ final class CodexIntegratedAgentModeRunner {
             switch outcome {
             case .sent:
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
-            case .cancelled, .failed, .stale:
+            case .preDispatchRejected, .cancelled, .failed, .stale:
                 if createdOwnership {
                     session.endRunAttempt(ifCurrent: ownership, source: "codex.sendRejected")
                 }

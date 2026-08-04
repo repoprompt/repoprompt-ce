@@ -52,37 +52,39 @@ final class AgentACPModelRegistry {
     }
 
     func warmStandardStoreIfNeeded() async {
+        let plan: StandardStoreWarmPlan? = lock.withLock {
+            guard !didWarmStandardStore else { return nil }
+
+            let task: Task<[ACPProviderID: ACPDiscoveredSessionModels], Never>
+            if let existing = standardStoreWarmTask {
+                task = existing
+            } else {
+                let newTask = Task.detached(priority: .utility) {
+                    ACPDynamicModelStore.loadAll()
+                }
+                standardStoreWarmTask = newTask
+                task = newTask
+            }
+            return StandardStoreWarmPlan(
+                task: task,
+                generation: standardStoreWarmGeneration
+            )
+        }
+
+        guard let plan else { return }
+        let loadedSnapshots = await plan.task.value
+
+        lock.withLock {
+            guard plan.generation == standardStoreWarmGeneration else { return }
+            persistedSnapshotsByProvider = loadedSnapshots
+            didWarmStandardStore = true
+            standardStoreWarmTask = nil
+        }
+    }
+
+    private struct StandardStoreWarmPlan {
         let task: Task<[ACPProviderID: ACPDiscoveredSessionModels], Never>
         let generation: UInt64
-
-        lock.lock()
-        if didWarmStandardStore {
-            lock.unlock()
-            return
-        }
-        generation = standardStoreWarmGeneration
-        if let existing = standardStoreWarmTask {
-            task = existing
-        } else {
-            let newTask = Task.detached(priority: .utility) {
-                ACPDynamicModelStore.loadAll()
-            }
-            standardStoreWarmTask = newTask
-            task = newTask
-        }
-        lock.unlock()
-
-        let loadedSnapshots = await task.value
-
-        lock.lock()
-        guard generation == standardStoreWarmGeneration else {
-            lock.unlock()
-            return
-        }
-        persistedSnapshotsByProvider = loadedSnapshots
-        didWarmStandardStore = true
-        standardStoreWarmTask = nil
-        lock.unlock()
     }
 
     func resolvedSnapshotAfterWarmingStandardStore(

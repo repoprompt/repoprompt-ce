@@ -13,8 +13,18 @@ on:
         type: string
 
 concurrency:
-  group: main-tip-channel
-  cancel-in-progress: false
+  group: >-
+    ${{
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'success') &&
+      'main-tip-channel' ||
+      format('main-tip-skipped-{0}', github.run_id)
+    }}
+  # Tip is a rolling channel: once main advances, completing an older artifact only
+  # delays the commit users actually asked the channel to publish. A failed CI
+  # notification receives a unique group so it cannot evict a healthy pending or
+  # in-flight Tip build before setup's success guard skips the replacement run.
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
 permissions:
   contents: read
@@ -46,6 +56,7 @@ jobs:
         env:
           REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -147,6 +158,8 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+          # Link Sentry and preserve dSYMs without exposing DSN or auth in this stage.
+          REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/main_tip_release.sh stage
 
       - name: Upload staged tip source
@@ -244,6 +257,25 @@ jobs:
           echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
           echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
 
+      - name: Install Sentry CLI for Tip symbol upload
+        run: |
+          set -euo pipefail
+          if ! command -v sentry-cli >/dev/null 2>&1; then
+            brew install getsentry/tools/sentry-cli
+          fi
+
+      - name: Prepare Tip Sentry auth token file
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ -n "${SENTRY_AUTH_TOKEN:-}" ]] || { echo "SENTRY_AUTH_TOKEN is not configured" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/repoprompt-tip-secrets"
+          SENTRY_TOKEN_FILE="$RUNNER_TEMP/repoprompt-tip-secrets/sentry-auth-token"
+          printf '%s' "$SENTRY_AUTH_TOKEN" > "$SENTRY_TOKEN_FILE"
+          chmod 600 "$SENTRY_TOKEN_FILE"
+
       - name: Sign and notarize staged tip
         env:
           TIP_COMMIT: ${{ needs.setup.outputs.commit }}
@@ -256,6 +288,11 @@ jobs:
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
+          REPOPROMPT_ENABLE_SENTRY: "1"
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+          REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
@@ -309,6 +346,7 @@ jobs:
         env:
           REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"
           REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"
+          REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -326,10 +364,20 @@ jobs:
             LOGNAME="$LOGNAME" \
             REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT" \
             REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT" \
+            REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR="$REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR" \
             ./trusted-control-plane/Scripts/smoke_packaged_mcp_roundtrip.sh \
             "extracted/RepoPrompt CE.app" \
             "Tip packaged app" \
             "${manifests[0]}"
+
+      - name: Upload Tip smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-tip-smoke-diagnostics
+          path: ${{ runner.temp }}/tip-smoke-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
 
   publish:
     name: Publish Tip Appcast

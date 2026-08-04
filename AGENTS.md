@@ -40,6 +40,7 @@ Package without launching:
 
 ```bash
 make dev-build                  # coordinated debug package (preferred)
+make dev-codex-schema-check     # coordinated bounded Codex app-server schema drift check
 # uncoordinated equivalents:
 make build
 ./Scripts/package_app.sh debug
@@ -163,9 +164,7 @@ make dev-run
 make dev-launch-existing                         # launch current DebugApps bundle without building
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
-make dev-test-list                                  # coordinated authoritative root XCTest method list
 make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
-make dev-provider-test-list                         # coordinated authoritative provider XCTest method list
 make dev-smoke          # non-disruptive: requires an already-running CE debug app and installed debug CLI
 make dev-smoke-launch   # builds/launches the debug app, then runs the smoke flow
 make dev-format-check   # non-mutating coordinated SwiftFormat check
@@ -174,6 +173,7 @@ make dev-format         # mutates first-party Swift files; run only when intende
 make dev-format-tools-status
 make dev-check-format-tools
 make dev-install-format-tools
+make dev-codex-schema-check                         # unlaned generated-schema contract check
 ```
 
 Lane detail: the mutating `format` daemon job also claims `build` (it rewrites files the compiler reads); non-mutating `format-check` and `lint` use only `style`; read-only `format-tools-status` is intentionally unlaned so it never queues behind a build.
@@ -283,6 +283,7 @@ make dev-test FILTER=WorkspaceFileContextStoreTests
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
 make dev-provider-test
+make dev-codex-schema-check
 make guardrails
 make doctor
 make dev-build
@@ -296,9 +297,7 @@ Use `make dev-run` (or `make run`) only when it is safe to stop any existing Rep
 
 ### XCTest optimization inventory and timing
 
-See [`docs/testing.md`](docs/testing.md) for the contributor workflow, exact XCTest IDs, surgical contract-ledger maintenance, scenario accounting, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test, authoritative list, and `verify-ledger`; never regenerate or overwrite the curated ledger.
-
-Optimization/performance campaigns additionally require append-only inventory, baseline, focused, and full-root artifacts under `docs/test-suite-optimizer/artifacts/` plus updates to `docs/test-suite-optimizer/scoreboard.md`. The primary metric is warm local root conductor execution time, provider timing remains separate, and diagnostic/wake-probe runs are invalid timing samples retained only as local/uncommitted lifecycle evidence.
+See [`docs/testing.md`](docs/testing.md) for the contributor workflow, test-quality guidance, exact focused-filter examples, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test plus broader target or full-suite validation when the changed boundary warrants it.
 
 ## Cleanup
 

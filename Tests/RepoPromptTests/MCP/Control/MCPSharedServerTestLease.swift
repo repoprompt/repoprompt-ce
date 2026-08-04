@@ -1,7 +1,7 @@
 import Foundation
 
 #if DEBUG
-    import Foundation
+    @testable import RepoPromptApp
 
     actor MCPSharedServerTestLease {
         struct Ownership {
@@ -11,44 +11,193 @@ import Foundation
         static let shared = MCPSharedServerTestLease()
 
         private var occupied = false
+        private var activeLeaseID: UUID?
+        private var currentOwner: String?
         /// Lock-backed waiter queue so `onCancel` can remove/resume waiters **synchronously**
         /// without an unstructured `Task { await }` hop.
         private let waiterState = LeaseWaiterState()
 
-        func withLease<T>(_ operation: (Ownership) async throws -> T) async throws -> T {
+        func withLease<T>(
+            owner: String = #function,
+            acquisitionTimeout: Duration = .seconds(120),
+            _ operation: (Ownership) async throws -> T
+        ) async throws -> T {
+            let leaseID = UUID()
             var ownsLease = false
-            try await acquireLease()
+            try await acquireLease(
+                leaseID: leaseID,
+                owner: owner,
+                timeout: acquisitionTimeout
+            )
             ownsLease = true
             defer {
                 if ownsLease {
                     ownsLease = false
-                    releaseLease()
+                    releaseLease(ifOwnedBy: leaseID)
                 }
             }
-            return try await operation(Ownership())
+
+            let baseline = await ServerNetworkManager.shared.debugTransportState()
+            let bodyResult: Result<T, Swift.Error>
+            do {
+                bodyResult = try await .success(operation(Ownership()))
+            } catch {
+                bodyResult = .failure(error)
+            }
+
+            do {
+                try await restoreTransportState(
+                    baseline,
+                    owner: owner,
+                    leaseID: leaseID
+                )
+            } catch {
+                switch bodyResult {
+                case let .failure(bodyError):
+                    throw LeaseError.bodyAndRestorationFailed(
+                        owner: owner,
+                        leaseID: leaseID,
+                        body: String(reflecting: bodyError),
+                        restoration: String(reflecting: error)
+                    )
+                case .success:
+                    throw error
+                }
+            }
+
+            return try bodyResult.get()
+        }
+
+        private func restoreTransportState(
+            _ baseline: ServerNetworkManager.DebugTransportState,
+            owner: String,
+            leaseID: UUID
+        ) async throws {
+            let manager = ServerNetworkManager.shared
+            let observed = await manager.debugTransportState()
+            if observed != baseline {
+                print(
+                    "[MCPSharedServerTestLease] owner=\(owner) lease=\(leaseID.uuidString) restoring baseline={\(baseline)} observed={\(observed)}"
+                )
+            }
+
+            if baseline.isRunning {
+                if !observed.isRunning {
+                    await manager.start()
+                }
+                await manager.setEnabled(baseline.isEnabled)
+            } else {
+                if observed.isRunning {
+                    await manager.stop()
+                }
+                await manager.setEnabled(baseline.isEnabled)
+            }
+
+            let restored = await manager.debugTransportState()
+            guard restored == baseline else {
+                throw LeaseError.transportRestorationMismatch(
+                    owner: owner,
+                    leaseID: leaseID,
+                    expected: baseline.description,
+                    observed: observed.description,
+                    actual: restored.description
+                )
+            }
+        }
+
+        private enum LeaseError: Swift.Error, CustomStringConvertible {
+            case acquisitionTimedOut(owner: String, currentOwner: String, timeout: String)
+            case bodyAndRestorationFailed(owner: String, leaseID: UUID, body: String, restoration: String)
+            case transportRestorationMismatch(
+                owner: String,
+                leaseID: UUID,
+                expected: String,
+                observed: String,
+                actual: String
+            )
+
+            var description: String {
+                switch self {
+                case let .acquisitionTimedOut(owner, currentOwner, timeout):
+                    "Shared MCP lease owner \(owner) timed out after \(timeout) waiting for current owner \(currentOwner)"
+                case let .bodyAndRestorationFailed(owner, leaseID, body, restoration):
+                    "Shared MCP lease owner \(owner) lease=\(leaseID) failed body=\(body) restoration=\(restoration)"
+                case let .transportRestorationMismatch(owner, leaseID, expected, observed, actual):
+                    "Shared MCP lease owner \(owner) lease=\(leaseID) transport restore mismatch expected={\(expected)} observed={\(observed)} actual={\(actual)}"
+                }
+            }
         }
 
         func waiterCountForTesting() -> Int {
             waiterState.waiterCount
         }
 
-        private func acquireLease() async throws {
+        private enum LeaseAcquisitionResult {
+            case acquired
+            case timedOut
+        }
+
+        private func acquireLease(
+            leaseID: UUID,
+            owner: String,
+            timeout: Duration
+        ) async throws {
+            let blockingOwner = currentOwner ?? "unknown"
+            let result: LeaseAcquisitionResult
+            do {
+                result = try await withThrowingTaskGroup(of: LeaseAcquisitionResult.self) { group in
+                    group.addTask { [self] in
+                        try await acquireLeaseWithoutTimeout(leaseID: leaseID, owner: owner)
+                        return .acquired
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: timeout)
+                        return .timedOut
+                    }
+                    guard let first = try await group.next() else {
+                        throw CancellationError()
+                    }
+                    group.cancelAll()
+                    return first
+                }
+            } catch {
+                releaseLease(ifOwnedBy: leaseID)
+                throw error
+            }
+
+            guard case .acquired = result else {
+                // The grant and timeout can settle concurrently. Reclaim only this acquisition's
+                // token after both task-group children have finished; never release a successor.
+                releaseLease(ifOwnedBy: leaseID)
+                throw LeaseError.acquisitionTimedOut(
+                    owner: owner,
+                    currentOwner: blockingOwner,
+                    timeout: String(describing: timeout)
+                )
+            }
+        }
+
+        private func acquireLeaseWithoutTimeout(leaseID: UUID, owner: String) async throws {
             guard occupied else {
                 occupied = true
+                activeLeaseID = leaseID
+                currentOwner = owner
                 do {
                     try Task.checkCancellation()
                 } catch {
-                    releaseLease()
+                    releaseLease(ifOwnedBy: leaseID)
                     throw error
                 }
                 return
             }
 
             try await waitForTurn()
+            activeLeaseID = leaseID
+            currentOwner = owner
             do {
                 try Task.checkCancellation()
             } catch {
-                releaseLease()
+                releaseLease(ifOwnedBy: leaseID)
                 throw error
             }
         }
@@ -65,7 +214,10 @@ import Foundation
             }
         }
 
-        private func releaseLease() {
+        private func releaseLease(ifOwnedBy leaseID: UUID) {
+            guard activeLeaseID == leaseID else { return }
+            activeLeaseID = nil
+            currentOwner = nil
             if let continuation = waiterState.dequeueNextReady() {
                 continuation.resume()
                 return

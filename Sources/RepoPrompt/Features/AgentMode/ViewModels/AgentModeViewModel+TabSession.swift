@@ -59,6 +59,12 @@ extension AgentModeViewModel {
         @Published var runningStatusText: String? = nil
         var activeAgentRunStartedAt: Date?
 
+        struct DeferredActiveAgentRunTimerRollback {
+            let originalStartedAt: Date?
+        }
+
+        var deferredActiveAgentRunTimerRollback: DeferredActiveAgentRunTimerRollback?
+
         enum RunningStatusSource: Equatable {
             case transport
             case reasoning
@@ -248,7 +254,7 @@ extension AgentModeViewModel {
             let turnKind: CodexTurnKind
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -257,7 +263,7 @@ extension AgentModeViewModel {
             let turnKind: CodexTurnKind
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -356,7 +362,7 @@ extension AgentModeViewModel {
             let turnID: String
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -452,6 +458,7 @@ extension AgentModeViewModel {
 
         /// Selected workflow template for next message
         var selectedWorkflow: AgentWorkflowDefinition?
+        var userWorkflowSelectionMutationGeneration: UInt64 = 0
 
         // Pending image attachments for the next user turn
         @Published var pendingImageAttachments: [AgentImageAttachment] = []
@@ -461,6 +468,7 @@ extension AgentModeViewModel {
 
         // Provider session ID for resumption (e.g., Claude CLI session_id)
         var providerSessionID: String?
+        var providerCleanupHandle: ProviderConversationCleanupHandle?
         var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
@@ -474,6 +482,7 @@ extension AgentModeViewModel {
         @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil
         var contextCompactedAt: Date?
         var codexNeedsReconnect: Bool = false
+        var codexNativeStartupDisposition: CodexNativeStartupDisposition?
         var codexResumeTimeoutState: CodexResumeTimeoutState = .init()
         var codexToolPreferencesGeneration: Int = 0
         var codexController: (any CodexSessionControlling)? {
@@ -495,13 +504,15 @@ extension AgentModeViewModel {
         /// The task label kind the current Codex controller was created with.
         /// Used to detect when role-specific native tool overrides require controller recycling.
         var codexControllerTaskLabelKind: AgentModelCatalog.TaskLabelKind?
-        /// The effective workspace path the current Codex controller was created with.
-        /// Used to recycle the provider when a session worktree binding changes cwd.
-        var codexControllerWorkspacePath: String?
+        /// The launch/execution directory pair the current Codex controller was created with.
+        /// Controller replacement key: the provider is recycled when either directory changes,
+        /// e.g. when a session worktree binding moves the execution cwd.
+        var codexControllerWorkspacePaths: CodexRuntimeWorkspacePaths?
         struct CodexControllerFeatureState: Equatable {
             var computerUseEnabled: Bool
             var goalSupportEnabled: Bool
             var reasoningSummariesEnabled: Bool
+            var memoriesEnabled: Bool
         }
 
         var pendingCodexComputerUseActivation: CodexComputerUseActivation?
@@ -1533,6 +1544,7 @@ extension AgentModeViewModel {
             setItemsSilently(items, reason: .testOverride)
             pendingTurnRuntimeAnchors.removeAll()
             agentMessageRuntimeFootersByItemID.removeAll()
+            deferredActiveAgentRunTimerRollback = nil
             pendingSourceItemsMutationSummary = nil
             onSourceItemsChanged?(self, .replaceAll)
             lastActivityAt = Date()

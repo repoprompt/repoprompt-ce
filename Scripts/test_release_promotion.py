@@ -22,6 +22,38 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: reviewed source release assets verified for v1.0.0.", result.stdout)
 
+    def test_verify_enforces_exact_codex_verifier_command_and_paths(self) -> None:
+        result, _capture, tools = self.run_promotion("verify")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [
+            line
+            for line in tools.read_text(encoding="utf-8").splitlines()
+            if line.startswith("codex ")
+        ]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertIn("--manifest", call)
+            self.assertIn("Vendor/Codex/manifest.json verify-bundle --arch all --bundle", call)
+            self.assertTrue(
+                call.endswith(
+                    "Contents/Resources/BundledRuntimes/Codex "
+                    "--signed-team-identifier 648A27MST5"
+                )
+            )
+
+    def test_verify_rejects_missing_codex_manifest(self) -> None:
+        result, _capture, _tools = self.run_promotion("verify", missing_codex_manifest=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Vendor/Codex/manifest.json", result.stderr)
+
+    def test_verify_rejects_missing_embedded_codex_package_target(self) -> None:
+        result, _capture, _tools = self.run_promotion("verify", missing_codex_package=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing embedded Codex package targets", result.stderr)
+
     def test_promote_mirrors_draft_before_publishing_and_runs_anonymous_smoke(self) -> None:
         result, capture, tools = self.run_promotion("promote")
 
@@ -189,6 +221,8 @@ class ReleasePromotionTests(unittest.TestCase):
         sentry_http_status: str = "200",
         anonymous_failure: bool = False,
         promotion_already_published: bool = False,
+        missing_codex_manifest: bool = False,
+        missing_codex_package: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -199,7 +233,16 @@ class ReleasePromotionTests(unittest.TestCase):
         fake_bin = temp_dir / "bin"
         app = temp_dir / "fixture" / "RepoPrompt CE.app"
         dmg_app = temp_dir / "dmg-fixture" / "RepoPrompt CE.app"
-        for directory in (scripts, vendor_bin, assets, fake_bin, app / "Contents" / "MacOS", app / "Contents" / "Resources" / "bin"):
+        for directory in (
+            scripts,
+            vendor_bin,
+            assets,
+            fake_bin,
+            app / "Contents" / "MacOS",
+            app / "Contents" / "Resources" / "bin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "aarch64-apple-darwin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin",
+        ):
             directory.mkdir(parents=True, exist_ok=True)
 
         shutil.copy2(SCRIPT_DIR / "promote_release.sh", scripts / "promote_release.sh")
@@ -210,6 +253,15 @@ class ReleasePromotionTests(unittest.TestCase):
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
+        (scripts / "codex_runtime_artifact.py").write_text(
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nargs = sys.argv[1:]\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nif len(args) != 9 or args[:6] != [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n] or args[7:] != [\"--signed-team-identifier\", \"648A27MST5\"]:\n    print(f\"ERROR: unexpected Codex verifier arguments: {args!r}\", file=sys.stderr)\n    raise SystemExit(64)\nbundle = Path(args[6])\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not bundle.is_dir() or {path.name for path in bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {bundle}\", file=sys.stderr)\n    raise SystemExit(66)\nexpected_suffix = Path(\"Contents/Resources/BundledRuntimes/Codex\")\nif tuple(bundle.parts[-len(expected_suffix.parts):]) != expected_suffix.parts:\n    print(f\"ERROR: unexpected embedded Codex bundle path: {bundle}\", file=sys.stderr)\n    raise SystemExit(67)\nwith Path(os.environ[\"FAKE_TOOL_CAPTURE\"]).open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\"codex \" + \" \".join(args) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
+            encoding="utf-8",
+        )
+        codex_vendor = root / "Vendor" / "Codex"
+        codex_vendor.mkdir(parents=True, exist_ok=True)
+        (codex_vendor / "manifest.json").write_text("{}\n", encoding="utf-8")
+        if missing_codex_manifest:
+            (codex_vendor / "manifest.json").unlink()
         (scripts / "promote_release.sh").chmod(0o755)
         (scripts / "validate_embedded_mcp_helper_layout.sh").chmod(0o755)
         (scripts / "validate_packaged_legal.sh").chmod(0o755)
@@ -240,6 +292,9 @@ class ReleasePromotionTests(unittest.TestCase):
         (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         self.write_legal_tree(root, app)
         shutil.copytree(app, dmg_app, symlinks=True)
+        if missing_codex_package:
+            shutil.rmtree(app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin")
+            shutil.rmtree(dmg_app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin")
         if mismatched_dmg_app:
             (dmg_app / "Contents" / "dmg-only-drift.txt").write_text("drift\n", encoding="utf-8")
 
@@ -536,6 +591,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "FAKE_ASSET_DIR": str(assets),
                 "FAKE_APP_SOURCE": str(app),
                 "FAKE_DMG_APP_SOURCE": str(dmg_app),
+                "FAKE_CODEX_MANIFEST": str(codex_vendor / "manifest.json"),
                 "FAKE_DERIVED_PUBLIC_KEY": derived_public_key,
                 "FAKE_LATEST_BUILD": latest_build,
                 "FAKE_LATEST_HTTP_STATUS": latest_http_status,

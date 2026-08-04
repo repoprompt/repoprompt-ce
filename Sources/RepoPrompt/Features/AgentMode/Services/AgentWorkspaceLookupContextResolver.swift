@@ -150,8 +150,17 @@ enum AgentWorkspaceLookupContextResolver {
         let logicalRootPaths = Set(bindings.compactMap {
             AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.logicalRootPath)
         })
+        let bindingsMapDistinctLogicalRootsToWorktrees = bindings.allSatisfy { binding in
+            guard let logicalRootPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(
+                binding.logicalRootPath
+            ), let worktreeRootPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(
+                binding.worktreeRootPath
+            ) else { return false }
+            return logicalRootPath != worktreeRootPath
+        }
         guard logicalRootPaths.count == bindings.count,
-              logicalRootPaths.isSubset(of: visibleRootPaths)
+              logicalRootPaths.isSubset(of: visibleRootPaths),
+              bindingsMapDistinctLogicalRootsToWorktrees
         else {
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }

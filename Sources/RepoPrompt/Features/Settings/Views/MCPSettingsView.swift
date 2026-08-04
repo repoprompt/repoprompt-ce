@@ -31,6 +31,17 @@ struct MCPSettingsView: View {
         )
     }
 
+    private var windowToolsEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { vm.windowToolsEnabled },
+            set: { enabled in
+                Task { @MainActor [weak vm] in
+                    _ = await vm?.setWindowToolsEnabled(enabled)
+                }
+            }
+        )
+    }
+
     private var showModelPresetsBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.mcpShowModelPresets() },
@@ -195,7 +206,7 @@ struct MCPSettingsView: View {
                     .hoverTooltip("Abort the current tool call")
                 }
 
-                Toggle("", isOn: $vm.windowToolsEnabled)
+                Toggle("", isOn: windowToolsEnabledBinding)
                     .toggleStyle(SwitchToggleStyle())
                     .hoverTooltip("Enable MCP tools for this window")
             }
@@ -443,7 +454,12 @@ struct MCPSettingsView: View {
                         }
                         Button("Codex CLI") {
                             let result = MCPIntegrationHelper.installInCodex()
-                            showFeedback(result.success ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured") : "Codex config failed", isError: !result.success)
+                            showFeedback(
+                                result.success
+                                    ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
+                                    : (result.errorMessage ?? "Codex config failed"),
+                                isError: !result.success
+                            )
                         }
                         Button("OpenCode") {
                             let result = MCPIntegrationHelper.installInOpenCode()
@@ -568,7 +584,7 @@ struct MCPSettingsView: View {
                     }
 
                     Section {
-                        Text("Codex CLI (~/.codex/prompts)")
+                        Text("RepoPrompt Codex (isolated prompts)")
                             .font(.caption)
                             .foregroundColor(.secondary)
 
@@ -688,7 +704,7 @@ struct MCPSettingsView: View {
                       "mcpServers": {
                         "RepoPrompt": {
                           "command": "\(serverCommand)",
-                          "args": []
+                          "args": ["--backend", "app"]
                         }
                       }
                     }

@@ -9,7 +9,8 @@ extension AgentModeViewModel {
         tabID: UUID,
         text: String,
         message: String,
-        strategy: AgentModeRunService.DraftRestorationStrategy
+        strategy: AgentModeRunService.DraftRestorationStrategy,
+        operation: AgentComposerDraftRestorationOperation? = nil
     ) {
         // Also update session draft so it persists across tab switches
         storeDraftText(for: tabID, text)
@@ -18,9 +19,87 @@ extension AgentModeViewModel {
             tabID: tabID,
             text: text,
             message: message,
-            strategy: strategy
+            strategy: strategy,
+            operation: operation
         )
         syncComposerUIState()
+    }
+
+    /// Restores the full composer state for a manual submission that was
+    /// rejected before provider dispatch: draft text, image attachments,
+    /// tagged-file attachments, and the selected workflow.
+    ///
+    /// Restores never displace newer user choices: attachments and tagged
+    /// files are prepended only when not already pending, and the workflow is
+    /// restored only when the user has not selected another one since the
+    /// rejected submission. The rejected draft text is composed above any
+    /// newer typing here (with `.replaceAlways` delivery) so back-to-back
+    /// rejections each restore exactly once even when restoration events
+    /// coalesce in the UI.
+    func restoreRejectedManualSubmissionComposerState(
+        tabID: UUID,
+        session: TabSession,
+        draftText: String,
+        images: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        selectedWorkflow workflow: AgentWorkflowDefinition?,
+        selectedWorkflowMutationGeneration: UInt64?,
+        message: String
+    ) {
+        var sessionChanged = false
+        if !images.isEmpty {
+            let existingImageIDs = Set(session.pendingImageAttachments.map(\.id))
+            let restoredImages = images.filter { !existingImageIDs.contains($0.id) }
+            if !restoredImages.isEmpty {
+                session.pendingImageAttachments = restoredImages + session.pendingImageAttachments
+                sessionChanged = true
+            }
+        }
+        if !taggedFiles.isEmpty {
+            let existingTaggedPaths = Set(session.pendingTaggedFileAttachments.map(\.relativePath))
+            let restoredTaggedFiles = taggedFiles.filter { !existingTaggedPaths.contains($0.relativePath) }
+            if !restoredTaggedFiles.isEmpty {
+                session.pendingTaggedFileAttachments = restoredTaggedFiles + session.pendingTaggedFileAttachments
+                sessionChanged = true
+            }
+        }
+        if let workflow,
+           let selectedWorkflowMutationGeneration,
+           session.userWorkflowSelectionMutationGeneration == selectedWorkflowMutationGeneration,
+           session.selectedWorkflow == nil
+        {
+            session.selectedWorkflow = workflow
+            if tabID == currentTabID {
+                selectedWorkflow = workflow
+            }
+            sessionChanged = true
+        }
+        if sessionChanged {
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: tabID)
+        }
+        let existingDraft = retrieveDraftText(for: tabID)
+        let composedDraft = AgentComposerDraftRestorationReducer.compose(
+            restoredText: draftText,
+            above: existingDraft
+        )
+        let previousRestorationEventID = draftRestorationEvent.flatMap { event in
+            event.tabID == tabID ? event.id : nil
+        }
+        let operation = AgentComposerDraftRestorationOperation(
+            rejectedDraftText: draftText,
+            draftTextBeforeRestoration: existingDraft,
+            composedDraftText: composedDraft,
+            previousRestorationEventID: previousRestorationEventID
+        )
+        restoreComposerDraft(
+            tabID: tabID,
+            text: composedDraft,
+            message: message,
+            strategy: .replaceAlways,
+            operation: operation
+        )
     }
 
     /// Store draft text for a tab

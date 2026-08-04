@@ -43,7 +43,6 @@ struct AnchorGeometryView: NSViewRepresentable {
         init(callback: @escaping UpdateCallback) {
             self.callback = callback
             super.init(frame: .zero)
-            translatesAutoresizingMaskIntoConstraints = false
         }
 
         @available(*, unavailable)

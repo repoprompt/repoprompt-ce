@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import OSLog
+import RepoPromptDomainRuntime
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -90,6 +92,7 @@ actor GitService {
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
     private static let gitBlobSizeOutputByteLimit = 64
     private static let gitBlobDiagnosticOutputByteLimit = 64 * 1024
+    private static let worktreeListLogger = Logger(subsystem: "com.repoprompt.git", category: "worktree-list")
     /// Root/search startup snapshots and receipts are process-local. A process-local salt
     /// provides one path-free repository namespace shared by all GitService instances while
     /// intentionally making restart/receipt loss fall back to the full crawler.
@@ -104,6 +107,22 @@ actor GitService {
         var errorDescription: String? {
             GitService.friendlyErrorDescription(for: message)
         }
+    }
+
+    struct ResolvedWorktreeRecord: Equatable {
+        let record: GitWorktreePorcelainRecord
+        let pathURL: URL
+        let layout: GitRepositoryLayout?
+    }
+
+    struct WorktreeAliasResolution: Equatable {
+        let records: [ResolvedWorktreeRecord]
+        let collapsedAliasCount: Int
+    }
+
+    enum WorktreeAliasConflict: String, Error, Equatable {
+        case recordMetadata = "record_metadata"
+        case repositoryLayout = "repository_layout"
     }
 
     enum GitProcessCaptureError: Error, Equatable {
@@ -735,17 +754,20 @@ actor GitService {
                     if let mutationLockAcquiredHandler {
                         await mutationLockAcquiredHandler(initializationContext?.correlationID)
                     }
+                #endif
+                let mutationRequest = try Self.canonicalizedAppManagedRequestAtMutationBoundary(request)
+                #if DEBUG
                     let parentLookupTrace = initializationContext.map { _ in ReceiptParentLookupTrace() }
                     var receiptDecision = initialReceiptDecision
                 #endif
-                if let mainWorktreeRoot = request.mainWorktreeRoot {
+                if let mainWorktreeRoot = mutationRequest.mainWorktreeRoot {
                     do {
                         try GitWorktreeDefaultPathPlanner.validate(
-                            path: request.path,
+                            path: mutationRequest.path,
                             mainWorktreeRoot: mainWorktreeRoot,
-                            knownWorktreeRoots: request.knownWorktreeRoots,
-                            appManagedContainer: request.appManagedContainer,
-                            allowExternalPath: request.allowExternalPath
+                            knownWorktreeRoots: mutationRequest.knownWorktreeRoots,
+                            appManagedContainer: mutationRequest.appManagedContainer,
+                            allowExternalPath: mutationRequest.allowExternalPath
                         )
                     } catch {
                         #if DEBUG
@@ -824,7 +846,7 @@ actor GitService {
                             )
                     #endif
                     var targetTree = try? await resolveTreeOID(
-                        request.baseRef?.isEmpty == false ? request.baseRef! : "HEAD",
+                        mutationRequest.baseRef?.isEmpty == false ? mutationRequest.baseRef! : "HEAD",
                         in: sourceLayout
                     )
                     #if DEBUG
@@ -841,9 +863,9 @@ actor GitService {
                             receiptDecision?.witnessRequested = true
                         #endif
                         parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
-                        if let stableWatchRootURL = request.appManagedContainer {
+                        if let stableWatchRootURL = mutationRequest.appManagedContainer {
                             witnessSession = creationReceiptCoordinator.start(
-                                destinationURL: request.path,
+                                destinationURL: mutationRequest.path,
                                 stableWatchRootURL: stableWatchRootURL
                             )
                         }
@@ -881,21 +903,21 @@ actor GitService {
                 }
                 do {
                     var args = ["worktree", "add"]
-                    if request.force { args.append("--force") }
-                    if request.detach { args.append("--detach") }
-                    if let lockReason = request.lockReason {
+                    if mutationRequest.force { args.append("--force") }
+                    if mutationRequest.detach { args.append("--detach") }
+                    if let lockReason = mutationRequest.lockReason {
                         args.append("--lock")
                         if !lockReason.isEmpty {
                             args.append("--reason")
                             args.append(lockReason)
                         }
                     }
-                    if let branch = request.branch, !branch.isEmpty {
+                    if let branch = mutationRequest.branch, !branch.isEmpty {
                         args.append("-b")
                         args.append(branch)
                     }
-                    args.append(request.path.standardizedFileURL.path)
-                    if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
+                    args.append(mutationRequest.path.standardizedFileURL.path)
+                    if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
                     #if DEBUG
                         let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
@@ -910,14 +932,14 @@ actor GitService {
                     #endif
 
                     await clearLayoutCache()
-                    let createdPath = request.path.standardizedFileURL.path
+                    let createdPath = mutationRequest.path.standardizedFileURL.path
                     let worktrees = try await listWorktrees(at: repoURL)
                     guard let created = worktrees.first(where: { $0.path == createdPath }) else {
                         throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
                     }
                     let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
-                    let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
-                        request: request,
+                    let includeCopyResult = try await copyWorktreeIncludeFilesIfRequested(
+                        request: mutationRequest,
                         sourceRepoURL: repoURL,
                         destinationURL: destinationURL
                     )
@@ -1083,10 +1105,10 @@ actor GitService {
                             parentCompatibilityKey: parentEvidence.snapshot.compatibilityKey,
                             parentAuthorityBefore: parentEvidence.lease.snapshot,
                             targetAuthorityAfter: targetAuthority,
-                            requestedBaseRef: request.baseRef,
+                            requestedBaseRef: mutationRequest.baseRef,
                             resolvedBaseTreeOID: parentEvidence.baseTree,
                             repositoryRelativeRootPrefix: initializationContext.repositoryRelativeRootPrefix,
-                            plannedTargetPath: request.path.standardizedFileURL.path,
+                            plannedTargetPath: mutationRequest.path.standardizedFileURL.path,
                             actualTargetPath: created.path,
                             exactCopiedRelativePaths: includeCopyResult?.copiedRelativePaths ?? [],
                             includeCopyHadFailures: includeCopyHadFailures,
@@ -1562,13 +1584,14 @@ actor GitService {
         request: GitWorktreeCreateRequest,
         sourceRepoURL: URL,
         destinationURL: URL
-    ) async -> GitWorktreeIncludeCopyResult? {
+    ) async throws -> GitWorktreeIncludeCopyResult? {
         guard request.copyWorktreeIncludeFiles,
               let appManagedContainer = request.appManagedContainer,
               Self.isPath(destinationURL, equalToOrInside: appManagedContainer)
         else { return nil }
         let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
         guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         do {
             let (stdout, stderr, exitCode) = try await runGit(
@@ -1582,12 +1605,15 @@ actor GitService {
                     errorSummaries: ["could not list Git-ignored files: \(stderr)"]
                 )
             }
-            return GitWorktreeIncludeCopier.copyIncludedFiles(
+            return try GitWorktreeIncludeCopier.copyIncludedFiles(
                 from: sourceRepoURL,
                 to: destinationURL,
                 ignoredFilesNULOutput: stdout,
-                appManagedContainer: appManagedContainer
+                appManagedContainer: appManagedContainer,
+                physicalMutationGuard: physicalMutationGuard
             )
+        } catch let error as DomainMutationPathFenceError {
+            throw error
         } catch {
             return GitWorktreeIncludeCopyResult(
                 copiedCount: 0,
@@ -1595,6 +1621,38 @@ actor GitService {
                 errorSummaries: ["could not copy .worktreeinclude files: \(error.localizedDescription)"]
             )
         }
+    }
+
+    private static func canonicalizedAppManagedRequestAtMutationBoundary(
+        _ request: GitWorktreeCreateRequest
+    ) throws -> GitWorktreeCreateRequest {
+        guard !request.allowExternalPath, let appManagedContainer = request.appManagedContainer else {
+            return request
+        }
+        guard let canonicalContainer = DomainMutationPathFence.canonicalPath(appManagedContainer.path),
+              let canonicalDestination = DomainMutationPathFence.canonicalPath(request.path.path)
+        else {
+            throw GitError(
+                message: "app-managed worktree destination could not be resolved safely: \(request.path.path)"
+            )
+        }
+        let containerPrefix = canonicalContainer.hasSuffix("/") ? canonicalContainer : canonicalContainer + "/"
+        guard canonicalDestination == canonicalContainer || canonicalDestination.hasPrefix(containerPrefix) else {
+            throw GitError(message: "app-managed worktree destination resolved outside its managed container: \(request.path.path)")
+        }
+        return GitWorktreeCreateRequest(
+            path: URL(fileURLWithPath: canonicalDestination, isDirectory: true),
+            branch: request.branch,
+            baseRef: request.baseRef,
+            detach: request.detach,
+            force: request.force,
+            lockReason: request.lockReason,
+            allowExternalPath: request.allowExternalPath,
+            appManagedContainer: URL(fileURLWithPath: canonicalContainer, isDirectory: true),
+            mainWorktreeRoot: request.mainWorktreeRoot,
+            knownWorktreeRoots: request.knownWorktreeRoots,
+            copyWorktreeIncludeFiles: request.copyWorktreeIncludeFiles
+        )
     }
 
     private static func canonicalPathSet(_ paths: [URL]) -> Set<String> {
@@ -1882,6 +1940,41 @@ actor GitService {
         }
     }
 
+    /// Apply a preview whose endpoint identities are revalidated inside the mutation boundary.
+    func applyAndCommitWorktreeMerge(
+        sourceEndpoint: GitWorktreeMergeEndpoint,
+        targetEndpoint: GitWorktreeMergeEndpoint,
+        sourceHead: String,
+        message: String
+    ) async throws -> (state: GitWorktreeMergeState, commit: String?) {
+        try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeApply) {
+            try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge apply")
+                }
+                try await validateCurrentEndpoint(sourceEndpoint, label: "Source")
+                try await validateCurrentEndpoint(targetEndpoint, label: "Target")
+                let (_, stderr, exitCode) = try await runGit(
+                    ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
+                    at: targetEndpoint.url
+                )
+                if exitCode == 0 || exitCode == 1 {
+                    let state = try await inspectMergeState(at: targetEndpoint.url)
+                    guard state.conflictFiles.isEmpty else { return (state: state, commit: nil) }
+                    guard state.inProgress else { return (state: state, commit: nil) }
+                    let commit = try await commitCurrentMergeWithoutLock(
+                        message: message,
+                        at: targetEndpoint.url,
+                        sourceEndpoint: sourceEndpoint,
+                        targetEndpoint: targetEndpoint
+                    )
+                    return (state: state, commit: commit)
+                }
+                throw GitError(message: "git merge --no-commit failed: \(stderr)")
+            }
+        }
+    }
+
     func commitWorktreeMerge(message: String, at targetRepoURL: URL) async throws -> String {
         try await withWorkspaceAuthorityMutation(at: targetRepoURL, kind: .mergeCommit) {
             try await withWorktreeMergeAdvisoryLock(at: targetRepoURL) { [weak self] in
@@ -1921,13 +2014,64 @@ actor GitService {
         }
     }
 
-    private func commitCurrentMergeWithoutLock(message: String, at targetRepoURL: URL) async throws -> String {
+    func continueWorktreeMerge(
+        sourceEndpoint: GitWorktreeMergeEndpoint,
+        targetEndpoint: GitWorktreeMergeEndpoint,
+        message: String
+    ) async throws -> String {
+        try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeContinue) {
+            try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge continue")
+                }
+                try await validateCurrentEndpoint(sourceEndpoint, label: "Source")
+                try await validateCurrentEndpoint(targetEndpoint, label: "Target")
+                return try await commitCurrentMergeWithoutLock(
+                    message: message,
+                    at: targetEndpoint.url,
+                    sourceEndpoint: sourceEndpoint,
+                    targetEndpoint: targetEndpoint
+                )
+            }
+        }
+    }
+
+    func abortWorktreeMerge(targetEndpoint: GitWorktreeMergeEndpoint) async throws -> Bool {
+        try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeAbort) {
+            try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
+                guard let self else {
+                    throw GitError(message: "git service was released before merge abort")
+                }
+                let state = try await inspectMergeState(at: targetEndpoint.url)
+                guard state.inProgress else { return false }
+                try await validateCurrentEndpoint(targetEndpoint, label: "Target")
+                let (_, stderr, exitCode) = try await runGit(["merge", "--abort"], at: targetEndpoint.url)
+                guard exitCode == 0 else {
+                    throw GitError(message: "git merge --abort failed: \(stderr)")
+                }
+                return true
+            }
+        }
+    }
+
+    private func commitCurrentMergeWithoutLock(
+        message: String,
+        at targetRepoURL: URL,
+        sourceEndpoint: GitWorktreeMergeEndpoint? = nil,
+        targetEndpoint: GitWorktreeMergeEndpoint? = nil
+    ) async throws -> String {
         let state = try await inspectMergeState(at: targetRepoURL)
         guard state.inProgress else {
             throw GitError(message: "No Git merge is in progress at \(targetRepoURL.path)")
         }
         guard state.conflictFiles.isEmpty else {
             throw GitError(message: "Cannot commit merge with unresolved conflicts: \(state.conflictFiles.joined(separator: ", "))")
+        }
+        if let sourceEndpoint {
+            try await validateCurrentEndpoint(sourceEndpoint, label: "Source")
+        }
+        if let targetEndpoint {
+            try await validateCurrentEndpoint(targetEndpoint, label: "Target")
         }
         let (_, stderr, exitCode) = try await runGit(
             ["commit", "--no-gpg-sign", "-m", message],
@@ -1948,8 +2092,10 @@ actor GitService {
 
     private func validateCurrentEndpoint(_ endpoint: GitWorktreeMergeEndpoint, label: String) async throws {
         let worktrees = try await listWorktrees(at: endpoint.url)
-        let standardizedPath = endpoint.url.standardizedFileURL.path
-        guard let current = worktrees.first(where: { $0.path == standardizedPath }) else {
+        let canonicalPath = GitRepoRootAuthorization.canonicalPath(endpoint.path)
+        guard let current = worktrees.first(where: {
+            GitRepoRootAuthorization.canonicalPath($0.path) == canonicalPath
+        }) else {
             throw GitError(message: "\(label) worktree is unavailable: \(endpoint.path)")
         }
         guard current.worktreeID == endpoint.worktreeID else {
@@ -3226,6 +3372,7 @@ actor GitService {
     func getDiffNumstat(
         compare: GitDiffCompareSpec,
         detectRenames: Bool = false,
+        paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> String {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .numstat)
@@ -3234,7 +3381,7 @@ actor GitService {
             contextLines: nil,
             detectRenames: detectRenames,
             refArg: refArg,
-            paths: nil,
+            paths: paths,
             at: repoURL
         )
     }
@@ -3242,6 +3389,7 @@ actor GitService {
     func getDiffNameStatus(
         compare: GitDiffCompareSpec,
         detectRenames: Bool = false,
+        paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> String {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .nameStatus)
@@ -3250,7 +3398,7 @@ actor GitService {
             contextLines: nil,
             detectRenames: detectRenames,
             refArg: refArg,
-            paths: nil,
+            paths: paths,
             at: repoURL
         )
     }
@@ -3259,8 +3407,10 @@ actor GitService {
         compare: GitDiffCompareSpec,
         includeUntrackedWhenApplicable: Bool,
         detectRenames: Bool = false,
+        paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
+        if let paths, paths.isEmpty { return [] }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
             case .uncommitted, .uncommittedMergeBase, .unstaged:
@@ -3270,9 +3420,9 @@ actor GitService {
             }
         }()
 
-        async let numOutTask = getDiffNumstat(compare: compare, detectRenames: detectRenames, at: repoURL)
-        async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, at: repoURL)
-        async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(at: repoURL) : []
+        async let numOutTask = getDiffNumstat(compare: compare, detectRenames: detectRenames, paths: paths, at: repoURL)
+        async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, paths: paths, at: repoURL)
+        async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(paths: paths, at: repoURL) : []
         let (numOut, nameOut, untrackedFiles) = try await (numOutTask, nameOutTask, untrackedFilesTask)
         let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
             (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
@@ -3323,9 +3473,15 @@ actor GitService {
         }.map(\.file)
     }
 
-    private func getUntrackedPaths(at repoURL: URL) async throws -> [String] {
+    private func getUntrackedPaths(paths: [String]?, at repoURL: URL) async throws -> [String] {
+        if let paths, paths.isEmpty { return [] }
+        var args = ["ls-files", "--others", "--exclude-standard"]
+        if let paths {
+            args.append("--")
+            args.append(contentsOf: paths)
+        }
         let (stdout, stderr, exitCode) = try await runGit(
-            ["ls-files", "--others", "--exclude-standard"],
+            args,
             at: repoURL
         )
         guard exitCode == 0 else {
@@ -7207,8 +7363,8 @@ actor GitService {
                     }
                 }
 
-                // Blocking waitpid runs on ProcessTermination's dedicated
-                // queue. This task remains the sole reaping authority.
+                // ProcessTermination retains cancellation-independent ownership
+                // until the child-exit source performs the sole destructive reap.
                 Task.detached(priority: .userInitiated) {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
                     let reapRequiresGroupCleanup: Bool
@@ -7216,7 +7372,7 @@ actor GitService {
                         reapOutcome = try await .success(
                             ProcessTermination.reapChildStatus(
                                 pid: spawned.pid,
-                                onReaped: { target.markTerminated() }
+                                beforeReap: { target.markTerminated() }
                             )
                         )
                         reapRequiresGroupCleanup = false
@@ -7406,6 +7562,7 @@ actor GitService {
         #if DEBUG
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
@@ -7460,6 +7617,7 @@ actor GitService {
                 let spawnStartedAt = DispatchTime.now().uptimeNanoseconds
                 do {
                     try lifecycleController.checkCancellationBeforeSpawn()
+                    try physicalMutationGuard?.revalidate()
                     let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
                         family: commandFamily,
                         priority: admissionPriority
@@ -7602,8 +7760,8 @@ actor GitService {
                     }
                 }
 
-                // Blocking waitpid runs on ProcessTermination's dedicated
-                // queue. This task remains the sole reaping authority.
+                // ProcessTermination retains cancellation-independent ownership
+                // until the child-exit source performs the sole destructive reap.
                 Task.detached(priority: .userInitiated) {
                     let reapOutcome: Result<ProcessExitStatus, any Error>
                     let reapRequiresGroupCleanup: Bool
@@ -7611,7 +7769,7 @@ actor GitService {
                         reapOutcome = try await .success(
                             ProcessTermination.reapChildStatus(
                                 pid: spawned.pid,
-                                onReaped: { target.markTerminated() }
+                                beforeReap: { target.markTerminated() }
                             )
                         )
                         reapRequiresGroupCleanup = false
@@ -7784,6 +7942,68 @@ actor GitService {
         }
     }
 
+    static func collapseEquivalentWorktreeAliases(
+        _ records: [GitWorktreePorcelainRecord],
+        resolveLayout: (URL) -> GitRepositoryLayout? = {
+            GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: $0)
+        }
+    ) throws -> WorktreeAliasResolution {
+        var resolvedRecords: [ResolvedWorktreeRecord] = []
+        var indexByPath: [String: Int] = [:]
+        var collapsedAliasCount = 0
+
+        for sourceRecord in records {
+            let sourceURL = URL(fileURLWithPath: sourceRecord.path)
+            let pathURL = sourceURL.standardizedFileURL
+            var record = sourceRecord
+            record.path = pathURL.path
+            let layout = resolveLayout(sourceURL).map(standardizedRepositoryLayout)
+            let candidate = ResolvedWorktreeRecord(record: record, pathURL: pathURL, layout: layout)
+
+            if let existingIndex = indexByPath[pathURL.path] {
+                let existing = resolvedRecords[existingIndex]
+                guard repositoryLayoutsAreEquivalent(existing.layout, candidate.layout) else {
+                    throw WorktreeAliasConflict.repositoryLayout
+                }
+                guard existing.record == candidate.record else {
+                    throw WorktreeAliasConflict.recordMetadata
+                }
+                collapsedAliasCount += 1
+                continue
+            }
+
+            indexByPath[pathURL.path] = resolvedRecords.count
+            resolvedRecords.append(candidate)
+        }
+
+        return WorktreeAliasResolution(
+            records: resolvedRecords,
+            collapsedAliasCount: collapsedAliasCount
+        )
+    }
+
+    private static func repositoryLayoutsAreEquivalent(
+        _ lhs: GitRepositoryLayout?,
+        _ rhs: GitRepositoryLayout?
+    ) -> Bool {
+        guard let lhs, let rhs else { return false }
+        return lhs.workTreeRoot.path == rhs.workTreeRoot.path
+            && lhs.dotGitPath.path == rhs.dotGitPath.path
+            && lhs.gitDir.path == rhs.gitDir.path
+            && lhs.commonDir.path == rhs.commonDir.path
+            && lhs.isWorktree == rhs.isWorktree
+    }
+
+    private static func standardizedRepositoryLayout(_ layout: GitRepositoryLayout) -> GitRepositoryLayout {
+        GitRepositoryLayout(
+            workTreeRoot: layout.workTreeRoot.standardizedFileURL,
+            dotGitPath: layout.dotGitPath.standardizedFileURL,
+            gitDir: layout.gitDir.standardizedFileURL,
+            commonDir: layout.commonDir.standardizedFileURL,
+            isWorktree: layout.isWorktree
+        )
+    }
+
     private func makeWorktreeDescriptors(
         from records: [GitWorktreePorcelainRecord],
         currentRepoURL: URL
@@ -7794,20 +8014,35 @@ actor GitService {
         } else {
             nil
         }
-        let worktreeRecords = normalizedWorktreeRecords(
+        let normalizedRecords = normalizedWorktreeRecords(
             records.filter { !$0.isBare },
             currentLayout: currentLayout,
             resolvedMainRoot: resolvedMainRoot
         )
-        guard !worktreeRecords.isEmpty else { return [] }
+        guard !normalizedRecords.isEmpty else { return [] }
 
+        let aliasResolution: WorktreeAliasResolution
+        do {
+            aliasResolution = try Self.collapseEquivalentWorktreeAliases(normalizedRecords)
+        } catch let conflict as WorktreeAliasConflict {
+            Self.worktreeListLogger.error(
+                "git worktree standardized-path alias conflict kind=\(conflict.rawValue, privacy: .public) record_count=\(normalizedRecords.count, privacy: .public)"
+            )
+            throw GitError(
+                message: "git worktree list returned conflicting \(conflict.rawValue) for one standardized checkout path"
+            )
+        }
+
+        if aliasResolution.collapsedAliasCount > 0 {
+            Self.worktreeListLogger.notice(
+                "git worktree standardized-path aliases collapsed record_count=\(normalizedRecords.count, privacy: .public) unique_count=\(aliasResolution.records.count, privacy: .public) collapsed_count=\(aliasResolution.collapsedAliasCount, privacy: .public)"
+            )
+        }
+
+        let worktreeRecords = aliasResolution.records.map(\.record)
         let layoutsByPath: [String: GitRepositoryLayout] = Dictionary(
-            uniqueKeysWithValues: worktreeRecords.compactMap { record -> (String, GitRepositoryLayout)? in
-                let pathURL = URL(fileURLWithPath: record.path)
-                guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: pathURL) else {
-                    return nil
-                }
-                return (pathURL.standardizedFileURL.path, layout)
+            uniqueKeysWithValues: aliasResolution.records.compactMap { resolvedRecord in
+                resolvedRecord.layout.map { (resolvedRecord.pathURL.path, $0) }
             }
         )
 

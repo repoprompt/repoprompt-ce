@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 public enum MCPTransportTerminalCause: String, Codable, Equatable, Sendable {
@@ -21,22 +22,16 @@ public struct MCPTransportCloseSnapshot: Equatable, Sendable {
     public let errorDescription: String?
 }
 
-struct MCPFirstTerminalRecordClaim: Equatable {
-    private(set) var record: MCPTerminalRecord?
-    private(set) var didPersist = false
+typealias MCPFirstTerminalRecordClaim = MCPDomainFirstTerminalClaim<MCPTerminalRecord>
 
-    mutating func claim(_ candidate: MCPTerminalRecord) -> MCPTerminalRecord? {
-        guard !didPersist else { return nil }
-        if record == nil {
-            record = candidate
-        }
-        return record
-    }
-
-    mutating func markPersisted() {
-        guard record != nil else { return }
-        didPersist = true
-    }
+struct MCPTerminalToolExecutionContext: Equatable {
+    let toolName: String
+    let invocationID: UUID
+    let elapsedMilliseconds: Double
+    let handlerPhase: String?
+    let handlerPhaseAgeMilliseconds: Double?
+    let executionDeadlineMilliseconds: Double?
+    let cleanupGraceMilliseconds: Double?
 }
 
 struct MCPConnectionCloseContext: Equatable {
@@ -44,17 +39,20 @@ struct MCPConnectionCloseContext: Equatable {
     let initiator: MCPTerminalInitiator
     let errno: Int32?
     let errorDescription: String?
+    let toolExecution: MCPTerminalToolExecutionContext?
 
     init(
         reason: String,
         initiator: MCPTerminalInitiator,
         errno: Int32? = nil,
-        errorDescription: String? = nil
+        errorDescription: String? = nil,
+        toolExecution: MCPTerminalToolExecutionContext? = nil
     ) {
         self.reason = reason
         self.initiator = initiator
         self.errno = errno
         self.errorDescription = errorDescription
+        self.toolExecution = toolExecution
     }
 
     init(transport snapshot: MCPTransportCloseSnapshot) {

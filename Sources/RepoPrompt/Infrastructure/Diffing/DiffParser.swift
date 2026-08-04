@@ -1,10 +1,9 @@
 // File: RepoPrompt/Models/DiffParserUtils.swift
 
 import Foundation
-import SwiftUI
 
 /// Central on/off switch for every debug print in the diff-parser stack.
-enum DebugFlags { static var parser = false }
+enum DebugFlags { nonisolated(unsafe) static var parser = false }
 
 /// Convenience wrapper so we can write `dprint("…")` instead of
 /// `if DebugFlags.parser { print("…") }`.
@@ -91,7 +90,7 @@ enum DiffParserUtils {
         escapeString(input)
     }
 
-    static var isDebugEnabled: Bool = false
+    nonisolated(unsafe) static var isDebugEnabled: Bool = false
     private static let backtickTags: Set<String> = ["start_selector", "end_selector", "content", "search"]
 
     // MARK: - Fence Seam and Sibling Boundary Cleanup
@@ -1066,33 +1065,20 @@ enum DiffParserUtils {
     }
 }
 
+import Foundation
+import RepoPromptDomainRuntime
+import SwiftUI
+
 class DiffParser {
     private let fileManager: WorkspaceFilesViewModel
-
-    #if DEBUG
-        /// Debug configuration for testing - only available in DEBUG builds
-        struct DebugConfig {
-            var treatNonExistentFilesAsExisting: Bool = false
-            var alwaysPreserveRewriteAction: Bool = false
-        }
-
-        private let debugConfig: DebugConfig?
-    #endif
 
     private func dbg(_ msg: @autoclosure () -> String) {
         dprint(msg())
     }
 
-    #if DEBUG
-        init(fileManager: WorkspaceFilesViewModel, debugConfig: DebugConfig? = nil) {
-            self.fileManager = fileManager
-            self.debugConfig = debugConfig
-        }
-    #else
-        init(fileManager: WorkspaceFilesViewModel) {
-            self.fileManager = fileManager
-        }
-    #endif
+    init(fileManager: WorkspaceFilesViewModel) {
+        self.fileManager = fileManager
+    }
 
     /// Merges two actions for the same file into a single effective action
     /// following these rules:
@@ -1218,13 +1204,6 @@ class DiffParser {
                         canBeLoaded = true
                         // latestContent is an async getter
                         loadedFile = await file.latestContent ?? ""
-                    } else if let baselineContent = await fileManager.getBaselineContent(
-                        forPath: location.correctedPath,
-                        rootIdentifier: location.rootIdentifier
-                    ) {
-                        // Use baseline content if available (e.g., in benchmark mode)
-                        canBeLoaded = true
-                        loadedFile = baselineContent
                     } else {
                         // File doesn't exist in hierarchy yet
                         canBeLoaded = false
@@ -1245,26 +1224,11 @@ class DiffParser {
             // ---- Handle modify on non-existent file (error but continue) -----
             if originalAction == .modify, !canBeLoaded {
                 errors.append(.fileNotFoundForModify(filePath: canonicalPath))
-                #if DEBUG
-                    // In debug mode, we can treat non-existent files as existing for testing
-                    if debugConfig?.treatNonExistentFilesAsExisting == true {
-                        canBeLoaded = true
-                    }
-                #endif
             }
 
             // ---- Convert rewrite → add if file doesn't exist -----
             if originalAction == .rewrite, !canBeLoaded {
-                #if DEBUG
-                    // In debug mode with alwaysPreserveRewriteAction, keep it as rewrite
-                    if debugConfig?.alwaysPreserveRewriteAction == true {
-                        effectiveAction = .rewrite
-                    } else {
-                        effectiveAction = .create
-                    }
-                #else
-                    effectiveAction = .create
-                #endif
+                effectiveAction = .create
                 canBeLoaded = true // Treat as new file
             }
 
@@ -1415,12 +1379,6 @@ class DiffParser {
                 if let data = await file.latestContent {
                     loadedOld = data
                 }
-            } else if let baselineContent = await fileManager.getBaselineContent(
-                forPath: locationOld.correctedPath,
-                rootIdentifier: locationOld.rootIdentifier
-            ) {
-                // Use baseline content if available (e.g., in benchmark mode)
-                loadedOld = baselineContent
             }
         }
 
@@ -1578,17 +1536,6 @@ struct Change: Identifiable {
             }
         }
         print("")
-    }
-}
-
-enum FileAction: String {
-    case modify
-    case create
-    case delete
-    case rewrite
-
-    func printDetails() {
-        print("File Action: \(rawValue)")
     }
 }
 

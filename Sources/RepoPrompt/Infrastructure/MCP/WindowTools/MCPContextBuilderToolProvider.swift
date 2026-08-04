@@ -3,6 +3,26 @@ import JSONSchema
 import MCP
 import Ontology
 
+/// Carries existing non-Sendable UI snapshot/DTO values through the provider's @Sendable timeline
+/// wrappers without broadening their conformances. Each operation stores once and is fully awaited
+/// before the owning task loads once; the lock makes that narrow handoff explicit and race-safe.
+private final class ContextBuilderTimelinePhaseValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value?
+
+    func store(_ value: Value) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func load() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 private struct ContextBuilderToolResult: Codable {
     let tabID: String
     let status: String
@@ -239,15 +259,21 @@ enum ContextBuilderTypedPromptResolver {
 }
 
 @MainActor
-final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .contextBuilder
+final class MCPContextBuilderToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .contextBuilder
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private typealias Dependencies = (
+        execution: MCPAppPhysicalCapabilityAdapters.Execution,
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    )
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    private let dependencies: Dependencies
+
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution, context: MCPAppPhysicalCapabilityAdapters.Context, files: MCPAppPhysicalCapabilityAdapters.Files) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = (execution: execution, context: context, files: files)
     }
 
     func buildTools() -> [Tool] {
@@ -314,10 +340,10 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     private static func executeContextBuilder(
         args: [String: Value],
         connectionID: UUID?,
-        dependencies: MCPWindowToolDependencies
+        dependencies: Dependencies
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata = await dependencies.context.captureRequestMetadata()
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
         let exportResponse: Bool
         if let value = args["export_response"] {
@@ -332,8 +358,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             exportResponse = false
         }
 
-        let targetWindow = try dependencies.requireTargetWindow()
-        let tabResolution = try await dependencies.resolveContextBuilderTab(
+        let targetWindow = try dependencies.execution.requireTargetWindow()
+        let tabResolution = try await dependencies.execution.resolveContextBuilderTab(
             args,
             targetWindow,
             connectionID
@@ -346,7 +372,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         let workspaceContext = tabResolution.workspaceContext
         let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
         if workspaceContext == nil {
-            let scopedRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(
+            let scopedRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(
                 scope: lookupContext.rootScope
             )
             let scopedPaths = Set(scopedRoots.map(\.standardizedFullPath))
@@ -363,13 +389,13 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
         try await workspaceContext?.validateReviewTargetAvailability(
-            store: dependencies.promptVM.workspaceFileContextStore
+            store: dependencies.context.promptVM.workspaceFileContextStore
         )
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
-            try dependencies.bindTabForConnection(
+            try dependencies.execution.bindTabForConnection(
                 connectionID,
                 clientName,
                 finalTabID,
@@ -390,7 +416,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             ),
             explicitWindowRoutingHint: metadata.explicitWindowRoutingHint
         )
-        guard await dependencies.drainReadFileAutoSelection(
+        guard try await dependencies.files.drainReadFileAutoSelection(
             targetMetadata,
             .mirroredSelectionAndMetrics
         ) == .completed else {
@@ -408,7 +434,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         if exportResponse {
             // Export into the exact root scope selected by Context Builder's final tab resolution.
             // Ambient request metadata may still describe a different active tab.
-            capturedOracleExportDestination = try dependencies.makeOracleExportDestination(
+            capturedOracleExportDestination = try dependencies.execution.makeOracleExportDestination(
                 workspace,
                 targetWindow.windowID,
                 finalTabID,
@@ -471,7 +497,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     .flatMap(AIModel.fromModelName)?.displayName
             } : nil
 
-            let sendStageProgress = dependencies.sendStageProgress
+            let sendStageProgress = dependencies.execution.sendStageProgress
             let progressTimeline = ContextBuilderMCPProgressTimeline { event in
                 await sendStageProgress(
                     connectionID,
@@ -488,14 +514,14 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             }
 
             func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "starting",
                     "Starting context builder..."
                 )
 
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "discovering",
@@ -515,89 +541,138 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
-                            progressReporter: progressReporter
+                            progressReporter: progressReporter,
+                            activityReporter: activityReporter
                         )
                     }
                 }
 
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "discovered",
                     "Context Builder run complete, building selection..."
                 )
 
-                let resultTab: ComposeTabState
-                switch snapshot.terminalDisposition {
-                case .completed:
-                    guard let committedTab = snapshot.committedTab else {
-                        throw MCPError.internalError(
-                            "Context Builder completed without an exact committed tab snapshot"
+                await progressTimeline.transition(to: .selectionReplyRendering)
+                let renderedSelection = ContextBuilderTimelinePhaseValue<(
+                    resultTab: ComposeTabState,
+                    effectivePrompt: String,
+                    status: String,
+                    selection: StoredSelection,
+                    fileCount: Int,
+                    reply: ToolResultDTOs.SelectionReply,
+                    formatted: String
+                )>()
+                try await withTimelinePhaseCompletion(progressTimeline) {
+                    try await withHeartbeat(
+                        connectionID: connectionID,
+                        tool: MCPWindowToolName.contextBuilder,
+                        stage: "processing",
+                        message: "Still rendering Context Builder selection...",
+                        timeline: progressTimeline
+                    ) {
+                        let committedResultTab: ComposeTabState?
+                        if let committedTab = snapshot.committedTab {
+                            guard committedTab.nestedRunID == snapshot.runID,
+                                  committedTab.identity == resolvedIdentity,
+                                  committedTab.tab.id == finalTabID
+                            else {
+                                throw MCPError.internalError(
+                                    "Context Builder committed tab identity does not match the completed run"
+                                )
+                            }
+                            if snapshot.terminalDisposition == .completed {
+                                let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
+                                    let manager = targetWindow.workspaceManager
+                                    return (
+                                        manager.composeTab(for: committedTab.identity),
+                                        manager.selectionRevisionForMCP(
+                                            workspaceID: committedTab.identity.workspaceID,
+                                            tabID: committedTab.identity.tabID
+                                        )
+                                    )
+                                }
+                                let committedSnapshotIsCurrent: Bool = if responseType == .review {
+                                    canonicalState.1 == committedTab.selectionRevision
+                                        && canonicalState.0?.selection == committedTab.tab.selection
+                                } else {
+                                    canonicalState.1 >= committedTab.selectionRevision
+                                        && (
+                                            canonicalState.1 != committedTab.selectionRevision
+                                                || canonicalState.0?.selection == committedTab.tab.selection
+                                        )
+                                }
+                                guard committedSnapshotIsCurrent else {
+                                    throw MCPError.internalError(
+                                        "Context Builder committed tab snapshot is no longer valid"
+                                    )
+                                }
+                            }
+                            committedResultTab = committedTab.tab
+                        } else {
+                            committedResultTab = nil
+                        }
+
+                        let resultTab: ComposeTabState
+                        switch snapshot.terminalDisposition {
+                        case .completed:
+                            guard let committedResultTab else {
+                                throw MCPError.internalError(
+                                    "Context Builder completed without an exact committed tab snapshot"
+                                )
+                            }
+                            resultTab = committedResultTab
+                        case .cancelled, .failed:
+                            // Cancellation or failure after a successful commit must report the exact
+                            // committed prompt and selection. Pre-commit outcomes retain the immutable
+                            // initial tab instead of consulting mutable active-tab state.
+                            resultTab = committedResultTab ?? initialResultTab
+                        }
+
+                        let overrides = resultTab.contextOverrides
+                        let effectivePrompt = overrides.useOverridePrompt
+                            ? overrides.overridePromptText
+                            : resultTab.promptText
+                        let status = switch snapshot.terminalDisposition {
+                        case .completed: "completed"
+                        case .cancelled: "cancelled"
+                        case let .failed(message): "failed: \(message)"
+                        }
+
+                        try workspaceContext?.validateAvailability()
+                        let selection = resultTab.selection
+                        let reply = try await dependencies.execution.buildTabSelectionReply(
+                            selection,
+                            false,
+                            .relative,
+                            .auto,
+                            lookupContext,
+                            tabResolution.reviewGitContext
                         )
+                        renderedSelection.store((
+                            resultTab: resultTab,
+                            effectivePrompt: effectivePrompt,
+                            status: status,
+                            selection: selection,
+                            fileCount: selection.selectedPaths.count,
+                            reply: reply,
+                            formatted: ToolOutputFormatter.formatSelectionReplyToString(reply)
+                        ))
                     }
-                    guard committedTab.nestedRunID == snapshot.runID,
-                          committedTab.identity == resolvedIdentity,
-                          committedTab.tab.id == finalTabID
-                    else {
-                        throw MCPError.internalError(
-                            "Context Builder committed tab identity does not match the completed run"
-                        )
-                    }
-                    let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
-                        let manager = targetWindow.workspaceManager
-                        return (
-                            manager.composeTab(for: committedTab.identity),
-                            manager.selectionRevisionForMCP(
-                                workspaceID: committedTab.identity.workspaceID,
-                                tabID: committedTab.identity.tabID
-                            )
-                        )
-                    }
-                    let committedSnapshotIsCurrent: Bool = if responseType == .review {
-                        canonicalState.1 == committedTab.selectionRevision
-                            && canonicalState.0?.selection == committedTab.tab.selection
-                    } else {
-                        canonicalState.1 >= committedTab.selectionRevision
-                            && (
-                                canonicalState.1 != committedTab.selectionRevision
-                                    || canonicalState.0?.selection == committedTab.tab.selection
-                            )
-                    }
-                    guard committedSnapshotIsCurrent else {
-                        throw MCPError.internalError(
-                            "Context Builder committed tab snapshot is no longer valid"
-                        )
-                    }
-                    resultTab = committedTab.tab
-                case .cancelled, .failed:
-                    // Genuine discovery failures retain the exact immutable pre-run tab instead of
-                    // falling back to an active or duplicate tab after child cleanup.
-                    resultTab = initialResultTab
                 }
-
-                let overrides = resultTab.contextOverrides
-                let effectivePrompt = overrides.useOverridePrompt ? overrides.overridePromptText : resultTab.promptText
-
-                let status = switch snapshot.terminalDisposition {
-                case .completed: "completed"
-                case .cancelled: "cancelled"
-                case let .failed(message): "failed: \(message)"
+                guard let renderedSelection = renderedSelection.load() else {
+                    throw MCPError.internalError(
+                        "Context Builder selection reply rendering completed without a result"
+                    )
                 }
-
-                try workspaceContext?.validateAvailability()
-                let sel = resultTab.selection
-                let fileCount = sel.selectedPaths.count
-
-                let selectionReply = try await dependencies.buildTabSelectionReply(
-                    sel,
-                    false,
-                    .relative,
-                    .auto,
-                    lookupContext,
-                    tabResolution.reviewGitContext
-                )
-
-                let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
+                let resultTab = renderedSelection.resultTab
+                let effectivePrompt = renderedSelection.effectivePrompt
+                let status = renderedSelection.status
+                let sel = renderedSelection.selection
+                let fileCount = renderedSelection.fileCount
+                let selectionReply = renderedSelection.reply
+                let formattedSelection = renderedSelection.formatted
 
                 var planReply: ChatSendReply? = nil
                 var reviewReply: ChatSendReply? = nil
@@ -631,50 +706,70 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             )
                         }
 
-                        await dependencies.beforeContextBuilderFinalReviewAuthorization()
-                        let preAuthorizationCanonical = await MainActor.run {
-                            () -> (ComposeTabState?, UInt64) in
-                            let manager = targetWindow.workspaceManager
-                            return (
-                                manager.composeTab(for: committedTab.identity),
-                                manager.selectionRevisionForMCP(
-                                    workspaceID: committedTab.identity.workspaceID,
-                                    tabID: committedTab.identity.tabID
-                                )
-                            )
-                        }
-                        guard preAuthorizationCanonical.1 == committedTab.selectionRevision,
-                              preAuthorizationCanonical.0?.selection == sel
-                        else {
-                            throw MCPError.invalidParams(
-                                "Context Builder review selection changed before final repository authorization."
-                            )
-                        }
+                        await progressTimeline.transition(to: .reviewSelectionAuthorization)
+                        let retainedAuthorization =
+                            ContextBuilderTimelinePhaseValue<ContextBuilderFinalReviewAuthorization>()
+                        try await withTimelinePhaseCompletion(progressTimeline) {
+                            try await withHeartbeat(
+                                connectionID: connectionID,
+                                tool: MCPWindowToolName.contextBuilder,
+                                stage: "generating",
+                                message: "Still authorizing Context Builder review selection...",
+                                timeline: progressTimeline
+                            ) {
+                                await dependencies.execution.beforeContextBuilderFinalReviewAuthorization()
+                                let preAuthorizationCanonical = await MainActor.run {
+                                    () -> (ComposeTabState?, UInt64) in
+                                    let manager = targetWindow.workspaceManager
+                                    return (
+                                        manager.composeTab(for: committedTab.identity),
+                                        manager.selectionRevisionForMCP(
+                                            workspaceID: committedTab.identity.workspaceID,
+                                            tabID: committedTab.identity.tabID
+                                        )
+                                    )
+                                }
+                                guard preAuthorizationCanonical.1 == committedTab.selectionRevision,
+                                      preAuthorizationCanonical.0?.selection == sel
+                                else {
+                                    throw MCPError.invalidParams(
+                                        "Context Builder review selection changed before final repository authorization."
+                                    )
+                                }
 
-                        let authorization = try await workspaceContext.authorizeFinalReviewSelection(
-                            sel,
-                            workspaceID: committedTab.identity.workspaceID,
-                            tabID: committedTab.identity.tabID,
-                            selectionRevision: committedTab.selectionRevision,
-                            store: dependencies.promptVM.workspaceFileContextStore
-                        )
-                        await dependencies.didFinalizeContextBuilderReview(authorization)
-
-                        let finalCanonical = await MainActor.run { () -> (ComposeTabState?, UInt64) in
-                            let manager = targetWindow.workspaceManager
-                            return (
-                                manager.composeTab(for: committedTab.identity),
-                                manager.selectionRevisionForMCP(
+                                let authorization = try await workspaceContext.authorizeFinalReviewSelection(
+                                    sel,
                                     workspaceID: committedTab.identity.workspaceID,
-                                    tabID: committedTab.identity.tabID
+                                    tabID: committedTab.identity.tabID,
+                                    selectionRevision: committedTab.selectionRevision,
+                                    store: dependencies.context.promptVM.workspaceFileContextStore
                                 )
-                            )
+                                await dependencies.execution.didFinalizeContextBuilderReview(authorization)
+
+                                let finalCanonical = await MainActor.run {
+                                    () -> (ComposeTabState?, UInt64) in
+                                    let manager = targetWindow.workspaceManager
+                                    return (
+                                        manager.composeTab(for: committedTab.identity),
+                                        manager.selectionRevisionForMCP(
+                                            workspaceID: committedTab.identity.workspaceID,
+                                            tabID: committedTab.identity.tabID
+                                        )
+                                    )
+                                }
+                                guard finalCanonical.1 == committedTab.selectionRevision,
+                                      finalCanonical.0?.selection == sel
+                                else {
+                                    throw MCPError.invalidParams(
+                                        "Context Builder review selection changed after final repository authorization."
+                                    )
+                                }
+                                retainedAuthorization.store(authorization)
+                            }
                         }
-                        guard finalCanonical.1 == committedTab.selectionRevision,
-                              finalCanonical.0?.selection == sel
-                        else {
-                            throw MCPError.invalidParams(
-                                "Context Builder review selection changed after final repository authorization."
+                        guard let authorization = retainedAuthorization.load() else {
+                            throw MCPError.internalError(
+                                "Context Builder review authorization completed without retained authority"
                             )
                         }
                         finalReviewAuthorization = authorization
@@ -689,7 +784,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     }
 
                     let modeLabel = responseType?.generationLabel ?? "question"
-                    await dependencies.sendStageProgress(
+                    await dependencies.execution.sendStageProgress(
                         connectionID,
                         MCPWindowToolName.contextBuilder,
                         "generating",
@@ -704,7 +799,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             message: "Still generating \(modeLabel)...",
                             timeline: progressTimeline
                         ) {
-                            try await dependencies.runMCPPlanOrQuestion(
+                            try await dependencies.execution.runMCPPlanOrQuestion(
                                 contextBuilderVM,
                                 resolvedIdentity,
                                 tabResolution.agentModeSessionID,
@@ -729,7 +824,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     followUpHint = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(reply.shortId)\", new_chat: false)"
                 }
 
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "complete",
@@ -792,12 +887,12 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     guard let capturedOracleExportDestination else {
                         throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
                     }
-                    let exportPath = try await dependencies.resolveDefaultOracleExportPath(
+                    let exportPath = try await dependencies.execution.resolveDefaultOracleExportPath(
                         exportMode,
                         chatID,
                         capturedOracleExportDestination
                     )
-                    let resolvedPath = try await dependencies.writeGeneratedOracleExportFile(
+                    let resolvedPath = try await dependencies.execution.writeGeneratedOracleExportFile(
                         exportPath,
                         markdown,
                         capturedOracleExportDestination
@@ -887,7 +982,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         guard let connectionID else {
             return try await operation()
         }
-        let shouldSendProgress = await ServerNetworkManager.shared.supportsControlNotifications(connectionID: connectionID)
+        let shouldSendProgress = await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
         guard shouldSendProgress else {
             return try await operation()
         }

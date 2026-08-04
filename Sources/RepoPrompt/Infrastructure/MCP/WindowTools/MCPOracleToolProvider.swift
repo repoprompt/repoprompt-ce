@@ -2,25 +2,25 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 
 @MainActor
-final class MCPOracleToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .oracle
+final class MCPOracleToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .oracle
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {
         [
             oracleUtilsTool(),
             askOracleTool(),
-            oracleSendTool(),
-            oracleChatLogTool()
+            oracleSendTool()
         ]
     }
 
@@ -139,31 +139,10 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private func oracleChatLogTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.oracleChatLog,
-            freshnessPolicy: .none,
-            description: """
-            Read recent Oracle conversation messages to recover context during agent mode.
-
-            Returns the tail of an Oracle chat as lightweight `{ role, text }` objects. Available only during agent mode runs.
-
-            **Parameters**:
-            - `chat_id` (optional): Target a specific Oracle chat (short ID or UUID). Omit to read the most recent one.
-            - `limit` (optional): Number of messages to return (default: 8, range: 1–50)
-            - `include_user` (optional): Include your own messages in output (default: false)
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "chat_id": .string(description: "Chat ID (short ID or UUID) to read"),
-                    "limit": .integer(description: "Max number of messages to return (default: 8, min: 1, max: 50)"),
-                    "include_user": .boolean(description: "Include user messages in output (default: false)")
-                ],
-                required: []
-            )
-        ) { [dependencies] _, args in
-            try await dependencies.executeOracleChatLog(args)
-        }
+    func executeDomainOracleChatLog(
+        context _: DomainReadInvocationContext,
+        args: [String: Value]
+    ) async throws -> Value {
+        try await dependencies.executeOracleChatLog(args)
     }
 }
