@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -61,10 +62,12 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 })
             )
             XCTAssertEqual(viewModel.currentFollowUpOracleChatID(for: tabID), oracleSession.shortID)
-            XCTAssertTrue(
+            let retainedResponse = try XCTUnwrap(
                 composition.oracleViewModel.messagesSnapshot(for: oracleSession.id)
-                    .contains(where: { !$0.isUser && $0.content == "partial response" })
+                    .first(where: { !$0.isUser })
             )
+            XCTAssertTrue(retainedResponse.content.hasPrefix("partial response"))
+            XCTAssertTrue(retainedResponse.content.contains("reason: max_tokens"))
             guard case .error = viewModel.planStatus(for: tabID) else {
                 return XCTFail("Expected Context Builder error state")
             }
@@ -74,7 +77,7 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     }
 
     @MainActor
-    func testInteractiveIncompleteTerminationPreservesPartialResponse() async throws {
+    func testInteractiveIncompleteTerminationPreservesPartialResponseAndShowsReason() async throws {
         #if DEBUG
             let composition = makeComposition(
                 windowID: -180,
@@ -112,8 +115,135 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 composition.oracleViewModel.messagesSnapshot(for: sessionID)
                     .first(where: { $0.id == queryID })
             )
-            XCTAssertEqual(response.content, "partial response")
+            XCTAssertTrue(response.content.hasPrefix("partial response"))
+            XCTAssertTrue(response.content.contains("reason: max_tokens"))
             XCTAssertTrue(response.isFinalized)
+        #else
+            throw XCTSkip("Strict finalization injection is DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testAskOracleIncompleteTerminationFailsAndPreservesTranscript() async throws {
+        #if DEBUG
+            let composition = makeComposition(
+                windowID: -181,
+                terminalOutcome: .incomplete(reason: "max_tokens")
+            )
+            await composition.workspaceManager.awaitInitialized()
+
+            let root = makeTemporaryRoot(label: "ask-oracle-incomplete")
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = composition.workspaceManager.createWorkspace(
+                name: "Ask Oracle incomplete completion test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await composition.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderStrictFinalizationTests.ask-oracle-incomplete"
+            )
+
+            let settings = GlobalSettingsStore.shared
+            let previousShowPresets = settings.mcpShowModelPresets()
+            let previousDisablePresets = settings.mcpTemporarilyDisablePresets()
+            let previousPlanningModel = composition.promptManager.planningModelName
+            let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
+            defer {
+                settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                settings.setMCPTemporarilyDisablePresets(previousDisablePresets, commit: false)
+                composition.promptManager.planningModelName = previousPlanningModel
+                composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity
+            }
+            settings.setMCPShowModelPresets(false, commit: false)
+            settings.setMCPTemporarilyDisablePresets(false, commit: false)
+            composition.apiSettingsViewModel.isCustomProviderValid = true
+            composition.promptManager.planningModelName = AIModel.customProviderUser(
+                name: "strict-finalization-test"
+            ).rawValue
+            let oracleSession = try await composition.oracleViewModel.createSession(
+                named: "Ask Oracle incomplete response"
+            )
+
+            do {
+                _ = try await composition.oracleViewModel.tool_chatSend(
+                    args: [
+                        "message": .string("Review the response."),
+                        "mode": .string("review"),
+                        "chat_id": .string(oracleSession.id.uuidString)
+                    ],
+                    promptVM: composition.promptManager
+                )
+                XCTFail("Expected Ask Oracle incomplete provider termination to fail")
+            } catch {
+                XCTAssertEqual(
+                    error as? OracleContextBuilderCompletionError,
+                    .providerTerminatedIncomplete(reason: "max_tokens")
+                )
+            }
+
+            let response = try XCTUnwrap(
+                composition.oracleViewModel.messagesSnapshot(for: oracleSession.id)
+                    .first(where: { !$0.isUser })
+            )
+            XCTAssertTrue(response.content.hasPrefix("partial response"))
+            XCTAssertTrue(response.content.contains("reason: max_tokens"))
+            XCTAssertTrue(response.isFinalized)
+        #else
+            throw XCTSkip("Strict finalization injection is DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testAskOracleProviderCompletionReturnsExactResponse() async throws {
+        #if DEBUG
+            let composition = makeComposition(windowID: -182, terminalOutcome: .completed)
+            await composition.workspaceManager.awaitInitialized()
+
+            let root = makeTemporaryRoot(label: "ask-oracle-completed")
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = composition.workspaceManager.createWorkspace(
+                name: "Ask Oracle completed response test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await composition.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderStrictFinalizationTests.ask-oracle-completed"
+            )
+
+            let settings = GlobalSettingsStore.shared
+            let previousShowPresets = settings.mcpShowModelPresets()
+            let previousDisablePresets = settings.mcpTemporarilyDisablePresets()
+            let previousPlanningModel = composition.promptManager.planningModelName
+            let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
+            defer {
+                settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                settings.setMCPTemporarilyDisablePresets(previousDisablePresets, commit: false)
+                composition.promptManager.planningModelName = previousPlanningModel
+                composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity
+            }
+            settings.setMCPShowModelPresets(false, commit: false)
+            settings.setMCPTemporarilyDisablePresets(false, commit: false)
+            composition.apiSettingsViewModel.isCustomProviderValid = true
+            composition.promptManager.planningModelName = AIModel.customProviderUser(
+                name: "strict-finalization-test"
+            ).rawValue
+
+            let reply = try await composition.oracleViewModel.tool_chatSend(
+                args: [
+                    "message": .string("Review the response."),
+                    "mode": .string("review")
+                ],
+                promptVM: composition.promptManager
+            )
+
+            XCTAssertEqual(reply["response"]?.stringValue, "partial response")
+            XCTAssertNil(reply["errors"])
         #else
             throw XCTSkip("Strict finalization injection is DEBUG-only.")
         #endif

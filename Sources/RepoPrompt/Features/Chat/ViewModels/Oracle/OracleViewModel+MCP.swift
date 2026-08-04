@@ -1197,33 +1197,28 @@ extension OracleViewModel {
                 reviewGitContextOverride: reviewGitContextOverride
             )
         }
+        let queryId: UUID?
         #if DEBUG
             let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
                 tabContext: tabContext,
                 observer: oracleReviewPackagingTraceObserverForTesting
             )
-            await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
+            queryId = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
         #else
-            await send()
+            queryId = await send()
         #endif
-        let queryId = activeQueryId(for: chatID) ?? currentQueryId
-
-        if let q = queryId {
-            try await waitUntilMessageFinalised(q)
+        guard let queryId else {
+            throw OracleContextBuilderCompletionError.missingExactQuery
         }
+        let response = try await waitForContextBuilderCompletion(queryId)
 
         // ────────── 6. Build typed reply ──────────
-        let errors: [String] = []
-        let aiMsg = queryId.flatMap { id in
-            getChatMessage(withId: id)
-        }.flatMap { $0.isUser ? nil : $0 }
-
         let replyObj = ChatSendReply(
             chatId: chatID,
             shortId: sessions.first(where: { $0.id == chatID })?.shortID ?? "",
             mode: mode,
-            response: aiMsg?.content,
-            errors: errors.isEmpty ? nil : errors
+            response: response,
+            errors: nil
         )
 
         // Serialise to MCP Value → dictionary

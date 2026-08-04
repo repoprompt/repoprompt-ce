@@ -3311,9 +3311,21 @@ class OracleViewModel: ObservableObject {
         }
 
         // 1️⃣ Snapshot the final assistant text (MainActor)
-        let finalContent = await MainActor.run { () -> String in
+        var finalContent = await MainActor.run { () -> String in
             messageStore[sessionID]?.first(where: { $0.id == aiResponseId })?
                 .content ?? partialBuffer
+        }
+        if case let .providerTerminatedIncomplete(reason) = outcome {
+            let error = OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
+            let incompleteContent = finalContent + "\n\n--\nError:\n\(error.localizedDescription)"
+            finalContent = incompleteContent
+            await MainActor.run {
+                self.withSessionMessages(sessionID) { msgs in
+                    if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
+                        msgs[idx].updateContent(incompleteContent)
+                    }
+                }
+            }
         }
 
         // 2️⃣ Process final display content before toggling the finished flags that external tools poll for.
