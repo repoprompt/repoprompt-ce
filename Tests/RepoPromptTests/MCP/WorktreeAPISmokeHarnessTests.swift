@@ -13,8 +13,8 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 startupTrace.record(event, sequence: sequence)
             }
             defer {
-                startupTrace.deactivate()
                 WorktreeStartupInstrumentation.removeEventObserverForTesting(startupTraceToken)
+                startupTrace.finish()
             }
         #endif
         Self.traceSmokePhase("fixture.begin")
@@ -1259,16 +1259,29 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
 #if DEBUG
     private final class WorktreeStartupEventTraceSink: @unchecked Sendable {
-        private let lock = NSLock()
+        private static let maximumPendingEventCount = 64
+
+        private let queue = DispatchQueue(label: "com.repoprompt.tests.worktree-startup-trace")
+        private let pendingCapacity = DispatchSemaphore(value: maximumPendingEventCount)
         private var isActive = true
         private var startNanosecondsByCorrelationID: [UUID: UInt64] = [:]
 
         func record(_ event: WorktreeStartupInstrumentation.Event, sequence: UInt64) {
-            lock.lock()
-            guard isActive else {
-                lock.unlock()
-                return
+            guard pendingCapacity.wait(timeout: .now()) == .success else { return }
+            queue.async { [self] in
+                defer { pendingCapacity.signal() }
+                guard isActive else { return }
+                emit(event, sequence: sequence)
             }
+        }
+
+        func finish() {
+            queue.sync {
+                isActive = false
+            }
+        }
+
+        private func emit(_ event: WorktreeStartupInstrumentation.Event, sequence: UInt64) {
             let startNanoseconds = startNanosecondsByCorrelationID[event.correlationID]
                 ?? event.timestampNanoseconds
             startNanosecondsByCorrelationID[event.correlationID] = startNanoseconds
@@ -1282,13 +1295,6 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 + " route=\(event.route?.rawValue ?? "none")"
                 + " fallback=\(event.fallback?.rawValue ?? "none")\n"
             FileHandle.standardError.write(Data(line.utf8))
-            lock.unlock()
-        }
-
-        func deactivate() {
-            lock.lock()
-            isActive = false
-            lock.unlock()
         }
     }
 
