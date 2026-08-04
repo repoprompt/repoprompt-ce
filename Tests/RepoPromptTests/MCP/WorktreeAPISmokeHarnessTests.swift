@@ -7,6 +7,16 @@ import XCTest
 @MainActor
 final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testManageWorktreeAndAgentRunAPISmokeFlow() async throws {
+        #if DEBUG
+            let startupTrace = WorktreeStartupEventTraceSink()
+            let startupTraceToken = WorktreeStartupInstrumentation.addEventObserverForTesting { event, sequence in
+                startupTrace.record(event, sequence: sequence)
+            }
+            defer {
+                startupTrace.deactivate()
+                WorktreeStartupInstrumentation.removeEventObserverForTesting(startupTraceToken)
+            }
+        #endif
         Self.traceSmokePhase("fixture.begin")
         let fixture = try Self.makeGitFixture()
         Self.traceSmokePhase("fixture.ready")
@@ -1248,6 +1258,40 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 }
 
 #if DEBUG
+    private final class WorktreeStartupEventTraceSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isActive = true
+        private var startNanosecondsByCorrelationID: [UUID: UInt64] = [:]
+
+        func record(_ event: WorktreeStartupInstrumentation.Event, sequence: UInt64) {
+            lock.lock()
+            guard isActive else {
+                lock.unlock()
+                return
+            }
+            let startNanoseconds = startNanosecondsByCorrelationID[event.correlationID]
+                ?? event.timestampNanoseconds
+            startNanosecondsByCorrelationID[event.correlationID] = startNanoseconds
+            let elapsedNanoseconds = event.timestampNanoseconds >= startNanoseconds
+                ? event.timestampNanoseconds - startNanoseconds
+                : 0
+            let line = "[WorktreeAPISmoke] startup sequence=\(sequence)"
+                + " correlation=\(event.correlationID.uuidString)"
+                + " phase=\(event.phase.rawValue)"
+                + " elapsed_us=\(elapsedNanoseconds / 1000)"
+                + " route=\(event.route?.rawValue ?? "none")"
+                + " fallback=\(event.fallback?.rawValue ?? "none")\n"
+            FileHandle.standardError.write(Data(line.utf8))
+            lock.unlock()
+        }
+
+        func deactivate() {
+            lock.lock()
+            isActive = false
+            lock.unlock()
+        }
+    }
+
     private final class WorktreeContextBuilderImmediateCompletionProvider: HeadlessAgentProvider {
         func streamAgentMessage(
             _ message: AgentMessage,
