@@ -6465,10 +6465,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard let createdTab = await promptManager.createBackgroundComposeTab(
             strategy: .blank,
-            name: name,
-            capacityPolicy: .mcpBackgroundAgent
+            name: name
         ) else {
-            throw MCPError.invalidParams("Background agent session capacity is full. Wait for detached agents to finish, close or stash idle agent sessions, or raise agentMode.maxBackgroundAgentComposeTabs.")
+            throw MCPError.internalError("The background agent session tab could not be created.")
         }
         return createdTab.id
     }

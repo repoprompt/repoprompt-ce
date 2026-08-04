@@ -340,8 +340,6 @@ class GlobalSettingsStore: ObservableObject {
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences()
 
-    private static let defaultBackgroundAgentComposeTabHardLimit = 500
-    private static let defaultComposeTabSoftLimit = 50
     private static let defaultAppearanceModeRaw = "System"
     private static let defaultFilePathDisplayOptionRaw = "Full"
     private static let defaultSelectedFilesSortMethodRaw = "nameAscending"
@@ -1241,18 +1239,6 @@ class GlobalSettingsStore: ObservableObject {
             object: nil,
             userInfo: ["key": key]
         )
-    }
-
-    func maxBackgroundAgentComposeTabs() -> Int {
-        let configuredLimit = scalarPreferences.agentMode?.maxBackgroundAgentComposeTabs ?? Self.defaultBackgroundAgentComposeTabHardLimit
-        let rawLimit = configuredLimit > 0 ? configuredLimit : Self.defaultBackgroundAgentComposeTabHardLimit
-        return max(Self.defaultComposeTabSoftLimit, rawLimit)
-    }
-
-    func setMaxBackgroundAgentComposeTabs(_ limit: Int?, commit: Bool = true) {
-        updateAgentModeScalar(commit: commit) { settings in
-            settings.maxBackgroundAgentComposeTabs = limit
-        }
     }
 
     func showBuiltInWorkflowCleanupGuidance() -> Bool {

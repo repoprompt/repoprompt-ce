@@ -155,17 +155,8 @@ class PromptViewModel: ObservableObject {
     private let maxComposeTabs = PromptViewModel.defaultComposeTabSoftLimit
     private var isDirtyStateUpdateScheduled = false
 
-    enum ComposeTabCapacityPolicy: Equatable {
-        case uiInteractive
-        case mcpBackgroundAgent
-    }
-
     typealias ComposeTabAutoStashEligibilityProvider = @MainActor (_ tabID: UUID) -> Bool
     var composeTabAutoStashEligibilityProvider: ComposeTabAutoStashEligibilityProvider?
-
-    private var backgroundAgentComposeTabHardLimit: Int {
-        max(maxComposeTabs, settingsManager.maxBackgroundAgentComposeTabs())
-    }
 
     // MARK: - Tab Close Listeners
 
@@ -2592,18 +2583,10 @@ class PromptViewModel: ObservableObject {
     private func ensureCapacityForNewComposeTab(
         in manager: WorkspaceManagerViewModel,
         workspaceIndex index: Int,
-        policy: ComposeTabCapacityPolicy,
         excluding excludedID: UUID? = nil
     ) async -> Bool {
         let currentCount = manager.workspaces[index].composeTabs.count
-        switch policy {
-        case .uiInteractive:
-            guard currentCount >= maxComposeTabs else { return true }
-        case .mcpBackgroundAgent:
-            let hardLimit = backgroundAgentComposeTabHardLimit
-            guard currentCount >= hardLimit else { return true }
-            guard currentCount == hardLimit else { return false }
-        }
+        guard currentCount >= maxComposeTabs else { return true }
 
         let excluded = excludedID ?? manager.workspaces[index].activeComposeTabID
         return await autoStashLeastRecentlyUsedTab(excluding: excluded)
@@ -2624,7 +2607,6 @@ class PromptViewModel: ObservableObject {
         guard await ensureCapacityForNewComposeTab(
             in: manager,
             workspaceIndex: index,
-            policy: .uiInteractive,
             excluding: manager.workspaces[index].activeComposeTabID
         ) else { return }
 
@@ -2697,7 +2679,7 @@ class PromptViewModel: ObservableObject {
             return manager.composeTab(with: id)
         }
 
-        // Create a new background tab using the existing helper (handles auto-stash), then foreground it.
+        // Create a new background tab, then foreground it.
         guard let newTab = await createBackgroundComposeTab(
             strategy: creationStrategy,
             name: name
@@ -2718,21 +2700,13 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func createBackgroundComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
-        name: String? = nil,
-        capacityPolicy: ComposeTabCapacityPolicy = .uiInteractive
+        name: String? = nil
     ) async -> ComposeTabState? {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
         else { return nil }
-
-        guard await ensureCapacityForNewComposeTab(
-            in: manager,
-            workspaceIndex: index,
-            policy: capacityPolicy,
-            excluding: manager.workspaces[index].activeComposeTabID
-        ) else { return nil }
 
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
         guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
@@ -3321,7 +3295,6 @@ class PromptViewModel: ObservableObject {
         guard await ensureCapacityForNewComposeTab(
             in: manager,
             workspaceIndex: index,
-            policy: .uiInteractive,
             excluding: manager.workspaces[index].activeComposeTabID
         ) else { return }
 

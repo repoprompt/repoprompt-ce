@@ -1079,8 +1079,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     private static func createBackgroundTab(in window: WindowState, name: String) async throws -> ComposeTabState {
         let tab = await window.promptManager.createBackgroundComposeTab(
             strategy: .blank,
-            name: name,
-            capacityPolicy: .mcpBackgroundAgent
+            name: name
         )
         return try XCTUnwrap(tab)
     }

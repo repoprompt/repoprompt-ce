@@ -550,6 +550,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         // DEPRECATED: Auto-Expand Tool Cards was removed in 2026-04.
         // Kept temporarily for decode/rollback compatibility only; do not read from UI/runtime.
         var agentAutoExpandToolCards: Bool?
+        // DEPRECATED: The background Agent compose-tab limit was removed in 2026-08.
+        // Kept for decode/rollback compatibility and round-trip preservation only.
         var maxBackgroundAgentComposeTabs: Int?
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
