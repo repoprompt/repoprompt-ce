@@ -45,7 +45,7 @@ final class OracleMessageFinalisationHubTests: XCTestCase {
         let futureResumedBeforeFulfilment = await futureSignal.isMarked()
         XCTAssertFalse(futureResumedBeforeFulfilment)
 
-        await hub.fulfil(messageID)
+        await hub.fulfil(messageID, outcome: .providerCompleted)
         await retainedWaiter.value
         await futureWaiter.value
 
@@ -87,10 +87,21 @@ final class OracleMessageFinalisationHubTests: XCTestCase {
         XCTAssertFalse(retainedResumedBeforeFulfilment)
         XCTAssertFalse(completedBeforeFulfilment)
 
-        await hub.fulfil(messageID)
+        await hub.fulfil(messageID, outcome: .providerCompleted)
         await retainedWaiter.value
         let retainedResumedAfterFulfilment = await retainedSignal.isMarked()
         XCTAssertTrue(retainedResumedAfterFulfilment)
+    }
+
+    func testFirstTerminalOutcomeRemainsAuthoritative() async {
+        let hub = MessageFinalisationHub()
+        let messageID = UUID()
+
+        await hub.fulfil(messageID, outcome: .streamEndedWithoutProviderCompletion)
+        await hub.fulfil(messageID, outcome: .providerCompleted)
+
+        let outcome = await hub.outcome(for: messageID)
+        XCTAssertEqual(outcome, .streamEndedWithoutProviderCompletion)
     }
 
     private func makeWaiter(
