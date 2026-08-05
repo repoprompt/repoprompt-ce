@@ -362,7 +362,8 @@ class ModelPresetsManager: ObservableObject {
     }
 
     /// Adds a new preset
-    func addPreset(_ preset: ModelPreset) {
+    @discardableResult
+    func addPreset(_ preset: ModelPreset) -> Bool {
         mutateAndPersist {
             presets.append(preset)
         }
@@ -402,16 +403,19 @@ class ModelPresetsManager: ObservableObject {
         persistenceErrorMessage = nil
     }
 
-    private func mutateAndPersist(_ mutation: () -> Void) {
+    @discardableResult
+    private func mutateAndPersist(_ mutation: () -> Void) -> Bool {
         let previousPresets = presets
         mutation()
 
         do {
             try savePresets()
             persistenceErrorMessage = nil
+            return true
         } catch {
             presets = previousPresets
             persistenceErrorMessage = "Your model preset change wasn't saved and has been reverted. \(error.localizedDescription)"
+            return false
         }
     }
 

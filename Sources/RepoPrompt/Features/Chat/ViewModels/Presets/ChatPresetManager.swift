@@ -22,6 +22,7 @@ class ChatPresetManager: ObservableObject {
             rebuildAllPresetsCache()
         }
     }
+
     @Published private(set) var persistenceErrorMessage: String?
 
     // MARK: - Storage

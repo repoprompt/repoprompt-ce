@@ -129,10 +129,18 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
         let manager = ModelPresetsManager(presetFileStore: store)
         let preset = ModelPreset(name: "Unsaved model", model: .claude4Sonnet)
 
-        manager.addPreset(preset)
+        XCTAssertFalse(manager.addPreset(preset))
 
         XCTAssertFalse(manager.presets.contains(where: { $0.id == preset.id }))
         XCTAssertNotNil(manager.persistenceErrorMessage)
+
+        let blockedParent = store.modelFileURL.deletingLastPathComponent()
+        try FileManager.default.removeItem(at: blockedParent)
+        try FileManager.default.createDirectory(at: blockedParent, withIntermediateDirectories: true)
+
+        XCTAssertTrue(manager.addPreset(preset))
+        XCTAssertTrue(manager.presets.contains(where: { $0.id == preset.id }))
+        XCTAssertNil(manager.persistenceErrorMessage)
     }
 
     func testCorruptPresetJSONIsBackedUpAndReplacedWithEmptyDocument() throws {

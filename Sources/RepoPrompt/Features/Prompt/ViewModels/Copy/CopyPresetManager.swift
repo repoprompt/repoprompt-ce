@@ -22,6 +22,7 @@ class CopyPresetManager: ObservableObject {
             rebuildAllPresetsCache()
         }
     }
+
     @Published private(set) var persistenceErrorMessage: String?
 
     // MARK: - Storage
