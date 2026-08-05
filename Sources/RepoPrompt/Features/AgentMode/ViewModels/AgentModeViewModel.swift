@@ -11216,6 +11216,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             #endif
         }
+        #if DEBUG
+            AgentTranscriptDebugInstrumentation.removeRefreshInputSignatures(for: tabIDs)
+        #endif
     }
 
     // MARK: - Persistence
