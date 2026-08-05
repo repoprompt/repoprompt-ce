@@ -14,6 +14,61 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testStderrCaptureCancellationBeforeRegistrationReturnsFalse() async {
+        let registrationGate = CodexStderrWaitRegistrationGate()
+        let completed = expectation(description: "cancelled stderr wait completed")
+        let capture = CodexProcessStderrCapture(
+            byteLimit: 8 * 1024,
+            beforeContinuationInstallForTesting: { await registrationGate.pause() }
+        )
+        let wait = Task {
+            let result = await capture.waitUntilFinished(timeout: 60)
+            completed.fulfill()
+            return result
+        }
+
+        await registrationGate.waitUntilPaused()
+        wait.cancel()
+        await registrationGate.resume()
+        await fulfillment(of: [completed], timeout: 1)
+        capture.finish()
+
+        XCTAssertFalse(await wait.value)
+    }
+
+    func testStderrCaptureCancellationRemovesOnlyCancelledWaiter() async {
+        let registered = expectation(description: "stderr waiters registered")
+        registered.expectedFulfillmentCount = 2
+        let capture = CodexProcessStderrCapture(
+            byteLimit: 8 * 1024,
+            waiterDidRegisterForTesting: { registered.fulfill() }
+        )
+        let cancelledWaitCompleted = expectation(description: "cancelled stderr waiter completed")
+        let cancelledWait = Task {
+            let result = await capture.waitUntilFinished(timeout: 60)
+            cancelledWaitCompleted.fulfill()
+            return result
+        }
+        let finishingWait = Task { await capture.waitUntilFinished(timeout: 60) }
+        await fulfillment(of: [registered], timeout: 1)
+
+        cancelledWait.cancel()
+        await fulfillment(of: [cancelledWaitCompleted], timeout: 1)
+        capture.finish()
+
+        XCTAssertFalse(await cancelledWait.value)
+        XCTAssertTrue(await finishingWait.value)
+    }
+
+    func testStderrCaptureZeroTimeoutAndFinishedSemanticsRemainDistinct() async {
+        let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
+
+        XCTAssertFalse(await capture.waitUntilFinished(timeout: 0))
+
+        capture.finish()
+        XCTAssertTrue(await capture.waitUntilFinished(timeout: 0))
+    }
+
     func testStderrCaptureRetainsExactRawSuffixAtEveryBoundary() async {
         let invalidUTF8 = Data([0x66, 0x80, 0x67])
         let scenarios: [[Data]] = [
@@ -914,6 +969,30 @@ private actor CompletionFlag {
 
     func markComplete() {
         isComplete = true
+    }
+}
+
+private actor CodexStderrWaitRegistrationGate {
+    private var didPause = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        didPause = true
+        let pending = pauseWaiters
+        pauseWaiters.removeAll()
+        pending.forEach { $0.resume() }
+        await withCheckedContinuation { resumeContinuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        guard !didPause else { return }
+        await withCheckedContinuation { pauseWaiters.append($0) }
+    }
+
+    func resume() {
+        resumeContinuation?.resume()
+        resumeContinuation = nil
     }
 }
 

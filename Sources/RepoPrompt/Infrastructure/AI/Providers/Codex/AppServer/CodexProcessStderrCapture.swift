@@ -8,16 +8,44 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
         let wasTruncated: Bool
     }
 
+    /// Reservation precedes cancellation-handler installation, so a terminal result may
+    /// temporarily exist before the checked continuation is available to resume.
+    private struct Waiter {
+        var continuation: CheckedContinuation<Bool, Never>?
+        var timeoutTask: Task<Void, Never>?
+        var terminalResult: Bool?
+    }
+
     private let lock = NSLock()
     private let byteLimit: Int
     private var tail = Data()
     private var wasTruncated = false
     private var isFinished = false
-    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var waiters: [UUID: Waiter] = [:]
+    #if DEBUG
+        private let beforeContinuationInstallForTesting: (@Sendable () async -> Void)?
+        private let waiterDidRegisterForTesting: (@Sendable () -> Void)?
+    #endif
 
     init(byteLimit: Int) {
         self.byteLimit = max(byteLimit, 0)
+        #if DEBUG
+            beforeContinuationInstallForTesting = nil
+            waiterDidRegisterForTesting = nil
+        #endif
     }
+
+    #if DEBUG
+        init(
+            byteLimit: Int,
+            beforeContinuationInstallForTesting: (@Sendable () async -> Void)? = nil,
+            waiterDidRegisterForTesting: (@Sendable () -> Void)? = nil
+        ) {
+            self.byteLimit = max(byteLimit, 0)
+            self.beforeContinuationInstallForTesting = beforeContinuationInstallForTesting
+            self.waiterDidRegisterForTesting = waiterDidRegisterForTesting
+        }
+    #endif
 
     func append(_ chunk: Data) {
         guard !chunk.isEmpty else { return }
@@ -52,34 +80,58 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
             return
         }
         isFinished = true
-        let continuations = waiters.values
-        waiters.removeAll()
+        var pendingWaiters: [Waiter] = []
+        for waiterID in Array(waiters.keys) {
+            guard var waiter = waiters[waiterID], waiter.terminalResult == nil else { continue }
+            waiter.terminalResult = true
+            if waiter.continuation == nil {
+                waiters[waiterID] = waiter
+            } else {
+                waiters.removeValue(forKey: waiterID)
+                pendingWaiters.append(waiter)
+            }
+        }
         lock.unlock()
 
-        for continuation in continuations {
-            continuation.resume(returning: true)
+        for waiter in pendingWaiters {
+            waiter.timeoutTask?.cancel()
+            waiter.continuation?.resume(returning: true)
         }
     }
 
     func waitUntilFinished(timeout: TimeInterval) async -> Bool {
         let waiterID = UUID()
-        return await withCheckedContinuation { continuation in
-            lock.lock()
-            if isFinished {
-                lock.unlock()
-                continuation.resume(returning: true)
-                return
+        if let immediateResult = reserveWaiter(waiterID) {
+            return immediateResult
+        }
+        #if DEBUG
+            if let beforeContinuationInstallForTesting {
+                await beforeContinuationInstallForTesting()
             }
-            waiters[waiterID] = continuation
-            lock.unlock()
+        #endif
+        let timeoutNanoseconds = UInt64(max(timeout, 0) * 1_000_000_000)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard installContinuation(continuation, for: waiterID) else { return }
+                #if DEBUG
+                    waiterDidRegisterForTesting?()
+                #endif
 
-            let timeoutNanoseconds = UInt64(max(timeout, 0) * 1_000_000_000)
-            Task.detached { [weak self] in
-                if timeoutNanoseconds > 0 {
-                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                let timeoutTask = Task.detached { [weak self] in
+                    do {
+                        if timeoutNanoseconds > 0 {
+                            try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        }
+                        try Task.checkCancellation()
+                    } catch {
+                        return
+                    }
+                    self?.settleWaiter(waiterID, returning: false)
                 }
-                self?.expireWaiter(waiterID)
+                installTimeoutTask(timeoutTask, for: waiterID)
             }
+        } onCancel: {
+            settleWaiter(waiterID, returning: false)
         }
     }
 
@@ -90,10 +142,74 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
         return snapshot
     }
 
-    private func expireWaiter(_ waiterID: UUID) {
+    private func reserveWaiter(_ waiterID: UUID) -> Bool? {
         lock.lock()
-        let continuation = waiters.removeValue(forKey: waiterID)
+        defer { lock.unlock() }
+        if isFinished {
+            return true
+        }
+        if Task<Never, Never>.isCancelled {
+            return false
+        }
+        waiters[waiterID] = Waiter(
+            continuation: nil,
+            timeoutTask: nil,
+            terminalResult: nil
+        )
+        return nil
+    }
+
+    private func installContinuation(
+        _ continuation: CheckedContinuation<Bool, Never>,
+        for waiterID: UUID
+    ) -> Bool {
+        lock.lock()
+        guard var waiter = waiters[waiterID] else {
+            lock.unlock()
+            assertionFailure("Reserved stderr waiter disappeared before continuation installation")
+            continuation.resume(returning: false)
+            return false
+        }
+        if let terminalResult = waiter.terminalResult {
+            waiters.removeValue(forKey: waiterID)
+            lock.unlock()
+            continuation.resume(returning: terminalResult)
+            return false
+        }
+        waiter.continuation = continuation
+        waiters[waiterID] = waiter
         lock.unlock()
-        continuation?.resume(returning: false)
+        return true
+    }
+
+    private func installTimeoutTask(_ timeoutTask: Task<Void, Never>, for waiterID: UUID) {
+        lock.lock()
+        guard var waiter = waiters[waiterID] else {
+            lock.unlock()
+            timeoutTask.cancel()
+            return
+        }
+        waiter.timeoutTask = timeoutTask
+        waiters[waiterID] = waiter
+        lock.unlock()
+    }
+
+    private func settleWaiter(_ waiterID: UUID, returning result: Bool) {
+        lock.lock()
+        guard var waiter = waiters[waiterID], waiter.terminalResult == nil else {
+            lock.unlock()
+            return
+        }
+        waiter.terminalResult = result
+        let continuation = waiter.continuation
+        let timeoutTask = waiter.timeoutTask
+        if continuation == nil {
+            waiters[waiterID] = waiter
+        } else {
+            waiters.removeValue(forKey: waiterID)
+        }
+        lock.unlock()
+        timeoutTask?.cancel()
+        continuation?.resume(returning: result)
     }
 }
