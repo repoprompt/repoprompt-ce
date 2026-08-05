@@ -1,8 +1,5 @@
 import CryptoKit
 import Foundation
-#if DEBUG
-    import Synchronization
-#endif
 import OSLog
 
 enum AgentConversationReplayMode: String, Equatable {
@@ -64,6 +61,8 @@ struct AgentConversationReplaySerialization: Equatable {
 }
 
 #if DEBUG
+    import Synchronization
+
     struct AgentTranscriptProtectedTailScanMetrics: Equatable {
         let transcriptTurnCount: Int
         let limit: Int
