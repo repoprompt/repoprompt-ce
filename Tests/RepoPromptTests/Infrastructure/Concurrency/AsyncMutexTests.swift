@@ -40,6 +40,7 @@ final class AsyncMutexTests: XCTestCase {
         ownerEntered.release()
 
         try await owner.value
-        XCTAssertTrue(try await cleanup.value)
+        let cleanupAcquired = try await cleanup.value
+        XCTAssertTrue(cleanupAcquired)
     }
 }
