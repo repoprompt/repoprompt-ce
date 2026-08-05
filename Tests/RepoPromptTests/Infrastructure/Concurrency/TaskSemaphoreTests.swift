@@ -20,10 +20,11 @@ final class TaskSemaphoreTests: XCTestCase {
         try await started.waitUntil("semaphore waiter started") { $0 }
         waiter.cancel()
 
-        let completedBeforeRelease = (try? await completion.waitUntil(
+        let completionResult = try? await completion.waitUntil(
             "cancelled semaphore waiter completion",
             timeout: 1
-        ) { $0 != nil }) != nil
+        ) { $0 != nil }
+        let completedBeforeRelease = completionResult != nil
 
         if !completedBeforeRelease {
             // Keep a known-bad implementation from leaking a parked task and
