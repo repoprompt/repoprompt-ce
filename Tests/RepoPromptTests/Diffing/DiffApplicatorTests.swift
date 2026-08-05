@@ -44,7 +44,7 @@ final class DiffApplicatorTests: XCTestCase {
         assertOutOfBounds(startLine: 2, content: ["line"], chunk: chunk)
     }
 
-    func testRevertPreservesReverseTraversalOrdering() throws {
+    func testRevertRestoresRemovalOrder() throws {
         let chunk = DiffChunk(
             lines: [
                 DiffLine(content: "-first"),
@@ -59,7 +59,7 @@ final class DiffApplicatorTests: XCTestCase {
             startingAt: chunk.startLine
         )
 
-        XCTAssertEqual(result, ["before", "second", "first", "after"])
+        XCTAssertEqual(result, ["before", "first", "second", "after"])
     }
 
     func testRevertPreservesMixedOperationAndBoundarySemantics() throws {
@@ -78,7 +78,7 @@ final class DiffApplicatorTests: XCTestCase {
             startingAt: chunk.startLine
         )
 
-        XCTAssertEqual(result, ["before", "removed", "added", "after"])
+        XCTAssertEqual(result, ["before", "context", "removed", "after"])
         assertRevertOutOfBounds(startLine: -1, content: ["line"], chunk: chunk)
         assertRevertOutOfBounds(startLine: 2, content: ["line"], chunk: chunk)
     }

@@ -63,14 +63,17 @@ package enum DiffApplicator {
         result.append(contentsOf: content[..<startLine])
         var contentIndex = startLine
 
-        for diffLine in diffChunk.lines.reversed() {
+        // Consume the post-apply content in diff order. Additions consume one
+        // post-apply line; removals restore their original line without
+        // consuming; context does both. This preserves mixed chunks and the
+        // original ordering of adjacent removals without array shifts.
+        for diffLine in diffChunk.lines {
             switch diffLine.type {
             case .addition:
                 if contentIndex < content.count {
                     contentIndex += 1
                 }
             case .removal:
-                precondition(contentIndex <= content.count, "Index out of range")
                 result.append(diffLine.content)
             case .context:
                 if contentIndex < content.count {
