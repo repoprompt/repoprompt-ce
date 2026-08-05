@@ -20,27 +20,36 @@ public struct ChatTokenInfo: Codable, Equatable {
     }
 }
 
-/// The output of our Chat stream, now carrying a TokenInfo block.
+public enum ChatStreamTerminalOutcome: Sendable, Equatable {
+    case completed
+    case incomplete(reason: String)
+}
+
+/// A normalized provider stream event. A terminal outcome exists only when the provider explicitly reports completion or incomplete termination; ordinary stream exhaustion remains non-terminal.
 public struct ChatStreamOutput {
     public let text: String
     public let reasoning: String?
     public let tokens: ChatTokenInfo
-    public let isFinal: Bool
+    public let terminalOutcome: ChatStreamTerminalOutcome?
     public let cleanupHandle: ProviderConversationCleanupHandle?
     public let isTransportActivity: Bool
+
+    public var isFinal: Bool {
+        terminalOutcome == .completed
+    }
 
     public init(
         text: String,
         reasoning: String?,
         tokens: ChatTokenInfo,
-        isFinal: Bool,
+        terminalOutcome: ChatStreamTerminalOutcome? = nil,
         cleanupHandle: ProviderConversationCleanupHandle? = nil,
         isTransportActivity: Bool = false
     ) {
         self.text = text
         self.reasoning = reasoning
         self.tokens = tokens
-        self.isFinal = isFinal
+        self.terminalOutcome = terminalOutcome
         self.cleanupHandle = cleanupHandle
         self.isTransportActivity = isTransportActivity
     }
@@ -327,9 +336,26 @@ public class AIQueriesService {
             text: "",
             reasoning: nil,
             tokens: ChatTokenInfo(),
-            isFinal: false,
             isTransportActivity: true
         )
+    }
+
+    static func terminalOutcome(for result: AIStreamResult) throws -> ChatStreamTerminalOutcome? {
+        switch result.type {
+        case "message_stop":
+            return .completed
+        case AIStreamResult.incompleteType:
+            guard let reason = result.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !reason.isEmpty
+            else {
+                throw AIProviderError.invalidResponse(
+                    detail: "The provider reported incomplete termination without a reason."
+                )
+            }
+            return .incomplete(reason: reason)
+        default:
+            return nil
+        }
     }
 
     static func cleanupHandle(for result: AIStreamResult, model: AIModel) -> ProviderConversationCleanupHandle? {
@@ -473,11 +499,12 @@ public class AIQueriesService {
                                 lastTokenInfo = chunkTokenInfo
                             }
 
-                            // If the provider signals end of message or buffers are ready to be flushed.
-                            if result.type == "message_stop" || shouldYield {
+                            let terminalOutcome = try Self.terminalOutcome(for: result)
+
+                            // Flush when the provider reports a terminal outcome or buffers are ready.
+                            if terminalOutcome != nil || shouldYield {
                                 let (combinedText, combinedReasoning, bufferedTokenInfo, _) = await self.taskManager.flushBuffer(for: taskId)
-                                let isFinal = (result.type == "message_stop")
-                                if isFinal { sawMessageStop = true }
+                                if terminalOutcome == .completed { sawMessageStop = true }
 
                                 // Prefer buffered counts; fall back to this chunk's counts
                                 let tokenInfo = bufferedTokenInfo ?? chunkTokenInfo
@@ -487,11 +514,11 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: isFinal,
+                                        terminalOutcome: terminalOutcome,
                                         cleanupHandle: cleanupHandle
                                     )
                                 )
-                                if isFinal {
+                                if terminalOutcome != nil {
                                     break streamLoop
                                 }
                             }
@@ -503,7 +530,7 @@ public class AIQueriesService {
                             _ = await self.taskManager.flushBuffer(for: taskId)
                             continuation.finish(throwing: CancellationError())
                         } else if !sawMessageStop {
-                            // Stream ended without message_stop - flush any remaining buffer as final
+                            // Stream ended without message_stop - flush remaining content as non-final
                             let (combinedText, combinedReasoning, bufferedTokenInfo, didHaveContent) = await self.taskManager.flushBuffer(for: taskId)
                             if didHaveContent {
                                 let tokenInfo = bufferedTokenInfo ?? lastTokenInfo ?? ChatTokenInfo()
@@ -512,7 +539,6 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: true,
                                         cleanupHandle: cleanupHandle
                                     )
                                 )

@@ -259,6 +259,49 @@ struct OracleMessageLifecycleActivityEvent: Equatable {
     }
 }
 
+enum OracleResponseCompletionPolicy: Equatable {
+    case interactive
+    case contextBuilderStrict
+}
+
+enum OracleMessageFinalizationOutcome: Equatable {
+    case providerCompleted
+    case providerTerminatedIncomplete(reason: String)
+    case streamEndedWithoutProviderCompletion
+    case interactiveWatchdog
+    case cancelled
+    case failed(message: String)
+}
+
+enum OracleContextBuilderCompletionError: LocalizedError, Equatable {
+    case missingExactQuery
+    case missingFinalizationOutcome
+    case providerTerminatedIncomplete(reason: String)
+    case streamEndedWithoutProviderCompletion
+    case interactiveWatchdogFinalization
+    case providerStreamFailed(message: String)
+    case emptyProcessedContent
+
+    var errorDescription: String? {
+        switch self {
+        case .missingExactQuery:
+            "The exact Context Builder query could not be found."
+        case .missingFinalizationOutcome:
+            "The Context Builder query finalized without a terminal outcome."
+        case let .providerTerminatedIncomplete(reason):
+            "The provider ended the response before successful completion (reason: \(reason))."
+        case .streamEndedWithoutProviderCompletion:
+            "The provider stream ended before reporting completion."
+        case .interactiveWatchdogFinalization:
+            "The Context Builder query was finalized by the interactive inactivity watchdog."
+        case let .providerStreamFailed(message):
+            message
+        case .emptyProcessedContent:
+            "The Context Builder query completed without a response."
+        }
+    }
+}
+
 actor MessageFinalisationHub {
     private struct WaiterKey: Hashable {
         let messageID: UUID
@@ -267,7 +310,7 @@ actor MessageFinalisationHub {
 
     private var waiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
     private var cancelledWaiters: Set<WaiterKey> = []
-    private var completed: Set<UUID> = []
+    private var completedOutcomes: [UUID: OracleMessageFinalizationOutcome] = [:]
 
     func register(
         _ id: UUID,
@@ -275,15 +318,17 @@ actor MessageFinalisationHub {
         cont: CheckedContinuation<Void, Never>
     ) {
         let key = WaiterKey(messageID: id, waiterID: waiterID)
-        if completed.contains(id) || cancelledWaiters.remove(key) != nil {
+        if completedOutcomes[id] != nil || cancelledWaiters.remove(key) != nil {
             cont.resume()
             return
         }
         waiters[id, default: [:]][waiterID] = cont
     }
 
-    func fulfil(_ id: UUID) {
-        completed.insert(id)
+    func fulfil(_ id: UUID, outcome: OracleMessageFinalizationOutcome) {
+        if completedOutcomes[id] == nil {
+            completedOutcomes[id] = outcome
+        }
         cancelledWaiters = Set(cancelledWaiters.filter { $0.messageID != id })
         guard let list = waiters.removeValue(forKey: id) else { return }
         for continuation in list.values {
@@ -294,7 +339,7 @@ actor MessageFinalisationHub {
     /// Cancels only the requesting task's waiter. Message completion remains authoritative
     /// for every other current or future waiter.
     func cancel(_ id: UUID, waiterID: UUID) {
-        guard !completed.contains(id) else { return }
+        guard completedOutcomes[id] == nil else { return }
         if let continuation = waiters[id]?.removeValue(forKey: waiterID) {
             if waiters[id]?.isEmpty == true {
                 waiters.removeValue(forKey: id)
@@ -306,7 +351,11 @@ actor MessageFinalisationHub {
     }
 
     func isCompleted(_ id: UUID) -> Bool {
-        completed.contains(id)
+        completedOutcomes[id] != nil
+    }
+
+    func outcome(for id: UUID) -> OracleMessageFinalizationOutcome? {
+        completedOutcomes[id]
     }
 
     /// Clean up any orphaned waiters (safety mechanism)
@@ -1019,6 +1068,7 @@ class OracleViewModel: ObservableObject {
     private var lastTextStreamActivityAt: [UUID: Date] = [:]
     private var hasSeenNonReasoningText: Set<UUID> = []
     private var providerStopSeen: Set<UUID> = []
+    private var completionPolicies: [UUID: OracleResponseCompletionPolicy] = [:]
     /// Tracks when we last armed the inactivity watchdog per query (for throttling)
     private var lastInactivityWatchdogArmAt: [UUID: Date] = [:]
     /// Minimum interval between watchdog re-arms during streaming (reduces Task churn)
@@ -1206,6 +1256,10 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func scheduleStreamInactivityWatchdog(for queryId: UUID) {
         streamInactivityWatchdogs[queryId]?.cancel()
+        guard completionPolicies[queryId] != .contextBuilderStrict else {
+            streamInactivityWatchdogs[queryId] = nil
+            return
+        }
         let grace = currentInactivityGrace(for: queryId)
         let task = Task { [weak self] in
             guard grace > 0 else { return }
@@ -1303,7 +1357,12 @@ class OracleViewModel: ObservableObject {
         cancelFinalizationWatchdog(for: queryId)
         clearStreamActivityTracking(for: queryId)
         Task {
-            await self.finalizeAIResponse(aiResponseId: queryId, sessionID: sessionID, partialBuffer: content)
+            await self.finalizeAIResponse(
+                aiResponseId: queryId,
+                sessionID: sessionID,
+                partialBuffer: content,
+                outcome: .interactiveWatchdog
+            )
         }
     }
 
@@ -1330,6 +1389,7 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func scheduleFinalizationWatchdog(for queryId: UUID, delay: TimeInterval = 1.5) {
+        guard completionPolicies[queryId] != .contextBuilderStrict else { return }
         guard finalizationWatchdogs[queryId] == nil else {
             EditFlowPerf.event(
                 EditFlowPerf.Stage.Finalization.watchdogSkip,
@@ -1463,11 +1523,81 @@ class OracleViewModel: ObservableObject {
         clearStreamActivityTracking(for: queryId)
 
         Task {
-            await self.finalizeAIResponse(aiResponseId: queryId, sessionID: sessionID, partialBuffer: content)
+            await self.finalizeAIResponse(
+                aiResponseId: queryId,
+                sessionID: sessionID,
+                partialBuffer: content,
+                outcome: .interactiveWatchdog
+            )
         }
     }
 
     // MARK: - Message Finalisation
+
+    nonisolated func waitForContextBuilderCompletion(_ id: UUID) async throws -> String {
+        if await finalisationHub.outcome(for: id) == nil {
+            let hasExactMessage = await MainActor.run {
+                guard let sessionID = self.sessionIDByMessageId[id],
+                      let messages = self.messageStore[sessionID]
+                else {
+                    return false
+                }
+                return messages.contains(where: { $0.id == id && !$0.isUser })
+            }
+            guard hasExactMessage else {
+                throw OracleContextBuilderCompletionError.missingExactQuery
+            }
+
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    Task {
+                        await finalisationHub.register(
+                            id,
+                            waiterID: waiterID,
+                            cont: cont
+                        )
+                    }
+                }
+            } onCancel: {
+                Task { await finalisationHub.cancel(id, waiterID: waiterID) }
+            }
+            try Task.checkCancellation()
+        }
+
+        guard let outcome = await finalisationHub.outcome(for: id) else {
+            throw OracleContextBuilderCompletionError.missingFinalizationOutcome
+        }
+        switch outcome {
+        case .providerCompleted:
+            let content = await MainActor.run { () -> String? in
+                guard let sessionID = self.sessionIDByMessageId[id],
+                      let message = self.messageStore[sessionID]?.first(where: { $0.id == id && !$0.isUser }),
+                      message.isFinalized
+                else {
+                    return nil
+                }
+                return message.content
+            }
+            guard let content else {
+                throw OracleContextBuilderCompletionError.missingExactQuery
+            }
+            guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw OracleContextBuilderCompletionError.emptyProcessedContent
+            }
+            return content
+        case let .providerTerminatedIncomplete(reason):
+            throw OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
+        case .streamEndedWithoutProviderCompletion:
+            throw OracleContextBuilderCompletionError.streamEndedWithoutProviderCompletion
+        case .interactiveWatchdog:
+            throw OracleContextBuilderCompletionError.interactiveWatchdogFinalization
+        case .cancelled:
+            throw CancellationError()
+        case let .failed(message):
+            throw OracleContextBuilderCompletionError.providerStreamFailed(message: message)
+        }
+    }
 
     nonisolated func waitUntilMessageFinalised(_ id: UUID) async throws {
         let messageState = await MainActor.run { () -> Bool? in
@@ -2813,6 +2943,7 @@ class OracleViewModel: ObservableObject {
     // MARK: - Main Send/Receive Flow
 
     @MainActor
+    @discardableResult
     func sendMessage(
         _ newUserMessage: String,
         sessionID: UUID? = nil,
@@ -2825,9 +2956,10 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        completionPolicy: OracleResponseCompletionPolicy = .interactive,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
-    ) async {
-        guard !newUserMessage.isEmpty else { return }
+    ) async -> UUID? {
+        guard !newUserMessage.isEmpty else { return nil }
         _ = true
 
         let targetSessionID: UUID
@@ -2837,7 +2969,7 @@ class OracleViewModel: ObservableObject {
             targetSessionID = currentSessionID
         } else {
             await startNewChatSession()
-            guard let currentSessionID else { return }
+            guard let currentSessionID else { return nil }
             targetSessionID = currentSessionID
         }
 
@@ -2885,7 +3017,11 @@ class OracleViewModel: ObservableObject {
             }
             registerMessage(errorMessage.id, sessionID: targetSessionID)
             autosaveChatHistory(for: targetSessionID)
-            return
+            await finalisationHub.fulfil(
+                errorMessage.id,
+                outcome: .failed(message: errorMessage.content)
+            )
+            return errorMessage.id
         }
 
         // Derive a string representation for storage / UI
@@ -2912,6 +3048,7 @@ class OracleViewModel: ObservableObject {
             msgs.append(aiPlaceholder)
         }
         registerMessage(aiResponseId, sessionID: targetSessionID)
+        completionPolicies[aiResponseId] = completionPolicy
         setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: nil)
 
         if currentSessionID == targetSessionID {
@@ -2996,6 +3133,8 @@ class OracleViewModel: ObservableObject {
 
                 var partialBuffer = ""
                 var reasoningBuffer = ""
+                var latestTokenInfo = ChatTokenInfo()
+                var incompleteProviderReason: String?
                 var didFinalize = false
 
                 for try await output in stream {
@@ -3012,7 +3151,13 @@ class OracleViewModel: ObservableObject {
                     let delta = output.text
                     let reasoningDelta = output.reasoning
                     let tokenInfo = output.tokens
+                    if tokenInfo.promptTokens != nil || tokenInfo.completionTokens != nil || tokenInfo.cost != nil {
+                        latestTokenInfo = tokenInfo
+                    }
                     let isStreamFinalized = output.isFinal
+                    if case let .incomplete(reason) = output.terminalOutcome {
+                        incompleteProviderReason = reason
+                    }
                     if let cleanupHandle = output.cleanupHandle {
                         providerCleanupHandle = cleanupHandle
                     }
@@ -3071,7 +3216,12 @@ class OracleViewModel: ObservableObject {
                         }
 
                         Task {
-                            await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer)
+                            await self.finalizeAIResponse(
+                                aiResponseId: aiResponseId,
+                                sessionID: targetSessionID,
+                                partialBuffer: partialBuffer,
+                                outcome: .providerCompleted
+                            )
                             await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                         }
                     }
@@ -3081,8 +3231,28 @@ class OracleViewModel: ObservableObject {
                     await MainActor.run {
                         self.cancelStreamInactivityWatchdog(for: aiResponseId)
                     }
+                    await MainActor.run {
+                        self.withSessionMessages(targetSessionID) { msgs in
+                            if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
+                                msgs[idx].updateTokenInfo(latestTokenInfo)
+                            }
+                        }
+                        if self.currentSessionID == targetSessionID {
+                            self.updateLatestTokenCounts()
+                        }
+                    }
+                    let outcome: OracleMessageFinalizationOutcome = if let incompleteProviderReason {
+                        .providerTerminatedIncomplete(reason: incompleteProviderReason)
+                    } else {
+                        .streamEndedWithoutProviderCompletion
+                    }
                     Task {
-                        await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer)
+                        await self.finalizeAIResponse(
+                            aiResponseId: aiResponseId,
+                            sessionID: targetSessionID,
+                            partialBuffer: partialBuffer,
+                            outcome: outcome
+                        )
                         await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                     }
                 }
@@ -3099,6 +3269,7 @@ class OracleViewModel: ObservableObject {
                 }
             }
         }
+        return aiResponseId
     }
 
     func cleanupOracleProviderConversation(
@@ -3117,7 +3288,8 @@ class OracleViewModel: ObservableObject {
     private func finalizeAIResponse(
         aiResponseId: UUID,
         sessionID: UUID,
-        partialBuffer: String
+        partialBuffer: String,
+        outcome: OracleMessageFinalizationOutcome
     ) async {
         // Single-flight finalisation: provider stop, watchdogs, and cancellation can
         // all race to finalize the same message.
@@ -3139,9 +3311,21 @@ class OracleViewModel: ObservableObject {
         }
 
         // 1️⃣ Snapshot the final assistant text (MainActor)
-        let finalContent = await MainActor.run { () -> String in
+        var finalContent = await MainActor.run { () -> String in
             messageStore[sessionID]?.first(where: { $0.id == aiResponseId })?
                 .content ?? partialBuffer
+        }
+        if case let .providerTerminatedIncomplete(reason) = outcome {
+            let error = OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
+            let incompleteContent = finalContent + "\n\n--\nError:\n\(error.localizedDescription)"
+            finalContent = incompleteContent
+            await MainActor.run {
+                self.withSessionMessages(sessionID) { msgs in
+                    if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
+                        msgs[idx].updateContent(incompleteContent)
+                    }
+                }
+            }
         }
 
         // 2️⃣ Process final display content before toggling the finished flags that external tools poll for.
@@ -3175,7 +3359,15 @@ class OracleViewModel: ObservableObject {
 
         // 5️⃣ Notify observers and any waiters that this message is finalised
         emitMessageLifecycleActivity(.finalizationCompleted, for: aiResponseId)
-        Task { await finalisationHub.fulfil(aiResponseId) }
+        await concludeFinalisation(aiResponseId, outcome: outcome)
+    }
+
+    private func concludeFinalisation(
+        _ id: UUID,
+        outcome: OracleMessageFinalizationOutcome
+    ) async {
+        completionPolicies.removeValue(forKey: id)
+        await finalisationHub.fulfil(id, outcome: outcome)
     }
 
     // MARK: - Error Handling
@@ -3195,18 +3387,19 @@ class OracleViewModel: ObservableObject {
             print("AI response was cancelled.")
             guard let index = messageStore[sessionID]?.firstIndex(where: { $0.id == aiResponseId }) else {
                 clearSessionStreaming(sessionID)
-                Task { await finalisationHub.fulfil(aiResponseId) }
+                await concludeFinalisation(aiResponseId, outcome: .cancelled)
                 return
             }
 
             if messageStore[sessionID]?[index].isFinalized == true {
                 clearSessionStreaming(sessionID)
-                Task { await finalisationHub.fulfil(aiResponseId) }
+                await concludeFinalisation(aiResponseId, outcome: .cancelled)
                 return
             }
 
             let finalContent = messageStore[sessionID]?[index].content ?? ""
             if finalContent.isEmpty {
+                await concludeFinalisation(aiResponseId, outcome: .cancelled)
                 withSessionMessages(sessionID) { msgs in
                     if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                         msgs.remove(at: idx)
@@ -3215,12 +3408,16 @@ class OracleViewModel: ObservableObject {
                 purgeMessageCaches(for: aiResponseId)
                 clearSessionStreaming(sessionID)
                 autosaveChatHistory(for: sessionID)
-                Task { await finalisationHub.fulfil(aiResponseId) }
                 return
             }
 
             Task {
-                await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: sessionID, partialBuffer: finalContent)
+                await self.finalizeAIResponse(
+                    aiResponseId: aiResponseId,
+                    sessionID: sessionID,
+                    partialBuffer: finalContent,
+                    outcome: .cancelled
+                )
             }
             return
         }
@@ -3253,7 +3450,10 @@ class OracleViewModel: ObservableObject {
         }
 
         clearSessionStreaming(sessionID)
-        Task { await finalisationHub.fulfil(aiResponseId) }
+        await concludeFinalisation(
+            aiResponseId,
+            outcome: .failed(message: errorMessage)
+        )
     }
 
     // MARK: - Conversation Entries Helper
@@ -3432,18 +3632,19 @@ class OracleViewModel: ObservableObject {
 
         guard !skipPartialParseAndSave, let queryId = qid else {
             if let qid {
-                Task { await finalisationHub.fulfil(qid) }
+                await concludeFinalisation(qid, outcome: .cancelled)
             }
             return
         }
 
         guard let idx = messageStore[sessionID]?.firstIndex(where: { $0.id == queryId && !$0.isUser }) else {
-            Task { await finalisationHub.fulfil(queryId) }
+            await concludeFinalisation(queryId, outcome: .cancelled)
             return
         }
 
         let finalContent = messageStore[sessionID]?[idx].content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if finalContent.isEmpty {
+            await concludeFinalisation(queryId, outcome: .cancelled)
             withSessionMessages(sessionID) { msgs in
                 if let index = msgs.firstIndex(where: { $0.id == queryId && !$0.isUser }) {
                     msgs.remove(at: index)
@@ -3451,7 +3652,6 @@ class OracleViewModel: ObservableObject {
             }
             purgeMessageCaches(for: queryId)
             autosaveChatHistory(for: sessionID)
-            Task { await finalisationHub.fulfil(queryId) }
             return
         }
 
@@ -3464,7 +3664,7 @@ class OracleViewModel: ObservableObject {
         autosaveChatHistory(for: sessionID)
 
         // Notify any waiters that this message is finalised (cancelled)
-        Task { await finalisationHub.fulfil(queryId) }
+        await concludeFinalisation(queryId, outcome: .cancelled)
     }
 
     @MainActor

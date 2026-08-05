@@ -8,7 +8,6 @@ struct AgentSessionRow: View {
     let isPinned: Bool
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
-    let isWaiting: Bool
     /// When non-nil, the session raised a completed/failed/waiting transition
     /// while the user was NOT viewing it. Drives a persistent attention badge
     /// that survives re-renders until the session is selected/resumed or the
@@ -34,7 +33,7 @@ struct AgentSessionRow: View {
     var onToggleThreadCollapse: (() -> Void)?
     let onSelect: () -> Void
     let onTogglePin: () -> Void
-    let onStash: () -> Void
+    var onStash: (() -> Void)?
     let onDelete: () -> Void
     let onRename: (String) -> Void
     var onDismissAttention: (() -> Void)?
@@ -227,14 +226,16 @@ struct AgentSessionRow: View {
                 .onHover { isRenameHovered = $0 }
                 .hoverTooltip(renameActionLabel)
 
-                Button(action: onStash) {
-                    Image(systemName: "tray.and.arrow.down")
-                        .font(.system(size: 11))
-                        .foregroundColor(isStashHovered ? .accentColor : .secondary)
+                if let onStash {
+                    Button(action: onStash) {
+                        Image(systemName: "tray.and.arrow.down")
+                            .font(.system(size: 11))
+                            .foregroundColor(isStashHovered ? .accentColor : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isStashHovered = $0 }
+                    .hoverTooltip(stashActionLabel)
                 }
-                .buttonStyle(.plain)
-                .onHover { isStashHovered = $0 }
-                .hoverTooltip(stashActionLabel)
 
                 Button(action: requestDeleteConfirmation) {
                     Image(systemName: "trash")
@@ -268,7 +269,9 @@ struct AgentSessionRow: View {
 
             Button(renameActionLabel, action: beginRename)
 
-            Button(stashActionLabel, action: onStash)
+            if let onStash {
+                Button(stashActionLabel, action: onStash)
+            }
 
             if attentionRunState != nil, let onDismissAttention {
                 Button(dismissAttentionActionLabel, action: onDismissAttention)

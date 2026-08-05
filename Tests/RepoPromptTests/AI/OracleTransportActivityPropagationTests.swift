@@ -199,26 +199,22 @@ final class OracleTransportActivityPropagationTests: XCTestCase {
             text: "",
             reasoning: nil,
             tokens: ChatTokenInfo(),
-            isFinal: false,
             isTransportActivity: true
         )
         let emptyOutput = ChatStreamOutput(
             text: "",
             reasoning: nil,
-            tokens: ChatTokenInfo(),
-            isFinal: false
+            tokens: ChatTokenInfo()
         )
         let contentOutput = ChatStreamOutput(
             text: "hello",
             reasoning: nil,
-            tokens: ChatTokenInfo(),
-            isFinal: false
+            tokens: ChatTokenInfo()
         )
         let reasoningOutput = ChatStreamOutput(
             text: "",
             reasoning: "thinking",
-            tokens: ChatTokenInfo(),
-            isFinal: false
+            tokens: ChatTokenInfo()
         )
 
         XCTAssertEqual(OracleViewModel.lifecycleActivityKind(for: transportOutput), .streamActivity)

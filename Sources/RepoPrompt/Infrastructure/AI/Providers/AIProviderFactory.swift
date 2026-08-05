@@ -347,12 +347,19 @@ private extension String {
     }
 }
 
+enum AIProviderCompletionOutcome: Equatable {
+    case completed
+    case incomplete(reason: String)
+}
+
 /// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
 struct AIStreamResult {
     /// Standard type strings for stream results
     static let lifecycleType = "lifecycle"
     /// Transport-level activity with no semantic assistant payload.
     static let transportActivityType = "transport_activity"
+    /// Provider-reported terminal state that preserves partial output without declaring success.
+    static let incompleteType = "message_incomplete"
 
     let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle", "transport_activity"
     let text: String? // normal content (like streaming tokens)
@@ -431,12 +438,20 @@ struct AICompletionResult {
     let promptTokens: Int?
     let completionTokens: Int?
     let cost: Double?
+    let completionOutcome: AIProviderCompletionOutcome
 
-    init(text: String, promptTokens: Int? = nil, completionTokens: Int? = nil, cost: Double? = nil) {
+    init(
+        text: String,
+        promptTokens: Int? = nil,
+        completionTokens: Int? = nil,
+        cost: Double? = nil,
+        completionOutcome: AIProviderCompletionOutcome = .completed
+    ) {
         self.text = text
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.cost = cost
+        self.completionOutcome = completionOutcome
     }
 }
 

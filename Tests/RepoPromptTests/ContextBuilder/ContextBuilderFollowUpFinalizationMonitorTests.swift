@@ -87,7 +87,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
         defer { continuation.finish() }
 
         do {
-            try await ContextBuilderFollowUpFinalizationMonitor.wait(
+            _ = try await ContextBuilderFollowUpFinalizationMonitor.wait(
                 activityEvents: events,
                 configuration: ContextBuilderFollowUpFinalizationConfiguration(
                     overallTimeout: 100,
@@ -101,6 +101,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
                 },
                 waitForFinalization: {
                     try await finalizationGate.wait()
+                    return "response"
                 },
                 cancelStreaming: {
                     await cancellationRecorder.recordCancellation()
@@ -131,7 +132,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
 
         let monitor = Task { () -> Result<Void, Error> in
             do {
-                try await ContextBuilderFollowUpFinalizationMonitor.wait(
+                _ = try await ContextBuilderFollowUpFinalizationMonitor.wait(
                     activityEvents: events,
                     configuration: ContextBuilderFollowUpFinalizationConfiguration(
                         overallTimeout: 100,
@@ -145,6 +146,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
                     },
                     waitForFinalization: {
                         try await finalizationGate.wait()
+                        return "response"
                     },
                     cancelStreaming: {
                         await finalizationGate.complete()
@@ -175,14 +177,14 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
         let (events, continuation) = AsyncStream<OracleMessageLifecycleActivityEvent>.makeStream()
         defer { continuation.finish() }
 
-        try await ContextBuilderFollowUpFinalizationMonitor.wait(
+        _ = try await ContextBuilderFollowUpFinalizationMonitor.wait(
             activityEvents: events,
             configuration: ContextBuilderFollowUpFinalizationConfiguration(
                 overallTimeout: 100,
                 inactivityTimeout: 10,
                 checkInterval: 60
             ),
-            waitForFinalization: {},
+            waitForFinalization: { "response" },
             cancelStreaming: {},
             reportPhase: { phase in
                 await recorder.recordPhase(phase)
@@ -204,7 +206,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
         continuation.yield(OracleMessageLifecycleActivityEvent(kind: .providerStopObserved))
 
         let monitor = Task {
-            try await ContextBuilderFollowUpFinalizationMonitor.wait(
+            _ = try await ContextBuilderFollowUpFinalizationMonitor.wait(
                 activityEvents: events,
                 configuration: ContextBuilderFollowUpFinalizationConfiguration(
                     overallTimeout: 100,
@@ -213,6 +215,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
                 ),
                 waitForFinalization: {
                     await finalizationGate.arriveAndWait()
+                    return "response"
                 },
                 cancelStreaming: {},
                 reportPhase: { phase in
@@ -229,7 +232,7 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
         await fulfillment(of: [activityExpectation, finalizationPhaseExpectation], timeout: 1)
         await finalizationGate.release()
         continuation.finish()
-        try await monitor.value
+        _ = try await monitor.value
 
         let snapshot = await recorder.snapshot()
         XCTAssertEqual(snapshot.phases, [.messageFinalization])
@@ -238,6 +241,30 @@ final class ContextBuilderFollowUpFinalizationMonitorTests: XCTestCase {
             "Oracle finalization watchdog armed",
             "Oracle provider stop observed"
         ])
+    }
+
+    func testContextBuilderCompletionErrorIdentityIsPreserved() async {
+        let expected = OracleContextBuilderCompletionError.providerStreamFailed(
+            message: "The provider rejected the request."
+        )
+        let (events, continuation) = AsyncStream<OracleMessageLifecycleActivityEvent>.makeStream()
+        defer { continuation.finish() }
+
+        do {
+            _ = try await ContextBuilderFollowUpFinalizationMonitor.wait(
+                activityEvents: events,
+                configuration: ContextBuilderFollowUpFinalizationConfiguration(
+                    overallTimeout: 100,
+                    inactivityTimeout: 10,
+                    checkInterval: 60
+                ),
+                waitForFinalization: { throw expected },
+                cancelStreaming: {}
+            )
+            XCTFail("Expected the strict completion error")
+        } catch {
+            XCTAssertEqual(error as? OracleContextBuilderCompletionError, expected)
+        }
     }
 }
 

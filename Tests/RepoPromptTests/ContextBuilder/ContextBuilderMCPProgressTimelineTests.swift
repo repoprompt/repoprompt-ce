@@ -209,7 +209,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                                     text: "deterministic follow-up",
                                     reasoning: nil,
                                     tokens: ChatTokenInfo(),
-                                    isFinal: true
+                                    terminalOutcome: .completed
                                 ))
                                 continuation.finish()
                             }

@@ -2244,7 +2244,7 @@ import XCTest
                                         completionTokens: 92,
                                         cost: 93
                                     ),
-                                    isFinal: true,
+                                    terminalOutcome: .completed,
                                     cleanupHandle: ProviderConversationCleanupHandle(
                                         provider: "ignored",
                                         conversationID: "ignored"
@@ -2255,7 +2255,7 @@ import XCTest
                                     text: "transported oracle response",
                                     reasoning: nil,
                                     tokens: ChatTokenInfo(),
-                                    isFinal: true
+                                    terminalOutcome: .completed
                                 ))
                                 continuation.finish()
                             }
