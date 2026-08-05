@@ -5,7 +5,7 @@ import XCTest
 final class AsyncMutexTests: XCTestCase {
     func testCancelledTaskCannotAcquireUnlockedMutex() async throws {
         let mutex = AsyncMutex()
-        let taskAcquired = await Task {
+        let taskAcquired = try await Task {
             withUnsafeCurrentTask { $0?.cancel() }
 
             do {
@@ -20,5 +20,26 @@ final class AsyncMutexTests: XCTestCase {
 
         let followUpAcquired = try await mutex.withLock { true }
         XCTAssertTrue(followUpAcquired)
+    }
+
+    func testCancelledTaskCanAcquireForCleanupAfterCurrentOwnerReleases() async throws {
+        let mutex = AsyncMutex()
+        let ownerEntered = TestReleaseFence(name: "AsyncMutex owner")
+
+        let owner = Task {
+            try await mutex.withLock {
+                await ownerEntered.enterAndWaitIgnoringCancellationUntilRelease()
+            }
+        }
+        await ownerEntered.waitUntilEntered()
+
+        let cleanup = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await mutex.withLockIgnoringCancellation { true }
+        }
+        ownerEntered.release()
+
+        try await owner.value
+        XCTAssertTrue(try await cleanup.value)
     }
 }
