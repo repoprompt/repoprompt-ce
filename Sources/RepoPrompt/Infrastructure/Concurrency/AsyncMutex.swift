@@ -18,6 +18,7 @@ actor AsyncMutex {
     /// Returns `true` if the lock was acquired, `false` if the waiter was
     /// removed due to task cancellation (caller must NOT enter the critical section).
     private func lock() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if !isLocked {
             isLocked = true
             return true
