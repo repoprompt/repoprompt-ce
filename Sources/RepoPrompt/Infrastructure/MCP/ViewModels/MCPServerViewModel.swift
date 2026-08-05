@@ -463,6 +463,16 @@ final class MCPServerViewModel: ObservableObject {
             try await oracleToolService.executeAskOracle(args: args)
         }
 
+        func resolveAgentSessionLifecycleMutationTargetForTesting(
+            connectionID: UUID?
+        ) async throws -> AgentSessionLifecycleAuthority.MutationTarget {
+            try await resolveAgentSessionLifecycleMutationTarget(
+                args: [:],
+                connectionID: connectionID,
+                intent: .setStatus
+            )
+        }
+
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
         ) {
@@ -1117,9 +1127,13 @@ final class MCPServerViewModel: ObservableObject {
             }
             return connectionID
         },
-        resolveAgentModeTabID: { [weak self] args, connectionID in
+        resolveAgentModeTabID: { [weak self] args, connectionID, intent in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving agent mode tab") }
-            return try await resolveTabIDForAgentMode(args: args, connectionID: connectionID)
+            return try await resolveAgentSessionLifecycleMutationTarget(
+                args: args,
+                connectionID: connectionID,
+                intent: intent
+            )
         },
         resolveContextBuilderTab: { [weak self] args, targetWindow, connectionID in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving context_builder tab") }
@@ -3609,7 +3623,8 @@ final class MCPServerViewModel: ObservableObject {
         args: [String: Value],
         connectionID: UUID?
     ) async throws -> UUID {
-        // 1) Explicit _tabID override (hidden param), validated against real tabs.
+        // Oracle tools use this only to anchor context packaging to a compose tab;
+        // they do not mutate or start the tab's Agent session identity.
         let explicitRaw = rawExplicitTabID(args: args)
         let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
         let availableTabIDs = workspaceTabIDs.isEmpty
@@ -3622,7 +3637,6 @@ final class MCPServerViewModel: ObservableObject {
             return explicitUUID
         }
 
-        // 2) Try to get tab from MCP connection context (bound tab)
         let resolvedConnectionID: UUID? = if let connectionID {
             connectionID
         } else {
@@ -3635,14 +3649,12 @@ final class MCPServerViewModel: ObservableObject {
             return boundTab
         }
 
-        // 3) Fallback to active compose tab in the window
         if let activeTab = promptVM.activeComposeTabID,
            composeTabExists(activeTab)
         {
             return activeTab
         }
 
-        // 4) Create a blank tab as a last resort
         if let newTab = await promptVM.ensureActiveComposeTab(
             nil,
             creationStrategy: .blank,
@@ -3654,10 +3666,113 @@ final class MCPServerViewModel: ObservableObject {
         throw MCPError.invalidParams("No active compose tab available; open or create a tab first.")
     }
 
+    private func resolveAgentSessionLifecycleMutationTarget(
+        args: [String: Value],
+        connectionID: UUID?,
+        intent: AgentSessionLifecycleAuthority.Intent
+    ) async throws -> AgentSessionLifecycleAuthority.MutationTarget {
+        // 1) Explicit _tabID override (hidden param), validated against real tabs.
+        let explicitRaw = rawExplicitTabID(args: args)
+        let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
+        let availableTabIDs = workspaceTabIDs.isEmpty
+            ? Set(promptVM.currentComposeTabs.map(\.id))
+            : workspaceTabIDs
+        if let explicitUUID = try Self.resolveExplicitTabIDForAgentMode(
+            rawTabID: explicitRaw,
+            availableTabIDs: availableTabIDs
+        ) {
+            let expectedSessionID = workspaceManager?.composeTab(with: explicitUUID)?.activeAgentSessionID
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: explicitUUID,
+                    expectedSessionID: expectedSessionID,
+                    intent: intent
+                )
+        }
+
+        // 2) Try to get tab from MCP connection context (bound tab)
+        let resolvedConnectionID: UUID? = if let connectionID {
+            connectionID
+        } else {
+            await service.currentRequestConnectionID()
+        }
+        let requiresBoundAgentSessionContext = switch intent {
+        case .setStatus, .shareThoughts, .waitForInstruction, .askUser:
+            true
+        case .createOrContinue, .applyProjection, .providerStart:
+            false
+        }
+        if requiresBoundAgentSessionContext,
+           let resolvedConnectionID
+        {
+            guard let boundContext = tabContextByConnectionID[resolvedConnectionID],
+                  boundContext.windowID == windowID
+            else {
+                throw MCPError.invalidParams(
+                    "The Agent session connection no longer has its bound tab; the operation was not retargeted. Bind the current context again."
+                )
+            }
+            guard composeTabExists(boundContext.tabID) else {
+                throw MCPError.invalidParams(
+                    "The Agent session's bound tab no longer exists; the operation was not retargeted. Bind the current context again."
+                )
+            }
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: boundContext.tabID,
+                    expectedSessionID: boundContext.activeAgentSessionID,
+                    intent: intent
+                )
+        }
+        if let resolvedConnectionID,
+           let boundContext = tabContextByConnectionID[resolvedConnectionID],
+           boundContext.windowID == windowID
+        {
+            guard composeTabExists(boundContext.tabID) else {
+                throw MCPError.invalidParams(
+                    "The Agent session's bound tab no longer exists; the operation was not retargeted. Bind the current context again."
+                )
+            }
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: boundContext.tabID,
+                    expectedSessionID: boundContext.activeAgentSessionID,
+                    intent: intent
+                )
+        }
+
+        // 3) Fallback to active compose tab in the window
+        if let activeTab = promptVM.activeComposeTabID,
+           composeTabExists(activeTab)
+        {
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: activeTab,
+                    expectedSessionID: nil,
+                    intent: intent
+                )
+        }
+
+        // 4) Create a blank tab as a last resort
+        if let newTab = await promptVM.ensureActiveComposeTab(
+            nil,
+            creationStrategy: .blank,
+            name: nil
+        ) {
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: newTab.id,
+                    expectedSessionID: newTab.activeAgentSessionID,
+                    intent: intent
+                )
+        }
+
+        throw MCPError.invalidParams("No active compose tab available; open or create a tab first.")
+    }
+
     /// Resolves an explicit `_tabID` from the args, returning nil when not provided.
-    /// Unlike `resolveExistingTabIDForAgentControl`, this does NOT fall back to the
-    /// connection-bound tab or active tab. This ensures run-starting operations
-    /// (agent_run.start) creates a fresh session by default.
+    /// This does not fall back to the connection-bound or active tab. Run-starting
+    /// operations therefore create a fresh session by default.
     private func resolveRequestedTabIDForAgentControl(
         args: [String: Value]
     ) throws -> UUID? {
@@ -3669,34 +3784,6 @@ final class MCPServerViewModel: ObservableObject {
             rawTabID: rawExplicitTabID(args: args),
             availableTabIDs: availableTabIDs
         )
-    }
-
-    private func resolveExistingTabIDForAgentControl(
-        args: [String: Value],
-        metadata: RequestMetadata
-    ) async throws -> UUID? {
-        let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
-        let availableTabIDs = workspaceTabIDs.isEmpty
-            ? Set(promptVM.currentComposeTabs.map(\.id))
-            : workspaceTabIDs
-        if let explicitUUID = try Self.resolveExplicitTabIDForAgentMode(
-            rawTabID: rawExplicitTabID(args: args),
-            availableTabIDs: availableTabIDs
-        ) {
-            return explicitUUID
-        }
-        if let connectionID = metadata.connectionID,
-           let boundTabID = boundTabID(forConnection: connectionID),
-           composeTabExists(boundTabID)
-        {
-            return boundTabID
-        }
-        if let activeTabID = promptVM.activeComposeTabID,
-           composeTabExists(activeTabID)
-        {
-            return activeTabID
-        }
-        return nil
     }
 
     func bindCurrentRequestToTabIfPossible(

@@ -631,7 +631,15 @@ struct AgentRunMCPToolService {
             ])
         #endif
         let outcome: AgentExternalMCPRunStarter.StartOutcome
+        var providerDispatchAttempted = false
         do {
+            try agentModeVM.requireCurrentAgentSessionLifecycleAdmission(target)
+            agentModeVM.recordAgentSessionProviderLifecycle(
+                target: target,
+                phase: .beforeProviderStart,
+                decision: .admitted,
+                reason: "binding_identity_validated"
+            )
             WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
             #if DEBUG
                 if worktreeStartupBenchmarkToken != nil {
@@ -641,6 +649,7 @@ struct AgentRunMCPToolService {
                     )
                 }
             #endif
+            providerDispatchAttempted = true
             outcome = try await startRun(
                 target,
                 message,
@@ -653,6 +662,12 @@ struct AgentRunMCPToolService {
                 workflow,
                 spawnParentSessionID,
                 oracleLaunchSource.source
+            )
+            agentModeVM.recordAgentSessionProviderLifecycle(
+                target: target,
+                phase: .afterProviderStart,
+                decision: .admitted,
+                reason: "provider_start_accepted"
             )
             #if DEBUG
                 if worktreeStartupBenchmarkToken != nil {
@@ -669,6 +684,19 @@ struct AgentRunMCPToolService {
                 }
             #endif
         } catch {
+            let providerFailureReason = if !providerDispatchAttempted {
+                "lifecycle_identity_rejected"
+            } else if error is CancellationError {
+                "provider_start_cancelled"
+            } else {
+                "provider_start_failed"
+            }
+            agentModeVM.recordAgentSessionProviderLifecycle(
+                target: target,
+                phase: providerDispatchAttempted ? .afterProviderStart : .beforeProviderStart,
+                decision: .rejected,
+                reason: providerFailureReason
+            )
             let decoratedError = startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,

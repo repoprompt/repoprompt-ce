@@ -263,6 +263,41 @@ enum WorkspaceOpenError: LocalizedError {
     }
 }
 
+enum WorkspacePersistenceOutcome: Equatable {
+    case persisted(workspaceID: UUID, stateVersion: Int)
+    case notRequired(workspaceID: UUID)
+    case rejected(reason: String)
+
+    var workspaceID: UUID? {
+        switch self {
+        case let .persisted(workspaceID, _), let .notRequired(workspaceID):
+            workspaceID
+        case .rejected:
+            nil
+        }
+    }
+
+    var acceptedForLifecycleAdmission: Bool {
+        switch self {
+        case .persisted, .notRequired:
+            true
+        case .rejected:
+            false
+        }
+    }
+
+    var diagnosticCategory: String {
+        switch self {
+        case .persisted:
+            "persisted"
+        case .notRequired:
+            "not_required"
+        case let .rejected(reason):
+            reason
+        }
+    }
+}
+
 /// The main WorkspaceManager, refactored to store each WorkspaceModel
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 @MainActor
@@ -796,12 +831,33 @@ class WorkspaceManagerViewModel: ObservableObject {
     let workspaceSearchService: WorkspaceSearchService
     /// Non-nil only in production composition; nil is the isolated legacy test owner.
     private let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
+    private var agentSessionProjectionReconciler: ((
+        _ projectedWorkspaces: [WorkspaceModel],
+        _ currentWorkspaces: [WorkspaceModel]
+    ) -> AgentSessionLifecycleAuthority.ProjectionOutcome)?
     private var lastDomainProjectionSequence: UInt64 = 0
     private lazy var checkoutRefreshService = WorkspaceCheckoutRefreshService(
         store: fileManager.workspaceFileContextStore,
         searchService: workspaceSearchService
     )
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
+
+    #if DEBUG
+        private var workspacePersistenceOutcomeOverrideForTesting: WorkspacePersistenceOutcome?
+
+        func setWorkspacePersistenceOutcomeOverrideForTesting(_ outcome: WorkspacePersistenceOutcome?) {
+            workspacePersistenceOutcomeOverrideForTesting = outcome
+        }
+    #endif
+
+    func setAgentSessionProjectionReconciler(
+        _ reconciler: @escaping (
+            _ projectedWorkspaces: [WorkspaceModel],
+            _ currentWorkspaces: [WorkspaceModel]
+        ) -> AgentSessionLifecycleAuthority.ProjectionOutcome
+    ) {
+        agentSessionProjectionReconciler = reconciler
+    }
 
     var liveUISelectionRevision: UInt64 {
         fileManager.selectionStateRevision
@@ -4190,14 +4246,24 @@ class WorkspaceManagerViewModel: ObservableObject {
                 invalidateDomainReadRegistration(for: workspaceID)
             }
         }
-        workspaces = projectedWorkspaces
-        recordRepoPathBaselines(for: projectedWorkspaces)
+        let lifecycleProjection = agentSessionProjectionReconciler?(
+            projectedWorkspaces,
+            workspaces
+        )
+        let reconciledWorkspaces = lifecycleProjection?.workspaces ?? projectedWorkspaces
+        workspaces = reconciledWorkspaces
+        recordRepoPathBaselines(for: reconciledWorkspaces)
         if let preferredActiveWorkspaceID,
-           projectedWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
+           reconciledWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
         {
             activeWorkspaceID = preferredActiveWorkspaceID
-        } else if !projectedWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
-            activeWorkspaceID = projectedWorkspaces.first?.id
+        } else if !reconciledWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
+            activeWorkspaceID = reconciledWorkspaces.first?.id
+        }
+        if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
+            for workspaceID in protectedWorkspaceIDs {
+                bumpStateVersion(for: workspaceID)
+            }
         }
     }
 
@@ -5431,7 +5497,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             object: nil,
             userInfo: [
                 "windowID": promptViewModel.windowID,
-                "workspaceID": active.id
+                "workspaceID": workspaceID
             ]
         )
 
@@ -5453,14 +5519,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         scheduleSave(workspaceID: workspaceID, fileURL: fileURL, source: source)
     }
 
-    func pollAndSaveStateAsync(source: WorkspaceSaveSource = .pollAndSaveStateAsync) async {
-        guard let active = activeWorkspace else { return }
+    func pollAndSaveStateAsync(
+        source: WorkspaceSaveSource = .pollAndSaveStateAsync
+    ) async {
+        _ = await pollAndSaveStateWithOutcomeAsync(source: source)
+    }
 
-        let wsID = active.id
+    func pollAndSaveStateWithOutcomeAsync(
+        workspaceID requestedWorkspaceID: UUID? = nil,
+        source: WorkspaceSaveSource = .pollAndSaveStateAsync
+    ) async -> WorkspacePersistenceOutcome {
+        guard let wsID = requestedWorkspaceID ?? activeWorkspace?.id,
+              workspace(withID: wsID) != nil
+        else {
+            return .rejected(reason: "active_workspace_unavailable")
+        }
         let cur = stateVersionByWorkspaceID[wsID, default: 0]
         let last = lastSavedVersionByWorkspaceID[wsID, default: -1]
 
-        guard cur != last else { return } // not dirty → nothing to do
+        guard cur != last else { return .notRequired(workspaceID: wsID) } // not dirty → nothing to do
 
         // Post notification to allow SwiftUI views to flush pending state
         NotificationCenter.default.post(
@@ -5468,36 +5545,59 @@ class WorkspaceManagerViewModel: ObservableObject {
             object: nil,
             userInfo: [
                 "windowID": promptViewModel.windowID,
-                "workspaceID": active.id
+                "workspaceID": wsID
             ]
         )
 
-        // Call before-save listeners on the active
-        if let active = activeWorkspace {
+        // Call before-save listeners for the workspace this admission is saving.
+        if let targetWorkspace = workspace(withID: wsID) {
             for listenerRecord in beforeSaveListeners {
-                listenerRecord.listener(active)
+                listenerRecord.listener(targetWorkspace)
             }
         }
 
-        guard let index = workspaceIndex(for: wsID) else { return }
+        guard let index = workspaceIndex(for: wsID) else {
+            return .rejected(reason: "workspace_changed_before_capture")
+        }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
-        guard let capturedWorkspace = workspace(withID: wsID) else { return }
+        guard let capturedWorkspace = workspace(withID: wsID) else {
+            return .rejected(reason: "workspace_changed_after_capture")
+        }
         let fileURL = workspaceFileURL(for: capturedWorkspace)
         reloadComposeTabsAfterSaveCaptureIfNeeded(capturedWorkspace, capturedSnapshot: snapshot)
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
+        #if DEBUG
+            if let workspacePersistenceOutcomeOverrideForTesting {
+                return workspacePersistenceOutcomeOverrideForTesting
+            }
+        #endif
         guard let savedStateVersion = await saveWorkspaceAsync(
             workspaceID: wsID,
             fileURL: fileURL,
             source: source
-        ) else { return }
+        ) else {
+            let issueCategory = if domainWorkspaceAuthorityIssue?.message
+                .localizedCaseInsensitiveContains("workspace_not_writable") == true
+            {
+                "workspace_not_writable"
+            } else {
+                "workspace_save_failed"
+            }
+            return .rejected(
+                reason: issueCategory
+            )
+        }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
-        guard workspace(withID: wsID) != nil else { return }
+        guard workspace(withID: wsID) != nil else {
+            return .rejected(reason: "workspace_changed_after_save")
+        }
         lastSavedVersionByWorkspaceID[wsID] = max(
             lastSavedVersionByWorkspaceID[wsID, default: -1],
             savedStateVersion
         )
+        return .persisted(workspaceID: wsID, stateVersion: savedStateVersion)
     }
 
     func restoreWorkspaceState(
@@ -6048,7 +6148,11 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let diskSnapshot = await loadWorkspaceSnapshotFromDisk()
         if !diskSnapshot.isEmpty {
-            workspaces = diskSnapshot
+            let lifecycleProjection = agentSessionProjectionReconciler?(
+                diskSnapshot,
+                workspaces
+            )
+            workspaces = lifecycleProjection?.workspaces ?? diskSnapshot
         }
 
         let activeWorkspaceIDs = Set(windowStates.allWindows.compactMap { $0.workspaceManager.activeWorkspace?.id })
