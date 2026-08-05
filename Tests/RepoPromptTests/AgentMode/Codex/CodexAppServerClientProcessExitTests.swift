@@ -19,7 +19,8 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         let completed = expectation(description: "cancelled stderr wait completed")
         let capture = CodexProcessStderrCapture(
             byteLimit: 8 * 1024,
-            beforeContinuationInstallForTesting: { await registrationGate.pause() }
+            beforeContinuationInstallForTesting: { await registrationGate.pause() },
+            waiterDidRegisterForTesting: nil
         )
         let wait = Task {
             let result = await capture.waitUntilFinished(timeout: 60)
@@ -42,6 +43,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         registered.expectedFulfillmentCount = 2
         let capture = CodexProcessStderrCapture(
             byteLimit: 8 * 1024,
+            beforeContinuationInstallForTesting: nil,
             waiterDidRegisterForTesting: { registered.fulfill() }
         )
         let cancelledWaitCompleted = expectation(description: "cancelled stderr waiter completed")

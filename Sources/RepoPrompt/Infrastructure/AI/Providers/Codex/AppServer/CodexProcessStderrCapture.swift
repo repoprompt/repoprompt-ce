@@ -22,30 +22,24 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
     private var wasTruncated = false
     private var isFinished = false
     private var waiters: [UUID: Waiter] = [:]
-    #if DEBUG
-        private let beforeContinuationInstallForTesting: (@Sendable () async -> Void)?
-        private let waiterDidRegisterForTesting: (@Sendable () -> Void)?
-    #endif
+    private let beforeContinuationInstallForTesting: (@Sendable () async -> Void)?
+    private let waiterDidRegisterForTesting: (@Sendable () -> Void)?
 
     init(byteLimit: Int) {
         self.byteLimit = max(byteLimit, 0)
-        #if DEBUG
-            beforeContinuationInstallForTesting = nil
-            waiterDidRegisterForTesting = nil
-        #endif
+        beforeContinuationInstallForTesting = nil
+        waiterDidRegisterForTesting = nil
     }
 
-    #if DEBUG
-        init(
-            byteLimit: Int,
-            beforeContinuationInstallForTesting: (@Sendable () async -> Void)? = nil,
-            waiterDidRegisterForTesting: (@Sendable () -> Void)? = nil
-        ) {
-            self.byteLimit = max(byteLimit, 0)
-            self.beforeContinuationInstallForTesting = beforeContinuationInstallForTesting
-            self.waiterDidRegisterForTesting = waiterDidRegisterForTesting
-        }
-    #endif
+    init(
+        byteLimit: Int,
+        beforeContinuationInstallForTesting: (@Sendable () async -> Void)?,
+        waiterDidRegisterForTesting: (@Sendable () -> Void)?
+    ) {
+        self.byteLimit = max(byteLimit, 0)
+        self.beforeContinuationInstallForTesting = beforeContinuationInstallForTesting
+        self.waiterDidRegisterForTesting = waiterDidRegisterForTesting
+    }
 
     func append(_ chunk: Data) {
         guard !chunk.isEmpty else { return }
@@ -104,18 +98,14 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
         if let immediateResult = reserveWaiter(waiterID) {
             return immediateResult
         }
-        #if DEBUG
-            if let beforeContinuationInstallForTesting {
-                await beforeContinuationInstallForTesting()
-            }
-        #endif
+        if let beforeContinuationInstallForTesting {
+            await beforeContinuationInstallForTesting()
+        }
         let timeoutNanoseconds = UInt64(max(timeout, 0) * 1_000_000_000)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard installContinuation(continuation, for: waiterID) else { return }
-                #if DEBUG
-                    waiterDidRegisterForTesting?()
-                #endif
+                waiterDidRegisterForTesting?()
 
                 let timeoutTask = Task.detached { [weak self] in
                     do {
