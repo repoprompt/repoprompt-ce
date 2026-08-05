@@ -79,9 +79,19 @@ final class DiffApplicatorTests: XCTestCase {
         )
 
         XCTAssertEqual(result, ["before", "removed", "added", "after"])
-        XCTAssertEqual(try DiffApplicator.revert(chunk, from: [], startingAt: -1), [])
         assertRevertOutOfBounds(startLine: -1, content: ["line"], chunk: chunk)
         assertRevertOutOfBounds(startLine: 2, content: ["line"], chunk: chunk)
+    }
+
+    func testRevertReturnsEmptyBeforeValidatingStartLine() {
+        let chunk = DiffChunk(lines: [], startLine: 0)
+
+        do {
+            let result = try DiffApplicator.revert(chunk, from: [], startingAt: -1)
+            XCTAssertEqual(result, [])
+        } catch {
+            XCTFail("Expected empty content to return before start-line validation, got \(error)")
+        }
     }
 
     private func assertOutOfBounds(startLine: Int, content: [String], chunk: DiffChunk) {
