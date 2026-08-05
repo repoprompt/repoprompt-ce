@@ -173,7 +173,6 @@ class PromptViewModel: ObservableObject {
 
     enum ComposeTabRemovalFailureStage: String, Equatable {
         case requiredSessionFlush
-        case durableSessionDeletion
     }
 
     struct ComposeTabRemovalFailure: Error, Equatable {
@@ -193,6 +192,11 @@ class PromptViewModel: ObservableObject {
     }
 
     typealias ComposeTabsWillCloseListener = @Sendable (_ tabIDs: Set<UUID>, _ reason: ComposeTabRemovalReason) async -> Void
+    typealias ComposeTabsDidRemoveListener = @MainActor @Sendable (
+        _ tabIDs: Set<UUID>,
+        _ reason: ComposeTabRemovalReason,
+        _ workspaceID: UUID
+    ) async -> Void
     typealias ComposeTabsRemovalHook = @MainActor @Sendable (
         _ tabIDs: Set<UUID>,
         _ reason: ComposeTabRemovalReason,
@@ -201,8 +205,8 @@ class PromptViewModel: ObservableObject {
     typealias ComposeTabCascadeResolver = @Sendable (_ tabIDs: Set<UUID>, _ reason: ComposeTabRemovalReason) async -> AgentSessionCascadePlan
     typealias StashedTabCascadeResolver = @Sendable (_ stashedTabIDs: Set<UUID>) async -> AgentSessionCascadePlan
     private var composeTabsWillCloseListeners: [UUID: ComposeTabsWillCloseListener] = [:]
+    private var composeTabsDidRemoveListeners: [UUID: ComposeTabsDidRemoveListener] = [:]
     private var composeTabsRemovalPreflight: (token: UUID, hook: ComposeTabsRemovalHook)?
-    private var composeTabsRemovalPreparation: (token: UUID, hook: ComposeTabsRemovalHook)?
     var composeTabCascadeResolver: ComposeTabCascadeResolver?
     var stashedTabCascadeResolver: StashedTabCascadeResolver?
 
@@ -2417,16 +2421,15 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func setComposeTabsRemovalPreparation(_ hook: @escaping ComposeTabsRemovalHook) -> UUID {
+    func addComposeTabsDidRemoveListener(_ listener: @escaping ComposeTabsDidRemoveListener) -> UUID {
         let token = UUID()
-        composeTabsRemovalPreparation = (token, hook)
+        composeTabsDidRemoveListeners[token] = listener
         return token
     }
 
     @MainActor
-    func removeComposeTabsRemovalPreparation(_ token: UUID) {
-        guard composeTabsRemovalPreparation?.token == token else { return }
-        composeTabsRemovalPreparation = nil
+    func removeComposeTabsDidRemoveListener(_ token: UUID) {
+        composeTabsDidRemoveListeners.removeValue(forKey: token)
     }
 
     @MainActor
@@ -2440,13 +2443,14 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    private func prepareComposeTabsRemoval(
+    private func notifyComposeTabsDidRemove(
         _ tabIDs: Set<UUID>,
         reason: ComposeTabRemovalReason,
         workspaceID: UUID
-    ) async -> ComposeTabRemovalDecision {
-        guard let hook = composeTabsRemovalPreparation?.hook else { return .proceed }
-        return await hook(tabIDs, reason, workspaceID)
+    ) async {
+        for listener in Array(composeTabsDidRemoveListeners.values) {
+            await listener(tabIDs, reason, workspaceID)
+        }
     }
 
     @MainActor
@@ -2470,6 +2474,29 @@ class PromptViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    @MainActor
+    private func runPostProjectionComposeTabCleanup(
+        _ tabIDs: Set<UUID>,
+        reason: ComposeTabRemovalReason,
+        workspaceID: UUID
+    ) async {
+        if reason != .stash {
+            deleteGitDataForClosingTabs(tabIDs: tabIDs)
+        }
+        await notifyComposeTabsWillClose(tabIDs, reason: reason)
+        await cleanupMCPStateForClosingTabs(tabIDs)
+        await notifyComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
+        #if DEBUG
+            for tabID in tabIDs {
+                AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
+                    tabID: tabID,
+                    source: "PromptViewModel.runPostProjectionComposeTabCleanup",
+                    fields: ["reason": String(describing: reason)]
+                )
+            }
+        #endif
     }
 
     @MainActor
@@ -2887,38 +2914,6 @@ class PromptViewModel: ObservableObject {
         {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
-        switch await prepareComposeTabsRemoval(
-            tabsBeingClosed,
-            reason: reason,
-            workspaceID: workspace.id
-        ) {
-        case .proceed:
-            break
-        case let .abort(failure):
-            logComposeTabRemovalAbort(failure)
-            return
-        }
-        guard mutationOwnerIsCurrent() else { return }
-
-        // Non-vetoing feature cleanup runs only after required AgentMode preparation succeeds.
-        await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
-        guard mutationOwnerIsCurrent() else { return }
-        await cleanupMCPStateForClosingTabs(tabsBeingClosed)
-        guard mutationOwnerIsCurrent() else { return }
-        #if DEBUG
-            for tabID in tabsBeingClosed {
-                AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
-                    tabID: tabID,
-                    source: "PromptViewModel.closeComposeTabs.closeListenersAndMCP",
-                    fields: ["reason": String(describing: reason)]
-                )
-            }
-        #endif
-
-        if reason == .close {
-            deleteGitDataForClosingTabs(tabIDs: tabsBeingClosed)
-        }
-
         if reason == .stash {
             let refreshedTabs = manager.workspaces[index].composeTabs
             for tabID in tabsBeingClosed {
@@ -2960,6 +2955,7 @@ class PromptViewModel: ObservableObject {
             #endif
             manager.markWorkspaceDirty()
             manager.pollAndSaveState()
+            await runPostProjectionComposeTabCleanup(tabsBeingClosed, reason: reason, workspaceID: workspace.id)
             if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
                 await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
             }
@@ -3007,6 +3003,7 @@ class PromptViewModel: ObservableObject {
         #endif
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
+        await runPostProjectionComposeTabCleanup(tabsBeingClosed, reason: reason, workspaceID: workspace.id)
         if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
             await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
         }
@@ -3269,23 +3266,6 @@ class PromptViewModel: ObservableObject {
                     logComposeTabRemovalAbort(failure)
                     return
                 }
-                switch await prepareComposeTabsRemoval(
-                    composeTabIDsBeingDeleted,
-                    reason: .close,
-                    workspaceID: workspace.id
-                ) {
-                case .proceed:
-                    break
-                case let .abort(failure):
-                    logComposeTabRemovalAbort(failure)
-                    return
-                }
-                guard mutationOwnerIsCurrent() else { return }
-                await notifyComposeTabsWillClose(composeTabIDsBeingDeleted, reason: .close)
-                guard mutationOwnerIsCurrent() else { return }
-                await cleanupMCPStateForClosingTabs(composeTabIDsBeingDeleted)
-                guard mutationOwnerIsCurrent() else { return }
-                deleteGitDataForClosingTabs(tabIDs: composeTabIDsBeingDeleted)
                 var remainingComposeTabs = composeTabsBeforeDelete
                 remainingComposeTabs.removeAll { composeTabIDsBeingDeleted.contains($0.id) }
                 dirtyTabIDs.subtract(composeTabIDsBeingDeleted)
@@ -3323,6 +3303,14 @@ class PromptViewModel: ObservableObject {
                         activeComposeTabID = newActiveID
                     }
                 }
+                loadComposeTabsFromWorkspace(manager.workspaces[index])
+                manager.markWorkspaceDirty()
+                manager.pollAndSaveState()
+                await runPostProjectionComposeTabCleanup(
+                    composeTabIDsBeingDeleted,
+                    reason: .close,
+                    workspaceID: workspace.id
+                )
             }
         }
 
@@ -3341,25 +3329,11 @@ class PromptViewModel: ObservableObject {
             logComposeTabRemovalAbort(failure)
             return
         }
-        switch await prepareComposeTabsRemoval(
-            tabIDs,
-            reason: .deleteStashed,
-            workspaceID: workspace.id
-        ) {
-        case .proceed:
-            break
-        case let .abort(failure):
-            logComposeTabRemovalAbort(failure)
-            return
-        }
-        guard mutationOwnerIsCurrent() else { return }
-        await notifyComposeTabsWillClose(tabIDs, reason: .deleteStashed)
-        guard mutationOwnerIsCurrent() else { return }
-        deleteGitDataForClosingTabs(tabIDs: tabIDs)
         manager.workspaces[index].stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
         loadComposeTabsFromWorkspace(manager.workspaces[index])
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
+        await runPostProjectionComposeTabCleanup(tabIDs, reason: .deleteStashed, workspaceID: workspace.id)
     }
 
     @MainActor

@@ -123,40 +123,6 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.prompt.dirtyTabIDs.intersection(originalIDs), dirtyIDs)
     }
 
-    func testWorkspaceSwitchDuringRemovalPreparationDoesNotMutateCapturedWorkspace() async throws {
-        let fixture = makeFixture(initialTabCount: 2)
-        let capturedWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
-        let capturedTabIDs = capturedWorkspace.composeTabs.map(\.id)
-        let tabID = try XCTUnwrap(capturedTabIDs.last)
-        let otherTab = ComposeTabState(name: "Other workspace tab")
-        let otherWorkspace = WorkspaceModel(
-            name: "Other workspace",
-            repoPaths: [],
-            ephemeralFlag: true,
-            composeTabs: [otherTab],
-            activeComposeTabID: otherTab.id
-        )
-        fixture.manager.workspaces.append(otherWorkspace)
-
-        let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { _, _, _ in .proceed }
-        let preparationToken = fixture.prompt.setComposeTabsRemovalPreparation { _, _, _ in
-            fixture.manager.activeWorkspace = otherWorkspace
-            return .proceed
-        }
-        defer {
-            fixture.prompt.removeComposeTabsRemovalPreflight(preflightToken)
-            fixture.prompt.removeComposeTabsRemovalPreparation(preparationToken)
-        }
-
-        await fixture.prompt.closeComposeTab(tabID)
-
-        let storedCapturedWorkspace = try XCTUnwrap(
-            fixture.manager.workspaces.first(where: { $0.id == capturedWorkspace.id })
-        )
-        XCTAssertEqual(storedCapturedWorkspace.composeTabs.map(\.id), capturedTabIDs)
-        XCTAssertEqual(fixture.manager.activeWorkspace?.id, otherWorkspace.id)
-    }
-
     func testFailedRequiredFlushKeepsTabRuntimeAndProjection() async throws {
         let fixture = makeFixture(initialTabCount: 2)
         let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
@@ -190,6 +156,95 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertTrue(viewModel.sessions[tabID] === session)
         XCTAssertEqual(session.runState, .running)
         XCTAssertTrue(session.isDirty)
+    }
+
+    func testFailedDurableDeletionDoesNotResurrectRemovedComposeTab() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        let sessionID = try XCTUnwrap(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.runState = .running
+        viewModel.setAgentRunActive(tabID, isActive: true)
+
+        var teardownTabIDs: [UUID] = []
+        viewModel.test_setComposeTabRemovalTeardownObserver { removedTabID in
+            XCTAssertFalse(fixture.manager.activeWorkspace?.composeTabs.contains(where: { $0.id == removedTabID }) == true)
+            XCTAssertFalse(fixture.prompt.currentComposeTabs.contains(where: { $0.id == removedTabID }))
+            teardownTabIDs.append(removedTabID)
+        }
+        viewModel.test_setAgentSessionsDeleter { _, _ in
+            throw RequiredFlushTestError.injectedFailure
+        }
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+        await fixture.prompt.closeComposeTab(tabID)
+
+        XCTAssertFalse(fixture.manager.activeWorkspace?.composeTabs.contains(where: { $0.id == tabID }) == true)
+        XCTAssertNil(viewModel.sessions[tabID])
+        XCTAssertEqual(teardownTabIDs, [tabID])
+    }
+
+    func testFailedStashedDeletionDoesNotResurrectRemovedProjection() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let stashedTab = try XCTUnwrap(fixture.manager.activeWorkspace?.stashedTabs.first)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        _ = viewModel.session(for: stashedTab.tab.id)
+        viewModel.test_setAgentSessionsDeleter { _, _ in
+            throw RequiredFlushTestError.injectedFailure
+        }
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+
+        await fixture.prompt.deleteStashedTab(stashedTab.id)
+
+        XCTAssertFalse(fixture.prompt.currentStashedTabs.contains(where: { $0.id == stashedTab.id }))
+        XCTAssertFalse(fixture.manager.activeWorkspace?.stashedTabs.contains(where: { $0.id == stashedTab.id }) == true)
+        XCTAssertNil(viewModel.sessions[stashedTab.tab.id])
+    }
+
+    func testMultiTabDeletionFailureContinuesRemainingCleanup() async throws {
+        let fixture = makeFixture(initialTabCount: 3)
+        let tabs = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        for tab in tabs {
+            _ = viewModel.session(for: tab.id)
+        }
+        let orderedTabIDs = tabs.map(\.id).sorted(by: { $0.uuidString < $1.uuidString })
+        let attempts = DeletionAttemptRecorder(failingTabID: orderedTabIDs[1])
+        viewModel.test_setAgentSessionsDeleter { tabID, _ in
+            try await attempts.delete(tabID)
+        }
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+
+        await fixture.prompt.closeAllComposeTabs()
+
+        let attemptedTabIDs = await attempts.attempted()
+        XCTAssertEqual(attemptedTabIDs, orderedTabIDs)
+        for tab in tabs {
+            XCTAssertNil(viewModel.sessions[tab.id])
+        }
+    }
+
+    func testStashRunsPostProjectionTeardownWithoutDurableDeletion() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        _ = viewModel.session(for: tabID)
+        let attempts = DeletionAttemptRecorder(failingTabID: nil)
+        viewModel.test_setAgentSessionsDeleter { deletedTabID, _ in
+            try await attempts.delete(deletedTabID)
+        }
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+        await fixture.prompt.stashTab(tabID)
+
+        XCTAssertTrue(fixture.manager.activeWorkspace?.stashedTabs.contains(where: { $0.tab.id == tabID }) == true)
+        XCTAssertNil(viewModel.sessions[tabID])
+        let attemptedTabIDs = await attempts.attempted()
+        XCTAssertTrue(attemptedTabIDs.isEmpty)
     }
 
     private func makeFixture(initialTabCount: Int) -> (manager: WorkspaceManagerViewModel, prompt: PromptViewModel) {
@@ -249,6 +304,15 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         viewModel.test_setSidebarAutoArchiveDependencies(promptManager: prompt, workspaceManager: manager)
         return viewModel
     }
+
+    private func installDidRemoveListener(
+        prompt: PromptViewModel,
+        viewModel: AgentModeViewModel
+    ) -> UUID {
+        prompt.addComposeTabsDidRemoveListener { tabIDs, reason, workspaceID in
+            await viewModel.handleComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
+        }
+    }
 }
 
 private actor ComposeRemovalSideEffectRecorder {
@@ -284,6 +348,26 @@ private actor SaveAttemptRecorder {
 
     func count() -> Int {
         value
+    }
+}
+
+private actor DeletionAttemptRecorder {
+    private let failingTabID: UUID?
+    private var tabIDs: [UUID] = []
+
+    init(failingTabID: UUID?) {
+        self.failingTabID = failingTabID
+    }
+
+    func delete(_ tabID: UUID) throws {
+        tabIDs.append(tabID)
+        if tabID == failingTabID {
+            throw RequiredFlushTestError.injectedFailure
+        }
+    }
+
+    func attempted() -> [UUID] {
+        tabIDs
     }
 }
 

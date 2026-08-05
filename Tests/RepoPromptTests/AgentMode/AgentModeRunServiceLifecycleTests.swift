@@ -684,7 +684,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             fixture.host.test_installLiveSession(fixture.session)
             XCTAssertTrue(Self.processIsRunning(fixture.processID), name)
 
-            await fixture.host.handleComposeTabsWillClose([fixture.session.tabID], reason: reason)
+            await fixture.host.handleComposeTabsDidRemove([fixture.session.tabID], reason: reason)
 
             XCTAssertNil(fixture.session.acpController, name)
             XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)

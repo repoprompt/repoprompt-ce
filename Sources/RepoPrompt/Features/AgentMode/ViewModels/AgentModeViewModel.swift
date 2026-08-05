@@ -685,6 +685,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_sidebarSessionRowsBuildCount = 0
         var test_sidebarListProjectionBuildCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
+        private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?,
@@ -722,6 +723,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_setAgentSessionsDeleter(_ deleter: @escaping AgentSessionsDeleter) {
             agentSessionsDeleter = deleter
+        }
+
+        func test_setComposeTabRemovalTeardownObserver(_ observer: @escaping @MainActor (UUID) -> Void) {
+            test_composeTabRemovalTeardownObserver = observer
         }
 
         var test_codexCoordinator: CodexAgentModeCoordinator {
@@ -2359,8 +2364,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             .store(in: &cancellables)
 
-        // Required persistence is a vetoable preflight; destructive AgentMode cleanup
-        // runs only after it succeeds and can veto Prompt projection removal on deletion failure.
+        // Required persistence is the only vetoable removal phase.
         listeners.addToken(
             promptManager.setComposeTabsRemovalPreflight { [weak self] tabIDs, reason, workspaceID in
                 guard let self else { return .proceed }
@@ -2370,12 +2374,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             promptManager?.removeComposeTabsRemovalPreflight(token)
         }
         listeners.addToken(
-            promptManager.setComposeTabsRemovalPreparation { [weak self] tabIDs, reason, workspaceID in
-                guard let self else { return .proceed }
-                return await handleComposeTabsWillClose(tabIDs, reason: reason, workspaceID: workspaceID)
+            promptManager.addComposeTabsDidRemoveListener { [weak self] tabIDs, reason, workspaceID in
+                guard let self else { return }
+                await handleComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
             }
         ) { [weak promptManager] token in
-            promptManager?.removeComposeTabsRemovalPreparation(token)
+            promptManager?.removeComposeTabsDidRemoveListener(token)
         }
 
         // Observe workspace changes
@@ -11124,20 +11128,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return .proceed
     }
 
-    @discardableResult
-    func handleComposeTabsWillClose(
+    func handleComposeTabsDidRemove(
         _ tabIDs: Set<UUID>,
         reason: PromptViewModel.ComposeTabRemovalReason,
         workspaceID: UUID? = nil
-    ) async -> PromptViewModel.ComposeTabRemovalDecision {
+    ) async {
         let removalWorkspace = workspaceID.flatMap { workspaceID in
             workspaceManager?.workspaces.first(where: { $0.id == workspaceID })
         } ?? workspaceManager?.activeWorkspace
 
+        let orderedTabIDs = tabIDs.sorted(by: { $0.uuidString < $1.uuidString })
         // Drop any sidebar attention / observed run-state for tabs that are
         // going away so we don't leave dangling entries referring to dead IDs.
         cleanupSidebarRunAttention(tabIDs: tabIDs)
-        for tabID in tabIDs {
+        for tabID in orderedTabIDs {
+            #if DEBUG
+                test_composeTabRemovalTeardownObserver?(tabID)
+            #endif
             let boundID = boundSessionID(for: tabID)
             if let session = sessions[tabID] {
                 removePendingUIRefresh(for: tabID)
@@ -11178,9 +11185,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     do {
                         try await agentSessionsDeleter(tabID, workspace)
                     } catch {
-                        let message = String(describing: error)
-                        print("[AgentModeVM] Failed to delete session data: \(message)")
-                        return .abort(.init(stage: .durableSessionDeletion, tabID: tabID, message: message))
+                        print("[AgentModeVM] Failed to delete removed tab session data for \(tabID): \(error)")
                     }
                 }
                 removeSessionIndex(forTabID: tabID)
@@ -11193,9 +11198,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     do {
                         try await agentSessionsDeleter(tabID, workspace)
                     } catch {
-                        let message = String(describing: error)
-                        print("[AgentModeVM] Failed to delete session data: \(message)")
-                        return .abort(.init(stage: .durableSessionDeletion, tabID: tabID, message: message))
+                        print("[AgentModeVM] Failed to delete removed stashed session data for \(tabID): \(error)")
                     }
                 }
                 removeSessionIndex(forTabID: tabID)
@@ -11207,12 +11210,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #if DEBUG
                 AgentModePerfDiagnostics.markSidebarDeleteAgentCleanupComplete(
                     tabID: tabID,
-                    source: "AgentModeViewModel.handleComposeTabsWillClose",
+                    source: "AgentModeViewModel.handleComposeTabsDidRemove",
                     fields: ["reason": String(describing: reason)]
                 )
             #endif
         }
-        return .proceed
     }
 
     // MARK: - Persistence
