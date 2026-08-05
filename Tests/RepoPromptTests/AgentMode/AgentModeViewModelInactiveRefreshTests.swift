@@ -1093,7 +1093,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(requestCountAfterStaleHandler, requestCountBeforeStaleHandler)
     }
 
-    func testAutoArchiveSkipsMutationAfterSameWorkspaceReactivation() async {
+    func testSidebarAutoArchiveSuggestionDoesNotMutateTabsOrSessions() {
         let tabs = (0 ... AgentModeViewModel.sessionSidebarPageSize + 10).map { offset in
             ComposeTabState(
                 id: UUID(),
@@ -1104,7 +1104,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         }
         let activeTabID = tabs.last?.id
         let workspace = makeWorkspace(
-            name: "Same workspace reactivation",
+            name: "Sidebar archive suggestion",
             tabs: tabs,
             activeTabID: activeTabID
         )
@@ -1116,45 +1116,30 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             promptManager: fixture.prompt,
             workspaceManager: fixture.manager
         )
-        viewModel.test_setSidebarAutoArchiveActive(true)
 
-        let initialOwner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
         viewModel.test_installSessionIndexSnapshot(
             [:],
-            owner: initialOwner,
-            latestOwner: initialOwner,
+            owner: owner,
+            latestOwner: owner,
             activeWorkspace: workspace
         )
 
-        let closeGate = SidebarIndexStreamGate()
-        let closeListenerToken = fixture.prompt.addComposeTabsWillCloseListener { _, reason in
-            guard reason == .stash else { return }
-            await closeGate.wait()
-        }
-        defer {
-            fixture.prompt.removeComposeTabsWillCloseListener(closeListenerToken)
-        }
-        let archiveTask = Task {
-            await viewModel.performSidebarAutoArchiveIfNeeded(
-                reason: .explicitTest,
-                now: Date()
-            )
-        }
-        await closeGate.waitForWaiter()
+        let protectedSession = viewModel.session(for: tabs[0].id)
+        protectedSession.runState = .running
+        let idleSession = viewModel.session(for: tabs[1].id)
+        XCTAssertTrue(viewModel.isComposeTabProtectedFromSidebarArchiveSuggestion(tabs[0].id))
+        XCTAssertFalse(viewModel.isComposeTabProtectedFromSidebarArchiveSuggestion(tabs[1].id))
 
-        let reactivatedOwner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
-        viewModel.test_installSessionIndexSnapshot(
-            [:],
-            owner: reactivatedOwner,
-            latestOwner: reactivatedOwner,
-            activeWorkspace: workspace
-        )
-        await closeGate.release()
-        let archivedTabIDs = await archiveTask.value
+        let originalOpenIDs = fixture.manager.activeWorkspace?.composeTabs.map(\.id)
+        let originalStashedTabs = fixture.manager.activeWorkspace?.stashedTabs
+        let decision = viewModel.sidebarAutoArchiveSuggestion(now: Date())
 
-        XCTAssertTrue(archivedTabIDs.isEmpty)
-        XCTAssertEqual(Set(fixture.manager.activeWorkspace?.composeTabs.map(\.id) ?? []), Set(tabs.map(\.id)))
-        XCTAssertTrue(fixture.manager.activeWorkspace?.stashedTabs.isEmpty == true)
+        XCTAssertFalse(decision.tabIDsToArchive.contains(tabs[0].id))
+        XCTAssertEqual(fixture.manager.activeWorkspace?.composeTabs.map(\.id), originalOpenIDs)
+        XCTAssertEqual(fixture.manager.activeWorkspace?.stashedTabs, originalStashedTabs)
+        XCTAssertTrue(viewModel.sessions[tabs[0].id] === protectedSession)
+        XCTAssertTrue(viewModel.sessions[tabs[1].id] === idleSession)
     }
 
     func testRestoredMatchingBindingPreservesRefreshAndRestoresIndexOnlyHierarchy() async throws {

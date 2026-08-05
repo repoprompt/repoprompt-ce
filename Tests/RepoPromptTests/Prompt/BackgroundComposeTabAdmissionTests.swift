@@ -34,6 +34,164 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertEqual(finalWorkspace.stashedTabs, originalStashedTabs)
     }
 
+    func testForegroundAgentCreationCrosses499Through502WithoutUnrelatedMutation() async throws {
+        let fixture = makeFixture(initialTabCount: 499)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let originalWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let originalTabs = originalWorkspace.composeTabs
+        let originalTabIDs = originalTabs.map(\.id)
+        let originalPins = Dictionary(uniqueKeysWithValues: originalTabs.map { ($0.id, $0.isPinned) })
+        let originalBindings = Dictionary(uniqueKeysWithValues: originalTabs.map { ($0.id, $0.activeAgentSessionID) })
+        let originalStashedTabs = originalWorkspace.stashedTabs
+        let originalDirtyTabIDs = Set(originalTabIDs.prefix(7))
+        fixture.prompt.testSetDirtyTabIDs(originalDirtyTabIDs)
+
+        let sideEffects = ComposeRemovalSideEffectRecorder()
+        fixture.prompt.composeTabCascadeResolver = { tabIDs, _ in
+            await sideEffects.recordCascade(tabIDs)
+            return .init()
+        }
+        let closeToken = fixture.prompt.addComposeTabsWillCloseListener { tabIDs, _ in
+            await sideEffects.recordClose(tabIDs)
+        }
+        defer { fixture.prompt.removeComposeTabsWillCloseListener(closeToken) }
+
+        var createdIDs: [UUID] = []
+        for expectedCount in 500 ... 502 {
+            let creationResult = await viewModel.createAndActivateSessionTab()
+            let createdID = try XCTUnwrap(creationResult)
+            createdIDs.append(createdID)
+            XCTAssertEqual(fixture.prompt.activeComposeTabID, createdID)
+            XCTAssertEqual(fixture.manager.activeWorkspace?.activeComposeTabID, createdID)
+            XCTAssertEqual(fixture.manager.activeWorkspace?.composeTabs.count, expectedCount)
+            XCTAssertEqual(fixture.manager.composeTab(with: createdID)?.activeAgentSessionID, viewModel.sessions[createdID]?.activeAgentSessionID)
+        }
+
+        let finalWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let existingTabs = Array(finalWorkspace.composeTabs.prefix(originalTabs.count))
+        XCTAssertEqual(existingTabs.map(\.id), originalTabIDs)
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: existingTabs.map { ($0.id, $0.isPinned) }), originalPins)
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: existingTabs.map { ($0.id, $0.activeAgentSessionID) }), originalBindings)
+        XCTAssertEqual(fixture.prompt.dirtyTabIDs.intersection(originalTabIDs), originalDirtyTabIDs)
+        XCTAssertEqual(finalWorkspace.stashedTabs, originalStashedTabs)
+        XCTAssertEqual(Array(finalWorkspace.composeTabs.suffix(createdIDs.count)).map(\.id), createdIDs)
+        let recordedSideEffects = await sideEffects.snapshot()
+        XCTAssertEqual(recordedSideEffects, .init())
+    }
+
+    func testFailedForegroundCreationDoesNotReturnOrMarkOldActiveTab() async throws {
+        let fixture = makeFixture(initialTabCount: 1)
+        let oldActiveTabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        XCTAssertNil(viewModel.sessions[oldActiveTabID])
+
+        fixture.manager.activeWorkspace = nil
+        let createdID = await viewModel.createAndActivateSessionTab()
+
+        XCTAssertNil(createdID)
+        XCTAssertEqual(fixture.prompt.activeComposeTabID, oldActiveTabID)
+        XCTAssertNil(viewModel.sessions[oldActiveTabID])
+    }
+
+    func testUnstashAboveFiftyRestoresRequestedTabWithoutUnrelatedMutation() async throws {
+        let fixture = makeFixture(initialTabCount: 51)
+        let originalWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let originalTabs = originalWorkspace.composeTabs
+        let originalIDs = originalTabs.map(\.id)
+        let originalPins = Dictionary(uniqueKeysWithValues: originalTabs.map { ($0.id, $0.isPinned) })
+        let originalBindings = Dictionary(uniqueKeysWithValues: originalTabs.map { ($0.id, $0.activeAgentSessionID) })
+        let stashed = try XCTUnwrap(originalWorkspace.stashedTabs.first)
+        let dirtyIDs = Set(originalIDs.prefix(5))
+        fixture.prompt.testSetDirtyTabIDs(dirtyIDs)
+
+        await fixture.prompt.unstashTab(stashed.id)
+
+        let finalWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        XCTAssertEqual(finalWorkspace.composeTabs.count, 52)
+        XCTAssertEqual(Array(finalWorkspace.composeTabs.prefix(originalIDs.count)).map(\.id), originalIDs)
+        XCTAssertEqual(finalWorkspace.composeTabs.last?.id, stashed.tab.id)
+        XCTAssertEqual(finalWorkspace.activeComposeTabID, stashed.tab.id)
+        XCTAssertTrue(finalWorkspace.stashedTabs.isEmpty)
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: finalWorkspace.composeTabs.prefix(originalIDs.count).map { ($0.id, $0.isPinned) }),
+            originalPins
+        )
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: finalWorkspace.composeTabs.prefix(originalIDs.count).map { ($0.id, $0.activeAgentSessionID) }),
+            originalBindings
+        )
+        XCTAssertEqual(fixture.prompt.dirtyTabIDs.intersection(originalIDs), dirtyIDs)
+    }
+
+    func testWorkspaceSwitchDuringRemovalPreparationDoesNotMutateCapturedWorkspace() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let capturedWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let capturedTabIDs = capturedWorkspace.composeTabs.map(\.id)
+        let tabID = try XCTUnwrap(capturedTabIDs.last)
+        let otherTab = ComposeTabState(name: "Other workspace tab")
+        let otherWorkspace = WorkspaceModel(
+            name: "Other workspace",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [otherTab],
+            activeComposeTabID: otherTab.id
+        )
+        fixture.manager.workspaces.append(otherWorkspace)
+
+        let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { _, _, _ in .proceed }
+        let preparationToken = fixture.prompt.setComposeTabsRemovalPreparation { _, _, _ in
+            fixture.manager.activeWorkspace = otherWorkspace
+            return .proceed
+        }
+        defer {
+            fixture.prompt.removeComposeTabsRemovalPreflight(preflightToken)
+            fixture.prompt.removeComposeTabsRemovalPreparation(preparationToken)
+        }
+
+        await fixture.prompt.closeComposeTab(tabID)
+
+        let storedCapturedWorkspace = try XCTUnwrap(
+            fixture.manager.workspaces.first(where: { $0.id == capturedWorkspace.id })
+        )
+        XCTAssertEqual(storedCapturedWorkspace.composeTabs.map(\.id), capturedTabIDs)
+        XCTAssertEqual(fixture.manager.activeWorkspace?.id, otherWorkspace.id)
+    }
+
+    func testFailedRequiredFlushKeepsTabRuntimeAndProjection() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        let sessionID = try XCTUnwrap(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.setItemsSilently([.user("must persist", sequenceIndex: 0)], reason: .testOverride)
+        session.isDirty = true
+        session.runState = .running
+
+        let saveAttempts = SaveAttemptRecorder()
+        viewModel.test_setAgentSessionSaver { _, _, _ in
+            await saveAttempts.record()
+            throw RequiredFlushTestError.injectedFailure
+        }
+        let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { tabIDs, reason, workspaceID in
+            await viewModel.preflightComposeTabsRemoval(tabIDs, reason: reason, workspaceID: workspaceID)
+        }
+        defer { fixture.prompt.removeComposeTabsRemovalPreflight(preflightToken) }
+
+        let originalOpenIDs = fixture.manager.activeWorkspace?.composeTabs.map(\.id)
+        let originalStashedTabs = fixture.manager.activeWorkspace?.stashedTabs
+        await fixture.prompt.closeComposeTab(tabID)
+
+        let saveAttemptCount = await saveAttempts.count()
+        XCTAssertEqual(saveAttemptCount, 1)
+        XCTAssertEqual(fixture.manager.activeWorkspace?.composeTabs.map(\.id), originalOpenIDs)
+        XCTAssertEqual(fixture.manager.activeWorkspace?.stashedTabs, originalStashedTabs)
+        XCTAssertEqual(fixture.prompt.activeComposeTabID, tabID)
+        XCTAssertTrue(viewModel.sessions[tabID] === session)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.isDirty)
+    }
+
     private func makeFixture(initialTabCount: Int) -> (manager: WorkspaceManagerViewModel, prompt: PromptViewModel) {
         let fileManager = WorkspaceFilesViewModel()
         let keyManager = KeyManager(
@@ -59,6 +217,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             ComposeTabState(
                 name: "Existing \(index)",
                 lastModified: Date(timeIntervalSince1970: TimeInterval(index)),
+                isPinned: index.isMultiple(of: 11),
                 activeAgentSessionID: UUID()
             )
         }
@@ -79,4 +238,131 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         prompt.loadComposeTabsFromWorkspace(workspace)
         return (manager, prompt)
     }
+
+    private func makeAgentModeViewModel(
+        prompt: PromptViewModel,
+        manager: WorkspaceManagerViewModel
+    ) -> AgentModeViewModel {
+        let viewModel = AgentModeViewModel(
+            codexControllerFactory: { _, _, _, _, _, _ in ComposeAdmissionFakeCodexController() }
+        )
+        viewModel.test_setSidebarAutoArchiveDependencies(promptManager: prompt, workspaceManager: manager)
+        return viewModel
+    }
+}
+
+private actor ComposeRemovalSideEffectRecorder {
+    struct Snapshot: Equatable {
+        var cascadeCount = 0
+        var closeCount = 0
+        var affectedTabIDs: Set<UUID> = []
+    }
+
+    private var value = Snapshot()
+
+    func recordCascade(_ tabIDs: Set<UUID>) {
+        value.cascadeCount += 1
+        value.affectedTabIDs.formUnion(tabIDs)
+    }
+
+    func recordClose(_ tabIDs: Set<UUID>) {
+        value.closeCount += 1
+        value.affectedTabIDs.formUnion(tabIDs)
+    }
+
+    func snapshot() -> Snapshot {
+        value
+    }
+}
+
+private actor SaveAttemptRecorder {
+    private var value = 0
+
+    func record() {
+        value += 1
+    }
+
+    func count() -> Int {
+        value
+    }
+}
+
+private enum RequiredFlushTestError: Error {
+    case injectedFailure
+}
+
+private final class ComposeAdmissionFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
+    var hasActiveThread: Bool {
+        false
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        AsyncStream { continuation in continuation.finish() }
+    }
+
+    func ensureEventsStreamReady() {}
+
+    func startOrResume(
+        existing _: CodexNativeSessionController.SessionRef?,
+        baseInstructions _: String
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        .init(conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil)
+    }
+
+    func startOrResume(
+        existing _: CodexNativeSessionController.SessionRef?,
+        baseInstructions _: String,
+        model: String?,
+        reasoningEffort: String?
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        .init(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+    }
+
+    func startOrResume(
+        existing _: CodexNativeSessionController.SessionRef?,
+        baseInstructions _: String,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier _: String?
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        .init(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+    }
+
+    func readThreadSnapshot(
+        includeTurns _: Bool,
+        timeout _: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        .init(
+            conversationID: "fake",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil,
+            runtimeStatus: .idle,
+            currentTurnID: nil,
+            activeTurnIDs: [],
+            latestTurnStatus: nil
+        )
+    }
+
+    func setThreadName(_: String, threadID _: String?) async throws {}
+    func compactThread() async throws {}
+    func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
+        nil
+    }
+
+    func setThreadGoalObjective(_: String) async throws -> CodexNativeSessionController.ThreadGoal {
+        throw CancellationError()
+    }
+
+    func setThreadGoalStatus(_: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal {
+        throw CancellationError()
+    }
+
+    func clearThreadGoal() async throws -> Bool {
+        false
+    }
+
+    func cancelCurrentTurn() async {}
+    func shutdown() async {}
+    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
 }
