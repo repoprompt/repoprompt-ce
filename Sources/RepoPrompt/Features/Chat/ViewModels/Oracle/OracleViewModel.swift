@@ -22,6 +22,10 @@ final class MessageReaper {
     /// Minimum tick interval to prevent busy-loop when interval=0.0 is passed
     private static let minTickInterval: TimeInterval = 1.0 / 60.0 // ~16ms
 
+    deinit {
+        timer?.invalidate()
+    }
+
     func drain(
         _ source: inout [AIChatMessage],
         chunkSize: Int = 64,
@@ -40,18 +44,16 @@ final class MessageReaper {
         // Sanitize interval and enforce minimum to prevent busy-loop
         let sanitized = interval.isFinite ? interval : 0
         let tickInterval = max(Self.minTickInterval, max(0.0, sanitized))
-        let newTimer = Timer.scheduledTimer(
-            timeInterval: tickInterval,
-            target: self,
-            selector: #selector(handleDrainTimer(_:)),
-            userInfo: nil,
-            repeats: true
-        )
+        let newTimer = Timer.scheduledTimer(withTimeInterval: tickInterval, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                self?.handleDrainTimer(timer)
+            }
+        }
         newTimer.tolerance = tickInterval * 0.2 // Reduce energy churn
         timer = newTimer
     }
 
-    @objc private func handleDrainTimer(_ timer: Timer) {
+    private func handleDrainTimer(_ timer: Timer) {
         guard !bins.isEmpty else {
             timer.invalidate()
             self.timer = nil
