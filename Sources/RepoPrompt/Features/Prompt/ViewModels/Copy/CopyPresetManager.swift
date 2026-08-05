@@ -81,11 +81,6 @@ class CopyPresetManager: ObservableObject {
         )
     }
 
-    /// Save user presets to Application Support JSON.
-    func save() {
-        persistCopyStateReportingFailure()
-    }
-
     /// Add a new user preset
     func add(_ preset: CopyPreset) {
         guard !preset.isBuiltIn else {
@@ -319,15 +314,6 @@ class CopyPresetManager: ObservableObject {
             userPresets = previousUserPresets
             presetVisibility = previousVisibility
             overrides = previousOverrides
-            reportPersistenceFailure(error)
-        }
-    }
-
-    private func persistCopyStateReportingFailure() {
-        do {
-            try persistCopyState()
-            persistenceErrorMessage = nil
-        } catch {
             reportPersistenceFailure(error)
         }
     }

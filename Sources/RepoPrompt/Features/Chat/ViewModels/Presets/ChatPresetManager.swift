@@ -79,11 +79,6 @@ class ChatPresetManager: ObservableObject {
         overrides = Dictionary(document.chatOverrides.map { ($0.presetID, $0) }, uniquingKeysWith: { _, new in new })
     }
 
-    /// Save user presets to Application Support JSON.
-    func save() {
-        persistChatStateReportingFailure()
-    }
-
     /// Add a new user preset
     func add(_ preset: ChatPreset) {
         guard !preset.isBuiltIn else {
@@ -346,15 +341,6 @@ class ChatPresetManager: ObservableObject {
             userPresets = previousUserPresets
             presetVisibility = previousVisibility
             overrides = previousOverrides
-            reportPersistenceFailure(error)
-        }
-    }
-
-    private func persistChatStateReportingFailure() {
-        do {
-            try persistChatState()
-            persistenceErrorMessage = nil
-        } catch {
             reportPersistenceFailure(error)
         }
     }
