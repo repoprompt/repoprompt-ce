@@ -1,6 +1,5 @@
 #if DEBUG
     import Foundation
-    import Synchronization
     @testable import RepoPromptApp
     import XCTest
 
@@ -77,17 +76,40 @@
             XCTAssertEqual(Set(recorder.values), Set(["first:1", "second:2"]))
             XCTAssertFalse(AgentTranscriptDebugInstrumentation.isEnabled)
         }
+
+        func testMetricsRemainLazyUntilAHandlerIsConfigured() {
+            var evaluationCount = 0
+
+            func metrics() -> AgentTranscriptWorkingSourceItemsMetrics {
+                evaluationCount += 1
+                return .init(transcriptTurnCount: 1, fullTurnCount: 1, itemCount: 1, durationMS: 0)
+            }
+
+            AgentTranscriptDebugInstrumentation.emitWorkingSourceItems(metrics())
+            AgentTranscriptDebugInstrumentation.configure(.init())
+            AgentTranscriptDebugInstrumentation.emitWorkingSourceItems(metrics())
+            XCTAssertEqual(evaluationCount, 0)
+
+            AgentTranscriptDebugInstrumentation.configure(.init(workingSourceItemsHandler: { _ in }))
+            AgentTranscriptDebugInstrumentation.emitWorkingSourceItems(metrics())
+            XCTAssertEqual(evaluationCount, 1)
+        }
     }
 
-    private final class InstrumentationValueRecorder<Value: Sendable>: Sendable {
-        private let storage = Mutex<[Value]>([])
+    private final class InstrumentationValueRecorder<Value: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [Value] = []
 
         var values: [Value] {
-            storage.withLock { $0 }
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
         }
 
         func record(_ value: Value) {
-            storage.withLock { $0.append(value) }
+            lock.lock()
+            storage.append(value)
+            lock.unlock()
         }
     }
 #endif

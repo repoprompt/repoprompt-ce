@@ -61,8 +61,6 @@ struct AgentConversationReplaySerialization: Equatable {
 }
 
 #if DEBUG
-    import Synchronization
-
     struct AgentTranscriptProtectedTailScanMetrics: Equatable {
         let transcriptTurnCount: Int
         let limit: Int
@@ -233,7 +231,18 @@ struct AgentConversationReplaySerialization: Equatable {
             var lastRefreshInputSignatureByTabID: [UUID: String] = [:]
         }
 
-        private static let state = Mutex(State())
+        private final class LockedState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = State()
+
+            func withLock<T>(_ body: (inout State) -> T) -> T {
+                lock.lock()
+                defer { lock.unlock() }
+                return body(&value)
+            }
+        }
+
+        private static let state = LockedState()
 
         static var isEnabled: Bool {
             state.withLock { $0.isEnabled }
@@ -288,48 +297,49 @@ struct AgentConversationReplaySerialization: Equatable {
         }
 
         static func emitProtectedTailScan(_ metrics: @autoclosure () -> AgentTranscriptProtectedTailScanMetrics) {
-            emit(\.protectedTailScanHandler, metrics())
+            emit(\.protectedTailScanHandler, metrics)
         }
 
         static func emitCompaction(_ metrics: @autoclosure () -> AgentTranscriptCompactionMetrics) {
-            emit(\.compactionHandler, metrics())
+            emit(\.compactionHandler, metrics)
         }
 
         static func emitWorkingSourceItems(_ metrics: @autoclosure () -> AgentTranscriptWorkingSourceItemsMetrics) {
-            emit(\.workingSourceItemsHandler, metrics())
+            emit(\.workingSourceItemsHandler, metrics)
         }
 
         static func emitRebuild(_ metrics: @autoclosure () -> AgentTranscriptRebuildMetrics) {
-            emit(\.rebuildHandler, metrics())
+            emit(\.rebuildHandler, metrics)
         }
 
         static func emitProjectionBuild(_ metrics: @autoclosure () -> AgentTranscriptProjectionBuildMetrics) {
-            emit(\.projectionBuildHandler, metrics())
+            emit(\.projectionBuildHandler, metrics)
         }
 
         static func emitPresentationPublish(_ metrics: @autoclosure () -> AgentTranscriptPresentationPublishMetrics) {
-            emit(\.presentationPublishHandler, metrics())
+            emit(\.presentationPublishHandler, metrics)
         }
 
         static func emitSessionItemsReplacement(
             _ metrics: @autoclosure () -> AgentTranscriptSessionItemsReplacementMetrics
         ) {
-            emit(\.sessionItemsReplacementHandler, metrics())
+            emit(\.sessionItemsReplacementHandler, metrics)
         }
 
         static func emitProjectionIdentity(_ metrics: @autoclosure () -> AgentTranscriptProjectionIdentityMetrics) {
-            emit(\.projectionIdentityHandler, metrics())
+            emit(\.projectionIdentityHandler, metrics)
         }
 
         private static func emit<Metrics>(
             _ handlerKeyPath: KeyPath<Handlers, ((Metrics) -> Void)?>,
-            _ metrics: @autoclosure () -> Metrics
+            _ metrics: () -> Metrics
         ) {
-            let handler = state.withLock {
+            let handler: ((Metrics) -> Void)? = state.withLock {
                 guard $0.isEnabled else { return nil }
                 return $0.handlers[keyPath: handlerKeyPath]
             }
-            handler?(metrics())
+            guard let handler else { return }
+            handler(metrics())
         }
 
         static func stableDigest(_ values: [String]) -> String {
