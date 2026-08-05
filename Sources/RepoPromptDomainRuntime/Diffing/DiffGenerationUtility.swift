@@ -1308,13 +1308,15 @@ package class DiffGenerationUtility {
             var seen = 0
             for (k, pos) in lineIndex {
                 if seen >= maxKeys { break }
+                let positionsAtOrAfterMinimum = pos.filter { $0 >= minimumMatchIndex }
+                guard !positionsAtOrAfterMinimum.isEmpty else { continue }
                 seen += 1
                 let coeff = sKey.diceCoefficient(against: k)
                 if enableDetailedLogging {
                     print("  🔍 Fuzzy probe test \(seen)/\(maxKeys): \(sKey) ↔ \(k)  Dice: \(coeff)")
                 }
                 guard coeff >= fuzzyThresh else { continue }
-                for p in pos where p >= minimumMatchIndex {
+                for p in positionsAtOrAfterMinimum {
                     starts.append(p)
                     fuzzyScoreMap[p] = max(fuzzyScoreMap[p] ?? 0, coeff)
                 }
@@ -1334,9 +1336,11 @@ package class DiffGenerationUtility {
                 var collected: [Int] = []
                 var scanned = 0
                 for (k, pos) in lineIndex where scanned < maxKeys {
+                    let positionsAtOrAfterMinimum = pos.filter { $0 >= minimumMatchIndex }
+                    guard !positionsAtOrAfterMinimum.isEmpty else { continue }
                     scanned += 1
                     if sKey.diceCoefficient(against: k) >= fuzzyThresh {
-                        collected += pos.compactMap {
+                        collected += positionsAtOrAfterMinimum.compactMap {
                             $0 > minimumMatchIndex ? $0 - 1 : nil
                         }
                     }
