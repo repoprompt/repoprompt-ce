@@ -40,6 +40,20 @@ struct ModelPresetsSheet: View {
                 }
             )
         }
+        .alert("Preset Save Failed", isPresented: persistenceErrorBinding) {
+            Button("OK", role: .cancel) { presetsManager.clearPersistenceError() }
+        } message: {
+            Text(presetsManager.persistenceErrorMessage ?? "The preset change couldn't be saved.")
+        }
+    }
+
+    private var persistenceErrorBinding: Binding<Bool> {
+        Binding(
+            get: { presetsManager.persistenceErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented { presetsManager.clearPersistenceError() }
+            }
+        )
     }
 
     private var headerView: some View {
