@@ -73,17 +73,17 @@
                 )
 
                 let recorder = TranscriptInstrumentationRecorder()
-                AgentTranscriptDebugInstrumentation.reset()
-                AgentTranscriptDebugInstrumentation.isEnabled = true
-                AgentTranscriptDebugInstrumentation.protectedTailScanHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.compactionHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.workingSourceItemsHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.rebuildHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.projectionBuildHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.presentationPublishHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler = { recorder.record($0) }
-                AgentTranscriptDebugInstrumentation.projectionIdentityHandler = { recorder.record($0) }
+                AgentTranscriptDebugInstrumentation.configure(.init(
+                    protectedTailScanHandler: { recorder.record($0) },
+                    compactionHandler: { recorder.record($0) },
+                    workingSourceItemsHandler: { recorder.record($0) },
+                    rebuildHandler: { recorder.record($0) },
+                    projectionBuildHandler: { recorder.record($0) },
+                    refreshAttemptHandler: { recorder.record($0) },
+                    presentationPublishHandler: { recorder.record($0) },
+                    sessionItemsReplacementHandler: { recorder.record($0) },
+                    projectionIdentityHandler: { recorder.record($0) }
+                ))
                 defer { AgentTranscriptDebugInstrumentation.reset() }
 
                 var aggregates: [CrawlRefreshBenchmarkAggregate] = []

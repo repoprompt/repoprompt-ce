@@ -1392,7 +1392,7 @@ extension AgentModeViewModel {
         func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
             #if DEBUG
                 if AgentTranscriptDebugInstrumentation.isEnabled {
-                    AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler?(.init(
+                    AgentTranscriptDebugInstrumentation.emitSessionItemsReplacement(.init(
                         reason: reason.rawValue,
                         previousItemCount: self.items.count,
                         newItemCount: items.count,

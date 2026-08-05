@@ -7937,7 +7937,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     currentBlockIdentityDigest,
                     currentSemanticDigest
                 ])
-                AgentTranscriptDebugInstrumentation.presentationPublishHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitPresentationPublish(.init(
                     visibleRowCount: candidateSnapshot.visibleRows.count,
                     workingRowCount: candidateSnapshot.workingRows.count,
                     visibleBlockCount: candidateSnapshot.visibleBlocks.count,
@@ -9893,7 +9893,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let newBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(newBlocks)
                 let previousBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(previousBlocks)
                 let newBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(newBlocks)
-                AgentTranscriptDebugInstrumentation.projectionIdentityHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitProjectionIdentity(.init(
                     previousRowCount: previousRows.count,
                     newRowCount: newRows.count,
                     previousBlockCount: previousBlocks.count,
