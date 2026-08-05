@@ -33,7 +33,8 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await fulfillment(of: [completed], timeout: 1)
         capture.finish()
 
-        XCTAssertFalse(await wait.value)
+        let result = await wait.value
+        XCTAssertFalse(result)
     }
 
     func testStderrCaptureCancellationRemovesOnlyCancelledWaiter() async {
@@ -56,17 +57,21 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await fulfillment(of: [cancelledWaitCompleted], timeout: 1)
         capture.finish()
 
-        XCTAssertFalse(await cancelledWait.value)
-        XCTAssertTrue(await finishingWait.value)
+        let cancelledResult = await cancelledWait.value
+        let finishingResult = await finishingWait.value
+        XCTAssertFalse(cancelledResult)
+        XCTAssertTrue(finishingResult)
     }
 
     func testStderrCaptureZeroTimeoutAndFinishedSemanticsRemainDistinct() async {
         let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
 
-        XCTAssertFalse(await capture.waitUntilFinished(timeout: 0))
+        let timedOut = await capture.waitUntilFinished(timeout: 0)
+        XCTAssertFalse(timedOut)
 
         capture.finish()
-        XCTAssertTrue(await capture.waitUntilFinished(timeout: 0))
+        let finished = await capture.waitUntilFinished(timeout: 0)
+        XCTAssertTrue(finished)
     }
 
     func testStderrCaptureRetainsExactRawSuffixAtEveryBoundary() async {
