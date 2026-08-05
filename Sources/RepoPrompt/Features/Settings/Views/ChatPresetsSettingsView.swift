@@ -121,10 +121,11 @@ struct ChatPresetsSettingsView: View {
         } message: {
             Text("Are you sure you want to delete '\(presetToDelete?.name ?? "")'? This action cannot be undone.")
         }
-        .alert("Preset Save Failed", isPresented: persistenceErrorBinding) {
-            Button("OK", role: .cancel) { presetManager.clearPersistenceError() }
-        } message: {
-            Text(presetManager.persistenceErrorMessage ?? "The preset change couldn't be saved.")
+        .background {
+            PresetPersistenceErrorAlertHost(
+                message: presetManager.persistenceErrorMessage ?? "The preset change couldn't be saved.",
+                isPresented: persistenceErrorBinding
+            )
         }
     }
 
