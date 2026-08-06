@@ -86,6 +86,12 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             canonicalDocument.contentDigest,
             "Fixture must produce a divergent overlay digest for the assertion to be meaningful."
         )
+        let canonicalWhileOverlayActive = await runtime.workspaceStore.canonicalWorkspaceSnapshot(
+            fixture.workspaceID
+        )
+        XCTAssertEqual(canonicalWhileOverlayActive?.document.contentDigest, canonicalDocument.contentDigest)
+        XCTAssertEqual(canonicalWhileOverlayActive?.revisions, created.workspace?.revisions)
+        XCTAssertEqual(canonicalWhileOverlayActive?.health, .writable)
 
         // Transient outcome path: a catalog-revision conflict is recorded while the overlay shadows
         // read routing. The outcome must still report canonical record state.
@@ -625,31 +631,56 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         try conflictingExternal.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
         await runtime.workspaceStore.reloadExternalChanges()
         snapshot = await runtime.workspaceStore.snapshot().workspaces.first
-        if case .externalConflict = snapshot?.health {
-            // Expected.
-        } else {
-            XCTFail("Dirty workspace did not enter external-conflict state")
-        }
+        XCTAssertEqual(
+            snapshot?.health,
+            .externalConflict(reason: "saved_document_changed_while_working_state_dirty")
+        )
         XCTAssertEqual(snapshot?.document.documentBytes, working.documentBytes)
 
-        let rebase = await runtime.workspaceStore.execute(.init(
+        let rejectedMutation = await runtime.workspaceStore.execute(.init(
             operationID: UUID(),
             expectedWorkspaceRevision: snapshot?.revisions.workingRevision,
             origin: .standalone,
-            command: .resolveExternalConflict(workspaceID: fixture.workspaceID, acceptExternal: false)
+            command: .replaceWorkingDocument(try fixture.document(prompt: "blocked mutation"))
         ))
-        XCTAssertEqual(rebase.disposition, .applied)
-        XCTAssertEqual(rebase.workspace?.health, .writable)
-        XCTAssertNotNil(rebase.after?.dirtyRevision)
+        XCTAssertEqual(rejectedMutation.disposition, .conflict)
+        XCTAssertEqual(rejectedMutation.errorCode, .workspaceExternalConflict)
+        XCTAssertEqual(rejectedMutation.diagnostic, "saved_document_changed_while_working_state_dirty")
         _ = await runtime.shutdown()
 
         let restarted = fixture.runtime(generation: 2)
         try await restarted.start()
-        let recovered = await restarted.workspaceStore.snapshot().workspaces.first
+        await restarted.workspaceStore.reloadExternalChanges()
+        let restartedConflict = await restarted.workspaceStore.snapshot().workspaces.first
+        XCTAssertEqual(restartedConflict?.document.documentBytes, working.documentBytes)
+        XCTAssertEqual(
+            restartedConflict?.health,
+            .externalConflict(reason: "saved_document_changed_while_working_state_dirty")
+        )
+        XCTAssertNotNil(restartedConflict?.revisions.dirtyRevision)
+
+        let rebase = await restarted.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: restartedConflict?.revisions.workingRevision,
+            origin: .standalone,
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: false,
+                protectedAgentIdentities: []
+            )
+        ))
+        XCTAssertEqual(rebase.disposition, .applied)
+        XCTAssertEqual(rebase.workspace?.health, .writable)
+        XCTAssertNotNil(rebase.after?.dirtyRevision)
+        _ = await restarted.shutdown()
+
+        let recoveredRuntime = fixture.runtime(generation: 3)
+        try await recoveredRuntime.start()
+        let recovered = await recoveredRuntime.workspaceStore.snapshot().workspaces.first
         XCTAssertEqual(recovered?.document.documentBytes, working.documentBytes)
         XCTAssertEqual(recovered?.health, .writable)
         XCTAssertNotNil(recovered?.revisions.dirtyRevision)
-        let save = await restarted.workspaceStore.execute(.init(
+        let save = await recoveredRuntime.workspaceStore.execute(.init(
             operationID: UUID(),
             expectedWorkspaceRevision: recovered?.revisions.workingRevision,
             origin: .standalone,
@@ -657,6 +688,169 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         ))
         XCTAssertEqual(save.disposition, .applied)
         XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), working.documentBytes)
+    }
+
+    func testAcceptExternalRejectsAgentIdentityLossWithoutChangingConflictState() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+
+        let initialCatalog = await runtime.workspaceStore.snapshot()
+        let initial = try XCTUnwrap(initialCatalog.workspaces.first)
+        let sessionID = UUID()
+        let local = try fixture.agentDocument(
+            prompt: "local live agent",
+            activeAgentSessionID: sessionID,
+            isPinned: true,
+            location: .composed
+        )
+        let working = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: initial.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(local)
+        ))
+        XCTAssertEqual(working.disposition, .applied)
+
+        let external = try fixture.agentDocument(
+            prompt: "external moved agent",
+            activeAgentSessionID: sessionID,
+            isPinned: true,
+            location: .stashed
+        )
+        try external.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        await runtime.workspaceStore.reloadExternalChanges()
+        let conflictCatalog = await runtime.workspaceStore.snapshot()
+        let conflicted = try XCTUnwrap(conflictCatalog.workspaces.first)
+        XCTAssertEqual(
+            conflicted.health,
+            .externalConflict(reason: "saved_document_changed_while_working_state_dirty")
+        )
+
+        let rejected = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: conflicted.revisions.workingRevision,
+            origin: .standalone,
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: true,
+                protectedAgentIdentities: []
+            )
+        ))
+        XCTAssertEqual(rejected.disposition, .conflict)
+        XCTAssertEqual(rejected.errorCode, .protectedAgentIdentityConflict)
+        XCTAssertEqual(rejected.diagnostic, "protected_agent_identity_location_changed")
+        let unchangedCatalog = await runtime.workspaceStore.snapshot()
+        let unchanged = try XCTUnwrap(unchangedCatalog.workspaces.first)
+        XCTAssertEqual(unchanged.document.documentBytes, local.documentBytes)
+        XCTAssertEqual(unchanged.health, conflicted.health)
+        XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), external.documentBytes)
+
+        let keepLocal = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: unchanged.revisions.workingRevision,
+            origin: .standalone,
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: false,
+                protectedAgentIdentities: []
+            )
+        ))
+        XCTAssertEqual(keepLocal.disposition, .applied)
+        XCTAssertEqual(keepLocal.workspace?.document.metadata.agentIdentityClaims, local.metadata.agentIdentityClaims)
+    }
+
+    func testAcceptExternalPreservesCompatibleAgentIdentityAcrossRestart() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+
+        let initialCatalog = await runtime.workspaceStore.snapshot()
+        let initial = try XCTUnwrap(initialCatalog.workspaces.first)
+        let sessionID = UUID()
+        let local = try fixture.agentDocument(
+            prompt: "local live agent",
+            activeAgentSessionID: sessionID,
+            isPinned: true,
+            location: .composed
+        )
+        let working = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: initial.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(local)
+        ))
+        XCTAssertEqual(working.disposition, .applied)
+
+        let external = try fixture.agentDocument(
+            prompt: "compatible external state",
+            activeAgentSessionID: sessionID,
+            isPinned: true,
+            location: .composed
+        )
+        try external.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        await runtime.workspaceStore.reloadExternalChanges()
+        let conflictCatalog = await runtime.workspaceStore.snapshot()
+        let conflicted = try XCTUnwrap(conflictCatalog.workspaces.first)
+        let accepted = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: conflicted.revisions.workingRevision,
+            origin: .standalone,
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: true,
+                protectedAgentIdentities: []
+            )
+        ))
+        XCTAssertEqual(accepted.disposition, .applied)
+        XCTAssertEqual(accepted.workspace?.health, .writable)
+        XCTAssertNil(accepted.after?.dirtyRevision)
+        XCTAssertEqual(accepted.workspace?.document.documentBytes, external.documentBytes)
+        XCTAssertEqual(accepted.workspace?.document.metadata.agentIdentityClaims, external.metadata.agentIdentityClaims)
+        _ = await runtime.shutdown()
+
+        let restarted = fixture.runtime(generation: 2)
+        try await restarted.start()
+        let recoveredCatalog = await restarted.workspaceStore.snapshot()
+        let recovered = try XCTUnwrap(recoveredCatalog.workspaces.first)
+        XCTAssertEqual(recovered.health, .writable)
+        XCTAssertNil(recovered.revisions.dirtyRevision)
+        XCTAssertEqual(recovered.document.documentBytes, external.documentBytes)
+        XCTAssertEqual(recovered.document.metadata.agentIdentityClaims, external.metadata.agentIdentityClaims)
+    }
+
+    func testDomainDecodeIgnoresMalformedAndComposedDuplicateStashedIdentityClaims() throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let sessionID = UUID()
+        let composed = try fixture.agentDocument(
+            prompt: "composed agent",
+            activeAgentSessionID: sessionID,
+            isPinned: true,
+            location: .composed
+        )
+        var object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: composed.documentBytes) as? [String: Any]
+        )
+        let composedTab = try XCTUnwrap((object["composeTabs"] as? [[String: Any]])?.first)
+        object["stashedTabs"] = [
+            ["malformed": true],
+            [
+                "id": UUID().uuidString,
+                "tab": composedTab,
+                "stashedAt": 0
+            ]
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+
+        let decoded = try DomainWorkspaceDocument.decode(
+            documentBytes: bytes,
+            fileURL: fixture.workspaceFile
+        )
+
+        XCTAssertEqual(decoded.metadata.agentIdentityClaims, composed.metadata.agentIdentityClaims)
     }
 
     func testSaveTimeExternalConflictCapturesResolvableDocument() async throws {
@@ -696,7 +890,11 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             operationID: UUID(),
             expectedWorkspaceRevision: conflictSnapshot.revisions.workingRevision,
             origin: .standalone,
-            command: .resolveExternalConflict(workspaceID: fixture.workspaceID, acceptExternal: false)
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: false,
+                protectedAgentIdentities: []
+            )
         ))
         XCTAssertEqual(resolved.disposition, .applied)
         XCTAssertEqual(resolved.workspace?.health, .writable)
@@ -903,7 +1101,8 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             command: .replaceWorkingDocument(fixture.document(prompt: "must not apply"))
         ))
         XCTAssertEqual(rejected.disposition, .readOnly)
-        XCTAssertEqual(rejected.errorCode, .runtimeReadOnlyDegraded)
+        XCTAssertEqual(rejected.errorCode, .workspaceReadOnlyDegraded)
+        XCTAssertEqual(rejected.diagnostic, workspace?.health.reason)
     }
 
     func testTwoWindowCaptureRevisionConflictPreventsLostUpdate() async throws {
@@ -1657,6 +1856,43 @@ private struct Fixture {
         ]
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         return try DomainWorkspaceDocument.decode(documentBytes: data, fileURL: fileURL)
+    }
+
+    func agentDocument(
+        prompt: String,
+        activeAgentSessionID: UUID,
+        isPinned: Bool,
+        location: DomainWorkspaceTabLocation
+    ) throws -> DomainWorkspaceDocument {
+        let tab: [String: Any] = [
+            "id": contextID.uuidString,
+            "name": "Context",
+            "prompt": prompt,
+            "activeAgentSessionID": activeAgentSessionID.uuidString,
+            "isPinned": isPinned
+        ]
+        var object: [String: Any] = [
+            "id": workspaceID.uuidString,
+            "schemaVersion": 1,
+            "name": workspaceName,
+            "repoPaths": ["/tmp/repo"],
+            "isSystemWorkspace": false,
+            "isHiddenInMenus": false,
+            "composeTabs": []
+        ]
+        switch location {
+        case .composed:
+            object["activeComposeTabID"] = contextID.uuidString
+            object["composeTabs"] = [tab]
+        case .stashed:
+            object["stashedTabs"] = [[
+                "id": UUID().uuidString,
+                "tab": tab,
+                "stashedAt": "2026-08-06T00:00:00Z"
+            ]]
+        }
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return try DomainWorkspaceDocument.decode(documentBytes: data, fileURL: workspaceFile)
     }
 
     func remove() {

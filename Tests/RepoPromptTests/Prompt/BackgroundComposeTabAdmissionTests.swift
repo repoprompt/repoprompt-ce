@@ -324,6 +324,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             fileURLsByWorkspaceID: [:],
             revisionsByWorkspaceID: [:],
             digestsByWorkspaceID: [:],
+            healthByWorkspaceID: [:],
             catalogRevision: 1,
             preferredActiveWorkspaceID: currentWorkspace.id,
             publicationSequence: 1

@@ -183,6 +183,12 @@ private let agentRunExpiredHandleRecoveryNote = [
 struct AgentRunMCPToolService {
     typealias RequestMetadata = MCPServerViewModel.RequestMetadata
     typealias HeartbeatOperation = @Sendable () async throws -> Value
+
+    static func requireWritableWorkspaceAuthority(_ issue: DomainWorkspaceAuthorityIssue?) throws {
+        guard let issue else { return }
+        throw MCPError.invalidParams(issue.agentAdmissionMessage)
+    }
+
     typealias StartRun = @MainActor (
         _ target: AgentModeViewModel.MCPSessionTarget,
         _ message: String,
@@ -331,6 +337,9 @@ struct AgentRunMCPToolService {
         guard workspace.isSystemWorkspace == false else {
             throw MCPError.invalidParams("Cannot start an agent run from the default system workspace. Open or select a project workspace and try again.")
         }
+        try await Self.requireWritableWorkspaceAuthority(
+            targetWindow.workspaceManager.domainAuthorityAdmissionIssue(for: workspace.id)
+        )
 
         let agentModeVM = targetWindow.agentModeViewModel
         let parentSourceTabID = await resolveSpawnParentSourceTabID(metadata)
@@ -631,8 +640,13 @@ struct AgentRunMCPToolService {
             ])
         #endif
         let outcome: AgentExternalMCPRunStarter.StartOutcome
+        var lifecycleAdmissionAttempted = false
         var providerDispatchAttempted = false
         do {
+            try await Self.requireWritableWorkspaceAuthority(
+                targetWindow.workspaceManager.domainAuthorityAdmissionIssue(for: workspace.id)
+            )
+            lifecycleAdmissionAttempted = true
             try agentModeVM.requireCurrentAgentSessionLifecycleAdmission(target)
             agentModeVM.recordAgentSessionProviderLifecycle(
                 target: target,
@@ -685,7 +699,9 @@ struct AgentRunMCPToolService {
             #endif
         } catch {
             let providerFailureReason = if !providerDispatchAttempted {
-                "lifecycle_identity_rejected"
+                lifecycleAdmissionAttempted
+                    ? "lifecycle_identity_rejected"
+                    : "workspace_authority_rejected"
             } else if error is CancellationError {
                 "provider_start_cancelled"
             } else {

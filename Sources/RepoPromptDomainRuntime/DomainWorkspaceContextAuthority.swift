@@ -42,6 +42,12 @@ package struct DomainWorkspaceStore {
     package func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
         await authority.workspaceSnapshot(workspaceID)
     }
+
+    /// Returns only persisted command-authority state. Read registrations are routing overlays and
+    /// must not influence mutation admission, recovery CAS baselines, or authority health.
+    package func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
+        await authority.canonicalWorkspaceSnapshot(workspaceID)
+    }
 }
 
 package struct DomainContextStore {
@@ -222,9 +228,9 @@ actor DomainWorkspaceContextAuthority {
         readRegistrations[workspaceID] ?? records[workspaceID].map(makeSnapshot)
     }
 
-    /// Command outcomes must report canonical record state; the read overlay is routing-only and
-    /// must never leak into dedup replay or transient-outcome revision lines.
-    private func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
+    /// Command outcomes and mutation admission must report canonical record state; the read
+    /// overlay is routing-only and must never leak into recovery health or revision baselines.
+    func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
     }
 
@@ -352,10 +358,11 @@ actor DomainWorkspaceContextAuthority {
             await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
         case let .saveWorkspaceDocument(workspaceID):
             await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
-        case let .resolveExternalConflict(workspaceID, acceptExternal):
+        case let .resolveExternalConflict(workspaceID, acceptExternal, protectedAgentIdentities):
             await resolveExternalConflict(
                 workspaceID,
                 acceptExternal: acceptExternal,
+                protectedAgentIdentities: protectedAgentIdentities,
                 envelope: envelope,
                 fingerprint: fingerprint
             )
@@ -997,12 +1004,7 @@ actor DomainWorkspaceContextAuthority {
             )
         }
         guard record.health.acceptsMutations else {
-            return recordTransientOutcome(
-                envelope: envelope,
-                disposition: .readOnly,
-                errorCode: .runtimeReadOnlyDegraded,
-                diagnostic: "workspace_not_writable"
-            )
+            return healthRejectionOutcome(envelope, record: record)
         }
         if let expected = envelope.expectedWorkspaceRevision,
            expected != record.revisions.workingRevision
@@ -1091,12 +1093,7 @@ actor DomainWorkspaceContextAuthority {
         }
         if var record = records[document.workspaceID] {
             guard record.health.acceptsMutations else {
-                return recordTransientOutcome(
-                    envelope: envelope,
-                    disposition: .readOnly,
-                    errorCode: .runtimeReadOnlyDegraded,
-                    diagnostic: "workspace_not_writable"
-                )
+                return healthRejectionOutcome(envelope, record: record)
             }
             if let expected = envelope.expectedWorkspaceRevision,
                expected != record.revisions.workingRevision
@@ -1234,12 +1231,7 @@ actor DomainWorkspaceContextAuthority {
             )
         }
         guard record.health.acceptsMutations else {
-            return recordTransientOutcome(
-                envelope: envelope,
-                disposition: .readOnly,
-                errorCode: .runtimeReadOnlyDegraded,
-                diagnostic: "workspace_not_writable"
-            )
+            return healthRejectionOutcome(envelope, record: record)
         }
         if let expected = envelope.expectedWorkspaceRevision,
            expected != record.revisions.workingRevision
@@ -1339,11 +1331,7 @@ actor DomainWorkspaceContextAuthority {
                         diagnostic: eventDiagnostic
                     )
                 }
-                return conflictOutcome(
-                    envelope,
-                    record: current,
-                    diagnostic: "external_document_conflict"
-                )
+                return healthRejectionOutcome(envelope, record: current)
             }
             return persistenceFailureOutcome(envelope, record: record, error: error)
         } catch {
@@ -1374,6 +1362,7 @@ actor DomainWorkspaceContextAuthority {
     private func resolveExternalConflict(
         _ workspaceID: UUID,
         acceptExternal: Bool,
+        protectedAgentIdentities: [DomainProtectedAgentIdentity],
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String
     ) async -> DomainCommandOutcome {
@@ -1393,6 +1382,20 @@ actor DomainWorkspaceContextAuthority {
            expected != before.workingRevision
         {
             return conflictOutcome(envelope, record: record, diagnostic: "workspace_revision_mismatch")
+        }
+        if acceptExternal,
+           let diagnostic = Self.protectedAgentIdentityConflict(
+               local: record.document,
+               external: external,
+               callerClaims: protectedAgentIdentities
+           )
+        {
+            return recordTransientOutcome(
+                envelope: envelope,
+                disposition: .conflict,
+                errorCode: .protectedAgentIdentityConflict,
+                diagnostic: diagnostic
+            )
         }
         let now = Date()
         let after = acceptExternal
@@ -1613,6 +1616,103 @@ actor DomainWorkspaceContextAuthority {
         unavailableWorkspaces.removeValue(forKey: workspaceID)
     }
 
+    private func healthRejectionOutcome(
+        _ envelope: DomainWorkspaceCommandEnvelope,
+        record: WorkspaceRecord
+    ) -> DomainCommandOutcome {
+        let disposition: DomainCommandDisposition
+        let errorCode: DomainCommandErrorCode
+        let diagnostic: String
+        switch record.health {
+        case .writable:
+            return recordTransientOutcome(
+                envelope: envelope,
+                disposition: .failed,
+                errorCode: .persistenceFailure,
+                diagnostic: "unexpected_writable_health_rejection"
+            )
+        case let .externalConflict(reason):
+            disposition = .conflict
+            errorCode = .workspaceExternalConflict
+            diagnostic = reason
+        case let .degradedReadOnly(reason):
+            disposition = .readOnly
+            errorCode = .workspaceReadOnlyDegraded
+            diagnostic = reason
+        case .removed:
+            disposition = .invalid
+            errorCode = .workspaceUnavailable
+            diagnostic = "workspace_removed"
+        }
+        return recordTransientOutcome(
+            envelope: envelope,
+            disposition: disposition,
+            errorCode: errorCode,
+            diagnostic: diagnostic
+        )
+    }
+
+    private static func protectedAgentIdentityConflict(
+        local: DomainWorkspaceDocument,
+        external: DomainWorkspaceDocument,
+        callerClaims: [DomainProtectedAgentIdentity]
+    ) -> String? {
+        var protectedByTabID = Dictionary(
+            uniqueKeysWithValues: local.metadata.agentIdentityClaims
+                .filter(\.requiresProtection)
+                .map { ($0.tabID, $0) }
+        )
+        for callerClaim in callerClaims where callerClaim.requiresProtection {
+            if let existing = protectedByTabID[callerClaim.tabID] {
+                guard existing.location == callerClaim.location else {
+                    return "protected_agent_identity_precondition_mismatch"
+                }
+                if let existingSessionID = existing.activeAgentSessionID,
+                   let callerSessionID = callerClaim.activeAgentSessionID,
+                   existingSessionID != callerSessionID
+                {
+                    return "protected_agent_identity_precondition_mismatch"
+                }
+                protectedByTabID[callerClaim.tabID] = DomainProtectedAgentIdentity(
+                    tabID: callerClaim.tabID,
+                    location: existing.location,
+                    activeAgentSessionID: callerClaim.activeAgentSessionID ?? existing.activeAgentSessionID,
+                    isPinned: existing.isPinned || callerClaim.isPinned
+                )
+            } else {
+                protectedByTabID[callerClaim.tabID] = callerClaim
+            }
+        }
+
+        let externalByTabID = Dictionary(
+            uniqueKeysWithValues: external.metadata.agentIdentityClaims.map { ($0.tabID, $0) }
+        )
+        let sessionCounts = Dictionary(
+            grouping: external.metadata.agentIdentityClaims.compactMap(\.activeAgentSessionID),
+            by: { $0 }
+        ).mapValues(\.count)
+        for claim in protectedByTabID.values {
+            guard let candidate = externalByTabID[claim.tabID] else {
+                return "protected_agent_identity_missing"
+            }
+            guard candidate.location == claim.location else {
+                return "protected_agent_identity_location_changed"
+            }
+            guard candidate.activeAgentSessionID == claim.activeAgentSessionID else {
+                return "protected_agent_identity_rebound"
+            }
+            guard !claim.isPinned || candidate.isPinned else {
+                return "protected_agent_identity_unpinned"
+            }
+            if let sessionID = claim.activeAgentSessionID,
+               sessionCounts[sessionID] != 1
+            {
+                return "protected_agent_identity_duplicated"
+            }
+        }
+        return nil
+    }
+
     private func conflictOutcome(
         _ envelope: DomainWorkspaceCommandEnvelope,
         record: WorkspaceRecord,
@@ -1813,7 +1913,7 @@ private extension DomainWorkspaceCommandEnvelope {
         case let .replaceWorkingDocument(document): document.workspaceID
         case let .saveWorkspaceDocument(workspaceID): workspaceID
         case let .deleteWorkspace(workspaceID): workspaceID
-        case let .resolveExternalConflict(workspaceID, _): workspaceID
+            case let .resolveExternalConflict(workspaceID, _, _): workspaceID
         }
     }
 }
