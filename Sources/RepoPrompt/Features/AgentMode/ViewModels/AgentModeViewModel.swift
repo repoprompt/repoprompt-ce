@@ -16774,11 +16774,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let validatedName = AgentSession.validatedName(newName)
         guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let session = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
-        promptManager?.renameComposeTab(target.tabID, to: validatedName)
-
-        guard let identity = target.identity,
-              let identitySessionID = identity.sessionID
-        else { return }
+        guard let identitySessionID = target.identity?.sessionID else {
+            promptManager?.renameComposeTab(target.tabID, to: validatedName)
+            return
+        }
         guard let session, session.activeAgentSessionID == identitySessionID else {
             throw MCPError.invalidParams(
                 "The Agent session identity changed before its title could be persisted."
@@ -16797,6 +16796,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             explicitThreadID: session.codexConversationID,
             source: "renameSession.lifecycleAuthority"
         )
+        promptManager?.renameComposeTab(target.tabID, to: validatedName)
     }
 
     func renameSession(tabID: UUID, to newName: String) {
