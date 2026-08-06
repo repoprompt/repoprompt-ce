@@ -60,14 +60,87 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
             modelFileURL: temp.appendingPathComponent("Presets/modelPresets.json")
         )
 
-        store.saveWorkflowPresets(.init())
-        store.saveModelPresets(.init())
+        try store.saveWorkflowPresets(.init())
+        try store.saveModelPresets(.init())
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: store.workflowFileURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: store.modelFileURL.path))
         for key in legacyKeys {
             XCTAssertNil(UserDefaults.standard.object(forKey: key), key)
         }
+    }
+
+    func testPresetSaveReportsBlockedDestination() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let blockedParent = temp.appendingPathComponent("not-a-directory")
+        try Data("blocking file".utf8).write(to: blockedParent)
+        let store = PresetFileStore(
+            workflowFileURL: blockedParent.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: blockedParent.appendingPathComponent("modelPresets.json")
+        )
+
+        XCTAssertThrowsError(try store.saveWorkflowPresets(.init()))
+        XCTAssertThrowsError(try store.saveModelPresets(.init()))
+    }
+
+    @MainActor
+    func testChatPresetManagerRollsBackFailedSaveAndPublishesError() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let store = try makeBlockedStore(in: temp)
+        let manager = ChatPresetManager(presetFileStore: store)
+        let preset = ChatPreset(name: "Unsaved chat", mode: .chat)
+
+        manager.addPreset(preset)
+
+        XCTAssertFalse(manager.userPresets.contains(where: { $0.id == preset.id }))
+        XCTAssertNotNil(manager.persistenceErrorMessage)
+
+        let blockedParent = store.workflowFileURL.deletingLastPathComponent()
+        try FileManager.default.removeItem(at: blockedParent)
+        try FileManager.default.createDirectory(at: blockedParent, withIntermediateDirectories: true)
+        manager.addPreset(preset)
+
+        XCTAssertTrue(manager.userPresets.contains(where: { $0.id == preset.id }))
+        XCTAssertNil(manager.persistenceErrorMessage)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.workflowFileURL.path))
+    }
+
+    @MainActor
+    func testCopyPresetManagerRollsBackFailedSaveAndPublishesError() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let store = try makeBlockedStore(in: temp)
+        let manager = CopyPresetManager(presetFileStore: store)
+        let preset = CopyPreset(name: "Unsaved copy")
+
+        manager.addPreset(preset)
+
+        XCTAssertFalse(manager.userPresets.contains(where: { $0.id == preset.id }))
+        XCTAssertNotNil(manager.persistenceErrorMessage)
+    }
+
+    @MainActor
+    func testModelPresetManagerRollsBackFailedSaveAndPublishesError() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let store = try makeBlockedStore(in: temp)
+        let manager = ModelPresetsManager(presetFileStore: store)
+        let preset = ModelPreset(name: "Unsaved model", model: .claude4Sonnet)
+
+        XCTAssertFalse(manager.addPreset(preset))
+
+        XCTAssertFalse(manager.presets.contains(where: { $0.id == preset.id }))
+        XCTAssertNotNil(manager.persistenceErrorMessage)
+
+        let blockedParent = store.modelFileURL.deletingLastPathComponent()
+        try FileManager.default.removeItem(at: blockedParent)
+        try FileManager.default.createDirectory(at: blockedParent, withIntermediateDirectories: true)
+
+        XCTAssertTrue(manager.addPreset(preset))
+        XCTAssertTrue(manager.presets.contains(where: { $0.id == preset.id }))
+        XCTAssertNil(manager.persistenceErrorMessage)
     }
 
     func testCorruptPresetJSONIsBackedUpAndReplacedWithEmptyDocument() throws {
@@ -92,6 +165,26 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(backups.contains { $0.hasPrefix("modelPresets.corrupt-") })
     }
 
+    func testUnbackedCorruptPresetDocumentIsPreservedAndSaveReportsFailure() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let presetsDirectory = temp.appendingPathComponent("Presets", isDirectory: true)
+        let workflowURL = presetsDirectory.appendingPathComponent("workflowPresets.json")
+        try FileManager.default.createDirectory(at: presetsDirectory, withIntermediateDirectories: true)
+        try Data("not json".utf8).write(to: workflowURL)
+        try Data("blocking file".utf8).write(to: presetsDirectory.appendingPathComponent("Backups"))
+        let store = PresetFileStore(
+            workflowFileURL: workflowURL,
+            modelFileURL: presetsDirectory.appendingPathComponent("modelPresets.json")
+        )
+
+        XCTAssertTrue(store.loadWorkflowPresets().copyUserPresets.isEmpty)
+        XCTAssertThrowsError(try store.saveWorkflowPresets(.init())) { error in
+            XCTAssertEqual(error as? PresetFileStore.PresetFileStoreError, .unbackedCorruptDocumentPreserved)
+        }
+        XCTAssertEqual(try String(contentsOf: workflowURL, encoding: .utf8), "not json")
+    }
+
     func testFuturePresetSchemaIsPreservedAndNotOverwritten() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
@@ -105,8 +198,12 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
         let store = PresetFileStore(workflowFileURL: workflowURL, modelFileURL: modelURL)
         XCTAssertTrue(store.loadWorkflowPresets().copyUserPresets.isEmpty)
         XCTAssertTrue(store.loadModelPresets().modelPresets.isEmpty)
-        store.saveWorkflowPresets(.init(copyVisibility: [UUID(): false]))
-        store.saveModelPresets(.init())
+        XCTAssertThrowsError(try store.saveWorkflowPresets(.init(copyVisibility: [UUID(): false]))) { error in
+            XCTAssertEqual(error as? PresetFileStore.PresetFileStoreError, .unsupportedFutureSchema(999))
+        }
+        XCTAssertThrowsError(try store.saveModelPresets(.init())) { error in
+            XCTAssertEqual(error as? PresetFileStore.PresetFileStoreError, .unsupportedFutureSchema(999))
+        }
 
         XCTAssertEqual(try String(contentsOf: workflowURL, encoding: .utf8), futureJSON)
         XCTAssertEqual(try String(contentsOf: modelURL, encoding: .utf8), futureJSON)
@@ -118,8 +215,8 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
         let workflowURL = temp.appendingPathComponent("Presets/workflowPresets.json")
         let modelURL = temp.appendingPathComponent("Presets/modelPresets.json")
         let store = PresetFileStore(workflowFileURL: workflowURL, modelFileURL: modelURL)
-        store.saveWorkflowPresets(.init(copyVisibility: [UUID(): true]))
-        store.saveModelPresets(.init())
+        try store.saveWorkflowPresets(.init(copyVisibility: [UUID(): true]))
+        try store.saveModelPresets(.init())
 
         let futureJSON = #"{"schemaVersion":999,"updatedAt":"2026-05-20T00:00:00Z"}"#
         try Data(futureJSON.utf8).write(to: workflowURL)
@@ -132,8 +229,12 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
             XCTAssertEqual(error as? PresetFileStore.PresetFileStoreError, .unsupportedFutureSchema(999))
         }
 
-        store.saveWorkflowPresets(.init())
-        store.saveModelPresets(.init())
+        XCTAssertThrowsError(try store.saveWorkflowPresets(.init())) { error in
+            XCTAssertEqual(error as? PresetFileStore.PresetFileStoreError, .unsupportedFutureSchema(999))
+        }
+        XCTAssertThrowsError(try store.saveModelPresets(.init())) { error in
+            XCTAssertEqual(error as? PresetFileStore.PresetFileStoreError, .unsupportedFutureSchema(999))
+        }
 
         XCTAssertEqual(try String(contentsOf: workflowURL, encoding: .utf8), futureJSON)
         XCTAssertEqual(try String(contentsOf: modelURL, encoding: .utf8), futureJSON)
@@ -144,5 +245,14 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
             .appendingPathComponent("PresetJSONOnlyPersistenceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func makeBlockedStore(in directory: URL) throws -> PresetFileStore {
+        let blockedParent = directory.appendingPathComponent("not-a-directory")
+        try Data("blocking file".utf8).write(to: blockedParent)
+        return PresetFileStore(
+            workflowFileURL: blockedParent.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: blockedParent.appendingPathComponent("modelPresets.json")
+        )
     }
 }

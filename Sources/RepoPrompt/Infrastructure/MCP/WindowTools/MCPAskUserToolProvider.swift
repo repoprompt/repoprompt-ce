@@ -43,14 +43,15 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                         )
                     }
                 case .agentModeRun:
-                    guard let tabID = try? await resolveAgentModeTabID(
+                    guard let target = try? await resolveAgentModeTabID(
                         request.payload,
-                        connectionID
+                        connectionID,
+                        .askUser
                     ) else {
                         return false
                     }
                     return await MainActor.run {
-                        targetWindow.agentModeViewModel.canPresentAskUserInteraction(tabID: tabID)
+                        targetWindow.agentModeViewModel.canPresentAskUserInteraction(tabID: target.tabID)
                     }
                 case .unknown:
                     return false
@@ -201,7 +202,8 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
 
         case .agentModeRun:
             // Route to agent mode UI.
-            let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+            let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .askUser)
+            let tabID = target.tabID
             // For non-MCP-controlled sessions, surface the tab so the user can
             // see and answer the question. MCP-controlled runs handle interactions
             // programmatically via `respond`, so pulling focus would be disruptive.
@@ -226,7 +228,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                 }
             ) {
                 try await targetWindow.agentModeViewModel.askUserInteraction(
-                    tabID: tabID,
+                    target: target,
                     interaction: parsed.interaction
                 )
             }
