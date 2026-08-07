@@ -4,9 +4,14 @@ import XCTest
 @MainActor
 final class MessageReaperTests: XCTestCase {
     func testReaperDeallocatesWhileMessagesRemainQueued() {
-        var reaper: MessageReaper? = MessageReaper()
+        let timerFactory = RecordingMessageReaperTimerFactory()
+        var reaper: MessageReaper? = MessageReaper(timerFactory: timerFactory)
         weak var weakReaper: MessageReaper?
-        var messages = [AIChatMessage(content: "pending", isUser: false)]
+        var messages = [
+            AIChatMessage(content: "pending 1", isUser: false),
+            AIChatMessage(content: "pending 2", isUser: false),
+            AIChatMessage(content: "pending 3", isUser: false)
+        ]
         weakReaper = reaper
 
         reaper?.drain(&messages, chunkSize: 1, interval: 60)
@@ -15,9 +20,17 @@ final class MessageReaperTests: XCTestCase {
         XCTAssertNotNil(weakReaper)
         reaper = nil
         XCTAssertNil(weakReaper)
+        XCTAssertTrue(timerFactory.timer?.isValid == true)
+
+        timerFactory.timer?.fire()
+        XCTAssertTrue(timerFactory.timer?.isValid == true)
+        timerFactory.timer?.fire()
+        XCTAssertTrue(timerFactory.timer?.isValid == true)
+        timerFactory.timer?.fire()
+        XCTAssertFalse(timerFactory.timer?.isValid == true)
     }
 
-    func testReaperDeinitInvalidatesItsRepeatingTimer() {
+    func testReaperTimerInvalidatesAfterQueuedMessagesDrain() {
         let timerFactory = RecordingMessageReaperTimerFactory()
         var reaper: MessageReaper? = MessageReaper(timerFactory: timerFactory)
         var messages = [AIChatMessage(content: "pending", isUser: false)]
@@ -26,6 +39,7 @@ final class MessageReaperTests: XCTestCase {
         XCTAssertTrue(timerFactory.timer?.isValid == true)
 
         reaper = nil
+        timerFactory.timer?.fire()
 
         XCTAssertFalse(timerFactory.timer?.isValid == true)
     }

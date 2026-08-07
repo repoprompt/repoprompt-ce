@@ -31,7 +31,7 @@ private struct DefaultMessageReaperTimerFactory: MessageReaperTimerFactory {
 }
 
 @MainActor
-final class MessageReaper {
+private final class MessageReaperState {
     private var bins: [[AIChatMessage]] = []
     private var timer: Timer?
     private var timerChunkSize = 0
@@ -40,7 +40,7 @@ final class MessageReaper {
     /// Minimum tick interval to prevent busy-loop when interval=0.0 is passed
     private static let minTickInterval: TimeInterval = 1.0 / 60.0 // ~16ms
 
-    init(timerFactory: any MessageReaperTimerFactory = DefaultMessageReaperTimerFactory()) {
+    init(timerFactory: any MessageReaperTimerFactory) {
         self.timerFactory = timerFactory
     }
 
@@ -66,13 +66,9 @@ final class MessageReaper {
         // Sanitize interval and enforce minimum to prevent busy-loop
         let sanitized = interval.isFinite ? interval : 0
         let tickInterval = max(Self.minTickInterval, max(0.0, sanitized))
-        let newTimer = timerFactory.makeRepeatingTimer(interval: tickInterval) { [weak self] timer in
+        let newTimer = timerFactory.makeRepeatingTimer(interval: tickInterval) { [state = self] timer in
             MainActor.assumeIsolated {
-                guard let self else {
-                    timer.invalidate()
-                    return
-                }
-                self.handleDrainTimer(timer)
+                state.handleDrainTimer(timer)
             }
         }
         newTimer.tolerance = tickInterval * 0.2 // Reduce energy churn
@@ -103,7 +99,27 @@ final class MessageReaper {
 
         if !bucket.isEmpty {
             bins.append(bucket)
+        } else if bins.isEmpty {
+            timer.invalidate()
+            self.timer = nil
         }
+    }
+}
+
+@MainActor
+final class MessageReaper {
+    private let state: MessageReaperState
+
+    init(timerFactory: any MessageReaperTimerFactory = DefaultMessageReaperTimerFactory()) {
+        state = MessageReaperState(timerFactory: timerFactory)
+    }
+
+    func drain(
+        _ source: inout [AIChatMessage],
+        chunkSize: Int = 64,
+        interval: TimeInterval = 0.0
+    ) {
+        state.drain(&source, chunkSize: chunkSize, interval: interval)
     }
 }
 
