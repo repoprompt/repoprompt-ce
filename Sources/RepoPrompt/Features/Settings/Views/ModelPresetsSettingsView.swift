@@ -47,6 +47,21 @@ struct ModelPresetsSettingsView: View {
                 }
             )
         }
+        .background {
+            PresetPersistenceErrorAlertHost(
+                message: presetsManager.persistenceErrorMessage ?? "The preset change couldn't be saved.",
+                isPresented: persistenceErrorBinding
+            )
+        }
+    }
+
+    private var persistenceErrorBinding: Binding<Bool> {
+        Binding(
+            get: { presetsManager.persistenceErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented { presetsManager.clearPersistenceError() }
+            }
+        )
     }
 
     private var emptyStateView: some View {
@@ -67,8 +82,9 @@ struct ModelPresetsSettingsView: View {
             Button(action: {
                 // Create default preset from current chat model
                 let defaultPreset = ModelPreset.fromCurrentChatModel(modelRawString: promptViewModel.preferredModel)
-                presetsManager.addPreset(defaultPreset)
-                editingPreset = defaultPreset
+                if presetsManager.addPreset(defaultPreset) {
+                    editingPreset = defaultPreset
+                }
             }) {
                 Label("Create Default Preset", systemImage: "plus.circle")
             }

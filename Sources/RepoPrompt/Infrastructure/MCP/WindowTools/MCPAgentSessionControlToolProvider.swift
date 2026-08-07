@@ -137,16 +137,20 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
         let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.shareThoughts)
         let targetWindow = try dependencies.requireTargetWindow()
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .shareThoughts)
 
         // Invariant: background tool updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
-            targetWindow.agentModeViewModel.shareThoughts(thoughts, title: title, tabID: tabID)
+        try await MainActor.run {
+            try targetWindow.agentModeViewModel.shareThoughts(
+                thoughts,
+                title: title,
+                target: target
+            )
         }
 
         return .object([
             "ok": .bool(true),
-            "context_id": .string(tabID.uuidString)
+            "context_id": .string(target.tabID.uuidString)
         ])
     }
 
@@ -160,18 +164,21 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         let sessionNameToApply = (trimmedSessionName?.isEmpty == false) ? trimmedSessionName : nil
 
         let targetWindow = try dependencies.requireTargetWindow()
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .setStatus)
 
         // Invariant: background status updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
+        try await MainActor.run {
             if let sessionNameToApply {
-                targetWindow.agentModeViewModel.renameSession(tabID: tabID, to: sessionNameToApply)
+                try targetWindow.agentModeViewModel.renameSession(
+                    target: target,
+                    to: sessionNameToApply
+                )
             }
         }
 
         var result: [String: Value] = [
             "ok": .bool(true),
-            "context_id": .string(tabID.uuidString),
+            "context_id": .string(target.tabID.uuidString),
             "session_name_applied": .bool(sessionNameToApply != nil)
         ]
         if let sessionNameToApply {
@@ -197,11 +204,11 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
         let targetWindow = try dependencies.requireTargetWindow()
         let connectionID = ServerNetworkManager.currentConnectionID
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .waitForInstruction)
 
         // Invariant: waiting state is stored on the target session; do not switch tabs here.
         let response = try await targetWindow.agentModeViewModel.waitForNextUserInstruction(
-            tabID: tabID,
+            target: target,
             prompt: prompt,
             timeoutSeconds: timeout
         )

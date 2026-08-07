@@ -435,6 +435,22 @@ extension AgentModeViewModel {
         let tabID: UUID
         let sessionID: UUID?
         let origin: Origin
+        let lifecycleIdentity: AgentSessionLifecycleAuthority.Identity?
+        let discardRestoreIndexEntry: AgentSessionIndexEntry?
+
+        init(
+            tabID: UUID,
+            sessionID: UUID?,
+            origin: Origin,
+            lifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = nil,
+            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil
+        ) {
+            self.tabID = tabID
+            self.sessionID = sessionID
+            self.origin = origin
+            self.lifecycleIdentity = lifecycleIdentity
+            self.discardRestoreIndexEntry = discardRestoreIndexEntry
+        }
     }
 
     struct AutoEditPermissionGuidance: Equatable {

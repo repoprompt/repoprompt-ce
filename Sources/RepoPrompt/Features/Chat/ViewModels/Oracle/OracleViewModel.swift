@@ -14,13 +14,39 @@ private func oracleViewModelDebugLog(_ message: @autoclosure () -> String) {
 
 /// MessageReaper - Gradually releases messages to prevent UI stalls
 @MainActor
-final class MessageReaper {
+protocol MessageReaperTimerFactory {
+    func makeRepeatingTimer(
+        interval: TimeInterval,
+        block: @escaping (Timer) -> Void
+    ) -> Timer
+}
+
+private struct DefaultMessageReaperTimerFactory: MessageReaperTimerFactory {
+    func makeRepeatingTimer(
+        interval: TimeInterval,
+        block: @escaping (Timer) -> Void
+    ) -> Timer {
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true, block: block)
+    }
+}
+
+@MainActor
+private final class MessageReaperState {
     private var bins: [[AIChatMessage]] = []
     private var timer: Timer?
     private var timerChunkSize = 0
+    private let timerFactory: any MessageReaperTimerFactory
 
     /// Minimum tick interval to prevent busy-loop when interval=0.0 is passed
     private static let minTickInterval: TimeInterval = 1.0 / 60.0 // ~16ms
+
+    init(timerFactory: any MessageReaperTimerFactory) {
+        self.timerFactory = timerFactory
+    }
+
+    deinit {
+        timer?.invalidate()
+    }
 
     func drain(
         _ source: inout [AIChatMessage],
@@ -40,18 +66,16 @@ final class MessageReaper {
         // Sanitize interval and enforce minimum to prevent busy-loop
         let sanitized = interval.isFinite ? interval : 0
         let tickInterval = max(Self.minTickInterval, max(0.0, sanitized))
-        let newTimer = Timer.scheduledTimer(
-            timeInterval: tickInterval,
-            target: self,
-            selector: #selector(handleDrainTimer(_:)),
-            userInfo: nil,
-            repeats: true
-        )
+        let newTimer = timerFactory.makeRepeatingTimer(interval: tickInterval) { [state = self] timer in
+            MainActor.assumeIsolated {
+                state.handleDrainTimer(timer)
+            }
+        }
         newTimer.tolerance = tickInterval * 0.2 // Reduce energy churn
         timer = newTimer
     }
 
-    @objc private func handleDrainTimer(_ timer: Timer) {
+    private func handleDrainTimer(_ timer: Timer) {
         guard !bins.isEmpty else {
             timer.invalidate()
             self.timer = nil
@@ -75,7 +99,31 @@ final class MessageReaper {
 
         if !bucket.isEmpty {
             bins.append(bucket)
+        } else if bins.isEmpty {
+            timer.invalidate()
+            self.timer = nil
         }
+    }
+}
+
+@MainActor
+final class MessageReaper {
+    private let state: MessageReaperState
+
+    convenience init() {
+        self.init(timerFactory: DefaultMessageReaperTimerFactory())
+    }
+
+    init(timerFactory: any MessageReaperTimerFactory) {
+        state = MessageReaperState(timerFactory: timerFactory)
+    }
+
+    func drain(
+        _ source: inout [AIChatMessage],
+        chunkSize: Int = 64,
+        interval: TimeInterval = 0.0
+    ) {
+        state.drain(&source, chunkSize: chunkSize, interval: interval)
     }
 }
 

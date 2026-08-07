@@ -29,7 +29,30 @@ private enum AppDomainRuntimeMetrics {
 final class AppDomainRuntimeComposition: Sendable {
     static let shared = AppDomainRuntimeComposition()
 
+    private static let legacyRuntimeDefaultKeys = [
+        "workspace.approvalSettings",
+        "agentModeAutoEditEnabled"
+    ]
+
     let runtime: MCPDomainRuntime
+
+    static func collectLegacyRuntimeDefaults(from defaults: UserDefaults) -> [String: Data] {
+        var collected: [String: Data] = [:]
+        for key in legacyRuntimeDefaultKeys {
+            guard let value = defaults.object(forKey: key) else { continue }
+            if let data = value as? Data {
+                collected[key] = data
+            } else if JSONSerialization.isValidJSONObject(["v": value]),
+                      let data = try? JSONSerialization.data(
+                          withJSONObject: value,
+                          options: .fragmentsAllowed
+                      )
+            {
+                collected[key] = data
+            }
+        }
+        return collected
+    }
 
     private init() {
         let applicationSupport = FileManager.default.urls(
@@ -37,22 +60,13 @@ final class AppDomainRuntimeComposition: Sendable {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        var legacyRuntimeDefaults: [String: Data] = [:]
         let defaults = UserDefaults.standard
         let customStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        var legacyRuntimeDefaults = Self.collectLegacyRuntimeDefaults(from: defaults)
         if let customStoragePath,
            let bytes = try? JSONEncoder().encode(customStoragePath)
         {
             legacyRuntimeDefaults["GlobalCustomStorageURL"] = bytes
-        }
-        for key in ["workspace.approvalSettings", "agentModeAutoEditEnabled"] {
-            if let data = defaults.data(forKey: key) {
-                legacyRuntimeDefaults[key] = data
-            } else if defaults.object(forKey: key) != nil,
-                      let data = try? JSONSerialization.data(withJSONObject: defaults.object(forKey: key) as Any)
-            {
-                legacyRuntimeDefaults[key] = data
-            }
         }
         let workspaceStorageDirectory = customStoragePath.map {
             URL(fileURLWithPath: $0, isDirectory: true)

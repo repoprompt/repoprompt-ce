@@ -46,7 +46,11 @@ enum MCPAppPhysicalCapabilityAdapters {
     typealias RequireTargetWindow = @MainActor @Sendable () throws -> WindowState
     typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPServerViewModel.TabContextSnapshot
     typealias RequireAgentModeConnection = @Sendable (_ toolName: String) async throws -> UUID
-    typealias ResolveAgentModeTabID = @Sendable (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
+    typealias ResolveAgentModeTabID = @Sendable (
+        _ args: [String: Value],
+        _ connectionID: UUID?,
+        _ intent: AgentSessionLifecycleAuthority.Intent
+    ) async throws -> AgentSessionLifecycleAuthority.MutationTarget
     typealias ResolveContextBuilderTab = @MainActor @Sendable (
         _ args: [String: Value],
         _ targetWindow: WindowState,
