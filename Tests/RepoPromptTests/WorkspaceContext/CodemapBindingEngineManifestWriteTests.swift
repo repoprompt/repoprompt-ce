@@ -10,7 +10,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             named: "repository",
             files: ["Sources/Shutdown.swift": SwiftFixtureSource.emptyStruct("Shutdown")]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = TestBlockingFence(name: "non-cancellable manifest store write")
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: CodeMapArtifactRuntime(
@@ -24,8 +24,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let demand = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Shutdown.swift"))
         }
-        let writeEntered = await writeGate.waitUntilEntered()
-        XCTAssertTrue(writeEntered)
+        XCTAssertTrue(writeGate.waitUntilEntered())
         let shutdownFinished = EngineCompletionFlag()
         let shutdown = Task {
             await fixture.engine.shutdown()
@@ -54,18 +53,15 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
-            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() }
-            )
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
@@ -135,25 +131,23 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let hookEvents = EngineHookEvents()
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: CodeMapArtifactRuntime(
-                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-                manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                    afterWriteShardAdmission: { writeGate.enterAndWait() }
-                )
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
             ),
             policy: WorkspaceCodemapBindingEnginePolicy(
                 maximumQueuedGraphIndexManifestMutationByteCountPerRoot: 1,
                 maximumQueuedGraphIndexManifestMutationByteCount: 1
             ),
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
         XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
@@ -221,22 +215,20 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
-            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() }
-            )
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
         XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
@@ -277,22 +269,20 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             named: "repository",
             files: [path: SwiftFixtureSource.emptyStruct("Original")]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
-            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() }
-            )
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let original = Task { await fixture.engine.demand(fixture.demand(path: path)) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let invalidation = Task {
             await fixture.engine.invalidateModified(
                 rootEpoch: fixture.rootEpoch,
@@ -346,24 +336,22 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublication(2)
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
         XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
@@ -464,15 +452,12 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 ($0.element, SwiftFixtureSource.emptyStruct("Item\($0.offset + 1)"))
             })
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublication(1)
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let fixture = try await makeEngineFixture(
             root: root,
@@ -480,11 +465,12 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             policy: WorkspaceCodemapBindingEnginePolicy(
                 maximumManifestWriterDeferredItemCount: 3
             ),
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: paths[0])) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         var successors: [Task<WorkspaceCodemapBindingDemandResult, Never>] = []
         for (offset, path) in paths.dropFirst().enumerated() {
             successors.append(Task {
@@ -562,15 +548,12 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             named: "repository",
             files: [path: SwiftFixtureSource.emptyStruct("Feature")]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublication(1)
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let fixture = try await makeEngineFixture(
             root: root,
@@ -578,11 +561,12 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             policy: WorkspaceCodemapBindingEnginePolicy(
                 maximumManifestWriterDeferredItemCount: 2
             ),
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let original = Task { await fixture.engine.demand(fixture.demand(path: path)) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
 
         let firstInvalidation = Task {
             await fixture.engine.invalidateModified(
@@ -654,14 +638,11 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 paths[2]: SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublications([1, 2, 3])
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let hookEvents = EngineHookEvents()
         let fixture = try await makeEngineFixture(
@@ -670,11 +651,12 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             policy: WorkspaceCodemapBindingEnginePolicy(
                 maximumManifestWriterDeferredItemCount: 2
             ),
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: paths[0])) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: paths[1])) }
         XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 2, timeout: 20))
         let third = Task { await fixture.engine.demand(fixture.demand(path: paths[2])) }
@@ -962,24 +944,22 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublication(2)
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
         let queued = await waitForEngineCondition {
@@ -1022,24 +1002,22 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublications([2, 3])
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
         let queued = await waitForEngineCondition {
@@ -1118,24 +1096,22 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
                 "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
             ]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let fault = EngineManifestFaultOnPublications(Array(2 ..< 100))
         let hookEvents = EngineHookEvents()
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() },
-                faultAction: fault.action
-            )
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(faultAction: fault.action)
         )
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: manifestWriteGateHooks(writeGate) { hookEvents.record($0) }
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
-        XCTAssertTrue(writeGate.waitUntilEntered())
+        let writeEntered = await writeGate.waitUntilEntered()
+        XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
         XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
@@ -1371,14 +1347,15 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             named: "repository",
             files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
         )
-        let writeGate = EngineBlockingGate()
+        let writeGate = EngineAsyncGate()
         let runtime = try CodeMapArtifactRuntime(
-            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() }
-            )
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         )
-        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            hooks: manifestWriteGateHooks(writeGate)
+        )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let demand = Task {
             await fixture.engine.demand(fixture.demand(path: "Sources/Feature.swift"))
@@ -1487,6 +1464,16 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(drained.ownerAdmissionHistoryCount, 0)
         XCTAssertEqual(drained.counters.cancellations, 2)
     }
+}
+
+private func manifestWriteGateHooks(
+    _ gate: EngineAsyncGate,
+    event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in }
+) -> WorkspaceCodemapBindingEngineHooks {
+    WorkspaceCodemapBindingEngineHooks(
+        debugBeforeManifestStoreWrite: { _ in await gate.enterAndWait() },
+        event: event
+    )
 }
 
 private enum ManifestRetryWaiterTestError: Error {

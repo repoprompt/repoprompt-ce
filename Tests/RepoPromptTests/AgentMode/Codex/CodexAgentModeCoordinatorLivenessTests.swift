@@ -5,6 +5,16 @@ import XCTest
 
 @MainActor
 final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
+    private var retainedHosts: [AgentModeViewModel] = []
+
+    override func tearDown() async throws {
+        for host in retainedHosts {
+            await host.prepareForWindowClose()
+        }
+        retainedHosts.removeAll()
+        try await super.tearDown()
+    }
+
     func testThreadSnapshotParsesAuthoritativeActiveCommandItem() throws {
         let itemID = UUID().uuidString
         let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(
@@ -2941,6 +2951,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             testCodexStallWatchdogRecoveryThreshold: watchdogRecoveryThreshold
         )
         viewModel.test_initializeRunService()
+        retainedHosts.append(viewModel)
         return viewModel
     }
 

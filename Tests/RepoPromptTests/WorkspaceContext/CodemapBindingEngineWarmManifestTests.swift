@@ -535,7 +535,14 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
                 let runtime = try CodeMapArtifactRuntime(
                     rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
                 )
-                let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+                let sourceAuthorityRejections = CodemapLockedValues<WorkspaceCodemapSourceAuthorityRejection>()
+                let fixture = try await makeEngineFixture(
+                    root: root,
+                    runtime: runtime,
+                    capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                        sourceAuthorityRejected: { sourceAuthorityRejections.append($0) }
+                    )
+                )
                 guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
                     return XCTFail("Expected registration for \(state.rawValue) / \(churn.rawValue).")
                 }
@@ -586,7 +593,8 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
                 )
                 XCTAssertNotNil(
                     directSourceAuthority,
-                    "Expected source authority after \(state.rawValue) / \(churn.rawValue)."
+                    "Expected source authority after \(state.rawValue) / \(churn.rawValue); " +
+                        "rejections=\(sourceAuthorityRejections.values)."
                 )
                 let result = await fixture.engine.demand(fixture.demand(path: targetPath))
                 guard isReady(result) else {
@@ -644,12 +652,11 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
                 priority: .background
             ))
         }
-        guard let replacementResult = await demandResult(
-            replacement,
-            before: .seconds(5)
-        ), await adoptionGate.resolutionCount >= 2,
-        isReady(replacementResult)
-        else {
+        guard await adoptionGate.waitUntilResolutionCount(2) else {
+            return XCTFail("Expected replacement adoption to enter after invalidation.")
+        }
+        let replacementResult = await replacement.value
+        guard isReady(replacementResult) else {
             return XCTFail("Expected warm manifest adoption to retry after invalidation.")
         }
         await adoptionGate.releaseFirstResolution()
@@ -838,10 +845,11 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         guard case .cancelled = await blocked.value else {
             return XCTFail("Expected logical cancellation before blocked I/O drained.")
         }
-        guard let replacementResult = await demandResult(replacement, before: .seconds(5)),
-              isReady(replacementResult),
-              await gate.resolutionCount >= 2
-        else {
+        guard await gate.waitUntilResolutionCount(2) else {
+            return XCTFail("Expected replacement read admission while stale I/O remained blocked.")
+        }
+        let replacementResult = await replacement.value
+        guard isReady(replacementResult) else {
             return XCTFail("Expected immediate replacement admission while stale I/O remained blocked.")
         }
         let recovered = await fixture.engine.accounting()

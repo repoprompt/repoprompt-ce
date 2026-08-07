@@ -137,17 +137,26 @@ final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase 
                 "Sources/Survivor.swift": SwiftFixtureSource.emptyStruct("Survivor")
             ]
         )
+        let sourceAuthorityRejections = CodemapLockedValues<WorkspaceCodemapSourceAuthorityRejection>()
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: CodeMapArtifactRuntime(
                 rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+            ),
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                sourceAuthorityRejected: { sourceAuthorityRejections.append($0) }
             )
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
-        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Fenced.swift")),
-              case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Survivor.swift"))
+        let fencedResult = await fixture.engine.demand(fixture.demand(path: "Sources/Fenced.swift"))
+        let survivorResult = await fixture.engine.demand(fixture.demand(path: "Sources/Survivor.swift"))
+        guard case .ready = fencedResult,
+              case .ready = survivorResult
         else {
-            return XCTFail("Expected initial ready results.")
+            return XCTFail(
+                "Expected initial ready results; fenced=\(fencedResult), survivor=\(survivorResult), " +
+                    "sourceAuthorityRejections=\(sourceAuthorityRejections.values)."
+            )
         }
         let graph = await fixture.engine.selectionGraph(rootEpoch: fixture.rootEpoch)
         let graphReady = await waitForEngineCondition {

@@ -8094,6 +8094,9 @@ actor WorkspaceCodemapBindingEngine {
                     continue
                 }
                 #if DEBUG
+                    await hooks.beforeManifestStoreWrite(scope.rootEpoch)
+                #endif
+                #if DEBUG
                     let debugContext = DebugManifestStoreAttemptContext(
                         rootEpoch: scope.rootEpoch,
                         proof: batch.proof,

@@ -854,29 +854,6 @@ actor EngineSecondCatalogResolutionMutation {
     }
 }
 
-/// Sync writer-hook fence — named thin wrapper over `TestBlockingFence`.
-final class EngineBlockingGate: @unchecked Sendable {
-    static let defaultEnterWaitTimeout = TestFenceDefaults.releaseWait
-
-    private let fence = TestBlockingFence(name: "engine blocking gate")
-
-    func enterAndWait(timeout: TimeInterval = defaultEnterWaitTimeout) {
-        fence.enterAndWait(timeout: timeout)
-    }
-
-    @discardableResult
-    func waitUntilEntered(
-        timeout: TimeInterval = TestFenceDefaults.enterWait,
-        failOnTimeout: Bool = true
-    ) -> Bool {
-        fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
-    }
-
-    func release() {
-        fence.release()
-    }
-}
-
 /// Async engine fence — named thin wrapper over `TestReleaseFence`.
 final class EngineAsyncGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "engine async gate")
@@ -1148,6 +1125,24 @@ actor EngineFirstResolutionGate {
         }
     }
 
+    func waitUntilResolutionCount(
+        _ expectedCount: Int,
+        timeout: Duration = TestFenceDefaults.enterWaitDuration
+    ) async -> Bool {
+        do {
+            return try await state.waitUntilResolutionCount(
+                expectedCount,
+                timeout: CodemapBindingEngineTestCase.timeInterval(timeout)
+            )
+        } catch {
+            if state.resolutionCount >= expectedCount {
+                return true
+            }
+            XCTFail(error.localizedDescription)
+            return false
+        }
+    }
+
     func releaseFirstResolution() {
         state.releaseFirstResolution()
     }
@@ -1160,6 +1155,7 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let resolutionCountCondition = AsyncTestCondition<Int>(0)
     private var storedResolutionCount = 0
     private var storedFirstResolutionEntered = false
     private var firstResolutionReleased = false
@@ -1169,7 +1165,7 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
     private var firstResolutionWaiters: [ResolutionWaiter] = []
 
     var resolutionCount: Int {
-        lock.withLock { storedResolutionCount }
+        resolutionCountCondition.snapshot()
     }
 
     var firstResolutionEntered: Bool {
@@ -1177,14 +1173,19 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
     }
 
     func enter() async {
-        let entry = lock.withLock { () -> (readyWaiters: [ResolutionWaiter], shouldBlock: Bool) in
+        let entry = lock.withLock { () -> (
+            count: Int,
+            readyWaiters: [ResolutionWaiter],
+            shouldBlock: Bool
+        ) in
             storedResolutionCount += 1
-            guard storedResolutionCount == 1 else { return ([], false) }
+            guard storedResolutionCount == 1 else { return (storedResolutionCount, [], false) }
             storedFirstResolutionEntered = true
             let waiters = firstResolutionWaiters
             firstResolutionWaiters.removeAll()
-            return (waiters, true)
+            return (storedResolutionCount, waiters, true)
         }
+        resolutionCountCondition.update { $0 = entry.count }
         for waiter in entry.readyWaiters {
             waiter.continuation.resume()
         }
@@ -1244,6 +1245,14 @@ private final class EngineFirstResolutionGateState: @unchecked Sendable {
             throw error
         }
         return firstResolutionEntered
+    }
+
+    func waitUntilResolutionCount(_ expectedCount: Int, timeout: TimeInterval) async throws -> Bool {
+        try await resolutionCountCondition.waitUntil(
+            "engine resolution count \(expectedCount)",
+            timeout: timeout
+        ) { $0 >= expectedCount }
+        return resolutionCount >= expectedCount
     }
 
     func releaseFirstResolution() {
