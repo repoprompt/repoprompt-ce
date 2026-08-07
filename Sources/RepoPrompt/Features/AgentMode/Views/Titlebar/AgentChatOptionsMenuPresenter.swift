@@ -17,6 +17,7 @@ enum AgentSessionHandoffPrompt {
         let prompt = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: \(String(reflecting: target.tabName))
         Window ID: \(target.windowID)
         Workspace ID: \(target.workspaceID.uuidString)
         Context ID (compose tab): \(target.tabID.uuidString)
