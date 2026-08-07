@@ -47,10 +47,18 @@ final class DiffGenerationUtilityRoutingTests: XCTestCase {
         }
         let fuzzyAlias = try XCTUnwrap(fuzzyAliases.first { candidate in
             let candidateLine = DiffGenerationUtility.processLine(candidate, precision: .high)
+            let candidateKeys = DiffGenerationUtility
+                .buildLineIndexMapHigh(content: [candidateLine])
+                .keys
             var candidateIndex = prefixIndex
-            candidateIndex[candidateLine.removedTagsHigh] = [minimumMatchIndex]
-            let position = Array(candidateIndex.keys).firstIndex(of: candidateLine.removedTagsHigh)
-            return (position ?? 0) >= 400
+            for key in candidateKeys {
+                candidateIndex[key] = [minimumMatchIndex]
+            }
+            let orderedKeys = Array(candidateIndex.keys)
+            let positions = candidateKeys.compactMap { key in
+                orderedKeys.firstIndex(of: key)
+            }
+            return !positions.isEmpty && positions.allSatisfy { $0 >= 400 }
         },
             "The test needs a fuzzy alias after the 400-key probe boundary"
         )
