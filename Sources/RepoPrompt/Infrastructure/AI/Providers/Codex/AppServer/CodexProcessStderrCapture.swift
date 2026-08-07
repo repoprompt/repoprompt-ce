@@ -8,8 +8,6 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
         let wasTruncated: Bool
     }
 
-    /// Reservation precedes cancellation-handler installation, so a terminal result may
-    /// temporarily exist before the checked continuation is available to resume.
     private struct Waiter {
         var continuation: CheckedContinuation<Bool, Never>?
         var timeoutTask: Task<Void, Never>?
@@ -81,13 +79,13 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
 
     func waitUntilFinished(timeout: TimeInterval) async -> Bool {
         let waiterID = UUID()
-        if let immediateResult = reserveWaiter(waiterID) {
-            return immediateResult
-        }
         let timeoutNanoseconds = UInt64(max(timeout, 0) * 1_000_000_000)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                guard installContinuation(continuation, for: waiterID) else { return }
+                if let immediateResult = registerWaiter(continuation, for: waiterID) {
+                    continuation.resume(returning: immediateResult)
+                    return
+                }
 
                 let timeoutTask = Task.detached { [weak self] in
                     do {
@@ -114,7 +112,10 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
         return snapshot
     }
 
-    private func reserveWaiter(_ waiterID: UUID) -> Bool? {
+    private func registerWaiter(
+        _ continuation: CheckedContinuation<Bool, Never>,
+        for waiterID: UUID
+    ) -> Bool? {
         lock.lock()
         defer { lock.unlock() }
         if isFinished {
@@ -124,34 +125,11 @@ final class CodexProcessStderrCapture: @unchecked Sendable {
             return false
         }
         waiters[waiterID] = Waiter(
-            continuation: nil,
+            continuation: continuation,
             timeoutTask: nil,
             terminalResult: nil
         )
         return nil
-    }
-
-    private func installContinuation(
-        _ continuation: CheckedContinuation<Bool, Never>,
-        for waiterID: UUID
-    ) -> Bool {
-        lock.lock()
-        guard var waiter = waiters[waiterID] else {
-            lock.unlock()
-            assertionFailure("Reserved stderr waiter disappeared before continuation installation")
-            continuation.resume(returning: false)
-            return false
-        }
-        if let terminalResult = waiter.terminalResult {
-            waiters.removeValue(forKey: waiterID)
-            lock.unlock()
-            continuation.resume(returning: terminalResult)
-            return false
-        }
-        waiter.continuation = continuation
-        waiters[waiterID] = waiter
-        lock.unlock()
-        return true
     }
 
     private func installTimeoutTask(_ timeoutTask: Task<Void, Never>, for waiterID: UUID) {

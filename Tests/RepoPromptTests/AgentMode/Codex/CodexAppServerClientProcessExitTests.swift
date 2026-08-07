@@ -14,7 +14,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testStderrCaptureCancellationBeforeContinuationInstallationReturnsFalse() async {
+    func testStderrCaptureCancellationDuringWaiterRegistrationReturnsFalse() async {
         let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
         let started = expectation(description: "stderr wait started")
         let wait = Task {
@@ -75,15 +75,21 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         _ task: Task<Bool, Never>,
         timeoutNanoseconds: UInt64 = 1_000_000_000
     ) async -> Bool? {
-        await withTaskGroup(of: Bool?.self) { group in
-            group.addTask { await task.value }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                return nil
+        await withCheckedContinuation { continuation in
+            let gate = StderrResultGate(continuation: continuation)
+            Task {
+                gate.complete(await task.value)
             }
-            let result = await group.next()!
-            group.cancelAll()
-            return result
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    try Task.checkCancellation()
+                    gate.complete(nil)
+                } catch {
+                    return
+                }
+            }
+            gate.install(timeoutTask: timeoutTask)
         }
     }
 
@@ -916,6 +922,45 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         throw WaitUntilError.timedOut(label)
+    }
+}
+
+private final class StderrResultGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool?, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var didComplete = false
+
+    init(continuation: CheckedContinuation<Bool?, Never>) {
+        self.continuation = continuation
+    }
+
+    func install(timeoutTask: Task<Void, Never>) {
+        lock.lock()
+        if didComplete {
+            lock.unlock()
+            timeoutTask.cancel()
+            return
+        }
+        self.timeoutTask = timeoutTask
+        lock.unlock()
+    }
+
+    func complete(_ result: Bool?) {
+        lock.lock()
+        guard !didComplete else {
+            lock.unlock()
+            return
+        }
+        didComplete = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let timeoutTask = self.timeoutTask
+        self.timeoutTask = nil
+        lock.unlock()
+
+        timeoutTask?.cancel()
+        continuation?.resume(returning: result)
     }
 }
 
