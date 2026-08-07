@@ -36,30 +36,32 @@ final class DiffGenerationUtilityRoutingTests: XCTestCase {
         let selector = DiffGenerationUtility.processLine(selectorText, precision: .high)
         let minimumMatchIndex = 401
         let prefix = (0 ..< minimumMatchIndex).map { "unrelated pre-boundary key \($0)" }
-        let content = prefix.map {
+        let processedPrefix = prefix.map {
             DiffGenerationUtility.processLine($0, precision: .high)
-        } + [selector]
-
-        var lineIndex = Dictionary(
-            uniqueKeysWithValues: prefix.enumerated().map { index, line in
-                (DiffGenerationUtility.processLine(line, precision: .high).removedTagsHigh, [index])
-            }
-        )
-        let fuzzyAliases = (0 ..< 1_024).map {
+        }
+        let prefixIndex = DiffGenerationUtility.buildLineIndexMapHigh(content: processedPrefix)
+        let fuzzyAliases = (0 ..< 1024).map {
             "calculate total for selected invoice line item \($0)"
         }
-        let fuzzyAlias = try XCTUnwrap(
-            fuzzyAliases.first { candidate in
-                var candidateIndex = lineIndex
-                candidateIndex[candidate] = [minimumMatchIndex]
-                guard let position = Array(candidateIndex.keys).firstIndex(of: candidate) else {
-                    return false
-                }
-                return position >= 400
-            },
+        let fuzzyAlias = try XCTUnwrap(fuzzyAliases.first { candidate in
+            let candidateLine = DiffGenerationUtility.processLine(candidate, precision: .high)
+            let candidateKeys = DiffGenerationUtility
+                .buildLineIndexMapHigh(content: [candidateLine])
+                .keys
+            var candidateIndex = prefixIndex
+            for key in candidateKeys {
+                candidateIndex[key] = [minimumMatchIndex]
+            }
+            let orderedKeys = Array(candidateIndex.keys)
+            let positions = candidateKeys.compactMap { key in
+                orderedKeys.firstIndex(of: key)
+            }
+            return !positions.isEmpty && positions.allSatisfy { $0 >= 400 }
+        },
             "The test needs a fuzzy alias after the 400-key probe boundary"
         )
-        lineIndex[fuzzyAlias] = [minimumMatchIndex]
+        let content = processedPrefix + [DiffGenerationUtility.processLine(fuzzyAlias, precision: .high)]
+        let lineIndex = DiffGenerationUtility.buildLineIndexMapHigh(content: content)
 
         let result = try DiffGenerationUtility.matchSelectorFast(
             selector: [selector],
