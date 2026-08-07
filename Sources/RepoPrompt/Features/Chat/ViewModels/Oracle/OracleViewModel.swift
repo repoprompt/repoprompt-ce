@@ -14,13 +14,35 @@ private func oracleViewModelDebugLog(_ message: @autoclosure () -> String) {
 
 /// MessageReaper - Gradually releases messages to prevent UI stalls
 @MainActor
+protocol MessageReaperTimerFactory {
+    func makeRepeatingTimer(
+        interval: TimeInterval,
+        block: @escaping (Timer) -> Void
+    ) -> Timer
+}
+
+private struct DefaultMessageReaperTimerFactory: MessageReaperTimerFactory {
+    func makeRepeatingTimer(
+        interval: TimeInterval,
+        block: @escaping (Timer) -> Void
+    ) -> Timer {
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true, block: block)
+    }
+}
+
+@MainActor
 final class MessageReaper {
     private var bins: [[AIChatMessage]] = []
     private var timer: Timer?
     private var timerChunkSize = 0
+    private let timerFactory: any MessageReaperTimerFactory
 
     /// Minimum tick interval to prevent busy-loop when interval=0.0 is passed
     private static let minTickInterval: TimeInterval = 1.0 / 60.0 // ~16ms
+
+    init(timerFactory: any MessageReaperTimerFactory = DefaultMessageReaperTimerFactory()) {
+        self.timerFactory = timerFactory
+    }
 
     deinit {
         timer?.invalidate()
@@ -44,9 +66,13 @@ final class MessageReaper {
         // Sanitize interval and enforce minimum to prevent busy-loop
         let sanitized = interval.isFinite ? interval : 0
         let tickInterval = max(Self.minTickInterval, max(0.0, sanitized))
-        let newTimer = Timer.scheduledTimer(withTimeInterval: tickInterval, repeats: true) { [weak self] timer in
+        let newTimer = timerFactory.makeRepeatingTimer(interval: tickInterval) { [weak self] timer in
             MainActor.assumeIsolated {
-                self?.handleDrainTimer(timer)
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                self.handleDrainTimer(timer)
             }
         }
         newTimer.tolerance = tickInterval * 0.2 // Reduce energy churn

@@ -16,4 +16,31 @@ final class MessageReaperTests: XCTestCase {
         reaper = nil
         XCTAssertNil(weakReaper)
     }
+
+    func testReaperDeinitInvalidatesItsRepeatingTimer() {
+        let timerFactory = RecordingMessageReaperTimerFactory()
+        var reaper: MessageReaper? = MessageReaper(timerFactory: timerFactory)
+        var messages = [AIChatMessage(content: "pending", isUser: false)]
+
+        reaper?.drain(&messages, chunkSize: 1, interval: 60)
+        XCTAssertTrue(timerFactory.timer?.isValid == true)
+
+        reaper = nil
+
+        XCTAssertFalse(timerFactory.timer?.isValid == true)
+    }
+}
+
+@MainActor
+private final class RecordingMessageReaperTimerFactory: MessageReaperTimerFactory {
+    private(set) var timer: Timer?
+
+    func makeRepeatingTimer(
+        interval: TimeInterval,
+        block: @escaping (Timer) -> Void
+    ) -> Timer {
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true, block: block)
+        self.timer = timer
+        return timer
+    }
 }
