@@ -618,11 +618,11 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             ]
         )
         let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
-        let demandPublication = TestReleaseFence(name: "automatic target publication")
+        let readinessWait = TestReleaseFence(name: "automatic target readiness wait")
         let demandGateEnabled = CodemapLockedCounter()
         let cleaned = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
         addTeardownBlock {
-            demandPublication.release()
+            readinessWait.release()
             await fixture.shutdown()
             repository.cleanup()
         }
@@ -630,7 +630,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             cancellationCleanupHook: { cleaned.append($0) },
             demandResultHook: { _, result in
                 if demandGateEnabled.value > 0 {
-                    await demandPublication.enterAndWaitIgnoringCancellationUntilRelease()
+                    return .busy(retryAfterMilliseconds: 0)
                 }
                 return result
             }
@@ -655,15 +655,18 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
                 initialBackoffMilliseconds: 1,
                 maximumBackoffMilliseconds: 1,
                 maximumTotalWait: .seconds(5)
-            )
+            ),
+            automaticSelectionWaiter: .init(sleep: { _ in
+                await readinessWait.enterAndWaitIgnoringCancellationUntilRelease()
+            })
         )
         let resolution = Task {
             try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
         }
-        let entered = await demandPublication.waitUntilEntered(timeout: TestFenceDefaults.enterWait)
+        let entered = await readinessWait.waitUntilEntered(timeout: TestFenceDefaults.enterWait)
         XCTAssertTrue(entered)
         resolution.cancel()
-        demandPublication.release()
+        readinessWait.release()
         do {
             _ = try await resolution.value
             XCTFail("Expected automatic target demand cancellation.")

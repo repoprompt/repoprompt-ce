@@ -193,10 +193,21 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         )
         let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         let runtime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
-        let seed = try await makeEngineFixture(root: root, runtime: runtime)
+        let seedEvents = EngineHookEvents()
+        let seed = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks { seedEvents.record($0) }
+        )
         _ = await seed.engine.registerRoot(seed.registration)
-        guard case .ready = await seed.engine.demand(seed.demand(path: "Sources/Warm.swift")) else {
-            return XCTFail("Expected warm artifact seed.")
+        let seedResult = await seed.engine.demand(seed.demand(path: "Sources/Warm.swift"))
+        guard case .ready = seedResult else {
+            return await XCTFail(bindingDemandFailureMessage(
+                "Expected warm artifact seed.",
+                result: seedResult,
+                accounting: seed.engine.accounting(),
+                events: seedEvents.snapshot()
+            ))
         }
         await seed.engine.unloadRoot(rootEpoch: seed.rootEpoch)
 

@@ -253,11 +253,22 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         await settlementRegistry.awaitDrained(windowID: settlementWindowID)
 
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
-        let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
+        let reloadedEvents = EngineHookEvents()
+        let reloaded = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks { reloadedEvents.record($0) }
+        )
         _ = await reloaded.engine.registerRoot(reloaded.registration)
         for path in ["Sources/One.swift", "Sources/Two.swift", "Sources/Three.swift"] {
-            guard await isReady(reloaded.engine.demand(reloaded.demand(path: path))) else {
-                return XCTFail("Expected batched manifest record for \(path).")
+            let result = await reloaded.engine.demand(reloaded.demand(path: path))
+            guard isReady(result) else {
+                return await XCTFail(bindingDemandFailureMessage(
+                    "Expected batched manifest record for \(path).",
+                    result: result,
+                    accounting: reloaded.engine.accounting(),
+                    events: reloadedEvents.snapshot()
+                ))
             }
         }
     }
