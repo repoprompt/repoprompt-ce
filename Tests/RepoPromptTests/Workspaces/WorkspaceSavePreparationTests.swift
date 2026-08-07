@@ -675,8 +675,12 @@ import XCTest
                     && !manager.workspaces.contains { $0.id == staleID }
             }
 
-            var localDirty = decoded
-            localDirty.currentPromptText = "local unresolved state"
+            guard let localIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else {
+                return XCTFail("Runtime workspace disappeared before external reconciliation")
+            }
+            manager.workspaces[localIndex].currentPromptText = "local working state preserved"
+            manager.markWorkspaceDirty()
+            let localDirty = manager.workspaces[localIndex]
             await manager.debugPublishWorkingDocumentToDomainAuthority(localDirty)
             let dirtySnapshot = try await waitForDomainWorkspace(
                 runtime,
@@ -688,122 +692,54 @@ import XCTest
                     documentBytes: snapshot.document.documentBytes,
                     fileURL: snapshot.document.fileURL
                 )
-                return projected.currentPromptText == "local unresolved state"
+                return projected.currentPromptText == "local working state preserved"
             }
             XCTAssertGreaterThan(dirtySnapshot.revisions.workingRevision, dirtySnapshot.revisions.savedRevision)
             XCTAssertEqual(dirtySnapshot.revisions.dirtyRevision, dirtySnapshot.revisions.workingRevision)
+
             var external = decoded
-            external.currentPromptText = "external accepted state"
-            let projectedPromptBeforeConflict = manager.workspaces.first(where: { $0.id == workspaceID })?.currentPromptText
+            external.currentPromptText = "external saved baseline"
             try JSONEncoder().encode(external).write(
                 to: savedDocument.document.fileURL,
                 options: .atomic
             )
-            await runtime.workspaceStore.reloadExternalChanges()
-            let conflictCatalog = await runtime.workspaceStore.snapshot()
-            let conflictProjectionCompleted = await presentationBridge.waitUntilProjected(
-                through: conflictCatalog.publicationSequence
+            let reloadActivity = await runtime.workspaceStore.reloadExternalChanges()
+            XCTAssertEqual(reloadActivity, .changed)
+            let reconciledCatalog = await runtime.workspaceStore.snapshot()
+            let reconciliationProjectionCompleted = await presentationBridge.waitUntilProjected(
+                through: reconciledCatalog.publicationSequence
             )
-            XCTAssertTrue(conflictProjectionCompleted)
-            let conflictedSnapshot = try await waitForDomainWorkspace(
-                runtime,
-                workspaceID: workspaceID,
-                description: "external conflict classification"
-            ) { snapshot in
-                if case .externalConflict = snapshot.health { return true }
-                return false
-            }
-            XCTAssertEqual(
-                conflictedSnapshot.health,
-                .externalConflict(reason: "saved_document_changed_while_working_state_dirty")
-            )
-            XCTAssertEqual(
-                manager.workspaces.first(where: { $0.id == workspaceID })?.currentPromptText,
-                projectedPromptBeforeConflict,
-                "A health-only projection must not replace the dirty live workspace model."
-            )
-            let issue = try XCTUnwrap(manager.domainWorkspaceAuthorityIssue)
-            XCTAssertEqual(issue.workspaceID, workspaceID)
-            XCTAssertEqual(issue.kind, .externalConflict)
-            XCTAssertEqual(issue.reason, "saved_document_changed_while_working_state_dirty")
-            XCTAssertEqual(issue.stableCode, "workspace_external_conflict")
-            XCTAssertTrue(issue.agentAdmissionMessage.contains("saved_document_changed_while_working_state_dirty"))
-            XCTAssertTrue(issue.agentAdmissionMessage.contains("Keep Local"))
-            XCTAssertTrue(issue.agentAdmissionMessage.contains("Use External"))
-            XCTAssertTrue(issue.canResolveExternalConflict)
-
-            let canonicalBaseline = manager.debugDomainAuthorityBaseline(for: workspaceID)
-            XCTAssertEqual(canonicalBaseline.revisions, conflictedSnapshot.revisions)
-            XCTAssertEqual(canonicalBaseline.digest, conflictedSnapshot.document.contentDigest)
-            XCTAssertEqual(canonicalBaseline.health, conflictedSnapshot.health)
-
-            var readOverlay = localDirty
-            readOverlay.currentPromptText = "transient read-routing overlay"
-            let readOverlayDocument = try DomainWorkspaceDocument.decode(
-                documentBytes: JSONEncoder().encode(readOverlay),
-                fileURL: savedDocument.document.fileURL
-            )
-            let registeredOverlay = await runtime.workspaceStore.registerReadDocument(readOverlayDocument)
-            XCTAssertEqual(registeredOverlay.health, .writable)
-            XCTAssertNotEqual(registeredOverlay.revisions, conflictedSnapshot.revisions)
-            XCTAssertNotEqual(registeredOverlay.document.contentDigest, conflictedSnapshot.document.contentDigest)
-            let routedOverlay = await runtime.contextStore.workspaceSnapshot(workspaceID)
-            XCTAssertEqual(routedOverlay?.document.contentDigest, readOverlayDocument.contentDigest)
-
-            let admissionResult = await manager.domainAuthorityAdmissionIssue(for: workspaceID)
-            let admissionIssue = try XCTUnwrap(admissionResult)
-            XCTAssertEqual(admissionIssue.kind, .externalConflict)
-            XCTAssertEqual(admissionIssue.reason, "saved_document_changed_while_working_state_dirty")
-            XCTAssertEqual(admissionIssue.stableCode, "workspace_external_conflict")
-            let retainedIssue = try XCTUnwrap(manager.domainWorkspaceAuthorityIssue)
-            XCTAssertEqual(retainedIssue.kind, .externalConflict)
-            XCTAssertEqual(retainedIssue.reason, "saved_document_changed_while_working_state_dirty")
-
-            let baselineAfterAdmission = manager.debugDomainAuthorityBaseline(for: workspaceID)
-            XCTAssertEqual(baselineAfterAdmission.revisions, conflictedSnapshot.revisions)
-            XCTAssertEqual(baselineAfterAdmission.digest, conflictedSnapshot.document.contentDigest)
-            XCTAssertEqual(baselineAfterAdmission.health, conflictedSnapshot.health)
-            let canonicalAfterAdmission = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
-            XCTAssertEqual(canonicalAfterAdmission?.revisions, conflictedSnapshot.revisions)
-            XCTAssertEqual(canonicalAfterAdmission?.document.contentDigest, conflictedSnapshot.document.contentDigest)
-            XCTAssertEqual(canonicalAfterAdmission?.health, conflictedSnapshot.health)
-
-            manager.reportDomainAuthorityFailure(
-                NSError(
-                    domain: "WorkspaceSavePreparationTests",
-                    code: 4,
-                    userInfo: [NSLocalizedDescriptionKey: "transient command failure"]
-                ),
-                workspaceID: workspaceID,
-                operation: "test_command_failure"
-            )
-            XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .commandFailure)
-
-            let conflictResolved = await manager.resolveDomainWorkspaceConflict(
-                workspaceID: workspaceID,
-                acceptExternal: true
-            )
-            XCTAssertTrue(conflictResolved)
-            XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
+            XCTAssertTrue(reconciliationProjectionCompleted)
             let resolved = try await waitForDomainWorkspace(
                 runtime,
                 workspaceID: workspaceID,
-                description: "accepted external conflict resolution"
+                description: "automatic dirty external reconciliation"
             ) { snapshot in
-                snapshot.health == .writable && snapshot.revisions.dirtyRevision == nil
+                guard snapshot.health == .writable,
+                      snapshot.revisions.dirtyRevision != nil
+                else { return false }
+                let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: snapshot.document.documentBytes,
+                    fileURL: snapshot.document.fileURL
+                )
+                return projected.currentPromptText == "local working state preserved"
             }
             XCTAssertEqual(resolved.health, .writable)
-            XCTAssertNil(resolved.revisions.dirtyRevision)
-            let resolvedCatalog = await runtime.workspaceStore.snapshot()
-            let resolvedProjectionCompleted = await presentationBridge.waitUntilProjected(
-                through: resolvedCatalog.publicationSequence
-            )
-            XCTAssertTrue(resolvedProjectionCompleted)
+            XCTAssertNotNil(resolved.revisions.dirtyRevision)
+            XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
+
+            let canonicalBaseline = manager.debugDomainAuthorityBaseline(for: workspaceID)
+            XCTAssertEqual(canonicalBaseline.revisions, resolved.revisions)
+            XCTAssertEqual(canonicalBaseline.digest, resolved.document.contentDigest)
+            XCTAssertEqual(canonicalBaseline.health, .writable)
+            let admissionIssue = await manager.domainAuthorityAdmissionIssue(for: workspaceID)
+            XCTAssertNil(admissionIssue)
+
             let accepted = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
                 documentBytes: resolved.document.documentBytes,
                 fileURL: resolved.document.fileURL
             )
-            XCTAssertEqual(accepted.currentPromptText, "external accepted state")
+            XCTAssertEqual(accepted.currentPromptText, "local working state preserved")
 
             let authoritativeURL = resolved.document.fileURL
             let authoritativeDirectory = authoritativeURL.deletingLastPathComponent().standardizedFileURL

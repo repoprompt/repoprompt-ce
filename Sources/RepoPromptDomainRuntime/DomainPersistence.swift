@@ -713,6 +713,7 @@ package struct DomainPersistenceCoordinator {
         document: DomainWorkspaceDocument,
         externalSavedDigest: String,
         expectedRevision: UInt64,
+        newRevisions: DomainRevisionState,
         contextRevisions: [UUID: DomainRevisionState],
         contextTombstones: [UUID: UInt64],
         operations: [DomainRecordedOperation],
@@ -723,6 +724,7 @@ package struct DomainPersistenceCoordinator {
                 document: document,
                 externalSavedDigest: externalSavedDigest,
                 expectedRevision: expectedRevision,
+                newRevisions: newRevisions,
                 contextRevisions: contextRevisions,
                 contextTombstones: contextTombstones,
                 operations: operations,
@@ -1507,6 +1509,7 @@ package struct DomainPersistenceCoordinator {
         document: DomainWorkspaceDocument,
         externalSavedDigest: String,
         expectedRevision: UInt64,
+        newRevisions: DomainRevisionState,
         contextRevisions: [UUID: DomainRevisionState],
         contextTombstones: [UUID: UInt64],
         operations: [DomainRecordedOperation],
@@ -1521,10 +1524,22 @@ package struct DomainPersistenceCoordinator {
                     actual: current.revisions.workingRevision
                 )
             }
+            let keepsRevision = newRevisions == current.revisions
+            let advancesRevision = newRevisions.workingRevision == current.revisions.workingRevision &+ 1
+                && newRevisions.savedRevision == current.revisions.savedRevision
+                && newRevisions.dirtyRevision == newRevisions.workingRevision
+            guard keepsRevision || advancesRevision else {
+                throw DomainPersistenceError.invalidWorkspaceDocument
+            }
+            guard let externalBytes = try? Data(contentsOf: document.fileURL),
+                  DomainContentDigest.sha256(externalBytes) == externalSavedDigest
+            else {
+                throw DomainPersistenceError.externalDocumentConflict
+            }
             let journal = DomainWorkingJournal(
                 workspaceID: document.workspaceID,
                 fileURL: document.fileURL,
-                revisions: current.revisions,
+                revisions: newRevisions,
                 savedDigest: externalSavedDigest,
                 workingDocument: document.documentBytes,
                 contextRevisions: contextRevisions,

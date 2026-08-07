@@ -117,25 +117,6 @@ struct DomainWorkspaceAuthorityClient {
         ))
     }
 
-    func resolveConflict(
-        workspaceID: UUID,
-        acceptExternal: Bool,
-        protectedAgentIdentities: [DomainProtectedAgentIdentity],
-        expectedWorkspaceRevision: UInt64?,
-        operationID: UUID = UUID()
-    ) async -> DomainCommandOutcome {
-        await executeStable(.init(
-            operationID: operationID,
-            expectedWorkspaceRevision: expectedWorkspaceRevision,
-            origin: .appPresentation(windowID: windowID),
-            command: .resolveExternalConflict(
-                workspaceID: workspaceID,
-                acceptExternal: acceptExternal,
-                protectedAgentIdentities: protectedAgentIdentities
-            )
-        ))
-    }
-
     func reloadExternalChanges() async -> DomainWorkspaceCatalogSnapshot {
         await store.reloadExternalChanges()
         return await store.snapshot()

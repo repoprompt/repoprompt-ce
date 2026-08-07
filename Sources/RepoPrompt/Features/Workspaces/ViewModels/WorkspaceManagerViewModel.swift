@@ -262,10 +262,6 @@ struct DomainWorkspaceAuthorityIssue: Equatable, Identifiable {
         self.diagnostic = diagnostic
     }
 
-    var canResolveExternalConflict: Bool {
-        kind == .externalConflict
-    }
-
     var stableCode: String {
         switch kind {
         case .externalConflict: "workspace_external_conflict"
@@ -279,7 +275,7 @@ struct DomainWorkspaceAuthorityIssue: Equatable, Identifiable {
     var message: String {
         switch kind {
         case .externalConflict:
-            "RepoPrompt retained both local working state and externally saved workspace state. Choose which state to keep."
+            "Workspace authority reconciliation did not complete."
         case .degradedReadOnly:
             "This workspace is read-only until its persistence problem is resolved."
         case .removed:
@@ -292,7 +288,7 @@ struct DomainWorkspaceAuthorityIssue: Equatable, Identifiable {
     var recoveryInstruction: String {
         switch kind {
         case .externalConflict:
-            "Resolve the workspace with Keep Local or Use External, then retry."
+            "Refresh workspace authority and retry."
         case .degradedReadOnly:
             "Retry the workspace authority refresh after correcting the persistence problem."
         case .removed:
@@ -314,12 +310,7 @@ struct DomainWorkspaceAuthorityOperationError: LocalizedError {
     var errorDescription: String? {
         let code = outcome.errorCode?.rawValue ?? "workspace_authority_command_failed"
         let diagnostic = outcome.diagnostic ?? outcome.disposition.rawValue
-        let recovery = if case .externalConflict = outcome.workspace?.health {
-            " Resolve the workspace with Keep Local or Use External, then retry."
-        } else {
-            ""
-        }
-        return "[\(code)] \(diagnostic).\(recovery)"
+        return "[\(code)] \(diagnostic)."
     }
 }
 
@@ -4341,50 +4332,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             diagnostic: error.localizedDescription
         ))
         Self.logger.error("Domain workspace authority \(operation, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
-    }
-
-    private func protectedAgentIdentities(for workspaceID: UUID) -> [DomainProtectedAgentIdentity] {
-        guard let workspace = workspace(withID: workspaceID) else { return [] }
-        let composed = workspace.composeTabs.map {
-            DomainProtectedAgentIdentity(
-                tabID: $0.id,
-                location: .composed,
-                activeAgentSessionID: $0.activeAgentSessionID,
-                isPinned: $0.isPinned
-            )
-        }
-        let stashed = workspace.stashedTabs.map {
-            DomainProtectedAgentIdentity(
-                tabID: $0.tab.id,
-                location: .stashed,
-                activeAgentSessionID: $0.tab.activeAgentSessionID,
-                isPinned: $0.tab.isPinned
-            )
-        }
-        return (composed + stashed).filter(\.requiresProtection)
-    }
-
-    @discardableResult
-    func resolveDomainWorkspaceConflict(
-        workspaceID: UUID,
-        acceptExternal: Bool
-    ) async -> Bool {
-        guard let domainWorkspaceAuthorityClient else { return false }
-        let outcome = await domainWorkspaceAuthorityClient.resolveConflict(
-            workspaceID: workspaceID,
-            acceptExternal: acceptExternal,
-            protectedAgentIdentities: protectedAgentIdentities(for: workspaceID),
-            expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
-                workspaceID
-            ]?.workingRevision
-        )
-        applyDomainAuthorityOutcome(outcome, workspaceID: workspaceID)
-        guard Self.isSuccessfulDomainOutcome(outcome) else {
-            reportDomainAuthorityIssue(outcome, operation: "resolve_external_conflict")
-            return false
-        }
-        synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "resolve_external_conflict")
-        return true
     }
 
     func refreshDomainWorkspaceAuthority() async {

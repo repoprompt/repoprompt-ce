@@ -5,19 +5,19 @@ import XCTest
 
 @MainActor
 final class AgentRunWorkspaceAuthorityAdmissionTests: XCTestCase {
-    func testExternalConflictBlocksAdmissionWithPreciseRecoveryMessage() throws {
-        let reason = "saved_document_changed_while_working_state_dirty"
+    func testDegradedWorkspaceBlocksAdmissionWithPreciseRecoveryMessage() throws {
+        let reason = "future_working_journal"
         let issue = DomainWorkspaceAuthorityIssue(
             workspaceID: UUID(),
             operation: "externalReload",
-            kind: .externalConflict,
+            kind: .degradedReadOnly,
             reason: reason
         )
 
         XCTAssertThrowsError(try AgentRunMCPToolService.requireWritableWorkspaceAuthority(issue)) { error in
             XCTAssertEqual(
                 String(describing: error),
-                "[-32602] Invalid params: [workspace_external_conflict] agent_run.start blocked: \(reason). Resolve the workspace with Keep Local or Use External, then retry."
+                "[-32602] Invalid params: [workspace_read_only_degraded] agent_run.start blocked: \(reason). Retry the workspace authority refresh after correcting the persistence problem."
             )
         }
     }

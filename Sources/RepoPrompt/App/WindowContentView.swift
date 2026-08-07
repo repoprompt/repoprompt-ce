@@ -22,9 +22,6 @@ struct WindowContentView: View {
 
     var body: some View {
         ContentView(windowState: windowState)
-            .safeAreaInset(edge: .top) {
-                WorkspaceAuthorityRecoveryBanner(workspaceManager: windowState.workspaceManager)
-            }
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
             .environmentObject(windowState) // If your subviews need it
             .environmentObject(sparkleManager)
