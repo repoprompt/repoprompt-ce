@@ -275,6 +275,37 @@ class OutputSummarizerTests(unittest.TestCase):
         self.assertLessEqual(rendered_chars, conductor.SUMMARY_MAX_CHARS)
         self.assertTrue(summary["truncated"] or summary["omittedLineCount"] > 0)
 
+    def test_lowercase_warning_at_start_is_counted_and_shown(self) -> None:
+        summary = summarize(
+            "swift-build",
+            "completed",
+            0,
+            [
+                "warning: cannot find user version number for module 'Dependency'\n",
+                "Sources/Foo.swift:10:5: warning: unused variable\n",
+            ],
+        )
+
+        self.assertEqual(summary["warningCount"], 2)
+        warnings = section(summary, "Warnings")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cannot find user version number", warnings[0])
+
+    def test_summary_version_and_duration_are_included(self) -> None:
+        summary = summarize("build", "completed", 0, ["==> Build\n"])
+
+        self.assertEqual(summary["version"], conductor.SUMMARY_VERSION)
+        self.assertIn("summaryDurationSeconds", summary)
+        self.assertIsInstance(summary["summaryDurationSeconds"], float)
+        self.assertGreaterEqual(summary["summaryDurationSeconds"], 0.0)
+
+    def test_minimal_summary_version_and_duration_are_included(self) -> None:
+        summary = conductor.OutputSummarizer._minimal_summary("build", "failed", 1, "note")
+
+        self.assertEqual(summary["version"], conductor.SUMMARY_VERSION)
+        self.assertIn("summaryDurationSeconds", summary)
+        self.assertEqual(summary["summaryDurationSeconds"], 0.0)
+
     def test_ansi_and_long_lines_are_cleaned(self) -> None:
         long_error = "\x1b[31mERROR: " + ("x" * 1000) + "\x1b[0m\n"
         summary = summarize("build", "failed", 1, [long_error])
