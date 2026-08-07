@@ -654,6 +654,71 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), working.documentBytes)
     }
 
+    func testDirtyExternalRebaseRefreshesWhenSameWorkingRevisionWasSavedByAnotherRuntime() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let first = fixture.runtime(runtimeID: UUID())
+        let second = fixture.runtime(runtimeID: UUID())
+        try await first.start()
+        try await second.start()
+
+        let local = try fixture.document(prompt: "first runtime captured local working bytes")
+        let firstWrite = await first.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .replaceWorkingDocument(local)
+        ))
+        XCTAssertEqual(firstWrite.disposition, .applied)
+        let firstRevisions = try XCTUnwrap(firstWrite.after)
+        XCTAssertEqual(firstRevisions.workingRevision, 1)
+        XCTAssertEqual(firstRevisions.savedRevision, 0)
+        XCTAssertEqual(firstRevisions.dirtyRevision, 1)
+
+        let secondAdoption = await second.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .replaceWorkingDocument(local)
+        ))
+        XCTAssertEqual(secondAdoption.disposition, .unchanged)
+        XCTAssertEqual(secondAdoption.after, firstRevisions)
+        let secondSave = await second.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: firstRevisions.workingRevision,
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+        ))
+        XCTAssertEqual(secondSave.disposition, .applied)
+        let secondRevisions = try XCTUnwrap(secondSave.after)
+        XCTAssertEqual(secondRevisions.workingRevision, 1)
+        XCTAssertEqual(secondRevisions.savedRevision, 1)
+        XCTAssertNil(secondRevisions.dirtyRevision)
+
+        let staleFirstSnapshot = await first.workspaceStore.snapshot()
+        let staleFirst = try XCTUnwrap(staleFirstSnapshot.workspaces.first)
+        XCTAssertEqual(staleFirst.revisions, firstRevisions)
+        XCTAssertEqual(staleFirst.document.documentBytes, local.documentBytes)
+
+        let activity = await first.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .changed)
+        let reconciledSnapshot = await first.workspaceStore.snapshot()
+        let reconciled = try XCTUnwrap(reconciledSnapshot.workspaces.first)
+        XCTAssertEqual(reconciled.health, .writable)
+        XCTAssertEqual(reconciled.revisions, secondRevisions)
+        XCTAssertEqual(reconciled.document.documentBytes, local.documentBytes)
+
+        _ = await first.shutdown()
+        _ = await second.shutdown()
+        let restarted = fixture.runtime(runtimeID: UUID(), generation: 2)
+        try await restarted.start()
+        let recoveredSnapshot = await restarted.workspaceStore.snapshot()
+        let recovered = try XCTUnwrap(recoveredSnapshot.workspaces.first)
+        XCTAssertEqual(recovered.health, .writable)
+        XCTAssertEqual(recovered.revisions, secondRevisions)
+        XCTAssertEqual(recovered.document.documentBytes, local.documentBytes)
+    }
+
     func testDirtyExternalRebaseReplaysCapturedLocalDocumentWhenJournalAdvancesBeforeCommit() async throws {
         let fixture = try Fixture.make()
         defer { fixture.remove() }

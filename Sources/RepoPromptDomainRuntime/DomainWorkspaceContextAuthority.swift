@@ -807,6 +807,9 @@ actor DomainWorkspaceContextAuthority {
               externalDocument.workspaceID == workspaceID
         else { return .failed }
 
+        // Recovery intentionally replays the captured local document as a whole-document winner.
+        // A refresh updates only its durable CAS baseline; substituting refreshed bytes here would
+        // silently discard this runtime's unsaved user state. The bounded loop prevents livelock.
         for attempt in 0 ..< Self.maximumCASRecoveryAttempts {
             guard var record = records[workspaceID], record.health.acceptsMutations else {
                 return .failed
@@ -843,7 +846,7 @@ actor DomainWorkspaceContextAuthority {
                 let persisted = try await persistence.persistConflictRebase(
                     document: localDocument,
                     externalSavedDigest: externalDocument.contentDigest,
-                    expectedRevision: before.workingRevision,
+                    expectedRevisions: before,
                     newRevisions: revisions,
                     contextRevisions: contextRevisions,
                     contextTombstones: contextTombstones,
@@ -1837,7 +1840,7 @@ actor DomainWorkspaceContextAuthority {
                 let persisted = try await persistence.persistConflictRebase(
                     document: record.document,
                     externalSavedDigest: external.contentDigest,
-                    expectedRevision: before.workingRevision,
+                    expectedRevisions: before,
                     newRevisions: after,
                     contextRevisions: record.contextRevisions,
                     contextTombstones: record.contextTombstones,

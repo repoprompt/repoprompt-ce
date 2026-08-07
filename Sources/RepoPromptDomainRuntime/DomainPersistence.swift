@@ -712,7 +712,7 @@ package struct DomainPersistenceCoordinator {
     func persistConflictRebase(
         document: DomainWorkspaceDocument,
         externalSavedDigest: String,
-        expectedRevision: UInt64,
+        expectedRevisions: DomainRevisionState,
         newRevisions: DomainRevisionState,
         contextRevisions: [UUID: DomainRevisionState],
         contextTombstones: [UUID: UInt64],
@@ -723,7 +723,7 @@ package struct DomainPersistenceCoordinator {
             try blockingWorker(cancellation).persistConflictRebaseBlocking(
                 document: document,
                 externalSavedDigest: externalSavedDigest,
-                expectedRevision: expectedRevision,
+                expectedRevisions: expectedRevisions,
                 newRevisions: newRevisions,
                 contextRevisions: contextRevisions,
                 contextTombstones: contextTombstones,
@@ -1508,7 +1508,7 @@ package struct DomainPersistenceCoordinator {
     private func persistConflictRebaseBlocking(
         document: DomainWorkspaceDocument,
         externalSavedDigest: String,
-        expectedRevision: UInt64,
+        expectedRevisions: DomainRevisionState,
         newRevisions: DomainRevisionState,
         contextRevisions: [UUID: DomainRevisionState],
         contextTombstones: [UUID: UInt64],
@@ -1518,9 +1518,9 @@ package struct DomainPersistenceCoordinator {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
             let current = try readCurrentJournalOrSeed(document: document)
-            guard current.revisions.workingRevision == expectedRevision else {
+            guard current.revisions == expectedRevisions else {
                 throw DomainPersistenceError.stateConflict(
-                    expected: expectedRevision,
+                    expected: expectedRevisions.workingRevision,
                     actual: current.revisions.workingRevision
                 )
             }
