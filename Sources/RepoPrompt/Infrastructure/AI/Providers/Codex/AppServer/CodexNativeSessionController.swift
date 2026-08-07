@@ -1395,7 +1395,7 @@ final class CodexNativeSessionController {
             try markStartOrResumeSucceeded()
             return sessionRef
         } catch {
-            try? await eventHandlingMutex.withLock {
+            try? await eventHandlingMutex.withLockIgnoringCancellation {
                 cancelBindingSession()
             }
             markStartOrResumeFailed()
@@ -3817,6 +3817,12 @@ final class CodexNativeSessionController {
             }
             try? markStartOrResumeSucceeded()
             return sessionRef
+        }
+
+        func test_bindingBufferState() async throws -> (isBinding: Bool, bufferedCount: Int) {
+            try await eventHandlingMutex.withLock {
+                (isBindingSession, bufferedInbound.count)
+            }
         }
 
         func test_simulateTransportStreamEnded(source: String) async {

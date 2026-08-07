@@ -138,6 +138,9 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         XCTAssertFalse(processRunning, "a cancelled start must not launch the app-server process")
         XCTAssertEqual(requests.methods, [], "a cancelled start must send no thread request")
         XCTAssertEqual(registrar.registeredCount, 0, "a cancelled start must register no expected-agent PID")
+        let bindingState = try await controller.test_bindingBufferState()
+        XCTAssertFalse(bindingState.isBinding, "a cancelled start must leave binding mode")
+        XCTAssertEqual(bindingState.bufferedCount, 0, "a cancelled start must discard buffered inbound events")
     }
 
     // MARK: - Successful provisioner proceeds, in order
