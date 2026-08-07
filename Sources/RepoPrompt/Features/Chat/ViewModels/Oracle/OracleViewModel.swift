@@ -110,7 +110,11 @@ private final class MessageReaperState {
 final class MessageReaper {
     private let state: MessageReaperState
 
-    init(timerFactory: any MessageReaperTimerFactory = DefaultMessageReaperTimerFactory()) {
+    init() {
+        self.init(timerFactory: DefaultMessageReaperTimerFactory())
+    }
+
+    init(timerFactory: any MessageReaperTimerFactory) {
         state = MessageReaperState(timerFactory: timerFactory)
     }
 
