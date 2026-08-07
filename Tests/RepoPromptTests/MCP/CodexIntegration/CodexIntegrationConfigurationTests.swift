@@ -33,6 +33,20 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         return lines[..<firstHeaderIndex].filter { $0.contains("tool_output_token_limit") }
     }
 
+    func testCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: []
+        ).args
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertEqual(
+            Array(arguments.suffix(4)),
+            ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
+        )
+    }
+
     private func occurrences(of needle: String, in haystack: String) -> Int {
         guard !needle.isEmpty else { return 0 }
         return haystack.components(separatedBy: needle).count - 1

@@ -76,7 +76,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         args.append(contentsOf: [
             "--json",
             "--skip-git-repo-check",
-            "--full-auto"
+            "--sandbox",
+            "workspace-write"
         ])
 
         return (args, modelSpecifier)
