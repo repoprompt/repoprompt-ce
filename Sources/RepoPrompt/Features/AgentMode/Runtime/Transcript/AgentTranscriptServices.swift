@@ -258,11 +258,11 @@ struct AgentConversationReplaySerialization: Equatable {
 
         static func removeRefreshInputSignatures(for tabIDs: Set<UUID>) {
             guard !tabIDs.isEmpty else { return }
-            refreshSignatureLock.lock()
-            for tabID in tabIDs {
-                lastRefreshInputSignatureByTabID.removeValue(forKey: tabID)
+            state.withLock {
+                for tabID in tabIDs {
+                    $0.lastRefreshInputSignatureByTabID.removeValue(forKey: tabID)
+                }
             }
-            refreshSignatureLock.unlock()
         }
 
         static func durationMS(since start: TimeInterval) -> Double {

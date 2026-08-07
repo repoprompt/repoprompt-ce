@@ -258,9 +258,10 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
 
         AgentTranscriptDebugInstrumentation.reset()
         defer { AgentTranscriptDebugInstrumentation.reset() }
-        AgentTranscriptDebugInstrumentation.isEnabled = true
         var attempts: [AgentTranscriptRefreshAttemptMetrics] = []
-        AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { attempts.append($0) }
+        AgentTranscriptDebugInstrumentation.configure(.init(
+            refreshAttemptHandler: { attempts.append($0) }
+        ))
 
         emitTranscriptRefreshAttempt(tabID: removedTabID, inputSignature: "removed-signature")
         emitTranscriptRefreshAttempt(tabID: retainedTabID, inputSignature: "retained-signature")
