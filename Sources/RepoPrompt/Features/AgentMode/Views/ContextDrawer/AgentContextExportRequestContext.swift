@@ -62,7 +62,13 @@ struct AgentContextExportViewContext {
     }
 
     var modelRequestIdentity: AgentSelectedFilesModelIdentity {
-        makeModelRequest(flushPendingUI: false).identity
+        let source = makeExportSource(flushPendingUI: false)
+        let cfg = promptManager.resolvePromptContext()
+        return AgentSelectedFilesModelIdentity(
+            exportContextIdentity: source.exportContextIdentity,
+            filePathDisplay: promptManager.filePathDisplayOption,
+            codeMapUsage: cfg.codeMapUsage
+        )
     }
 
     func makeModelRequest(flushPendingUI: Bool = true) -> AgentSelectedFilesModelRequest {
