@@ -78,7 +78,8 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await withCheckedContinuation { continuation in
             let gate = StderrResultGate(continuation: continuation)
             Task {
-                gate.complete(await task.value)
+                let result = await task.value
+                gate.complete(result)
             }
             let timeoutTask = Task {
                 do {
@@ -734,7 +735,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         import signal
         import sys
         import time
-
         sys.stdin.readline()
         os.write(2, base64.b64decode(\(String(reflecting: stderr.base64EncodedString()))))
         release_path = \(releasePath.map(String.init(reflecting:)) ?? "None")
@@ -764,7 +764,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         import json
         import os
         import sys
-
         attempt_path = \(String(reflecting: attemptURL.path))
         try:
             with open(attempt_path, "r", encoding="utf-8") as handle:
@@ -774,7 +773,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         attempt += 1
         with open(attempt_path, "w", encoding="utf-8") as handle:
             handle.write(str(attempt))
-
         for line in sys.stdin:
             request = json.loads(line)
             method = request.get("method")
@@ -801,7 +799,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         import os
         import sys
         import time
-
         sys.stdin.readline()
         os.close(1)
         while True:
@@ -816,7 +813,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         #!/usr/bin/env python3
         import os
         import sys
-
         sys.stdin.readline()
         os.write(2, os.getcwd().encode("utf-8"))
         os.close(1)
@@ -931,18 +927,18 @@ private final class StderrResultGate: @unchecked Sendable {
     private var timeoutTask: Task<Void, Never>?
     private var didComplete = false
 
-    init(continuation: CheckedContinuation<Bool?, Never>) {
-        self.continuation = continuation
+    init(continuation initialContinuation: CheckedContinuation<Bool?, Never>) {
+        continuation = initialContinuation
     }
 
-    func install(timeoutTask: Task<Void, Never>) {
+    func install(timeoutTask newTimeoutTask: Task<Void, Never>) {
         lock.lock()
         if didComplete {
             lock.unlock()
-            timeoutTask.cancel()
+            newTimeoutTask.cancel()
             return
         }
-        self.timeoutTask = timeoutTask
+        timeoutTask = newTimeoutTask
         lock.unlock()
     }
 
@@ -953,14 +949,14 @@ private final class StderrResultGate: @unchecked Sendable {
             return
         }
         didComplete = true
-        let continuation = self.continuation
-        self.continuation = nil
-        let timeoutTask = self.timeoutTask
-        self.timeoutTask = nil
+        let storedContinuation = continuation
+        continuation = nil
+        let storedTimeoutTask = timeoutTask
+        timeoutTask = nil
         lock.unlock()
 
-        timeoutTask?.cancel()
-        continuation?.resume(returning: result)
+        storedTimeoutTask?.cancel()
+        storedContinuation?.resume(returning: result)
     }
 }
 
