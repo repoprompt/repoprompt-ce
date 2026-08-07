@@ -24,10 +24,12 @@ struct PromptContextEntryMetricsSnapshot: Equatable {
     init(totalSelectedDisplayTokens: Int, metrics: [PromptContextEntryMetric]) {
         self.totalSelectedDisplayTokens = totalSelectedDisplayTokens
         metricsByFileID = Dictionary(
-            uniqueKeysWithValues: metrics.map { ($0.fileID, $0) }
+            metrics.map { ($0.fileID, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
         metricsByStandardizedFullPath = Dictionary(
-            uniqueKeysWithValues: metrics.map { ($0.standardizedFullPath, $0) }
+            metrics.map { ($0.standardizedFullPath, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
     }
 
