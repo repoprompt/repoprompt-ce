@@ -14,15 +14,50 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testStderrCaptureCancellationReturnsFalsePromptly() async {
+    func testStderrCaptureCancellationBeforeContinuationInstallationReturnsFalse() async {
         let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
-        let wait = Task { await capture.waitUntilFinished(timeout: 60) }
+        let started = expectation(description: "stderr wait started")
+        let wait = Task {
+            started.fulfill()
+            return await capture.waitUntilFinished(timeout: 60)
+        }
 
-        await Task.yield()
+        await fulfillment(of: [started], timeout: 1)
         wait.cancel()
 
+        let promptResult = await waitForStderrResult(wait)
+        XCTAssertEqual(promptResult, false)
+
+        capture.finish()
         let result = await wait.value
         XCTAssertFalse(result)
+    }
+
+    func testStderrCaptureCancellationRemovesOnlyCancelledWaiter() async {
+        let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
+        let cancelledStarted = expectation(description: "cancelled stderr wait started")
+        let finishingStarted = expectation(description: "finishing stderr wait started")
+        let cancelledWait = Task {
+            cancelledStarted.fulfill()
+            return await capture.waitUntilFinished(timeout: 60)
+        }
+        let finishingWait = Task {
+            finishingStarted.fulfill()
+            return await capture.waitUntilFinished(timeout: 60)
+        }
+
+        await fulfillment(of: [cancelledStarted, finishingStarted], timeout: 1)
+        await Task.yield()
+        cancelledWait.cancel()
+
+        let cancelledPromptResult = await waitForStderrResult(cancelledWait)
+        XCTAssertEqual(cancelledPromptResult, false)
+
+        capture.finish()
+        let cancelledResult = await cancelledWait.value
+        let finishingResult = await finishingWait.value
+        XCTAssertFalse(cancelledResult)
+        XCTAssertTrue(finishingResult)
     }
 
     func testStderrCaptureZeroTimeoutAndFinishedSemanticsRemainDistinct() async {
@@ -34,6 +69,22 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         capture.finish()
         let finished = await capture.waitUntilFinished(timeout: 0)
         XCTAssertTrue(finished)
+    }
+
+    private func waitForStderrResult(
+        _ task: Task<Bool, Never>,
+        timeoutNanoseconds: UInt64 = 1_000_000_000
+    ) async -> Bool? {
+        await withTaskGroup(of: Bool?.self) { group in
+            group.addTask { await task.value }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                return nil
+            }
+            let result = await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     func testStderrCaptureRetainsExactRawSuffixAtEveryBoundary() async {
