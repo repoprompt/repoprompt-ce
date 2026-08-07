@@ -212,6 +212,13 @@ SWIFT_BUILD_ARGS=(-c "$CONF")
 if sentry_linking_enabled; then
     SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)
 fi
+if [[ -n "${REPOPROMPT_SWIFT_JOBS:-}" ]]; then
+    if [[ "$REPOPROMPT_SWIFT_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        SWIFT_BUILD_ARGS+=("--jobs" "$REPOPROMPT_SWIFT_JOBS")
+    else
+        fail "REPOPROMPT_SWIFT_JOBS must be a positive integer"
+    fi
+fi
 PUBLIC_UNIVERSAL_RELEASE=0
 ARCHITECTURE_POLICY="matching"
 if (( IS_RELEASE )) && (( ! USE_LOCAL_SELF_SIGNED_RELEASE )); then
