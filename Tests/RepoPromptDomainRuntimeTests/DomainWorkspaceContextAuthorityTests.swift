@@ -708,6 +708,22 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(reconciled.revisions, secondRevisions)
         XCTAssertEqual(reconciled.document.documentBytes, local.documentBytes)
 
+        let journalURL = try XCTUnwrap(
+            try allFiles(below: fixture.storageRoot.appendingPathComponent("DomainRuntime"))
+                .first {
+                    $0.path.contains("working-journals")
+                        && $0.lastPathComponent == "\(fixture.workspaceID.uuidString).json"
+                }
+        )
+        let journal = try JSONDecoder().decode(
+            DomainWorkingJournal.self,
+            from: Data(contentsOf: journalURL)
+        )
+        XCTAssertNil(
+            journal.workingDocument,
+            "A clean conflict rebase must not leave crash recovery working bytes."
+        )
+
         _ = await first.shutdown()
         _ = await second.shutdown()
         let restarted = fixture.runtime(runtimeID: UUID(), generation: 2)

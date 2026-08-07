@@ -1541,7 +1541,7 @@ package struct DomainPersistenceCoordinator {
                 fileURL: document.fileURL,
                 revisions: newRevisions,
                 savedDigest: externalSavedDigest,
-                workingDocument: document.documentBytes,
+                workingDocument: newRevisions.dirtyRevision == nil ? nil : document.documentBytes,
                 contextRevisions: contextRevisions,
                 contextDigests: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
                     ($0.identity.contextID, $0.contentDigest)
