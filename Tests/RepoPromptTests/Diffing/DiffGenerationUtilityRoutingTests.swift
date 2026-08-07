@@ -31,6 +31,48 @@ final class DiffGenerationUtilityRoutingTests: XCTestCase {
         XCTAssertEqual(result, "same\nskip\nreplacement\nmiddle\nreplacement")
     }
 
+    func testFuzzyProbeIgnoresPreBoundaryKeysBeforeSpendingBudget() throws {
+        let selectorText = "calculate total for selected invoice line items"
+        let selector = DiffGenerationUtility.processLine(selectorText, precision: .high)
+        let minimumMatchIndex = 401
+        let prefix = (0 ..< minimumMatchIndex).map { "unrelated pre-boundary key \($0)" }
+        let content = prefix.map {
+            DiffGenerationUtility.processLine($0, precision: .high)
+        } + [selector]
+
+        var lineIndex = Dictionary(
+            uniqueKeysWithValues: prefix.enumerated().map { index, line in
+                (DiffGenerationUtility.processLine(line, precision: .high).removedTagsHigh, [index])
+            }
+        )
+        let fuzzyAliases = (0 ..< 1_024).map {
+            "calculate total for selected invoice line item \($0)"
+        }
+        let fuzzyAlias = try XCTUnwrap(
+            fuzzyAliases.first { candidate in
+                var candidateIndex = lineIndex
+                candidateIndex[candidate] = [minimumMatchIndex]
+                guard let position = Array(candidateIndex.keys).firstIndex(of: candidate) else {
+                    return false
+                }
+                return position >= 400
+            },
+            "The test needs a fuzzy alias after the 400-key probe boundary"
+        )
+        lineIndex[fuzzyAlias] = [minimumMatchIndex]
+
+        let result = try DiffGenerationUtility.matchSelectorFast(
+            selector: [selector],
+            content: content,
+            lineIndex: lineIndex,
+            maxFuzzyKeys: 400,
+            fuzzyThreshold: 0.80,
+            minimumMatchIndex: minimumMatchIndex
+        )
+
+        XCTAssertEqual(result, minimumMatchIndex)
+    }
+
     func testBatchReplaceAllKeepsFullFileIndexCoordinatesAfterFirstMatch() async throws {
         let original = [
             "header",
