@@ -1,9 +1,19 @@
 import AppKit
 import SwiftUI
 
-extension EnvironmentValues {
-    @Entry var agentWindowIsFocused: Bool = true
+// swiftformat:disable environmentEntry
+private struct AgentWindowIsFocusedKey: EnvironmentKey {
+    static let defaultValue = true
 }
+
+extension EnvironmentValues {
+    var agentWindowIsFocused: Bool {
+        get { self[AgentWindowIsFocusedKey.self] }
+        set { self[AgentWindowIsFocusedKey.self] = newValue }
+    }
+}
+
+// swiftformat:enable environmentEntry
 
 // MARK: - Message Footer Strip
 

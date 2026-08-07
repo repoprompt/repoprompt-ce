@@ -94,9 +94,19 @@ final class MarkdownFileLinkOpener {
     }
 }
 
-extension EnvironmentValues {
-    @Entry var markdownFileLinkOpener: MarkdownFileLinkOpener?
+// swiftformat:disable environmentEntry
+private struct MarkdownFileLinkOpenerKey: EnvironmentKey {
+    static let defaultValue: MarkdownFileLinkOpener? = nil
 }
+
+extension EnvironmentValues {
+    var markdownFileLinkOpener: MarkdownFileLinkOpener? {
+        get { self[MarkdownFileLinkOpenerKey.self] }
+        set { self[MarkdownFileLinkOpenerKey.self] = newValue }
+    }
+}
+
+// swiftformat:enable environmentEntry
 
 extension NSAttributedString.Key {
     static let markdownRawLink = NSAttributedString.Key("markdownRawLink")
