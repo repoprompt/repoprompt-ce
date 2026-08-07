@@ -941,9 +941,6 @@ enum HistoryMCPToolService {
         for error: HistorySessionScannerError,
         phase: String
     ) -> HistoryScanDiagnostic {
-        if let diagnostic = error.scanDiagnostic {
-            return diagnostic
-        }
         switch error {
         case .sessionFileNotFound:
             return sessionReadFailureDiagnostic(phase: phase)
