@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Stable Codex version (for example 0.146.0)
+        description: Stable Codex version (for example 0.148.0)
         required: false
         type: string
       tag:
-        description: Stable Codex tag (for example rust-v0.146.0)
+        description: Stable Codex tag (for example rust-v0.148.0)
         required: false
         type: string
       latest_stable:
