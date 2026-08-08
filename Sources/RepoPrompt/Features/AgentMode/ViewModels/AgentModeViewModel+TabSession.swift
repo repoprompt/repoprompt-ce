@@ -418,11 +418,32 @@ extension AgentModeViewModel {
         var instructionTimeoutTask: Task<Void, Never>?
         var instructionWaitID: UUID?
 
-        // Agent run
-        var runID: UUID?
-        private(set) var runLifecycleTracker = AgentRunLifecycleTracker()
+        /// Agent run — transient run-attempt lifecycle/settlement state is owned by
+        /// the extracted `AgentRunAttemptLifecycle` facade. The properties below are
+        /// stable forwarders so existing call sites keep working; mutation happens
+        /// through the facade's named operations.
+        let runLifecycle = AgentRunAttemptLifecycle()
+
+        var runID: UUID? {
+            get { runLifecycle.currentRunID }
+            set {
+                if let newValue {
+                    runLifecycle.installRunID(newValue)
+                } else {
+                    runLifecycle.clearRunID()
+                }
+            }
+        }
+
+        /// Clears the run ID only when it still matches the caller's run, so a
+        /// stale cleanup cannot clear a successor run's identity.
+        @discardableResult
+        func clearRunID(ifCurrent runID: UUID) -> Bool {
+            runLifecycle.clearRunID(ifCurrent: runID)
+        }
+
         var activeRunOwnership: AgentRunOwnership? {
-            runLifecycleTracker.activeOwnership
+            runLifecycle.activeOwnership
         }
 
         var activeRunAttemptID: UUID? {
@@ -430,7 +451,7 @@ extension AgentModeViewModel {
         }
 
         var activeRunLiveness: AgentRunLivenessSnapshot? {
-            runLifecycleTracker.liveness
+            runLifecycle.liveness
         }
 
         var provider: HeadlessAgentProvider?
@@ -539,11 +560,30 @@ extension AgentModeViewModel {
         var assistantDeltaFlushTask: Task<Void, Never>?
         var assistantDeltaTaskGeneration: UInt64 = 0
         var assistantDeltaFlushGeneration: UInt64 = 0
-        var providerTerminalDrainGeneration: UInt64 = 0
-        var terminalCommitInProgress: Bool = false
-        var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
-        var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
-        var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
+        var providerTerminalDrainGeneration: UInt64 {
+            runLifecycle.providerTerminalDrainGeneration
+        }
+
+        func bumpProviderTerminalDrainGeneration() {
+            runLifecycle.bumpProviderTerminalDrainGeneration()
+        }
+
+        var terminalCommitInProgress: Bool {
+            runLifecycle.terminalCommitInProgress
+        }
+
+        var lastTerminalCommitRevision: AgentRunTerminalCommitRevision? {
+            runLifecycle.lastTerminalCommitRevision
+        }
+
+        var lastTerminalPublicationResult: AgentRunTerminalPublicationResult? {
+            runLifecycle.lastTerminalPublicationResult
+        }
+
+        var runAttemptTerminalResources: AgentRunAttemptTerminalResources? {
+            runLifecycle.terminalResources
+        }
+
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.
         var pendingHandoff: PendingHandoffState = .init()
@@ -652,8 +692,7 @@ extension AgentModeViewModel {
             // Terminal commit revisions are scoped to the binding captured by
             // their run ownership. A rebind must not carry that runtime-only
             // classification or publication result into another session.
-            lastTerminalCommitRevision = nil
-            lastTerminalPublicationResult = nil
+            runLifecycle.invalidateTerminalRevisionForBindingTransition()
             authoritativeHydratedBinding = nil
             authoritativeHydratedBindingTransitionGeneration = nil
             return bindingTransitionGeneration
@@ -718,33 +757,22 @@ extension AgentModeViewModel {
             ownership: AgentRunOwnership,
             prepare: @escaping AgentRunAttemptTerminalResources.Prepare
         ) {
-            guard isCurrentRunAttempt(ownership) else { return }
-            runAttemptTerminalResources = AgentRunAttemptTerminalResources(
-                ownership: ownership,
-                prepare: prepare
-            )
+            runLifecycle.installTerminalResources(ownership: ownership, prepare: prepare)
         }
 
         func claimRunAttemptTerminalTeardown(
             ownership: AgentRunOwnership,
             terminalState: AgentSessionRunState
         ) -> AgentRunAttemptTerminalResources.Teardown? {
-            guard let resources = runAttemptTerminalResources else { return nil }
-            let teardown = resources.claim(for: ownership, terminalState: terminalState)
-            if resources.isClaimed {
-                runAttemptTerminalResources = nil
-            }
-            return teardown
+            runLifecycle.claimTerminalTeardown(ownership: ownership, terminalState: terminalState)
         }
 
         @discardableResult
         func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
-            assert(runAttemptTerminalResources == nil || runAttemptTerminalResources?.isClaimed == true)
-            runAttemptTerminalResources = nil
-            terminalCommitInProgress = false
-            lastTerminalCommitRevision = nil
-            lastTerminalPublicationResult = nil
-            providerTerminalDrainGeneration = 0
+            // Host-specific responsibilities stay here: Codex routing resets and
+            // exactly-once MCP prepared-epoch consumption. The neutral attempt
+            // initialization (terminal-state reset + tracker begin) is delegated
+            // to the facade, which preserves the installed run ID.
             codexAuthoritativeActiveTurn = nil
             codexAnonymousActiveTurn = nil
             codexRoutingObservedTurnID = nil
@@ -757,13 +785,15 @@ extension AgentModeViewModel {
                     mcpControlContext = context
                 }
             }
-            let ownership = runLifecycleTracker.begin(
-                tabID: tabID,
-                persistentSessionID: activeAgentSessionID,
-                persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
-                bindingTransitionGeneration: bindingTransitionGeneration,
-                attemptID: attemptID,
-                turnEpoch: turnEpoch
+            let ownership = runLifecycle.beginAttempt(
+                context: .init(
+                    tabID: tabID,
+                    persistentSessionID: activeAgentSessionID,
+                    persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
+                    bindingTransitionGeneration: bindingTransitionGeneration,
+                    turnEpoch: turnEpoch
+                ),
+                attemptID: attemptID
             )
             #if DEBUG
                 AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
@@ -785,11 +815,7 @@ extension AgentModeViewModel {
         }
 
         func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
-            guard activeRunOwnership == ownership else { return false }
-            if let expectedRunID {
-                return runID == expectedRunID
-            }
-            return true
+            runLifecycle.isCurrentAttempt(ownership, expectedRunID: expectedRunID)
         }
 
         func isCurrentRunAttemptForCurrentBinding(
@@ -812,7 +838,7 @@ extension AgentModeViewModel {
             retryIntent: AgentRunRetryIntent = .none,
             timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
         ) -> AgentRunProgressAcceptance {
-            let result = runLifecycleTracker.record(
+            let result = runLifecycle.recordProgress(
                 ownership: ownership,
                 kind: kind,
                 stage: stage,
@@ -825,14 +851,14 @@ extension AgentModeViewModel {
 
         @discardableResult
         func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
-            let result = runLifecycleTracker.accept(signal)
+            let result = runLifecycle.acceptProgress(signal)
             recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
             return result
         }
 
         @discardableResult
         func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
-            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
             recordRunAttemptEnded(ownership, source: source)
             return true
         }
@@ -840,7 +866,7 @@ extension AgentModeViewModel {
         @discardableResult
         func endCurrentRunAttempt(source: String) -> Bool {
             guard let ownership = activeRunOwnership else { return false }
-            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
             recordRunAttemptEnded(ownership, source: source)
             return true
         }

@@ -6544,7 +6544,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         finalizePendingToolCalls(in: session, turnStatus: turnStatus)
         finalizeLingeringRunningCommandExecutionResults(in: session, turnStatus: turnStatus)
         reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
-        session.providerTerminalDrainGeneration &+= 1
+        session.bumpProviderTerminalDrainGeneration()
     }
 
     private func finalizeCodexRun(
