@@ -923,6 +923,70 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(recorder.events.count(where: { $0 == "assistant-flush" }), 1)
     }
 
+    func testFailedTerminalCommitStampsFailureReasonAndDuplicateSettlementPreservesIt() async throws {
+        let recorder = LifecycleRecorder()
+        var envelopeFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+        var publishedFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+        var publicationAttempts = 0
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, revision, _ in
+                publicationAttempts += 1
+                publishedFailureReasons.append(revision.failureReason)
+                return publicationAttempts == 1
+                    ? .rejected(reason: "test_transient_rejection")
+                    : .accepted(successorEpoch: nil)
+            },
+            makeTerminalPublicationEnvelope: { _, _, _, _, failureReason in
+                envelopeFailureReasons.append(failureReason)
+                return nil
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.failureReasonStamp")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("Provider request timed out after 60 seconds", sequenceIndex: 1)
+            ],
+            compact: false
+        )
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .failed,
+            source: "test.failureReasonStamp",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        )
+
+        let firstResult = await barrier.commit(request)
+        let first = try XCTUnwrap(firstResult)
+        XCTAssertEqual(first.failureReason, .timeout)
+        XCTAssertEqual(envelopeFailureReasons, [.timeout])
+        XCTAssertEqual(publishedFailureReasons, [.timeout])
+
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("transport closed unexpectedly", sequenceIndex: 1)
+            ],
+            compact: false
+        )
+        let duplicateResult = await barrier.commit(request)
+        let duplicate = try XCTUnwrap(duplicateResult)
+        XCTAssertEqual(duplicate, first)
+        XCTAssertEqual(duplicate.failureReason, .timeout)
+        XCTAssertEqual(envelopeFailureReasons, [.timeout])
+        XCTAssertEqual(publishedFailureReasons, [.timeout, .timeout])
+    }
+
     func testQueuedFollowUpStartsOnlyAfterCanonicalSuccessorPublicationResolves() async {
         let recorder = LifecycleRecorder()
         let sessionID = UUID()
@@ -955,7 +1019,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ? .rejected(reason: "test_transient_rejection")
                     : .accepted(successorEpoch: successor)
             },
-            makeTerminalPublicationEnvelope: { _, _, _, _ in
+            makeTerminalPublicationEnvelope: { _, _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
             startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
@@ -1606,7 +1670,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
             AgentSessionRunState,
-            UUID?
+            UUID?,
+            AgentRunMCPSnapshot.FailureReason?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
         startFollowUpRun: ((UUID, String) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
@@ -1667,7 +1732,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ),
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-                makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
+                makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _, _ in nil },
                 publishTerminalCommit: { session, revision, successorKind in
                     if let publishTerminalCommitResult {
                         return await publishTerminalCommitResult(session, revision, successorKind)

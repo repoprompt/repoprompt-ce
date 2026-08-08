@@ -1,8 +1,19 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 extension AgentSessionRunState {
     var isTerminalForCommit: Bool {
         self == .completed || self == .cancelled || self == .failed
+    }
+
+    /// MCP snapshot status equivalent of a committed terminal run state.
+    var mcpTerminalSnapshotStatus: DomainAgentRunSnapshot.Status? {
+        switch self {
+        case .completed: .completed
+        case .failed: .failed
+        case .cancelled: .cancelled
+        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval: nil
+        }
     }
 }
 
@@ -10,6 +21,7 @@ struct AgentRunTerminalCommitRevision: Equatable {
     let commitID: UUID
     let ownership: AgentRunOwnership
     let terminalState: AgentSessionRunState
+    let failureReason: DomainAgentRunSnapshot.FailureReason?
     let expectedRunID: UUID?
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
@@ -38,6 +50,7 @@ final class AgentRunTerminalCommitBarrier {
         let source: String
         let completion: AgentModeRunService.CancellationCompletion
         let errorText: String?
+        let failureReason: DomainAgentRunSnapshot.FailureReason?
         let attachmentReservationID: UUID?
         let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition
         let finalizeNonCodexUsage: Bool
@@ -57,6 +70,7 @@ final class AgentRunTerminalCommitBarrier {
             source: String,
             completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
             errorText: String? = nil,
+            failureReason: DomainAgentRunSnapshot.FailureReason? = nil,
             attachmentReservationID: UUID? = nil,
             attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition,
             finalizeNonCodexUsage: Bool,
@@ -75,6 +89,7 @@ final class AgentRunTerminalCommitBarrier {
             self.source = source
             self.completion = completion
             self.errorText = errorText
+            self.failureReason = failureReason
             self.attachmentReservationID = attachmentReservationID
             self.attachmentDisposition = attachmentDisposition
             self.finalizeNonCodexUsage = finalizeNonCodexUsage
@@ -275,10 +290,14 @@ final class AgentRunTerminalCommitBarrier {
         } else {
             providerSuccessor?.transitionKind
         }
+        // Resolved exactly once at settlement; the publication envelope is built
+        // before the revision is stored, so the reason is threaded explicitly.
+        let failureReason = resolveTerminalFailureReason(request: request, session: session)
         let revision = AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: request.ownership,
             terminalState: request.terminalState,
+            failureReason: failureReason,
             expectedRunID: request.expectedRunID,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
@@ -287,7 +306,8 @@ final class AgentRunTerminalCommitBarrier {
                 session,
                 request.ownership,
                 request.terminalState,
-                request.expectedRunID
+                request.expectedRunID,
+                failureReason
             ),
             successorKind: successorKind,
             providerSuccessorID: providerSuccessor?.id
@@ -343,6 +363,29 @@ final class AgentRunTerminalCommitBarrier {
             )
         #endif
         return revision
+    }
+
+    /// Settles the terminal failure classification for a commit. Runs after the
+    /// transcript flush/finalization and after any request error item has been
+    /// appended, so the failed-state text classification sees the same latest
+    /// settled error text the publication snapshot projects today.
+    private func resolveTerminalFailureReason(
+        request: Request,
+        session: AgentModeViewModel.TabSession
+    ) -> DomainAgentRunSnapshot.FailureReason? {
+        switch request.terminalState {
+        case .cancelled:
+            return .cancelled
+        case .failed:
+            if let failureReason = request.failureReason {
+                return failureReason
+            }
+            let settledFailureText = AgentTranscriptIO.latestErrorText(from: session.transcript, latestTurnOnly: true)
+                ?? AgentTranscriptIO.latestErrorText(from: session.transcript, latestTurnOnly: false)
+            return DomainAgentRunSnapshot.FailureReason.classify(status: .failed, statusText: settledFailureText)
+        default:
+            return nil
+        }
     }
 
     private func notifyProviderSuccessor(

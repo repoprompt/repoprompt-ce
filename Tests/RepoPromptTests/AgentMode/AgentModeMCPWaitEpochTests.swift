@@ -50,6 +50,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             commitID: UUID(),
             ownership: firstOwnership,
             terminalState: .completed,
+            failureReason: nil,
             expectedRunID: nil,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
@@ -653,6 +654,106 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testLiveTerminalSnapshotPrefersStampedFailureReasonOverDisplayTextClassification() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        let runID = UUID()
+        session.runID = runID
+        let ownership = session.beginRunAttempt(source: "test.stampedFailureReason")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("Run timed out waiting for the provider", sequenceIndex: 1)
+            ],
+            terminalState: .failed,
+            compact: false
+        )
+        session.runState = .failed
+        session.mcpFollowUpRunPending = false
+
+        let envelope = try XCTUnwrap(viewModel.test_makeTerminalPublicationEnvelope(
+            for: session,
+            ownership: ownership,
+            terminalState: .failed,
+            providerRunID: runID,
+            failureReason: .processCrash
+        ))
+        XCTAssertEqual(envelope.snapshot.status, .failed)
+        XCTAssertEqual(envelope.snapshot.failureReason, .processCrash)
+
+        session.lastTerminalCommitRevision = AgentRunTerminalCommitRevision(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: .failed,
+            failureReason: .processCrash,
+            expectedRunID: runID,
+            sourceItemsRevision: session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        )
+        let livePoll = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(livePoll.status, .failed)
+        XCTAssertEqual(livePoll.statusText, "Run timed out waiting for the provider")
+        XCTAssertEqual(livePoll.failureReason, .processCrash)
+        XCTAssertEqual(livePoll.asObject()["failure_reason"]?.stringValue, "process_crash")
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    func testRestoredTerminalSnapshotWithoutMatchingRevisionFallsBackToTextClassification() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil
+        )
+        let ownership = session.beginRunAttempt(source: "test.restoredFallback")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("Run timed out waiting for the provider", sequenceIndex: 1)
+            ],
+            terminalState: .failed,
+            compact: false
+        )
+        session.runState = .idle
+
+        let restored = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(restored.status, .failed)
+        XCTAssertEqual(restored.failureReason, .timeout)
+
+        session.lastTerminalCommitRevision = AgentRunTerminalCommitRevision(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: .failed,
+            failureReason: .processCrash,
+            expectedRunID: UUID(),
+            sourceItemsRevision: session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        )
+        let unrelatedAttempt = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(unrelatedAttempt.failureReason, .timeout)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     func testControlledTerminalPublicationRejectsMissingCanonicalEnvelope() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
@@ -668,6 +769,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             commitID: UUID(),
             ownership: ownership,
             terminalState: .completed,
+            failureReason: nil,
             expectedRunID: nil,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,

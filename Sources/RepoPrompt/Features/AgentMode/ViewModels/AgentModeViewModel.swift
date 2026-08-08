@@ -792,13 +792,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             for session: TabSession,
             ownership: AgentRunOwnership,
             terminalState: AgentSessionRunState,
-            providerRunID: UUID? = nil
+            providerRunID: UUID? = nil,
+            failureReason: AgentRunMCPSnapshot.FailureReason? = nil
         ) -> AgentRunTerminalPublicationEnvelope? {
             makeTerminalPublicationEnvelope(
                 for: session,
                 ownership: ownership,
                 terminalState: terminalState,
-                providerRunID: providerRunID
+                providerRunID: providerRunID,
+                failureReason: failureReason
             )
         }
 
@@ -2295,12 +2297,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 prepareTerminalPublication: { [weak self] session in
                     self?.prepareTerminalPublication(for: session)
                 },
-                makeTerminalPublicationEnvelope: { [weak self] session, ownership, terminalState, providerRunID in
+                makeTerminalPublicationEnvelope: { [weak self] session, ownership, terminalState, providerRunID, failureReason in
                     self?.makeTerminalPublicationEnvelope(
                         for: session,
                         ownership: ownership,
                         terminalState: terminalState,
-                        providerRunID: providerRunID
+                        providerRunID: providerRunID,
+                        failureReason: failureReason
                     )
                 },
                 publishTerminalCommit: { [weak self] session, revision, successorKind in
@@ -4992,7 +4995,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         ownership: AgentRunOwnership,
         terminalState: AgentSessionRunState,
-        providerRunID: UUID?
+        providerRunID: UUID?,
+        failureReason: AgentRunMCPSnapshot.FailureReason?
     ) -> AgentRunTerminalPublicationEnvelope? {
         guard let epoch = ownership.turnEpoch,
               let context = session.mcpControlContext,
@@ -5002,7 +5006,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               let snapshot = mcpSnapshot(
                   for: session,
                   canonicalTerminalState: terminalState,
-                  canonicalProviderRunID: providerRunID
+                  canonicalProviderRunID: providerRunID,
+                  canonicalFailureReason: failureReason
               )
         else {
             return nil
@@ -5429,7 +5434,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func mcpSnapshot(
         for session: TabSession,
         canonicalTerminalState: AgentSessionRunState? = nil,
-        canonicalProviderRunID: UUID? = nil
+        canonicalProviderRunID: UUID? = nil,
+        canonicalFailureReason: AgentRunMCPSnapshot.FailureReason? = nil
     ) -> AgentRunMCPSnapshot? {
         guard let context = session.mcpControlContext else { return nil }
         let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
@@ -5540,7 +5546,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name { return name }
             return "Agent Session"
         }()
-        let failureReason = AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: resolvedStatusText)
         let providerRunID: UUID? = if canonicalTerminalState != nil {
             canonicalProviderRunID ?? AgentModeProcessRunIdentity.mostRecentTranscriptProcessRunID(for: session)
         } else if status.isTerminal {
@@ -5548,6 +5553,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             session.runID
         }
+        let failureReason: AgentRunMCPSnapshot.FailureReason? = {
+            if let canonicalFailureReason {
+                return canonicalFailureReason
+            }
+            // Live post-terminal polls reuse the reason stamped by the terminal
+            // commit barrier; the terminal-state and run-identity guards keep a
+            // stale revision from another terminal state/attempt from
+            // contaminating this snapshot. Text classification remains only as
+            // the restored/legacy fallback.
+            if canonicalTerminalState == nil,
+               let revision = session.lastTerminalCommitRevision,
+               let stampedReason = revision.failureReason,
+               revision.terminalState.mcpTerminalSnapshotStatus == status,
+               revision.expectedRunID == providerRunID
+            {
+                return stampedReason
+            }
+            return AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: resolvedStatusText)
+        }()
         return AgentRunMCPSnapshot(
             sessionID: resolvedSessionID,
             runID: providerRunID,
