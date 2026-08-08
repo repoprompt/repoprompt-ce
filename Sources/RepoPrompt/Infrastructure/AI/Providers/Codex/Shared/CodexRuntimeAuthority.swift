@@ -128,7 +128,7 @@ enum CodexRuntimeAuthority {
         }
 
         static func parse(_ text: String) -> Version? {
-            let pattern = #"(?<![0-9])([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?![0-9A-Za-z.+-])"#
+            let pattern = #"(?<![0-9A-Za-z.+-])([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?![0-9A-Za-z.+-])"#
             guard let regex = try? NSRegularExpression(pattern: pattern),
                   let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
                   match.numberOfRanges == 5,
@@ -142,6 +142,12 @@ enum CodexRuntimeAuthority {
                 return nil
             }
             let prerelease = Range(match.range(at: 4), in: text).map { String(text[$0]) }
+            if let prerelease {
+                let hasInvalidNumericIdentifier = prerelease.split(separator: ".").contains { identifier in
+                    identifier.count > 1 && identifier.first == "0" && identifier.allSatisfy(\.isNumber)
+                }
+                guard !hasInvalidNumericIdentifier else { return nil }
+            }
             return Version(major: major, minor: minor, patch: patch, prerelease: prerelease)
         }
 

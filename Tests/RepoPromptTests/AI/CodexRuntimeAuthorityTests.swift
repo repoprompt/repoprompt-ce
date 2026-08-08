@@ -91,6 +91,15 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         )
     }
 
+    func testVersionParserRejectsMalformedTokensAndInvalidNumericPrereleaseIdentifiers() {
+        XCTAssertNil(CodexRuntimeAuthority.Version.parse("codex-cli 0.147.0.1"))
+        XCTAssertNil(CodexRuntimeAuthority.Version.parse("codex-cli 0.147.0-rc.01"))
+        XCTAssertEqual(
+            CodexRuntimeAuthority.Version.parse("codex-cli 0.147.0-rc.1"),
+            .init(major: 0, minor: 147, patch: 0, prerelease: "rc.1")
+        )
+    }
+
     func testExplicitExternalOverrideIsAbsoluteVersionGatedAndObservable() async throws {
         let override = temporaryDirectory.appendingPathComponent("external/codex")
         try makeExecutable(at: override)
