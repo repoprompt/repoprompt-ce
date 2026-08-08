@@ -69,6 +69,25 @@ actor DirectHeadlessProviderCoordinator {
         ]
     }
 
+    static func codexExecArguments(model: String?, fullAccess: Bool) -> [String] {
+        var arguments: [String] = []
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
+            arguments += ["--model", model]
+        }
+        arguments += ["exec", "--skip-git-repo-check"]
+        if fullAccess {
+            arguments.append("--dangerously-bypass-approvals-and-sandbox")
+        } else {
+            arguments += ["--sandbox", "workspace-write"]
+        }
+        arguments += ["--json", "-"]
+        return arguments
+    }
+
+    static func codexFullAccessEnabled(environment: [String: String]) -> Bool {
+        environment["REPOPROMPT_CODEX_EXEC_FULL_ACCESS"] == "1"
+    }
+
     func runProviderOnce(
         message: String,
         providerID: String?,
@@ -82,11 +101,10 @@ actor DirectHeadlessProviderCoordinator {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
         let snapshot = try await context.snapshot(for: request)
-        var arguments: [String] = []
-        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
-            arguments += ["--model", model]
-        }
-        arguments += ["exec", "--json", "--skip-git-repo-check", "--full-auto", "-"]
+        let arguments = Self.codexExecArguments(
+            model: model,
+            fullAccess: Self.codexFullAccessEnabled(environment: environment)
+        )
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }

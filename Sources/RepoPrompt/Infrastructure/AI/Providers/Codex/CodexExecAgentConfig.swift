@@ -6,16 +6,19 @@ struct CodexExecAgentConfig {
     let additionalPathHints: [String]
     let modelString: String?
     let enableDebugLogging: Bool
+    let fullAccess: Bool
 
     init(
         commandName: String? = nil,
         additionalPathHints: [String] = CLIPathHints.codex,
         modelString: String? = nil,
-        enableDebugLogging: Bool = false
+        enableDebugLogging: Bool = false,
+        fullAccess: Bool = false
     ) {
         self.commandName = commandName ?? CLILaunchProfiles.codex.commandName
         self.additionalPathHints = additionalPathHints
         self.modelString = modelString
         self.enableDebugLogging = enableDebugLogging
+        self.fullAccess = fullAccess
     }
 }
