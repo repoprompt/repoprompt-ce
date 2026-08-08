@@ -21,8 +21,11 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
 
         let loadStarted = expectation(description: "initial settings load started")
         let waiterJoined = expectation(description: "concurrent bootstrap joined shared load")
+        let firstCompleted = expectation(description: "initial bootstrap completed")
+        let secondCompleted = expectation(description: "joined bootstrap completed")
         let releaseLoad = TestGate()
         let events = EventRecorder()
+        let results = TestResultRecorder<DomainSettingValue>()
         let store = DomainDirectSettingsStore(
             persistence: persistence,
             profileIdentifier: profile
@@ -35,29 +38,42 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
                 await releaseLoad.wait()
             case .waiterJoined:
                 waiterJoined.fulfill()
-            case .loadPublished, .willCompareAndSwap:
+            case .loadPublished:
                 break
             }
         }
 
         let first = Task {
-            await store.bootstrap()
-            return try await store.effectiveValue(
-                for: "agent_mode.show_built_in_workflow_cleanup_guidance"
-            )
+            let result = await readCleanupGuidance(from: store)
+            await results.record(result, for: "first")
+            firstCompleted.fulfill()
         }
-        await fulfillment(of: [loadStarted], timeout: 1)
+        guard await waitForCompletion(of: [loadStarted]) else {
+            await releaseLoad.open()
+            first.cancel()
+            return
+        }
         let second = Task {
-            await store.bootstrap()
-            return try await store.effectiveValue(
-                for: "agent_mode.show_built_in_workflow_cleanup_guidance"
-            )
+            let result = await readCleanupGuidance(from: store)
+            await results.record(result, for: "second")
+            secondCompleted.fulfill()
         }
-        await fulfillment(of: [waiterJoined], timeout: 1)
+        guard await waitForCompletion(of: [waiterJoined]) else {
+            await releaseLoad.open()
+            first.cancel()
+            second.cancel()
+            return
+        }
         await releaseLoad.open()
+        guard await waitForCompletion(of: [firstCompleted, secondCompleted]) else {
+            first.cancel()
+            second.cancel()
+            return
+        }
 
-        let values = try await [first.value, second.value]
-        XCTAssertEqual(values, [.bool(false), .bool(false)])
+        let recordedResults = await results.values()
+        XCTAssertEqual(recordedResults["first"], .success(.bool(false)))
+        XCTAssertEqual(recordedResults["second"], .success(.bool(false)))
         let recordedEvents = await events.values()
         XCTAssertEqual(recordedEvents, [.loadStarted, .waiterJoined, .loadPublished])
     }
@@ -80,8 +96,11 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
 
         let loadStarted = expectation(description: "initial settings load started")
         let waiterJoined = expectation(description: "concurrent write joined shared load")
+        let firstCompleted = expectation(description: "initial bootstrap completed")
+        let secondCompleted = expectation(description: "joined write completed")
         let releaseLoad = TestGate()
         let events = EventRecorder()
+        let results = TestResultRecorder<UInt64>()
         let store = DomainDirectSettingsStore(
             persistence: persistence,
             profileIdentifier: profile
@@ -94,30 +113,53 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
                 await releaseLoad.wait()
             case .waiterJoined:
                 waiterJoined.fulfill()
-            case .loadPublished, .willCompareAndSwap:
+            case .loadPublished:
                 break
             }
         }
 
-        let first = Task { await store.bootstrap() }
-        await fulfillment(of: [loadStarted], timeout: 1)
-        let second = Task {
+        let first = Task {
             await store.bootstrap()
-            return try await store.set(
-                key: "agent_mode.show_built_in_workflow_cleanup_guidance",
-                value: .bool(true)
-            )
+            firstCompleted.fulfill()
         }
-        await fulfillment(of: [waiterJoined], timeout: 1)
+        guard await waitForCompletion(of: [loadStarted]) else {
+            await releaseLoad.open()
+            first.cancel()
+            return
+        }
+        let second = Task {
+            let result: TestTaskResult<UInt64>
+            do {
+                await store.bootstrap()
+                result = try await .success(store.set(
+                    key: "agent_mode.show_built_in_workflow_cleanup_guidance",
+                    value: .bool(true)
+                ))
+            } catch {
+                result = .failure(String(describing: error))
+            }
+            await results.record(result, for: "second")
+            secondCompleted.fulfill()
+        }
+        guard await waitForCompletion(of: [waiterJoined]) else {
+            await releaseLoad.open()
+            first.cancel()
+            second.cancel()
+            return
+        }
         await releaseLoad.open()
+        guard await waitForCompletion(of: [firstCompleted, secondCompleted]) else {
+            first.cancel()
+            second.cancel()
+            return
+        }
 
-        await first.value
-        let revision = try await second.value
-        XCTAssertEqual(revision, 2)
+        let recordedResults = await results.values()
+        XCTAssertEqual(recordedResults["second"], .success(2))
         let recordedEvents = await events.values()
         XCTAssertEqual(
             recordedEvents,
-            [.loadStarted, .waiterJoined, .loadPublished, .willCompareAndSwap]
+            [.loadStarted, .waiterJoined, .loadPublished]
         )
 
         let verifier = DomainDirectSettingsStore(
@@ -156,8 +198,20 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
         let recordedEvents = await events.values()
         XCTAssertEqual(
             recordedEvents,
-            [.loadStarted, .loadPublished, .willCompareAndSwap]
+            [.loadStarted, .loadPublished]
         )
+    }
+
+    private func waitForCompletion(
+        of expectations: [XCTestExpectation],
+        timeout: TimeInterval = 1
+    ) async -> Bool {
+        let result = await XCTWaiter.fulfillment(of: expectations, timeout: timeout)
+        guard result == .completed else {
+            XCTFail("Timed out waiting for task completion: \(result)")
+            return false
+        }
+        return true
     }
 
     private func makePersistence(root: URL, profile: String) -> DomainPersistenceCoordinator {
@@ -177,6 +231,19 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
             externalReloadInterval: nil
         )
         return DomainPersistenceCoordinator(configuration: configuration, identity: identity)
+    }
+}
+
+private func readCleanupGuidance(
+    from store: DomainDirectSettingsStore
+) async -> TestTaskResult<DomainSettingValue> {
+    do {
+        await store.bootstrap()
+        return try await .success(store.effectiveValue(
+            for: "agent_mode.show_built_in_workflow_cleanup_guidance"
+        ))
+    } catch {
+        return .failure(String(describing: error))
     }
 }
 
@@ -207,6 +274,23 @@ private actor EventRecorder {
     }
 
     func values() -> [DomainDirectSettingsBootstrapEvent] {
+        recorded
+    }
+}
+
+private enum TestTaskResult<Value: Equatable & Sendable>: Equatable {
+    case success(Value)
+    case failure(String)
+}
+
+private actor TestResultRecorder<Value: Equatable & Sendable> {
+    private var recorded: [String: TestTaskResult<Value>] = [:]
+
+    func record(_ result: TestTaskResult<Value>, for key: String) {
+        recorded[key] = result
+    }
+
+    func values() -> [String: TestTaskResult<Value>] {
         recorded
     }
 }

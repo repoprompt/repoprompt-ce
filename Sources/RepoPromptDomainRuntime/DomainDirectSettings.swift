@@ -160,11 +160,10 @@ private struct DomainDirectSettingsDocument: Codable, Sendable {
     let updatedAt: Date
 }
 
-package enum DomainDirectSettingsBootstrapEvent: Equatable, Sendable {
+enum DomainDirectSettingsBootstrapEvent: Equatable, Sendable {
     case loadStarted
     case waiterJoined
     case loadPublished
-    case willCompareAndSwap
 }
 
 package actor DomainDirectSettingsStore {
@@ -251,7 +250,6 @@ package actor DomainDirectSettingsStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(document)
-        await bootstrapEventHandler?(.willCompareAndSwap)
         do {
             try await persistence.compareAndSwapDirectSettingsData(expectedDigest: persistedDigest, data: data)
         } catch DomainPersistenceError.externalDocumentConflict {
@@ -264,7 +262,7 @@ package actor DomainDirectSettingsStore {
     }
 }
 
-package extension DomainDirectSettingsStore {
+extension DomainDirectSettingsStore {
     func test_setBootstrapEventHandler(
         _ handler: (@Sendable (DomainDirectSettingsBootstrapEvent) async -> Void)?
     ) {
