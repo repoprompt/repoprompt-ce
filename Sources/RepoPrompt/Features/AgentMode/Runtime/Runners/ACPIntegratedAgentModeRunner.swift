@@ -91,14 +91,14 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
     ) async {
-        let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
+        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
            !session.pendingNonCodexUserInputTokenQueue.isEmpty
         {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.estimateRuntimeTokens(initialMessageForRun)
+            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
         }
-        hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
@@ -107,7 +107,7 @@ final class ACPIntegratedAgentModeRunner {
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
-        hooks.setAgentRunActive(tabID, true)
+        hooks.presentation.setAgentRunActive(tabID, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
         let freshRunRequest = runRequest
@@ -341,7 +341,7 @@ final class ACPIntegratedAgentModeRunner {
             return false
         }
 
-        let agentMessage = hooks.buildHeadlessAgentMessage(
+        let agentMessage = hooks.providerInput.buildHeadlessAgentMessage(
             session,
             messageForRun,
             runID,
@@ -397,7 +397,7 @@ final class ACPIntegratedAgentModeRunner {
               let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -428,7 +428,7 @@ final class ACPIntegratedAgentModeRunner {
               let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -496,8 +496,8 @@ final class ACPIntegratedAgentModeRunner {
             }
             var initialMessageForPromptTurn = initialMessageForRun
             if bootstrap.didFallbackToNewSessionAfterLoadFailure {
-                await hooks.stageResumeRecoveryHandoffIfNeeded(session)
-                initialMessageForPromptTurn = hooks.prependPendingHandoffIfNeeded(initialMessageForRun, session)
+                await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
+                initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
             }
             applyProviderSessionIdentity(
                 bootstrap.providerSessionIdentity,
@@ -506,8 +506,8 @@ final class ACPIntegratedAgentModeRunner {
             )
             _ = syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session)
             session.isDirty = true
-            hooks.scheduleSave(session.tabID)
-            hooks.updateBindings(session)
+            hooks.persistence.scheduleSave(session.tabID)
+            hooks.bindingObservation.updateBindings(session)
 
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
@@ -690,15 +690,15 @@ final class ACPIntegratedAgentModeRunner {
     ) async {
         log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
-        let agentMessage = hooks.buildHeadlessAgentMessage(
+        let agentMessage = hooks.providerInput.buildHeadlessAgentMessage(
             session,
             initialMessageForRun,
             runID,
             attachments
         )
-        hooks.recordPendingHandoffSendOutcome(session, true)
-        hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-        hooks.markAttachmentsConsumed(session, attachmentReservationID)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+        hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+        hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
 
         if prepareControllerForNextTurn {
             let prepared = await controller.prepareForNextTurn()
@@ -804,8 +804,8 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard changed else { return }
         session.isDirty = true
-        hooks.scheduleSave(session.tabID)
-        hooks.updateBindings(session)
+        hooks.persistence.scheduleSave(session.tabID)
+        hooks.bindingObservation.updateBindings(session)
     }
 
     private func applyRequestedSessionModeIfNeeded(
@@ -876,7 +876,7 @@ final class ACPIntegratedAgentModeRunner {
             }
             switch event {
             case let .stream(result):
-                await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+                await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .approvalRequested(request):
                 session.pendingApproval = request
                 session.runState = .waitingForApproval
@@ -888,7 +888,7 @@ final class ACPIntegratedAgentModeRunner {
                         session.runState = .running
                         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
                     } else {
-                        hooks.updateBindings(session)
+                        hooks.bindingObservation.updateBindings(session)
                     }
                 }
             case let .terminal(state, errorText):
@@ -922,7 +922,7 @@ final class ACPIntegratedAgentModeRunner {
         guard let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -1051,15 +1051,15 @@ final class ACPIntegratedAgentModeRunner {
         let normalizedSource = value == nil ? nil : source
         guard session.runningStatusText != value || session.runningStatusSource != normalizedSource else {
             if urgent {
-                hooks.updateBindings(session)
-                hooks.requestUIRefresh(session.tabID, true)
+                hooks.bindingObservation.updateBindings(session)
+                hooks.presentation.requestUIRefresh(session.tabID, true)
             }
             return
         }
         session.runningStatusText = value
         session.runningStatusSource = normalizedSource
-        hooks.updateBindings(session)
-        hooks.requestUIRefresh(session.tabID, urgent)
+        hooks.bindingObservation.updateBindings(session)
+        hooks.presentation.requestUIRefresh(session.tabID, urgent)
     }
 
     private func initialTransportStatusText(for _: AgentProviderKind) -> String {

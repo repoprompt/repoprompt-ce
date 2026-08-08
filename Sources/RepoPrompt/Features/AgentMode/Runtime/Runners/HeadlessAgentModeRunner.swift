@@ -24,14 +24,14 @@ final class HeadlessAgentModeRunner {
         attachments: [AgentImageAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease
     ) async {
-        let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
+        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
            !session.pendingNonCodexUserInputTokenQueue.isEmpty
         {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.estimateRuntimeTokens(initialMessageForRun)
+            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
         }
-        hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
 
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
@@ -46,8 +46,8 @@ final class HeadlessAgentModeRunner {
         session.runningStatusText = nil
         session.runningStatusSource = nil
         session.runState = .running
-        hooks.setAgentRunActive(tabID, true)
-        hooks.updateBindings(session)
+        hooks.presentation.setAgentRunActive(tabID, true)
+        hooks.bindingObservation.updateBindings(session)
 
         guard session.selectedAgent != .codexExec else {
             await terminalCommitBarrier.commit(.init(
@@ -110,7 +110,7 @@ final class HeadlessAgentModeRunner {
                     return
                 }
 
-                let agentMessage = self.hooks.buildHeadlessAgentMessage(
+                let agentMessage = self.hooks.providerInput.buildHeadlessAgentMessage(
                     session,
                     initialMessageForRun,
                     runID,
@@ -137,7 +137,7 @@ final class HeadlessAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -174,9 +174,9 @@ final class HeadlessAgentModeRunner {
             let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
-            hooks.recordPendingHandoffSendOutcome(session, true)
-            hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-            hooks.markAttachmentsConsumed(session, attachmentReservationID)
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+            hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+            hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
             _ = await lease.releaseWhenRouted()
             if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
@@ -186,7 +186,7 @@ final class HeadlessAgentModeRunner {
                 guard !Task.isCancelled else { break }
                 guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { return }
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
-                await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+                await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             }
 
             guard session.runID == runID,
@@ -216,7 +216,7 @@ final class HeadlessAgentModeRunner {
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
             }
-            hooks.recordPendingHandoffSendOutcome(session, false)
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
                 ownership: ownership,
@@ -238,7 +238,7 @@ final class HeadlessAgentModeRunner {
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
             }
-            hooks.recordPendingHandoffSendOutcome(session, false)
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
                 ownership: ownership,

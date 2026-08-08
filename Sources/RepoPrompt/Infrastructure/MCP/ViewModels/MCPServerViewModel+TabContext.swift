@@ -1862,7 +1862,8 @@ extension MCPServerViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey,
-        expectedBaseSelection: StoredSelection
+        expectedBaseSelection: StoredSelection,
+        automaticCodemapDisposition: MCPReadFileAutoSelectionCoordinator.AutomaticCodemapDisposition
     ) async -> ReadFileAutoSelectionAuthoritativeResult? {
         guard isReadFileAutoSelectionContextCurrent(contextKey) else { return nil }
 
@@ -1900,7 +1901,8 @@ extension MCPServerViewModel {
         )
         guard MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
             expectedBaseForPreservation,
-            isPreservedBy: persistedSelection
+            isPreservedBy: persistedSelection,
+            automaticCodemapDisposition: automaticCodemapDisposition
         ),
             let target = currentReadFileAutoSelectionTab(for: contextKey)
         else { return nil }

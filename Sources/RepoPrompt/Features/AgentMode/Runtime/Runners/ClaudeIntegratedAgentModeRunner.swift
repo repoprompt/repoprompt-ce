@@ -50,14 +50,14 @@ final class ClaudeIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease
     ) async {
-        let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
+        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
            !session.pendingNonCodexUserInputTokenQueue.isEmpty
         {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.estimateRuntimeTokens(initialMessageForRun)
+            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
         }
-        hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
@@ -87,8 +87,8 @@ final class ClaudeIntegratedAgentModeRunner {
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.claudeExpectedTurnIDs.removeAll()
-        hooks.setAgentRunActive(tabID, true)
-        hooks.updateBindings(session)
+        hooks.presentation.setAgentRunActive(tabID, true)
+        hooks.bindingObservation.updateBindings(session)
 
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
@@ -121,7 +121,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     provider: providerName,
                     outcome: sent ? "ready" : (Task.isCancelled ? "cancelled" : "failed")
                 )
-                self.hooks.recordPendingHandoffSendOutcome(session, sent)
+                self.hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
                 guard sent else {
                     await self.finalize(
                         session: session,
@@ -135,8 +135,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     return
                 }
 
-                self.hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-                self.hooks.markAttachmentsConsumed(session, attachmentReservationID)
+                self.hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+                self.hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
                 _ = await lease.releaseWhenRouted()
 
                 guard let events = await self.claudeCoordinator.events(for: session) else {
@@ -201,7 +201,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
                     }
                 #endif
-                await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+                await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .runtimeInit(status):
                 // Persist provider session ID as soon as it becomes available from
                 // runtime init events (initialize response or system/init stream).
@@ -218,7 +218,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         codexRolloutPath: session.codexRolloutPath
                     )
                     session.isDirty = true
-                    hooks.scheduleSave(session.tabID)
+                    hooks.persistence.scheduleSave(session.tabID)
                 }
                 if status.isRepoPromptServerFailed {
                     return ConsumeEventsOutcome(
@@ -235,7 +235,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
                 session.runState = .waitingForApproval
-                hooks.updateBindings(session)
+                hooks.bindingObservation.updateBindings(session)
             case let .approvalCancelled(requestID):
                 if session.pendingApproval?.requestID == .claudeControl(requestID) {
                     session.pendingApproval = nil
@@ -244,7 +244,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         session.setRunningStatus("Thinking…", source: .transport)
                         session.runState = .running
                     }
-                    hooks.updateBindings(session)
+                    hooks.bindingObservation.updateBindings(session)
                 }
             case let .turnCompleted(turnID, turnStatus):
                 guard session.claudeExpectedTurnIDs.contains(turnID) else {
@@ -265,8 +265,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     if !session.runState.isActive {
                         session.runState = .running
                     }
-                    hooks.setAgentRunActive(session.tabID, true)
-                    hooks.updateBindings(session)
+                    hooks.presentation.setAgentRunActive(session.tabID, true)
+                    hooks.bindingObservation.updateBindings(session)
                     continue eventLoop
                 }
                 // No superseding turn expected — terminal for this run.
@@ -292,8 +292,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     #endif
                     let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)
-                    hooks.updateBindings(session)
-                    hooks.scheduleSave(session.tabID)
+                    hooks.bindingObservation.updateBindings(session)
+                    hooks.persistence.scheduleSave(session.tabID)
                 }
             }
         }
@@ -321,7 +321,7 @@ final class ClaudeIntegratedAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,

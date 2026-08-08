@@ -5,7 +5,7 @@ func toolResultHasPayload(_ item: AgentChatItem) -> Bool {
         return false
     }
     guard !raw.isEmpty else { return false }
-    if let object = ToolRawJSON.object(from: item.toolResultJSON),
+    if let object = ToolJSON.rawObject(from: item.toolResultJSON),
        ToolRawJSON.bool(object, key: "summary_only") == true
     {
         return false
@@ -14,7 +14,7 @@ func toolResultHasPayload(_ item: AgentChatItem) -> Bool {
 }
 
 func toolResultIsSummaryOnly(_ item: AgentChatItem) -> Bool {
-    guard let object = ToolRawJSON.object(from: item.toolResultJSON) else {
+    guard let object = ToolJSON.rawObject(from: item.toolResultJSON) else {
         return false
     }
     return ToolRawJSON.bool(object, key: "summary_only") == true
@@ -39,7 +39,7 @@ struct StoredToolCardPresentation: Equatable {
     }
 
     static func fromSummaryOnly(raw: String?) -> StoredToolCardPresentation? {
-        guard let object = ToolRawJSON.object(from: raw),
+        guard let object = ToolJSON.rawObject(from: raw),
               ToolRawJSON.bool(object, key: "summary_only") == true
         else {
             return nil
@@ -126,7 +126,7 @@ extension ToolCardStatus {
 }
 
 func storageStatusSubtitle(for item: AgentChatItem) -> String? {
-    guard let object = ToolRawJSON.object(from: item.toolResultJSON),
+    guard let object = ToolJSON.rawObject(from: item.toolResultJSON),
           ToolRawJSON.bool(object, key: "summary_only") == true
     else {
         return nil

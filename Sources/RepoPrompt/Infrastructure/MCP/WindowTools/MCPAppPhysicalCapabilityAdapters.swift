@@ -12,6 +12,14 @@ struct MCPFileActionMutationAcknowledgement {
     let freshness: String
 }
 
+enum MCPAppFileReadResult {
+    case workspace(
+        reply: ToolResultDTOs.ReadFileReply,
+        absolutePhysicalPath: String
+    )
+    case nonSelecting(reply: ToolResultDTOs.ReadFileReply)
+}
+
 /// Namespace for independently injected app-process capability families.
 /// No provider receives an unrestricted aggregate of every app capability.
 enum MCPAppPhysicalCapabilityAdapters {
@@ -46,7 +54,11 @@ enum MCPAppPhysicalCapabilityAdapters {
     typealias RequireTargetWindow = @MainActor @Sendable () throws -> WindowState
     typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPServerViewModel.TabContextSnapshot
     typealias RequireAgentModeConnection = @Sendable (_ toolName: String) async throws -> UUID
-    typealias ResolveAgentModeTabID = @Sendable (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
+    typealias ResolveAgentModeTabID = @Sendable (
+        _ args: [String: Value],
+        _ connectionID: UUID?,
+        _ intent: AgentSessionLifecycleAuthority.Intent
+    ) async throws -> AgentSessionLifecycleAuthority.MutationTarget
     typealias ResolveContextBuilderTab = @MainActor @Sendable (
         _ args: [String: Value],
         _ targetWindow: WindowState,
@@ -272,19 +284,19 @@ enum MCPAppPhysicalCapabilityAdapters {
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope, _ maximumSeedCount: Int) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
-    typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
+    typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> MCPAppFileReadResult
     typealias ReadSelectedAuthorizedGitArtifact = @MainActor @Sendable (
         _ requestedPath: String,
-        _ resolvedPath: String,
+        _ translatedLookupPath: String,
         _ startLine1Based: Int?,
         _ lineCount: Int?,
         _ metadata: MCPServerViewModel.RequestMetadata,
         _ lookupContext: WorkspaceLookupContext
-    ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)?
+    ) async throws -> ToolResultDTOs.ReadFileReply?
     typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (
         _ reply: ToolResultDTOs.ReadFileReply,
         _ requestedPath: String,
-        _ resolvedPhysicalPath: String,
+        _ absolutePhysicalPath: String,
         _ metadata: MCPServerViewModel.RequestMetadata
     ) async throws -> Void
     typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult

@@ -135,7 +135,7 @@ final class AgentRunTerminalCommitBarrier {
         {
             recordRejection("duplicate_commit", request: request)
             if session.lastTerminalPublicationResult?.isResolved != true {
-                session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+                session.lastTerminalPublicationResult = await hooks.terminalSettlement.publishTerminalCommit(
                     session,
                     existingRevision,
                     existingRevision.successorKind
@@ -146,7 +146,7 @@ final class AgentRunTerminalCommitBarrier {
                 revision: existingRevision,
                 publicationResult: session.lastTerminalPublicationResult
             ) {
-                hooks.startFollowUpRun(session.tabID, followUpInstruction)
+                hooks.continuation.startFollowUpRun(session.tabID, followUpInstruction)
             }
             if let providerSuccessor = request.providerSuccessor,
                providerSuccessor.id == existingRevision.providerSuccessorID,
@@ -177,7 +177,7 @@ final class AgentRunTerminalCommitBarrier {
 
         session.terminalCommitInProgress = true
         recordTerminalBarrierState(true, request: request)
-        hooks.flushPendingAssistantDelta(session)
+        hooks.transcript.flushPendingAssistantDelta(session)
         guard validatesOwnership(request) else {
             session.terminalCommitInProgress = false
             recordTerminalBarrierState(false, request: request)
@@ -185,10 +185,10 @@ final class AgentRunTerminalCommitBarrier {
             return nil
         }
 
-        hooks.finalizeStreamingItems(session)
-        hooks.finalizePendingToolCalls(session, request.terminalState)
+        hooks.transcript.finalizeStreamingItems(session)
+        hooks.transcript.finalizePendingToolCalls(session, request.terminalState)
         if request.finalizeNonCodexUsage {
-            hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
+            hooks.usage.finalizeNonCodexTurnUsage(session, nil, nil, nil)
         }
 
         let queuedInstruction = request.terminalState == .completed && request.supportsFollowUp
@@ -205,8 +205,8 @@ final class AgentRunTerminalCommitBarrier {
             session.mcpFollowUpRunPending = true
         }
 
-        hooks.cancelPendingQuestion(session)
-        hooks.cancelPendingApproval(session)
+        hooks.interactions.cancelPendingQuestion(session)
+        hooks.interactions.cancelPendingApproval(session)
         let reviewCancellationReason = switch request.terminalState {
         case .completed:
             "Run completed before review decision"
@@ -217,9 +217,9 @@ final class AgentRunTerminalCommitBarrier {
         default:
             "Run finished"
         }
-        hooks.cancelPendingApplyEditsReview(session, reviewCancellationReason)
-        hooks.cancelPendingWorktreeMergeReview(session, reviewCancellationReason)
-        hooks.finalizeAttachmentsForTurn(
+        hooks.interactions.cancelPendingApplyEditsReview(session, reviewCancellationReason)
+        hooks.interactions.cancelPendingWorktreeMergeReview(session, reviewCancellationReason)
+        hooks.attachments.finalizeAttachmentsForTurn(
             session,
             request.attachmentReservationID,
             request.attachmentDisposition
@@ -260,8 +260,8 @@ final class AgentRunTerminalCommitBarrier {
         session.waitingPrompt = nil
         session.runState = request.terminalState
         _ = session.endRunAttempt(ifCurrent: request.ownership, source: request.source)
-        hooks.setAgentRunActive(session.tabID, false)
-        hooks.prepareTerminalPublication(session)
+        hooks.presentation.setAgentRunActive(session.tabID, false)
+        hooks.terminalSettlement.prepareTerminalPublication(session)
         if let runID = request.expectedRunID, let terminalTurnID {
             AgentModeProcessRunIdentity.retainProcessRunID(
                 runID,
@@ -283,7 +283,7 @@ final class AgentRunTerminalCommitBarrier {
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: request.providerDrainGeneration,
-            mcpPublicationEnvelope: hooks.makeTerminalPublicationEnvelope(
+            mcpPublicationEnvelope: hooks.terminalSettlement.makeTerminalPublicationEnvelope(
                 session,
                 request.ownership,
                 request.terminalState,
@@ -295,12 +295,12 @@ final class AgentRunTerminalCommitBarrier {
         session.lastTerminalCommitRevision = revision
         session.lastTerminalPublicationResult = nil
 
-        hooks.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
         if request.notifyTurnComplete {
-            hooks.notifyAgentTurnComplete(session)
+            hooks.presentation.notifyAgentTurnComplete(session)
         }
-        hooks.scheduleSave(session.tabID)
-        session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+        hooks.persistence.scheduleSave(session.tabID)
+        session.lastTerminalPublicationResult = await hooks.terminalSettlement.publishTerminalCommit(
             session,
             revision,
             successorKind
@@ -329,7 +329,7 @@ final class AgentRunTerminalCommitBarrier {
         request.postCommit()
 
         if let followUpInstruction {
-            hooks.startFollowUpRun(session.tabID, followUpInstruction)
+            hooks.continuation.startFollowUpRun(session.tabID, followUpInstruction)
         }
         if request.completion == .terminalTeardownCompleted {
             await teardownTask?.value

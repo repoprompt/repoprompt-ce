@@ -21,6 +21,10 @@ struct DomainWorkspaceAuthorityClient {
         await store.snapshot()
     }
 
+    func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
+        await store.canonicalWorkspaceSnapshot(workspaceID)
+    }
+
     /// Awaited read-registration seam for current app state. Unlike create/replace/save, this is
     /// transient and therefore also supports ephemeral and focused-test workspaces.
     func registerForRead(
@@ -113,23 +117,6 @@ struct DomainWorkspaceAuthorityClient {
         ))
     }
 
-    func resolveConflict(
-        workspaceID: UUID,
-        acceptExternal: Bool,
-        expectedWorkspaceRevision: UInt64?,
-        operationID: UUID = UUID()
-    ) async -> DomainCommandOutcome {
-        await executeStable(.init(
-            operationID: operationID,
-            expectedWorkspaceRevision: expectedWorkspaceRevision,
-            origin: .appPresentation(windowID: windowID),
-            command: .resolveExternalConflict(
-                workspaceID: workspaceID,
-                acceptExternal: acceptExternal
-            )
-        ))
-    }
-
     func reloadExternalChanges() async -> DomainWorkspaceCatalogSnapshot {
         await store.reloadExternalChanges()
         return await store.snapshot()
@@ -170,6 +157,7 @@ final class DomainWorkspacePresentationBridge {
     private var subscriptionTask: Task<Void, Never>?
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
+    private var projectedHealth: [UUID: DomainAuthorityHealth] = [:]
     private var projectedModels: [UUID: WorkspaceModel] = [:]
 
     init(workspaceManager: WorkspaceManagerViewModel, client: DomainWorkspaceAuthorityClient) {
@@ -185,6 +173,7 @@ final class DomainWorkspacePresentationBridge {
         subscriptionTask?.cancel()
         subscriptionTask = nil
         projectedDigests.removeAll(keepingCapacity: false)
+        projectedHealth.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
     }
 
@@ -258,7 +247,7 @@ final class DomainWorkspacePresentationBridge {
         let snapshot = await client.snapshot()
         project(
             snapshot,
-            force: gap || event.kind == .externalReloaded || event.kind == .degraded
+            force: gap || event.kind == .externalReloaded
         )
     }
 
@@ -282,10 +271,12 @@ final class DomainWorkspacePresentationBridge {
         else { return false }
         projectedModels[workspaceID] = model
         projectedDigests[workspaceID] = workspace.document.contentDigest
+        projectedHealth[workspaceID] = workspace.health
         workspaceManager?.applyDomainAuthorityBaseline(
             workspaceID: workspaceID,
             revisions: workspace.revisions,
             digest: workspace.document.contentDigest,
+            health: workspace.health,
             catalogRevision: event.catalogRevision
         )
         lastPublicationSequence = event.sequence
@@ -299,22 +290,32 @@ final class DomainWorkspacePresentationBridge {
         let nextDigests = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
             ($0.document.workspaceID, $0.document.contentDigest)
         })
+        let nextHealth = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+            ($0.document.workspaceID, $0.health)
+        })
+        let revisions = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+            ($0.document.workspaceID, $0.revisions)
+        })
         let changedIDs = Set(snapshot.workspaces.compactMap { workspace -> UUID? in
             projectedDigests[workspace.document.workspaceID] == workspace.document.contentDigest
                 ? nil
                 : workspace.document.workspaceID
         })
         let removedIDs = Set(projectedModels.keys).subtracting(nextDigests.keys)
-        guard force || !changedIDs.isEmpty || !removedIDs.isEmpty else {
-            for workspace in snapshot.workspaces {
-                workspaceManager?.applyDomainAuthorityBaseline(
-                    workspaceID: workspace.document.workspaceID,
-                    revisions: workspace.revisions,
-                    digest: workspace.document.contentDigest,
-                    catalogRevision: snapshot.catalogRevision
-                )
-            }
+        let requiresModelProjection = !changedIDs.isEmpty
+            || !removedIDs.isEmpty
+            || (force && projectedModels.isEmpty && !snapshot.workspaces.isEmpty)
+        guard requiresModelProjection else {
+            projectedDigests = nextDigests
+            projectedHealth = nextHealth
             lastPublicationSequence = snapshot.publicationSequence
+            workspaceManager?.applyDomainAuthorityMetadataProjection(
+                revisionsByWorkspaceID: revisions,
+                digestsByWorkspaceID: nextDigests,
+                healthByWorkspaceID: nextHealth,
+                catalogRevision: snapshot.catalogRevision,
+                publicationSequence: snapshot.publicationSequence
+            )
             return
         }
 
@@ -343,16 +344,16 @@ final class DomainWorkspacePresentationBridge {
         }
         projectedModels = nextModels
         projectedDigests = nextDigests
+        projectedHealth = nextHealth
         lastPublicationSequence = snapshot.publicationSequence
         workspaceManager?.applyDomainWorkspaceProjection(
             decoded,
             fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                 ($0.document.workspaceID, $0.document.fileURL)
             }),
-            revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
-                ($0.document.workspaceID, $0.revisions)
-            }),
+            revisionsByWorkspaceID: revisions,
             digestsByWorkspaceID: nextDigests,
+            healthByWorkspaceID: nextHealth,
             catalogRevision: snapshot.catalogRevision,
             preferredActiveWorkspaceID: workspaceManager?.activeWorkspaceID,
             publicationSequence: snapshot.publicationSequence

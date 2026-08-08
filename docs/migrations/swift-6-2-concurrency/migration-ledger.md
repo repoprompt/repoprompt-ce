@@ -1,11 +1,11 @@
 # Swift 6.2 Concurrency Migration Ledger
 
-Updated: 2026-07-26
+Updated: 2026-08-08
 
 ## Toolchain and policy
 
-- Active compiler: Apple Swift 6.2.4 (`swift-driver` 1.127.15), arm64-apple-macosx26.0.
-- Root package tools version: 6.2; the package default remains Swift 5. Target-local Swift 6 boundaries are listed below; the headless domain runtime is first evidenced with Swift 5 complete checking before its separate M1 language-mode promotion.
+- Active compiler: Apple Swift 6.3.3 (`swift-driver` 1.148.6), arm64-apple-macosx26.0.
+- Root package tools version: 6.2; the package default remains Swift 5. Target-local Swift 6 boundaries are listed below; each newly promoted boundary is first evidenced with Swift 5 complete checking before its separate language-mode promotion.
 - Migration policy: target-scoped complete strict-concurrency checking first, followed by independently evidenced target-local `.swiftLanguageMode(.v6)`. No default MainActor or Swift 6.2 execution/isolation feature is adopted by this tranche.
 
 ## Completed boundaries
@@ -21,6 +21,7 @@ Updated: 2026-07-26
 | `RepoPromptRegexCore` | extraction `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; eight owner tests and Swift 5 app-consumer linkage pass. |
 | `RepoPromptCodeMapCore` / owner tests | extraction `22bfff1c5904d5f02c0a881055142c94f4783a84`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; 16 owner tests, mixed-mode app tests, and both Swift 5 product builds pass. |
 | `RepoPromptDomainRuntime` / owner tests (M1 foundation + M2 workspace/context authority) | Swift 5 foundation `76f3dcae131b2880a37a4c0ef6d1e80b2e784129`; Swift 6 promotion `5ccbc063`; M2 this branch | Swift 6 | Production and owner-test targets compile with target-local Swift 6 language mode and complete strict-concurrency checking; M2 adds actor-owned persistence, snapshots, routing, and launch-token values without isolation escape hatches. |
+| `RepoPromptShared` | this PR; initial baseline `cc9ff8f5901c2d511eef2e52d45cb21df780bace`, refreshed task base `c42e153b4f5c6d469c59d694ceb22a069800914e` | Swift 6 | The shared app/MCP protocol target passed Swift 5 complete checking before target-local Swift 6 promotion. Both mixed-mode products and the implicated CodeMap/lifecycle tests pass under Swift 6; final phase validation is recorded below. |
 
 ## Item 3 ownership record
 
@@ -45,7 +46,7 @@ Test ownership:
 
 ## Strict-concurrency diagnostics and escape-hatch inventory
 
-- `RepoPromptRegexCore`, `RepoPromptCodeMapCore`, `RepoPromptRegexCoreTests`, and `RepoPromptCodeMapCoreTests` now use target-local Swift 6 language mode. Verbose SwiftPM compiler invocations contain `-swift-version 6` for exactly those four modules; `RepoPromptApp`, `RepoPromptTests`, and `RepoPromptMCP` remain `-swift-version 5` consumers. No invocation adds default MainActor, `NonisolatedNonsendingByDefault`, `InferIsolatedConformances`, or another execution/isolation feature.
+- `RepoPromptRegexCore`, `RepoPromptCodeMapCore`, `RepoPromptDomainRuntime`, their owner-test targets, and `RepoPromptShared` now use target-local Swift 6 language mode. `RepoPromptApp`, `RepoPromptTests`, `RepoPromptMCP`, and the package default remain Swift 5 consumers. No invocation adds default MainActor, `NonisolatedNonsendingByDefault`, `InferIsolatedConformances`, or another execution/isolation feature.
 - Parser and cursor objects remain invocation-local and never cross a Sendable boundary. Public cross-target graphs remain package-visible immutable Sendable values.
 
 | Escape hatch | Scope | Preserved invariant | Audit / removal condition |
@@ -53,7 +54,7 @@ Test ownership:
 | `nonisolated(unsafe)` on standard-library `Regex` constants | 25 existing annotations in `LanguageTypeExtractor` | Every value is immutable and initialized once; matching is nonmutating; no mutable shared cache or escaping match state is hidden by the annotation. The annotation exists because the standard-library `Regex` output metadata used here does not expose Sendable conformance. | Re-audit when the deployed Swift standard library makes these concrete/type-erased `Regex` values Sendable; remove only when the active minimum toolchain compiles the declarations without the escape hatch. |
 | `PCRE2Regex: @unchecked Sendable` | One existing class in `RepoPromptRegexCore` | Compilation, including JIT, completes before publication and the compiled `pcre2_code` is immutable afterward. Ordinary matches allocate independent match data/context; `MatchSession` owns mutable state, is deliberately non-Sendable, and is confined to one sequential consumer. A live call retains the regex, preventing deinitialization from racing the call. The current implementation therefore needs no lock around immutable compiled code. | Re-audit on a PCRE2 upgrade or any change that shares mutable match/session state, mutates compiled code after publication, or changes lifetime ownership. |
 
-No new escape hatch or source annotation was added for Item 6. M1 likewise adds no `nonisolated(unsafe)`, `@unchecked Sendable`, `@preconcurrency`, or default-actor-isolation escape hatch to `RepoPromptDomainRuntime`. The four target logs and raw verbose invocation evidence contain zero diagnostics attributed to their source or owner-test paths.
+No new escape hatch or source annotation was added for Item 6, M1/M2, or the `RepoPromptShared` promotion. The promoted target logs and raw verbose invocation evidence contain zero diagnostics attributed to their source or owner-test paths.
 
 ## Item 3 evidence
 
@@ -77,6 +78,16 @@ No new escape hatch or source annotation was added for Item 6. M1 likewise adds 
 - Swift 5 consumer products: RepoPrompt ticket `6c091ce4…`; repoprompt-mcp ticket `afed7b28…`; both built successfully.
 - Phase boundary: full root ticket `a5f3c831…` passed in 9m28s; full provider ticket `11ad3aad…` passed; lint ticket `ce6cd2f4…`, 23 generator contract tests, and source/license guardrails passed.
 - Package default remains `swiftLanguageModes: [.v5]`; `Package.resolved` and all source files are unchanged.
+
+## RepoPromptShared Swift 6 language-mode evidence
+
+- Clean baseline at `cc9ff8f5901c2d511eef2e52d45cb21df780bace`: `RepoPrompt` ticket `101708d1-f662-44ef-9379-ee521d3504b2` and `repoprompt-mcp` ticket `caa17164-ef7b-467f-8213-fba21efaf04e` built successfully before any manifest change.
+- Swift 5 complete strict-concurrency stage: both products passed (`b2aa4b5e-9f09-424a-9434-270dcfb05d9d` / `0d58dbb0-8dbc-414a-b35d-c2166f5c5525`), along with six tracer tests (`c700c5d2-1c74-4f48-9989-2ebc17f779e6`), 18 JSON-RPC ledger tests (`2daba278-6020-425b-96fa-24d079e32106`), and seven MCP message tests (`272cc344-8c8a-452f-82e9-3a94f0af3f37`). No `RepoPromptShared` compiler diagnostic or source repair was required.
+- Target-local Swift 6 stage: the SwiftPM build plan records `-swift-version 6` for `RepoPromptShared`. Both products passed before the broader investigation (`97afbe82-f83f-46ff-8c2b-cb444d3ff744` / `7cbb0a90-f3b1-40e3-bcec-a006ae5325a7`), as did the same six tracer (`61038d4b-3b1f-47fa-8487-d30692ed6e0b`), 18 JSON-RPC ledger (`80b22dff-73e3-463c-81de-16f427c38da2`), and seven MCP message (`e00bbca4-9fb6-4e7c-90ae-631a48f29d70`) tests.
+- The first full-suite run exposed seven load/order-sensitive CodeMap failures and later stopped making progress while multiple Codex watchdog tasks remained alive from the liveness suite. No assertion, retry count, or timeout was weakened. Coordinator tests now wait on lifecycle hook delivery, binding-engine tests wait on explicit resolution-count signals, automatic-selection coverage waits on the real sync task, and the liveness suite performs the production window-close teardown used by neighboring suites. Source-authority rejection remains fail-closed and now reports a redacted typed rejection boundary for future diagnosis.
+- The implicated suites passed together under Swift 6 in ticket `b2b1c0e1-ffb6-496b-8f5f-9a9117201037`: 162 tests covering coordinator cancellation/publication, automatic selection, binding invalidation, warm-manifest adoption, Codex liveness teardown, and the memory-sampler boundary. Post-repair product builds passed for `RepoPrompt` (`9669f37c-b1fc-4fb5-bea5-8dc952e659e8`) and `repoprompt-mcp` (`9c66d0f3-c973-4553-bccf-e55ef9af32b8`). Final full-suite/style/guardrail evidence is pending.
+- The refreshed current-main investigation reproduced a genuine automatic-selection scheduling failure rather than extending its wait budget: pending target demands now use completion-driven waiting, and owned busy demands use atomic replacement with exact retained-ticket cleanup. The deterministic busy, cancellation, manifest-shutdown, and source-authority cases passed under tickets `7038f675-3b71-4efc-86b3-57c14f9fc875`, `ab25dd8f-d932-4824-b1a8-7beee4c3a911`, and `9f66bb42-656f-4560-af64-c48a5cd0857f`; refreshed Swift 6 `RepoPrompt` build ticket `7367af22-ea86-4a37-b798-ae9de7c9f01d` passed. Production deadlines and fail-closed behavior remain unchanged.
+- The package default, `RepoPromptApp`, `RepoPromptTests`, and `RepoPromptMCP` remain Swift 5. No default-actor-isolation feature or unchecked concurrency escape hatch was added, and no app lifecycle action was run.
 
 ## M1 headless domain-runtime foundation evidence
 

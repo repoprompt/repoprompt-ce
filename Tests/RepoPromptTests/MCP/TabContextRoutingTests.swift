@@ -13,6 +13,66 @@ final class TabContextRoutingTests: XCTestCase {
         super.tearDown()
     }
 
+    #if DEBUG
+        @MainActor
+        func testMissingBoundAgentSessionTabIsRejectedWithoutActiveTabRetargeting() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Missing bound Agent tab",
+                repoPaths: [],
+                ephemeral: true
+            )
+            _ = await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "missingBoundAgentSessionTabTest"
+            )
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let activeTabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+            window.promptManager.setComposeTabPinned(true, for: activeTabID)
+
+            let connectionID = UUID()
+            window.mcpServer.tabContextByConnectionID[connectionID] = .init(
+                tabID: UUID(),
+                windowID: window.windowID,
+                workspaceID: activeWorkspace.id,
+                promptText: "",
+                selection: StoredSelection(),
+                selectedMetaPromptIDs: [],
+                tabName: "Missing bound tab",
+                runID: UUID(),
+                activeAgentSessionID: UUID(),
+                explicitlyBound: true
+            )
+
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentSessionLifecycleMutationTargetForTesting(
+                    connectionID: connectionID
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("not retargeted"), String(describing: error))
+            }
+            window.mcpServer.tabContextByConnectionID.removeValue(forKey: connectionID)
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentSessionLifecycleMutationTargetForTesting(
+                    connectionID: connectionID
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("not retargeted"), String(describing: error))
+            }
+            XCTAssertEqual(window.promptManager.activeComposeTabID, activeTabID)
+            XCTAssertTrue(window.workspaceManager.composeTab(with: activeTabID)?.isPinned == true)
+            await window.tearDown()
+        }
+    #endif
+
     func testScopedReadRebindsStaleRebindableBindingsButNeverRunScoped() {
         let t1 = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
         let t2 = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())

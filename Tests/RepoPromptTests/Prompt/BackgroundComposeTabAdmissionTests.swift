@@ -247,6 +247,235 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertTrue(attemptedTabIDs.isEmpty)
     }
 
+    func testPostRemovalClearsOnlyRemovedTabTranscriptRefreshSignature() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let removedTabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        let retainedTabID = try XCTUnwrap(
+            fixture.manager.activeWorkspace?.composeTabs.first(where: { $0.id != removedTabID })?.id
+        )
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        _ = viewModel.session(for: removedTabID)
+
+        AgentTranscriptDebugInstrumentation.reset()
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+        var attempts: [AgentTranscriptRefreshAttemptMetrics] = []
+        AgentTranscriptDebugInstrumentation.configure(.init(
+            refreshAttemptHandler: { attempts.append($0) }
+        ))
+
+        emitTranscriptRefreshAttempt(tabID: removedTabID, inputSignature: "removed-signature")
+        emitTranscriptRefreshAttempt(tabID: retainedTabID, inputSignature: "retained-signature")
+
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+        await fixture.prompt.stashTab(removedTabID)
+
+        attempts.removeAll()
+        emitTranscriptRefreshAttempt(tabID: removedTabID, inputSignature: "removed-signature")
+        emitTranscriptRefreshAttempt(tabID: retainedTabID, inputSignature: "retained-signature")
+
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertNil(attempts[0].previousInputSignature)
+        XCTAssertFalse(attempts[0].isConsecutiveDuplicateInput)
+        XCTAssertEqual(attempts[1].previousInputSignature, "retained-signature")
+        XCTAssertTrue(attempts[1].isConsecutiveDuplicateInput)
+    }
+
+    func testRejectedConcurrentAgentAdmissionsPreserveActiveLivePinnedSession() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        fixture.prompt.setComposeTabPinned(true, for: tabID)
+        let sessionID = try XCTUnwrap(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.runState = .running
+        viewModel.setAgentRunActive(tabID, isActive: true)
+        fixture.manager.setWorkspacePersistenceOutcomeOverrideForTesting(
+            .rejected(reason: "workspace_not_writable")
+        )
+        defer { fixture.manager.setWorkspacePersistenceOutcomeOverrideForTesting(nil) }
+
+        let originalWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let originalTabs = originalWorkspace.composeTabs
+        let originalStashedTabs = originalWorkspace.stashedTabs
+
+        let first = Task { @MainActor in
+            await self.admissionWasRejected(viewModel)
+        }
+        let second = Task { @MainActor in
+            await self.admissionWasRejected(viewModel)
+        }
+        let rejections = await [first.value, second.value]
+
+        XCTAssertEqual(rejections, [true, true])
+        let finalWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        XCTAssertEqual(finalWorkspace.composeTabs.map(\.id), originalTabs.map(\.id))
+        XCTAssertEqual(finalWorkspace.composeTabs.map(\.name), originalTabs.map(\.name))
+        XCTAssertEqual(finalWorkspace.composeTabs.map(\.isPinned), originalTabs.map(\.isPinned))
+        XCTAssertEqual(
+            finalWorkspace.composeTabs.map(\.activeAgentSessionID),
+            originalTabs.map(\.activeAgentSessionID)
+        )
+        XCTAssertEqual(finalWorkspace.stashedTabs, originalStashedTabs)
+        XCTAssertEqual(finalWorkspace.activeComposeTabID, tabID)
+        XCTAssertEqual(fixture.prompt.activeComposeTabID, tabID)
+        XCTAssertTrue(fixture.prompt.currentComposeTabs.contains(where: {
+            $0.id == tabID && $0.isPinned && $0.activeAgentSessionID == sessionID
+        }))
+        XCTAssertTrue(viewModel.sessions[tabID] === session)
+        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(Set(viewModel.sessions.keys), Set([tabID]))
+    }
+
+    func testStaleProjectionCannotReplaceActiveLivePinnedSession() throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        fixture.prompt.setComposeTabPinned(true, for: tabID)
+        let sessionID = try XCTUnwrap(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.runState = .running
+        viewModel.setAgentRunActive(tabID, isActive: true)
+
+        let currentWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        var staleWorkspace = currentWorkspace
+        var staleTab = try XCTUnwrap(currentWorkspace.composeTabs.first(where: { $0.id == tabID }))
+        staleTab.name = "Stale replacement"
+        staleTab.isPinned = false
+        staleTab.activeAgentSessionID = UUID()
+        staleWorkspace.composeTabs.removeAll { $0.id == tabID }
+        staleWorkspace.activeComposeTabID = staleWorkspace.composeTabs.first?.id
+        staleWorkspace.stashedTabs.append(StashedTab(
+            tab: staleTab,
+            stashedAt: Date()
+        ))
+
+        fixture.manager.applyDomainWorkspaceProjection(
+            [staleWorkspace],
+            fileURLsByWorkspaceID: [:],
+            revisionsByWorkspaceID: [:],
+            digestsByWorkspaceID: [:],
+            healthByWorkspaceID: [:],
+            catalogRevision: 1,
+            preferredActiveWorkspaceID: currentWorkspace.id,
+            publicationSequence: 1
+        )
+
+        let reconciled = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let protectedTab = try XCTUnwrap(reconciled.composeTabs.first(where: { $0.id == tabID }))
+        XCTAssertTrue(protectedTab.isPinned)
+        XCTAssertEqual(protectedTab.activeAgentSessionID, sessionID)
+        XCTAssertEqual(protectedTab.name, currentWorkspace.composeTabs.first(where: { $0.id == tabID })?.name)
+        XCTAssertEqual(reconciled.activeComposeTabID, tabID)
+        XCTAssertFalse(reconciled.stashedTabs.contains(where: { $0.tab.id == tabID }))
+        XCTAssertTrue(viewModel.sessions[tabID] === session)
+        XCTAssertEqual(session.runState, .running)
+    }
+
+    func testLateTitleProviderAndInteractionAttemptsCannotCrossChangedSessionIdentity() async throws {
+        let fixture = makeFixture(initialTabCount: 1)
+        let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
+        fixture.prompt.setComposeTabPinned(true, for: tabID)
+        let originalSessionID = try XCTUnwrap(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: originalSessionID, on: session)
+        let target = try viewModel.resolveAgentSessionLifecycleMutationTarget(
+            tabID: tabID,
+            expectedSessionID: originalSessionID,
+            intent: .setStatus
+        )
+        let runTarget = AgentModeViewModel.MCPSessionTarget(
+            tabID: tabID,
+            sessionID: originalSessionID,
+            origin: .existingSession,
+            lifecycleIdentity: target.identity
+        )
+        let originalName = fixture.manager.composeTab(with: tabID)?.name
+
+        let replacementSessionID = UUID()
+        _ = viewModel.test_installPersistentSessionBinding(
+            sessionID: replacementSessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+
+        XCTAssertThrowsError(try viewModel.renameSession(target: target, to: "Late stale title"))
+        XCTAssertThrowsError(try viewModel.requireCurrentAgentSessionLifecycleAdmission(runTarget))
+        let interaction = AgentAskUserInteraction(
+            title: "Late question",
+            questions: [
+                AgentAskUserQuestion(
+                    id: "answer",
+                    question: "Should not be shown",
+                    allowsMultiple: false,
+                    allowsCustom: true
+                )
+            ]
+        )
+        await assertThrowsErrorAsync {
+            try await viewModel.askUserInteraction(target: target, interaction: interaction)
+        }
+        await assertThrowsErrorAsync {
+            try await viewModel.waitForNextUserInstruction(target: target)
+        }
+        XCTAssertEqual(fixture.manager.composeTab(with: tabID)?.name, originalName)
+        XCTAssertEqual(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID, replacementSessionID)
+        XCTAssertEqual(session.activeAgentSessionID, replacementSessionID)
+        XCTAssertNil(session.pendingAskUser)
+        XCTAssertNil(session.instructionContinuation)
+    }
+
+    func testLifecycleAdmissionAcceptsCorrectAlreadySavedWorkspaceAndRejectsWrongWorkspace() {
+        let authority = AgentSessionLifecycleAuthority()
+        let workspaceID = UUID()
+
+        XCTAssertEqual(
+            authority.decideAdmission(
+                persistence: .notRequired(workspaceID: workspaceID),
+                targetWorkspaceID: workspaceID,
+                bindingStillCurrent: true
+            ),
+            .commit
+        )
+        XCTAssertEqual(
+            authority.decideAdmission(
+                persistence: .persisted(workspaceID: UUID(), stateVersion: 7),
+                targetWorkspaceID: workspaceID,
+                bindingStillCurrent: true
+            ),
+            .rollback(.workspaceChanged)
+        )
+    }
+
+    private func admissionWasRejected(_ viewModel: AgentModeViewModel) async -> Bool {
+        do {
+            _ = try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil,
+                sessionID: nil,
+                createIfNeeded: true,
+                sessionName: "Rejected concurrent workflow"
+            )
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    private func assertThrowsErrorAsync(
+        _ expression: () async throws -> some Any,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await expression()
+            XCTFail("Expected expression to throw", file: file, line: line)
+        } catch {}
+    }
+
     private func makeFixture(initialTabCount: Int) -> (manager: WorkspaceManagerViewModel, prompt: PromptViewModel) {
         let fileManager = WorkspaceFilesViewModel()
         let keyManager = KeyManager(
@@ -312,6 +541,22 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         prompt.addComposeTabsDidRemoveListener { tabIDs, reason, workspaceID in
             await viewModel.handleComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
         }
+    }
+
+    private func emitTranscriptRefreshAttempt(tabID: UUID, inputSignature: String) {
+        AgentTranscriptDebugInstrumentation.emitRefreshAttempt(
+            tabID: tabID,
+            reason: "test",
+            sourceItemsRevision: 0,
+            itemCount: 0,
+            nextSequenceIndex: 0,
+            runState: "idle",
+            selectedAgent: "test",
+            projectionProtection: "none",
+            pendingMutationSummary: "none",
+            incrementalPath: "test",
+            inputSignature: inputSignature
+        )
     }
 }
 

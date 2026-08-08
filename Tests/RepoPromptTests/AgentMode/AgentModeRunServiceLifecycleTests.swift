@@ -1617,47 +1617,69 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("commit:\(revision.commitID.uuidString)")
         }
         return AgentModeRunService.Hooks(
-            estimateRuntimeTokens: { $0.count },
-            addUserInputTokensToActiveNonCodexTurn: { tokens, _ in recorder.record("tokens:\(tokens)") },
-            startNonCodexTurnAccountingIfNeeded: { _, _ in },
-            reserveAttachmentsForTurn: { _, _ in nil },
-            markAttachmentsConsumed: { _, _ in },
-            stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
-            consumeDeferredAttachmentCleanup: { _, _ in },
-            finalizeAttachmentsForTurn: { _, _, disposition in recorder.record("attachments:\(disposition)") },
-            setAgentRunActive: { _, isActive in recorder.record("run-active:\(isActive)") },
-            updateBindings: { _ in recorder.record("bindings") },
-            requestUIRefresh: { _, _ in },
-            scheduleSave: { _ in recorder.record("save") },
-            notifyAgentTurnComplete: { _ in },
-            handleHeadlessStreamResult: { _, _, _, _ in },
-            buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
-            finalizeStreamingItems: { _ in },
-            finalizePendingToolCalls: { _, _ in },
-            finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-            finalizeNonCodexTurnUsage: { _, _, _, _ in },
-            cancelPendingQuestion: { _ in },
-            cancelPendingApproval: { _ in },
-            cancelPendingApplyEditsReview: { _, _ in },
-            cancelPendingWorktreeMergeReview: { _, _ in },
-            flushPendingAssistantDelta: flushPendingAssistantDelta,
-            clearPendingAssistantDelta: { _ in },
-            prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
-            publishTerminalCommit: { session, revision, successorKind in
-                if let publishTerminalCommitResult {
-                    return await publishTerminalCommitResult(session, revision, successorKind)
+            usage: .init(
+                estimateRuntimeTokens: { $0.count },
+                addUserInputTokensToActiveNonCodexTurn: { tokens, _ in recorder.record("tokens:\(tokens)") },
+                startNonCodexTurnAccountingIfNeeded: { _, _ in },
+                finalizeNonCodexTurnUsage: { _, _, _, _ in }
+            ),
+            attachments: .init(
+                reserveAttachmentsForTurn: { _, _ in nil },
+                markAttachmentsConsumed: { _, _ in },
+                stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
+                consumeDeferredAttachmentCleanup: { _, _ in },
+                finalizeAttachmentsForTurn: { _, _, disposition in recorder.record("attachments:\(disposition)") }
+            ),
+            presentation: .init(
+                setAgentRunActive: { _, isActive in recorder.record("run-active:\(isActive)") },
+                requestUIRefresh: { _, _ in },
+                notifyAgentTurnComplete: { _ in }
+            ),
+            bindingObservation: .init(
+                updateBindings: { _ in recorder.record("bindings") }
+            ),
+            queuedWorkRecovery: .init(
+                restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") }
+            ),
+            persistence: .init(
+                scheduleSave: { _ in recorder.record("save") }
+            ),
+            transcript: .init(
+                handleHeadlessStreamResult: { _, _, _, _ in },
+                finalizeStreamingItems: { _ in },
+                finalizePendingToolCalls: { _, _ in },
+                finalizePendingToolCallsWithUpperBound: { _, _, _ in },
+                flushPendingAssistantDelta: flushPendingAssistantDelta,
+                clearPendingAssistantDelta: { _ in }
+            ),
+            providerInput: .init(
+                buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
+                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                stageResumeRecoveryHandoffIfNeeded: { _ in },
+                prependPendingHandoffIfNeeded: { text, _ in text },
+                recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") }
+            ),
+            interactions: .init(
+                cancelPendingQuestion: { _ in },
+                cancelPendingApproval: { _ in },
+                cancelPendingApplyEditsReview: { _, _ in },
+                cancelPendingWorktreeMergeReview: { _, _ in }
+            ),
+            terminalSettlement: .init(
+                prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
+                makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
+                publishTerminalCommit: { session, revision, successorKind in
+                    if let publishTerminalCommitResult {
+                        return await publishTerminalCommitResult(session, revision, successorKind)
+                    }
+                    await publishTerminalCommit(session, revision)
+                    return .accepted(successorEpoch: nil)
                 }
-                await publishTerminalCommit(session, revision)
-                return .accepted(successorEpoch: nil)
-            },
-            startFollowUpRun: startFollowUpRun ?? { _, _ in },
-            restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
-            stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
-            signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+            ),
+            continuation: .init(
+                startFollowUpRun: startFollowUpRun ?? { _, _ in },
+                signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+            )
         )
     }
 
