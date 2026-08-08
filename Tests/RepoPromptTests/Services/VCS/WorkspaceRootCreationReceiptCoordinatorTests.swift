@@ -4,16 +4,16 @@ import Foundation
 import XCTest
 
 final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
-    func testActivationUsesExplicitCutAndWaitsForFlushAndCallbackBarrier() throws {
+    func testActivationUsesExplicitCutAndWaitsForFlushAndCallbackBarrier() async throws {
         let fixture = try WitnessFixture(configuration: .init(
             currentEventIDs: [100, 120],
             eventsOnStart: [event("child/pre-start.txt", id: 101)]
         ))
         defer { fixture.cleanup() }
 
-        let session = fixture.start()
+        let session = await fixture.start()
         XCTAssertTrue(session.streamStartedBeforeMutation)
-        let coverage = fixture.coordinator.finish(session)
+        let coverage = await fixture.coordinator.finish(session)
 
         XCTAssertEqual(fixture.backend.requestedSinceWhen, 100)
         XCTAssertEqual(fixture.backend.requestedWatchRootPath, fixture.stableRoot.resolvingSymlinksInPath().path)
@@ -29,7 +29,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         XCTAssertTrue(coverage.provesCreationInterval)
     }
 
-    func testNonexistentStrictDescendantRecordsDestinationCreation() throws {
+    func testNonexistentStrictDescendantRecordsDestinationCreation() async throws {
         let fixture = try WitnessFixture(configuration: .init(
             currentEventIDs: [20, 30],
             eventsOnEndingFlush: [
@@ -41,7 +41,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         defer { fixture.cleanup() }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.destination.path))
-        let coverage = fixture.coordinator.finish(fixture.start())
+        let coverage = await fixture.coordinator.finish(fixture.start())
 
         XCTAssertTrue(coverage.destinationWasAbsentBeforeMutation)
         XCTAssertTrue(coverage.destinationWasStrictDescendant)
@@ -50,14 +50,14 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         XCTAssertTrue(coverage.provesCreationInterval)
     }
 
-    func testDestinationCreatedAfterActivationBarrierCannotIssueReceipt() throws {
+    func testDestinationCreatedAfterActivationBarrierCannotIssueReceipt() async throws {
         let fixture = try WitnessFixture(configuration: .init(
             currentEventIDs: [20, 30],
             createDestinationAfterActivationBarrier: true
         ))
         defer { fixture.cleanup() }
 
-        let coverage = fixture.coordinator.finish(fixture.start())
+        let coverage = await fixture.coordinator.finish(fixture.start())
 
         XCTAssertEqual(
             fixture.backend.operations.prefix(6),
@@ -70,7 +70,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         XCTAssertFalse(coverage.provesCreationInterval)
     }
 
-    func testEndCutIncludesFinalFlushEventsAndExcludesPostCutEvents() throws {
+    func testEndCutIncludesFinalFlushEventsAndExcludesPostCutEvents() async throws {
         let fixture = try WitnessFixture(configuration: .init(
             currentEventIDs: [100, 150],
             eventsOnEndingFlush: [
@@ -81,7 +81,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         ))
         defer { fixture.cleanup() }
 
-        let coverage = fixture.coordinator.finish(fixture.start())
+        let coverage = await fixture.coordinator.finish(fixture.start())
 
         XCTAssertEqual(coverage.endEventID, 150)
         XCTAssertEqual(coverage.acceptedDestinationEventCount, 2)
@@ -93,14 +93,14 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         XCTAssertTrue(coverage.provesCreationInterval)
     }
 
-    func testMustScanSubDirsOnlyToleratesProvenDisjointSibling() throws {
+    func testMustScanSubDirsOnlyToleratesProvenDisjointSibling() async throws {
         let flag = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
         let sibling = try WitnessFixture(configuration: .init(
             currentEventIDs: [10, 20],
             eventsOnEndingFlush: [event("sibling", id: 11, flags: flag)]
         ))
         defer { sibling.cleanup() }
-        let siblingCoverage = sibling.coordinator.finish(sibling.start())
+        let siblingCoverage = await sibling.coordinator.finish(sibling.start())
         XCTAssertFalse(siblingCoverage.mustScanSubDirs)
         XCTAssertTrue(siblingCoverage.provesCreationInterval)
 
@@ -109,7 +109,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
                 currentEventIDs: [30, 40],
                 eventsOnEndingFlush: [event(relativePath, id: 31, flags: flag)]
             ))
-            let coverage = fixture.coordinator.finish(fixture.start())
+            let coverage = await fixture.coordinator.finish(fixture.start())
             fixture.cleanup()
             XCTAssertTrue(coverage.mustScanSubDirs, relativePath)
             XCTAssertTrue(coverage.hadGap, relativePath)
@@ -117,7 +117,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         }
     }
 
-    func testRecoveryFlagsRemainFailClosedWithExpectedClassification() throws {
+    func testRecoveryFlagsRemainFailClosedWithExpectedClassification() async throws {
         struct RecoveryCase {
             let flag: FSEventStreamEventFlags
             let assertClassification: (GitWorktreeCreationWitnessCoverage) -> Bool
@@ -151,7 +151,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
                 currentEventIDs: [100, 110],
                 eventsOnEndingFlush: [event("sibling", id: 101, flags: testCase.flag)]
             ))
-            let coverage = fixture.coordinator.finish(fixture.start())
+            let coverage = await fixture.coordinator.finish(fixture.start())
             fixture.cleanup()
             XCTAssertTrue(testCase.assertClassification(coverage))
             XCTAssertEqual(coverage.hadDrop, testCase.expectsDrop)
@@ -160,7 +160,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         }
     }
 
-    func testEventIDJumpsSucceedWhileRegressionFails() throws {
+    func testEventIDJumpsSucceedWhileRegressionFails() async throws {
         let jumping = try WitnessFixture(configuration: .init(
             currentEventIDs: [100, 1000],
             eventsOnEndingFlush: [
@@ -169,7 +169,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
             ]
         ))
         defer { jumping.cleanup() }
-        let jumpingCoverage = jumping.coordinator.finish(jumping.start())
+        let jumpingCoverage = await jumping.coordinator.finish(jumping.start())
         XCTAssertFalse(jumpingCoverage.eventIDRegressed)
         XCTAssertTrue(jumpingCoverage.provesCreationInterval)
 
@@ -181,13 +181,13 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
             ]
         ))
         defer { regressing.cleanup() }
-        let regressingCoverage = regressing.coordinator.finish(regressing.start())
+        let regressingCoverage = await regressing.coordinator.finish(regressing.start())
         XCTAssertTrue(regressingCoverage.eventIDRegressed)
         XCTAssertTrue(regressingCoverage.hadGap)
         XCTAssertFalse(regressingCoverage.provesCreationInterval)
     }
 
-    func testStreamCutAndBarrierFailuresRemainFailClosed() throws {
+    func testStreamCutAndBarrierFailuresRemainFailClosed() async throws {
         let configurations: [ScriptedWitnessBackend.Configuration] = [
             .init(currentEventIDs: [0]),
             .init(currentEventIDs: [UInt64.max]),
@@ -205,14 +205,14 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
 
         for configuration in configurations {
             let fixture = try WitnessFixture(configuration: configuration)
-            let coverage = fixture.coordinator.finish(fixture.start())
+            let coverage = await fixture.coordinator.finish(fixture.start())
             fixture.cleanup()
             XCTAssertTrue(coverage.hadGap)
             XCTAssertFalse(coverage.provesCreationInterval)
         }
     }
 
-    func testHundredThousandCreationEventsUseBoundedScalarStateWithoutOverflow() throws {
+    func testHundredThousandCreationEventsUseBoundedScalarStateWithoutOverflow() async throws {
         let eventCount = 100_001
         let fixture = try WitnessFixture(configuration: .init(
             currentEventIDs: [100, UInt64(eventCount + 200)],
@@ -220,7 +220,7 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         ))
         defer { fixture.cleanup() }
 
-        let coverage = fixture.coordinator.finish(fixture.start())
+        let coverage = await fixture.coordinator.finish(fixture.start())
 
         XCTAssertEqual(coverage.acceptedDestinationEventCount, eventCount)
         XCTAssertEqual(coverage.acceptedEventCount, eventCount)
@@ -234,45 +234,45 @@ final class WorkspaceRootCreationReceiptCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.backend.releaseCount, 1)
     }
 
-    func testAdmissionAndStableRootReplacementRemainFailClosed() throws {
+    func testAdmissionAndStableRootReplacementRemainFailClosed() async throws {
         let existingDestination = try WitnessFixture(configuration: .init(currentEventIDs: [10]))
         try FileManager.default.createDirectory(
             at: existingDestination.destination,
             withIntermediateDirectories: true
         )
-        let existingCoverage = existingDestination.coordinator.finish(existingDestination.start())
+        let existingCoverage = await existingDestination.coordinator.finish(existingDestination.start())
         existingDestination.cleanup()
         XCTAssertFalse(existingCoverage.destinationWasAbsentBeforeMutation)
         XCTAssertFalse(existingCoverage.provesCreationInterval)
 
         let equalDestination = try WitnessFixture(configuration: .init(currentEventIDs: [10]))
-        let equalSession = equalDestination.coordinator.start(
+        let equalSession = await equalDestination.coordinator.start(
             destinationURL: equalDestination.stableRoot,
             stableWatchRootURL: equalDestination.stableRoot
         )
-        let equalCoverage = equalDestination.coordinator.finish(equalSession)
+        let equalCoverage = await equalDestination.coordinator.finish(equalSession)
         equalDestination.cleanup()
         XCTAssertFalse(equalCoverage.destinationWasStrictDescendant)
         XCTAssertFalse(equalCoverage.provesCreationInterval)
 
         let replaced = try WitnessFixture(configuration: .init(currentEventIDs: [10, 20]))
-        let replacedSession = replaced.start()
+        let replacedSession = await replaced.start()
         try FileManager.default.removeItem(at: replaced.stableRoot)
         try FileManager.default.createDirectory(at: replaced.stableRoot, withIntermediateDirectories: true)
-        let replacedCoverage = replaced.coordinator.finish(replacedSession)
+        let replacedCoverage = await replaced.coordinator.finish(replacedSession)
         replaced.cleanup()
         XCTAssertFalse(replacedCoverage.stableWatchRootUnchangedAfterInitialization)
         XCTAssertTrue(replacedCoverage.hadGap)
         XCTAssertFalse(replacedCoverage.provesCreationInterval)
     }
 
-    func testFinishIsIdempotentAndTearsStreamDownExactlyOnce() throws {
+    func testFinishIsIdempotentAndTearsStreamDownExactlyOnce() async throws {
         let fixture = try WitnessFixture(configuration: .init(currentEventIDs: [10, 20]))
         defer { fixture.cleanup() }
-        let session = fixture.start()
+        let session = await fixture.start()
 
-        let first = fixture.coordinator.finish(session)
-        let second = fixture.coordinator.finish(session)
+        let first = await fixture.coordinator.finish(session)
+        let second = await fixture.coordinator.finish(session)
 
         XCTAssertEqual(first, second)
         XCTAssertEqual(fixture.backend.stopCount, 1)
@@ -309,8 +309,8 @@ private final class WitnessFixture {
         coordinator = WorkspaceRootCreationReceiptCoordinator(backend: backend)
     }
 
-    func start() -> WorkspaceRootCreationReceiptCoordinator.Session {
-        coordinator.start(destinationURL: destination, stableWatchRootURL: stableRoot)
+    func start() async -> WorkspaceRootCreationReceiptCoordinator.Session {
+        await coordinator.start(destinationURL: destination, stableWatchRootURL: stableRoot)
     }
 
     func cleanup() {
@@ -448,7 +448,7 @@ private final class ScriptedWitnessBackend: @unchecked Sendable,
             return true
         }
 
-        func flushSync(phase: WorkspaceRootCreationWitnessFlushPhase) -> Bool {
+        func flush(phase: WorkspaceRootCreationWitnessFlushPhase) async -> Bool {
             record(phase == .activation ? "flush-activation" : "flush-ending")
             guard !configuration.failedFlushPhases.contains(phase) else { return false }
             let events = phase == .activation

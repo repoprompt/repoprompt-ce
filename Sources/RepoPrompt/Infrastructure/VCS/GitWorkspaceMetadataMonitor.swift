@@ -335,7 +335,7 @@ actor GitWorkspaceMetadataMonitor {
         repositoryRoot: URL,
         prefix: GitRepositoryRelativeRootPrefix,
         expectedAcceptedWatermark: UInt64
-    ) -> Bool {
+    ) async -> Bool {
         guard token.repositoryKey == repositoryKey,
               let requested = try? Self.resolvePrefixControlWatchTarget(
                   repositoryRoot: repositoryRoot,
@@ -347,8 +347,9 @@ actor GitWorkspaceMetadataMonitor {
               token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys))
         else { return false }
         for key in token.coveredTargetKeys.sorted() {
-            guard let source = record.sourcesByTargetKey[key] else { return false }
-            source.flushSync()
+            guard let source = record.sourcesByTargetKey[key],
+                  await source.flush()
+            else { return false }
         }
         guard let currentRecord = records[repositoryKey],
               currentRecord.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
@@ -383,7 +384,7 @@ actor GitWorkspaceMetadataMonitor {
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         paths: [URL],
         expectedAcceptedWatermark: UInt64
-    ) -> Bool {
+    ) async -> Bool {
         guard token.repositoryKey == repositoryKey,
               let requestedTargets = try? Self.resolveWatchTargets(paths),
               token.coveredTargetKeys == Set(requestedTargets.map(\.key)),
@@ -392,8 +393,9 @@ actor GitWorkspaceMetadataMonitor {
               token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys))
         else { return false }
         for key in token.coveredTargetKeys.sorted() {
-            guard let source = record.sourcesByTargetKey[key] else { return false }
-            source.flushSync()
+            guard let source = record.sourcesByTargetKey[key],
+                  await source.flush()
+            else { return false }
         }
         guard let currentRecord = records[repositoryKey],
               currentRecord.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
@@ -474,7 +476,10 @@ actor GitWorkspaceMetadataMonitor {
         }
 
         func flushForTesting(repositoryKey: GitWorkspaceAuthorityRepositoryKey) async {
-            records[repositoryKey]?.sourcesByTargetKey.values.forEach { $0.flushSync() }
+            guard let sources = records[repositoryKey]?.sourcesByTargetKey.values else { return }
+            for source in sources {
+                _ = await source.flush()
+            }
         }
 
         func snapshotForTesting() -> Snapshot {
@@ -636,6 +641,8 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
     private let target: GitWorkspaceMetadataMonitor.WatchTarget
     private let onEvent: @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
     private let queue: DispatchQueue
+    private let deliveryBarrier = FSEventAsyncDeliveryBarrier()
+    private let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
     private let lock = NSLock()
     private var stream: FSEventStreamRef?
     private var directorySource: DispatchSourceFileSystemObject?
@@ -652,6 +659,7 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             label: "com.repoprompt.git-workspace-metadata.\(UUID().uuidString)",
             qos: .utility
         )
+        deliveryGeneration = deliveryBarrier.currentGeneration
         if case .exactFile = target.scope {
             let descriptor = open(target.watchRootURL.path, O_EVTONLY | O_CLOEXEC)
             guard descriptor >= 0 else {
@@ -711,27 +719,34 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             releaseSelfPointer()
             throw GitWorkspaceMetadataMonitorError.streamStartFailed
         }
-        // Retain does not succeed until the dispatch-backed stream has crossed
-        // an activation barrier. This closes the create/delete race where a
-        // caller mutates a newly retained external source immediately after
-        // retain returns.
-        FSEventStreamFlushSync(stream)
-        queue.sync {}
+        // `FSEventStreamStart` installs observation before retain returns. The
+        // authority layer crosses an asynchronous delivery cut before admitting
+        // or reusing evidence, so activation never blocks this actor on
+        // `FSEventStreamFlushSync`.
     }
 
-    func flushSync() {
-        lock.lock()
-        let stream = isCancelled ? nil : stream
-        lock.unlock()
-        if let stream {
-            FSEventStreamFlushSync(stream)
-            // FlushSync requests delivery, but callbacks target this private
-            // dispatch queue. A queue barrier makes the accepted watermark a
-            // true synchronous cut for conditional authority installation.
-            queue.sync {}
-        } else {
-            queue.sync {}
+    func flush() async -> Bool {
+        let sourceState: (flushTarget: FSEventStreamEventId?, hasDirectorySource: Bool) = lock.withLock {
+            guard !isCancelled else { return (nil, false) }
+            if let stream {
+                return (FSEventStreamFlushAsync(stream), false)
+            }
+            return (nil, directorySource != nil)
         }
+        if let flushTarget = sourceState.flushTarget {
+            guard await deliveryBarrier.waitUntilDelivered(
+                flushTarget,
+                generation: deliveryGeneration
+            ) else { return false }
+        } else if !sourceState.hasDirectorySource {
+            return false
+        }
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume()
+            }
+        }
+        return lock.withLock { !isCancelled }
     }
 
     func cancel() {
@@ -771,6 +786,12 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             eventFlags: eventFlags,
             eventIds: eventIDs
         ) else { return }
+        defer {
+            deliveryBarrier.recordDelivered(
+                eventIDs: payload.entries.map(\.id),
+                generation: deliveryGeneration
+            )
+        }
         var kinds = Set<GitWorkspaceMetadataEventKind>()
         for entry in payload.entries {
             let gapMask = FSEventStreamEventFlags(
