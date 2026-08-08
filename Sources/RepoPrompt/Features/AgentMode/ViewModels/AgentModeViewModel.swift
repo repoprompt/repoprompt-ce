@@ -2190,17 +2190,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 setAgentRunActive: { [weak self] tabID, isActive in
                     self?.setAgentRunActive(tabID, isActive: isActive)
                 },
-                updateBindings: { [weak self] session in
-                    guard let self else { return }
-                    updateBindingsFromSession(session)
-                    handleObservedMCPStateChange(for: session)
-                },
                 requestUIRefresh: { [weak self] tabID, urgent in
                     self?.requestUIRefresh(tabID: tabID, urgent: urgent)
                 },
                 notifyAgentTurnComplete: { [weak self] session in
                     self?.notifyAgentTurnComplete(for: session)
-                },
+                }
+            ),
+            bindingObservation: .init(
+                updateBindings: { [weak self] session in
+                    guard let self else { return }
+                    updateBindingsFromSession(session)
+                    handleObservedMCPStateChange(for: session)
+                }
+            ),
+            queuedWorkRecovery: .init(
                 restoreDraftText: { [weak self] tabID, text, message, strategy in
                     self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
                 }

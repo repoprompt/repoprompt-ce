@@ -14,7 +14,7 @@ import Foundation
 ///
 /// This is a command-side contract: hosts translate user or lifecycle actions
 /// into one of these intents before asking their execution layer to stop a run.
-package enum DomainAgentRunCancellationIntent: String, Codable, Equatable, Hashable, Sendable {
+package enum DomainAgentRunCancellationIntent: Equatable, Hashable {
     /// The user explicitly stopped the run.
     case userStop
     /// The run is being stopped because its execution location (worktree/cwd)
@@ -38,7 +38,7 @@ package enum DomainAgentRunCancellationIntent: String, Codable, Equatable, Hasha
 ///
 /// Terminal settlement is exactly-once: waiting for `terminalTeardownCompleted`
 /// never re-runs teardown, it only awaits the single claimed teardown closure.
-package enum DomainAgentRunCancellationCompletion: String, Equatable, Hashable, Sendable {
+package enum DomainAgentRunCancellationCompletion: Equatable, Hashable {
     /// Return after canonical terminal publication and synchronous provider
     /// detachment.
     case terminalPublished
@@ -52,8 +52,8 @@ package enum DomainAgentRunCancellationCompletion: String, Equatable, Hashable, 
 /// canonical settlement surface (`DomainAgentRunSessionStore.publishTerminal`
 /// via a `DomainAgentRunTerminalPublicationEnvelope`); the store enforces
 /// exactly-once publication per epoch regardless of host.
-package struct DomainAgentRunTerminalOutcome: Equatable, Hashable, Sendable {
-    package enum Kind: String, Codable, Equatable, Hashable, Sendable {
+package struct DomainAgentRunTerminalOutcome: Equatable, Hashable {
+    package enum Kind: String, Codable, Equatable, Hashable {
         case completed
         case cancelled
         case failed

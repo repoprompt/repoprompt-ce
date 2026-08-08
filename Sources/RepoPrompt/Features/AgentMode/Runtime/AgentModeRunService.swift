@@ -566,7 +566,7 @@ final class AgentModeRunService {
         }
         session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
         session.isDirty = true
-        hooks.presentation.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
         hooks.persistence.scheduleSave(tabID)
     }
 
@@ -861,7 +861,7 @@ final class AgentModeRunService {
     ) {
         guard !drafts.isEmpty else { return }
         let combined = drafts.joined(separator: "\n")
-        hooks.presentation.restoreDraftText(tabID, combined, "Restored queued steering messages", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(tabID, combined, "Restored queued steering messages", strategy)
     }
 
     private func restoreAllQueuedDraftsForExecutionLocationChange(
@@ -877,7 +877,7 @@ final class AgentModeRunService {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
         guard !drafts.isEmpty else { return }
-        hooks.presentation.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
     }
 
     /// Concatenates all queued Claude steering draft texts and restores them to the composer.

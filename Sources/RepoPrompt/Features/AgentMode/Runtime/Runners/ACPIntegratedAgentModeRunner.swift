@@ -507,7 +507,7 @@ final class ACPIntegratedAgentModeRunner {
             _ = syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session)
             session.isDirty = true
             hooks.persistence.scheduleSave(session.tabID)
-            hooks.presentation.updateBindings(session)
+            hooks.bindingObservation.updateBindings(session)
 
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
@@ -805,7 +805,7 @@ final class ACPIntegratedAgentModeRunner {
         guard changed else { return }
         session.isDirty = true
         hooks.persistence.scheduleSave(session.tabID)
-        hooks.presentation.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
     }
 
     private func applyRequestedSessionModeIfNeeded(
@@ -888,7 +888,7 @@ final class ACPIntegratedAgentModeRunner {
                         session.runState = .running
                         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
                     } else {
-                        hooks.presentation.updateBindings(session)
+                        hooks.bindingObservation.updateBindings(session)
                     }
                 }
             case let .terminal(state, errorText):
@@ -1051,14 +1051,14 @@ final class ACPIntegratedAgentModeRunner {
         let normalizedSource = value == nil ? nil : source
         guard session.runningStatusText != value || session.runningStatusSource != normalizedSource else {
             if urgent {
-                hooks.presentation.updateBindings(session)
+                hooks.bindingObservation.updateBindings(session)
                 hooks.presentation.requestUIRefresh(session.tabID, true)
             }
             return
         }
         session.runningStatusText = value
         session.runningStatusSource = normalizedSource
-        hooks.presentation.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
         hooks.presentation.requestUIRefresh(session.tabID, urgent)
     }
 

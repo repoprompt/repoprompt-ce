@@ -295,7 +295,7 @@ final class AgentRunTerminalCommitBarrier {
         session.lastTerminalCommitRevision = revision
         session.lastTerminalPublicationResult = nil
 
-        hooks.presentation.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
         if request.notifyTurnComplete {
             hooks.presentation.notifyAgentTurnComplete(session)
         }

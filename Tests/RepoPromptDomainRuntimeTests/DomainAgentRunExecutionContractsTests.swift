@@ -53,9 +53,13 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
         )
     }
 
-    // MARK: - Exactly-once terminal settlement through the canonical store
+    // MARK: - Compatibility with the store's pre-existing exactly-once settlement
 
-    func testOutcomeMappedTerminalPublicationIsExactlyOncePerEpoch() async {
+    // The exactly-once-per-epoch guarantee is pre-existing
+    // `DomainAgentRunSessionStore` behavior, not something the outcome mapping
+    // introduces; this test only verifies that outcome-mapped publication
+    // composes with that store behavior unchanged.
+    func testOutcomeMappedTerminalPublicationRemainsCompatibleWithStoreExactlyOnceSemantics() async {
         let identity = makeIdentity()
         let store = makeSessionStore(identity: identity, profile: "execution-contracts-once")
         let sessionID = UUID()

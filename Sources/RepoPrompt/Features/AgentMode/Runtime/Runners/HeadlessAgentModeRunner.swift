@@ -47,7 +47,7 @@ final class HeadlessAgentModeRunner {
         session.runningStatusSource = nil
         session.runState = .running
         hooks.presentation.setAgentRunActive(tabID, true)
-        hooks.presentation.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
 
         guard session.selectedAgent != .codexExec else {
             await terminalCommitBarrier.commit(.init(

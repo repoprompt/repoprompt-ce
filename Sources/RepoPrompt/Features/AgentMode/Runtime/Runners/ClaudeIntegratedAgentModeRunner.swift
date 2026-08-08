@@ -88,7 +88,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.claudeExpectedTurnIDs.removeAll()
         hooks.presentation.setAgentRunActive(tabID, true)
-        hooks.presentation.updateBindings(session)
+        hooks.bindingObservation.updateBindings(session)
 
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
@@ -235,7 +235,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
                 session.runState = .waitingForApproval
-                hooks.presentation.updateBindings(session)
+                hooks.bindingObservation.updateBindings(session)
             case let .approvalCancelled(requestID):
                 if session.pendingApproval?.requestID == .claudeControl(requestID) {
                     session.pendingApproval = nil
@@ -244,7 +244,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         session.setRunningStatus("Thinking…", source: .transport)
                         session.runState = .running
                     }
-                    hooks.presentation.updateBindings(session)
+                    hooks.bindingObservation.updateBindings(session)
                 }
             case let .turnCompleted(turnID, turnStatus):
                 guard session.claudeExpectedTurnIDs.contains(turnID) else {
@@ -266,7 +266,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         session.runState = .running
                     }
                     hooks.presentation.setAgentRunActive(session.tabID, true)
-                    hooks.presentation.updateBindings(session)
+                    hooks.bindingObservation.updateBindings(session)
                     continue eventLoop
                 }
                 // No superseding turn expected — terminal for this run.
@@ -292,7 +292,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     #endif
                     let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)
-                    hooks.presentation.updateBindings(session)
+                    hooks.bindingObservation.updateBindings(session)
                     hooks.persistence.scheduleSave(session.tabID)
                 }
             }

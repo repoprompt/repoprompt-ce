@@ -10,9 +10,9 @@ import Foundation
 // - Canonical lifecycle/durable settlement stays owned by the domain layer
 //   (`DomainAgentRunSessionStore`); `TerminalSettlementHooks` only adapts into
 //   that authority and must remain exactly-once per run attempt ownership.
-// - Presentation and persistence hooks are host projections. They must never
-//   become backend authority: a headless host may implement them as no-ops
-//   without changing run semantics.
+// - Presentation, binding-observation, queued-work recovery, and persistence
+//   hooks are host projections. They must never become backend authority: a
+//   headless host may implement them as no-ops without changing run semantics.
 // - `AgentModeViewModel.TabSession` still appears in these signatures because
 //   the app host is the only adopter today. The grouping is the contract seam;
 //   neutralizing the session parameter is the provider-migration step (PR 3).
@@ -44,10 +44,27 @@ extension AgentModeRunService {
     /// Authority: presentation projection.
     struct RunPresentationHooks {
         let setAgentRunActive: (UUID, Bool) -> Void
-        let updateBindings: (AgentModeViewModel.TabSession) -> Void
         let requestUIRefresh: (UUID, Bool) -> Void
         let notifyAgentTurnComplete: (AgentModeViewModel.TabSession) -> Void
-        /// Restore queued steering draft text back to the composer.
+    }
+
+    /// Session binding/run-state observation invoked from the central run
+    /// execution routing points. Not UI-only: alongside presentation binding
+    /// updates, the app host also observes MCP-controlled session state from
+    /// this callback, so it is classified as host binding observation rather
+    /// than pure presentation.
+    ///
+    /// Authority: host binding/state observation projection. Never
+    /// authoritative for run lifecycle decisions.
+    struct RunBindingObservationHooks {
+        let updateBindings: (AgentModeViewModel.TabSession) -> Void
+    }
+
+    /// Recovery of queued, undelivered user work when a run settles before
+    /// delivery (restoring queued steering text back into the host composer).
+    ///
+    /// Authority: queued-work recovery projection.
+    struct QueuedWorkRecoveryHooks {
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
     }
 
@@ -134,6 +151,8 @@ extension AgentModeRunService {
         let usage: UsageAccountingHooks
         let attachments: AttachmentLifecycleHooks
         let presentation: RunPresentationHooks
+        let bindingObservation: RunBindingObservationHooks
+        let queuedWorkRecovery: QueuedWorkRecoveryHooks
         let persistence: RunPersistenceHooks
         let transcript: TranscriptProjectionHooks
         let providerInput: ProviderInputAssemblyHooks

@@ -1632,9 +1632,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ),
             presentation: .init(
                 setAgentRunActive: { _, isActive in recorder.record("run-active:\(isActive)") },
-                updateBindings: { _ in recorder.record("bindings") },
                 requestUIRefresh: { _, _ in },
-                notifyAgentTurnComplete: { _ in },
+                notifyAgentTurnComplete: { _ in }
+            ),
+            bindingObservation: .init(
+                updateBindings: { _ in recorder.record("bindings") }
+            ),
+            queuedWorkRecovery: .init(
                 restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") }
             ),
             persistence: .init(

@@ -656,9 +656,13 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
             ),
             presentation: .init(
                 setAgentRunActive: { _, _ in },
-                updateBindings: { _ in },
                 requestUIRefresh: { _, _ in },
-                notifyAgentTurnComplete: { _ in },
+                notifyAgentTurnComplete: { _ in }
+            ),
+            bindingObservation: .init(
+                updateBindings: { _ in }
+            ),
+            queuedWorkRecovery: .init(
                 restoreDraftText: { _, _, _, _ in }
             ),
             persistence: .init(
