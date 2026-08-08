@@ -37,6 +37,75 @@ actor MCPToolCatalogReadiness {
     private struct CheckAttempt {
         let id: UUID
         let task: Task<Bool, Never>
+        let completion: CheckCompletion
+    }
+
+    private actor CheckCompletion {
+        private struct Waiter {
+            let continuation: CheckedContinuation<Bool, Never>
+            let deadlineTask: Task<Void, Never>
+        }
+
+        private var result: Bool?
+        private var waiters: [UUID: Waiter] = [:]
+
+        func wait(until deadline: ContinuousClock.Instant) async -> Bool {
+            if let result { return result }
+            if Task.isCancelled { return false }
+
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if let result {
+                        continuation.resume(returning: result)
+                        return
+                    }
+                    if Task.isCancelled {
+                        continuation.resume(returning: false)
+                        return
+                    }
+
+                    let deadlineTask = Task { [weak self] in
+                        do {
+                            try await ContinuousClock().sleep(until: deadline)
+                        } catch {
+                            return
+                        }
+                        await self?.expire(waiterID)
+                    }
+                    waiters[waiterID] = Waiter(
+                        continuation: continuation,
+                        deadlineTask: deadlineTask
+                    )
+                }
+            } onCancel: {
+                Task { [weak self] in
+                    await self?.cancel(waiterID)
+                }
+            }
+        }
+
+        func resolve(_ result: Bool) {
+            guard self.result == nil else { return }
+            self.result = result
+            let resolvedWaiters = waiters.values
+            waiters.removeAll()
+            for waiter in resolvedWaiters {
+                waiter.deadlineTask.cancel()
+                waiter.continuation.resume(returning: result)
+            }
+        }
+
+        private func expire(_ waiterID: UUID) {
+            guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+            waiter.continuation.resume(returning: false)
+        }
+
+        private func cancel(_ waiterID: UUID) {
+            guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+            waiter.deadlineTask.cancel()
+            waiter.continuation.resume(returning: false)
+        }
     }
 
     typealias ScopePresenceOperation = @Sendable (
@@ -102,7 +171,7 @@ actor MCPToolCatalogReadiness {
             if Task.isCancelled { return false }
             guard clock.now < deadline else { break }
 
-            let isReady = await checkServicesReady(windowID: windowID)
+            let isReady = await checkServicesReady(windowID: windowID, deadline: deadline)
             if Task.isCancelled { return false }
             guard clock.now <= deadline else { break }
             if isReady {
@@ -125,34 +194,45 @@ actor MCPToolCatalogReadiness {
         return false
     }
 
-    private func checkServicesReady(windowID: Int?) async -> Bool {
+    private func checkServicesReady(
+        windowID: Int?,
+        deadline: ContinuousClock.Instant
+    ) async -> Bool {
         let key = windowID.map(CheckKey.window) ?? .application
+        let attempt: CheckAttempt
         if let activeCheck = activeChecks[key] {
-            #if DEBUG
-                await checkJoinedOperation(windowID)
-            #endif
-            return await activeCheck.task.value
+            attempt = activeCheck
+        } else {
+            let scopePresenceOperation = scopePresenceOperation
+            let windowStateOperation = windowStateOperation
+            let task = Task {
+                await Self.performReadinessCheck(
+                    windowID: windowID,
+                    scopePresenceOperation: scopePresenceOperation,
+                    windowStateOperation: windowStateOperation
+                )
+            }
+            let completion = CheckCompletion()
+            attempt = CheckAttempt(id: UUID(), task: task, completion: completion)
+            activeChecks[key] = attempt
+
+            Task { [weak self] in
+                let result = await task.value
+                await completion.resolve(result)
+                await self?.removeActiveCheck(key: key, id: attempt.id)
+            }
         }
 
-        let scopePresenceOperation = scopePresenceOperation
-        let windowStateOperation = windowStateOperation
-        let task = Task {
-            await Self.performReadinessCheck(
-                windowID: windowID,
-                scopePresenceOperation: scopePresenceOperation,
-                windowStateOperation: windowStateOperation
-            )
-        }
-        let attempt = CheckAttempt(id: UUID(), task: task)
-        activeChecks[key] = attempt
         #if DEBUG
             await checkJoinedOperation(windowID)
         #endif
-        let result = await task.value
-        if activeChecks[key]?.id == attempt.id {
+        return await attempt.completion.wait(until: deadline)
+    }
+
+    private func removeActiveCheck(key: CheckKey, id: UUID) {
+        if activeChecks[key]?.id == id {
             activeChecks.removeValue(forKey: key)
         }
-        return result
     }
 
     private static func performReadinessCheck(

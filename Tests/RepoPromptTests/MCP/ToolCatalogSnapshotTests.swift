@@ -250,6 +250,105 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #endif
     }
 
+    func testReadinessCallerDeadlineDoesNotCancelSharedCheck() async throws {
+        #if DEBUG
+            let queryProbe = MCPReadinessScopePresenceProbe()
+            let joinedObservations = AsyncTestCondition<[Int?]>([])
+            let shortCompletion = AsyncTestCondition<Bool?>(nil)
+            let readiness = MCPToolCatalogReadiness(
+                scopePresenceOperation: { requiredNames, scope in
+                    await queryProbe.query(requiredNames: requiredNames, scope: scope)
+                },
+                windowStateOperation: { _ in
+                    MCPToolCatalogReadiness.WindowRegistrationState(
+                        toolsEnabled: true,
+                        toolsRequested: true
+                    )
+                },
+                checkJoinedOperation: { windowID in
+                    joinedObservations.update { $0.append(windowID) }
+                }
+            )
+
+            let longWaiters = (0 ..< 2).map { _ in
+                Task { await readiness.awaitReady(windowID: 902, timeout: 5) }
+            }
+            let shortWaiter = Task {
+                let result = await readiness.awaitReady(windowID: 902, timeout: 0.05)
+                shortCompletion.update { $0 = result }
+                return result
+            }
+            var lateWaiter: Task<Bool, Never>?
+
+            do {
+                try await AsyncTestWait.waitUntil("blocked readiness scope query", timeout: 3) {
+                    await queryProbe.queryCount == 1
+                }
+                try await joinedObservations.waitUntil(
+                    "initial readiness callers joining the shared check",
+                    timeout: 3
+                ) { $0.count >= 3 }
+                try await shortCompletion.waitUntil(
+                    "short readiness caller deadline",
+                    timeout: 1
+                ) { $0 != nil }
+
+                let shortResult = await shortWaiter.value
+                XCTAssertFalse(shortResult, "The caller-local deadline must expire while the shared query remains held.")
+                let queryCountAfterShortDeadline = await queryProbe.queryCount
+                XCTAssertEqual(
+                    queryCountAfterShortDeadline,
+                    1,
+                    "A timed-out caller must not start a replacement query or cancel shared work."
+                )
+
+                lateWaiter = Task { await readiness.awaitReady(windowID: 902, timeout: 5) }
+                try await joinedObservations.waitUntil(
+                    "late readiness caller joining after the short deadline",
+                    timeout: 3
+                ) { $0.count >= 4 }
+                let queryCountAfterLateJoin = await queryProbe.queryCount
+                XCTAssertEqual(
+                    queryCountAfterLateJoin,
+                    1,
+                    "The shared check must remain registered for callers arriving after another caller times out."
+                )
+
+                await queryProbe.releaseFirstQuery()
+                for waiter in longWaiters {
+                    let ready = await waiter.value
+                    XCTAssertTrue(ready)
+                }
+                let lateReady = await lateWaiter?.value
+                XCTAssertEqual(lateReady, true)
+                let finalQueryCount = await queryProbe.queryCount
+                XCTAssertEqual(
+                    finalQueryCount,
+                    2,
+                    "The surviving shared check should issue exactly one application and one window query."
+                )
+            } catch {
+                longWaiters.forEach { $0.cancel() }
+                shortWaiter.cancel()
+                lateWaiter?.cancel()
+                await queryProbe.releaseFirstQuery()
+                for waiter in longWaiters {
+                    _ = await waiter.value
+                }
+                _ = await shortWaiter.value
+                _ = await lateWaiter?.value
+                let observedCount = joinedObservations.snapshot().count
+                let queryCount = await queryProbe.queryCount
+                XCTFail(
+                    "Readiness caller-deadline setup failed: \(error); "
+                        + "joined=\(observedCount), queries=\(queryCount)"
+                )
+            }
+        #else
+            throw XCTSkip("Readiness operation-count probes require DEBUG test seams.")
+        #endif
+    }
+
     func testPresentationSummaryPublicationDoesNotReregisterActiveWindowCatalog() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
