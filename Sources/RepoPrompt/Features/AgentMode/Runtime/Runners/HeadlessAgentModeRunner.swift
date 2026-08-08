@@ -64,7 +64,7 @@ final class HeadlessAgentModeRunner {
                 notifyTurnComplete: false,
                 prepareProviderState: {
                     session.provider = nil
-                    session.runID = nil
+                    session.clearRunID(ifCurrent: runID)
                     return nil
                 }
             ))
@@ -80,9 +80,7 @@ final class HeadlessAgentModeRunner {
         session.provider = provider
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
             session.provider = nil
-            if session.runID == runID {
-                session.runID = nil
-            }
+            session.clearRunID(ifCurrent: runID)
             return {
                 switch terminalState {
                 case .failed:
@@ -151,7 +149,7 @@ final class HeadlessAgentModeRunner {
             notifyTurnComplete: false,
             prepareProviderState: {
                 session.provider = nil
-                session.runID = nil
+                session.clearRunID(ifCurrent: runID)
                 return nil
             }
         ))
@@ -208,7 +206,7 @@ final class HeadlessAgentModeRunner {
                 notifyTurnComplete: true,
                 prepareProviderState: {
                     session.provider = nil
-                    session.runID = nil
+                    session.clearRunID(ifCurrent: runID)
                     return nil
                 }
             ))
@@ -230,7 +228,7 @@ final class HeadlessAgentModeRunner {
                 notifyTurnComplete: false,
                 prepareProviderState: {
                     session.provider = nil
-                    session.runID = nil
+                    session.clearRunID(ifCurrent: runID)
                     return nil
                 }
             ))
@@ -253,7 +251,7 @@ final class HeadlessAgentModeRunner {
                 notifyTurnComplete: false,
                 prepareProviderState: {
                     session.provider = nil
-                    session.runID = nil
+                    session.clearRunID(ifCurrent: runID)
                     return nil
                 }
             ))
