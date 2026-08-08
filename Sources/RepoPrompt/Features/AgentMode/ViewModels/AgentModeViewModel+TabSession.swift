@@ -419,20 +419,20 @@ extension AgentModeViewModel {
         var instructionWaitID: UUID?
 
         /// Agent run — transient run-attempt lifecycle/settlement state is owned by
-        /// the extracted `AgentRunAttemptLifecycle` facade. The properties below are
-        /// stable forwarders so existing call sites keep working; mutation happens
-        /// through the facade's named operations.
+        /// the extracted `AgentRunAttemptLifecycle` facade. Run identity is
+        /// read-only here; mutation happens only through the named operations
+        /// below (`installRunID`, `clearRunID(ifCurrent:)`) or the
+        /// host-authoritative `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
         let runLifecycle = AgentRunAttemptLifecycle()
 
         var runID: UUID? {
-            get { runLifecycle.currentRunID }
-            set {
-                if let newValue {
-                    runLifecycle.installRunID(newValue)
-                } else {
-                    runLifecycle.clearRunID()
-                }
-            }
+            runLifecycle.currentRunID
+        }
+
+        /// Installs the provider process run identity for a starting or resumed
+        /// run. The installing path owns the identity until it is cleared.
+        func installRunID(_ runID: UUID) {
+            runLifecycle.installRunID(runID)
         }
 
         /// Clears the run ID only when it still matches the caller's run, so a

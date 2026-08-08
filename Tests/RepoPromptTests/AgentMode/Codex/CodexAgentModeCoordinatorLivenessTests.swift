@@ -449,7 +449,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
         XCTAssertTrue(session.endRunAttempt(ifCurrent: attemptA, source: "test.watchdog.attemptA.terminal"))
         let attemptB = session.beginRunAttempt(source: "test.watchdog.attemptB")
-        session.runID = runID
+        session.installRunID(runID)
         session.runState = .running
         session.codexController = controller
         session.codexWatchdogState = .init()
@@ -2320,7 +2320,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             )
         }
         await drainGate.waitUntilWaiting()
-        session.runID = UUID()
+        session.installRunID(UUID())
         drainGate.release()
 
         let outcome = await sendTask.value
@@ -2898,6 +2898,103 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    // MARK: - Shutdown run-identity scoping
+
+    func testIdleReclaimShutdownSkipsTailWhenSuccessorStartsDuringRetirement() async {
+        let shutdownGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            shutdownGate: shutdownGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        // Post-run idle shape: a completed run's identity is retained for
+        // follow-up reuse; no attempt ownership is active.
+        let retainedRunID = UUID()
+        session.installRunID(retainedRunID)
+        session.runState = .completed
+        session.codexController = controller
+
+        let shutdownTask = Task {
+            await viewModel.test_codexCoordinator.shutdownCodexSession(
+                session,
+                reclaimOnlyIfStillIdle: true
+            )
+        }
+        await shutdownGate.waitUntilWaiting()
+
+        // A follow-up begins while the idle reclaim is suspended in controller
+        // retirement. Codex follow-ups reuse the retained run ID, so run-ID
+        // staleness alone cannot detect the successor — the reclaim tail must
+        // key off idle/ownership/controller state instead.
+        let successorController = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let successorOwnership = session.beginRunAttempt(source: "test.idleReclaimSuccessor")
+        session.runState = .running
+        session.codexController = successorController
+        XCTAssertEqual(session.runID, retainedRunID)
+
+        shutdownGate.release()
+        await shutdownTask.value
+
+        XCTAssertEqual(
+            session.runID,
+            retainedRunID,
+            "idle reclaim must not clear a successor's (reused) run identity"
+        )
+        XCTAssertEqual(session.activeRunOwnership, successorOwnership)
+        XCTAssertNotNil(session.codexController)
+        XCTAssertEqual(session.runState, .running)
+    }
+
+    func testIdleReclaimShutdownClearsRetainedRunIdentityWhenStillIdle() async {
+        let controller = LivenessFakeCodexController(snapshot: .idle)
+        let viewModel = makeViewModel(controller: controller)
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        session.runState = .completed
+        session.codexController = controller
+
+        await viewModel.test_codexCoordinator.shutdownCodexSession(
+            session,
+            reclaimOnlyIfStillIdle: true
+        )
+
+        XCTAssertNil(session.runID, "still-idle reclaim performs the normal shutdown tail")
+        XCTAssertNil(session.codexController)
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+    }
+
+    func testDetachedShutdownScopesRunIdentityClearToDetachedRun() async {
+        let controller = LivenessFakeCodexController(snapshot: .idle)
+        let viewModel = makeViewModel(controller: controller)
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        let detachedRunID = UUID()
+        let successorRunID = UUID()
+        session.installRunID(successorRunID)
+
+        await viewModel.test_codexCoordinator.shutdownCodexSession(
+            session,
+            clearTabScopedCoordinatorState: false,
+            detachedRunID: detachedRunID
+        )
+        XCTAssertEqual(
+            session.runID,
+            successorRunID,
+            "detached teardown owns only the run it was handed"
+        )
+
+        session.installRunID(detachedRunID)
+        await viewModel.test_codexCoordinator.shutdownCodexSession(
+            session,
+            clearTabScopedCoordinatorState: false,
+            detachedRunID: detachedRunID
+        )
+        XCTAssertNil(session.runID, "detached teardown clears its own run when still current")
+    }
+
     private func makeCommandToolItem(
         turnID: String = "turn",
         itemID: UUID,
@@ -2962,7 +3059,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     ) -> AgentModeViewModel.TabSession {
         let session = viewModel.session(for: UUID())
         session.selectedAgent = .codexExec
-        session.runID = runID
+        if let runID {
+            session.installRunID(runID)
+        }
         session.runState = .running
         session.beginRunAttempt(source: "test.codexLiveness")
         session.codexController = controller
@@ -3166,6 +3265,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     private let postReattachActiveTurnIDs: [String]?
     private let snapshotReadGate: LivenessSnapshotReadGate?
     private let postReattachSnapshotReadGate: LivenessSnapshotReadGate?
+    private let shutdownGate: LivenessSnapshotReadGate?
     private var pendingTurnFailure: CodexNativeSessionController.TurnFailure?
 
     init(
@@ -3186,6 +3286,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         postReattachActiveTurnIDs: [String]? = nil,
         snapshotReadGate: LivenessSnapshotReadGate? = nil,
         postReattachSnapshotReadGate: LivenessSnapshotReadGate? = nil,
+        shutdownGate: LivenessSnapshotReadGate? = nil,
         pendingTurnFailure: CodexNativeSessionController.TurnFailure? = nil
     ) {
         snapshotStatuses = if let snapshotSequence, !snapshotSequence.isEmpty {
@@ -3208,6 +3309,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         self.postReattachActiveTurnIDs = postReattachActiveTurnIDs
         self.snapshotReadGate = snapshotReadGate
         self.postReattachSnapshotReadGate = postReattachSnapshotReadGate
+        self.shutdownGate = shutdownGate
         self.pendingTurnFailure = pendingTurnFailure
     }
 
@@ -3413,6 +3515,9 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     func cancelCurrentTurn() async {}
     func shutdown() async {
         shutdownCount += 1
+        if let shutdownGate {
+            await shutdownGate.wait()
+        }
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}

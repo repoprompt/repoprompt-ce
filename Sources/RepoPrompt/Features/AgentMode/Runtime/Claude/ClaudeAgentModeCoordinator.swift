@@ -262,8 +262,7 @@ final class ClaudeAgentModeCoordinator {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return }
         await awaitPendingClaudeResumeTransferIfNeeded(for: session)
 
-        let runID = session.runID ?? UUID()
-        session.runID = runID
+        let runID = AgentModeProcessRunIdentity.ensureProcessRunID(for: session)
         let launchModelRaw = session.selectedModelRaw
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
         let runtimePermission = effectiveClaudeRuntimePermission(for: session)
@@ -593,14 +592,18 @@ final class ClaudeAgentModeCoordinator {
                 throw ControllerLifecycleError.superseded
             }
             await stopToolTracking(detached, for: session)
-            session.runID = nil
+            // Run-scoped retry: if a successor installed its own run identity
+            // while tool tracking stopped, this fresh-start retry is superseded
+            // and must not touch the successor's state.
+            guard session.clearRunID(ifCurrent: runID) else {
+                throw ControllerLifecycleError.superseded
+            }
             session.providerSessionID = nil
             session.providerCleanupHandle = nil
             session.isDirty = true
             viewModel?.scheduleSave(for: session.tabID)
 
-            let freshRunID = UUID()
-            session.runID = freshRunID
+            let freshRunID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
             let retryWorkspacePath = try workspacePathProvider(session)
             let launchSettings = ControllerLaunchSettings(
                 runtimeVariant: runtimeVariant,
@@ -1003,7 +1006,9 @@ final class ClaudeAgentModeCoordinator {
         if detached == nil {
             clearClaudeControllerLaunchMetadata(for: session)
         }
-        session.runID = nil
+        // Force reset: user cancel / provider identity transition — no run
+        // survives, and this synchronous path decides that authoritatively.
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         return detached
@@ -1180,7 +1185,32 @@ final class ClaudeAgentModeCoordinator {
             invalidateControllerRetirement(for: session)
             clearClaudeControllerLaunchMetadata(for: session)
         }
-        session.runID = nil
+        if clearTabScopedCoordinatorState {
+            // Force semantics: every tab-scoped caller is tab/context-terminal
+            // (window/tab close, session delete, execution-location change), so
+            // any run present — including one that started during the awaits
+            // above — must not survive.
+            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        } else {
+            // Detached background teardown owns only the run it was handed. If
+            // a different live identity is visible (the discarded session was
+            // re-adopted or gained a successor during the awaits above), skip
+            // the session-state tail entirely — preserving only the ID while
+            // clearing adjacent run/presentation state would be split-brain.
+            // Only the detached run's tool tracking still needs reaping, and
+            // that cleanup is run-scoped.
+            let detachedIdentityCurrent: Bool = {
+                guard let detachedRunID else { return session.runID == nil }
+                if session.clearRunID(ifCurrent: detachedRunID) { return true }
+                // Common path: an earlier authoritative teardown (user cancel,
+                // workspace-switch cancel) already cleared this run's identity.
+                return session.runID == nil
+            }()
+            guard detachedIdentityCurrent else {
+                await clearClaudeToolTracking(for: session, matchingRunID: detachedRunID)
+                return
+            }
+        }
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)

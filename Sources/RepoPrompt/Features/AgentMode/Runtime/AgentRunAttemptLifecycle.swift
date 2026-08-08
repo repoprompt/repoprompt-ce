@@ -153,7 +153,13 @@ final class AgentRunAttemptLifecycle {
         return true
     }
 
-    func clearRunID() {
+    /// Host-authoritative force reset: unconditionally clears the run ID,
+    /// including a successor's. Reserved for teardown paths whose contract is
+    /// "no run may survive this transition" (tab/window close, session delete,
+    /// provider identity change, workspace switch, execution-location change).
+    /// Run-scoped cleanup must use `clearRunID(ifCurrent:)` instead. Callers
+    /// reach this through `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
+    func forceClearRunID() {
         currentRunID = nil
     }
 

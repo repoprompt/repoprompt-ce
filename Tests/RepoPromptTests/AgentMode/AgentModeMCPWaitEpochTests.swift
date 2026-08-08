@@ -166,7 +166,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
                 startedAt: Date()
             )
         ])
-        session.runID = runID
+        session.installRunID(runID)
         let ownership = session.beginRunAttempt(source: "test.canonical")
         session.runState = .completed
         session.mcpFollowUpRunPending = true
@@ -175,7 +175,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         XCTAssertEqual(projected.status, .running)
         XCTAssertEqual(projected.runID, runID)
 
-        session.runID = nil
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         let queuedProjection = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
         XCTAssertEqual(queuedProjection.status, .running)
         XCTAssertNil(queuedProjection.runID)
@@ -503,7 +503,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         let controller = EpochTestCodexController()
         let runID = UUID()
         backgroundSession.selectedAgent = .codexExec
-        backgroundSession.runID = runID
+        backgroundSession.installRunID(runID)
         backgroundSession.runState = .running
         let ownership = backgroundSession.beginRunAttempt(source: "test.backgroundTerminal")
         backgroundSession.codexController = controller
@@ -584,7 +584,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
             let runID = UUID()
             session.selectedAgent = .openCode
-            session.runID = runID
+            session.installRunID(runID)
             session.runState = .running
             let ownership = session.beginRunAttempt(source: "test.finalContentDiagnostic")
             let runAttemptID = try XCTUnwrap(session.activeRunAttemptID)
@@ -667,7 +667,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         )
         await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
         let runID = UUID()
-        session.runID = runID
+        session.installRunID(runID)
         let ownership = session.beginRunAttempt(source: "test.stampedFailureReason")
         session.transcript = AgentTranscriptIO.buildTranscript(
             from: [
