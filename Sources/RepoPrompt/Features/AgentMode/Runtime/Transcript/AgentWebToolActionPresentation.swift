@@ -127,6 +127,7 @@ enum AgentWebToolCanonicalNames {
     }
 
     private static func normalizedNameCandidates(_ raw: String) -> [String] {
+        guard raw.count < 500 else { return [] }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         let stripped = trimmed.replacingOccurrences(of: "mcp__RepoPrompt__", with: "")
