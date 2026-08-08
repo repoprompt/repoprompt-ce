@@ -690,7 +690,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         XCTAssertEqual(envelope.snapshot.status, .failed)
         XCTAssertEqual(envelope.snapshot.failureReason, .processCrash)
 
-        session.lastTerminalCommitRevision = AgentRunTerminalCommitRevision(
+        session.runLifecycle.stageTerminalRevision(AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: ownership,
             terminalState: .failed,
@@ -702,7 +702,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             mcpPublicationEnvelope: nil,
             successorKind: nil,
             providerSuccessorID: nil
-        )
+        ))
         let livePoll = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
         XCTAssertEqual(livePoll.status, .failed)
         XCTAssertEqual(livePoll.statusText, "Run timed out waiting for the provider")
@@ -732,7 +732,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         )
         session.runState = .failed
         XCTAssertTrue(session.endRunAttempt(ifCurrent: ownership, source: "test.bindingTransitionFailureStamp"))
-        session.lastTerminalCommitRevision = AgentRunTerminalCommitRevision(
+        session.runLifecycle.stageTerminalRevision(AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: ownership,
             terminalState: .failed,
@@ -744,8 +744,8 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             mcpPublicationEnvelope: nil,
             successorKind: nil,
             providerSuccessorID: nil
-        )
-        session.lastTerminalPublicationResult = .accepted(successorEpoch: nil)
+        ))
+        session.runLifecycle.recordTerminalPublicationResult(.accepted(successorEpoch: nil))
 
         let originalBinding = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
         XCTAssertEqual(originalBinding.failureReason, .processCrash)
@@ -789,7 +789,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         XCTAssertEqual(restored.status, .failed)
         XCTAssertEqual(restored.failureReason, .timeout)
 
-        session.lastTerminalCommitRevision = AgentRunTerminalCommitRevision(
+        session.runLifecycle.stageTerminalRevision(AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: ownership,
             terminalState: .failed,
@@ -801,7 +801,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             mcpPublicationEnvelope: nil,
             successorKind: nil,
             providerSuccessorID: nil
-        )
+        ))
         let unrelatedAttempt = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
         XCTAssertEqual(unrelatedAttempt.failureReason, .timeout)
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)

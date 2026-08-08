@@ -733,7 +733,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.runID = UUID()
         session.runState = .running
         let codexOwnership = session.beginRunAttempt(source: "test.codex")
-        session.providerTerminalDrainGeneration = 4
+        for _ in 0 ..< 4 {
+            session.bumpProviderTerminalDrainGeneration()
+        }
+        XCTAssertEqual(session.providerTerminalDrainGeneration, 4)
         _ = session.endRunAttempt(ifCurrent: codexOwnership, source: "test.rotate")
 
         let claudeOwnership = session.beginRunAttempt(source: "test.claude")

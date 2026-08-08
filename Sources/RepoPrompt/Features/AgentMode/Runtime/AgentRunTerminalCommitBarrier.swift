@@ -150,11 +150,14 @@ final class AgentRunTerminalCommitBarrier {
         {
             recordRejection("duplicate_commit", request: request)
             if session.lastTerminalPublicationResult?.isResolved != true {
-                session.lastTerminalPublicationResult = await hooks.terminalSettlement.publishTerminalCommit(
+                // Duplicate retry: records a result while no terminal commit is
+                // in progress; the facade operation is intentionally unguarded.
+                let retriedResult = await hooks.terminalSettlement.publishTerminalCommit(
                     session,
                     existingRevision,
                     existingRevision.successorKind
                 )
+                session.runLifecycle.recordTerminalPublicationResult(retriedResult)
             }
             if let followUpInstruction = takeQueuedFollowUpIfReady(
                 session: session,
@@ -190,11 +193,12 @@ final class AgentRunTerminalCommitBarrier {
         }
         let terminalTurnID = session.items.last(where: { $0.kind == .user })?.id
 
-        session.terminalCommitInProgress = true
+        let acquiredTerminalCommitPhase = session.runLifecycle.beginTerminalCommit()
+        assert(acquiredTerminalCommitPhase, "Terminal commit phase acquisition must succeed after the in-progress guard")
         recordTerminalBarrierState(true, request: request)
         hooks.transcript.flushPendingAssistantDelta(session)
         guard validatesOwnership(request) else {
-            session.terminalCommitInProgress = false
+            session.runLifecycle.abortTerminalCommit()
             recordTerminalBarrierState(false, request: request)
             recordRejection("ownership_changed_during_drain", request: request)
             return nil
@@ -250,7 +254,7 @@ final class AgentRunTerminalCommitBarrier {
               session.providerTerminalDrainGeneration == request.providerDrainGeneration,
               request.providerBuffersAreDrained()
         else {
-            session.terminalCommitInProgress = false
+            session.runLifecycle.abortTerminalCommit()
             recordTerminalBarrierState(false, request: request)
             recordRejection("ownership_or_drain_changed_before_commit", request: request)
             return nil
@@ -312,19 +316,19 @@ final class AgentRunTerminalCommitBarrier {
             successorKind: successorKind,
             providerSuccessorID: providerSuccessor?.id
         )
-        session.lastTerminalCommitRevision = revision
-        session.lastTerminalPublicationResult = nil
+        session.runLifecycle.stageTerminalRevision(revision)
 
         hooks.bindingObservation.updateBindings(session)
         if request.notifyTurnComplete {
             hooks.presentation.notifyAgentTurnComplete(session)
         }
         hooks.persistence.scheduleSave(session.tabID)
-        session.lastTerminalPublicationResult = await hooks.terminalSettlement.publishTerminalCommit(
+        let publicationResult = await hooks.terminalSettlement.publishTerminalCommit(
             session,
             revision,
             successorKind
         )
+        session.runLifecycle.recordTerminalPublicationResult(publicationResult)
         let followUpInstruction = takeQueuedFollowUpIfReady(
             session: session,
             revision: revision,
@@ -344,7 +348,7 @@ final class AgentRunTerminalCommitBarrier {
             ownership: request.ownership,
             tabID: session.tabID
         )
-        session.terminalCommitInProgress = false
+        session.runLifecycle.completeTerminalCommit()
         recordTerminalBarrierState(false, request: request)
         request.postCommit()
 
