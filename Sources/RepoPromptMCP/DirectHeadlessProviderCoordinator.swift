@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 actor DirectHeadlessProviderCoordinator {
     struct ProviderDescriptor {
@@ -102,9 +103,7 @@ actor DirectHeadlessProviderCoordinator {
 
     func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
         guard !isShuttingDown else { throw CancellationError() }
-        guard let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
-            throw MCPError.invalidParams("agent_run start requires message")
-        }
+        let message = try Self.resolvedLaunchMessage(args: args)
         let providerID = args["model_id"]?.stringValue ?? args["agent"]?.stringValue ?? "codexExec"
         let descriptor = try resolveProvider(providerID)
         guard descriptor.executable != nil else {
@@ -412,6 +411,25 @@ actor DirectHeadlessProviderCoordinator {
             throw MCPError.invalidParams("unknown standalone provider '\(id)'")
         }
         return descriptor
+    }
+
+    nonisolated static func resolvedLaunchMessage(args: [String: Value]) throws -> String {
+        guard let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
+            throw MCPError.invalidParams("agent_run start requires message")
+        }
+        do {
+            let workflow = try RepoPromptBuiltInAgentWorkflow.resolve(
+                workflowID: args["workflow_id"]?.stringValue,
+                workflowName: args["workflow_name"]?.stringValue
+            )
+            return workflow?.wrapUserText(message) ?? message
+        } catch RepoPromptBuiltInAgentWorkflow.ResolutionError.conflictingReferences {
+            throw MCPError.invalidParams("Specify either workflow_id or workflow_name, not both.")
+        } catch let RepoPromptBuiltInAgentWorkflow.ResolutionError.unknownReference(reference) {
+            throw MCPError.invalidParams("Workflow '\(reference)' was not found.")
+        } catch {
+            throw MCPError.invalidParams("Invalid workflow selection.")
+        }
     }
 
     private nonisolated static func findExecutable(named command: String, path: String?) -> String? {

@@ -3,9 +3,93 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 @testable import RepoPromptMCP
+import RepoPromptShared
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testHeadlessAgentManageSchemaAdvertisesListWorkflows() throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_manage"))
+        let encoded = try JSONEncoder().encode(definition.inputSchema)
+        let schema = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        XCTAssertTrue(schema.contains("\"list_workflows\""), schema)
+    }
+
+    func testHeadlessWorkflowSelectionAppliesCanonicalPromptAndRejectsInvalidReferences() throws {
+        let message = "Implement the bounded change."
+        XCTAssertEqual(
+            try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: ["message": .string(message)]),
+            message
+        )
+
+        for workflow in RepoPromptBuiltInAgentWorkflow.allCases {
+            let expected = workflow.wrapUserText(message)
+            XCTAssertEqual(
+                try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+                    "message": .string(message),
+                    "workflow_id": .string(workflow.rawValue)
+                ]),
+                expected
+            )
+            XCTAssertEqual(
+                try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+                    "message": .string(message),
+                    "workflow_name": .string(workflow.metadata.displayName)
+                ]),
+                expected
+            )
+        }
+
+        XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+            "message": .string(message),
+            "workflow_id": .string("build"),
+            "workflow_name": .string("Plan & Build")
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("either workflow_id or workflow_name"))
+        }
+        XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+            "message": .string(message),
+            "workflow_name": .string("missing-workflow")
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("was not found"))
+        }
+    }
+
+    func testHeadlessListWorkflowsReturnsAllEightBuiltIns() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-workflow-root-\(UUID().uuidString)", isDirectory: true)
+        let profile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-workflow-profile-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: profile)
+        }
+
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "workflow-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": root.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: root
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessAgentBackend(coordinator: prepared.providerCoordinator)
+        let request = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(["op": Value.string("list_workflows")]),
+            securityContext: nil
+        )
+
+        let result = try await backend.manage(request)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
+        XCTAssertEqual(object["backend"] as? String, "headless")
+        let workflows = try XCTUnwrap(object["workflows"] as? [[String: Any]])
+        XCTAssertEqual(workflows.compactMap { $0["id"] as? String }, RepoPromptBuiltInAgentWorkflow.displayOrder.map(\.rawValue))
+        XCTAssertEqual(Set(workflows.compactMap { $0["source"] as? String }), ["built_in"])
+    }
+
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-headless-worktree-fence-\(UUID().uuidString)", isDirectory: true)
