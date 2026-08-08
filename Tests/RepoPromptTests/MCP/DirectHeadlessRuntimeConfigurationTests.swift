@@ -188,6 +188,216 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         XCTAssertEqual(Set(authorized.roots.map(\.path)), Set([primaryRoot.path, secondaryRoot.path]))
     }
 
+    func testDefaultProfileRoutesSavedWorkspaceThroughExistingWorktreeWithoutPersistence() async throws {
+        let fixture = try await makeSavedWorkspaceWorktreeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-routing-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": fixture.profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": fixture.launchWorktree.path,
+                "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: fixture.launchWorktree
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+
+        let processSnapshot = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(processSnapshot.identity.workspaceID, fixture.workspaceID)
+        XCTAssertEqual(processSnapshot.identity.contextID, fixture.contextID)
+        XCTAssertEqual(processSnapshot.canonicalRoots.map(\.path), [fixture.canonicalRepo.path])
+        XCTAssertEqual(processSnapshot.roots.map(\.path), [fixture.launchWorktree.path])
+        XCTAssertEqual(processSnapshot.workspace.document.metadata.repoPaths, [fixture.canonicalRepo.path])
+        let workspaceCatalog = await prepared.runtime.workspaceStore.snapshot()
+        XCTAssertEqual(workspaceCatalog.workspaces.count, 1)
+
+        let security = DomainToolInvocationSecurityContext(
+            principal: prepared.principal,
+            connectionID: prepared.connectionID,
+            connectionGeneration: prepared.connectionGeneration,
+            invocationID: UUID(),
+            runtimeID: prepared.runtime.identity.runtimeID,
+            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+            workspaceID: processSnapshot.identity.workspaceID,
+            workspaceRevision: processSnapshot.workspace.revisions.workingRevision,
+            authorizedCanonicalRoots: Set(processSnapshot.roots.map(\.path)),
+            hasAuthoritativeRoutingContext: true,
+            ephemeralGrantedToolNames: [],
+            ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations
+        )
+        let request = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(["op": Value.string("start")]),
+            securityContext: security
+        )
+        let result = try await prepared.providerCoordinator.startAgent(
+            args: [
+                "message": .string("Report the working directory."),
+                "workflow_name": .string("orchestrate"),
+                "worktree": .string("@branch:route-alternate"),
+                "worktree_label": .string("Alternate route"),
+                "worktree_color": .string("#3366ff"),
+                "inherit_worktree": .bool(false),
+                "detach": .bool(true),
+                "timeout": .int(10)
+            ],
+            request: request
+        )
+        let resultObject = try XCTUnwrap(result.objectValue)
+        XCTAssertEqual(resultObject["status"]?.stringValue, "running")
+        let sessionID = try XCTUnwrap(try UUID(
+            uuidString: XCTUnwrap(resultObject["session_id"]?.stringValue)
+        ))
+        let terminal = await prepared.providerCoordinator.waitAgent(sessionID: sessionID, timeout: 10)
+        XCTAssertEqual(terminal.status, .completed)
+        let providerWorkingDirectory = try URL(
+            fileURLWithPath: XCTUnwrap(terminal.latestAssistantPreview),
+            isDirectory: true
+        ).standardizedFileURL.resolvingSymlinksInPath()
+        XCTAssertEqual(providerWorkingDirectory.path, fixture.alternateWorktree.resolvingSymlinksInPath().path)
+        XCTAssertEqual(terminal.worktreeBindings.count, 1)
+        XCTAssertEqual(
+            terminal.worktreeBindings.first?.worktreeRootPath,
+            fixture.alternateWorktree.path
+        )
+        XCTAssertTrue(terminal.worktreeBindings.first?.repoKey.hasPrefix("canonical-") == true)
+        XCTAssertEqual(terminal.worktreeBindings.first?.visualLabel, "Alternate route")
+        XCTAssertEqual(terminal.worktreeBindings.first?.visualColorHex, "#3366FF")
+        let sessionSnapshot = try await prepared.context.snapshot(
+            connectionID: prepared.connectionID,
+            sessionID: sessionID
+        )
+        XCTAssertEqual(sessionSnapshot.roots.map(\.path), [fixture.alternateWorktree.path])
+        let runPrincipal = DomainClientPrincipal(
+            principalID: UUID(),
+            stableKey: "test-run-principal",
+            displayName: "Test run",
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            processID: nil,
+            runID: sessionID,
+            provider: "test"
+        )
+        let runSecurity = await DirectHeadlessMCPService.securityContext(
+            prepared: prepared,
+            connection: DirectHeadlessMCPService.ConnectionContext(
+                connectionID: prepared.connectionID,
+                connectionGeneration: prepared.connectionGeneration,
+                principal: runPrincipal,
+                policyProfile: .direct,
+                restrictedToolNames: [],
+                additionalToolNames: [],
+                ephemeralGrantedOperations: []
+            ),
+            invocationID: UUID()
+        )
+        XCTAssertEqual(runSecurity.authorizedCanonicalRoots, [fixture.alternateWorktree.path])
+        XCTAssertThrowsError(
+            try DirectHeadlessDomainContext.resolvePath(
+                fixture.canonicalRepo.appendingPathComponent("fixture.txt").path,
+                roots: sessionSnapshot.roots
+            )
+        )
+        let persistedBindings = await prepared.runtime.agentWorktreeBindingStore.bindings(sessionID: sessionID)
+        XCTAssertTrue(persistedBindings.isEmpty)
+        XCTAssertEqual(processSnapshot.workspace.document.documentBytes, fixture.savedWorkspaceBytes)
+
+        let childRequest = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(["op": Value.string("start")]),
+            securityContext: runSecurity
+        )
+        let childStart = try await prepared.providerCoordinator.startAgent(
+            args: [
+                "message": .string("Report the inherited working directory."),
+                "detach": .bool(true)
+            ],
+            request: childRequest
+        )
+        let childID = try XCTUnwrap(try UUID(
+            uuidString: XCTUnwrap(childStart.objectValue?["session_id"]?.stringValue)
+        ))
+        let childTerminal = await prepared.providerCoordinator.waitAgent(sessionID: childID, timeout: 10)
+        XCTAssertEqual(childTerminal.status, .completed)
+        XCTAssertEqual(childTerminal.parentSessionID, sessionID)
+        XCTAssertEqual(childTerminal.worktreeBindings.first?.worktreeRootPath, fixture.alternateWorktree.path)
+        XCTAssertEqual(
+            try URL(fileURLWithPath: XCTUnwrap(childTerminal.latestAssistantPreview))
+                .standardizedFileURL.resolvingSymlinksInPath().path,
+            fixture.alternateWorktree.path
+        )
+        let childPrincipal = DomainClientPrincipal(
+            principalID: UUID(),
+            stableKey: "test-child-principal",
+            displayName: "Test child",
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            processID: nil,
+            runID: childID,
+            provider: "test"
+        )
+        let childSecurity = await DirectHeadlessMCPService.securityContext(
+            prepared: prepared,
+            connection: DirectHeadlessMCPService.ConnectionContext(
+                connectionID: prepared.connectionID,
+                connectionGeneration: prepared.connectionGeneration,
+                principal: childPrincipal,
+                policyProfile: .direct,
+                restrictedToolNames: [],
+                additionalToolNames: [],
+                ephemeralGrantedOperations: []
+            ),
+            invocationID: UUID()
+        )
+        XCTAssertEqual(childSecurity.authorizedCanonicalRoots, [fixture.alternateWorktree.path])
+        let listedSessions = await prepared.providerCoordinator.listAgents()
+        let listedChild = listedSessions.first { value in
+            value.objectValue?["session_id"]?.stringValue == childID.uuidString
+        }
+        XCTAssertEqual(listedChild?.objectValue?["status"]?.stringValue, "completed")
+        XCTAssertEqual(
+            listedChild?.objectValue?["session"]?.objectValue?["parent_session_id"]?.stringValue,
+            sessionID.uuidString
+        )
+
+        let optedOutStart = try await prepared.providerCoordinator.startAgent(
+            args: [
+                "message": .string("Report the process working directory."),
+                "inherit_worktree": .bool(false),
+                "detach": .bool(true)
+            ],
+            request: childRequest
+        )
+        let optedOutID = try XCTUnwrap(try UUID(
+            uuidString: XCTUnwrap(optedOutStart.objectValue?["session_id"]?.stringValue)
+        ))
+        let optedOutTerminal = await prepared.providerCoordinator.waitAgent(sessionID: optedOutID, timeout: 10)
+        XCTAssertEqual(optedOutTerminal.parentSessionID, sessionID)
+        XCTAssertEqual(
+            try URL(fileURLWithPath: XCTUnwrap(optedOutTerminal.latestAssistantPreview))
+                .standardizedFileURL.resolvingSymlinksInPath().path,
+            fixture.launchWorktree.path
+        )
+
+        do {
+            _ = try await prepared.context.prepareSessionRootMappings(
+                sessionID: UUID(),
+                sourceSessionID: nil,
+                arguments: ["worktree_create": .bool(true)],
+                connectionID: prepared.connectionID
+            )
+            XCTFail("Expected direct-headless worktree creation to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("does not create worktrees"), String(describing: error))
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.savedWorkspaceURL), fixture.savedWorkspaceBytes)
+        let finalWorktreeInventory = try await DirectProcess.run(
+            "/usr/bin/git",
+            arguments: ["-C", fixture.canonicalRepo.path, "worktree", "list", "--porcelain"]
+        )
+        XCTAssertEqual(finalWorktreeInventory, fixture.worktreeInventory)
+    }
+
     func testCloseTabAllowActivePreservesUnrelatedBindingForSameConnection() async throws {
         let root = temporaryDirectory("close-tab-binding")
         let storageRoot = root.appendingPathComponent("state", isDirectory: true)
@@ -273,6 +483,102 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             command: .createWorkspace(document)
         ))
         XCTAssertEqual(outcome.disposition, .applied, outcome.diagnostic ?? String(describing: outcome.disposition))
+    }
+
+    private struct SavedWorkspaceWorktreeFixture {
+        let root: URL
+        let profile: URL
+        let canonicalRepo: URL
+        let launchWorktree: URL
+        let alternateWorktree: URL
+        let provider: URL
+        let workspaceID: UUID
+        let contextID: UUID
+        let savedWorkspaceURL: URL
+        let savedWorkspaceBytes: Data
+        let worktreeInventory: String
+    }
+
+    private func makeSavedWorkspaceWorktreeFixture() async throws -> SavedWorkspaceWorktreeFixture {
+        let root = temporaryDirectory("saved-workspace-worktree")
+        let profile = root.appendingPathComponent("profile", isDirectory: true)
+        let workspaceDirectory = profile.appendingPathComponent("Workspaces", isDirectory: true)
+        let canonicalRepo = root.appendingPathComponent("canonical", isDirectory: true)
+        let launchWorktree = root.appendingPathComponent("launch-worktree", isDirectory: true)
+        let alternateWorktree = root.appendingPathComponent("alternate-worktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: canonicalRepo, withIntermediateDirectories: true)
+        _ = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", canonicalRepo.path, "init", "-b", "main"])
+        _ = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", canonicalRepo.path, "config", "user.email", "test@example.invalid"])
+        _ = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", canonicalRepo.path, "config", "user.name", "RepoPrompt Tests"])
+        try "fixture\n".write(
+            to: canonicalRepo.appendingPathComponent("fixture.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", canonicalRepo.path, "add", "fixture.txt"])
+        _ = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", canonicalRepo.path, "commit", "-m", "fixture"])
+        _ = try await DirectProcess.run(
+            "/usr/bin/git",
+            arguments: ["-C", canonicalRepo.path, "worktree", "add", "-b", "route-launch", launchWorktree.path]
+        )
+        _ = try await DirectProcess.run(
+            "/usr/bin/git",
+            arguments: ["-C", canonicalRepo.path, "worktree", "add", "-b", "route-alternate", alternateWorktree.path]
+        )
+
+        let workspaceID = UUID()
+        let contextID = UUID()
+        let workspaceName = workspaceID.uuidString
+        let savedWorkspaceDirectory = workspaceDirectory.appendingPathComponent(
+            DomainWorkspaceStoragePath.directoryName(name: workspaceName, id: workspaceID),
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: savedWorkspaceDirectory, withIntermediateDirectories: true)
+        let workspaceURL = savedWorkspaceDirectory.appendingPathComponent("workspace.json")
+        let workspace = try makeWorkspaceDocument(
+            workspaceID: workspaceID,
+            contextID: contextID,
+            roots: [canonicalRepo],
+            fileURL: workspaceURL
+        )
+        try workspace.documentBytes.write(to: workspaceURL)
+        let index = [[
+            "id": workspaceID.uuidString,
+            "name": workspaceName,
+            "customStoragePath": NSNull(),
+            "isSystemWorkspace": false,
+            "isHiddenInMenus": false
+        ] as [String: Any]]
+        try JSONSerialization.data(withJSONObject: index, options: [.sortedKeys]).write(
+            to: workspaceDirectory.appendingPathComponent("workspacesIndex.json")
+        )
+
+        let provider = root.appendingPathComponent("fake-codex-provider")
+        let providerScript = """
+        #!/bin/sh
+        cat >/dev/null
+        printf '{"item":{"type":"agent_message","text":"%s"}}\\n' "$PWD"
+        """
+        try providerScript.write(to: provider, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: provider.path)
+        let worktreeInventory = try await DirectProcess.run(
+            "/usr/bin/git",
+            arguments: ["-C", canonicalRepo.path, "worktree", "list", "--porcelain"]
+        )
+        return SavedWorkspaceWorktreeFixture(
+            root: root,
+            profile: profile,
+            canonicalRepo: canonicalRepo.standardizedFileURL.resolvingSymlinksInPath(),
+            launchWorktree: launchWorktree.standardizedFileURL.resolvingSymlinksInPath(),
+            alternateWorktree: alternateWorktree.standardizedFileURL.resolvingSymlinksInPath(),
+            provider: provider,
+            workspaceID: workspaceID,
+            contextID: contextID,
+            savedWorkspaceURL: workspaceURL,
+            savedWorkspaceBytes: workspace.documentBytes,
+            worktreeInventory: worktreeInventory
+        )
     }
 
     private func bindRequest(workingDirs: [URL]) throws -> DomainPhysicalToolRequest {

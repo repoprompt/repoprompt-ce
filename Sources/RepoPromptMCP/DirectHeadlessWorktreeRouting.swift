@@ -1,0 +1,467 @@
+import CryptoKit
+import Foundation
+import MCP
+import RepoPromptDomainRuntime
+
+struct DirectHeadlessRootMapping: Equatable {
+    let canonicalRoot: URL
+    let physicalRoot: URL
+    let worktree: DirectHeadlessGitWorktree?
+    let visualLabel: String?
+    let visualColorHex: String?
+}
+
+struct DirectHeadlessInitialRoute: Equatable {
+    let bindingWorkingDirectories: [URL]
+    let rootMappings: [DirectHeadlessRootMapping]
+}
+
+struct DirectHeadlessGitWorktree: Equatable {
+    let repositoryID: String
+    let repoKey: String
+    let worktreeID: String
+    let path: URL
+    let gitDirectory: URL
+    let branch: String?
+    let head: String?
+    let isMain: Bool
+}
+
+enum DirectHeadlessWorktreeRouting {
+    static func resolveInitialRoute(
+        workingDirectories: [URL],
+        catalog: DomainWorkspaceCatalogSnapshot
+    ) async -> DirectHeadlessInitialRoute {
+        guard !workingDirectories.isEmpty else {
+            return DirectHeadlessInitialRoute(bindingWorkingDirectories: [], rootMappings: [])
+        }
+
+        let physicalRoots = workingDirectories.map(canonicalPath)
+        var physicalWorktreeInventories: [[DirectHeadlessGitWorktree]?] = []
+        for physicalRoot in physicalRoots {
+            guard let inventory = try? await listWorktrees(repositoryRoot: physicalRoot),
+                  let physicalWorktree = inventory.first(where: { $0.path.path == physicalRoot.path }),
+                  await (try? verifyWorktree(physicalWorktree)) != nil
+            else {
+                physicalWorktreeInventories.append(nil)
+                continue
+            }
+            physicalWorktreeInventories.append(inventory)
+        }
+        var candidates: [DirectHeadlessInitialRoute] = []
+        for workspace in catalog.workspaces {
+            let canonicalRoots = workspace.document.metadata.repoPaths.map {
+                canonicalPath(URL(fileURLWithPath: $0, isDirectory: true))
+            }
+            guard canonicalRoots.count == physicalRoots.count,
+                  let mappings = exactMappings(
+                      canonicalRoots: canonicalRoots,
+                      physicalRoots: physicalRoots,
+                      physicalWorktreeInventories: physicalWorktreeInventories
+                  )
+            else { continue }
+            candidates.append(DirectHeadlessInitialRoute(
+                bindingWorkingDirectories: canonicalRoots,
+                rootMappings: mappings
+            ))
+        }
+        guard candidates.count == 1, let route = candidates.first else {
+            return DirectHeadlessInitialRoute(
+                bindingWorkingDirectories: physicalRoots,
+                rootMappings: physicalRoots.map {
+                    DirectHeadlessRootMapping(
+                        canonicalRoot: $0,
+                        physicalRoot: $0,
+                        worktree: nil,
+                        visualLabel: nil,
+                        visualColorHex: nil
+                    )
+                }
+            )
+        }
+        return route
+    }
+
+    static func resolveSessionMappings(
+        arguments: [String: Value],
+        canonicalRoots: [URL],
+        baseMappings: [DirectHeadlessRootMapping]
+    ) async throws -> [DirectHeadlessRootMapping] {
+        let selector = normalized(arguments["worktree"]?.stringValue)
+        let worktreeID = normalized(arguments["worktree_id"]?.stringValue)
+        let visualLabel = normalized(arguments["worktree_label"]?.stringValue)
+        let visualColorHex = normalized(arguments["worktree_color"]?.stringValue)
+        let create = arguments["worktree_create"]?.boolValue == true
+        let selectorCount = [selector != nil, worktreeID != nil, create].count(where: { $0 })
+        guard selectorCount <= 1 else {
+            throw MCPError.invalidParams("worktree, worktree_id, and worktree_create are mutually exclusive for agent_run start")
+        }
+        if create {
+            throw MCPError.invalidRequest("direct headless agent_run does not create worktrees; pass an exact existing worktree selector")
+        }
+        let creationOnlyKeys = [
+            "worktree_branch",
+            "worktree_base_ref",
+            "worktree_path",
+            "allow_external_worktree_path"
+        ]
+        if creationOnlyKeys.contains(where: { arguments[$0] != nil }) {
+            throw MCPError.invalidParams("worktree creation arguments require worktree_create=true, which direct headless does not support")
+        }
+        let selectorOnlyKeys = ["worktree_repo_root", "worktree_label", "worktree_color"]
+        if selector == nil, worktreeID == nil, selectorOnlyKeys.contains(where: { arguments[$0] != nil }) {
+            throw MCPError.invalidParams("worktree_repo_root, worktree_label, and worktree_color require an existing worktree selector")
+        }
+        guard selector != nil || worktreeID != nil else { return baseMappings }
+        if let visualColorHex, !isHexColor(visualColorHex) {
+            throw MCPError.invalidParams("worktree_color must be a valid #RRGGBB value")
+        }
+
+        let logicalRoot = try selectLogicalRoot(
+            arguments["worktree_repo_root"]?.stringValue,
+            canonicalRoots: canonicalRoots,
+            mappings: baseMappings
+        )
+        let currentPhysicalRoot = baseMappings.first(where: {
+            canonicalPath($0.canonicalRoot).path == canonicalPath(logicalRoot).path
+        })?.physicalRoot ?? logicalRoot
+        let worktrees = try await listWorktrees(repositoryRoot: logicalRoot)
+        let selected = try selectWorktree(
+            selector: selector,
+            worktreeID: worktreeID,
+            currentPhysicalRoot: currentPhysicalRoot,
+            worktrees: worktrees
+        )
+        guard FileManager.default.fileExists(atPath: selected.path.path) else {
+            throw MCPError.invalidRequest("selected worktree path is unavailable: \(selected.path.path)")
+        }
+        try await verifyWorktree(selected)
+
+        var result = baseMappings.filter {
+            canonicalPath($0.canonicalRoot).path != canonicalPath(logicalRoot).path
+        }
+        result.append(DirectHeadlessRootMapping(
+            canonicalRoot: canonicalPath(logicalRoot),
+            physicalRoot: canonicalPath(selected.path),
+            worktree: selected,
+            visualLabel: visualLabel,
+            visualColorHex: visualColorHex?.uppercased()
+        ))
+        return try canonicalRoots.map { canonical in
+            let matches = result.filter {
+                canonicalPath($0.canonicalRoot).path == canonicalPath(canonical).path
+            }
+            guard matches.count == 1, let match = matches.first else {
+                throw MCPError.internalError("direct-headless worktree mapping became incomplete or ambiguous")
+            }
+            return match
+        }
+    }
+
+    static func listWorktrees(repositoryRoot: URL) async throws -> [DirectHeadlessGitWorktree] {
+        let root = canonicalPath(repositoryRoot)
+        let commonDirectory = try await gitURL(root: root, arguments: ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        let repositoryID = "gitrepo_\(sha256(commonDirectory.path))"
+        let output = try await DirectProcess.run(
+            "/usr/bin/git",
+            arguments: ["-C", root.path, "worktree", "list", "--porcelain"]
+        )
+        let records = porcelainRecords(output)
+        struct ResolvedRecord {
+            let record: PorcelainRecord
+            let path: URL
+            let gitDirectory: URL
+            let isMain: Bool
+        }
+        var resolvedRecords: [ResolvedRecord] = []
+        for record in records {
+            let path = canonicalPath(URL(fileURLWithPath: record.path, isDirectory: true))
+            guard let layout = gitLayout(worktreeRoot: path) else { continue }
+            let gitDirectory = layout.gitDirectory
+            let candidateCommon = layout.commonDirectory
+            guard candidateCommon.path == commonDirectory.path else {
+                throw MCPError.invalidRequest("listed worktree repository identity changed: \(record.path)")
+            }
+            let isMain = gitDirectory.path == commonDirectory.path
+            resolvedRecords.append(ResolvedRecord(
+                record: record,
+                path: path,
+                gitDirectory: gitDirectory,
+                isMain: isMain
+            ))
+        }
+        let repositoryName = resolvedRecords.first(where: \.isMain)?.path.lastPathComponent
+            ?? commonDirectory.deletingLastPathComponent().lastPathComponent
+        let repoKey = "\(slug(repositoryName))-\(sha256(commonDirectory.path).prefix(8))"
+        return resolvedRecords.map { resolved in
+            let record = resolved.record
+            let path = resolved.path
+            let gitDirectory = resolved.gitDirectory
+            let isMain = resolved.isMain
+            let stableComponent = isMain ? "main" : gitDirectory.path
+            return DirectHeadlessGitWorktree(
+                repositoryID: repositoryID,
+                repoKey: repoKey,
+                worktreeID: "wt_\(sha256("\(repositoryID)\u{0}\(stableComponent)"))",
+                path: path,
+                gitDirectory: gitDirectory,
+                branch: record.branch,
+                head: record.head,
+                isMain: isMain
+            )
+        }
+    }
+
+    static func binding(
+        mapping: DirectHeadlessRootMapping,
+        source: String
+    ) -> DomainAgentRunSnapshot.WorktreeBinding? {
+        guard let worktree = mapping.worktree else { return nil }
+        return DomainAgentRunSnapshot.WorktreeBinding(
+            id: "\(worktree.repositoryID):\(worktree.worktreeID)",
+            repositoryID: worktree.repositoryID,
+            repoKey: worktree.repoKey,
+            logicalRootPath: mapping.canonicalRoot.path,
+            logicalRootName: mapping.canonicalRoot.lastPathComponent,
+            worktreeID: worktree.worktreeID,
+            worktreeRootPath: worktree.path.path,
+            worktreeName: worktree.path.lastPathComponent,
+            branch: worktree.branch,
+            head: worktree.head,
+            visualLabel: mapping.visualLabel,
+            visualColorHex: mapping.visualColorHex,
+            boundAt: Date(),
+            source: source,
+            unavailable: false
+        )
+    }
+
+    private static func exactMappings(
+        canonicalRoots: [URL],
+        physicalRoots: [URL],
+        physicalWorktreeInventories: [[DirectHeadlessGitWorktree]?]
+    ) -> [DirectHeadlessRootMapping]? {
+        var remaining = Array(physicalRoots.indices)
+        var result: [DirectHeadlessRootMapping] = []
+        for canonicalRoot in canonicalRoots {
+            if let remainingIndex = remaining.firstIndex(where: {
+                canonicalPath(physicalRoots[$0]).path == canonicalPath(canonicalRoot).path
+            }) {
+                let physicalIndex = remaining.remove(at: remainingIndex)
+                result.append(DirectHeadlessRootMapping(
+                    canonicalRoot: canonicalPath(canonicalRoot),
+                    physicalRoot: canonicalPath(physicalRoots[physicalIndex]),
+                    worktree: nil,
+                    visualLabel: nil,
+                    visualColorHex: nil
+                ))
+                continue
+            }
+            let matches = remaining.enumerated().compactMap { remainingIndex, physicalIndex -> (Int, DirectHeadlessGitWorktree)? in
+                guard let inventory = physicalWorktreeInventories[physicalIndex],
+                      inventory.contains(where: { $0.path.path == canonicalPath(canonicalRoot).path }),
+                      let worktree = inventory.first(where: {
+                          $0.path.path == canonicalPath(physicalRoots[physicalIndex]).path
+                      })
+                else { return nil }
+                return (remainingIndex, worktree)
+            }
+            guard matches.count == 1, let match = matches.first else { return nil }
+            remaining.remove(at: match.0)
+            result.append(DirectHeadlessRootMapping(
+                canonicalRoot: canonicalPath(canonicalRoot),
+                physicalRoot: match.1.path,
+                worktree: match.1,
+                visualLabel: nil,
+                visualColorHex: nil
+            ))
+        }
+        return remaining.isEmpty ? result : nil
+    }
+
+    private static func selectLogicalRoot(
+        _ selector: String?,
+        canonicalRoots: [URL],
+        mappings: [DirectHeadlessRootMapping]
+    ) throws -> URL {
+        let gitRoots = canonicalRoots.filter { root in
+            FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path)
+        }
+        guard let selector = normalized(selector) else {
+            guard gitRoots.count == 1, let root = gitRoots.first else {
+                throw MCPError.invalidParams("worktree_repo_root is required when the workspace does not have exactly one Git root")
+            }
+            return root
+        }
+        let matches = canonicalRoots.filter { canonical in
+            let mapping = mappings.first { canonicalPath($0.canonicalRoot).path == canonicalPath(canonical).path }
+            return selector == canonical.path
+                || selector == canonical.lastPathComponent
+                || mapping.map { selector == $0.physicalRoot.path } == true
+        }
+        guard matches.count == 1, let root = matches.first else {
+            throw MCPError.invalidParams("worktree_repo_root is unknown or ambiguous")
+        }
+        return root
+    }
+
+    private static func selectWorktree(
+        selector: String?,
+        worktreeID: String?,
+        currentPhysicalRoot: URL,
+        worktrees: [DirectHeadlessGitWorktree]
+    ) throws -> DirectHeadlessGitWorktree {
+        let matches: [DirectHeadlessGitWorktree]
+        if let worktreeID {
+            matches = worktrees.filter { $0.worktreeID == worktreeID }
+        } else if let selector {
+            if selector == "@current" {
+                matches = worktrees.filter { $0.path.path == canonicalPath(currentPhysicalRoot).path }
+            } else if selector == "@main" {
+                matches = worktrees.filter(\.isMain)
+            } else if selector.hasPrefix("@id:") {
+                matches = worktrees.filter { $0.worktreeID == String(selector.dropFirst(4)) }
+            } else {
+                let branch = selector.hasPrefix("@branch:") ? String(selector.dropFirst(8)) : selector
+                matches = worktrees.filter {
+                    $0.path.path == canonicalPath(URL(fileURLWithPath: selector)).path
+                        || $0.path.lastPathComponent == selector
+                        || $0.branch == branch
+                }
+            }
+        } else {
+            matches = []
+        }
+        guard matches.count == 1, let match = matches.first else {
+            let description = worktreeID ?? selector ?? ""
+            throw MCPError.invalidParams("existing worktree selector is unknown or ambiguous: \(description)")
+        }
+        return match
+    }
+
+    private struct PorcelainRecord {
+        let path: String
+        let head: String?
+        let branch: String?
+    }
+
+    private static func porcelainRecords(_ output: String) -> [PorcelainRecord] {
+        output.split(separator: "\n\n").compactMap { block in
+            var path: String?
+            var head: String?
+            var branch: String?
+            for line in block.split(separator: "\n") {
+                if line.hasPrefix("worktree ") { path = String(line.dropFirst(9)) }
+                if line.hasPrefix("HEAD ") { head = String(line.dropFirst(5)) }
+                if line.hasPrefix("branch refs/heads/") { branch = String(line.dropFirst(18)) }
+            }
+            return path.map { PorcelainRecord(path: $0, head: head, branch: branch) }
+        }
+    }
+
+    private static func gitURL(root: URL, arguments: [String]) async throws -> URL {
+        let raw = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = raw.hasPrefix("/")
+            ? URL(fileURLWithPath: raw, isDirectory: true)
+            : root.appendingPathComponent(raw, isDirectory: true)
+        return canonicalPath(url)
+    }
+
+    private static func gitLayout(worktreeRoot: URL) -> (gitDirectory: URL, commonDirectory: URL)? {
+        let dotGit = worktreeRoot.appendingPathComponent(".git")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) else { return nil }
+        let gitDirectory: URL
+        if isDirectory.boolValue {
+            gitDirectory = canonicalPath(dotGit)
+        } else {
+            guard let contents = smallMetadataString(at: dotGit),
+                  let firstLine = contents.split(separator: "\n", maxSplits: 1).first,
+                  firstLine.hasPrefix("gitdir:")
+            else { return nil }
+            let raw = firstLine.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty else { return nil }
+            gitDirectory = canonicalPath(
+                raw.hasPrefix("/") ? URL(fileURLWithPath: raw) : worktreeRoot.appendingPathComponent(raw)
+            )
+        }
+        let commonFile = gitDirectory.appendingPathComponent("commondir")
+        guard let rawCommon = smallMetadataString(at: commonFile)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !rawCommon.isEmpty
+        else { return (gitDirectory, gitDirectory) }
+        let commonDirectory = canonicalPath(
+            rawCommon.hasPrefix("/")
+                ? URL(fileURLWithPath: rawCommon)
+                : gitDirectory.appendingPathComponent(rawCommon)
+        )
+        return (gitDirectory, commonDirectory)
+    }
+
+    private static func verifyWorktree(_ worktree: DirectHeadlessGitWorktree) async throws {
+        let topLevel = try await gitURL(root: worktree.path, arguments: ["rev-parse", "--show-toplevel"])
+        let gitDirectory = try await gitURL(
+            root: worktree.path,
+            arguments: ["rev-parse", "--path-format=absolute", "--git-dir"]
+        )
+        let commonDirectory = try await gitURL(
+            root: worktree.path,
+            arguments: ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        )
+        let isMain = gitDirectory.path == commonDirectory.path
+        let stableComponent = isMain ? "main" : gitDirectory.path
+        guard topLevel.path == worktree.path.path,
+              gitDirectory.path == worktree.gitDirectory.path,
+              isMain == worktree.isMain,
+              worktree.repositoryID == "gitrepo_\(sha256(commonDirectory.path))",
+              worktree.worktreeID == "wt_\(sha256("\(worktree.repositoryID)\u{0}\(stableComponent)"))"
+        else {
+            throw MCPError.invalidRequest("selected worktree identity could not be verified: \(worktree.path.path)")
+        }
+    }
+
+    private static func smallMetadataString(at url: URL) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > 0,
+              size.intValue <= 4096,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe)
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func isHexColor(_ value: String) -> Bool {
+        guard value.count == 7, value.first == "#" else { return false }
+        return UInt64(value.dropFirst(), radix: 16) != nil
+    }
+
+    private static func canonicalPath(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func sha256(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func slug(_ value: String) -> String {
+        let components = value.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        var result = components.joined(separator: "-").prefix(24).description
+        while result.hasSuffix("-") {
+            result.removeLast()
+        }
+        return result.ifEmpty("repo")
+    }
+}
+
+private extension String {
+    func ifEmpty(_ replacement: String) -> String {
+        isEmpty ? replacement : self
+    }
+}
