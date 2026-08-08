@@ -711,6 +711,59 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testPersistentBindingTransitionInvalidatesNilRunIDFailureStamp() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil
+        )
+        let ownership = session.beginRunAttempt(source: "test.bindingTransitionFailureStamp")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("Run timed out waiting for the provider", sequenceIndex: 1)
+            ],
+            terminalState: .failed,
+            compact: false
+        )
+        session.runState = .failed
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: ownership, source: "test.bindingTransitionFailureStamp"))
+        session.lastTerminalCommitRevision = AgentRunTerminalCommitRevision(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: .failed,
+            failureReason: .processCrash,
+            expectedRunID: nil,
+            sourceItemsRevision: session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        )
+        session.lastTerminalPublicationResult = .accepted(successorEpoch: nil)
+
+        let originalBinding = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(originalBinding.failureReason, .processCrash)
+
+        let replacementSessionID = UUID()
+        _ = viewModel.test_installPersistentSessionBinding(
+            sessionID: replacementSessionID,
+            on: session
+        )
+
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertNil(session.lastTerminalPublicationResult)
+        let rebound = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(rebound.status, .failed)
+        XCTAssertEqual(rebound.failureReason, .timeout)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     func testRestoredTerminalSnapshotWithoutMatchingRevisionFallsBackToTextClassification() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()

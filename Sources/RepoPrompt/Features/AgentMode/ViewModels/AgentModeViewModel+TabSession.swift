@@ -649,6 +649,11 @@ extension AgentModeViewModel {
         func beginPersistentBindingTransition() -> UInt64 {
             bindingTransitionGeneration &+= 1
             bindingTransitionInProgress = true
+            // Terminal commit revisions are scoped to the binding captured by
+            // their run ownership. A rebind must not carry that runtime-only
+            // classification or publication result into another session.
+            lastTerminalCommitRevision = nil
+            lastTerminalPublicationResult = nil
             authoritativeHydratedBinding = nil
             authoritativeHydratedBindingTransitionGeneration = nil
             return bindingTransitionGeneration
