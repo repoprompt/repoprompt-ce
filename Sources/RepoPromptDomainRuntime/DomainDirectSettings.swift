@@ -168,6 +168,11 @@ package actor DomainDirectSettingsStore {
     private var persistedDigest: String?
     private var healthReason: String?
     private var didBootstrap = false
+    private var bootstrapTask: Task<Void, Never>?
+#if DEBUG
+    private var testBootstrapDidEnter: (@Sendable () async -> Void)?
+    private var testBootstrapBeforeLoad: (@Sendable () async -> Void)?
+#endif
 
     package init(persistence: DomainPersistenceCoordinator, profileIdentifier: String) {
         self.persistence = persistence
@@ -176,7 +181,26 @@ package actor DomainDirectSettingsStore {
 
     package func bootstrap() async {
         guard !didBootstrap else { return }
-        didBootstrap = true
+        if let bootstrapTask {
+#if DEBUG
+            await testBootstrapDidEnter?()
+#endif
+            await bootstrapTask.value
+            return
+        }
+        let task = Task { await self.loadPersistedSettings() }
+        bootstrapTask = task
+#if DEBUG
+        await testBootstrapDidEnter?()
+#endif
+        await task.value
+        bootstrapTask = nil
+    }
+
+    private func loadPersistedSettings() async {
+#if DEBUG
+        await testBootstrapBeforeLoad?()
+#endif
         do {
             let snapshot = try await persistence.loadDirectSettingsData()
             persistedDigest = snapshot.data.map(DomainContentDigest.sha256)
@@ -195,6 +219,7 @@ package actor DomainDirectSettingsStore {
         } catch {
             healthReason = DomainDirectSettingsError.corruptDocument.localizedDescription
         }
+        didBootstrap = true
     }
 
     package func effectiveValue(for key: String) throws -> DomainSettingValue {
@@ -238,3 +263,19 @@ package actor DomainDirectSettingsStore {
         return revision
     }
 }
+
+#if DEBUG
+    extension DomainDirectSettingsStore {
+        package func test_setBootstrapDidEnter(
+            _ hook: (@Sendable () async -> Void)?
+        ) {
+            testBootstrapDidEnter = hook
+        }
+
+        package func test_setBootstrapBeforeLoad(
+            _ hook: (@Sendable () async -> Void)?
+        ) {
+            testBootstrapBeforeLoad = hook
+        }
+    }
+#endif
