@@ -19,17 +19,25 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
             value: .bool(false)
         )
 
-        let twoCallersEntered = TestGate(targetCount: 2)
-        let releaseLoad = TestGate(targetCount: 1)
+        let loadStarted = expectation(description: "initial settings load started")
+        let waiterJoined = expectation(description: "concurrent bootstrap joined shared load")
+        let releaseLoad = TestGate()
+        let events = EventRecorder()
         let store = DomainDirectSettingsStore(
             persistence: persistence,
             profileIdentifier: profile
         )
-        await store.test_setBootstrapDidEnter {
-            await twoCallersEntered.arrive()
-        }
-        await store.test_setBootstrapBeforeLoad {
-            await releaseLoad.wait()
+        await store.test_setBootstrapEventHandler { event in
+            await events.record(event)
+            switch event {
+            case .loadStarted:
+                loadStarted.fulfill()
+                await releaseLoad.wait()
+            case .waiterJoined:
+                waiterJoined.fulfill()
+            case .loadPublished, .willCompareAndSwap:
+                break
+            }
         }
 
         let first = Task {
@@ -38,17 +46,20 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
                 for: "agent_mode.show_built_in_workflow_cleanup_guidance"
             )
         }
+        await fulfillment(of: [loadStarted], timeout: 1)
         let second = Task {
             await store.bootstrap()
             return try await store.effectiveValue(
                 for: "agent_mode.show_built_in_workflow_cleanup_guidance"
             )
         }
-        await twoCallersEntered.wait()
-        await releaseLoad.arrive()
+        await fulfillment(of: [waiterJoined], timeout: 1)
+        await releaseLoad.open()
 
         let values = try await [first.value, second.value]
         XCTAssertEqual(values, [.bool(false), .bool(false)])
+        let recordedEvents = await events.values()
+        XCTAssertEqual(recordedEvents, [.loadStarted, .waiterJoined, .loadPublished])
     }
 
     func testConcurrentColdStartWriteWaitsForPersistedDigest() async throws {
@@ -67,20 +78,29 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
             value: .bool(false)
         )
 
-        let twoCallersEntered = TestGate(targetCount: 2)
-        let releaseLoad = TestGate(targetCount: 1)
+        let loadStarted = expectation(description: "initial settings load started")
+        let waiterJoined = expectation(description: "concurrent write joined shared load")
+        let releaseLoad = TestGate()
+        let events = EventRecorder()
         let store = DomainDirectSettingsStore(
             persistence: persistence,
             profileIdentifier: profile
         )
-        await store.test_setBootstrapDidEnter {
-            await twoCallersEntered.arrive()
-        }
-        await store.test_setBootstrapBeforeLoad {
-            await releaseLoad.wait()
+        await store.test_setBootstrapEventHandler { event in
+            await events.record(event)
+            switch event {
+            case .loadStarted:
+                loadStarted.fulfill()
+                await releaseLoad.wait()
+            case .waiterJoined:
+                waiterJoined.fulfill()
+            case .loadPublished, .willCompareAndSwap:
+                break
+            }
         }
 
         let first = Task { await store.bootstrap() }
+        await fulfillment(of: [loadStarted], timeout: 1)
         let second = Task {
             await store.bootstrap()
             return try await store.set(
@@ -88,12 +108,17 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
                 value: .bool(true)
             )
         }
-        await twoCallersEntered.wait()
-        await releaseLoad.arrive()
+        await fulfillment(of: [waiterJoined], timeout: 1)
+        await releaseLoad.open()
 
         await first.value
         let revision = try await second.value
         XCTAssertEqual(revision, 2)
+        let recordedEvents = await events.values()
+        XCTAssertEqual(
+            recordedEvents,
+            [.loadStarted, .waiterJoined, .loadPublished, .willCompareAndSwap]
+        )
 
         let verifier = DomainDirectSettingsStore(
             persistence: persistence,
@@ -104,6 +129,35 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
             for: "agent_mode.show_built_in_workflow_cleanup_guidance"
         )
         XCTAssertEqual(persisted, .bool(true))
+    }
+
+    func testEmptyProfileBootstrapCompletesOnceAndFirstWriteUsesNilDigest() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "empty-profile"
+        let events = EventRecorder()
+        let store = DomainDirectSettingsStore(
+            persistence: makePersistence(root: root, profile: profile),
+            profileIdentifier: profile
+        )
+        await store.test_setBootstrapEventHandler { event in
+            await events.record(event)
+        }
+
+        await store.bootstrap()
+        await store.bootstrap()
+        let revision = try await store.set(
+            key: "agent_mode.show_built_in_workflow_cleanup_guidance",
+            value: .bool(false)
+        )
+
+        XCTAssertEqual(revision, 1)
+        let recordedEvents = await events.values()
+        XCTAssertEqual(
+            recordedEvents,
+            [.loadStarted, .loadPublished, .willCompareAndSwap]
+        )
     }
 
     private func makePersistence(root: URL, profile: String) -> DomainPersistenceCoordinator {
@@ -127,30 +181,32 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
 }
 
 private actor TestGate {
-    private let targetCount: Int
-    private var count = 0
+    private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(targetCount: Int) {
-        self.targetCount = targetCount
-    }
-
-    func arrive() {
-        count += 1
-        resumeIfReady()
-    }
-
     func wait() async {
-        guard count < targetCount else { return }
+        guard !isOpen else { return }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
         }
     }
 
-    private func resumeIfReady() {
-        guard count >= targetCount else { return }
+    func open() {
+        isOpen = true
         let pending = waiters
         waiters.removeAll()
         pending.forEach { $0.resume() }
+    }
+}
+
+private actor EventRecorder {
+    private var recorded: [DomainDirectSettingsBootstrapEvent] = []
+
+    func record(_ event: DomainDirectSettingsBootstrapEvent) {
+        recorded.append(event)
+    }
+
+    func values() -> [DomainDirectSettingsBootstrapEvent] {
+        recorded
     }
 }

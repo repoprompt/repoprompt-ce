@@ -160,6 +160,13 @@ private struct DomainDirectSettingsDocument: Codable, Sendable {
     let updatedAt: Date
 }
 
+package enum DomainDirectSettingsBootstrapEvent: Equatable, Sendable {
+    case loadStarted
+    case waiterJoined
+    case loadPublished
+    case willCompareAndSwap
+}
+
 package actor DomainDirectSettingsStore {
     private let persistence: DomainPersistenceCoordinator
     private let profileIdentifier: String
@@ -169,10 +176,7 @@ package actor DomainDirectSettingsStore {
     private var healthReason: String?
     private var didBootstrap = false
     private var bootstrapTask: Task<Void, Never>?
-#if DEBUG
-    private var testBootstrapDidEnter: (@Sendable () async -> Void)?
-    private var testBootstrapBeforeLoad: (@Sendable () async -> Void)?
-#endif
+    private var bootstrapEventHandler: (@Sendable (DomainDirectSettingsBootstrapEvent) async -> Void)?
 
     package init(persistence: DomainPersistenceCoordinator, profileIdentifier: String) {
         self.persistence = persistence
@@ -182,44 +186,39 @@ package actor DomainDirectSettingsStore {
     package func bootstrap() async {
         guard !didBootstrap else { return }
         if let bootstrapTask {
-#if DEBUG
-            await testBootstrapDidEnter?()
-#endif
+            await bootstrapEventHandler?(.waiterJoined)
             await bootstrapTask.value
             return
         }
         let task = Task { await self.loadPersistedSettings() }
         bootstrapTask = task
-#if DEBUG
-        await testBootstrapDidEnter?()
-#endif
         await task.value
         bootstrapTask = nil
     }
 
     private func loadPersistedSettings() async {
-#if DEBUG
-        await testBootstrapBeforeLoad?()
-#endif
+        await bootstrapEventHandler?(.loadStarted)
         do {
             let snapshot = try await persistence.loadDirectSettingsData()
             persistedDigest = snapshot.data.map(DomainContentDigest.sha256)
-            guard let data = snapshot.data else { return }
-            let document = try JSONDecoder().decode(DomainDirectSettingsDocument.self, from: data)
-            guard document.version <= DomainDirectSettingsDocument.version else { throw DomainDirectSettingsError.futureDocument }
-            guard document.profileIdentifier == profileIdentifier else { throw DomainDirectSettingsError.wrongProfile }
-            for (key, value) in document.values {
-                guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else { continue }
-                try DomainAppSettingsCatalog.validate(value, for: descriptor)
-                values[key] = value
+            if let data = snapshot.data {
+                let document = try JSONDecoder().decode(DomainDirectSettingsDocument.self, from: data)
+                guard document.version <= DomainDirectSettingsDocument.version else { throw DomainDirectSettingsError.futureDocument }
+                guard document.profileIdentifier == profileIdentifier else { throw DomainDirectSettingsError.wrongProfile }
+                for (key, value) in document.values {
+                    guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else { continue }
+                    try DomainAppSettingsCatalog.validate(value, for: descriptor)
+                    values[key] = value
+                }
+                revision = document.revision
             }
-            revision = document.revision
         } catch let error as DomainDirectSettingsError {
             healthReason = error.localizedDescription
         } catch {
             healthReason = DomainDirectSettingsError.corruptDocument.localizedDescription
         }
         didBootstrap = true
+        await bootstrapEventHandler?(.loadPublished)
     }
 
     package func effectiveValue(for key: String) throws -> DomainSettingValue {
@@ -252,6 +251,7 @@ package actor DomainDirectSettingsStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(document)
+        await bootstrapEventHandler?(.willCompareAndSwap)
         do {
             try await persistence.compareAndSwapDirectSettingsData(expectedDigest: persistedDigest, data: data)
         } catch DomainPersistenceError.externalDocumentConflict {
@@ -264,18 +264,10 @@ package actor DomainDirectSettingsStore {
     }
 }
 
-#if DEBUG
-    extension DomainDirectSettingsStore {
-        package func test_setBootstrapDidEnter(
-            _ hook: (@Sendable () async -> Void)?
-        ) {
-            testBootstrapDidEnter = hook
-        }
-
-        package func test_setBootstrapBeforeLoad(
-            _ hook: (@Sendable () async -> Void)?
-        ) {
-            testBootstrapBeforeLoad = hook
-        }
+package extension DomainDirectSettingsStore {
+    func test_setBootstrapEventHandler(
+        _ handler: (@Sendable (DomainDirectSettingsBootstrapEvent) async -> Void)?
+    ) {
+        bootstrapEventHandler = handler
     }
-#endif
+}
