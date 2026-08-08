@@ -21,35 +21,30 @@ package enum DiffApplicator {
             throw DiffApplicationError.outOfBounds(line: startLine, contentSize: content.count)
         }
 
-        var result = content
-        var currentLine = startLine
+        var result: [String] = []
+        result.reserveCapacity(content.count)
+        result.append(contentsOf: content[..<startLine])
+        var contentIndex = startLine
 
         for diffLine in diffChunk.lines {
             switch diffLine.type {
             case .addition:
-                if currentLine == result.count {
-                    result.append(diffLine.content)
-                } else if currentLine < result.count {
-                    result.insert(diffLine.content, at: currentLine)
-                } else {
-                    return result
-                }
-                currentLine += 1
+                result.append(diffLine.content)
             case .removal:
-                if currentLine < result.count {
-                    result.remove(at: currentLine)
-                } else {
+                guard contentIndex < content.count else {
                     return result
                 }
+                contentIndex += 1
             case .context:
-                if currentLine < result.count {
-                    currentLine += 1
-                } else {
+                guard contentIndex < content.count else {
                     return result
                 }
+                result.append(content[contentIndex])
+                contentIndex += 1
             }
         }
 
+        result.append(contentsOf: content[contentIndex...])
         return result
     }
 
@@ -63,66 +58,35 @@ package enum DiffApplicator {
             throw DiffApplicationError.outOfBounds(line: startLine, contentSize: content.count)
         }
 
-        var result = content
-        var currentLine = startLine
+        var result: [String] = []
+        result.reserveCapacity(content.count)
+        result.append(contentsOf: content[..<startLine])
+        var contentIndex = startLine
 
-        for diffLine in diffChunk.lines.reversed() {
+        // Consume the post-apply content in diff order. Additions consume one
+        // post-apply line; removals restore their original line without
+        // consuming; context does both. This preserves mixed chunks and the
+        // original ordering of adjacent removals without array shifts.
+        for diffLine in diffChunk.lines {
             switch diffLine.type {
             case .addition:
-                if currentLine < result.count {
-                    result.remove(at: currentLine)
+                if contentIndex < content.count {
+                    contentIndex += 1
                 }
             case .removal:
-                result.insert(diffLine.content, at: currentLine)
-                currentLine += 1
+                result.append(diffLine.content)
             case .context:
-                currentLine += 1
+                if contentIndex < content.count {
+                    result.append(content[contentIndex])
+                }
+                contentIndex += 1
             }
         }
 
+        if contentIndex < content.count {
+            result.append(contentsOf: content[contentIndex...])
+        }
         return result
-    }
-
-    private static func applyDiffChunkToContent(_ diffChunk: DiffChunk, _ content: [String]) -> [String] {
-        var newContent = content
-        var offset = 0
-
-        for line in diffChunk.lines {
-            switch line.type {
-            case .addition:
-                newContent.insert(line.content, at: offset)
-                offset += 1
-            case .removal:
-                if offset < newContent.count {
-                    newContent.remove(at: offset)
-                }
-            case .context:
-                offset += 1
-            }
-        }
-
-        return newContent
-    }
-
-    private static func revertDiffChunkFromContent(_ diffChunk: DiffChunk, _ content: [String]) -> [String] {
-        var oldContent = content
-        var offset = 0
-
-        for line in diffChunk.lines.reversed() {
-            switch line.type {
-            case .addition:
-                if offset < oldContent.count {
-                    oldContent.remove(at: offset)
-                }
-            case .removal:
-                oldContent.insert(line.content, at: offset)
-                offset += 1
-            case .context:
-                offset += 1
-            }
-        }
-
-        return oldContent
     }
 
     private static func applyEditOperations(_ operations: [EditOperation], to content: [String]) -> [String] {
