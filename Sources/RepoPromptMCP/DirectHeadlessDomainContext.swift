@@ -7,6 +7,7 @@ actor DirectHeadlessDomainContext {
         case routingUnavailable
         case workspaceUnavailable
         case contextUnavailable
+        case rootMappingUnavailable
         case invalidWorkspaceDocument
         case stateConflict(String)
         case pathOutsideWorkspace(String)
@@ -16,6 +17,7 @@ actor DirectHeadlessDomainContext {
             case .routingUnavailable: "Standalone connection is not bound to a context"
             case .workspaceUnavailable: "Bound workspace is unavailable"
             case .contextUnavailable: "Bound context is unavailable"
+            case .rootMappingUnavailable: "Direct-headless root mapping is incomplete or ambiguous"
             case .invalidWorkspaceDocument: "Workspace document is invalid"
             case let .stateConflict(reason): "Workspace state conflict: \(reason)"
             case let .pathOutsideWorkspace(path): "Path is outside the bound workspace roots: \(path)"
@@ -32,6 +34,8 @@ actor DirectHeadlessDomainContext {
         let identity: DomainContextIdentity
         let workspace: DomainWorkspaceSnapshot
         let context: DomainContextSnapshot
+        let canonicalRoots: [URL]
+        let rootMappings: [DirectHeadlessRootMapping]
         let roots: [URL]
         let prompt: String
         let selection: [String]
@@ -39,45 +43,94 @@ actor DirectHeadlessDomainContext {
 
     let runtime: MCPDomainRuntime
     let scopeID: DomainStandaloneScopeID
+    private let processRootMappings: [DirectHeadlessRootMapping]
+    private var sessionRootMappings: [UUID: [DirectHeadlessRootMapping]] = [:]
 
-    init(runtime: MCPDomainRuntime, scopeID: DomainStandaloneScopeID) {
+    init(
+        runtime: MCPDomainRuntime,
+        scopeID: DomainStandaloneScopeID,
+        processRootMappings: [DirectHeadlessRootMapping] = []
+    ) {
         self.runtime = runtime
         self.scopeID = scopeID
+        self.processRootMappings = processRootMappings
     }
 
     func snapshot(for request: DomainPhysicalToolRequest) async throws -> Snapshot {
         guard let securityContext = request.securityContext else { throw Error.routingUnavailable }
-        return try await snapshot(connectionID: securityContext.connectionID)
+        return try await snapshot(
+            connectionID: securityContext.connectionID,
+            sessionID: securityContext.principal.runID
+        )
     }
 
     func snapshot(for request: DomainPhysicalReadRequest) async throws -> Snapshot {
         if let identity = request.context.handle?.context {
-            return try await snapshot(identity: identity)
+            return try await snapshot(
+                identity: identity,
+                sessionID: request.request.securityContext?.principal.runID
+            )
         }
         guard let connectionID = request.context.connectionID else { throw Error.routingUnavailable }
-        return try await snapshot(connectionID: connectionID)
+        return try await snapshot(
+            connectionID: connectionID,
+            sessionID: request.request.securityContext?.principal.runID
+        )
     }
 
-    func snapshot(connectionID: UUID) async throws -> Snapshot {
+    func snapshot(connectionID: UUID, sessionID: UUID? = nil) async throws -> Snapshot {
         let registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
         let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
-        return try await snapshot(identity: handle.context)
+        return try await snapshot(identity: handle.context, sessionID: sessionID)
     }
 
-    func snapshot(identity: DomainContextIdentity) async throws -> Snapshot {
+    func snapshot(identity: DomainContextIdentity, sessionID: UUID? = nil) async throws -> Snapshot {
         guard let workspace = await runtime.contextStore.workspaceSnapshot(identity.workspaceID) else {
             throw Error.workspaceUnavailable
         }
         guard let context = workspace.contexts.first(where: { $0.metadata.identity == identity }) else {
             throw Error.contextUnavailable
         }
-        let roots = try workspace.document.metadata.repoPaths.map { raw -> URL in
+        let canonicalRoots = try workspace.document.metadata.repoPaths.map { raw -> URL in
             let url = URL(fileURLWithPath: raw).standardizedFileURL.resolvingSymlinksInPath()
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
                 throw DomainStandaloneScopeError.invalidWorkingDirectory(raw)
             }
             return url
+        }
+        let preferredMappings = sessionID.flatMap { sessionRootMappings[$0] } ?? processRootMappings
+        let rootMappings: [DirectHeadlessRootMapping]
+        if preferredMappings.isEmpty {
+            rootMappings = canonicalRoots.map {
+                DirectHeadlessRootMapping(
+                    canonicalRoot: $0,
+                    physicalRoot: $0,
+                    worktree: nil,
+                    visualLabel: nil,
+                    visualColorHex: nil
+                )
+            }
+        } else {
+            guard preferredMappings.count == canonicalRoots.count else { throw Error.rootMappingUnavailable }
+            var physicalPaths: Set<String> = []
+            rootMappings = try canonicalRoots.map { canonicalRoot in
+                let matches = preferredMappings.filter {
+                    $0.canonicalRoot.standardizedFileURL.resolvingSymlinksInPath().path == canonicalRoot.path
+                }
+                guard matches.count == 1, let match = matches.first,
+                      physicalPaths.insert(match.physicalRoot.path).inserted
+                else { throw Error.rootMappingUnavailable }
+                return match
+            }
+        }
+        let roots = try rootMappings.map { mapping -> URL in
+            let physical = mapping.physicalRoot.standardizedFileURL.resolvingSymlinksInPath()
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: physical.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw DomainStandaloneScopeError.invalidWorkingDirectory(physical.path)
+            }
+            return physical
         }
         let contextObject = try Self.contextObject(from: workspace, contextID: identity.contextID)
         let prompt = contextObject["prompt"] as? String ?? ""
@@ -88,10 +141,41 @@ actor DirectHeadlessDomainContext {
             identity: identity,
             workspace: workspace,
             context: context,
+            canonicalRoots: canonicalRoots,
+            rootMappings: rootMappings,
             roots: roots,
             prompt: prompt,
             selection: selection
         )
+    }
+
+    func prepareSessionRootMappings(
+        sessionID: UUID,
+        sourceSessionID: UUID?,
+        arguments: [String: Value],
+        connectionID: UUID
+    ) async throws -> [DomainAgentRunSnapshot.WorktreeBinding] {
+        let current = try await snapshot(connectionID: connectionID)
+        let inherits = arguments["inherit_worktree"]?.boolValue ?? true
+        let hasExplicitSelector = arguments["worktree"] != nil
+            || arguments["worktree_id"] != nil
+            || arguments["worktree_create"]?.boolValue == true
+        let inheritedMappings = inherits && !hasExplicitSelector
+            ? sourceSessionID.flatMap { sessionRootMappings[$0] }
+            : nil
+        let baseMappings = inheritedMappings ?? current.rootMappings
+        let resolved = try await DirectHeadlessWorktreeRouting.resolveSessionMappings(
+            arguments: arguments,
+            canonicalRoots: current.canonicalRoots,
+            baseMappings: baseMappings
+        )
+        sessionRootMappings[sessionID] = resolved
+        return resolved.compactMap {
+            DirectHeadlessWorktreeRouting.binding(
+                mapping: $0,
+                source: inheritedMappings == nil ? "direct-headless-session-overlay" : "direct-headless-inherited-overlay"
+            )
+        }
     }
 
     func mutate(
@@ -135,7 +219,10 @@ actor DirectHeadlessDomainContext {
         else {
             throw Error.stateConflict(outcome.diagnostic ?? outcome.errorCode?.rawValue ?? outcome.disposition.rawValue)
         }
-        return try await snapshot(identity: current.identity)
+        return try await snapshot(
+            identity: current.identity,
+            sessionID: request.securityContext?.principal.runID
+        )
     }
 
     nonisolated static func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {

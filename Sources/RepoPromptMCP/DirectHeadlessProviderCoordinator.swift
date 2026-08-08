@@ -26,6 +26,8 @@ actor DirectHeadlessProviderCoordinator {
         let agentID: String
         let model: String?
         var name: String?
+        let parentSessionID: UUID?
+        let worktreeBindings: [DomainAgentRunSnapshot.WorktreeBinding]
         var latestText: String?
         var task: Task<Void, Never>?
     }
@@ -74,6 +76,7 @@ actor DirectHeadlessProviderCoordinator {
         providerID: String?,
         model: String?,
         request: DomainPhysicalToolRequest,
+        sessionID: UUID? = nil,
         carrierEnvironment: [String: String]? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
@@ -81,7 +84,10 @@ actor DirectHeadlessProviderCoordinator {
         guard let executable = descriptor.executable else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
-        let snapshot = try await context.snapshot(for: request)
+        guard let connectionID = request.securityContext?.connectionID else {
+            throw DirectHeadlessDomainContext.Error.routingUnavailable
+        }
+        let snapshot = try await context.snapshot(connectionID: connectionID, sessionID: sessionID)
         var arguments: [String] = []
         if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
             arguments += ["--model", model]
@@ -112,6 +118,17 @@ actor DirectHeadlessProviderCoordinator {
         }
         let sessionID = DomainChildLaunchContext.current?.runID ?? UUID()
         let runID = sessionID
+        guard let connectionID = request.securityContext?.connectionID else {
+            throw DirectHeadlessDomainContext.Error.routingUnavailable
+        }
+        let requestedParentSessionID = request.securityContext?.principal.runID
+        let parentSessionID = requestedParentSessionID.flatMap { agents[$0] == nil ? nil : $0 }
+        let worktreeBindings = try await context.prepareSessionRootMappings(
+            sessionID: sessionID,
+            sourceSessionID: parentSessionID,
+            arguments: args,
+            connectionID: connectionID
+        )
         let registration = await runtime.agentSessionStore.register(sessionID: sessionID)
         let activationID = UUID()
         let epoch: DomainAgentRunTurnEpoch
@@ -133,6 +150,8 @@ actor DirectHeadlessProviderCoordinator {
             agentID: descriptor.id,
             model: args["model"]?.stringValue,
             name: name,
+            parentSessionID: parentSessionID,
+            worktreeBindings: worktreeBindings,
             latestText: nil,
             task: nil
         )
@@ -158,6 +177,7 @@ actor DirectHeadlessProviderCoordinator {
                     providerID: descriptor.id,
                     model: args["model"]?.stringValue,
                     request: capturedRequest,
+                    sessionID: sessionID,
                     carrierEnvironment: capturedCarrierEnvironment
                 )
                 await finishAgent(sessionID: sessionID, outcome: .completed(assistantText: text))
@@ -225,9 +245,11 @@ actor DirectHeadlessProviderCoordinator {
     }
 
     func listAgents() async -> [Value] {
-        var values = agents.values.map { record -> Value in
-            let current = awaitSnapshot(record)
-            return current.toValue()
+        var values: [Value] = []
+        for record in agents.values {
+            let current = await runtime.agentSessionStore.snapshot(for: record.registration)
+                ?? awaitSnapshot(record)
+            values.append(current.toValue())
         }
         let activeIDs = Set(agents.keys)
         for metadata in await runtime.agentSessionStore.restoredMetadata() where !activeIDs.contains(metadata.sessionID) {
@@ -385,9 +407,9 @@ actor DirectHeadlessProviderCoordinator {
             interaction: nil,
             transcriptItemCount: assistantText == nil ? 0 : 1,
             updatedAt: Date(),
-            parentSessionID: nil,
+            parentSessionID: record.parentSessionID,
             failureReason: failure,
-            worktreeBindings: [],
+            worktreeBindings: record.worktreeBindings,
             activeWorktreeMerges: []
         )
     }

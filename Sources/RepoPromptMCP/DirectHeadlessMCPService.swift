@@ -158,15 +158,23 @@ actor DirectHeadlessMCPService {
                 roots: workingDirectories
             )
         }
+        let initialRoute = await DirectHeadlessWorktreeRouting.resolveInitialRoute(
+            workingDirectories: workingDirectories,
+            catalog: runtime.workspaceStore.snapshot()
+        )
 
         let scopeID = DomainStandaloneScopeID()
         let connectionID = UUID()
         let scope = try await runtime.standaloneScopeCoordinator.register(
             scopeID: scopeID,
             connectionID: connectionID,
-            workingDirectories: workingDirectories
+            workingDirectories: initialRoute.bindingWorkingDirectories
         )
-        let context = DirectHeadlessDomainContext(runtime: runtime, scopeID: scopeID)
+        let context = DirectHeadlessDomainContext(
+            runtime: runtime,
+            scopeID: scopeID,
+            processRootMappings: initialRoute.rootMappings
+        )
         let workspace = DirectHeadlessWorkspaceBackend(context: context)
         let global = DirectHeadlessGlobalBackend(runtime: runtime, scopeID: scopeID, context: context)
         let providerCoordinator = DirectHeadlessProviderCoordinator(
@@ -395,12 +403,15 @@ actor DirectHeadlessMCPService {
         )
     }
 
-    private static func securityContext(
+    static func securityContext(
         prepared: PreparedRuntime,
         connection: ConnectionContext,
         invocationID: UUID
     ) async -> DomainToolInvocationSecurityContext {
-        let snapshot = try? await prepared.context.snapshot(connectionID: connection.connectionID)
+        let snapshot = try? await prepared.context.snapshot(
+            connectionID: connection.connectionID,
+            sessionID: connection.principal.runID
+        )
         return DomainToolInvocationSecurityContext(
             principal: connection.principal,
             connectionID: connection.connectionID,
