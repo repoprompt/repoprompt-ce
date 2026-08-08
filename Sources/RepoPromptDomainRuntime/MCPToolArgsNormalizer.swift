@@ -163,6 +163,12 @@ package enum MCPToolArgsNormalizer {
                     nestedArgs.removeValue(forKey: "_rawJSON")
                 }
 
+                #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+                    // Diagnostic request identity is hidden from tool providers only in
+                    // builds that compile the latency diagnostic surface.
+                    nestedArgs.removeValue(forKey: "_latencyTraceID")
+                #endif
+
                 if let contextIDValue = nestedArgs["context_id"],
                    let contextIDString = contextIDValue.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                    let contextID = UUID(uuidString: contextIDString)
@@ -205,6 +211,12 @@ package enum MCPToolArgsNormalizer {
                 raw.removeValue(forKey: "_rawJSON")
             }
 
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+                // Diagnostic request identity is hidden from tool providers only in
+                // builds that compile the latency diagnostic surface.
+                raw.removeValue(forKey: "_latencyTraceID")
+            #endif
+
             if let contextIDValue = raw["context_id"],
                let contextIDString = contextIDValue.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                let contextID = UUID(uuidString: contextIDString)
@@ -229,6 +241,29 @@ package enum MCPToolArgsNormalizer {
             warnings: warnings
         )
     }
+
+    #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+        package static func diagnosticLatencyTraceID(params: [String: Value]?) -> UUID? {
+            guard let params else { return nil }
+            if let raw = params["_latencyTraceID"]?.stringValue,
+               let id = UUID(uuidString: raw)
+            {
+                return id
+            }
+            if let nested = params["args"]?.objectValue,
+               let raw = nested["_latencyTraceID"]?.stringValue
+            {
+                return UUID(uuidString: raw)
+            }
+            if let encoded = params["args"]?.stringValue,
+               let nested = Value.objectFromJSONString(encoded),
+               let raw = nested["_latencyTraceID"]?.stringValue
+            {
+                return UUID(uuidString: raw)
+            }
+            return nil
+        }
+    #endif
 
     /// Repair malformed edit arguments where replacement text became a property name
     /// Example: {"search": "...", "\tprivate func...": "..."} → {"search": "...", "replace": "..."}
@@ -313,7 +348,10 @@ package enum MCPToolArgsNormalizer {
     }
 
     private static func allowedSiblingKeys(for tool: String) -> Set<String> {
-        let common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args", "operation_id"]
+        var common: Set = ["_tabID", "_windowID", "_rawJSON", "context_id", "path", "verbose", "args", "operation_id"]
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+            common.insert("_latencyTraceID")
+        #endif
         switch tool {
         case "bind_context":
             return common.union(["op", "window_id", "working_dirs", "create_if_missing", "tab_name"])

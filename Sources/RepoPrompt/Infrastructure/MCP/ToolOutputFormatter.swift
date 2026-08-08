@@ -159,7 +159,8 @@ enum ToolOutputFormatter {
             }
         }
 
-        lines.append(contentsOf: searchMatchesTree(dto: dto))
+        let matchTreeLines = searchMatchesTree(dto: dto)
+        lines.append(contentsOf: matchTreeLines)
 
         // Show suggestion if present (e.g., when path filter yields no results)
         if let suggestion = dto.suggestion, !suggestion.isEmpty {
@@ -227,6 +228,21 @@ enum ToolOutputFormatter {
     }
 
     private static func searchMatchesTree(dto: ToolResultDTOs.SearchResultDTO) -> [String] {
+        let dimensions = EditFlowPerf.Dimensions(
+            contentMatchCount: dto.contentMatches,
+            pathMatchCount: dto.pathMatches
+        )
+        let treeState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FormattedOutput.searchTreeAssembly,
+            dimensions
+        )
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FormattedOutput.searchTreeAssembly,
+                treeState,
+                dimensions
+            )
+        }
         let pathMatchSet = Set(dto.pathMatchLines)
 
         var includedLookup: [String: Int] = [:]
@@ -2367,9 +2383,23 @@ extension ToolOutputFormatter {
     }
 
     static func formatFileTree(value: Value) -> [MCP.Tool.Content] {
-        if let dto = value.decode(ToolResultDTOs.FileTreeDTO.self) {
-            let text = fileTreeSummary(rootsCount: dto.rootsCount, usesLegend: dto.usesLegend, tree: dto.tree, note: dto.note, worktreeScope: dto.worktreeScope)
-            return [.text(text)]
+        let dto = EditFlowPerf.measure(EditFlowPerf.Stage.FormattedOutput.decode) {
+            value.decode(ToolResultDTOs.FileTreeDTO.self)
+        }
+        if let dto {
+            return EditFlowPerf.measure(
+                EditFlowPerf.Stage.FormattedOutput.fileTreeAssembly,
+                EditFlowPerf.Dimensions(rootCount: dto.rootsCount, resultBytes: dto.tree.utf8.count)
+            ) {
+                let text = fileTreeSummary(
+                    rootsCount: dto.rootsCount,
+                    usesLegend: dto.usesLegend,
+                    tree: dto.tree,
+                    note: dto.note,
+                    worktreeScope: dto.worktreeScope
+                )
+                return [.text(text)]
+            }
         }
         if let s = value.stringValue {
             // Legacy fallback: do not infer legends here; return raw tree text
@@ -2525,12 +2555,31 @@ extension ToolOutputFormatter {
 
     static func formatPromptState(value: Value) -> [MCP.Tool.Content] {
         // Forwarded prompt-tool envelope (e.g. workspace_context op=list_presets/export/select_preset)
-        if value.decode(ToolResultDTOs.PromptToolEnvelope.self) != nil {
+        let promptEnvelope = EditFlowPerf.measure(EditFlowPerf.Stage.FormattedOutput.promptEnvelopeProbeDecode) {
+            value.decode(ToolResultDTOs.PromptToolEnvelope.self)
+        }
+        if promptEnvelope != nil {
             return formatPrompt(value: value)
         }
 
         // New unified DTO
-        if let ctx = value.decode(ToolResultDTOs.PromptContextDTO.self) {
+        let promptContext = EditFlowPerf.measure(EditFlowPerf.Stage.FormattedOutput.promptContextDecode) {
+            value.decode(ToolResultDTOs.PromptContextDTO.self)
+        }
+        if let ctx = promptContext {
+            let assemblyState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.FormattedOutput.workspaceContextAssembly,
+                EditFlowPerf.Dimensions(
+                    fileCount: ctx.selection?.files.count,
+                    contentItemCount: ctx.fileBlocks?.count
+                )
+            )
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.FormattedOutput.workspaceContextAssembly,
+                    assemblyState
+                )
+            }
             var out: [String] = []
             let selectionCount = ctx.selection?.files.count ?? 0
             let blockCount = ctx.fileBlocks?.count ?? 0
@@ -5428,7 +5477,10 @@ extension ToolOutputFormatter {
     }
 
     static func formatSearch(value: Value) -> [MCP.Tool.Content] {
-        if let dto = value.decode(ToolResultDTOs.SearchResultDTO.self) {
+        let dto = EditFlowPerf.measure(EditFlowPerf.Stage.FormattedOutput.decode) {
+            value.decode(ToolResultDTOs.SearchResultDTO.self)
+        }
+        if let dto {
             if let error = dto.errorMessage, !error.isEmpty {
                 return [.text(searchErrorResults(dto: dto, error: error))]
             }
@@ -5443,6 +5495,17 @@ extension ToolOutputFormatter {
     }
 
     private static func matchSnippetLines(for group: ToolResultDTOs.SearchResultDTO.ContentMatchGroup, adjacency: Int = 2) -> [String] {
+        let snippetState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FormattedOutput.searchSnippetAssembly,
+            EditFlowPerf.Dimensions(lineCount: group.lines.count)
+        )
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FormattedOutput.searchSnippetAssembly,
+                snippetState
+            )
+        }
+
         struct LineInfo {
             let text: String
             let isMatch: Bool
@@ -5558,8 +5621,10 @@ extension ToolOutputFormatter {
 
     /// Fallback: present Value as a single fenced JSON block.
     static func formatGeneric(value: Value) -> [MCP.Tool.Content] {
-        let json = prettyJSON(value)
-        return [.text("```json\n\(json)\n```")]
+        EditFlowPerf.measure(EditFlowPerf.Stage.FormattedOutput.genericFallbackAssembly) {
+            let json = prettyJSON(value)
+            return [.text("```json\n\(json)\n```")]
+        }
     }
 
     static func formatAgentRun(args: [String: Value], value: Value) -> [MCP.Tool.Content] {

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF="${1:-debug}"
+PACKAGE_MODE="${1:-debug}"
+case "$PACKAGE_MODE" in
+    debug|release) SWIFT_CONFIGURATION="$PACKAGE_MODE" ;;
+    mcp-latency-diagnostic) SWIFT_CONFIGURATION="release" ;;
+    *) echo "ERROR: Unsupported package mode '$PACKAGE_MODE'." >&2; exit 2 ;;
+esac
+CONF="$PACKAGE_MODE"
+IS_MCP_LATENCY_DIAGNOSTIC=0
+[[ "$PACKAGE_MODE" == "mcp-latency-diagnostic" ]] && IS_MCP_LATENCY_DIAGNOSTIC=1
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scripts}"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
@@ -83,9 +91,11 @@ trap 'finish $?' EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"
-# Invalidate public-release manifests before metadata parsing, checks, or builds
-# so failed non-public packaging cannot leave stale release metadata behind.
-remove_stale_artifact_manifests
+# The diagnostic package has an isolated non-release manifest authority and must not
+# remove or replace ordinary release manifests.
+if (( ! IS_MCP_LATENCY_DIAGNOSTIC )); then
+    remove_stale_artifact_manifests
+fi
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"
 if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
@@ -95,14 +105,32 @@ if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
 fi
 APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+MCP_LATENCY_ARTIFACT_ROOT="$ROOT_DIR/.build/mcp-latency/optimized-server"
+MCP_LATENCY_ARTIFACT_MANIFEST="$MCP_LATENCY_ARTIFACT_ROOT/artifact-manifest.json"
+MCP_LATENCY_PROVENANCE_FILENAME="RepoPromptMCPLatencyDiagnosticProvenance.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
 if (( IS_RELEASE )); then
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$BASE_BUNDLE_ID}"
+elif (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    [[ -z "$BUNDLE_ID_OVERRIDE" ]] || fail "The MCP latency diagnostic bundle identifier is fixed and cannot be overridden."
+    BUNDLE_ID="$BASE_BUNDLE_ID.mcp-latency-diagnostic"
 else
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-$BASE_BUNDLE_ID.debug}}"
+fi
+
+if (( IS_RELEASE )) && { truthy "${RPCE_ENABLE_MCP_LATENCY_DIAGNOSTICS:-}" || truthy "${RPCE_ENABLE_MCP_LATENCY_TRACE:-}"; }; then
+    fail "Ordinary release packaging refuses MCP latency diagnostic compile gates. Use the isolated mcp-latency-diagnostic mode."
+fi
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    truthy "${REPOPROMPT_ENABLE_SENTRY:-}" && fail "MCP latency diagnostic packaging does not link Sentry."
+    truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}" && fail "MCP latency diagnostic packaging does not upload symbols."
+    truthy "${LOCAL_SELF_SIGNED_RELEASE:-}" && fail "MCP latency diagnostic packaging does not use release signing modes."
+    [[ -z "${SIGN_IDENTITY:-}" ]] || fail "MCP latency diagnostic packaging is always isolated ad-hoc signing; do not set SIGN_IDENTITY."
+    export RPCE_ENABLE_MCP_LATENCY_DIAGNOSTICS=1
+    export RPCE_ENABLE_MCP_LATENCY_TRACE=1
 fi
 
 phase "Checking build environment"
@@ -128,6 +156,10 @@ LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE="$ROOT_DIR/AppBundle/RepoPrompt.local-se
 APP_ENTITLEMENTS=""
 USE_ADHOC_SIGNING=0
 USE_LOCAL_SELF_SIGNED_RELEASE=0
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    USE_ADHOC_SIGNING=1
+    SIGN_IDENTITY="-"
+fi
 DEBUG_STORAGE_BACKEND_MARKER="alternate-in-memory"
 SIGNING_MODE_MARKER="debug-apple-development"
 warn_adhoc_signing(){
@@ -153,7 +185,7 @@ if [[ "$LOCAL_SELF_SIGNED_RELEASE" == "1" || "$LOCAL_SELF_SIGNED_RELEASE" == "tr
     echo "WARNING: Building a local-only self-signed production app."
     echo "WARNING: This app is for installation on this Mac only. It is not notarized and must not be uploaded to GitHub Releases."
 fi
-if [[ -z "$SIGN_IDENTITY" ]] && (( ! IS_RELEASE )) && [[ "$PREFER_STABLE_DEBUG_SIGNING" == "1" || "$PREFER_STABLE_DEBUG_SIGNING" == "true" ]]; then
+if [[ -z "$SIGN_IDENTITY" ]] && (( ! IS_RELEASE )) && (( ! IS_MCP_LATENCY_DIAGNOSTIC )) && [[ "$PREFER_STABLE_DEBUG_SIGNING" == "1" || "$PREFER_STABLE_DEBUG_SIGNING" == "true" ]]; then
     AUTO_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/"Apple Development: / { print $2; exit }')"
     if [[ -n "$AUTO_SIGN_IDENTITY" ]]; then
         SIGN_IDENTITY="$AUTO_SIGN_IDENTITY"
@@ -187,7 +219,10 @@ else
     fi
 fi
 
-if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    DEBUG_STORAGE_BACKEND_MARKER="alternate-in-memory"
+    SIGNING_MODE_MARKER="mcp-latency-diagnostic-adhoc"
+elif (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
     SIGNING_MODE_MARKER="local-self-signed"
 elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
@@ -208,7 +243,10 @@ fi
 printf 'Debug secure storage backend marker: %s\n' "$DEBUG_STORAGE_BACKEND_MARKER"
 printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 
-SWIFT_BUILD_ARGS=(-c "$CONF")
+SWIFT_BUILD_ARGS=(-c "$SWIFT_CONFIGURATION")
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    SWIFT_BUILD_ARGS+=(--scratch-path "$MCP_LATENCY_ARTIFACT_ROOT/scratch")
+fi
 if sentry_linking_enabled; then
     SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)
 fi
@@ -249,26 +287,37 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
         "$CONTROL_PLANE_SCRIPTS_DIR/build_swiftpm_release_products.sh" "$BUILD_DIR"
 else
     phase "Patching KeyboardShortcuts resource lookup"
-    run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+    if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+        run env REPOPROMPT_SWIFTPM_SCRATCH_PATH="$MCP_LATENCY_ARTIFACT_ROOT/scratch" \
+            "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+    else
+        run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+    fi
 
-    phase "Building $APP_NAME ($CONF, host-native)"
+    phase "Building $APP_NAME ($SWIFT_CONFIGURATION, host-native; package mode $PACKAGE_MODE)"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
-    phase "Building repoprompt-mcp ($CONF, host-native)"
+    phase "Building repoprompt-mcp ($SWIFT_CONFIGURATION, host-native; package mode $PACKAGE_MODE)"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
 
     phase "Resolving build artifact paths"
-    echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
-    BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
+    echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path
+    BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
 fi
-if (( PUBLIC_UNIVERSAL_RELEASE )); then
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    APP_BUNDLE="$MCP_LATENCY_ARTIFACT_ROOT/$APP_NAME.app"
+elif (( PUBLIC_UNIVERSAL_RELEASE )); then
     APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 elif (( IS_RELEASE )); then
     APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 else
     APP_BUNDLE="${REPOPROMPT_DEBUG_APP_BUNDLE:-$HOME/Library/Application Support/RepoPrompt CE/DebugApps/$APP_NAME.app}"
 fi
-COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    COMPAT_APP_BUNDLE="$APP_BUNDLE"
+else
+    COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
+fi
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
 printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
 
@@ -366,8 +415,20 @@ run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Con
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
 
 if (( ! IS_RELEASE )); then
-    phase "Writing debug bundle provenance"
-    ROOT_DIR_FOR_PROVENANCE="$ROOT_DIR" APP_BUNDLE_FOR_PROVENANCE="$APP_BUNDLE" python3 - <<'PY'
+    if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+        phase "Writing optimized MCP latency diagnostic provenance"
+        PROVENANCE_FILENAME="$MCP_LATENCY_PROVENANCE_FILENAME"
+    else
+        phase "Writing debug bundle provenance"
+        PROVENANCE_FILENAME="RepoPromptDebugProvenance.json"
+    fi
+    SOURCE_FINGERPRINT_SHA256="$(python3 "$CONTROL_PLANE_SCRIPTS_DIR/source_tree_fingerprint.py" --repo "$ROOT_DIR")"
+    ROOT_DIR_FOR_PROVENANCE="$ROOT_DIR" \
+        APP_BUNDLE_FOR_PROVENANCE="$APP_BUNDLE" \
+        PACKAGE_MODE_FOR_PROVENANCE="$PACKAGE_MODE" \
+        PROVENANCE_FILENAME="$PROVENANCE_FILENAME" \
+        SOURCE_FINGERPRINT_SHA256="$SOURCE_FINGERPRINT_SHA256" \
+        python3 - <<'PY'
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -376,9 +437,12 @@ import json
 import os
 import subprocess
 import time
+import uuid
 
 root = Path(os.environ["ROOT_DIR_FOR_PROVENANCE"]).resolve()
 bundle = Path(os.environ["APP_BUNDLE_FOR_PROVENANCE"])
+package_mode = os.environ["PACKAGE_MODE_FOR_PROVENANCE"]
+filename = os.environ["PROVENANCE_FILENAME"]
 
 def git(args: list[str]) -> str | None:
     try:
@@ -400,15 +464,32 @@ payload = {
     "branch": git(["rev-parse", "--abbrev-ref", "HEAD"]),
     "commit": git(["rev-parse", "HEAD"]),
     "dirty": bool(status),
+    "source_fingerprint_sha256": os.environ["SOURCE_FINGERPRINT_SHA256"],
     "buildTimeEpoch": now,
     "buildTimeISO": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
 }
-path = bundle / "Contents" / "Resources" / "RepoPromptDebugProvenance.json"
+if package_mode == "mcp-latency-diagnostic":
+    payload.update({
+        "schema_version": 1,
+        "artifact_id": str(uuid.uuid4()),
+        "artifact_kind": "optimized_mcp_latency_diagnostic_server",
+        "ordinary_release_artifact": False,
+        "swift_configuration": "release",
+        "server_diagnostic_configuration": "optimized_diagnostic",
+        "diagnostic_surface": "mcp_latency_v1",
+        "enabled_defines_by_target": {
+            "RepoPromptApp": ["MCP_LATENCY_DIAGNOSTICS"],
+            "RepoPromptDomainRuntime": ["MCP_LATENCY_DIAGNOSTICS"],
+            "RepoPromptMCP": ["MCP_LATENCY_TRACE"],
+            "RepoPromptShared": ["MCP_LATENCY_DIAGNOSTICS"],
+        },
+    })
+path = bundle / "Contents" / "Resources" / filename
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print(f"Debug bundle provenance: {path}")
+print(f"Bundle provenance: {path}")
 PY
     run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_json.py" \
-        "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
+        "$APP_BUNDLE/Contents/Resources/$PROVENANCE_FILENAME"
 fi
 
 phase "Signing app bundle"
@@ -509,6 +590,13 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
 fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
 run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
+if (( IS_MCP_LATENCY_DIAGNOSTIC )); then
+    phase "Writing optimized MCP latency diagnostic artifact manifest"
+    run python3 "$CONTROL_PLANE_SCRIPTS_DIR/write_mcp_latency_diagnostic_manifest.py" \
+        --app "$APP_BUNDLE" \
+        --output "$MCP_LATENCY_ARTIFACT_MANIFEST" \
+        --artifact-root "$MCP_LATENCY_ARTIFACT_ROOT"
+fi
 if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then
     sentry_linking_enabled || fail "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS requires REPOPROMPT_ENABLE_SENTRY=1."
     require_sentry_upload_credentials

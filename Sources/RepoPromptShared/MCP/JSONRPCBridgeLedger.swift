@@ -119,19 +119,38 @@ public struct JSONRPCBridgeMessageMetadata: Equatable, Sendable {
     public let method: String?
     public let tool: String?
     public let requestOrdinal: UInt64?
+    public let appInvocationID: String?
 
     public init(
         kind: Kind,
         id: JSONRPCBridgeID?,
         method: String?,
         tool: String?,
-        requestOrdinal: UInt64?
+        requestOrdinal: UInt64?,
+        appInvocationID: String? = nil
     ) {
         self.kind = kind
         self.id = id
         self.method = method
         self.tool = tool
         self.requestOrdinal = requestOrdinal
+        self.appInvocationID = appInvocationID
+    }
+}
+
+private enum MCPRequestLatencyTraceIdentity {
+    static func extract(method: String?, arguments: [String: Any]?) -> String? {
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+            guard method == "tools/call",
+                  let raw = arguments?["_latencyTraceID"] as? String,
+                  let id = UUID(uuidString: raw)
+            else {
+                return nil
+            }
+            return id.uuidString
+        #else
+            return nil
+        #endif
     }
 }
 
@@ -158,7 +177,7 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
     public let permitActive: Bool?
     public let publicationPending: Bool?
     public let terminalBarrier: Bool?
-    #if DEBUG
+    #if DEBUG || MCP_LATENCY_DIAGNOSTICS
         /// Same-process monotonic timestamp used to correlate response delivery with deferred work.
         public let monotonicUptimeMS: Double
     #endif
@@ -203,7 +222,7 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
         self.activeRequestCount = activeRequestCount
         self.responseInDeliveryCount = responseInDeliveryCount
         self.terminalReason = terminalReason
-        #if DEBUG
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
             self.requestIdentity = MCPRequestTimelineIdentity(
                 jsonRPCRequestID: id,
                 connectionID: connectionID,
@@ -219,7 +238,7 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
         self.permitActive = permitActive
         self.publicationPending = publicationPending
         self.terminalBarrier = terminalBarrier
-        #if DEBUG
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
             monotonicUptimeMS = ProcessInfo.processInfo.systemUptime * 1000
         #endif
     }
@@ -247,7 +266,7 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
             "publication_pending": publicationPending ?? NSNull(),
             "terminal_barrier": terminalBarrier ?? NSNull()
         ]
-        #if DEBUG
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
             value["monotonic_uptime_ms"] = monotonicUptimeMS
         #endif
         return value
@@ -283,8 +302,10 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
 
 public enum MCPResponseDeliveryTracer {
     private static let lock = NSLock()
-    #if DEBUG
+    #if DEBUG || MCP_LATENCY_DIAGNOSTICS
         private nonisolated(unsafe) static var debugEvents: [MCPResponseDeliveryTraceEvent] = []
+        private nonisolated(unsafe) static var debugCaptureActive = false
+        private nonisolated(unsafe) static var debugDroppedEventCount = 0
         private static let maximumDebugEvents = 20000
     #endif
 
@@ -302,18 +323,30 @@ public enum MCPResponseDeliveryTracer {
         _ event: MCPResponseDeliveryTraceEvent,
         to descriptor: Int32 = STDERR_FILENO
     ) {
-        guard event.terminalReason != nil || successTracingEnabled else { return }
-        guard let data = "[MCPResponseDelivery] \(event)\n".data(using: .utf8) else { return }
+        let shouldWrite = event.terminalReason != nil || successTracingEnabled
+        var retainedForCapture = false
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+            if lock.try() {
+                if debugCaptureActive {
+                    retainedForCapture = true
+                    if debugEvents.count < maximumDebugEvents {
+                        debugEvents.append(event)
+                    } else {
+                        debugDroppedEventCount += 1
+                    }
+                }
+                lock.unlock()
+            }
+        #endif
+        guard shouldWrite || retainedForCapture else { return }
+        guard shouldWrite,
+              let data = "[MCPResponseDelivery] \(event)\n".data(using: .utf8)
+        else { return }
         // Terminal tracing must not wait behind another diagnostic emitter or
         // a full stderr pipe. Dropping a contended/unwritable trace is safer
         // than delaying the transport's required terminal exit.
         guard lock.try() else { return }
         defer { lock.unlock() }
-        #if DEBUG
-            if debugEvents.count < maximumDebugEvents {
-                debugEvents.append(event)
-            }
-        #endif
         // Terminal events are emitted even with success tracing disabled, so
         // this path runs during transport failure handling when stderr may
         // already be closed. Best-effort raw write; never FileHandle.write,
@@ -321,10 +354,12 @@ public enum MCPResponseDeliveryTracer {
         BestEffortStderrWriter.writeNonBlocking(data, to: descriptor)
     }
 
-    #if DEBUG
+    #if DEBUG || MCP_LATENCY_DIAGNOSTICS
         public static func resetDebugEvents() {
             lock.lock()
             debugEvents.removeAll(keepingCapacity: true)
+            debugDroppedEventCount = 0
+            debugCaptureActive = true
             lock.unlock()
         }
 
@@ -332,6 +367,17 @@ public enum MCPResponseDeliveryTracer {
             lock.lock()
             defer { lock.unlock() }
             return debugEvents
+        }
+
+        public static func debugCaptureSnapshot(
+            finish: Bool
+        ) -> (events: [MCPResponseDeliveryTraceEvent], droppedEventCount: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            if finish {
+                debugCaptureActive = false
+            }
+            return (debugEvents, debugDroppedEventCount)
         }
     #endif
 
@@ -359,6 +405,7 @@ public enum MCPResponseDeliveryTracer {
                 id: message?.id,
                 method: message?.method,
                 tool: message?.tool,
+                invocationID: message?.appInvocationID,
                 lifecycleState: message?.kind.rawValue,
                 requestOrdinal: message?.requestOrdinal,
                 framedByteCount: prepared.deliveryFrame?.count ?? prepared.framedByteCount,
@@ -392,6 +439,7 @@ public enum MCPResponseDeliveryTracer {
                 id: summary?.id,
                 method: summary?.method,
                 tool: summary?.tool,
+                invocationID: summary?.appInvocationID,
                 requestOrdinal: summary?.requestOrdinal,
                 framedByteCount: frame.count,
                 framedSHA256: sha256Hex(frame),
@@ -781,7 +829,11 @@ public actor JSONRPCBridgeLedger {
                     id: id,
                     method: method,
                     tool: tool,
-                    requestOrdinal: metadata.ordinal
+                    requestOrdinal: metadata.ordinal,
+                    appInvocationID: MCPRequestLatencyTraceIdentity.extract(
+                        method: method,
+                        arguments: toolArguments
+                    )
                 ))
 
             case let .response(id):
@@ -1259,6 +1311,7 @@ public actor JSONRPCBridgeLedger {
                 id: message?.id,
                 method: message?.method,
                 tool: message?.tool,
+                invocationID: message?.appInvocationID,
                 lifecycleState: message?.kind.rawValue,
                 requestOrdinal: message?.requestOrdinal,
                 framedByteCount: prepared?.framedByteCount,
@@ -1492,6 +1545,13 @@ public enum JSONRPCBridgeFrameInspector {
             let hasID = dictionary.keys.contains("id")
             let id = hasID ? parseID(dictionary["id"]) : nil
             let method = dictionary["method"] as? String
+            let toolArguments: [String: Any]? = if method == "tools/call",
+                                                   let params = dictionary["params"] as? [String: Any]
+            {
+                params["arguments"] as? [String: Any]
+            } else {
+                nil
+            }
             let tool: String? = if method == "tools/call",
                                    let params = dictionary["params"] as? [String: Any]
             {
@@ -1513,7 +1573,11 @@ public enum JSONRPCBridgeFrameInspector {
                 id: id,
                 method: method,
                 tool: tool,
-                requestOrdinal: nil
+                requestOrdinal: nil,
+                appInvocationID: MCPRequestLatencyTraceIdentity.extract(
+                    method: method,
+                    arguments: toolArguments
+                )
             )
         }
     }

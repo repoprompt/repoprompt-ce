@@ -2695,6 +2695,15 @@ func parseCLIMode() -> CLIMode {
             }
 
         // Exec mode flags
+        #if DEBUG || MCP_LATENCY_TRACE
+            case "--latency-concurrent-batch":
+                isExec = true
+                i = args.index(after: i)
+                if i < args.endIndex {
+                    execOptions.latencyConcurrentBatchPath = args[i]
+                }
+        #endif
+
         case "--exec", "-e":
             isExec = true
             i = args.index(after: i)

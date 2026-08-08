@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-mcp-latency dev-mcp-latency-client-build dev-mcp-latency-debug-server-build dev-mcp-latency-server-build dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 CODEX_ARCH ?= all
@@ -21,6 +21,10 @@ help:
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-launch-existing' 'Launch existing coordinated debug app without building'
 	@printf '  %-30s %s\n' 'dev-codex-schema-check' 'Coordinated Codex app-server schema validation'
+	@printf '  %-30s %s\n' 'dev-mcp-latency' 'Coordinated MCP latency fixture/run/analyze; set MCP_LATENCY_ARGS="..."'
+	@printf '  %-30s %s\n' 'dev-mcp-latency-client-build' 'Build legacy client-only optimized diagnostic CLI'
+	@printf '  %-30s %s\n' 'dev-mcp-latency-debug-server-build' 'Package isolated DEBUG attribution app (never launches)'
+	@printf '  %-30s %s\n' 'dev-mcp-latency-server-build' 'Package isolated release-optimized diagnostic app (never launches)'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-provider-test' 'Run provider package tests; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-smoke' 'Run non-disruptive live debug app smoke checks'
@@ -204,6 +208,18 @@ dev-launch-existing:
 
 dev-codex-schema-check:
 	./conductor codex-schema-check
+
+dev-mcp-latency:
+	./conductor mcp-latency -- $(MCP_LATENCY_ARGS)
+
+dev-mcp-latency-client-build:
+	./conductor mcp-latency-client-build
+
+dev-mcp-latency-debug-server-build:
+	./conductor mcp-latency-debug-server-build
+
+dev-mcp-latency-server-build:
+	./conductor mcp-latency-server-build
 
 dev-test:
 	./conductor test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))

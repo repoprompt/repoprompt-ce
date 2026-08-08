@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "fixture_seed": "mcp-tool-latency-v1-2026-07-29",
+  "fixture_inventory": {
+    "manifest_location": "external_sibling",
+    "workspace_roots": "populated_roots_plus_empty_root",
+    "digest_scope": "measured_payload_files_only"
+  },
+  "work_count_authority": "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md",
+  "wi3_authority": {
+    "source": "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md",
+    "baseline_commit": "6f8fcbb",
+    "snapshot_surfaces": ["mcp_read_search_runtime_snapshot", "mcp_read_search_admission_snapshot"],
+    "lane_capacities": {"connection_ordinary":1,"connection_file_search":4,"store_file_search":4},
+    "parity_counter_groups": ["catalog_rebuilds","search_rebuilds","ui_projection_rebuilds","freshness","watchers_crawls","content_reads","git_processes"],
+    "workload_matrices": [
+      {"id":"same-connection-ordinary-burst","expected_signature":"ordinary limit 1; FIFO queue/acquire/release","execution":{"enabled_by_default":true,"mode":"same_connection_burst","row_id":"tree-roots","request_count":4}},
+      {"id":"same-connection-mixed-ordinary-search","expected_signature":"ordinary limit 1 and connection file_search limit 4 remain independent"},
+      {"id":"distinct-connections-one-window","expected_signature":"per-connection 1+4 lanes converge on one store search lane of 4","execution":{"enabled_by_default":true,"mode":"distinct_connections","row_id":"search-content-few","connection_count":5}},
+      {"id":"distinct-windows-one-physical-root","expected_signature":"per-window watchers, crawls, indexes, and freshness flights remain visible as duplication"},
+      {"id":"short-versus-long-agent-transcript","expected_signature":"observer scan and callback work remain correlated to one request identity"}
+    ]
+  },
+  "sample_discipline": {"cold_samples":10,"warmups_discarded":3,"warm_samples_per_repeat":30,"warm_repeats":3},
+  "rows": [
+    {"id":"tree-roots","tool":"get_file_tree","arguments":{"type":"roots"},"profiles":["real","small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"tree-auto","tool":"get_file_tree","arguments":{},"profiles":["real","small","medium"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"tree-full","tool":"get_file_tree","arguments":{"mode":"full"},"profiles":["real","small","medium"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"tree-full-large-preflight","tool":"get_file_tree","arguments":{"mode":"full"},"profiles":["large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":false,"requires":"bounded response-size preflight"},
+    {"id":"tree-folders","tool":"get_file_tree","arguments":{"mode":"folders"},"profiles":["real","small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"tree-selected","tool":"get_file_tree","arguments":{"mode":"selected"},"profiles":["real","small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true,"requires":"pinned selection fixture"},
+    {"id":"tree-subtree-depth-2","tool":"get_file_tree","arguments":{"path":"${FIXTURE_SUBTREE}","max_depth":2},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"tree-empty-root","tool":"get_file_tree","arguments":{"path":"${FIXTURE_EMPTY_ROOT}","max_depth":2},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":false,"requires":"empty root attached to workspace"},
+    {"id":"tree-worktree-auto","tool":"get_file_tree","arguments":{},"profiles":["real"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":false,"requires":"worktree-bound context"},
+    {"id":"search-path-literal","tool":"file_search","arguments":{"pattern":"Duplicate.swift","mode":"path","regex":false,"max_results":50},"profiles":["real","small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"search-path-wildcard","tool":"file_search","arguments":{"pattern":"*Duplicate.swift","mode":"path","regex":false,"max_results":1000},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"search-content-few","tool":"file_search","arguments":{"pattern":"LATENCY_RARE","mode":"content","regex":false,"max_results":50,"context_lines":0},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"search-content-context-2","tool":"file_search","arguments":{"pattern":"LATENCY_RARE","mode":"content","regex":false,"max_results":50,"context_lines":2},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"search-content-zero","tool":"file_search","arguments":{"pattern":"LATENCY_ZERO_MATCH","mode":"content","regex":false,"max_results":50},"profiles":["real","small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"search-content-capped","tool":"file_search","arguments":{"pattern":"LATENCY_COMMON","mode":"content","regex":false,"max_results":1000,"context_lines":0},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"cap_hit_success","expected_outcome_by_profile":{"small":"success","medium":"cap_hit_success","large":"cap_hit_success"},"enabled_by_default":true},
+    {"id":"search-content-regex","tool":"file_search","arguments":{"pattern":"LATENCY_(COMMON|RARE)","mode":"content","regex":true,"max_results":50},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"cap_hit_success","enabled_by_default":true},
+    {"id":"search-both","tool":"file_search","arguments":{"pattern":"Duplicate|LATENCY_RARE","mode":"both","regex":true,"max_results":50},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"cap_hit_success","expected_outcome_by_profile":{"small":"success","medium":"cap_hit_success","large":"cap_hit_success"},"enabled_by_default":true},
+    {"id":"search-count-only","tool":"file_search","arguments":{"pattern":"LATENCY_COMMON","mode":"content","regex":false,"count_only":true,"max_results":1000},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"cap_hit_success","expected_outcome_by_profile":{"small":"success","medium":"cap_hit_success","large":"cap_hit_success"},"enabled_by_default":true},
+    {"id":"search-scoped","tool":"file_search","arguments":{"pattern":"LATENCY_COMMON","mode":"content","regex":false,"filter":{"paths":["${FIXTURE_SUBTREE}"]},"max_results":1000},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"search-worktree","tool":"file_search","arguments":{"pattern":"LATENCY_COMMON","mode":"content","regex":false,"max_results":50},"profiles":["real"],"formats":["formatted","raw"],"expected_outcome":"cap_hit_success","enabled_by_default":false,"requires":"worktree-bound context"},
+    {"id":"workspace-ordinary","tool":"workspace_context","arguments":{"include":["prompt","selection","code","tokens"]},"profiles":["real","small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"workspace-envelope","tool":"workspace_context","arguments":{"include":["prompt","selection","code","files","tree","tokens"]},"profiles":["small","medium"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"read-small-control","tool":"read_file","arguments":{"path":"${FIXTURE_SMALL_FILE}","start_line":1,"limit":8},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"success","enabled_by_default":true},
+    {"id":"retryable-readiness-control","tool":"file_search","arguments":{"pattern":"LATENCY_RARE","mode":"content","regex":false,"max_results":10},"profiles":["small","medium","large"],"formats":["formatted","raw"],"expected_outcome":"retryable_error","enabled_by_default":false,"requires":"intentionally unready store cohort"},
+    {"id":"expected-timeout-backpressure-control","tool":"get_file_tree","arguments":{"mode":"full"},"profiles":["large"],"formats":["formatted","raw"],"expected_outcome":"expected_timeout","enabled_by_default":false,"requires":"separate bounded timeout cohort after response-size preflight"}
+  ]
+}

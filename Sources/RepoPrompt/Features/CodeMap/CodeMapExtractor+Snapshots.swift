@@ -15,9 +15,16 @@ enum WorkspaceFileTreePresentationRenderer {
         let normalizedMode = snapshot.mode.lowercased()
         let shouldFilterRootsToSelection = snapshot.onlyIncludeRootsWithSelectedFiles
             && (normalizedMode != "full" || !snapshot.selectedFileIDs.isEmpty)
-        let effectiveRoots = shouldFilterRootsToSelection
-            ? snapshot.roots.filter { snapshotFolderContainsSelectedFile($0, selectedFileIDs: snapshot.selectedFileIDs) }
-            : snapshot.roots
+        let effectiveRoots = EditFlowPerf.measure(
+            EditFlowPerf.Stage.FileTree.renderIndexPreparation,
+            EditFlowPerf.Dimensions(scanKind: "root_filter")
+        ) {
+            shouldFilterRootsToSelection
+                ? snapshot.roots.filter {
+                    snapshotFolderContainsSelectedFile($0, selectedFileIDs: snapshot.selectedFileIDs)
+                }
+                : snapshot.roots
+        }
         guard !effectiveRoots.isEmpty else { return "" }
 
         var cachedSelectedFolderIDs: Set<UUID>? = nil
@@ -27,8 +34,16 @@ enum WorkspaceFileTreePresentationRenderer {
                 cachedSelectedFolderIDs = []
                 return []
             }
-            let computed = effectiveRoots.reduce(into: Set<UUID>()) { acc, root in
-                acc.formUnion(snapshotFolderIDsContainingSelectedFiles(rootFolder: root, selectedFileIDs: snapshot.selectedFileIDs))
+            let computed = EditFlowPerf.measure(
+                EditFlowPerf.Stage.FileTree.renderIndexPreparation,
+                EditFlowPerf.Dimensions(scanKind: "selected_folder_index")
+            ) {
+                effectiveRoots.reduce(into: Set<UUID>()) { acc, root in
+                    acc.formUnion(snapshotFolderIDsContainingSelectedFiles(
+                        rootFolder: root,
+                        selectedFileIDs: snapshot.selectedFileIDs
+                    ))
+                }
             }
             cachedSelectedFolderIDs = computed
             return computed
@@ -38,8 +53,19 @@ enum WorkspaceFileTreePresentationRenderer {
             mode: String,
             depthLimit: Int?,
             tokenBudget: Int?,
-            siblingCap: Int?
+            siblingCap: Int?,
+            attemptLabel: String,
+            attemptOrdinal: Int,
+            attemptCount: Int
         ) -> (tree: String, usedSelectedMarker: Bool, truncated: Bool) {
+            let dimensions = EditFlowPerf.Dimensions(
+                taskCount: attemptCount,
+                workloadClass: attemptLabel,
+                serialPosition: attemptOrdinal
+            )
+            let attemptState = EditFlowPerf.begin(EditFlowPerf.Stage.FileTree.renderAttempt, dimensions)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.FileTree.renderAttempt, attemptState, dimensions) }
+
             var parts: [String] = []
             var usedSelectedMarker = false
             var hitBudget = false
@@ -73,10 +99,20 @@ enum WorkspaceFileTreePresentationRenderer {
                 usedSelectedMarker = usedSelectedMarker || usedSelection
 
                 if let currentRemaining = remaining {
-                    let consumedTokens = text.isEmpty ? 0 : max(
-                        1,
-                        TokenCalculationService.estimateTokens(for: text)
-                    )
+                    let consumedTokens = EditFlowPerf.measure(
+                        EditFlowPerf.Stage.FileTree.renderTokenEstimation,
+                        EditFlowPerf.Dimensions(
+                            taskCount: attemptCount,
+                            workloadClass: attemptLabel,
+                            scanKind: "per_root_budget",
+                            serialPosition: attemptOrdinal
+                        )
+                    ) {
+                        text.isEmpty ? 0 : max(
+                            1,
+                            TokenCalculationService.estimateTokens(for: text)
+                        )
+                    }
                     remaining = max(0, currentRemaining - consumedTokens)
                 }
 
@@ -100,7 +136,21 @@ enum WorkspaceFileTreePresentationRenderer {
         }
 
         if normalizedMode != "auto" {
-            let built = buildOnce(mode: snapshot.mode, depthLimit: snapshot.maxDepth, tokenBudget: nil, siblingCap: nil)
+            let explicitAttemptLabel = switch normalizedMode {
+            case "full": "explicitFull"
+            case "folders": "explicitFolders"
+            case "selected": "explicitSelected"
+            default: "explicitOther"
+            }
+            let built = buildOnce(
+                mode: snapshot.mode,
+                depthLimit: snapshot.maxDepth,
+                tokenBudget: nil,
+                siblingCap: nil,
+                attemptLabel: explicitAttemptLabel,
+                attemptOrdinal: 1,
+                attemptCount: 1
+            )
             return finalizeSnapshotTree(
                 tree: built.tree,
                 includeLegend: snapshot.includeLegend,
@@ -118,32 +168,46 @@ enum WorkspaceFileTreePresentationRenderer {
         }
 
         let attempts: [Attempt] = [.fullUnlimited, .fullDepth3, .foldersUnlimited, .foldersDepth3, .selectedOnly]
-        for attempt in attempts {
-            let (mode, depthCap, noteParts): (String, Int?, [String]) = switch attempt {
+        for (attemptIndex, attempt) in attempts.enumerated() {
+            let (mode, depthCap, noteParts, attemptLabel): (String, Int?, [String], String) = switch attempt {
             case .fullUnlimited:
-                ("full", nil, [])
+                ("full", nil, [], "fullUnlimited")
             case .fullDepth3:
-                ("full", 3, ["depth cap 3"])
+                ("full", 3, ["depth cap 3"], "fullDepth3")
             case .foldersUnlimited:
-                ("folders", nil, snapshot.selectedFileIDs.isEmpty ? ["directory-only view"] : ["directory-only view", "selected files shown"])
+                ("folders", nil, snapshot.selectedFileIDs.isEmpty ? ["directory-only view"] : ["directory-only view", "selected files shown"], "foldersUnlimited")
             case .foldersDepth3:
-                ("folders", 3, snapshot.selectedFileIDs.isEmpty ? ["directory-only view", "depth cap 3"] : ["directory-only view", "depth cap 3", "selected files shown"])
+                ("folders", 3, snapshot.selectedFileIDs.isEmpty ? ["directory-only view", "depth cap 3"] : ["directory-only view", "depth cap 3", "selected files shown"], "foldersDepth3")
             case .selectedOnly:
-                ("selected", nil, ["selected-only view"])
+                ("selected", nil, ["selected-only view"], "selectedOnly")
             }
 
             let built = buildOnce(
                 mode: mode,
                 depthLimit: depthCap,
                 tokenBudget: snapshotAutoTokenBudget,
-                siblingCap: snapshotMaxChildrenPerFolderAutoCap
+                siblingCap: snapshotMaxChildrenPerFolderAutoCap,
+                attemptLabel: attemptLabel,
+                attemptOrdinal: attemptIndex + 1,
+                attemptCount: attempts.count
             )
             guard !built.tree.isEmpty else { continue }
             guard !built.truncated else { continue }
 
             var text = built.tree
             let usedCodeMapMarker = snapshot.showCodeMapMarkers && text.contains(snapshotCodeMapMark)
-            if TokenCalculationService.estimateTokens(for: text) <= snapshotAutoTokenBudget {
+            let estimatedTokens = EditFlowPerf.measure(
+                EditFlowPerf.Stage.FileTree.renderTokenEstimation,
+                EditFlowPerf.Dimensions(
+                    taskCount: attempts.count,
+                    workloadClass: attemptLabel,
+                    scanKind: "final_budget",
+                    serialPosition: attemptIndex + 1
+                )
+            ) {
+                TokenCalculationService.estimateTokens(for: text)
+            }
+            if estimatedTokens <= snapshotAutoTokenBudget {
                 text = finalizeSnapshotTree(
                     tree: text,
                     includeLegend: snapshot.includeLegend,

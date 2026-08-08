@@ -6796,6 +6796,9 @@ final class MCPServerViewModel: ObservableObject {
         startPath: String?,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> (result: FileTreeResult, rootCount: Int) {
+        let bridgeTotal = EditFlowPerf.begin(EditFlowPerf.Stage.FileTree.bridgeTotal)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.FileTree.bridgeTotal, bridgeTotal) }
+
         let presentationMode: WorkspaceFileTreePresentationMode
         switch mode.lowercased() {
         case "selected": presentationMode = .selected
@@ -6805,9 +6808,17 @@ final class MCPServerViewModel: ObservableObject {
         default: throw MCPError.invalidParams("invalid mode: \(mode)")
         }
 
-        let filePathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
-        let showCodeMapMarkers = await MainActor.run { !promptVM.codeMapsGloballyDisabled }
-        let selection = try await lookupContext.physicalizeSelection(storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: true))
+        let filePathDisplay = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.settingsSnapshot) {
+            await MainActor.run { promptVM.filePathDisplayOption }
+        }
+        let showCodeMapMarkers = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.settingsSnapshot) {
+            await MainActor.run { !promptVM.codeMapsGloballyDisabled }
+        }
+        let selection = try await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.selectionPhysicalization) {
+            try await lookupContext.physicalizeSelection(storedSelectionForCurrentTabContext(
+                includeCodemapPathsWhenSelectedUsage: true
+            ))
+        }
         let store = promptVM.workspaceFileContextStore
         let fileTree = await store.makeCurrentSnapshotFileTreePresentation(
             selection: selection,

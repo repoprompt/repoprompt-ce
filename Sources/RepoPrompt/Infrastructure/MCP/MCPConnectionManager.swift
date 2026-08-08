@@ -2451,7 +2451,7 @@ actor ServerNetworkManager {
         let effectiveProgressState = progressContext
             ?? (connectionID == currentConnectionID ? currentProgressState : nil)
         return try await $currentProgressState.withValue(effectiveProgressState) {
-            #if DEBUG || EDIT_FLOW_PERF
+            #if DEBUG || EDIT_FLOW_PERF || MCP_LATENCY_DIAGNOSTICS
                 let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
                 guard let effectiveLifecycleCorrelation else {
                     return try await $currentConnectionID.withValue(connectionID, operation: operation)
@@ -10905,30 +10905,49 @@ actor ServerNetworkManager {
                     }
                 }
             #endif
-            #if DEBUG
-                let transportRequestIdentity = MCPRequestTimelineRegistry.shared.claimToolRequest(
-                    connectionID: connectionID.uuidString,
-                    originalToolName: originalName
-                )
-                let inheritedRequestIdentity = transportRequestIdentity?.fillingMissingFields(
-                    from: MCPRequestTimelineContext.current
-                ) ?? MCPRequestTimelineContext.current
-                let fallbackConnectionGeneration = await requestTimelineConnectionGeneration(for: connectionID)
-                let requestIdentity = MCPRequestTimelineIdentity(
-                    jsonRPCRequestID: inheritedRequestIdentity?.jsonRPCRequestID,
-                    connectionID: inheritedRequestIdentity?.connectionID ?? connectionID.uuidString,
-                    connectionGeneration: inheritedRequestIdentity?.connectionGeneration ?? fallbackConnectionGeneration,
-                    appInvocationID: inheritedRequestIdentity?.appInvocationID,
-                    requestOrdinal: inheritedRequestIdentity?.requestOrdinal
-                )
-                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
-                let resolvedRequestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineIdentity(
-                    jsonRPCRequestID: requestIdentity.jsonRPCRequestID,
-                    connectionID: requestIdentity.connectionID,
-                    connectionGeneration: requestIdentity.connectionGeneration,
-                    appInvocationID: invocationID.uuidString,
-                    requestOrdinal: requestIdentity.requestOrdinal
-                )
+            #if MCP_LATENCY_DIAGNOSTICS && !DEBUG
+                if Self.isMCPLatencyDiagnosticsToolName(toolName) {
+                    guard let limiterResolution = await connectionCallLimiterResolution(for: connectionID) else {
+                        return Self.executionContractToolErrorResult(
+                            rawJSON: false,
+                            code: "tool_execution_connection_terminal",
+                            message: "The MCP connection is closing."
+                        )
+                    }
+                    return await withConnectionCallPermit(
+                        connectionID: connectionID,
+                        lane: .ordinary,
+                        resolution: limiterResolution,
+                        cancellationResult: {
+                            Self.executionContractToolErrorResult(
+                                rawJSON: false,
+                                code: "tool_execution_connection_terminal",
+                                message: "The MCP connection is closing."
+                            )
+                        }
+                    ) {
+                        await self.handleMCPLatencyDiagnosticsTool(arguments: params.arguments ?? [:])
+                    }
+                }
+            #endif
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+                let diagnosticLatencyTraceID = MCPToolArgsNormalizer.diagnosticLatencyTraceID(params: params.arguments)
+                let invocationID = diagnosticLatencyTraceID ?? UUID()
+                let resolvedRequestIdentity: MCPRequestTimelineIdentity? = if let diagnosticLatencyTraceID,
+                                                                              let claimed = MCPRequestTimelineRegistry.shared.claimToolRequest(
+                                                                                  connectionID: connectionID.uuidString,
+                                                                                  appInvocationID: diagnosticLatencyTraceID
+                                                                              ),
+                                                                              claimed.appInvocationID == diagnosticLatencyTraceID.uuidString,
+                                                                              claimed.isCompleteLatencyEvidenceIdentity
+                {
+                    claimed
+                } else {
+                    nil
+                }
+                if let resolvedRequestIdentity {
+                    MCPRequestTimelineRegistry.shared.updateResponseIdentity(to: resolvedRequestIdentity)
+                }
                 let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive(
                     requestIdentity: resolvedRequestIdentity
                 )
@@ -11275,10 +11294,18 @@ actor ServerNetworkManager {
                 EditFlowPerf.Stage.MCPToolCall.limiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
-                let limiterWaitState = EditFlowPerf.begin(
-                    EditFlowPerf.Stage.MCPToolCall.limiterWait,
-                    EditFlowPerf.Dimensions(toolName: toolName)
-                )
+                #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+                    let limiterWaitState = EditFlowPerf.begin(
+                        EditFlowPerf.Stage.MCPToolCall.limiterWait,
+                        EditFlowPerf.Dimensions(toolName: toolName),
+                        debugCaptureRequestIdentity: resolvedRequestIdentity
+                    )
+                #else
+                    let limiterWaitState = EditFlowPerf.begin(
+                        EditFlowPerf.Stage.MCPToolCall.limiterWait,
+                        EditFlowPerf.Dimensions(toolName: toolName)
+                    )
+                #endif
                 EditFlowPerf.lifecycleEvent(
                     EditFlowPerf.Lifecycle.MCPToolCall.limiterWaitBegan,
                     correlation: lifecycleCorrelation,
@@ -12395,6 +12422,10 @@ actor ServerNetworkManager {
                                                         await self.debugBeforeToolResultFormattingForTesting?(connectionID, toolName)
                                                     #endif
                                                     // Build well‑structured, human‑readable content blocks for the result
+                                                    EditFlowPerf.lifecycleEvent(
+                                                        EditFlowPerf.Lifecycle.MCPToolCall.formatResultBegan,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    )
                                                     let contentBlocks = EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.formatResult,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
@@ -12521,6 +12552,10 @@ actor ServerNetworkManager {
                                                 await self.debugBeforeToolResultFormattingForTesting?(connectionID, toolName)
                                             #endif
                                             // Build well‑structured, human‑readable content blocks for the result
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.formatResultBegan,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            )
                                             let contentBlocks = EditFlowPerf.measure(
                                                 EditFlowPerf.Stage.MCPToolCall.formatResult,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
@@ -14493,6 +14528,64 @@ actor ServerNetworkManager {
                         activeCount: releasedSnapshot.activePermitCount, admissionClass: lane.rawValue,
                         queueDepth: releasedSnapshot.waiterCount, windowID: ownerWindowID, runID: ownerRunID,
                         ownerResource: ownerResource, permitActive: false, publicationPending: true, terminalBarrier: false
+                    )
+                )
+                throw error
+            }
+        }
+    }
+
+#elseif MCP_LATENCY_DIAGNOSTICS
+    extension MCPDomainConnectionCallLimiters {
+        func withPermit<T: Sendable>(
+            lane: MCPConnectionCallLane,
+            toolName: String? = nil,
+            lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+            ownerResource: String? = nil,
+            ownerWindowID: Int? = nil,
+            ownerRunID: String? = nil,
+            _ operation: @Sendable () async throws -> T
+        ) async throws -> T {
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.permitQueued,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    toolName: toolName, outcome: "queued", admissionClass: lane.rawValue,
+                    windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                    permitActive: false
+                )
+            )
+            do {
+                let result = try await withPermit(lane: lane) {
+                    EditFlowPerf.lifecycleEvent(
+                        EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
+                        correlation: lifecycleCorrelation,
+                        EditFlowPerf.Dimensions(
+                            toolName: toolName, outcome: "acquired", admissionClass: lane.rawValue,
+                            windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                            permitActive: true
+                        )
+                    )
+                    return try await operation()
+                }
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.permitReleased,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName, outcome: "completed", admissionClass: lane.rawValue,
+                        windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                        permitActive: false, publicationPending: true
+                    )
+                )
+                return result
+            } catch {
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.permitReleased,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName, outcome: error is CancellationError ? "cancelled" : "failed",
+                        admissionClass: lane.rawValue, windowID: ownerWindowID, runID: ownerRunID,
+                        ownerResource: ownerResource, permitActive: false, publicationPending: true
                     )
                 )
                 throw error

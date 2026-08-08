@@ -606,18 +606,74 @@ actor InteractiveREPL {
         }
     }
 
+    private enum LatencyDiagnosticPrintStyle {
+        case repl
+        case plain
+    }
+
+    private func callAndPrintTool(
+        name: String,
+        arguments: [String: Value]?,
+        style: LatencyDiagnosticPrintStyle
+    ) async throws -> CallTool.Result {
+        #if DEBUG || MCP_LATENCY_TRACE
+            let preparedInvocation = MCPCommandLatencyDiagnostics.prepareInvocation(
+                toolName: name,
+                arguments: arguments
+            )
+            let invocation = preparedInvocation.invocation
+            let callArguments = preparedInvocation.arguments
+        #else
+            let callArguments = arguments
+        #endif
+
+        do {
+            let result = try await session.callTool(name: name, arguments: callArguments)
+            #if DEBUG || MCP_LATENCY_TRACE
+                let c1Nanoseconds = DispatchTime.now().uptimeNanoseconds
+            #endif
+            switch style {
+            case .repl:
+                printCallResult(result)
+            case .plain:
+                printCallResultPlain(result)
+            }
+            #if DEBUG || MCP_LATENCY_TRACE
+                let c2Nanoseconds = DispatchTime.now().uptimeNanoseconds
+                await MCPCommandLatencyDiagnostics.shared.record(
+                    invocation: invocation,
+                    c1Nanoseconds: c1Nanoseconds,
+                    c2Nanoseconds: c2Nanoseconds,
+                    result: result,
+                    outcome: result.isError == true ? .toolError : .success
+                )
+            #endif
+            return result
+        } catch {
+            #if DEBUG || MCP_LATENCY_TRACE
+                let returnedNanoseconds = DispatchTime.now().uptimeNanoseconds
+                await MCPCommandLatencyDiagnostics.shared.record(
+                    invocation: invocation,
+                    c1Nanoseconds: returnedNanoseconds,
+                    c2Nanoseconds: returnedNanoseconds,
+                    result: nil,
+                    outcome: MCPCommandLatencyDiagnostics.outcome(for: error)
+                )
+            #endif
+            throw error
+        }
+    }
+
     private func callTool(name: String, jsonPayload: String?) async throws {
         let args = try MCPCommandParser.parseJSONArgs(jsonPayload)
 
         print("Calling \(name)...")
-        let result = try await session.callTool(name: name, arguments: args)
-        printCallResult(result)
+        _ = try await callAndPrintTool(name: name, arguments: args, style: .repl)
     }
 
     private func callToolWithArgs(name: String, args: [String: UncheckedSendableValue]) async throws {
         let valueArgs = try MCPCommandParser.convertToMCPValues(args)
-        let result = try await session.callTool(name: name, arguments: valueArgs)
-        printCallResult(result)
+        _ = try await callAndPrintTool(name: name, arguments: valueArgs, style: .repl)
     }
 
     private func snapshotTools(to path: String) async throws {
@@ -769,8 +825,7 @@ actor InteractiveREPL {
 
     private func callToolSingleShot(name: String, argsJSON: String?) async throws {
         let args = try MCPCommandParser.parseJSONArgs(argsJSON)
-        let result = try await session.callTool(name: name, arguments: args)
-        printCallResultPlain(result)
+        let result = try await callAndPrintTool(name: name, arguments: args, style: .plain)
 
         // Ensure --call exits non-zero on tool failure
         if result.isError == true {

@@ -9492,25 +9492,33 @@ actor WorkspaceFileContextStore {
                 )
             }
         #endif
-        let unmarkedSnapshot = await makeFileTreeSelectionSnapshot(
-            selection: selection,
-            request: request,
-            renderableCodemapFileIDs: [],
-            profile: profile
-        )
-        let rootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: self)
+        let unmarkedSnapshot = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.snapshotConstruction) {
+            await makeFileTreeSelectionSnapshot(
+                selection: selection,
+                request: request,
+                renderableCodemapFileIDs: [],
+                profile: profile
+            )
+        }
+        let rootDisplayNames = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.logicalProjection) {
+            await lookupContext.logicalRootDisplayNamesByRootID(store: self)
+        }
         let renderableCodemapFileIDs = request.showCodeMapMarkers
             ? currentRenderableCodemapFileIDs(rootScope: request.rootScope)
             : Set<UUID>()
-        let snapshot = fileTreeSnapshot(
-            unmarkedSnapshot,
-            renderableCodemapFileIDs: renderableCodemapFileIDs,
-            showCodeMapMarkers: request.showCodeMapMarkers
-        )
-        let logicalSnapshot = snapshot.logicalized(
-            roots: rootRefs(scope: request.rootScope),
-            rootDisplayNamesByRootID: rootDisplayNames
-        )
+        let snapshot = EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.codemapMarkerProjection) {
+            fileTreeSnapshot(
+                unmarkedSnapshot,
+                renderableCodemapFileIDs: renderableCodemapFileIDs,
+                showCodeMapMarkers: request.showCodeMapMarkers
+            )
+        }
+        let logicalSnapshot = EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.logicalProjection) {
+            snapshot.logicalized(
+                roots: rootRefs(scope: request.rootScope),
+                rootDisplayNamesByRootID: rootDisplayNames
+            )
+        }
         return WorkspaceFileTreePresentation(
             content: WorkspaceFileTreePresentationRenderer.render(logicalSnapshot),
             rootCount: logicalSnapshot.roots.count,
@@ -9529,18 +9537,24 @@ actor WorkspaceFileContextStore {
         codemapIssues: [WorkspaceCodemapOperationIssue],
         profile: PathLocateProfile
     ) async -> WorkspaceFileTreePresentation {
-        let snapshot = await makeFileTreeSelectionSnapshot(
-            selection: selection,
-            request: request,
-            renderableCodemapFileIDs: renderableCodemapFileIDs,
-            profile: profile
-        )
+        let snapshot = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.snapshotConstruction) {
+            await makeFileTreeSelectionSnapshot(
+                selection: selection,
+                request: request,
+                renderableCodemapFileIDs: renderableCodemapFileIDs,
+                profile: profile
+            )
+        }
         let roots = rootRefs(scope: request.rootScope)
-        let rootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: self)
-        let logicalSnapshot = snapshot.logicalized(
-            roots: roots,
-            rootDisplayNamesByRootID: rootDisplayNames
-        )
+        let rootDisplayNames = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.logicalProjection) {
+            await lookupContext.logicalRootDisplayNamesByRootID(store: self)
+        }
+        let logicalSnapshot = EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.logicalProjection) {
+            snapshot.logicalized(
+                roots: roots,
+                rootDisplayNamesByRootID: rootDisplayNames
+            )
+        }
         return WorkspaceFileTreePresentation(
             content: WorkspaceFileTreePresentationRenderer.render(logicalSnapshot),
             rootCount: logicalSnapshot.roots.count,

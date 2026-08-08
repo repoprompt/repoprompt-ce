@@ -1,5 +1,6 @@
 // MARK: - Hidden DEBUG Diagnostics Surface
 
+import CryptoKit
 import Foundation
 import MCP
 
@@ -25,6 +26,8 @@ import MCP
             }
 
             switch op {
+            case "mcp_latency_server_identity":
+                return debugDiagnosticsResult(Self.debugLatencyServerAppIdentityPayload())
             case "ping":
                 return await debugDiagnosticsResult(debugPingPayload(connectionID: connectionID, op: op, arguments: arguments))
             case "connection_snapshot":
@@ -222,6 +225,47 @@ import MCP
             default:
                 return debugDiagnosticsError(op: op, code: "unknown_op", message: "Unknown debug diagnostics op: \(op)")
             }
+        }
+
+        nonisolated static func debugLatencyServerAppIdentityPayload() -> [String: Any] {
+            let bundle = Bundle.main
+            let executableURL = bundle.executableURL?.standardizedFileURL
+            let executableData = executableURL.flatMap { try? Data(contentsOf: $0, options: [.mappedIfSafe]) }
+            let executableSHA256 = executableData.map {
+                SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
+            }
+            let provenanceURL = bundle.url(
+                forResource: "RepoPromptDebugProvenance",
+                withExtension: "json"
+            )
+            let provenanceData = provenanceURL.flatMap { try? Data(contentsOf: $0) }
+            let provenance = provenanceData.flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            }
+            let provenanceSHA256 = provenanceData.map {
+                SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
+            }
+            let identity: [String: Any] = [
+                "identity_authority": "server_process",
+                "app_configuration": "debug",
+                "swift_configuration": "debug",
+                "diagnostic_surface": "mcp_latency_v1",
+                "ordinary_release_artifact": false,
+                "process_identifier": ProcessInfo.processInfo.processIdentifier,
+                "bundle_path": bundle.bundleURL.standardizedFileURL.path,
+                "executable_path": executableURL?.path ?? NSNull(),
+                "executable_sha256": executableSHA256 ?? NSNull(),
+                "bundle_identifier": bundle.bundleIdentifier ?? NSNull(),
+                "marketing_version": bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? NSNull(),
+                "build_number": bundle.object(forInfoDictionaryKey: "CFBundleVersion") ?? NSNull(),
+                "provenance": provenance ?? NSNull(),
+                "provenance_sha256": provenanceSHA256 ?? NSNull()
+            ]
+            return [
+                "ok": true,
+                "op": "mcp_latency_server_identity",
+                "server_app_identity": identity
+            ]
         }
 
         nonisolated func debugDiagnosticsResult(_ object: [String: Any], isError: Bool = false) -> CallTool.Result {

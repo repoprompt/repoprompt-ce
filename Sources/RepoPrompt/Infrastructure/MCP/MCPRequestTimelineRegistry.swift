@@ -1,4 +1,4 @@
-#if DEBUG
+#if DEBUG || MCP_LATENCY_DIAGNOSTICS
     import Foundation
     import RepoPromptShared
 
@@ -24,7 +24,6 @@
         }
 
         private struct PendingRequest {
-            let tool: String?
             let identity: MCPRequestTimelineIdentity
         }
 
@@ -33,7 +32,7 @@
         private var pendingToolRequestsByConnection: [ConnectionKey: [PendingRequest]] = [:]
         private var identitiesByResponseKey: [ResponseKey: MCPRequestTimelineIdentity] = [:]
 
-        private init() {}
+        init() {}
 
         func recordAcceptedFrame(
             _ frame: Data,
@@ -64,12 +63,14 @@
                     id: summary.id,
                     method: summary.method,
                     tool: summary.tool,
-                    requestOrdinal: ordinal
+                    requestOrdinal: ordinal,
+                    appInvocationID: summary.appInvocationID
                 )
                 let identity = MCPRequestTimelineIdentity(
                     jsonRPCRequestID: summary.id,
                     connectionID: correlationConnectionID,
                     connectionGeneration: connectionGeneration,
+                    appInvocationID: summary.appInvocationID,
                     requestOrdinal: ordinal
                 )
                 recorded.append(RecordedMessage(metadata: metadata, identity: identity))
@@ -78,7 +79,6 @@
                     identitiesByResponseKey[ResponseKey(connection: key, id: id)] = identity
                     if summary.method == "tools/call" {
                         pendingToolRequestsByConnection[key, default: []].append(PendingRequest(
-                            tool: summary.tool,
                             identity: identity
                         ))
                     }
@@ -89,20 +89,52 @@
             return recorded
         }
 
-        func claimToolRequest(connectionID: String, originalToolName: String) -> MCPRequestTimelineIdentity? {
+        func claimToolRequest(
+            connectionID: String,
+            appInvocationID: UUID
+        ) -> MCPRequestTimelineIdentity? {
+            let canonicalInvocationID = appInvocationID.uuidString
             lock.lock()
             defer { lock.unlock() }
-            let keys = pendingToolRequestsByConnection.keys
-                .filter { $0.connectionID == connectionID }
-                .sorted { $0.generation > $1.generation }
-            for key in keys {
-                guard var pending = pendingToolRequestsByConnection[key], !pending.isEmpty else { continue }
-                let index = pending.firstIndex { $0.tool == originalToolName } ?? pending.startIndex
-                let request = pending.remove(at: index)
-                pendingToolRequestsByConnection[key] = pending
-                return request.identity
+
+            var matches: [(ConnectionKey, Int)] = []
+            for (key, pending) in pendingToolRequestsByConnection where key.connectionID == connectionID {
+                for index in pending.indices {
+                    let identity = pending[index].identity
+                    guard identity.appInvocationID == canonicalInvocationID,
+                          identity.isCompleteLatencyEvidenceIdentity
+                    else {
+                        continue
+                    }
+                    matches.append((key, index))
+                }
             }
-            return nil
+            guard matches.count == 1,
+                  let (key, index) = matches.first,
+                  var pending = pendingToolRequestsByConnection[key]
+            else {
+                return nil
+            }
+            let request = pending.remove(at: index)
+            pendingToolRequestsByConnection[key] = pending
+            return request.identity
+        }
+
+        func updateResponseIdentity(to resolvedIdentity: MCPRequestTimelineIdentity) {
+            guard let requestID = resolvedIdentity.jsonRPCRequestID else { return }
+            lock.lock()
+            defer { lock.unlock() }
+            let responseKeys: [ResponseKey] = identitiesByResponseKey.compactMap { key, identity in
+                guard key.id == requestID,
+                      identity.connectionID == resolvedIdentity.connectionID,
+                      identity.connectionGeneration == resolvedIdentity.connectionGeneration,
+                      identity.requestOrdinal == resolvedIdentity.requestOrdinal
+                else { return nil }
+                return key
+            }
+            for key in responseKeys {
+                identitiesByResponseKey[key] = resolvedIdentity
+            }
         }
 
         func recordedResponses(

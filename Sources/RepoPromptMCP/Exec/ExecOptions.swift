@@ -24,6 +24,11 @@ struct ExecOptions {
     /// If true, request raw JSON tool output (server skips markdown formatting).
     var rawJSON: Bool = false
 
+    #if DEBUG || MCP_LATENCY_TRACE
+        /// Diagnostic-only JSON request batch executed concurrently on one connection.
+        var latencyConcurrentBatchPath: String?
+    #endif
+
     /// Commands to execute (from repeated --exec flags).
     var commands: [String] = []
 

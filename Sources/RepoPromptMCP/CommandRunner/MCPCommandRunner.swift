@@ -405,8 +405,7 @@ actor MCPCommandRunner {
         if settings.verbose {
             await output("Calling \(name)...", isError: false)
         }
-        let result = try await session.callTool(name: name, arguments: args)
-        await printCallResult(result)
+        let result = try await callAndPrintTool(name: name, arguments: args)
         if result.isError == true {
             throw ToolCallFailedError(toolName: name)
         }
@@ -416,10 +415,56 @@ actor MCPCommandRunner {
         // Note: window_id injection for tools like manage_workspaces is now handled
         // by the app's routing layer (MCPConnectionManager.injectWindowIDIfNeeded)
         let valueArgs = try MCPCommandParser.convertToMCPValues(args)
-        let result = try await session.callTool(name: name, arguments: valueArgs)
-        await printCallResult(result)
+        let result = try await callAndPrintTool(name: name, arguments: valueArgs)
         if result.isError == true {
             throw ToolCallFailedError(toolName: name)
+        }
+    }
+
+    private func callAndPrintTool(
+        name: String,
+        arguments: [String: Value]?
+    ) async throws -> CallTool.Result {
+        #if DEBUG || MCP_LATENCY_TRACE
+            let preparedInvocation = MCPCommandLatencyDiagnostics.prepareInvocation(
+                toolName: name,
+                arguments: arguments
+            )
+            let invocation = preparedInvocation.invocation
+            let callArguments = preparedInvocation.arguments
+        #else
+            let callArguments = arguments
+        #endif
+
+        do {
+            let result = try await session.callTool(name: name, arguments: callArguments)
+            #if DEBUG || MCP_LATENCY_TRACE
+                let c1Nanoseconds = DispatchTime.now().uptimeNanoseconds
+            #endif
+            await printCallResult(result)
+            #if DEBUG || MCP_LATENCY_TRACE
+                let c2Nanoseconds = DispatchTime.now().uptimeNanoseconds
+                await MCPCommandLatencyDiagnostics.shared.record(
+                    invocation: invocation,
+                    c1Nanoseconds: c1Nanoseconds,
+                    c2Nanoseconds: c2Nanoseconds,
+                    result: result,
+                    outcome: result.isError == true ? .toolError : .success
+                )
+            #endif
+            return result
+        } catch {
+            #if DEBUG || MCP_LATENCY_TRACE
+                let returnedNanoseconds = DispatchTime.now().uptimeNanoseconds
+                await MCPCommandLatencyDiagnostics.shared.record(
+                    invocation: invocation,
+                    c1Nanoseconds: returnedNanoseconds,
+                    c2Nanoseconds: returnedNanoseconds,
+                    result: nil,
+                    outcome: MCPCommandLatencyDiagnostics.outcome(for: error)
+                )
+            #endif
+            throw error
         }
     }
 

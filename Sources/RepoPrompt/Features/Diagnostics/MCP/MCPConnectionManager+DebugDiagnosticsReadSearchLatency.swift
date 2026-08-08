@@ -21,10 +21,14 @@ import RepoPromptShared
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "`max_samples` must be an integer between 100 and 100000.")
             }
 
-            MCPResponseDeliveryTracer.resetDebugEvents()
-            MCPToolWorkCountDiagnostics.resetDebugHistory()
-            switch EditFlowPerf.beginDebugCapture(label: label, maxSamples: maxSamples) {
+            switch EditFlowPerf.beginDebugCapture(
+                label: label,
+                maxSamples: maxSamples,
+                mode: .mcpLatencyEvidence
+            ) {
             case let .started(snapshot):
+                MCPResponseDeliveryTracer.resetDebugEvents()
+                MCPToolWorkCountDiagnostics.resetDebugHistory()
                 return debugDiagnosticsResult([
                     "ok": true,
                     "op": op,
@@ -43,11 +47,13 @@ import RepoPromptShared
             let finish = debugBool(arguments, "finish") ?? true
             let includeTimeline = debugBool(arguments, "include_timeline") ?? true
             let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: finish)
+            let delivery = MCPResponseDeliveryTracer.debugCaptureSnapshot(finish: finish)
             return debugDiagnosticsResult([
                 "ok": true,
                 "op": op,
                 "capture": snapshot.payload(includeTimeline: includeTimeline),
-                "delivery_events": MCPResponseDeliveryTracer.debugEventSnapshot().map(\.payload)
+                "delivery_events": delivery.events.map(\.payload),
+                "delivery_dropped_event_count": delivery.droppedEventCount
             ])
         }
 

@@ -8,6 +8,7 @@
 
 import Foundation
 import Logging
+import MCP
 import ServiceLifecycle
 
 /// ServiceLifecycle service that runs exec mode (non-interactive command execution).
@@ -112,6 +113,16 @@ actor ExecMCPService: Service {
             fputs("Warning: Failed to bind \(target): \(error)\n", stderr)
         }
 
+        #if DEBUG || MCP_LATENCY_TRACE
+            if let latencyConcurrentBatchPath = options.latencyConcurrentBatchPath {
+                try await runLatencyConcurrentBatch(
+                    at: latencyConcurrentBatchPath,
+                    session: session
+                )
+                return
+            }
+        #endif
+
         // Collect commands to run
         let commands = try collectCommands()
         if commands.isEmpty {
@@ -199,6 +210,128 @@ actor ExecMCPService: Service {
             throw ExecError.commandFailed
         }
     }
+
+    #if DEBUG || MCP_LATENCY_TRACE
+        private struct LatencyConcurrentBatchRequest: Decodable {
+            enum OutputFormat: String, Decodable {
+                case formatted
+                case raw
+            }
+
+            let invocationID: UUID
+            let tool: String
+            let outputFormat: OutputFormat
+            let outputPath: String
+            let arguments: [String: Value]?
+
+            enum CodingKeys: String, CodingKey {
+                case invocationID = "invocation_id"
+                case tool
+                case outputFormat = "output_format"
+                case outputPath = "output_path"
+                case arguments
+            }
+        }
+
+        private func runLatencyConcurrentBatch(
+            at path: String,
+            session: InteractiveMCPClientSession
+        ) async throws {
+            let url = URL(fileURLWithPath: path)
+            let data = try Data(contentsOf: url)
+            let requests = try JSONDecoder().decode([LatencyConcurrentBatchRequest].self, from: data)
+            guard !requests.isEmpty else { throw ExecError.commandFailed }
+            guard Set(requests.map(\.invocationID)).count == requests.count,
+                  Set(requests.map(\.outputPath)).count == requests.count,
+                  requests.allSatisfy({ $0.outputPath.hasPrefix("/") })
+            else { throw ExecError.commandFailed }
+
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for request in requests {
+                    group.addTask {
+                        var arguments = request.arguments ?? [:]
+                        arguments[MCPCommandLatencyDiagnostics.requestIdentityArgument] = .string(
+                            request.invocationID.uuidString
+                        )
+                        switch request.outputFormat {
+                        case .formatted:
+                            arguments.removeValue(forKey: "_rawJSON")
+                        case .raw:
+                            arguments["_rawJSON"] = .bool(true)
+                        }
+                        let prepared = MCPCommandLatencyDiagnostics.prepareInvocation(
+                            toolName: request.tool,
+                            arguments: arguments
+                        )
+                        do {
+                            let result = try await session.callTool(
+                                name: request.tool,
+                                arguments: prepared.arguments
+                            )
+                            let returned = DispatchTime.now().uptimeNanoseconds
+                            let output = Self.latencyBatchResponseData(result)
+                            try output.write(
+                                to: URL(fileURLWithPath: request.outputPath),
+                                options: .atomic
+                            )
+                            let printed = DispatchTime.now().uptimeNanoseconds
+                            await MCPCommandLatencyDiagnostics.shared.record(
+                                invocation: prepared.invocation,
+                                c1Nanoseconds: returned,
+                                c2Nanoseconds: printed,
+                                result: result,
+                                outcome: result.isError == true ? .toolError : .success
+                            )
+                        } catch {
+                            let returned = DispatchTime.now().uptimeNanoseconds
+                            await MCPCommandLatencyDiagnostics.shared.record(
+                                invocation: prepared.invocation,
+                                c1Nanoseconds: returned,
+                                c2Nanoseconds: returned,
+                                result: nil,
+                                outcome: MCPCommandLatencyDiagnostics.outcome(for: error)
+                            )
+                            throw error
+                        }
+                    }
+                }
+                try await group.waitForAll()
+            }
+        }
+
+        private nonisolated static func latencyBatchResponseData(_ result: CallTool.Result) -> Data {
+            // Match redirected MCPCommandRunner output: successful content blocks are
+            // emitted in order with one trailing newline per output callback. Tool
+            // errors remain on stderr and therefore produce an empty response file.
+            guard result.isError != true else { return Data() }
+            var output = ""
+            for content in result.content {
+                let rendered: [String]
+                switch content {
+                case let .text(text, _, _):
+                    rendered = [text]
+                case let .image(data, mimeType, _, _):
+                    rendered = ["[Image: \(mimeType), \(data.count) bytes]"]
+                case let .audio(data, mimeType, _, _):
+                    rendered = ["[Audio: \(mimeType), \(data.count) bytes]"]
+                case let .resource(resource, _, _):
+                    var lines = ["[Resource: \(resource.uri) (\(resource.mimeType ?? "unknown"))]"]
+                    if let text = resource.text {
+                        lines.append(text)
+                    } else if let blob = resource.blob {
+                        lines.append("[Binary resource: \(blob.count) base64 characters]")
+                    }
+                    rendered = lines
+                case let .resourceLink(uri, name, _, _, mimeType, _):
+                    rendered = ["[Resource Link: \(name) \(uri) (\(mimeType ?? "unknown"))]"]
+                }
+                for line in rendered {
+                    output += line + "\n"
+                }
+            }
+            return Data(output.utf8)
+        }
+    #endif
 
     func shutdown() async throws {
         logger.debug("Shutting down exec MCP service...")

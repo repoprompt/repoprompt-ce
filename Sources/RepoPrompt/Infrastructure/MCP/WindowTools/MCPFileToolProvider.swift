@@ -302,61 +302,142 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         }
     }
 
+    enum FileTreeRequest: Equatable {
+        case roots
+        case files(mode: String, maxDepth: Int?, startPath: String?)
+    }
+
+    static func parseFileTreeRequest(args: [String: Value]) throws -> FileTreeRequest {
+        let type = args["type"]?.stringValue ?? "files"
+        switch type {
+        case "roots":
+            return .roots
+        case "files":
+            let mode = args["mode"]?.stringValue ?? "auto"
+            let maxDepth: Int?
+            if let maxDepthArg = args["max_depth"] {
+                guard let intValue = maxDepthArg.intValue else {
+                    throw MCPError.invalidParams("max_depth must be an integer")
+                }
+                maxDepth = intValue
+            } else {
+                maxDepth = nil
+            }
+            return .files(mode: mode, maxDepth: maxDepth, startPath: args["path"]?.stringValue)
+        default:
+            throw MCPError.invalidParams("invalid type: \(type)")
+        }
+    }
+
     private func executeGetFileTree(
         args: [String: Value],
         appContext: MCPServerViewModel.DomainReadAppExecutionContext?
     ) async throws -> Value {
         try await withActiveWorktreeStartupBenchmarkTag(appContext: appContext) {
-            let type = args["type"]?.stringValue ?? "files"
-            switch type {
-            case "roots":
-                let filePathDisplay = await MainActor.run { dependencies.context.promptVM.filePathDisplayOption }
-                let lookupContext = await readAuthority(appContext).lookupContext
-                _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.FileTree.providerTotal)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.FileTree.providerTotal, providerTotal) }
+
+            let request = try EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerArgumentParsing) {
+                try Self.parseFileTreeRequest(args: args)
+            }
+
+            switch request {
+            case .roots:
+                let filePathDisplay = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.settingsSnapshot) {
+                    await MainActor.run { dependencies.context.promptVM.filePathDisplayOption }
+                }
+                let authority = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerRequestMetadata) {
+                    await readAuthority(appContext)
+                }
+                let lookupContext = EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerLookupContextResolution) {
+                    authority.lookupContext
+                }
+                _ = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerIngressFreshnessWait) {
+                    await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                }
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-                let snapshot = await dependencies.context.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
-                    selection: StoredSelection(),
-                    request: WorkspaceFileTreeSnapshotRequest(mode: .full, filePathDisplay: filePathDisplay, onlyIncludeRootsWithSelectedFiles: false, includeLegend: false, showCodeMapMarkers: false, rootScope: lookupContext.rootScope),
-                    profile: .mcpRead
-                )
-                if snapshot.roots.isEmpty {
-                    let msg = await dependencies.files.workspaceContextMessage(MCPWindowToolName.getFileTree, nil)
-                    return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: 0, usesLegend: false, tree: msg, note: "No workspace loaded", wasTruncated: false, worktreeScope: worktreeScope))
+                let snapshot = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.snapshotConstruction) {
+                    await dependencies.context.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
+                        selection: StoredSelection(),
+                        request: WorkspaceFileTreeSnapshotRequest(
+                            mode: .full,
+                            filePathDisplay: filePathDisplay,
+                            onlyIncludeRootsWithSelectedFiles: false,
+                            includeLegend: false,
+                            showCodeMapMarkers: false,
+                            rootScope: lookupContext.rootScope
+                        ),
+                        profile: .mcpRead
+                    )
                 }
-                let rootLines = snapshot.roots.map { root in
-                    lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: root.fullPath, display: .full) ?? root.fullPath
-                }
-                return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: snapshot.roots.count, usesLegend: false, tree: rootLines.joined(separator: "\n"), note: nil, wasTruncated: false, worktreeScope: worktreeScope))
-            case "files":
-                let mode = args["mode"]?.stringValue ?? "auto"
-                let maxDepth: Int?
-                if let maxDepthArg = args["max_depth"] {
-                    guard let intVal = maxDepthArg.intValue else { throw MCPError.invalidParams("max_depth must be an integer") }
-                    maxDepth = intVal
-                } else {
-                    maxDepth = nil
-                }
-                let authority = await readAuthority(appContext)
-                let metadata = authority.metadata
-                let lookupContext = authority.lookupContext
-                _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-                if mode.lowercased() == "selected" {
-                    guard try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
-                        throw CancellationError()
+                let dto = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.dtoAssembly) {
+                    if snapshot.roots.isEmpty {
+                        let msg = await dependencies.files.workspaceContextMessage(MCPWindowToolName.getFileTree, nil)
+                        return ToolResultDTOs.FileTreeDTO(
+                            rootsCount: 0,
+                            usesLegend: false,
+                            tree: msg,
+                            note: "No workspace loaded",
+                            wasTruncated: false,
+                            worktreeScope: worktreeScope
+                        )
                     }
+                    let rootLines = snapshot.roots.map { root in
+                        lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                            forPhysicalPath: root.fullPath,
+                            display: .full
+                        ) ?? root.fullPath
+                    }
+                    return ToolResultDTOs.FileTreeDTO(
+                        rootsCount: snapshot.roots.count,
+                        usesLegend: false,
+                        tree: rootLines.joined(separator: "\n"),
+                        note: nil,
+                        wasTruncated: false,
+                        worktreeScope: worktreeScope
+                    )
+                }
+                return try EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerValueEncoding) {
+                    try Value(dto)
+                }
+
+            case let .files(mode, maxDepth, startPath):
+                let authority = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerRequestMetadata) {
+                    await readAuthority(appContext)
+                }
+                let metadata = authority.metadata
+                let lookupContext = EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerLookupContextResolution) {
+                    authority.lookupContext
+                }
+                _ = await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerIngressFreshnessWait) {
+                    await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                }
+                if mode.lowercased() == "selected" {
+                    let drain = try await EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerSelectionDrain) {
+                        try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                    }
+                    guard drain == .completed else { throw CancellationError() }
                 }
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-                let resultAndRootCount = try await dependencies.files.buildStoreBackedFileTreeResult(mode, maxDepth, args["path"]?.stringValue, lookupContext)
-                return try Value(ToolResultDTOs.FileTreeDTO(
-                    rootsCount: resultAndRootCount.rootCount,
-                    usesLegend: resultAndRootCount.result.usesLegend,
-                    tree: resultAndRootCount.result.tree,
-                    note: resultAndRootCount.result.note,
-                    wasTruncated: resultAndRootCount.result.wasTruncated,
-                    worktreeScope: worktreeScope
-                ))
-            default:
-                throw MCPError.invalidParams("invalid type: \(type)")
+                let resultAndRootCount = try await dependencies.files.buildStoreBackedFileTreeResult(
+                    mode,
+                    maxDepth,
+                    startPath,
+                    lookupContext
+                )
+                let dto = EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.dtoAssembly) {
+                    ToolResultDTOs.FileTreeDTO(
+                        rootsCount: resultAndRootCount.rootCount,
+                        usesLegend: resultAndRootCount.result.usesLegend,
+                        tree: resultAndRootCount.result.tree,
+                        note: resultAndRootCount.result.note,
+                        wasTruncated: resultAndRootCount.result.wasTruncated,
+                        worktreeScope: worktreeScope
+                    )
+                }
+                return try EditFlowPerf.measure(EditFlowPerf.Stage.FileTree.providerValueEncoding) {
+                    try Value(dto)
+                }
             }
         }
     }

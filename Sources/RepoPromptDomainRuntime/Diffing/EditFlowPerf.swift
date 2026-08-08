@@ -1,9 +1,9 @@
 import Foundation
 import RepoPromptShared
-#if DEBUG
+#if DEBUG || MCP_LATENCY_DIAGNOSTICS
     import Synchronization
 #endif
-#if DEBUG || EDIT_FLOW_PERF
+#if DEBUG || EDIT_FLOW_PERF || MCP_LATENCY_DIAGNOSTICS
     import os
 #endif
 
@@ -26,14 +26,15 @@ package enum EditFlowPerf {
     @TaskLocal
     package static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
 
-    #if DEBUG || EDIT_FLOW_PERF
+    #if DEBUG || EDIT_FLOW_PERF || MCP_LATENCY_DIAGNOSTICS
         package struct IntervalState {
             let signpostState: OSSignpostIntervalState?
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 let debugCaptureEpoch: UInt64?
                 let debugCaptureStartNanoseconds: UInt64?
                 let debugCaptureStageName: String
                 let debugCaptureDimensions: String
+                let debugCaptureRequestIdentity: MCPRequestTimelineIdentity?
             #endif
         }
     #else
@@ -545,6 +546,37 @@ package enum EditFlowPerf {
             package static let flushDeltas: StaticString = "EditFlow.ApplyEdits.FlushDeltas"
         }
 
+        package enum FileTree {
+            package static let providerTotal: StaticString = "EditFlow.FileTree.ProviderTotal"
+            package static let providerArgumentParsing: StaticString = "EditFlow.FileTree.ProviderArgumentParsing"
+            package static let providerRequestMetadata: StaticString = "EditFlow.FileTree.ProviderRequestMetadata"
+            package static let providerLookupContextResolution: StaticString = "EditFlow.FileTree.ProviderLookupContextResolution"
+            package static let providerIngressFreshnessWait: StaticString = "EditFlow.FileTree.ProviderIngressFreshnessWait"
+            package static let providerSelectionDrain: StaticString = "EditFlow.FileTree.ProviderSelectionDrain"
+            package static let bridgeTotal: StaticString = "EditFlow.FileTree.BridgeTotal"
+            package static let settingsSnapshot: StaticString = "EditFlow.FileTree.SettingsSnapshot"
+            package static let selectionPhysicalization: StaticString = "EditFlow.FileTree.SelectionPhysicalization"
+            package static let snapshotConstruction: StaticString = "EditFlow.FileTree.SnapshotConstruction"
+            package static let codemapMarkerProjection: StaticString = "EditFlow.FileTree.CodemapMarkerProjection"
+            package static let logicalProjection: StaticString = "EditFlow.FileTree.LogicalProjection"
+            package static let renderIndexPreparation: StaticString = "EditFlow.FileTree.RenderIndexPreparation"
+            package static let renderAttempt: StaticString = "EditFlow.FileTree.RenderAttempt"
+            package static let renderTokenEstimation: StaticString = "EditFlow.FileTree.RenderTokenEstimation"
+            package static let dtoAssembly: StaticString = "EditFlow.FileTree.DTOAssembly"
+            package static let providerValueEncoding: StaticString = "EditFlow.FileTree.ProviderValueEncoding"
+        }
+
+        package enum FormattedOutput {
+            package static let decode: StaticString = "EditFlow.FormattedOutput.Decode"
+            package static let promptEnvelopeProbeDecode: StaticString = "EditFlow.FormattedOutput.PromptEnvelopeProbeDecode"
+            package static let promptContextDecode: StaticString = "EditFlow.FormattedOutput.PromptContextDecode"
+            package static let searchTreeAssembly: StaticString = "EditFlow.FormattedOutput.SearchTreeAssembly"
+            package static let searchSnippetAssembly: StaticString = "EditFlow.FormattedOutput.SearchSnippetAssembly"
+            package static let fileTreeAssembly: StaticString = "EditFlow.FormattedOutput.FileTreeAssembly"
+            package static let workspaceContextAssembly: StaticString = "EditFlow.FormattedOutput.WorkspaceContextAssembly"
+            package static let genericFallbackAssembly: StaticString = "EditFlow.FormattedOutput.GenericFallbackAssembly"
+        }
+
         package enum Search {
             package static let broadAdmissionWait: StaticString = "EditFlow.Search.BroadAdmissionWait"
             package static let broadAdmissionLeaseHold: StaticString = "EditFlow.Search.BroadAdmissionLeaseHold"
@@ -731,6 +763,7 @@ package enum EditFlowPerf {
             package static let mainActorExited: StaticString = "MCP.ToolCall.MainActorExited"
             package static let publicationOwnershipState: StaticString = "MCP.ToolCall.PublicationOwnershipState"
             package static let completionObserverReturned: StaticString = "MCP.ToolCall.CompletionObserverReturned"
+            package static let formatResultBegan: StaticString = "MCP.ToolCall.FormatResultBegan"
             package static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
             package static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
             package static let resolvedProviderEnded: StaticString = "MCP.ToolCall.ResolvedProviderEnded"
@@ -843,26 +876,76 @@ package enum EditFlowPerf {
         }
     }
 
-    #if DEBUG
+    #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+        package enum DebugCaptureMode: String {
+            case exhaustive
+            case mcpLatencyEvidence = "mcp_latency_evidence"
+
+            var sampleCapacityUnit: String {
+                switch self {
+                case .exhaustive: "elapsed_interval_samples"
+                case .mcpLatencyEvidence: "unique_stage_dimension_request_keys"
+                }
+            }
+
+            var percentileSemantics: String {
+                switch self {
+                case .exhaustive: "exact_nearest_rank"
+                case .mcpLatencyEvidence: "unavailable_online_aggregation"
+                }
+            }
+
+            var lifecycleCaptureContract: String {
+                switch self {
+                case .exhaustive: "all_correlated_events"
+                case .mcpLatencyEvidence: "s0_s7_required_boundaries"
+                }
+            }
+
+            var stageCaptureContract: String {
+                switch self {
+                case .exhaustive: "all_intervals"
+                case .mcpLatencyEvidence: "w2_selector_stages"
+                }
+            }
+        }
+
         package struct DebugCaptureStageAggregate {
             package let stageName: String
             package let sanitizedDimensions: String
             package let sampleCount: Int
-            package let p50MS: Double
-            package let p95MS: Double
+            package let p50MS: Double?
+            package let p95MS: Double?
             package let maxMS: Double
             package let totalMS: Double
+            package let requestIdentity: MCPRequestTimelineIdentity?
 
             package var payload: [String: Any] {
                 [
                     "stage_name": stageName,
                     "sanitized_dimensions": sanitizedDimensions,
                     "sample_count": sampleCount,
-                    "p50_ms": Self.roundedMS(p50MS),
-                    "p95_ms": Self.roundedMS(p95MS),
+                    "p50_ms": Self.optionalRoundedMS(p50MS),
+                    "p95_ms": Self.optionalRoundedMS(p95MS),
                     "max_ms": Self.roundedMS(maxMS),
-                    "total_ms": Self.roundedMS(totalMS)
+                    "total_ms": Self.roundedMS(totalMS),
+                    "request_identity": requestIdentity.map(Self.requestIdentityPayload) ?? NSNull()
                 ]
+            }
+
+            private static func requestIdentityPayload(_ identity: MCPRequestTimelineIdentity) -> [String: Any] {
+                [
+                    "jsonrpc_request_id": identity.jsonRPCRequestID?.description ?? NSNull(),
+                    "connection_id": identity.connectionID ?? NSNull(),
+                    "connection_generation": identity.connectionGeneration ?? NSNull(),
+                    "app_invocation_id": identity.appInvocationID ?? NSNull(),
+                    "request_ordinal": identity.requestOrdinal ?? NSNull()
+                ]
+            }
+
+            private static func optionalRoundedMS(_ value: Double?) -> Any {
+                guard let value else { return NSNull() }
+                return roundedMS(value)
             }
 
             private static func roundedMS(_ value: Double) -> Double {
@@ -905,32 +988,53 @@ package enum EditFlowPerf {
         }
 
         package struct DebugCaptureSnapshot {
+            package let mode: DebugCaptureMode
             package let label: String
             package let active: Bool
             package let startedAt: Date?
             package let finishedAt: Date?
+            package let captureStartUptimeMS: Double?
             package let maxSamples: Int
             package let retainedSampleCount: Int
             package let droppedSampleCount: Int
+            package let ignoredOutOfContractSampleCount: Int
             package let stages: [DebugCaptureStageAggregate]
             package let maxLifecycleEvents: Int
             package let retainedLifecycleEventCount: Int
             package let droppedLifecycleEventCount: Int
+            package let ignoredOutOfContractLifecycleEventCount: Int
             package let lifecycleEvents: [DebugCaptureLifecycleEvent]
 
             package func payload(includeTimeline: Bool = true) -> [String: Any] {
                 var result: [String: Any] = [
+                    "capture_mode": mode.rawValue,
+                    "sample_capacity_unit": mode.sampleCapacityUnit,
+                    "percentile_semantics": mode.percentileSemantics,
+                    "lifecycle_capture_contract": mode.lifecycleCaptureContract,
+                    "lifecycle_event_allowlist": Self.lifecycleEventAllowlistPayload(mode),
+                    "stage_capture_contract": mode.stageCaptureContract,
+                    "stage_name_allowlist": Self.stageNameAllowlistPayload(mode),
                     "label": label,
                     "active": active,
                     "started_at": startedAt?.timeIntervalSince1970 ?? NSNull(),
                     "finished_at": finishedAt?.timeIntervalSince1970 ?? NSNull(),
+                    "capture_start_uptime_ms": captureStartUptimeMS.map(Self.roundedMS) ?? NSNull(),
                     "max_samples": maxSamples,
                     "retained_sample_count": retainedSampleCount,
                     "dropped_sample_count": droppedSampleCount,
+                    "ignored_out_of_contract_sample_count": ignoredOutOfContractSampleCount,
+                    "observed_sample_count": retainedSampleCount
+                        + droppedSampleCount
+                        + ignoredOutOfContractSampleCount,
+                    "retained_aggregate_key_count": stages.count,
                     "stages": stages.map(\.payload),
                     "max_lifecycle_events": maxLifecycleEvents,
                     "retained_lifecycle_event_count": retainedLifecycleEventCount,
                     "dropped_lifecycle_event_count": droppedLifecycleEventCount,
+                    "ignored_out_of_contract_lifecycle_event_count": ignoredOutOfContractLifecycleEventCount,
+                    "observed_lifecycle_event_count": retainedLifecycleEventCount
+                        + droppedLifecycleEventCount
+                        + ignoredOutOfContractLifecycleEventCount,
                     "timeline_included": includeTimeline,
                     "request_timeline_count": requestTimelinePayloads.count,
                     "request_timelines": requestTimelinePayloads,
@@ -940,6 +1044,28 @@ package enum EditFlowPerf {
                     result["lifecycle_events"] = lifecycleEvents.map(\.payload)
                 }
                 return result
+            }
+
+            private static func roundedMS(_ value: Double) -> Double {
+                (value * 1000).rounded() / 1000
+            }
+
+            private static func lifecycleEventAllowlistPayload(_ mode: DebugCaptureMode) -> Any {
+                switch mode {
+                case .exhaustive:
+                    NSNull()
+                case .mcpLatencyEvidence:
+                    DebugCaptureRecorder.mcpLatencyLifecycleEventAllowlist.sorted()
+                }
+            }
+
+            private static func stageNameAllowlistPayload(_ mode: DebugCaptureMode) -> Any {
+                switch mode {
+                case .exhaustive:
+                    NSNull()
+                case .mcpLatencyEvidence:
+                    DebugCaptureRecorder.mcpLatencyStageNameAllowlist.sorted()
+                }
             }
 
             private var requestTimelinePayloads: [[String: Any]] {
@@ -978,11 +1104,24 @@ package enum EditFlowPerf {
         private struct DebugCaptureKey: Hashable {
             let stageName: String
             let sanitizedDimensions: String
+            let appInvocationID: String?
         }
 
         private struct DebugCaptureStart {
             let epoch: UInt64
             let startNanoseconds: UInt64
+        }
+
+        private struct DebugCaptureOnlineAggregate {
+            var sampleCount: Int
+            var totalMS: Double
+            var maxMS: Double
+        }
+
+        private enum DebugLifecycleCaptureDisposition {
+            case inactive
+            case ignored
+            case retain
         }
 
         private final class DebugCaptureActiveHint {
@@ -1016,6 +1155,59 @@ package enum EditFlowPerf {
         }
 
         private final class DebugCaptureRecorder {
+            fileprivate static let mcpLatencyLifecycleEventAllowlist: Set<String> = [
+                "MCP.ToolCall.Received",
+                "MCP.ToolCall.PermitAcquired",
+                "MCP.ToolCall.ResolvedProviderBegan",
+                "MCP.ToolCall.ResolvedProviderEnded",
+                "MCP.ToolCall.FormatResultBegan",
+                "MCP.ToolCall.FormatResultReturned",
+                "MCP.ToolCall.CompletionObserverReturned",
+                "MCP.ToolCall.HandlerResultReady"
+            ]
+            fileprivate static let mcpLatencyStageNameAllowlist: Set<String> = [
+                "EditFlow.FileTree.BridgeTotal",
+                "EditFlow.FileTree.CodemapMarkerProjection",
+                "EditFlow.FileTree.DTOAssembly",
+                "EditFlow.FileTree.LogicalProjection",
+                "EditFlow.FileTree.ProviderArgumentParsing",
+                "EditFlow.FileTree.ProviderIngressFreshnessWait",
+                "EditFlow.FileTree.ProviderLookupContextResolution",
+                "EditFlow.FileTree.ProviderRequestMetadata",
+                "EditFlow.FileTree.ProviderSelectionDrain",
+                "EditFlow.FileTree.ProviderTotal",
+                "EditFlow.FileTree.ProviderValueEncoding",
+                "EditFlow.FileTree.RenderAttempt",
+                "EditFlow.FileTree.RenderIndexPreparation",
+                "EditFlow.FileTree.RenderTokenEstimation",
+                "EditFlow.FileTree.SelectionPhysicalization",
+                "EditFlow.FileTree.SettingsSnapshot",
+                "EditFlow.FileTree.SnapshotConstruction",
+                "EditFlow.FormattedOutput.Decode",
+                "EditFlow.FormattedOutput.FileTreeAssembly",
+                "EditFlow.FormattedOutput.GenericFallbackAssembly",
+                "EditFlow.FormattedOutput.PromptContextDecode",
+                "EditFlow.FormattedOutput.PromptEnvelopeProbeDecode",
+                "EditFlow.FormattedOutput.SearchSnippetAssembly",
+                "EditFlow.FormattedOutput.SearchTreeAssembly",
+                "EditFlow.FormattedOutput.WorkspaceContextAssembly",
+                "EditFlow.MCPToolCall.CompletionObserverCallbacks",
+                "EditFlow.MCPToolCall.CompletionObserverResultEncoding",
+                "EditFlow.MCPToolCall.CompletionObservers",
+                "EditFlow.MCPToolCall.FormatResult",
+                "EditFlow.MCPToolCall.HandlerResultHandoff",
+                "EditFlow.MCPToolCall.LimiterWait",
+                "EditFlow.Search.BroadAdmissionWait",
+                "EditFlow.Search.DTOBuild",
+                "EditFlow.Search.DTOBuild.Assembly",
+                "EditFlow.Search.IngressFreshnessWait",
+                "EditFlow.Search.ProviderTotal",
+                "EditFlow.Search.ProviderValueEncoding",
+                "EditFlow.Search.ProviderWorkspaceSearchAwait",
+                "EditFlow.Search.RootScopeAvailabilityGate",
+                "EditFlow.Search.WorkspaceReadinessAcquireGate",
+                "EditFlow.Search.WorkspaceReadinessValidationGate"
+            ]
             private static let sampleLimitRange = 100 ... 100_000
             private static let lifecycleEventLimit = 20000
 
@@ -1023,6 +1215,7 @@ package enum EditFlowPerf {
             private let activeHint = DebugCaptureActiveHint()
             private var active = false
             private var captureEpoch: UInt64 = 0
+            private var mode = DebugCaptureMode.exhaustive
             private var label = ""
             private var startedAt: Date?
             private var finishedAt: Date?
@@ -1030,10 +1223,14 @@ package enum EditFlowPerf {
             private var maxSamples = 20000
             private var retainedSampleCount = 0
             private var droppedSampleCount = 0
+            private var ignoredOutOfContractSampleCount = 0
             private var samplesByKey: [DebugCaptureKey: [Double]] = [:]
+            private var onlineAggregatesByKey: [DebugCaptureKey: DebugCaptureOnlineAggregate] = [:]
+            private var requestIdentityByKey: [DebugCaptureKey: MCPRequestTimelineIdentity] = [:]
             private var nextLifecycleOrdinal: UInt64 = 1
             private var retainedLifecycleEventCount = 0
             private var droppedLifecycleEventCount = 0
+            private var ignoredOutOfContractLifecycleEventCount = 0
             private var lifecycleEvents: [DebugCaptureLifecycleEvent] = []
 
             var isActive: Bool {
@@ -1045,11 +1242,16 @@ package enum EditFlowPerf {
                 return active
             }
 
-            package func begin(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
+            package func begin(
+                label: String,
+                maxSamples: Int,
+                mode: DebugCaptureMode
+            ) -> DebugCaptureBeginResult {
                 lock.lock()
                 defer { lock.unlock() }
                 guard !active else { return .busy(snapshotLocked()) }
                 captureEpoch += 1
+                self.mode = mode
                 self.label = Self.sanitizedLabel(label)
                 // Defense in depth for non-MCP callers; MCP controls reject out-of-range input earlier.
                 self.maxSamples = Self.clampedMaxSamples(maxSamples)
@@ -1059,10 +1261,14 @@ package enum EditFlowPerf {
                 captureStartNanoseconds = DispatchTime.now().uptimeNanoseconds
                 retainedSampleCount = 0
                 droppedSampleCount = 0
+                ignoredOutOfContractSampleCount = 0
                 samplesByKey.removeAll(keepingCapacity: true)
+                onlineAggregatesByKey.removeAll(keepingCapacity: true)
+                requestIdentityByKey.removeAll(keepingCapacity: true)
                 nextLifecycleOrdinal = 1
                 retainedLifecycleEventCount = 0
                 droppedLifecycleEventCount = 0
+                ignoredOutOfContractLifecycleEventCount = 0
                 lifecycleEvents.removeAll(keepingCapacity: true)
                 activeHint.store(true)
                 return .started(snapshotLocked())
@@ -1083,6 +1289,7 @@ package enum EditFlowPerf {
                 lock.lock()
                 active = false
                 activeHint.store(false)
+                mode = .exhaustive
                 label = ""
                 startedAt = nil
                 finishedAt = nil
@@ -1090,10 +1297,14 @@ package enum EditFlowPerf {
                 maxSamples = 20000
                 retainedSampleCount = 0
                 droppedSampleCount = 0
+                ignoredOutOfContractSampleCount = 0
                 samplesByKey.removeAll(keepingCapacity: false)
+                onlineAggregatesByKey.removeAll(keepingCapacity: false)
+                requestIdentityByKey.removeAll(keepingCapacity: false)
                 nextLifecycleOrdinal = 1
                 retainedLifecycleEventCount = 0
                 droppedLifecycleEventCount = 0
+                ignoredOutOfContractLifecycleEventCount = 0
                 lifecycleEvents.removeAll(keepingCapacity: false)
                 lock.unlock()
             }
@@ -1113,12 +1324,24 @@ package enum EditFlowPerf {
                 return active ? captureEpoch : nil
             }
 
-            package func shouldRecordLifecycleEvent(_ correlation: LifecycleCorrelation) -> Bool {
-                guard let correlationEpoch = correlation.captureEpoch else { return false }
-                if let active = activeHint.loadIfAvailable(), !active { return false }
+            package func lifecycleCaptureDisposition(
+                eventName: String,
+                correlation: LifecycleCorrelation
+            ) -> DebugLifecycleCaptureDisposition {
+                guard let correlationEpoch = correlation.captureEpoch else { return .inactive }
+                if let active = activeHint.loadIfAvailable(), !active { return .inactive }
                 lock.lock()
                 defer { lock.unlock() }
-                return active && correlationEpoch == captureEpoch
+                guard active, correlationEpoch == captureEpoch else { return .inactive }
+                if mode == .mcpLatencyEvidence {
+                    guard correlation.requestIdentity?.isCompleteLatencyEvidenceIdentity == true,
+                          Self.mcpLatencyLifecycleEventAllowlist.contains(eventName)
+                    else {
+                        ignoredOutOfContractLifecycleEventCount += 1
+                        return .ignored
+                    }
+                }
+                return .retain
             }
 
             package func recordLifecycleEvent(
@@ -1136,7 +1359,7 @@ package enum EditFlowPerf {
                 else { return }
                 let ordinal = nextLifecycleOrdinal
                 nextLifecycleOrdinal &+= 1
-                guard retainedLifecycleEventCount < min(maxSamples, Self.lifecycleEventLimit) else {
+                guard retainedLifecycleEventCount < maxLifecycleEventsForCurrentMode else {
                     droppedLifecycleEventCount += 1
                     return
                 }
@@ -1154,19 +1377,67 @@ package enum EditFlowPerf {
                 retainedLifecycleEventCount += 1
             }
 
-            package func record(stageName: String, sanitizedDimensions: String, captureEpoch: UInt64, startNanoseconds: UInt64) {
+            package func record(
+                stageName: String,
+                sanitizedDimensions: String,
+                requestIdentity: MCPRequestTimelineIdentity?,
+                captureEpoch: UInt64,
+                startNanoseconds: UInt64
+            ) {
                 let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds - startNanoseconds
                 let elapsedMS = Double(elapsedNanoseconds) / 1_000_000.0
                 lock.lock()
                 defer { lock.unlock() }
                 guard active, captureEpoch == self.captureEpoch else { return }
-                guard retainedSampleCount < maxSamples else {
-                    droppedSampleCount += 1
-                    return
+                if mode == .mcpLatencyEvidence {
+                    guard requestIdentity?.isCompleteLatencyEvidenceIdentity == true,
+                          Self.mcpLatencyStageNameAllowlist.contains(stageName)
+                    else {
+                        ignoredOutOfContractSampleCount += 1
+                        return
+                    }
                 }
-                let key = DebugCaptureKey(stageName: stageName, sanitizedDimensions: sanitizedDimensions)
-                samplesByKey[key, default: []].append(elapsedMS)
+                let key = DebugCaptureKey(
+                    stageName: stageName,
+                    sanitizedDimensions: sanitizedDimensions,
+                    appInvocationID: requestIdentity?.appInvocationID
+                )
+                switch mode {
+                case .exhaustive:
+                    guard retainedSampleCount < maxSamples else {
+                        droppedSampleCount += 1
+                        return
+                    }
+                    samplesByKey[key, default: []].append(elapsedMS)
+                case .mcpLatencyEvidence:
+                    if var aggregate = onlineAggregatesByKey[key] {
+                        aggregate.sampleCount += 1
+                        aggregate.totalMS += elapsedMS
+                        aggregate.maxMS = max(aggregate.maxMS, elapsedMS)
+                        onlineAggregatesByKey[key] = aggregate
+                    } else {
+                        guard onlineAggregatesByKey.count < maxSamples else {
+                            droppedSampleCount += 1
+                            return
+                        }
+                        onlineAggregatesByKey[key] = DebugCaptureOnlineAggregate(
+                            sampleCount: 1,
+                            totalMS: elapsedMS,
+                            maxMS: elapsedMS
+                        )
+                    }
+                }
+                if let requestIdentity {
+                    requestIdentityByKey[key] = requestIdentity
+                }
                 retainedSampleCount += 1
+            }
+
+            private var maxLifecycleEventsForCurrentMode: Int {
+                switch mode {
+                case .exhaustive: min(maxSamples, Self.lifecycleEventLimit)
+                case .mcpLatencyEvidence: maxSamples
+                }
             }
 
             private static func clampedMaxSamples(_ maxSamples: Int) -> Int {
@@ -1184,36 +1455,61 @@ package enum EditFlowPerf {
             }
 
             private func snapshotLocked() -> DebugCaptureSnapshot {
-                let stages = samplesByKey.map { key, samples in
-                    let sorted = samples.sorted()
-                    return DebugCaptureStageAggregate(
-                        stageName: key.stageName,
-                        sanitizedDimensions: key.sanitizedDimensions,
-                        sampleCount: sorted.count,
-                        p50MS: nearestRank(sorted, percentile: 0.50),
-                        p95MS: nearestRank(sorted, percentile: 0.95),
-                        maxMS: sorted.last ?? 0,
-                        totalMS: sorted.reduce(0, +)
-                    )
+                let stages: [DebugCaptureStageAggregate] = switch mode {
+                case .exhaustive:
+                    samplesByKey.map { key, samples in
+                        let sorted = samples.sorted()
+                        return DebugCaptureStageAggregate(
+                            stageName: key.stageName,
+                            sanitizedDimensions: key.sanitizedDimensions,
+                            sampleCount: sorted.count,
+                            p50MS: nearestRank(sorted, percentile: 0.50),
+                            p95MS: nearestRank(sorted, percentile: 0.95),
+                            maxMS: sorted.last ?? 0,
+                            totalMS: sorted.reduce(0, +),
+                            requestIdentity: requestIdentityByKey[key]
+                        )
+                    }
+                case .mcpLatencyEvidence:
+                    onlineAggregatesByKey.map { key, aggregate in
+                        DebugCaptureStageAggregate(
+                            stageName: key.stageName,
+                            sanitizedDimensions: key.sanitizedDimensions,
+                            sampleCount: aggregate.sampleCount,
+                            p50MS: nil,
+                            p95MS: nil,
+                            maxMS: aggregate.maxMS,
+                            totalMS: aggregate.totalMS,
+                            requestIdentity: requestIdentityByKey[key]
+                        )
+                    }
                 }
-                .sorted {
-                    if $0.stageName == $1.stageName {
+                let orderedStages = stages.sorted {
+                    if $0.stageName != $1.stageName {
+                        return $0.stageName < $1.stageName
+                    }
+                    if $0.sanitizedDimensions != $1.sanitizedDimensions {
                         return $0.sanitizedDimensions < $1.sanitizedDimensions
                     }
-                    return $0.stageName < $1.stageName
+                    return ($0.requestIdentity?.appInvocationID ?? "")
+                        < ($1.requestIdentity?.appInvocationID ?? "")
                 }
                 return DebugCaptureSnapshot(
+                    mode: mode,
                     label: label,
                     active: active,
                     startedAt: startedAt,
                     finishedAt: finishedAt,
+                    captureStartUptimeMS: captureStartNanoseconds.map { Double($0) / 1_000_000.0 },
                     maxSamples: maxSamples,
                     retainedSampleCount: retainedSampleCount,
                     droppedSampleCount: droppedSampleCount,
-                    stages: stages,
-                    maxLifecycleEvents: min(maxSamples, Self.lifecycleEventLimit),
+                    ignoredOutOfContractSampleCount: ignoredOutOfContractSampleCount,
+                    stages: orderedStages,
+                    maxLifecycleEvents: maxLifecycleEventsForCurrentMode,
                     retainedLifecycleEventCount: retainedLifecycleEventCount,
                     droppedLifecycleEventCount: droppedLifecycleEventCount,
+                    ignoredOutOfContractLifecycleEventCount: ignoredOutOfContractLifecycleEventCount,
                     lifecycleEvents: lifecycleEvents
                 )
             }
@@ -1231,8 +1527,12 @@ package enum EditFlowPerf {
             debugCaptureRecorder.isActive
         }
 
-        package static func beginDebugCapture(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
-            debugCaptureRecorder.begin(label: label, maxSamples: maxSamples)
+        package static func beginDebugCapture(
+            label: String,
+            maxSamples: Int,
+            mode: DebugCaptureMode = .exhaustive
+        ) -> DebugCaptureBeginResult {
+            debugCaptureRecorder.begin(label: label, maxSamples: maxSamples, mode: mode)
         }
 
         package static func debugCaptureSnapshot(finish: Bool) -> DebugCaptureSnapshot {
@@ -1244,7 +1544,7 @@ package enum EditFlowPerf {
         }
     #endif
 
-    #if DEBUG || EDIT_FLOW_PERF
+    #if DEBUG || EDIT_FLOW_PERF || MCP_LATENCY_DIAGNOSTICS
         private static let signposter = OSSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
         private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
         private static let environmentEnabled: Bool = {
@@ -1260,16 +1560,20 @@ package enum EditFlowPerf {
         }
 
         private static var shouldCaptureIntervals: Bool {
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 isDebugCaptureActive
             #else
                 false
             #endif
         }
 
-        private static func makeIntervalState(_ name: StaticString, dimensions: Dimensions) -> IntervalState? {
+        private static func makeIntervalState(
+            _ name: StaticString,
+            dimensions: Dimensions,
+            debugCaptureRequestIdentity: MCPRequestTimelineIdentity? = currentLifecycleCorrelation?.requestIdentity
+        ) -> IntervalState? {
             let signpostState = isEnabled ? signposter.beginInterval(name) : nil
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 let debugCaptureStart = debugCaptureRecorder.startTimestampIfActive()
                 guard signpostState != nil || debugCaptureStart != nil else { return nil }
                 return IntervalState(
@@ -1277,7 +1581,8 @@ package enum EditFlowPerf {
                     debugCaptureEpoch: debugCaptureStart?.epoch,
                     debugCaptureStartNanoseconds: debugCaptureStart?.startNanoseconds,
                     debugCaptureStageName: String(describing: name),
-                    debugCaptureDimensions: dimensions.logDescription
+                    debugCaptureDimensions: dimensions.logDescription,
+                    debugCaptureRequestIdentity: debugCaptureRequestIdentity
                 )
             #else
                 guard signpostState != nil else { return nil }
@@ -1301,15 +1606,36 @@ package enum EditFlowPerf {
             return makeIntervalState(name, dimensions: renderedDimensions)
         }
 
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+            @discardableResult
+            package static func begin(
+                _ name: StaticString,
+                _ dimensions: @autoclosure () -> Dimensions,
+                debugCaptureRequestIdentity: MCPRequestTimelineIdentity?
+            ) -> IntervalState? {
+                guard isEnabled || shouldCaptureIntervals else { return nil }
+                let renderedDimensions = dimensions()
+                if isEnabled {
+                    logDimensions(renderedDimensions)
+                }
+                return makeIntervalState(
+                    name,
+                    dimensions: renderedDimensions,
+                    debugCaptureRequestIdentity: debugCaptureRequestIdentity
+                )
+            }
+        #endif
+
         package static func end(_ name: StaticString, _ state: IntervalState?) {
             guard let state else { return }
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 if let captureEpoch = state.debugCaptureEpoch,
                    let startNanoseconds = state.debugCaptureStartNanoseconds
                 {
                     debugCaptureRecorder.record(
                         stageName: state.debugCaptureStageName,
                         sanitizedDimensions: state.debugCaptureDimensions,
+                        requestIdentity: state.debugCaptureRequestIdentity,
                         captureEpoch: captureEpoch,
                         startNanoseconds: startNanoseconds
                     )
@@ -1326,13 +1652,14 @@ package enum EditFlowPerf {
             if isEnabled {
                 logDimensions(renderedDimensions)
             }
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 if let captureEpoch = state.debugCaptureEpoch,
                    let startNanoseconds = state.debugCaptureStartNanoseconds
                 {
                     debugCaptureRecorder.record(
                         stageName: state.debugCaptureStageName,
                         sanitizedDimensions: renderedDimensions.isEmpty ? state.debugCaptureDimensions : renderedDimensions.logDescription,
+                        requestIdentity: state.debugCaptureRequestIdentity,
                         captureEpoch: captureEpoch,
                         startNanoseconds: startNanoseconds
                     )
@@ -1357,7 +1684,7 @@ package enum EditFlowPerf {
         package static func makeLifecycleCorrelationIfActive(
             requestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineContext.current
         ) -> LifecycleCorrelation? {
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 let captureEpoch = debugCaptureRecorder.activeEpochIfActive()
                 guard isEnabled || captureEpoch != nil else { return nil }
                 return LifecycleCorrelation(
@@ -1381,8 +1708,18 @@ package enum EditFlowPerf {
             _ dimensions: @autoclosure () -> Dimensions = Dimensions()
         ) {
             guard let correlation else { return }
-            #if DEBUG
-                let shouldRecord = debugCaptureRecorder.shouldRecordLifecycleEvent(correlation)
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
+                let eventName = String(describing: name)
+                let captureDisposition = debugCaptureRecorder.lifecycleCaptureDisposition(
+                    eventName: eventName,
+                    correlation: correlation
+                )
+                let shouldRecord = switch captureDisposition {
+                case .retain:
+                    true
+                case .inactive, .ignored:
+                    false
+                }
                 guard isEnabled || shouldRecord else { return }
             #else
                 guard isEnabled else { return }
@@ -1392,10 +1729,10 @@ package enum EditFlowPerf {
                 logDimensions(renderedDimensions)
                 signposter.emitEvent(name)
             }
-            #if DEBUG
+            #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                 if shouldRecord {
                     debugCaptureRecorder.recordLifecycleEvent(
-                        eventName: String(describing: name),
+                        eventName: eventName,
                         correlation: correlation,
                         sanitizedDimensions: renderedDimensions.logDescription
                     )

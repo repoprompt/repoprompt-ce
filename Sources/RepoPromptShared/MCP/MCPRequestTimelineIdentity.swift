@@ -47,6 +47,22 @@ public struct MCPRequestTimelineIdentity: Equatable, Sendable {
         return "\(hex.prefix(8))-\(hex.dropFirst(8).prefix(4))-\(hex.dropFirst(12).prefix(4))-\(hex.dropFirst(16).prefix(4))-\(hex.dropFirst(20).prefix(12))"
     }
 
+    package var isCompleteLatencyEvidenceIdentity: Bool {
+        guard let jsonRPCRequestID,
+              jsonRPCRequestID != .null,
+              let connectionID,
+              !connectionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              connectionGeneration != nil,
+              let requestOrdinal,
+              requestOrdinal > 0,
+              let appInvocationID,
+              UUID(uuidString: appInvocationID) != nil
+        else {
+            return false
+        }
+        return true
+    }
+
     public func fillingMissingFields(from fallback: MCPRequestTimelineIdentity?) -> MCPRequestTimelineIdentity {
         MCPRequestTimelineIdentity(
             jsonRPCRequestID: jsonRPCRequestID ?? fallback?.jsonRPCRequestID,

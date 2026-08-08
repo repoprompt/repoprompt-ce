@@ -79,6 +79,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
+            goalSupportEnabledProvider: { true },
             memoriesEnabledProvider: { true }
         )
 

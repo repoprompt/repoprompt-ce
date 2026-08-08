@@ -9,3 +9,5 @@ cd "$ROOT_DIR"
 ./Scripts/swiftpm_notice_guardrails.sh
 ./Scripts/codex_vendor_guardrails.sh
 ./Scripts/headless_runtime_guardrails.sh
+python3 Scripts/test_mcp_tool_latency.py
+python3 Scripts/test_mcp_latency_diagnostic_artifact.py

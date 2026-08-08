@@ -507,6 +507,9 @@
             try withIsolatedCaptureCase("testSearchDTOBuildNestedRecorderCapturesOnlyCoarseSanitizedDimensions") {
                 scenarioSearchDTOBuildNestedRecorderCapturesOnlyCoarseSanitizedDimensions()
             }
+            try withIsolatedCaptureCase("testFileTreeAndFormattedOutputRecorderInventoryIsLeafAttributedAndSanitized") {
+                scenarioFileTreeAndFormattedOutputRecorderInventoryIsLeafAttributedAndSanitized()
+            }
             try withIsolatedCaptureCase("testNewReadDispatchStageRecorderCapturesToolDimensionAndFinishes") {
                 try scenarioNewReadDispatchStageRecorderCapturesToolDimensionAndFinishes()
             }
@@ -545,6 +548,7 @@
         private func scenarioHiddenDispatcherRecognizesReadSearchCaptureOperations() throws {
             let diagnostics = try diagnosticsSource()
             XCTAssertTrue(diagnostics.contains("mcp_read_search_capture_begin"))
+            XCTAssertTrue(diagnostics.contains("mode: .mcpLatencyEvidence"))
             XCTAssertTrue(diagnostics.contains("mcp_read_search_capture_snapshot"))
             XCTAssertTrue(diagnostics.contains("mcp_read_search_admission_snapshot"))
             XCTAssertTrue(diagnostics.contains("mcp_read_search_admission_configure"))
@@ -648,7 +652,7 @@
             )
 
             let bridgeLedger = try source("Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift")
-            XCTAssertTrue(bridgeLedger.contains("#if DEBUG\n        /// Same-process monotonic timestamp"))
+            XCTAssertTrue(bridgeLedger.contains("#if DEBUG || MCP_LATENCY_DIAGNOSTICS\n        /// Same-process monotonic timestamp"))
             XCTAssertTrue(bridgeLedger.contains("value[\"monotonic_uptime_ms\"] = monotonicUptimeMS"))
             let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
             XCTAssertTrue(coordinator.contains("#if DEBUG\n        enum DebugCanonicalApplyOutcome"))
@@ -665,6 +669,36 @@
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
             XCTAssertFalse(provider.contains("mcp_read_file_auto_selection_probe_"))
             XCTAssertFalse(provider.contains("debugDrainReadFileAutoSelection"))
+
+            let traceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000909"))
+            let traceArguments: [String: Value] = ["_latencyTraceID": .string(traceID.uuidString)]
+            XCTAssertEqual(MCPToolArgsNormalizer.diagnosticLatencyTraceID(params: traceArguments), traceID)
+            XCTAssertNil(MCPToolArgsNormalizer.normalize(
+                params: traceArguments,
+                originalToolName: "file_search",
+                canonicalToolName: "file_search"
+            ).payload["_latencyTraceID"])
+
+            let clientDiagnostics = try source("Sources/RepoPromptMCP/CommandRunner/MCPCommandLatencyDiagnostics.swift")
+            XCTAssertTrue(clientDiagnostics.contains("#if DEBUG || MCP_LATENCY_TRACE"))
+            XCTAssertTrue(clientDiagnostics.contains("RP_MCP_LATENCY_TRACE_PATH"))
+            XCTAssertTrue(clientDiagnostics.contains("O_NOFOLLOW"))
+            XCTAssertTrue(clientDiagnostics.contains("Darwin.fchmod(fd, S_IRUSR | S_IWUSR)"))
+            for forbidden in ["\"arguments\"", "\"path\"", "\"content\"", "\"output_text\"", "\"result_text\""] {
+                XCTAssertFalse(clientDiagnostics.contains(forbidden), forbidden)
+            }
+            let commandRunner = try source("Sources/RepoPromptMCP/CommandRunner/MCPCommandRunner.swift")
+            XCTAssertTrue(commandRunner.contains("MCPCommandLatencyDiagnostics.prepareInvocation("))
+            XCTAssertTrue(commandRunner.contains("arguments: callArguments"))
+            XCTAssertTrue(commandRunner.contains("let c1Nanoseconds = DispatchTime.now().uptimeNanoseconds"))
+            XCTAssertTrue(commandRunner.contains("let c2Nanoseconds = DispatchTime.now().uptimeNanoseconds"))
+            let interactiveREPL = try source("Sources/RepoPromptMCP/Interactive/InteractiveREPL.swift")
+            XCTAssertTrue(interactiveREPL.contains("private func callAndPrintTool("))
+            XCTAssertTrue(interactiveREPL.contains("let result = try await session.callTool(name: name, arguments: callArguments)"))
+            XCTAssertTrue(interactiveREPL.contains("let c1Nanoseconds = DispatchTime.now().uptimeNanoseconds"))
+            XCTAssertTrue(interactiveREPL.contains("let c2Nanoseconds = DispatchTime.now().uptimeNanoseconds"))
+            XCTAssertTrue(interactiveREPL.contains("style: .plain"))
+            XCTAssertTrue(interactiveREPL.contains("style: .repl"))
         }
 
         func testPerStoreAdmissionDebugConfigurationIsFixedCapacityIdleOnlyAndBounded() async {
@@ -808,6 +842,48 @@
             }
         }
 
+        func testDetachedStageCaptureIsRetainedButExplicitlyUnidentified() async throws {
+            let identity = MCPRequestTimelineIdentity(
+                jsonRPCRequestID: .string("detached-stage"),
+                connectionID: UUID().uuidString,
+                connectionGeneration: 1,
+                requestOrdinal: 1
+            )
+            _ = startedCapture(label: "detached-stage-attribution", maxSamples: 100)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive(requestIdentity: identity))
+            await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
+                EditFlowPerf.measure(EditFlowPerf.Stage.Search.dtoAssembly) {}
+                await Task.detached {
+                    EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {}
+                }.value
+            }
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertNotNil(snapshot.captureStartUptimeMS)
+            let structured = try XCTUnwrap(snapshot.stages.first {
+                $0.stageName == "EditFlow.Search.DTOBuild.Assembly"
+            })
+            XCTAssertEqual(structured.requestIdentity?.appInvocationID, identity.appInvocationID)
+            let detached = try XCTUnwrap(snapshot.stages.first {
+                $0.stageName == "EditFlow.Search.ProviderValueEncoding"
+            })
+            XCTAssertNil(detached.requestIdentity)
+        }
+
+        func testDebugLatencyServerIdentityIsServerProcessAuthoritative() throws {
+            let payload = ServerNetworkManager.debugLatencyServerAppIdentityPayload()
+            let identity = try XCTUnwrap(payload["server_app_identity"] as? [String: Any])
+            XCTAssertEqual(identity["identity_authority"] as? String, "server_process")
+            XCTAssertEqual(identity["app_configuration"] as? String, "debug")
+            XCTAssertEqual(
+                (identity["process_identifier"] as? NSNumber)?.int32Value,
+                ProcessInfo.processInfo.processIdentifier
+            )
+            XCTAssertFalse(try XCTUnwrap(identity["bundle_path"] as? String).isEmpty)
+            XCTAssertFalse(try XCTUnwrap(identity["executable_path"] as? String).isEmpty)
+            XCTAssertEqual((identity["executable_sha256"] as? String)?.count, 64)
+        }
+
         func testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices() throws {
             let connectionID = UUID().uuidString
             let identity = MCPRequestTimelineIdentity(
@@ -904,6 +980,38 @@
             XCTAssertEqual(delivery.count, 7)
             XCTAssertTrue(delivery.allSatisfy { $0.requestIdentity?.appInvocationID == invocationID })
 
+            let transportConnectionID = UUID().uuidString
+            let correlationConnectionID = UUID().uuidString
+            let transportRequestID = "transport-identity-upgrade"
+            let explicitInvocationID = UUID()
+            let requestFrame = Data("""
+            {"jsonrpc":"2.0","id":"\(transportRequestID)","method":"tools/call","params":{"name":"read_file","arguments":{"_latencyTraceID":"\(explicitInvocationID.uuidString)"}}}
+            """.utf8)
+            let registry = MCPRequestTimelineRegistry()
+            _ = registry.recordAcceptedFrame(
+                requestFrame,
+                connectionID: transportConnectionID,
+                correlationConnectionID: correlationConnectionID,
+                connectionGeneration: 19
+            )
+            let resolvedIdentity = try XCTUnwrap(registry.claimToolRequest(
+                connectionID: transportConnectionID,
+                appInvocationID: explicitInvocationID
+            ))
+            XCTAssertTrue(resolvedIdentity.isCompleteLatencyEvidenceIdentity)
+            registry.updateResponseIdentity(to: resolvedIdentity)
+            let responseFrame = Data("""
+            {"jsonrpc":"2.0","id":"\(transportRequestID)","result":{"content":[]}}
+            """.utf8)
+            let recordedResponses = registry.recordedResponses(
+                in: responseFrame,
+                connectionID: transportConnectionID,
+                connectionGeneration: 19
+            )
+            XCTAssertEqual(recordedResponses.count, 1)
+            XCTAssertEqual(recordedResponses.first?.identity, resolvedIdentity)
+            XCTAssertEqual(recordedResponses.first?.identity.appInvocationID, explicitInvocationID.uuidString)
+
             let sources = try [
                 source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"),
                 source("Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift"),
@@ -929,6 +1037,104 @@
             ] {
                 XCTAssertTrue(sources.contains(hook), "Missing WI-2 stage hook: \(hook)")
             }
+        }
+
+        func testConcurrentSameToolRequestsClaimExactIdentityInReverseHandlerOrder() throws {
+            let registry = MCPRequestTimelineRegistry()
+            let connectionID = UUID().uuidString
+            let firstInvocationID = UUID()
+            let secondInvocationID = UUID()
+            let frame = Data("""
+            [
+              {"jsonrpc":"2.0","id":"request-first","method":"tools/call","params":{"name":"file_search","arguments":{"_latencyTraceID":"\(firstInvocationID.uuidString)"}}},
+              {"jsonrpc":"2.0","id":"request-second","method":"tools/call","params":{"name":"file_search","arguments":{"_latencyTraceID":"\(secondInvocationID.uuidString)"}}}
+            ]
+            """.utf8)
+            let recorded = registry.recordAcceptedFrame(
+                frame,
+                connectionID: connectionID,
+                correlationConnectionID: connectionID,
+                connectionGeneration: 7
+            )
+            XCTAssertEqual(recorded.count, 2)
+            XCTAssertNil(registry.claimToolRequest(
+                connectionID: connectionID,
+                appInvocationID: UUID()
+            ))
+
+            let second = try XCTUnwrap(registry.claimToolRequest(
+                connectionID: connectionID,
+                appInvocationID: secondInvocationID
+            ))
+            let first = try XCTUnwrap(registry.claimToolRequest(
+                connectionID: connectionID,
+                appInvocationID: firstInvocationID
+            ))
+            XCTAssertEqual(second.jsonRPCRequestID, .string("request-second"))
+            XCTAssertEqual(second.appInvocationID, secondInvocationID.uuidString)
+            XCTAssertEqual(first.jsonRPCRequestID, .string("request-first"))
+            XCTAssertEqual(first.appInvocationID, firstInvocationID.uuidString)
+            XCTAssertTrue(first.isCompleteLatencyEvidenceIdentity)
+            XCTAssertTrue(second.isCompleteLatencyEvidenceIdentity)
+        }
+
+        func testDuplicateInvocationIdentityFailsClosedWithoutClaimingEitherRequest() {
+            let registry = MCPRequestTimelineRegistry()
+            let connectionID = UUID().uuidString
+            let duplicateInvocationID = UUID()
+            let frame = Data("""
+            [
+              {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"_latencyTraceID":"\(duplicateInvocationID.uuidString)"}}},
+              {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"_latencyTraceID":"\(duplicateInvocationID.uuidString)"}}}
+            ]
+            """.utf8)
+            _ = registry.recordAcceptedFrame(
+                frame,
+                connectionID: connectionID,
+                correlationConnectionID: connectionID,
+                connectionGeneration: 8
+            )
+            XCTAssertNil(registry.claimToolRequest(
+                connectionID: connectionID,
+                appInvocationID: duplicateInvocationID
+            ))
+            XCTAssertNil(registry.claimToolRequest(
+                connectionID: connectionID,
+                appInvocationID: duplicateInvocationID
+            ))
+        }
+
+        func testFrameInspectorRecognizesOnlyExactDiagnosticInvocationPath() throws {
+            let invocationID = UUID()
+            let valid = Data("""
+            {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"_latencyTraceID":"\(invocationID.uuidString)"}}}
+            """.utf8)
+            let summary = try XCTUnwrap(JSONRPCBridgeFrameInspector.inspectPermissively(
+                valid,
+                direction: .clientToServer
+            ).first)
+            XCTAssertEqual(summary.appInvocationID, invocationID.uuidString)
+
+            for invalid in [
+                Data("""
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"args":{"_latencyTraceID":"\(invocationID.uuidString)"}}}}
+                """.utf8),
+                Data("""
+                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"_LatencyTraceID":"\(invocationID.uuidString)"}}}
+                """.utf8),
+                Data("""
+                {"jsonrpc":"2.0","id":4,"method":"ping","params":{"arguments":{"_latencyTraceID":"\(invocationID.uuidString)"}}}
+                """.utf8)
+            ] {
+                XCTAssertNil(JSONRPCBridgeFrameInspector.inspectPermissively(
+                    invalid,
+                    direction: .clientToServer
+                ).first?.appInvocationID)
+            }
+            XCTAssertTrue(JSONRPCBridgeFrameInspector.inspectPermissively(
+                Data("not-json".utf8),
+                direction: .clientToServer
+            ).isEmpty)
         }
 
         func testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState() async {
@@ -1355,6 +1561,66 @@
             })
         }
 
+        private func scenarioFileTreeAndFormattedOutputRecorderInventoryIsLeafAttributedAndSanitized() {
+            _ = startedCapture(label: "file-tree-formatted-output", maxSamples: 100)
+            let fileTreeStages: [(StaticString, String)] = [
+                (EditFlowPerf.Stage.FileTree.providerTotal, "EditFlow.FileTree.ProviderTotal"),
+                (EditFlowPerf.Stage.FileTree.providerArgumentParsing, "EditFlow.FileTree.ProviderArgumentParsing"),
+                (EditFlowPerf.Stage.FileTree.providerRequestMetadata, "EditFlow.FileTree.ProviderRequestMetadata"),
+                (EditFlowPerf.Stage.FileTree.providerLookupContextResolution, "EditFlow.FileTree.ProviderLookupContextResolution"),
+                (EditFlowPerf.Stage.FileTree.providerIngressFreshnessWait, "EditFlow.FileTree.ProviderIngressFreshnessWait"),
+                (EditFlowPerf.Stage.FileTree.providerSelectionDrain, "EditFlow.FileTree.ProviderSelectionDrain"),
+                (EditFlowPerf.Stage.FileTree.bridgeTotal, "EditFlow.FileTree.BridgeTotal"),
+                (EditFlowPerf.Stage.FileTree.settingsSnapshot, "EditFlow.FileTree.SettingsSnapshot"),
+                (EditFlowPerf.Stage.FileTree.selectionPhysicalization, "EditFlow.FileTree.SelectionPhysicalization"),
+                (EditFlowPerf.Stage.FileTree.snapshotConstruction, "EditFlow.FileTree.SnapshotConstruction"),
+                (EditFlowPerf.Stage.FileTree.codemapMarkerProjection, "EditFlow.FileTree.CodemapMarkerProjection"),
+                (EditFlowPerf.Stage.FileTree.logicalProjection, "EditFlow.FileTree.LogicalProjection"),
+                (EditFlowPerf.Stage.FileTree.renderIndexPreparation, "EditFlow.FileTree.RenderIndexPreparation"),
+                (EditFlowPerf.Stage.FileTree.renderAttempt, "EditFlow.FileTree.RenderAttempt"),
+                (EditFlowPerf.Stage.FileTree.renderTokenEstimation, "EditFlow.FileTree.RenderTokenEstimation"),
+                (EditFlowPerf.Stage.FileTree.dtoAssembly, "EditFlow.FileTree.DTOAssembly"),
+                (EditFlowPerf.Stage.FileTree.providerValueEncoding, "EditFlow.FileTree.ProviderValueEncoding")
+            ]
+            let formattedStages: [(StaticString, String)] = [
+                (EditFlowPerf.Stage.FormattedOutput.decode, "EditFlow.FormattedOutput.Decode"),
+                (EditFlowPerf.Stage.FormattedOutput.promptEnvelopeProbeDecode, "EditFlow.FormattedOutput.PromptEnvelopeProbeDecode"),
+                (EditFlowPerf.Stage.FormattedOutput.promptContextDecode, "EditFlow.FormattedOutput.PromptContextDecode"),
+                (EditFlowPerf.Stage.FormattedOutput.searchTreeAssembly, "EditFlow.FormattedOutput.SearchTreeAssembly"),
+                (EditFlowPerf.Stage.FormattedOutput.searchSnippetAssembly, "EditFlow.FormattedOutput.SearchSnippetAssembly"),
+                (EditFlowPerf.Stage.FormattedOutput.fileTreeAssembly, "EditFlow.FormattedOutput.FileTreeAssembly"),
+                (EditFlowPerf.Stage.FormattedOutput.workspaceContextAssembly, "EditFlow.FormattedOutput.WorkspaceContextAssembly"),
+                (EditFlowPerf.Stage.FormattedOutput.genericFallbackAssembly, "EditFlow.FormattedOutput.GenericFallbackAssembly")
+            ]
+            let dimensions = EditFlowPerf.Dimensions(
+                taskCount: 5,
+                workloadClass: "full/unlimited private/path",
+                fileCount: 50000,
+                rootCount: 4,
+                serialPosition: 1
+            )
+            for (stage, _) in fileTreeStages + formattedStages {
+                EditFlowPerf.measure(stage, dimensions) {}
+            }
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(snapshot.retainedSampleCount, fileTreeStages.count + formattedStages.count)
+            XCTAssertEqual(snapshot.droppedSampleCount, 0)
+            XCTAssertEqual(
+                Set(snapshot.stages.map(\.stageName)),
+                Set((fileTreeStages + formattedStages).map(\.1))
+            )
+            XCTAssertTrue(snapshot.stages.allSatisfy {
+                $0.sanitizedDimensions == "taskCount=5 workloadClass=full_unlimited_private_path fileCount=50000 rootCount=4 serialPosition=1"
+            })
+            XCTAssertTrue(snapshot.stages.allSatisfy {
+                !$0.sanitizedDimensions.contains("/")
+                    && !$0.sanitizedDimensions.contains("fixture")
+                    && !$0.sanitizedDimensions.contains("pattern")
+                    && !$0.sanitizedDimensions.contains("content")
+            })
+        }
+
         private func scenarioNewReadDispatchStageRecorderCapturesToolDimensionAndFinishes() throws {
             _ = startedCapture(label: "dispatch-decomposition", maxSamples: 100)
             EditFlowPerf.measure(
@@ -1676,6 +1942,87 @@
             XCTAssertTrue(aggregate.sanitizedDimensions.contains("tool=read_file"))
             XCTAssertFalse(aggregate.sanitizedDimensions.contains("/"))
             XCTAssertFalse(aggregate.sanitizedDimensions.contains("namespace"))
+            XCTAssertEqual(snapshot.mode, .exhaustive)
+            XCTAssertNotNil(aggregate.p50MS)
+            XCTAssertNotNil(aggregate.p95MS)
+
+            EditFlowPerf.resetDebugCaptureForTesting()
+            _ = startedCapture(
+                label: "bounded-evidence",
+                maxSamples: 100,
+                mode: .mcpLatencyEvidence
+            )
+            let evidenceCorrelation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive(
+                requestIdentity: completeLatencyEvidenceIdentity()
+            ))
+            EditFlowPerf.$currentLifecycleCorrelation.withValue(evidenceCorrelation) {
+                for ordinal in 0 ..< 100 {
+                    EditFlowPerf.measure(
+                        EditFlowPerf.Stage.MCPToolCall.limiterWait,
+                        EditFlowPerf.Dimensions(status: "key-\(ordinal)")
+                    ) {}
+                }
+                EditFlowPerf.measure(
+                    EditFlowPerf.Stage.MCPToolCall.limiterWait,
+                    EditFlowPerf.Dimensions(status: "overflow")
+                ) {}
+                EditFlowPerf.measure(
+                    EditFlowPerf.Stage.MCPToolCall.limiterWait,
+                    EditFlowPerf.Dimensions(status: "key-0")
+                ) {}
+                EditFlowPerf.measure(EditFlowPerf.Stage.MCPToolCall.providerExecution) {}
+            }
+
+            let evidence = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(evidence.mode, .mcpLatencyEvidence)
+            XCTAssertEqual(evidence.maxSamples, 100)
+            XCTAssertEqual(evidence.retainedSampleCount, 101)
+            XCTAssertEqual(evidence.droppedSampleCount, 1)
+            XCTAssertEqual(evidence.ignoredOutOfContractSampleCount, 1)
+            XCTAssertEqual(evidence.stages.count, 100)
+            XCTAssertEqual(evidence.stages.reduce(0) { $0 + $1.sampleCount }, 101)
+            let repeated = try XCTUnwrap(evidence.stages.first { $0.sampleCount == 2 })
+            XCTAssertTrue(repeated.sanitizedDimensions.contains("status=key-0"))
+            XCTAssertEqual(repeated.sampleCount, 2)
+            XCTAssertNil(repeated.p50MS)
+            XCTAssertNil(repeated.p95MS)
+            XCTAssertGreaterThanOrEqual(repeated.totalMS, repeated.maxMS)
+            let payload = evidence.payload()
+            XCTAssertEqual(payload["capture_mode"] as? String, "mcp_latency_evidence")
+            XCTAssertEqual(payload["sample_capacity_unit"] as? String, "unique_stage_dimension_request_keys")
+            XCTAssertEqual(payload["percentile_semantics"] as? String, "unavailable_online_aggregation")
+            XCTAssertEqual(payload["retained_aggregate_key_count"] as? Int, 100)
+            XCTAssertEqual(payload["ignored_out_of_contract_sample_count"] as? Int, 1)
+            XCTAssertEqual(payload["observed_sample_count"] as? Int, 103)
+            let payloadStages = try XCTUnwrap(payload["stages"] as? [[String: Any]])
+            XCTAssertTrue(payloadStages.allSatisfy { $0["p50_ms"] is NSNull && $0["p95_ms"] is NSNull })
+        }
+
+        func testEvidenceCaptureRejectsIncompleteRequestIdentity() throws {
+            _ = startedCapture(
+                label: "incomplete-evidence",
+                maxSamples: 100,
+                mode: .mcpLatencyEvidence
+            )
+            let incomplete = MCPRequestTimelineIdentity(appInvocationID: UUID().uuidString)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive(
+                requestIdentity: incomplete
+            ))
+            EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
+                EditFlowPerf.measure(EditFlowPerf.Stage.MCPToolCall.limiterWait) {}
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.received,
+                    correlation: correlation
+                )
+            }
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(snapshot.retainedSampleCount, 0)
+            XCTAssertEqual(snapshot.ignoredOutOfContractSampleCount, 1)
+            XCTAssertEqual(snapshot.retainedLifecycleEventCount, 0)
+            XCTAssertEqual(snapshot.ignoredOutOfContractLifecycleEventCount, 1)
+            XCTAssertTrue(snapshot.stages.isEmpty)
+            XCTAssertTrue(snapshot.lifecycleEvents.isEmpty)
         }
 
         func testLifecycleTimelinePreservesCorrelationOrderingAndSanitizesDimensions() throws {
@@ -1733,6 +2080,47 @@
             XCTAssertTrue(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("contentSource=unsafe"))
             XCTAssertFalse(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("/"))
             XCTAssertFalse(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("|"))
+
+            EditFlowPerf.resetDebugCaptureForTesting()
+            _ = startedCapture(
+                label: "timeline-evidence",
+                maxSamples: 100,
+                mode: .mcpLatencyEvidence
+            )
+            let evidenceCorrelation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive(
+                requestIdentity: completeLatencyEvidenceIdentity()
+            ))
+            let required: [StaticString] = [
+                EditFlowPerf.Lifecycle.MCPToolCall.received,
+                EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
+                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderBegan,
+                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                EditFlowPerf.Lifecycle.MCPToolCall.formatResultBegan,
+                EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
+                EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
+                EditFlowPerf.Lifecycle.MCPToolCall.handlerResultReady
+            ]
+            for event in required {
+                EditFlowPerf.lifecycleEvent(event, correlation: evidenceCorrelation)
+            }
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.permitReleased,
+                correlation: evidenceCorrelation
+            )
+
+            let evidence = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(evidence.mode, .mcpLatencyEvidence)
+            XCTAssertEqual(evidence.maxLifecycleEvents, 100)
+            XCTAssertEqual(evidence.retainedLifecycleEventCount, required.count)
+            XCTAssertEqual(evidence.droppedLifecycleEventCount, 0)
+            XCTAssertEqual(evidence.ignoredOutOfContractLifecycleEventCount, 1)
+            XCTAssertEqual(evidence.lifecycleEvents.map(\.eventName), required.map { String(describing: $0) })
+            let payload = evidence.payload()
+            XCTAssertEqual(payload["observed_lifecycle_event_count"] as? Int, required.count + 1)
+            XCTAssertEqual(
+                payload["lifecycle_event_allowlist"] as? [String],
+                required.map { String(describing: $0) }.sorted()
+            )
         }
 
         func testLifecycleTimelineBoundReportsDroppedEventsWithoutConsumingIntervalBudget() throws {
@@ -2112,7 +2500,7 @@
                 $0.stageName == "EditFlow.MCPProviderProjection.WorkerBody"
             })
             XCTAssertEqual(workerStage.sanitizedDimensions, "tool=git outcome=test_projection")
-            XCTAssertGreaterThanOrEqual(workerStage.p50MS, 10)
+            XCTAssertGreaterThanOrEqual(try XCTUnwrap(workerStage.p50MS), 10)
             XCTAssertGreaterThanOrEqual(
                 handoffEvents[3].offsetMS - handoffEvents[2].offsetMS,
                 10,
@@ -2222,14 +2610,31 @@
             }
         }
 
+        private func completeLatencyEvidenceIdentity(
+            invocationID: UUID = UUID()
+        ) -> MCPRequestTimelineIdentity {
+            MCPRequestTimelineIdentity(
+                jsonRPCRequestID: .string("request-\(invocationID.uuidString)"),
+                connectionID: "connection-\(invocationID.uuidString)",
+                connectionGeneration: 1,
+                appInvocationID: invocationID.uuidString,
+                requestOrdinal: 1
+            )
+        }
+
         private func startedCapture(
             label: String,
             maxSamples: Int,
+            mode: EditFlowPerf.DebugCaptureMode = .exhaustive,
             failureLabel: String? = nil,
             file: StaticString = #filePath,
             line: UInt = #line
         ) -> EditFlowPerf.DebugCaptureSnapshot {
-            switch EditFlowPerf.beginDebugCapture(label: label, maxSamples: maxSamples) {
+            switch EditFlowPerf.beginDebugCapture(
+                label: label,
+                maxSamples: maxSamples,
+                mode: mode
+            ) {
             case let .started(snapshot):
                 return snapshot
             case .busy:

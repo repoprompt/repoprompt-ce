@@ -38,7 +38,7 @@ from debug_app_process import ProcessIdentityError, matching_processes, terminat
 
 PROTOCOL_VERSION = 11
 TERMINAL_STATES = {"completed", "failed", "canceled"}
-LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
+LANE_NAMES = {"build", "debugArtifact", "mcpLatencyArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 SUMMARY_VERSION = 1
@@ -101,6 +101,10 @@ IMPLEMENTED_OPERATIONS = {
     "app",
     "smoke",
     "diagnostics",
+    "mcp-latency",
+    "mcp-latency-client-build",
+    "mcp-latency-debug-server-build",
+    "mcp-latency-server-build",
     "release",
 }
 
@@ -152,12 +156,18 @@ Operation commands:
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
+  ./conductor mcp-latency -- fixture --profile small --output /absolute/external/path
+  ./conductor mcp-latency -- run <matrix args...>     # existing app only; never performs lifecycle actions
+  ./conductor mcp-latency -- analyze <aggregate args...>
+  ./conductor mcp-latency-client-build              # legacy client-only optimized diagnostic CLI
+  ./conductor mcp-latency-debug-server-build        # isolated DEBUG attribution app; never launches
+  ./conductor mcp-latency-server-build              # isolated release-optimized diagnostic app; never launches
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
   ./conductor sleep <seconds> [--lane <lane>]... [--message <text>] [--exit-code <n>]
   ./conductor fake-sleep <seconds> [same options]
-  valid lanes: build, debugArtifact, liveApp, release, style
+  valid lanes: build, debugArtifact, mcpLatencyArtifact, liveApp, release, style
 
 Global operation flags:
   --async              enqueue and return a ticket immediately
@@ -1059,7 +1069,9 @@ def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
+    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli", "mcp-latency-client-build", "mcp-latency-debug-server-build", "mcp-latency-server-build"}:
+        return True
+    if operation == "mcp-latency" and (args.get("toolArgs") or [None])[0] == "run":
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
@@ -1422,6 +1434,37 @@ class OperationRegistry:
                 return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
             if subcommand == "build-cache":
                 return self._internal_argv("diagnostics_build_cache", dict(args)), lanes, cwd, env, effective_timeout
+        if operation == "mcp-latency-client-build":
+            return [script("build_mcp_latency_client.sh")], ["build", "mcpLatencyArtifact"], cwd, env, effective_timeout
+        if operation == "mcp-latency-debug-server-build":
+            env["REPOPROMPT_DEBUG_APP_BUNDLE"] = str(
+                self.repo_root / ".build/mcp-latency/debug-server/RepoPrompt.app"
+            )
+            env["ALLOW_ADHOC_SIGNING"] = "1"
+            return [script("package_app.sh"), "debug"], ["build", "mcpLatencyArtifact"], cwd, env, effective_timeout
+        if operation == "mcp-latency-server-build":
+            return [script("package_app.sh"), "mcp-latency-diagnostic"], ["build", "mcpLatencyArtifact"], cwd, env, effective_timeout
+        if operation == "mcp-latency":
+            tool_args = [str(value) for value in args.get("toolArgs", [])]
+            if not tool_args:
+                raise ConductorError("mcp-latency requires fixture, run, or analyze arguments")
+            subcommand = tool_args[0]
+            if subcommand == "fixture":
+                return [sys.executable, script("mcp-latency/generate_fixture.py"), *tool_args[1:]], lanes, cwd, env, effective_timeout
+            if subcommand in {"run", "analyze"}:
+                if subcommand == "run":
+                    try:
+                        configuration = tool_args[tool_args.index("--configuration") + 1]
+                    except (ValueError, IndexError) as error:
+                        raise ConductorError("mcp-latency run requires --configuration debug|optimized") from error
+                    if configuration == "debug":
+                        lanes = ["debugArtifact", "liveApp"]
+                    elif configuration == "optimized":
+                        lanes = ["mcpLatencyArtifact", "liveApp"]
+                    else:
+                        raise ConductorError("mcp-latency run requires --configuration debug|optimized")
+                return [sys.executable, script("mcp-latency/run_latency_matrix.py"), *tool_args], lanes, cwd, env, effective_timeout
+            raise ConductorError("mcp-latency subcommand must be fixture, run, or analyze")
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
@@ -1511,6 +1554,8 @@ class OperationRegistry:
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
+        if operation in {"mcp-latency", "mcp-latency-server-build"}:
+            return RELEASE_ARTIFACT_TIMEOUT_SECONDS
         if operation == "diagnostics":
             return SHORT_TIMEOUT_SECONDS
         return MEDIUM_TIMEOUT_SECONDS
@@ -4633,6 +4678,9 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "format-tools-status",
         "check-format-tools",
         "install-format-tools",
+        "mcp-latency-client-build",
+        "mcp-latency-debug-server-build",
+        "mcp-latency-server-build",
     }:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
@@ -4731,6 +4779,10 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             if ns.limit <= 0:
                 raise ConductorError("diagnostics build-cache --limit must be greater than zero")
             args["limit"] = ns.limit
+    elif operation == "mcp-latency":
+        if not rest or rest[0] != "--" or len(rest) < 2:
+            raise ConductorError("usage: ./conductor mcp-latency -- fixture|run|analyze <arguments...>")
+        args["toolArgs"] = rest[1:]
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
         parser.add_argument("subcommand", choices=["preflight", "artifact", "package", "local-install"])

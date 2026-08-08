@@ -11,6 +11,8 @@ let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().pa
 let environment = ProcessInfo.processInfo.environment
 let sentryEnabled = environment["REPOPROMPT_ENABLE_SENTRY"] == "1"
 let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
+let mcpLatencyTraceEnabled = environment["RPCE_ENABLE_MCP_LATENCY_TRACE"] == "1"
+let mcpLatencyDiagnosticsEnabled = environment["RPCE_ENABLE_MCP_LATENCY_DIAGNOSTICS"] == "1"
 
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
@@ -77,6 +79,10 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
     ])
 ]
 
+if mcpLatencyDiagnosticsEnabled {
+    repoPromptAppSwiftSettings.append(.define("MCP_LATENCY_DIAGNOSTICS"))
+}
+
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
     "RepoPromptDomainRuntime",
@@ -93,6 +99,27 @@ var repoPromptTestSwiftSettings: [SwiftSetting] = [
 var repoPromptCodeMapTestSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug))
 ]
+
+var repoPromptMCPSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+if mcpLatencyTraceEnabled {
+    repoPromptMCPSwiftSettings.append(.define("MCP_LATENCY_TRACE"))
+}
+
+var repoPromptDomainRuntimeSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+if mcpLatencyDiagnosticsEnabled {
+    repoPromptDomainRuntimeSwiftSettings.append(.define("MCP_LATENCY_DIAGNOSTICS"))
+}
+
+var repoPromptSharedSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
+]
+if mcpLatencyDiagnosticsEnabled {
+    repoPromptSharedSwiftSettings.append(.define("MCP_LATENCY_DIAGNOSTICS"))
+}
 
 if sentryEnabled {
     let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")
@@ -135,9 +162,7 @@ let package = Package(
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Sources/RepoPromptDomainRuntime",
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
+            swiftSettings: swift6LanguageMode + repoPromptDomainRuntimeSwiftSettings
         ),
         .target(
             name: "RepoPromptWorkspaceCore",
@@ -183,14 +208,12 @@ let package = Package(
             name: "RepoPromptMCP",
             dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: repoPromptMCPSwiftSettings
         ),
         .target(
             name: "RepoPromptShared",
             path: "Sources/RepoPromptShared",
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
+            swiftSettings: swift6LanguageMode + repoPromptSharedSwiftSettings
         ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
         .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),

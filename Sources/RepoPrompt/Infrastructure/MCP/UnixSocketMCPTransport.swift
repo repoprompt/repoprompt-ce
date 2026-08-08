@@ -463,7 +463,7 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         let framed = Self.frameWithNewlineIfNeeded(message)
-        #if DEBUG
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
             let recordedResponses: [MCPRequestTimelineRegistry.RecordedMessage] = if let timelineConnectionID {
                 MCPRequestTimelineRegistry.shared.recordedResponses(
                     in: framed,
@@ -531,7 +531,7 @@ public actor UnixSocketMCPTransport: Transport {
         }
         responseDeliveryGate.recordDeliveredServerFrame(framed)
         lastActivityTime = Date()
-        #if DEBUG
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
             if recordedResponses.isEmpty {
                 MCPResponseDeliveryTracer.emitFrame(
                     layer: "app_uds_transport",
@@ -733,7 +733,7 @@ public actor UnixSocketMCPTransport: Transport {
     ) {
         guard !streamFinished else { return }
         responseDeliveryGate.close()
-        #if DEBUG
+        #if DEBUG || MCP_LATENCY_DIAGNOSTICS
             if let timelineConnectionID {
                 MCPRequestTimelineRegistry.shared.removeConnection(
                     connectionID: timelineConnectionID,
@@ -1118,7 +1118,7 @@ public actor UnixSocketMCPTransport: Transport {
                 responseDeliveryGate.recordAcceptedClientFrame(frame)
                 switch inboundChannel.gate.offer(frame, to: inboundChannel.continuation) {
                 case .accepted:
-                    #if DEBUG
+                    #if DEBUG || MCP_LATENCY_DIAGNOSTICS
                         if let timelineConnectionID {
                             let recorded = MCPRequestTimelineRegistry.shared.recordAcceptedFrame(
                                 frame,

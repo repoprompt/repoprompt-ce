@@ -232,6 +232,62 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(cwd, repo_root)
         self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
 
+    def test_mcp_latency_coordinates_artifacts_and_never_adds_lifecycle_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            fixture_argv, fixture_lanes, _cwd, _env, _timeout = registry.prepare({
+                "operation": "mcp-latency",
+                "args": {"toolArgs": ["fixture", "--profile", "small", "--output", "/tmp/fixture"]},
+            })
+            debug_argv, debug_lanes, _cwd, _env, _timeout = registry.prepare({
+                "operation": "mcp-latency",
+                "args": {"toolArgs": ["run", "--configuration", "debug"]},
+            })
+            optimized_argv, optimized_lanes, _cwd, _env, _timeout = registry.prepare({
+                "operation": "mcp-latency",
+                "args": {"toolArgs": ["run", "--configuration", "optimized"]},
+            })
+            analyze_argv, analyze_lanes, _cwd, _env, _timeout = registry.prepare({
+                "operation": "mcp-latency",
+                "args": {"toolArgs": ["analyze", "--input", "/tmp/input", "--output", "/tmp/output"]},
+            })
+            client_argv, client_lanes, _cwd, _env, _timeout = registry.prepare({
+                "operation": "mcp-latency-client-build", "args": {},
+            })
+            debug_server_argv, debug_server_lanes, _cwd, debug_server_env, _timeout = registry.prepare({
+                "operation": "mcp-latency-debug-server-build", "args": {},
+            })
+            server_argv, server_lanes, _cwd, _env, server_timeout = registry.prepare({
+                "operation": "mcp-latency-server-build", "args": {},
+            })
+
+        self.assertEqual(Path(fixture_argv[1]).name, "generate_fixture.py")
+        self.assertEqual(fixture_lanes, [])
+        self.assertEqual(Path(debug_argv[1]).name, "run_latency_matrix.py")
+        self.assertEqual(debug_lanes, ["debugArtifact", "liveApp"])
+        self.assertEqual(Path(optimized_argv[1]).name, "run_latency_matrix.py")
+        self.assertEqual(optimized_lanes, ["mcpLatencyArtifact", "liveApp"])
+        self.assertEqual(Path(analyze_argv[1]).name, "run_latency_matrix.py")
+        self.assertEqual(analyze_lanes, [])
+        self.assertEqual(Path(client_argv[0]).name, "build_mcp_latency_client.sh")
+        self.assertEqual(client_lanes, ["build", "mcpLatencyArtifact"])
+        self.assertEqual(Path(debug_server_argv[0]).name, "package_app.sh")
+        self.assertEqual(debug_server_argv[1], "debug")
+        self.assertEqual(debug_server_lanes, ["build", "mcpLatencyArtifact"])
+        self.assertTrue(debug_server_env["REPOPROMPT_DEBUG_APP_BUNDLE"].endswith(
+            ".build/mcp-latency/debug-server/RepoPrompt.app"
+        ))
+        self.assertEqual(debug_server_env["ALLOW_ADHOC_SIGNING"], "1")
+        self.assertEqual(Path(server_argv[0]).name, "package_app.sh")
+        self.assertEqual(server_argv[1], "mcp-latency-diagnostic")
+        self.assertEqual(server_lanes, ["build", "mcpLatencyArtifact"])
+        self.assertEqual(server_timeout, conductor.RELEASE_ARTIFACT_TIMEOUT_SECONDS)
+        for argv in (debug_argv, optimized_argv, client_argv, debug_server_argv, server_argv):
+            joined = " ".join(argv)
+            self.assertNotIn("__operation_runner", joined)
+            self.assertNotIn("open ", joined)
+            self.assertNotIn("app stop", joined)
+
     def test_release_artifact_delegates_release_script_with_release_lanes_and_extended_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
