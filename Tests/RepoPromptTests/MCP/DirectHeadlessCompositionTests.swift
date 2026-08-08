@@ -33,6 +33,13 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             XCTAssertEqual(
                 try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
                     "message": .string(message),
+                    "workflow_id": .string("builtin-\(workflow.rawValue)")
+                ]),
+                expected
+            )
+            XCTAssertEqual(
+                try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+                    "message": .string(message),
                     "workflow_name": .string(workflow.metadata.displayName)
                 ]),
                 expected
@@ -86,8 +93,101 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
         XCTAssertEqual(object["backend"] as? String, "headless")
         let workflows = try XCTUnwrap(object["workflows"] as? [[String: Any]])
-        XCTAssertEqual(workflows.compactMap { $0["id"] as? String }, RepoPromptBuiltInAgentWorkflow.displayOrder.map(\.rawValue))
+        XCTAssertEqual(workflows.compactMap { $0["id"] as? String }, [
+            "builtin-orchestrate",
+            "builtin-deepPlan",
+            "builtin-optimize",
+            "builtin-build",
+            "builtin-review",
+            "builtin-refactor",
+            "builtin-investigate",
+            "builtin-oracleExport"
+        ])
         XCTAssertEqual(Set(workflows.compactMap { $0["source"] as? String }), ["built_in"])
+    }
+
+    func testHeadlessWorkflowLaunchHonorsDisabledCleanupGuidanceSetting() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-workflow-setting-root-\(UUID().uuidString)", isDirectory: true)
+        let profile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-workflow-setting-profile-\(UUID().uuidString)", isDirectory: true)
+        let stub = profile.appendingPathComponent("codex-stub")
+        let capturedPrompt = profile.appendingPathComponent("captured-prompt.txt")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
+        let stubScript = """
+        #!/bin/sh
+        /usr/bin/tee '\(capturedPrompt.path)' >/dev/null
+        /usr/bin/printf '%s\\n' '{"type":"message","text":"STUB_OK"}'
+        """
+        try Data(stubScript.utf8).write(to: stub)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stub.path)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: profile)
+        }
+
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_CODEX_COMMAND": stub.path,
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "workflow-setting-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": root.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: root
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let settings = DirectHeadlessGlobalBackend(
+            runtime: prepared.runtime,
+            scopeID: prepared.scopeID,
+            context: prepared.context
+        )
+        let settingRequest = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode([
+                "op": Value.string("set"),
+                "key": .string("agent_mode.show_built_in_workflow_cleanup_guidance"),
+                "value": .bool(false)
+            ]),
+            securityContext: nil
+        )
+        _ = try await settings.accessSettings(settingRequest)
+
+        let message = "Exercise the persisted headless workflow setting."
+        let arguments: [String: Value] = [
+            "message": .string(message),
+            "workflow_id": .string("builtin-orchestrate"),
+            "timeout": .double(10)
+        ]
+        let snapshot = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let securityContext = DomainToolInvocationSecurityContext(
+            principal: prepared.principal,
+            connectionID: prepared.connectionID,
+            connectionGeneration: prepared.connectionGeneration,
+            invocationID: UUID(),
+            runtimeID: prepared.runtime.identity.runtimeID,
+            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+            workspaceID: snapshot.identity.workspaceID,
+            workspaceRevision: snapshot.workspace.revisions.workingRevision,
+            authorizedCanonicalRoots: Set(snapshot.roots.map(\.path)),
+            hasAuthoritativeRoutingContext: true,
+            ephemeralGrantedToolNames: [],
+            ephemeralGrantedOperations: []
+        )
+        let runRequest = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(arguments),
+            securityContext: securityContext
+        )
+        _ = try await prepared.providerCoordinator.startAgent(args: arguments, request: runRequest)
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !FileManager.default.fileExists(atPath: capturedPrompt.path), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let prompt = try String(contentsOf: capturedPrompt, encoding: .utf8)
+        XCTAssertTrue(prompt.contains(message))
+        XCTAssertFalse(prompt.contains("Dismiss a completed session"))
     }
 
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {

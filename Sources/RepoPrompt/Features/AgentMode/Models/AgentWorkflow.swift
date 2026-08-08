@@ -144,7 +144,7 @@ public struct AgentWorkflowDefinition: Sendable, Identifiable, Equatable, Hashab
 
     public var id: String {
         switch source {
-        case let .builtIn(workflow): "builtin-\(workflow.rawValue)"
+        case let .builtIn(workflow): workflow.canonicalID
         case let .custom(uuid): "custom-\(uuid.uuidString)"
         }
     }

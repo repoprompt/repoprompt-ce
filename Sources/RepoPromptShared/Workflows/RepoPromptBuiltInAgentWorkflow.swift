@@ -38,11 +38,15 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
         rawValue
     }
 
+    public var canonicalID: String {
+        "builtin-\(rawValue)"
+    }
+
     public var metadata: Metadata {
         switch self {
         case .build:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Plan & Build",
                 iconName: "hammer.fill",
                 tooltipText: "Deep-research, plan, and implement complex tasks",
@@ -50,7 +54,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .review:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Review",
                 iconName: "eye.fill",
                 tooltipText: "Thorough code review across branches and diffs",
@@ -58,7 +62,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .refactor:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Refactor",
                 iconName: "arrow.triangle.2.circlepath",
                 tooltipText: "Analyze and improve code organization",
@@ -66,7 +70,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .investigate:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Investigate",
                 iconName: "magnifyingglass",
                 tooltipText: "Hypothesis-driven research with evidence gathering",
@@ -74,7 +78,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .oracleExport:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "ChatGPT Export",
                 iconName: "square.and.arrow.up",
                 tooltipText: "Export codebase context for ChatGPT analysis",
@@ -82,7 +86,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .orchestrate:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Orchestrate",
                 iconName: "arrow.triangle.branch",
                 tooltipText: "Plan, decompose, and delegate tasks across multiple agents",
@@ -90,7 +94,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .optimize:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Optimize",
                 iconName: "speedometer",
                 tooltipText: "Instrument, baseline, and iteratively optimize a target metric",
@@ -98,7 +102,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
             )
         case .deepPlan:
             Metadata(
-                id: rawValue,
+                id: canonicalID,
                 displayName: "Deep Plan",
                 iconName: "text.book.closed.fill",
                 tooltipText: "Deeply research and shape a polished plan document",
@@ -137,7 +141,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
         guard let reference = normalizedID ?? normalizedName else { return nil }
         let match = allCases.first { workflow in
             reference.caseInsensitiveCompare(workflow.rawValue) == .orderedSame
-                || reference.caseInsensitiveCompare("builtin-\(workflow.rawValue)") == .orderedSame
+                || reference.caseInsensitiveCompare(workflow.canonicalID) == .orderedSame
                 || reference.caseInsensitiveCompare(workflow.metadata.displayName) == .orderedSame
         }
         guard let match else { throw ResolutionError.unknownReference(reference) }
