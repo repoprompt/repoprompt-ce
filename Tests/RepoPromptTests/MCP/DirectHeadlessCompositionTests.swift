@@ -7,13 +7,41 @@ import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
     func testHeadlessCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
-        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(
+            model: nil,
+            fullAccess: false
+        )
 
         XCTAssertFalse(arguments.contains("--full-auto"))
         XCTAssertEqual(
             Array(arguments.suffix(5)),
             ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
         )
+    }
+
+    func testHeadlessCodexExecUsesBypassOnlyForExplicitFullAccess() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(
+            model: nil,
+            fullAccess: true
+        )
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertFalse(arguments.contains("--sandbox"))
+        XCTAssertTrue(arguments.contains("--dangerously-bypass-approvals-and-sandbox"))
+    }
+
+    func testHeadlessCodexExecFullAccessEnvironmentRequiresExactOptIn() {
+        XCTAssertTrue(
+            DirectHeadlessProviderCoordinator.codexFullAccessEnabled(
+                environment: ["REPOPROMPT_CODEX_EXEC_FULL_ACCESS": "1"]
+            )
+        )
+        XCTAssertFalse(
+            DirectHeadlessProviderCoordinator.codexFullAccessEnabled(
+                environment: ["REPOPROMPT_CODEX_EXEC_FULL_ACCESS": "true"]
+            )
+        )
+        XCTAssertFalse(DirectHeadlessProviderCoordinator.codexFullAccessEnabled(environment: [:]))
     }
 
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {

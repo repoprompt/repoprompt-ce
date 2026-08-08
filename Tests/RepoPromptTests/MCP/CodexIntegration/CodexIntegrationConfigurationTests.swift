@@ -37,7 +37,8 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         let arguments = CodexExecAgentProvider.buildCodexExecArguments(
             selectedModelString: nil,
             serverEntries: [],
-            brokenServers: []
+            brokenServers: [],
+            fullAccess: false
         ).args
 
         XCTAssertFalse(arguments.contains("--full-auto"))
@@ -45,6 +46,19 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             Array(arguments.suffix(4)),
             ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
         )
+    }
+
+    func testCodexExecUsesBypassOnlyForExplicitFullAccess() {
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: [],
+            fullAccess: true
+        ).args
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertFalse(arguments.contains("--sandbox"))
+        XCTAssertTrue(arguments.contains("--dangerously-bypass-approvals-and-sandbox"))
     }
 
     private func occurrences(of needle: String, in haystack: String) -> Int {
