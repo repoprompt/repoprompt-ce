@@ -2553,6 +2553,20 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             publish_staged.index("prepare_dist"),
         )
 
+    def test_ci_workflow_cancels_only_superseded_pull_request_runs(self) -> None:
+        ci_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        concurrency_block = ci_workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
+        normalized_concurrency = " ".join(concurrency_block.split())
+
+        self.assertIn(
+            "group: ci-${{ github.event.pull_request.number || github.run_id }}",
+            normalized_concurrency,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            normalized_concurrency,
+        )
+        self.assertNotIn("cancel-in-progress: true", concurrency_block)
 
     def test_main_tip_workflow_keeps_tip_separate_and_uses_hardened_smoke(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")

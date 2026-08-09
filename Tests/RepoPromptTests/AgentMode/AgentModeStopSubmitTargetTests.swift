@@ -70,7 +70,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         codexSession.replaceItems([.user("codex transcript", sequenceIndex: 1)])
         codexSession.codexController = controller
         codexSession.runState = .running
-        codexSession.runID = UUID()
+        codexSession.installRunID(UUID())
         codexSession.testInstallPersistentSessionBinding(sessionID: UUID())
         codexSession.beginRunAttempt(source: "managed-logout-test")
         claudeSession.selectedAgent = .claudeCode
@@ -103,7 +103,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         lingeringSession.replaceItems([.assistant("preserved transcript", sequenceIndex: 1)])
         lingeringSession.runState = .running
         let unrelatedRunID = UUID()
-        lingeringSession.runID = unrelatedRunID
+        lingeringSession.installRunID(unrelatedRunID)
         plainClaudeSession.selectedAgent = .claudeCode
         plainClaudeSession.runState = .running
 
@@ -130,7 +130,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let agentSessionID = UUID()
         let attemptID = UUID()
         runningSession.runState = .running
-        runningSession.runID = runID
+        runningSession.installRunID(runID)
         runningSession.testInstallPersistentSessionBinding(sessionID: agentSessionID)
         runningSession.beginRunAttempt(source: "test", attemptID: attemptID)
         idleSession.runState = .idle
@@ -161,11 +161,11 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let targetRunID = UUID()
         let otherRunID = UUID()
         targetSession.runState = .running
-        targetSession.runID = targetRunID
+        targetSession.installRunID(targetRunID)
         targetSession.testInstallPersistentSessionBinding(sessionID: UUID())
         targetSession.beginRunAttempt(source: "test")
         otherSession.runState = .running
-        otherSession.runID = otherRunID
+        otherSession.installRunID(otherRunID)
         otherSession.testInstallPersistentSessionBinding(sessionID: UUID())
         otherSession.beginRunAttempt(source: "test")
         let cancelTarget = vm.makeRunCancelTarget(tabID: targetTabID, session: targetSession)
@@ -190,12 +190,12 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         vm.ensureSession(for: tabID)
         let session = try XCTUnwrap(vm.sessions[tabID])
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.beginRunAttempt(source: "test")
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
         let newerRunID = UUID()
-        session.runID = newerRunID
+        session.installRunID(newerRunID)
 
         let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
 
@@ -214,7 +214,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         vm.ensureSession(for: tabID)
         let session = try XCTUnwrap(vm.sessions[tabID])
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.beginRunAttempt(source: "test")
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
@@ -237,7 +237,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         vm.ensureSession(for: tabID)
         let session = try XCTUnwrap(vm.sessions[tabID])
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.beginRunAttempt(source: "test")
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
@@ -304,7 +304,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let liveRunID = UUID()
         let liveAttemptID = UUID()
         session.runState = .running
-        session.runID = liveRunID
+        session.installRunID(liveRunID)
         session.beginRunAttempt(source: "test.liveRunStarted", attemptID: liveAttemptID)
         let result = await vm.submitUserTurnCreatingSessionIfNeeded(text: "send to live run", target: target)
 
@@ -326,7 +326,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.runState = .running
         let liveRunID = UUID()
-        session.runID = liveRunID
+        session.installRunID(liveRunID)
         let firstOwnership = session.beginRunAttempt(source: "test.firstAttempt", attemptID: UUID())
         let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
         XCTAssertEqual(target.route, .existingAgentSession)
@@ -356,7 +356,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         session.selectedAgent = .codexExec
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
         let firstResult = await vm.submitUserTurnCreatingSessionIfNeeded(text: "send once", target: target)
@@ -594,7 +594,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         session.selectedAgent = .codexExec
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         vm.storeDraftText(for: tabID, "submitted draft")
         let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
@@ -640,7 +640,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let linkedSessionID = UUID()
         sourceSession.testInstallPersistentSessionBinding(sessionID: linkedSessionID)
         sourceSession.runState = .running
-        sourceSession.runID = UUID()
+        sourceSession.installRunID(UUID())
         sourceSession.beginRunAttempt(source: "test.linked")
         var createCalled = false
 

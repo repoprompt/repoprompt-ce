@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 @MainActor
 final class AgentModeRunService {
@@ -28,18 +29,10 @@ final class AgentModeRunService {
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
     }
 
-    enum CancellationIntent {
-        case userStop
-        case executionLocationChange
-        case runtimeShutdown
-    }
-
-    enum CancellationCompletion: Equatable {
-        /// Return after canonical terminal publication and synchronous provider detachment.
-        case terminalPublished
-        /// Also wait for the exactly-once attempt/provider teardown closure to return.
-        case terminalTeardownCompleted
-    }
+    /// Neutral command/cancellation contracts shared with the direct/headless
+    /// composition. See `DomainAgentRunExecutionContracts`.
+    typealias CancellationIntent = DomainAgentRunCancellationIntent
+    typealias CancellationCompletion = DomainAgentRunCancellationCompletion
 
     /// Strategy for restoring draft text back to the composer.
     enum DraftRestorationStrategy: Equatable {
@@ -51,64 +44,6 @@ final class AgentModeRunService {
         /// caller has already composed the restored draft together with any
         /// newer typing, so applying the event again must not re-prepend.
         case replaceAlways
-    }
-
-    struct Hooks {
-        let estimateRuntimeTokens: (String) -> Int
-        let addUserInputTokensToActiveNonCodexTurn: (Int, AgentModeViewModel.TabSession) -> Void
-        let startNonCodexTurnAccountingIfNeeded: (AgentModeViewModel.TabSession, String) -> Void
-        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> UUID?
-        let markAttachmentsConsumed: (AgentModeViewModel.TabSession, UUID?) -> Void
-        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> Void
-        let consumeDeferredAttachmentCleanup: (AgentModeViewModel.TabSession, Bool) -> Void
-        let finalizeAttachmentsForTurn: (AgentModeViewModel.TabSession, UUID?, AgentModeViewModel.AttachmentTurnDisposition) -> Void
-        let setAgentRunActive: (UUID, Bool) -> Void
-        let updateBindings: (AgentModeViewModel.TabSession) -> Void
-        let requestUIRefresh: (UUID, Bool) -> Void
-        let scheduleSave: (UUID) -> Void
-        let notifyAgentTurnComplete: (AgentModeViewModel.TabSession) -> Void
-        let handleHeadlessStreamResult: (AIStreamResult, AgentModeViewModel.TabSession, UUID, UUID) async -> Void
-        let buildHeadlessAgentMessage: (AgentModeViewModel.TabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
-        let finalizeStreamingItems: (AgentModeViewModel.TabSession) -> Void
-        let finalizePendingToolCalls: (AgentModeViewModel.TabSession, AgentSessionRunState) -> Void
-        let finalizePendingToolCallsWithUpperBound: (AgentModeViewModel.TabSession, AgentSessionRunState, Int?) -> Void
-        let finalizeNonCodexTurnUsage: (AgentModeViewModel.TabSession, Int?, Int?, Int?) -> Void
-        let cancelPendingQuestion: (AgentModeViewModel.TabSession) -> Void
-        let cancelPendingApproval: (AgentModeViewModel.TabSession) -> Void
-        let cancelPendingApplyEditsReview: (AgentModeViewModel.TabSession, String) -> Void
-        let cancelPendingWorktreeMergeReview: (AgentModeViewModel.TabSession, String) -> Void
-        let flushPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
-        let clearPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
-        let prepareTerminalPublication: (AgentModeViewModel.TabSession) -> Void
-        let makeTerminalPublicationEnvelope: (
-            AgentModeViewModel.TabSession,
-            AgentRunOwnership,
-            AgentSessionRunState,
-            UUID?
-        ) -> AgentRunTerminalPublicationEnvelope?
-        let publishTerminalCommit: (
-            AgentModeViewModel.TabSession,
-            AgentRunTerminalCommitRevision,
-            AgentRunEpochTransitionKind?
-        ) async -> AgentRunTerminalPublicationResult
-        let startFollowUpRun: (UUID, String) -> Void
-        /// Restore queued steering draft text back to the composer.
-        let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
-        /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
-        let augmentUserMessageForProviderSend: (
-            _ text: String,
-            _ attachments: [AgentImageAttachment],
-            _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentModeViewModel.TabSession?
-        ) async -> String
-        /// Stages a transcript handoff for fresh-session resume recovery.
-        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentModeViewModel.TabSession) async -> Void
-        /// Prepends a staged handoff payload to provider-facing text.
-        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentModeViewModel.TabSession) -> String
-        /// Records whether a staged handoff payload was accepted by the provider send attempt.
-        let recordPendingHandoffSendOutcome: (_ session: AgentModeViewModel.TabSession, _ didSend: Bool) -> Void
-        /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
-        let signalMCPInstructionDelivered: (_ session: AgentModeViewModel.TabSession) async -> Void
     }
 
     private let dependencies: Dependencies
@@ -135,9 +70,12 @@ final class AgentModeRunService {
     ) {
         self.dependencies = dependencies
         self.hooks = hooks
-        let terminalCommitBarrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let terminalCommitBarrier = AgentRunTerminalCommitBarrier()
         self.terminalCommitBarrier = terminalCommitBarrier
-        dependencies.codexCoordinator.installTerminalCommitBarrier(terminalCommitBarrier)
+        dependencies.codexCoordinator.installTerminalCommitBarrier(
+            terminalCommitBarrier,
+            terminalSessionBinder: { hooks.bindTerminalSession($0) }
+        )
         headlessRunner = HeadlessAgentModeRunner(
             headlessProviderFactory: dependencies.headlessProviderFactory,
             hooks: hooks,
@@ -442,10 +380,10 @@ final class AgentModeRunService {
                 }
                 let steeringUserInputTokens = dequeuedUserInputTokens.count == steeringBatch.count
                     ? dequeuedUserInputTokens.reduce(0, +)
-                    : hooks.estimateRuntimeTokens(providerTextForSend)
-                hooks.addUserInputTokensToActiveNonCodexTurn(steeringUserInputTokens, session)
+                    : hooks.usage.estimateRuntimeTokens(providerTextForSend)
+                hooks.usage.addUserInputTokensToActiveNonCodexTurn(steeringUserInputTokens, session)
 
-                let augmentedSteeringText = await hooks.augmentUserMessageForProviderSend(
+                let augmentedSteeringText = await hooks.providerInput.augmentUserMessageForProviderSend(
                     providerTextForSend,
                     steeringBatch.flatMap(\.attachments),
                     steeringBatch.flatMap(\.taggedFileAttachments),
@@ -459,9 +397,9 @@ final class AgentModeRunService {
                     targetRunAttemptID: runAttemptID,
                     targetController: controller
                 )
-                hooks.recordPendingHandoffSendOutcome(session, sent)
+                hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
                 if sent {
-                    await hooks.signalMCPInstructionDelivered(session)
+                    await hooks.continuation.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
                     releaseSupersedingProtectionIfUnused()
@@ -495,9 +433,9 @@ final class AgentModeRunService {
 
     private func failBeforeProviderStartup(session: AgentModeViewModel.TabSession, message: String) async {
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .failed,
@@ -626,13 +564,13 @@ final class AgentModeRunService {
                 session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
             }
             session.mcpFollowUpRunPending = true
-            hooks.startFollowUpRun(tabID, first)
+            hooks.continuation.startFollowUpRun(session, first)
             return
         }
         session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
         session.isDirty = true
-        hooks.updateBindings(session)
-        hooks.scheduleSave(tabID)
+        hooks.bindingObservation.updateBindings(session)
+        hooks.persistence.scheduleSave(session)
     }
 
     /// Claims superseding protection for the currently outstanding Claude turn when
@@ -840,7 +778,7 @@ final class AgentModeRunService {
                     return session.pendingNonCodexUserInputTokenQueue.removeFirst()
                 }()
 
-                let augmentedSteeringText = await hooks.augmentUserMessageForProviderSend(
+                let augmentedSteeringText = await hooks.providerInput.augmentUserMessageForProviderSend(
                     steering.providerText,
                     steering.attachments,
                     steering.taggedFileAttachments,
@@ -853,9 +791,9 @@ final class AgentModeRunService {
                     attachments: []
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) sent=\(sent)")
-                hooks.recordPendingHandoffSendOutcome(session, sent)
+                hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
                 if sent {
-                    await hooks.signalMCPInstructionDelivered(session)
+                    await hooks.continuation.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
                     // Re-insert the failed instruction so it's included in the restore
@@ -926,7 +864,7 @@ final class AgentModeRunService {
     ) {
         guard !drafts.isEmpty else { return }
         let combined = drafts.joined(separator: "\n")
-        hooks.restoreDraftText(tabID, combined, "Restored queued steering messages", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(tabID, combined, "Restored queued steering messages", strategy)
     }
 
     private func restoreAllQueuedDraftsForExecutionLocationChange(
@@ -942,7 +880,7 @@ final class AgentModeRunService {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
         guard !drafts.isEmpty else { return }
-        hooks.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
     }
 
     /// Concatenates all queued Claude steering draft texts and restores them to the composer.
@@ -970,20 +908,20 @@ final class AgentModeRunService {
         {
             await terminalCommitBarrier.awaitTerminalPublication(
                 for: revision.ownership,
-                session: session
+                lifecycle: session.runLifecycle
             )
             if completion == .terminalTeardownCompleted {
                 await terminalCommitBarrier.awaitTerminalTeardown(
                     for: revision.ownership,
-                    session: session
+                    lifecycle: session.runLifecycle
                 )
             }
             return
         }
-        hooks.cancelPendingQuestion(session)
-        hooks.cancelPendingApproval(session)
-        hooks.cancelPendingApplyEditsReview(session, "Run cancelled")
-        hooks.cancelPendingWorktreeMergeReview(session, "Run cancelled")
+        hooks.interactions.cancelPendingQuestion(session)
+        hooks.interactions.cancelPendingApproval(session)
+        hooks.interactions.cancelPendingApplyEditsReview(session, "Run cancelled")
+        hooks.interactions.cancelPendingWorktreeMergeReview(session, "Run cancelled")
 
         // Cancel steering flush tasks first so they don't race with cleanup.
         session.claudeSteeringFlushTask?.cancel()
@@ -1021,14 +959,9 @@ final class AgentModeRunService {
         }
 
         // Cancel all active MCP tool executions for this run (all providers) before stopping providers.
-        let cancellationReason = switch intent {
-        case .userStop: "user_stop"
-        case .executionLocationChange: "execution_location_change"
-        case .runtimeShutdown: "runtime_shutdown"
-        }
         cancelToolsBeforeStoppingProvider(
             session: session,
-            reason: cancellationReason
+            reason: intent.cancellationReason
         )
 
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.cancel")
@@ -1049,7 +982,7 @@ final class AgentModeRunService {
         }
 
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: expectedRunID,
             terminalState: .cancelled,
@@ -1095,7 +1028,9 @@ final class AgentModeRunService {
                     }
                 }
                 session.provider = nil
-                session.runID = nil
+                // Barrier-validated: the terminal-commit barrier re-checked
+                // expectedRunID synchronously before invoking this closure.
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 guard let provider, !hasAttemptTerminalResources else { return nil }
                 return { await provider.dispose() }
             }
@@ -1103,7 +1038,7 @@ final class AgentModeRunService {
         if completion == .terminalTeardownCompleted {
             await terminalCommitBarrier.awaitTerminalTeardown(
                 for: ownership,
-                session: session
+                lifecycle: session.runLifecycle
             )
         }
     }

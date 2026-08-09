@@ -231,24 +231,94 @@ struct WorkspaceMenuQuery {
 }
 
 struct DomainWorkspaceAuthorityIssue: Equatable, Identifiable {
+    enum Kind: String, Equatable {
+        case externalConflict
+        case degradedReadOnly
+        case removed
+        case commandFailure
+        case projectionFailure
+    }
+
     let id: UUID
     let workspaceID: UUID?
     let operation: String
-    let message: String
-    let canResolveExternalConflict: Bool
+    let kind: Kind
+    let reason: String?
+    let diagnostic: String?
 
     init(
         id: UUID = UUID(),
         workspaceID: UUID?,
         operation: String,
-        message: String,
-        canResolveExternalConflict: Bool
+        kind: Kind,
+        reason: String? = nil,
+        diagnostic: String? = nil
     ) {
         self.id = id
         self.workspaceID = workspaceID
         self.operation = operation
-        self.message = message
-        self.canResolveExternalConflict = canResolveExternalConflict
+        self.kind = kind
+        self.reason = reason
+        self.diagnostic = diagnostic
+    }
+
+    var stableCode: String {
+        switch kind {
+        case .externalConflict: "workspace_external_conflict"
+        case .degradedReadOnly: "workspace_read_only_degraded"
+        case .removed: "workspace_unavailable"
+        case .commandFailure: "workspace_authority_command_failed"
+        case .projectionFailure: "workspace_authority_projection_failed"
+        }
+    }
+
+    var message: String {
+        switch kind {
+        case .externalConflict:
+            "Workspace authority reconciliation did not complete."
+        case .degradedReadOnly:
+            "This workspace is read-only until its persistence problem is resolved."
+        case .removed:
+            "This workspace is no longer available."
+        case .commandFailure, .projectionFailure:
+            diagnostic ?? reason ?? "The workspace authority operation failed."
+        }
+    }
+
+    var recoveryInstruction: String {
+        switch kind {
+        case .externalConflict:
+            "Refresh workspace authority and retry."
+        case .degradedReadOnly:
+            "Retry the workspace authority refresh after correcting the persistence problem."
+        case .removed:
+            "Select or open another workspace, then retry."
+        case .commandFailure, .projectionFailure:
+            "Retry after the workspace authority error is resolved."
+        }
+    }
+
+    var agentAdmissionMessage: String {
+        let preciseReason = reason ?? diagnostic ?? kind.rawValue
+        return "[\(stableCode)] agent_run.start blocked: \(preciseReason). \(recoveryInstruction)"
+    }
+}
+
+struct DomainWorkspaceAuthorityOperationError: LocalizedError {
+    let outcome: DomainCommandOutcome
+
+    var errorDescription: String? {
+        let code = outcome.errorCode?.rawValue ?? "workspace_authority_command_failed"
+        let diagnostic = outcome.diagnostic ?? outcome.disposition.rawValue
+        return "[\(code)] \(diagnostic)."
+    }
+}
+
+private enum WorkspaceDirectWriteError: LocalizedError {
+    case domainAuthorityRequired
+
+    var errorDescription: String? {
+        "Runtime-owned workspaces must be written through the domain workspace authority."
     }
 }
 
@@ -259,6 +329,41 @@ enum WorkspaceOpenError: LocalizedError {
         switch self {
         case .noActiveWorkspace:
             "No active workspace. Open or create a workspace first."
+        }
+    }
+}
+
+enum WorkspacePersistenceOutcome: Equatable {
+    case persisted(workspaceID: UUID, stateVersion: Int)
+    case notRequired(workspaceID: UUID)
+    case rejected(reason: String)
+
+    var workspaceID: UUID? {
+        switch self {
+        case let .persisted(workspaceID, _), let .notRequired(workspaceID):
+            workspaceID
+        case .rejected:
+            nil
+        }
+    }
+
+    var acceptedForLifecycleAdmission: Bool {
+        switch self {
+        case .persisted, .notRequired:
+            true
+        case .rejected:
+            false
+        }
+    }
+
+    var diagnosticCategory: String {
+        switch self {
+        case .persisted:
+            "persisted"
+        case .notRequired:
+            "not_required"
+        case let .rejected(reason):
+            reason
         }
     }
 }
@@ -289,6 +394,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard oldValue != activeWorkspaceID else { return }
             workspaceSearchReadinessFence.publish(nil)
             refreshSelectionMirrorContextRevision()
+            synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "workspace_selection")
         }
     }
 
@@ -313,6 +419,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var domainWorkspaceFileURLsByID: [UUID: URL] = [:]
     private var domainWorkspaceRevisionsByID: [UUID: DomainRevisionState] = [:]
     private var domainWorkspaceDigestsByID: [UUID: String] = [:]
+    private var domainWorkspaceHealthByID: [UUID: DomainAuthorityHealth] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
@@ -561,6 +668,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             lastSyncedRepoPathsByWorkspaceID[workspaceID]
         }
 
+        func debugDomainAuthorityBaseline(
+            for workspaceID: UUID
+        ) -> (revisions: DomainRevisionState?, digest: String?, health: DomainAuthorityHealth?) {
+            (
+                domainWorkspaceRevisionsByID[workspaceID],
+                domainWorkspaceDigestsByID[workspaceID],
+                domainWorkspaceHealthByID[workspaceID]
+            )
+        }
+
         func debugPublishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) async {
             publishWorkingDocumentToDomainAuthority(workspace)
             await debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: workspace.id)
@@ -796,12 +913,33 @@ class WorkspaceManagerViewModel: ObservableObject {
     let workspaceSearchService: WorkspaceSearchService
     /// Non-nil only in production composition; nil is the isolated legacy test owner.
     private let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
+    private var agentSessionProjectionReconciler: ((
+        _ projectedWorkspaces: [WorkspaceModel],
+        _ currentWorkspaces: [WorkspaceModel]
+    ) -> AgentSessionLifecycleAuthority.ProjectionOutcome)?
     private var lastDomainProjectionSequence: UInt64 = 0
     private lazy var checkoutRefreshService = WorkspaceCheckoutRefreshService(
         store: fileManager.workspaceFileContextStore,
         searchService: workspaceSearchService
     )
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
+
+    #if DEBUG
+        private var workspacePersistenceOutcomeOverrideForTesting: WorkspacePersistenceOutcome?
+
+        func setWorkspacePersistenceOutcomeOverrideForTesting(_ outcome: WorkspacePersistenceOutcome?) {
+            workspacePersistenceOutcomeOverrideForTesting = outcome
+        }
+    #endif
+
+    func setAgentSessionProjectionReconciler(
+        _ reconciler: @escaping (
+            _ projectedWorkspaces: [WorkspaceModel],
+            _ currentWorkspaces: [WorkspaceModel]
+        ) -> AgentSessionLifecycleAuthority.ProjectionOutcome
+    ) {
+        agentSessionProjectionReconciler = reconciler
+    }
 
     var liveUISelectionRevision: UInt64 {
         fileManager.selectionStateRevision
@@ -2108,6 +2246,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                         digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                             ($0.document.workspaceID, $0.document.contentDigest)
                         }),
+                        healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                            ($0.document.workspaceID, $0.health)
+                        }),
                         catalogRevision: snapshot.catalogRevision,
                         preferredActiveWorkspaceID: activeWorkspaceID,
                         publicationSequence: snapshot.publicationSequence
@@ -2147,7 +2288,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     do {
-                        try loadedMutable.append(Self.loadWorkspaceFromFile(at: wURL))
+                        try loadedMutable.append(Self.loadWorkspaceFromFile(at: wURL, scheduleNormalizationWriteback: true))
                     } catch {
                         print("Error loading workspace from new scheme: \(error)")
                     }
@@ -2196,7 +2337,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
 
         do {
-            let diskWorkspace = try await Self.loadWorkspaceFromFileAsync(at: fileURL)
+            let diskWorkspace = try await Self.loadWorkspaceFromFileAsync(at: fileURL, scheduleNormalizationWriteback: false)
             guard let latestIndex = workspaceIndex(for: workspaceID) else { return }
             guard !hasLocalRepoPathEdit(for: workspaces[latestIndex]) else { return }
             let previousRepoPaths = workspaces[latestIndex].repoPaths
@@ -2243,7 +2384,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     do {
-                        let ws = try Self.loadWorkspaceFromFile(at: wURL)
+                        let ws = try Self.loadWorkspaceFromFile(at: wURL, scheduleNormalizationWriteback: false)
                         print("[WorkspaceSnapshot] Loaded \(ws.name): \(ws.repoPaths.count) repoPaths")
                         loaded.append(ws)
                     } catch {
@@ -2290,7 +2431,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
 
                 do {
-                    let ws = try Self.loadWorkspaceFromFile(at: wURL)
+                    let ws = try Self.loadWorkspaceFromFile(at: wURL, scheduleNormalizationWriteback: false)
                     updatesMutable.append((entry.id, ws.presets, ws.activePresetID))
                 } catch {
                     print("Error reloading presets for workspace \(entry.name): \(error)")
@@ -3384,7 +3525,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             let diskURL = workspaceFileURL(for: newWorkspace)
             if FileManager.default.fileExists(atPath: diskURL.path) {
                 do {
-                    let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL)
+                    let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL, scheduleNormalizationWriteback: false)
                     workspaces[wsIndex] = upgraded
                     recordRepoPathBaseline(for: upgraded)
                 } catch {
@@ -3401,7 +3542,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
 
             do {
-                let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL)
+                let upgraded = try await Self.loadWorkspaceFromFileAsync(at: diskURL, scheduleNormalizationWriteback: false)
                 workspaces.append(upgraded)
                 recordRepoPathBaseline(for: upgraded)
                 activeWorkspaceID = upgraded.id
@@ -4023,30 +4164,37 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceID: workspaceID,
             revisions: outcome.workspace?.revisions ?? outcome.after,
             digest: outcome.workspace?.document.contentDigest ?? outcome.resultingDigest,
+            health: outcome.workspace?.health,
             catalogRevision: outcome.catalogRevision
         )
-        if domainWorkspaceAuthorityIssue?.workspaceID == workspaceID,
-           outcome.disposition == .applied
+        if Self.isSuccessfulDomainOutcome(outcome),
+           domainWorkspaceAuthorityIssue?.workspaceID == workspaceID,
+           domainWorkspaceAuthorityIssue?.kind == .commandFailure
         {
-            domainWorkspaceAuthorityIssue = nil
+            publishDomainAuthorityIssueIfChanged(nil)
         }
+        synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_outcome")
     }
 
     func applyDomainAuthorityBaseline(
         workspaceID: UUID,
         revisions: DomainRevisionState,
         digest: String,
+        health: DomainAuthorityHealth,
         catalogRevision: UInt64
     ) {
         domainWorkspaceRevisionsByID[workspaceID] = revisions
         domainWorkspaceDigestsByID[workspaceID] = digest
+        domainWorkspaceHealthByID[workspaceID] = health
         domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
+        synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
     }
 
     private func applyDomainAuthorityBaseline(
         workspaceID: UUID,
         revisions: DomainRevisionState?,
         digest: String?,
+        health: DomainAuthorityHealth?,
         catalogRevision: UInt64
     ) {
         if let revisions {
@@ -4055,29 +4203,97 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let digest {
             domainWorkspaceDigestsByID[workspaceID] = digest
         }
+        if let health {
+            domainWorkspaceHealthByID[workspaceID] = health
+        }
         domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
     }
 
-    func reportDomainAuthorityIssue(_ outcome: DomainCommandOutcome, operation: String) {
-        let hasExternalConflict: Bool = if case .externalConflict = outcome.workspace?.health {
-            true
-        } else {
-            outcome.diagnostic?.contains("external") == true
+    private func authorityIssue(
+        workspaceID: UUID?,
+        operation: String,
+        health: DomainAuthorityHealth,
+        diagnostic: String? = nil
+    ) -> DomainWorkspaceAuthorityIssue? {
+        switch health {
+        case .writable:
+            nil
+        case let .externalConflict(reason):
+            DomainWorkspaceAuthorityIssue(
+                workspaceID: workspaceID,
+                operation: operation,
+                kind: .externalConflict,
+                reason: reason,
+                diagnostic: diagnostic
+            )
+        case let .degradedReadOnly(reason):
+            DomainWorkspaceAuthorityIssue(
+                workspaceID: workspaceID,
+                operation: operation,
+                kind: .degradedReadOnly,
+                reason: reason,
+                diagnostic: diagnostic
+            )
+        case .removed:
+            DomainWorkspaceAuthorityIssue(
+                workspaceID: workspaceID,
+                operation: operation,
+                kind: .removed,
+                reason: health.reason,
+                diagnostic: diagnostic
+            )
         }
-        let nextIssue = DomainWorkspaceAuthorityIssue(
-            workspaceID: outcome.workspace?.document.workspaceID,
+    }
+
+    private func publishDomainAuthorityIssueIfChanged(_ issue: DomainWorkspaceAuthorityIssue?) {
+        guard domainWorkspaceAuthorityIssue?.workspaceID != issue?.workspaceID
+            || domainWorkspaceAuthorityIssue?.operation != issue?.operation
+            || domainWorkspaceAuthorityIssue?.kind != issue?.kind
+            || domainWorkspaceAuthorityIssue?.reason != issue?.reason
+            || domainWorkspaceAuthorityIssue?.diagnostic != issue?.diagnostic
+        else { return }
+        domainWorkspaceAuthorityIssue = issue
+    }
+
+    private func synchronizeDomainAuthorityIssueForActiveWorkspace(operation: String) {
+        guard let activeWorkspaceID,
+              let health = domainWorkspaceHealthByID[activeWorkspaceID]
+        else { return }
+        if let issue = authorityIssue(
+            workspaceID: activeWorkspaceID,
             operation: operation,
-            message: outcome.diagnostic ?? outcome.disposition.rawValue,
-            canResolveExternalConflict: hasExternalConflict
-        )
-        if domainWorkspaceAuthorityIssue?.workspaceID != nextIssue.workspaceID
-            || domainWorkspaceAuthorityIssue?.operation != nextIssue.operation
-            || domainWorkspaceAuthorityIssue?.message != nextIssue.message
-            || domainWorkspaceAuthorityIssue?.canResolveExternalConflict != nextIssue.canResolveExternalConflict
+            health: health
+        ) {
+            publishDomainAuthorityIssueIfChanged(issue)
+        } else if let current = domainWorkspaceAuthorityIssue,
+                  current.kind == .externalConflict
+                  || current.kind == .degradedReadOnly
+                  || current.kind == .removed
         {
-            domainWorkspaceAuthorityIssue = nextIssue
+            publishDomainAuthorityIssueIfChanged(nil)
         }
-        if let workspaceID = outcome.workspace?.document.workspaceID,
+    }
+
+    func reportDomainAuthorityIssue(_ outcome: DomainCommandOutcome, operation: String) {
+        let workspaceID = outcome.workspace?.document.workspaceID
+        if let workspace = outcome.workspace,
+           let healthIssue = authorityIssue(
+               workspaceID: workspaceID,
+               operation: operation,
+               health: workspace.health,
+               diagnostic: outcome.diagnostic
+           )
+        {
+            publishDomainAuthorityIssueIfChanged(healthIssue)
+        } else {
+            publishDomainAuthorityIssueIfChanged(DomainWorkspaceAuthorityIssue(
+                workspaceID: workspaceID,
+                operation: operation,
+                kind: .commandFailure,
+                diagnostic: outcome.diagnostic ?? outcome.disposition.rawValue
+            ))
+        }
+        if let workspaceID,
            let workspace = workspace(withID: workspaceID)
         {
             WorkspaceSaveTracer.event(
@@ -4087,18 +4303,21 @@ class WorkspaceManagerViewModel: ObservableObject {
                 extra: [
                     "operation": operation,
                     "disposition": outcome.disposition.rawValue,
-                    "errorCode": outcome.errorCode?.rawValue ?? "none"
+                    "errorCode": outcome.errorCode?.rawValue ?? "none",
+                    "authorityHealth": String(describing: outcome.workspace?.health ?? .removed),
+                    "authorityReason": outcome.workspace?.health.reason ?? "none"
                 ]
             )
         }
     }
 
     func reportDomainProjectionFailure(_ error: Error) {
-        reportDomainAuthorityFailure(
-            error,
+        publishDomainAuthorityIssueIfChanged(DomainWorkspaceAuthorityIssue(
             workspaceID: nil,
-            operation: "projection"
-        )
+            operation: "projection",
+            kind: .projectionFailure,
+            diagnostic: error.localizedDescription
+        ))
     }
 
     func reportDomainAuthorityFailure(
@@ -4106,51 +4325,51 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID: UUID?,
         operation: String
     ) {
-        domainWorkspaceAuthorityIssue = DomainWorkspaceAuthorityIssue(
+        publishDomainAuthorityIssueIfChanged(DomainWorkspaceAuthorityIssue(
             workspaceID: workspaceID,
             operation: operation,
-            message: error.localizedDescription,
-            canResolveExternalConflict: false
-        )
+            kind: .commandFailure,
+            diagnostic: error.localizedDescription
+        ))
         Self.logger.error("Domain workspace authority \(operation, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
-    }
-
-    @discardableResult
-    func resolveDomainWorkspaceConflict(
-        workspaceID: UUID,
-        acceptExternal: Bool
-    ) async -> Bool {
-        guard let domainWorkspaceAuthorityClient else { return false }
-        let outcome = await domainWorkspaceAuthorityClient.resolveConflict(
-            workspaceID: workspaceID,
-            acceptExternal: acceptExternal,
-            expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
-                workspaceID
-            ]?.workingRevision
-        )
-        applyDomainAuthorityOutcome(outcome, workspaceID: workspaceID)
-        guard Self.isSuccessfulDomainOutcome(outcome) else {
-            reportDomainAuthorityIssue(outcome, operation: "resolve_external_conflict")
-            return false
-        }
-        domainWorkspaceAuthorityIssue = nil
-        return true
     }
 
     func refreshDomainWorkspaceAuthority() async {
         guard let domainWorkspaceAuthorityClient else { return }
         let snapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
-        if let conflict = snapshot.workspaces.first(where: {
-            if case .externalConflict = $0.health { return true }
-            return false
-        }) {
-            domainWorkspaceAuthorityIssue = DomainWorkspaceAuthorityIssue(
-                workspaceID: conflict.document.workspaceID,
-                operation: "external_refresh",
-                message: "The saved workspace changed while local working state is dirty.",
-                canResolveExternalConflict: true
+        for workspace in snapshot.workspaces {
+            applyDomainAuthorityBaseline(
+                workspaceID: workspace.document.workspaceID,
+                revisions: workspace.revisions,
+                digest: workspace.document.contentDigest,
+                health: workspace.health,
+                catalogRevision: snapshot.catalogRevision
             )
         }
+        synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "external_refresh")
+    }
+
+    func domainAuthorityAdmissionIssue(for workspaceID: UUID) async -> DomainWorkspaceAuthorityIssue? {
+        guard let domainWorkspaceAuthorityClient else { return nil }
+        guard let snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID) else {
+            return authorityIssue(
+                workspaceID: workspaceID,
+                operation: "agent_admission",
+                health: .removed
+            )
+        }
+        applyDomainAuthorityBaseline(
+            workspaceID: workspaceID,
+            revisions: snapshot.revisions,
+            digest: snapshot.document.contentDigest,
+            health: snapshot.health,
+            catalogRevision: domainWorkspaceCatalogRevision
+        )
+        return authorityIssue(
+            workspaceID: workspaceID,
+            operation: "agent_admission",
+            health: snapshot.health
+        )
     }
 
     private static func isSuccessfulDomainOutcome(_ outcome: DomainCommandOutcome) -> Bool {
@@ -4164,6 +4383,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileURLsByWorkspaceID: [UUID: URL],
         revisionsByWorkspaceID: [UUID: DomainRevisionState],
         digestsByWorkspaceID: [UUID: String],
+        healthByWorkspaceID: [UUID: DomainAuthorityHealth],
         catalogRevision: UInt64,
         preferredActiveWorkspaceID: UUID?,
         publicationSequence: UInt64
@@ -4182,6 +4402,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             domainWorkspaceFileURLsByID = fileURLsByWorkspaceID
             domainWorkspaceRevisionsByID = revisionsByWorkspaceID
             domainWorkspaceDigestsByID = digestsByWorkspaceID
+            domainWorkspaceHealthByID = healthByWorkspaceID
             domainWorkspaceCatalogRevision = catalogRevision
         } else {
             let trackedWorkspaceIDs = Set(confirmedDomainReadRegistrationsByWorkspaceID.keys)
@@ -4190,15 +4411,49 @@ class WorkspaceManagerViewModel: ObservableObject {
                 invalidateDomainReadRegistration(for: workspaceID)
             }
         }
-        workspaces = projectedWorkspaces
-        recordRepoPathBaselines(for: projectedWorkspaces)
+        let lifecycleProjection = agentSessionProjectionReconciler?(
+            projectedWorkspaces,
+            workspaces
+        )
+        let reconciledWorkspaces = lifecycleProjection?.workspaces ?? projectedWorkspaces
+        workspaces = reconciledWorkspaces
+        recordRepoPathBaselines(for: reconciledWorkspaces)
         if let preferredActiveWorkspaceID,
-           projectedWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
+           reconciledWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
         {
             activeWorkspaceID = preferredActiveWorkspaceID
-        } else if !projectedWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
-            activeWorkspaceID = projectedWorkspaces.first?.id
+        } else if !reconciledWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
+            activeWorkspaceID = reconciledWorkspaces.first?.id
         }
+        if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
+            for workspaceID in protectedWorkspaceIDs {
+                bumpStateVersion(for: workspaceID)
+            }
+        }
+        if domainWorkspaceAuthorityIssue?.kind == .projectionFailure {
+            publishDomainAuthorityIssueIfChanged(nil)
+        }
+        synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
+    }
+
+    func applyDomainAuthorityMetadataProjection(
+        revisionsByWorkspaceID: [UUID: DomainRevisionState],
+        digestsByWorkspaceID: [UUID: String],
+        healthByWorkspaceID: [UUID: DomainAuthorityHealth],
+        catalogRevision: UInt64,
+        publicationSequence: UInt64
+    ) {
+        guard publicationSequence >= lastDomainProjectionSequence else { return }
+        lastDomainProjectionSequence = publicationSequence
+        invalidateConfirmedDomainReadRegistrations(
+            previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
+            projectedDigestsByWorkspaceID: digestsByWorkspaceID
+        )
+        domainWorkspaceRevisionsByID = revisionsByWorkspaceID
+        domainWorkspaceDigestsByID = digestsByWorkspaceID
+        domainWorkspaceHealthByID = healthByWorkspaceID
+        domainWorkspaceCatalogRevision = catalogRevision
+        synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_health_projection")
     }
 
     func collectComposeTabSnapshot(name: String, base: ComposeTabState? = nil) -> ComposeTabState {
@@ -5431,7 +5686,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             object: nil,
             userInfo: [
                 "windowID": promptViewModel.windowID,
-                "workspaceID": active.id
+                "workspaceID": workspaceID
             ]
         )
 
@@ -5453,14 +5708,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         scheduleSave(workspaceID: workspaceID, fileURL: fileURL, source: source)
     }
 
-    func pollAndSaveStateAsync(source: WorkspaceSaveSource = .pollAndSaveStateAsync) async {
-        guard let active = activeWorkspace else { return }
+    func pollAndSaveStateAsync(
+        source: WorkspaceSaveSource = .pollAndSaveStateAsync
+    ) async {
+        _ = await pollAndSaveStateWithOutcomeAsync(source: source)
+    }
 
-        let wsID = active.id
+    func pollAndSaveStateWithOutcomeAsync(
+        workspaceID requestedWorkspaceID: UUID? = nil,
+        source: WorkspaceSaveSource = .pollAndSaveStateAsync
+    ) async -> WorkspacePersistenceOutcome {
+        guard let wsID = requestedWorkspaceID ?? activeWorkspace?.id,
+              workspace(withID: wsID) != nil
+        else {
+            return .rejected(reason: "active_workspace_unavailable")
+        }
         let cur = stateVersionByWorkspaceID[wsID, default: 0]
         let last = lastSavedVersionByWorkspaceID[wsID, default: -1]
 
-        guard cur != last else { return } // not dirty → nothing to do
+        guard cur != last else { return .notRequired(workspaceID: wsID) } // not dirty → nothing to do
 
         // Post notification to allow SwiftUI views to flush pending state
         NotificationCenter.default.post(
@@ -5468,36 +5734,59 @@ class WorkspaceManagerViewModel: ObservableObject {
             object: nil,
             userInfo: [
                 "windowID": promptViewModel.windowID,
-                "workspaceID": active.id
+                "workspaceID": wsID
             ]
         )
 
-        // Call before-save listeners on the active
-        if let active = activeWorkspace {
+        // Call before-save listeners for the workspace this admission is saving.
+        if let targetWorkspace = workspace(withID: wsID) {
             for listenerRecord in beforeSaveListeners {
-                listenerRecord.listener(active)
+                listenerRecord.listener(targetWorkspace)
             }
         }
 
-        guard let index = workspaceIndex(for: wsID) else { return }
+        guard let index = workspaceIndex(for: wsID) else {
+            return .rejected(reason: "workspace_changed_before_capture")
+        }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
-        guard let capturedWorkspace = workspace(withID: wsID) else { return }
+        guard let capturedWorkspace = workspace(withID: wsID) else {
+            return .rejected(reason: "workspace_changed_after_capture")
+        }
         let fileURL = workspaceFileURL(for: capturedWorkspace)
         reloadComposeTabsAfterSaveCaptureIfNeeded(capturedWorkspace, capturedSnapshot: snapshot)
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
+        #if DEBUG
+            if let workspacePersistenceOutcomeOverrideForTesting {
+                return workspacePersistenceOutcomeOverrideForTesting
+            }
+        #endif
         guard let savedStateVersion = await saveWorkspaceAsync(
             workspaceID: wsID,
             fileURL: fileURL,
             source: source
-        ) else { return }
+        ) else {
+            let issueCategory = if domainWorkspaceAuthorityIssue?.message
+                .localizedCaseInsensitiveContains("workspace_not_writable") == true
+            {
+                "workspace_not_writable"
+            } else {
+                "workspace_save_failed"
+            }
+            return .rejected(
+                reason: issueCategory
+            )
+        }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
-        guard workspace(withID: wsID) != nil else { return }
+        guard workspace(withID: wsID) != nil else {
+            return .rejected(reason: "workspace_changed_after_save")
+        }
         lastSavedVersionByWorkspaceID[wsID] = max(
             lastSavedVersionByWorkspaceID[wsID, default: -1],
             savedStateVersion
         )
+        return .persisted(workspaceID: wsID, stateVersion: savedStateVersion)
     }
 
     func restoreWorkspaceState(
@@ -6048,7 +6337,11 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let diskSnapshot = await loadWorkspaceSnapshotFromDisk()
         if !diskSnapshot.isEmpty {
-            workspaces = diskSnapshot
+            let lifecycleProjection = agentSessionProjectionReconciler?(
+                diskSnapshot,
+                workspaces
+            )
+            workspaces = lifecycleProjection?.workspaces ?? diskSnapshot
         }
 
         let activeWorkspaceIDs = Set(windowStates.allWindows.compactMap { $0.workspaceManager.activeWorkspace?.id })
@@ -8030,6 +8323,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return result.savedStateVersion
             } catch is CancellationError {
                 return nil
+            } catch let error as DomainWorkspaceAuthorityOperationError {
+                reportDomainAuthorityIssue(error.outcome, operation: "save_workspace")
+                return nil
             } catch {
                 reportDomainAuthorityFailure(
                     error,
@@ -8074,7 +8370,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
 
                 let diskWorkspace: WorkspaceModel? = if fm.fileExists(atPath: fileURL.path) {
-                    try? Self.loadWorkspaceFromFile(at: fileURL)
+                    try? Self.loadWorkspaceFromFile(at: fileURL, scheduleNormalizationWriteback: false)
                 } else {
                     nil
                 }
@@ -8201,7 +8497,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let mergeResult = await Task.detached(priority: .utility) {
             let diskWorkspace: WorkspaceModel? = if FileManager.default.fileExists(atPath: targetURL.path) {
-                try? Self.loadWorkspaceFromFile(at: targetURL)
+                try? Self.loadWorkspaceFromFile(at: targetURL, scheduleNormalizationWriteback: false)
             } else {
                 nil
             }
@@ -8269,11 +8565,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         applyDomainAuthorityOutcome(outcome, workspaceID: workspaceToSave.id)
         guard Self.isSuccessfulDomainOutcome(outcome) else {
-            throw NSError(
-                domain: "RepoPrompt.DomainWorkspaceAuthority",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: outcome.diagnostic ?? outcome.disposition.rawValue]
-            )
+            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
         }
 
         if let index = workspaceIndex(for: workspaceToSave.id) {
@@ -8333,7 +8625,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if preserveDiskRepoPathsIfUnchangedSinceBaseline,
            FileManager.default.fileExists(atPath: targetURL.path)
         {
-            let diskWorkspace = try? Self.loadWorkspaceFromFile(at: targetURL)
+            let diskWorkspace = try? Self.loadWorkspaceFromFile(at: targetURL, scheduleNormalizationWriteback: false)
             let mergeResult = Self.workspaceForSavePreservingDiskRepoPaths(
                 current: workspace,
                 diskWorkspace: diskWorkspace,
@@ -8373,13 +8665,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         return finalURL
     }
 
-    nonisolated func saveWorkspaceToFileAsync(_ workspace: WorkspaceModel, baseRoot: URL, metadata: WorkspaceSavePayloadMetadata? = nil) async throws -> URL {
-        // Encode JSON
-        let encoded = try JSONEncoder().encode(workspace)
+    func saveWorkspaceToFileAsync(
+        _ workspace: WorkspaceModel,
+        baseRoot: URL,
+        metadata: WorkspaceSavePayloadMetadata? = nil
+    ) async throws -> URL {
+        let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
+        guard domainWorkspaceAuthorityClient == nil else {
+            WorkspaceSaveTracer.event(
+                "workspaceSave.direct.denied",
+                metadata: metadata ?? workspaceSaveMetadata(for: workspace, source: .directUnknown),
+                url: finalURL,
+                extra: ["reason": "domain_authority_required"]
+            )
+            throw WorkspaceDirectWriteError.domainAuthorityRequired
+        }
 
-        // Prepare file path
-        let folder = try ensureWorkspaceDirectoryExists(for: workspace, baseRoot: baseRoot)
-        let finalURL = folder.appendingPathComponent("workspace.json")
+        // Encode JSON only after the authority check so a denied writer has no side effects.
+        let encoded = try JSONEncoder().encode(workspace)
+        _ = try ensureWorkspaceDirectoryExists(for: workspace, baseRoot: baseRoot)
 
         // Enqueue write to shared disk writer for serialization
         WorkspaceFileDecodeCache.shared.invalidate(url: finalURL)
@@ -8431,7 +8735,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     nonisolated static func loadWorkspaceFromFileResult(
         at fileURL: URL,
-        scheduleNormalizationWriteback: Bool = true
+        scheduleNormalizationWriteback: Bool
     ) throws -> WorkspaceFileLoadResult {
         let cachedResult = try WorkspaceFileDecodeCache.shared.loadWorkspace(at: fileURL)
         let normalizationSaveTask: Task<Void, Never>?
@@ -8477,13 +8781,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
-    nonisolated static func loadWorkspaceFromFile(at fileURL: URL) throws -> WorkspaceModel {
-        try loadWorkspaceFromFileResult(at: fileURL).workspace
+    nonisolated static func loadWorkspaceFromFile(
+        at fileURL: URL,
+        scheduleNormalizationWriteback: Bool
+    ) throws -> WorkspaceModel {
+        try loadWorkspaceFromFileResult(
+            at: fileURL,
+            scheduleNormalizationWriteback: scheduleNormalizationWriteback
+        ).workspace
     }
 
-    nonisolated static func loadWorkspaceFromFileAsync(at fileURL: URL) async throws -> WorkspaceModel {
+    nonisolated static func loadWorkspaceFromFileAsync(
+        at fileURL: URL,
+        scheduleNormalizationWriteback: Bool
+    ) async throws -> WorkspaceModel {
         try await Task.detached(priority: .utility) {
-            try Self.loadWorkspaceFromFile(at: fileURL)
+            try Self.loadWorkspaceFromFile(
+                at: fileURL,
+                scheduleNormalizationWriteback: scheduleNormalizationWriteback
+            )
         }.value
     }
 

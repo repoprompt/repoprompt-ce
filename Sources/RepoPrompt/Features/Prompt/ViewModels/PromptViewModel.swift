@@ -191,6 +191,11 @@ class PromptViewModel: ObservableObject {
         case failed
     }
 
+    enum DurableBackgroundComposeTabCreationResult: Equatable {
+        case created(ComposeTabState, WorkspacePersistenceOutcome)
+        case rejected(WorkspacePersistenceOutcome)
+    }
+
     typealias ComposeTabsWillCloseListener = @Sendable (_ tabIDs: Set<UUID>, _ reason: ComposeTabRemovalReason) async -> Void
     typealias ComposeTabsDidRemoveListener = @MainActor @Sendable (
         _ tabIDs: Set<UUID>,
@@ -2738,6 +2743,79 @@ class PromptViewModel: ObservableObject {
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         return newTab
+    }
+
+    /// Transactional primitive used by Agent-session lifecycle admission.
+    /// The tab is created already bound to its intended durable session identity and
+    /// is not returned to provider-start callers until the workspace authority accepts it.
+    @MainActor
+    func createDurableBackgroundAgentSessionTab(
+        name: String?,
+        sessionID: UUID,
+        lifecycleAuthority: AgentSessionLifecycleAuthority
+    ) async -> DurableBackgroundComposeTabCreationResult {
+        guard
+            let manager = workspaceManager,
+            let workspace = manager.activeWorkspace,
+            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
+            let newTab = makeComposeTab(
+                for: .blank,
+                explicitName: name,
+                workspaceIndex: index,
+                manager: manager,
+                blankAgentSessionID: sessionID
+            )
+        else {
+            return .rejected(.rejected(reason: "workspace_unavailable"))
+        }
+
+        flushAndSnapshotSourceTabIfNeeded(for: .blank, in: manager, workspaceIndex: index)
+        manager.workspaces[index].composeTabs.append(newTab)
+        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        manager.markWorkspaceDirty()
+
+        let persistence = await manager.pollAndSaveStateWithOutcomeAsync(
+            workspaceID: workspace.id,
+            source: WorkspaceSaveSource("agentSessionLifecycleAdmission")
+        )
+        let bindingStillCurrent = manager.workspaces
+            .first(where: { $0.id == workspace.id })?
+            .composeTabs.contains(where: {
+                $0.id == newTab.id && $0.activeAgentSessionID == sessionID
+            }) == true
+        guard lifecycleAuthority.decideAdmission(
+            persistence: persistence,
+            targetWorkspaceID: workspace.id,
+            bindingStillCurrent: bindingStillCurrent
+        ) == .commit else {
+            rollbackProvisionalAgentSessionTab(
+                newTab.id,
+                workspaceID: workspace.id,
+                manager: manager
+            )
+            return .rejected(persistence)
+        }
+
+        return .created(newTab, persistence)
+    }
+
+    @MainActor
+    private func rollbackProvisionalAgentSessionTab(
+        _ tabID: UUID,
+        workspaceID: UUID,
+        manager: WorkspaceManagerViewModel
+    ) {
+        guard let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else {
+            return
+        }
+        manager.workspaces[index].composeTabs.removeAll { $0.id == tabID }
+        manager.workspaces[index].stashedTabs.removeAll { $0.tab.id == tabID }
+        if manager.workspaces[index].activeComposeTabID == tabID {
+            manager.workspaces[index].activeComposeTabID = manager.workspaces[index].composeTabs.first?.id
+        }
+        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        dirtyTabIDs.remove(tabID)
+        manager.markWorkspaceDirty()
     }
 
     /// Switch to a compose tab and wait for the tab state to fully apply.

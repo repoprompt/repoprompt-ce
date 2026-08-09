@@ -69,6 +69,15 @@ actor DirectHeadlessProviderCoordinator {
         ]
     }
 
+    static func codexExecArguments(model: String?) -> [String] {
+        var arguments: [String] = []
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
+            arguments += ["--model", model]
+        }
+        arguments += ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        return arguments
+    }
+
     func runProviderOnce(
         message: String,
         providerID: String?,
@@ -82,11 +91,7 @@ actor DirectHeadlessProviderCoordinator {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
         let snapshot = try await context.snapshot(for: request)
-        var arguments: [String] = []
-        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
-            arguments += ["--model", model]
-        }
-        arguments += ["exec", "--json", "--skip-git-repo-check", "--full-auto", "-"]
+        let arguments = Self.codexExecArguments(model: model)
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
@@ -160,15 +165,13 @@ actor DirectHeadlessProviderCoordinator {
                     request: capturedRequest,
                     carrierEnvironment: capturedCarrierEnvironment
                 )
-                await finishAgent(sessionID: sessionID, status: .completed, text: text, reason: nil)
+                await finishAgent(sessionID: sessionID, outcome: .completed(assistantText: text))
             } catch is CancellationError {
-                await finishAgent(sessionID: sessionID, status: .cancelled, text: nil, reason: .cancelled)
+                await finishAgent(sessionID: sessionID, outcome: .cancelled())
             } catch {
                 await finishAgent(
                     sessionID: sessionID,
-                    status: .failed,
-                    text: error.localizedDescription,
-                    reason: .agentError
+                    outcome: .failed(assistantText: error.localizedDescription)
                 )
             }
         }
@@ -329,17 +332,24 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
+    /// Settles one agent run through the neutral terminal-outcome contract.
+    /// The canonical exactly-once settlement stays owned by
+    /// `DomainAgentRunSessionStore.publishTerminal`.
     private func finishAgent(
         sessionID: UUID,
-        status: DomainAgentRunSnapshot.Status,
-        text: String?,
-        reason: DomainAgentRunSnapshot.FailureReason?
+        outcome: DomainAgentRunTerminalOutcome
     ) async {
         guard var record = agents[sessionID] else { return }
-        record.latestText = text
+        record.latestText = outcome.assistantText
         record.task = nil
         agents[sessionID] = record
-        let terminal = snapshot(record: record, status: status, statusText: text, assistantText: text, failure: reason)
+        let terminal = snapshot(
+            record: record,
+            status: outcome.snapshotStatus,
+            statusText: outcome.assistantText,
+            assistantText: outcome.assistantText,
+            failure: outcome.failureReason
+        )
         _ = await runtime.agentSessionStore.publishTerminal(
             DomainAgentRunTerminalPublicationEnvelope(epoch: record.epoch, snapshot: terminal),
             registration: record.registration,

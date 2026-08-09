@@ -237,6 +237,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let fable5Raw = "claude-fable-5"
     private static let opus1mRaw = "opus[1m]"
     private static let opus5Raw = "claude-opus-5"
+    private static let opus48Raw = "claude-opus-4-8"
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
@@ -268,6 +269,12 @@ public enum ClaudeCompatibleModelCatalog {
             rawValue: opus5Raw,
             displayName: "Opus 5",
             description: "Pinned Claude Opus 5 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.219 or newer.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: opus48Raw,
+            displayName: "Opus 4.8",
+            description: "Pinned Claude Opus 4.8 with native 1M context. Opus-tier capability for complex reasoning and architecture.",
             supportsXHigh: true
         ),
         StaticModel(

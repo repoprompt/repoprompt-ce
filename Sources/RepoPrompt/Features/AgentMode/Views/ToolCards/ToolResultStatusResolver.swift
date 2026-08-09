@@ -1,8 +1,30 @@
 import Foundation
 
 enum ToolResultStatusResolver {
-    static func resolve(toolIsError: Bool?, raw: String?, fallback: ToolCardStatus) -> ToolCardStatus {
-        guard let object = ToolRawJSON.object(from: raw) else {
+    /// Resolves the presentation status for a tool result payload.
+    /// Classification is deterministic for a given `(toolIsError, raw,
+    /// fallback)` input, so the derived status is memoized via
+    /// `ToolCardProjectionCache` and reused across SwiftUI body evaluations.
+    static func resolve(
+        toolIsError: Bool?,
+        raw: String?,
+        fallback: ToolCardStatus,
+        cache: ToolCardProjectionCache = .shared
+    ) -> ToolCardStatus {
+        let variant = "status|e:\(toolIsError.map { $0 ? "1" : "0" } ?? "-")|f:\(fallback.projectionCacheDiscriminator)"
+        let resolved = cache.projection(ToolCardStatus.self, variant: variant, primary: raw) {
+            resolveUncached(toolIsError: toolIsError, raw: raw, fallback: fallback, cache: cache)
+        }
+        return resolved ?? fallback
+    }
+
+    private static func resolveUncached(
+        toolIsError: Bool?,
+        raw: String?,
+        fallback: ToolCardStatus,
+        cache: ToolCardProjectionCache
+    ) -> ToolCardStatus {
+        guard let object = ToolJSON.rawObject(from: raw, cache: cache) else {
             if toolIsError == true { return .failure }
             if toolIsError == false { return .success }
             return fallback
@@ -148,5 +170,18 @@ enum ToolResultStatusResolver {
         let normalized = AgentTranscriptToolStatusSemantics.normalizedStatusWord(value)
         let transcriptStatus = AgentTranscriptToolStatusSemantics.transcriptStatus(fromNormalizedStatusWord: normalized)
         return ToolCardStatus.fromTranscriptStatus(transcriptStatus)
+    }
+}
+
+private extension ToolCardStatus {
+    /// Stable cache-key discriminator for `ToolCardProjectionCache` variants.
+    var projectionCacheDiscriminator: String {
+        switch self {
+        case .running: "running"
+        case .success: "success"
+        case .warning: "warning"
+        case .failure: "failure"
+        case .neutral: "neutral"
+        }
     }
 }

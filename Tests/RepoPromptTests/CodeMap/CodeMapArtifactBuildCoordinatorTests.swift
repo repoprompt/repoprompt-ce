@@ -54,6 +54,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let queuedInput = try makeInput("bounds-queued", root: fixture.root)
         let busyInput = try makeInput("bounds-busy", root: fixture.root)
         let gate = CoordinatorTestGate()
+        let hookEvents = CoordinatorHookCondition()
         let coordinator = makeCoordinator(
             fixture: fixture,
             policy: CodeMapArtifactBuildCoordinatorPolicy(
@@ -66,7 +67,8 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
                 maximumConsecutiveDemandAdmissions: 2,
                 agePromotionNanoseconds: 1_000_000_000,
                 retryAfterMilliseconds: 17
-            )
+            ),
+            hooks: CodeMapArtifactBuildCoordinatorHooks { hookEvents.record($0) }
         ) { _, _, _ in
             await gate.enter()
             return .readyNoSymbols
@@ -75,7 +77,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let first = Task { try await coordinator.resolve(request(firstInput)) }
         await gate.waitUntilEntered()
         let queued = Task { try await coordinator.resolve(request(queuedInput)) }
-        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        try await hookEvents.waitUntil(
+            kind: .buildEnqueued,
+            artifactStorageDigest: queuedInput.artifactKey.storageDigestHex
+        )
+        let queuedAccounting = await coordinator.accounting()
+        XCTAssertEqual(queuedAccounting.queuedBuildCount, 1)
 
         do {
             _ = try await coordinator.resolve(request(busyInput))
@@ -232,7 +239,11 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         )
         XCTAssertEqual(input.artifactKey, finalWaiterInput.artifactKey)
         let gate = CoordinatorTestGate()
-        let coordinator = makeCoordinator(fixture: fixture) { _, _, _ in
+        let hookEvents = CoordinatorHookCondition()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            hooks: CodeMapArtifactBuildCoordinatorHooks { hookEvents.record($0) }
+        ) { _, _, _ in
             await gate.enter()
             return .readyNoSymbols
         }
@@ -246,7 +257,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         finalWaiter.cancel()
         await assertCancellation(finalWaiter)
         await gate.release()
-        try await waitUntil { await coordinator.accounting().activeFlightCount == 0 }
+        try await hookEvents.waitUntil(
+            kind: .flightCompleted,
+            artifactStorageDigest: input.artifactKey.storageDigestHex
+        )
+        let completedAccounting = await coordinator.accounting()
+        XCTAssertEqual(completedAccounting.activeFlightCount, 0)
 
         switch try await fixture.artifactStore.lookup(key: input.artifactKey) {
         case .miss: XCTFail("admitted non-preemptive build did not persist")
@@ -271,6 +287,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let casInput = try makeInput("cancel-during-cas", root: fixture.root)
         let insertGate = CoordinatorTestGate()
+        let casHookEvents = CoordinatorHookCondition()
         let storeClient = CodeMapArtifactStoreClient(
             lookup: { try await fixture.artifactStore.lookup(key: $0) },
             insert: { key, outcome in
@@ -283,14 +300,20 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let casCoordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: storeClient,
             locatorStore: GitBlobCodeMapLocatorStoreClient(store: fixture.locatorStore),
-            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols }),
+            hooks: CodeMapArtifactBuildCoordinatorHooks { casHookEvents.record($0) }
         )
         let casTask = Task { try await casCoordinator.resolve(request(casInput)) }
         await insertGate.waitUntilEntered()
         casTask.cancel()
         await assertCancellation(casTask)
         await insertGate.release()
-        try await waitUntil { await casCoordinator.accounting().activeFlightCount == 0 }
+        try await casHookEvents.waitUntil(
+            kind: .flightCompleted,
+            artifactStorageDigest: casInput.artifactKey.storageDigestHex
+        )
+        let completedCASAccounting = await casCoordinator.accounting()
+        XCTAssertEqual(completedCASAccounting.activeFlightCount, 0)
         _ = try await requireHit(fixture.artifactStore, key: casInput.artifactKey)
 
         let locatedInput = try await makeInput("cancel-during-locator", root: fixture.root, withLocator: true)
@@ -299,6 +322,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             deterministicOutcome: .readyNoSymbols
         )
         let locatorGate = CoordinatorTestGate()
+        let locatorHookEvents = CoordinatorHookCondition()
         let locatorClient = GitBlobCodeMapLocatorStoreClient(
             read: { try await fixture.locatorStore.read(identity: $0) },
             write: { association in
@@ -309,14 +333,20 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let locatorCoordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: CodeMapArtifactStoreClient(store: fixture.artifactStore),
             locatorStore: locatorClient,
-            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols }),
+            hooks: CodeMapArtifactBuildCoordinatorHooks { locatorHookEvents.record($0) }
         )
         let locatorTask = Task { try await locatorCoordinator.resolve(request(locatedInput)) }
         await locatorGate.waitUntilEntered()
         locatorTask.cancel()
         await assertCancellation(locatorTask)
         await locatorGate.release()
-        try await waitUntil { await locatorCoordinator.accounting().activeFlightCount == 0 }
+        try await locatorHookEvents.waitUntil(
+            kind: .flightCompleted,
+            artifactStorageDigest: locatedInput.artifactKey.storageDigestHex
+        )
+        let completedLocatorAccounting = await locatorCoordinator.accounting()
+        XCTAssertEqual(completedLocatorAccounting.activeFlightCount, 0)
         let publishedLocator = try await fixture.locatorStore.read(
             identity: XCTUnwrap(locatedInput.locatorIdentity)
         )
@@ -2056,6 +2086,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         fixture: CoordinatorFixture,
         policy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         clock: CodeMapArtifactBuildCoordinatorClock = .continuous,
+        hooks: CodeMapArtifactBuildCoordinatorHooks = .none,
         build: @escaping @Sendable (
             CodeMapArtifactBuildInput,
             UUID,
@@ -2067,7 +2098,8 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             locatorStore: GitBlobCodeMapLocatorStoreClient(store: fixture.locatorStore),
             builder: CodeMapArtifactBuilderClient(build: build),
             policy: policy,
-            clock: clock
+            clock: clock,
+            hooks: hooks
         )
     }
 
@@ -2514,6 +2546,29 @@ private actor CoordinatorHookRecorder {
 
     func append(_ event: CodeMapArtifactBuildCoordinatorHookEvent) {
         events.append(event)
+    }
+}
+
+private final class CoordinatorHookCondition: @unchecked Sendable {
+    private let events = AsyncTestCondition<[CodeMapArtifactBuildCoordinatorHookEvent]>([])
+
+    func record(_ event: CodeMapArtifactBuildCoordinatorHookEvent) {
+        events.update { $0.append(event) }
+    }
+
+    func waitUntil(
+        kind: CodeMapArtifactBuildCoordinatorHookKind,
+        artifactStorageDigest: String,
+        timeout: TimeInterval = TestFenceDefaults.enterWait
+    ) async throws {
+        try await events.waitUntil(
+            "coordinator hook \(kind.rawValue) for \(artifactStorageDigest)",
+            timeout: timeout
+        ) { events in
+            events.contains {
+                $0.kind == kind && $0.artifactStorageDigest == artifactStorageDigest
+            }
+        }
     }
 }
 

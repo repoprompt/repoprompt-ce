@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
     let tabID: UUID
@@ -435,6 +436,22 @@ extension AgentModeViewModel {
         let tabID: UUID
         let sessionID: UUID?
         let origin: Origin
+        let lifecycleIdentity: AgentSessionLifecycleAuthority.Identity?
+        let discardRestoreIndexEntry: AgentSessionIndexEntry?
+
+        init(
+            tabID: UUID,
+            sessionID: UUID?,
+            origin: Origin,
+            lifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = nil,
+            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil
+        ) {
+            self.tabID = tabID
+            self.sessionID = sessionID
+            self.origin = origin
+            self.lifecycleIdentity = lifecycleIdentity
+            self.discardRestoreIndexEntry = discardRestoreIndexEntry
+        }
     }
 
     struct AutoEditPermissionGuidance: Equatable {
@@ -468,11 +485,9 @@ extension AgentModeViewModel {
         }
     }
 
-    enum AttachmentTurnDisposition: Equatable {
-        case restoreToPending
-        case deleteFiles
-        case keepFiles
-    }
+    /// Compatibility alias for app call sites while terminal settlement uses the
+    /// provider-neutral domain command vocabulary directly.
+    typealias AttachmentTurnDisposition = DomainAgentRunAttachmentTurnDisposition
 
     enum AttachmentTurnState: Equatable {
         case idle

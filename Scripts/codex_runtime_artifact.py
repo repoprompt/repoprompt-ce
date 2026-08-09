@@ -28,7 +28,7 @@ DEFAULT_MANIFEST = ROOT / "Vendor" / "Codex" / "manifest.json"
 DEFAULT_CACHE_ROOT = ROOT / ".build" / "codex-runtime"
 # Compatibility authority shared with the schema-gate branch that must land first.
 # Pin rotations intentionally update these values and Vendor/Codex/manifest.json together.
-SUPPORTED_VERSION = "0.145.0"
+SUPPORTED_VERSION = "0.147.0"
 SUPPORTED_TAG = f"rust-v{SUPPORTED_VERSION}"
 OFFICIAL_REPOSITORY_URL = "https://github.com/openai/codex"
 OFFICIAL_RELEASE_URL = f"{OFFICIAL_REPOSITORY_URL}/releases/tag/{SUPPORTED_TAG}"

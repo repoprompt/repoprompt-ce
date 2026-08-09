@@ -44,9 +44,33 @@ final class MCPReadFileAutoSelectionCoordinator {
         let tabID: UUID
     }
 
+    enum AutomaticCodemapDisposition: Hashable {
+        case preserve
+        case disableAutomaticPreservingManual
+
+        func merging(_ other: AutomaticCodemapDisposition) -> AutomaticCodemapDisposition {
+            if self == .disableAutomaticPreservingManual || other == .disableAutomaticPreservingManual {
+                return .disableAutomaticPreservingManual
+            }
+            return .preserve
+        }
+    }
+
     enum Intent: Equatable {
-        case full(paths: [String])
-        case slices(entries: [WorkspaceSelectionSliceInput])
+        case full(
+            paths: [String],
+            automaticCodemapDisposition: AutomaticCodemapDisposition = .preserve
+        )
+        case slices(
+            entries: [WorkspaceSelectionSliceInput],
+            automaticCodemapDisposition: AutomaticCodemapDisposition = .preserve
+        )
+
+        var automaticCodemapDisposition: AutomaticCodemapDisposition {
+            switch self {
+            case let .full(_, disposition), let .slices(_, disposition): disposition
+            }
+        }
     }
 
     /// Exact normalized physical coverage requested by one complete canonical batch.
@@ -60,19 +84,20 @@ final class MCPReadFileAutoSelectionCoordinator {
 
         let fullPaths: [String]
         let slices: [Slice]
+        let automaticCodemapDisposition: AutomaticCodemapDisposition
 
         init?(intent: Intent, resolvedPaths: [String]) {
             var fullPathKeys = Set<String>()
             var rangesByPath: [String: [LineRange]] = [:]
 
             switch intent {
-            case let .full(paths):
+            case let .full(paths, _):
                 guard paths.count == resolvedPaths.count else { return nil }
                 for resolvedPath in resolvedPaths {
                     guard let path = Self.normalizedPhysicalPath(resolvedPath) else { return nil }
                     fullPathKeys.insert(path)
                 }
-            case let .slices(entries):
+            case let .slices(entries, _):
                 guard entries.count == resolvedPaths.count else { return nil }
                 for (entry, resolvedPath) in zip(entries, resolvedPaths) {
                     guard let path = Self.normalizedPhysicalPath(resolvedPath) else { return nil }
@@ -84,10 +109,18 @@ final class MCPReadFileAutoSelectionCoordinator {
                 }
             }
 
-            self.init(fullPathKeys: fullPathKeys, rangesByPath: rangesByPath)
+            self.init(
+                fullPathKeys: fullPathKeys,
+                rangesByPath: rangesByPath,
+                automaticCodemapDisposition: intent.automaticCodemapDisposition
+            )
         }
 
-        private init(fullPathKeys: Set<String>, rangesByPath: [String: [LineRange]]) {
+        private init(
+            fullPathKeys: Set<String>,
+            rangesByPath: [String: [LineRange]],
+            automaticCodemapDisposition: AutomaticCodemapDisposition
+        ) {
             fullPaths = fullPathKeys.sorted()
             slices = rangesByPath.keys
                 .filter { !fullPathKeys.contains($0) }
@@ -98,6 +131,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                     }
                     return ranges.isEmpty ? nil : Slice(path: path, ranges: ranges)
                 }
+            self.automaticCodemapDisposition = automaticCodemapDisposition
         }
 
         func merging(_ other: CoverageIdentity) -> CoverageIdentity {
@@ -107,10 +141,19 @@ final class MCPReadFileAutoSelectionCoordinator {
             for slice in other.slices {
                 rangesByPath[slice.path, default: []].append(contentsOf: slice.ranges)
             }
-            return CoverageIdentity(fullPathKeys: fullPathKeys, rangesByPath: rangesByPath)
+            return CoverageIdentity(
+                fullPathKeys: fullPathKeys,
+                rangesByPath: rangesByPath,
+                automaticCodemapDisposition: automaticCodemapDisposition.merging(other.automaticCodemapDisposition)
+            )
         }
 
         func isCovered(by physicalSelection: StoredSelection) -> Bool {
+            if automaticCodemapDisposition == .disableAutomaticPreservingManual,
+               physicalSelection.codemapAutoEnabled
+            {
+                return false
+            }
             let selectedPathKeys = Set(StoredSelectionPathNormalization.standardizedPaths(physicalSelection.selectedPaths))
             let normalizedSlices = StoredSelectionPathNormalization.standardizedSlices(physicalSelection.slices)
 
@@ -137,6 +180,32 @@ final class MCPReadFileAutoSelectionCoordinator {
             let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.hasPrefix("/") else { return nil }
             return StandardizedPath.absolute((trimmed as NSString).expandingTildeInPath)
+        }
+    }
+
+    static func authoritativeReadSelection(
+        _ expected: StoredSelection,
+        isPreservedBy candidate: StoredSelection
+    ) -> Bool {
+        let expectedWithoutAutomaticCodemaps = StoredSelection(
+            selectedPaths: expected.selectedPaths,
+            manualCodemapPaths: expected.manualCodemapPaths,
+            slices: expected.slices,
+            codemapAutoEnabled: false
+        )
+        return authoritativeSelection(expectedWithoutAutomaticCodemaps, isPreservedBy: candidate)
+    }
+
+    static func authoritativeSelection(
+        _ expected: StoredSelection,
+        isPreservedBy candidate: StoredSelection,
+        automaticCodemapDisposition: AutomaticCodemapDisposition
+    ) -> Bool {
+        switch automaticCodemapDisposition {
+        case .preserve:
+            authoritativeSelection(expected, isPreservedBy: candidate)
+        case .disableAutomaticPreservingManual:
+            authoritativeReadSelection(expected, isPreservedBy: candidate)
         }
     }
 
@@ -204,6 +273,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         private(set) var fullPaths: [String] = []
         private(set) var sliceEntries: [WorkspaceSelectionSliceInput] = []
         private(set) var coverageIdentity: CoverageIdentity?
+        private(set) var automaticCodemapDisposition: AutomaticCodemapDisposition = .preserve
 
         private var fullPathKeys = Set<String>()
         private var slicePathOrder: [String] = []
@@ -218,6 +288,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         }
 
         mutating func merge(_ intent: Intent, coverageIdentity incomingCoverageIdentity: CoverageIdentity? = nil) {
+            automaticCodemapDisposition = automaticCodemapDisposition.merging(intent.automaticCodemapDisposition)
             if coveragePermitted {
                 if let incomingCoverageIdentity {
                     coverageIdentity = coverageIdentity?.merging(incomingCoverageIdentity) ?? incomingCoverageIdentity
@@ -227,7 +298,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 }
             }
             switch intent {
-            case let .full(paths):
+            case let .full(paths, _):
                 for rawPath in paths {
                     guard let path = Self.trimmed(rawPath),
                           let key = StoredSelectionPathNormalization.standardizedPath(path)
@@ -238,7 +309,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                     sliceRangesByPath.removeValue(forKey: key)
                     originalSlicePathByKey.removeValue(forKey: key)
                 }
-            case let .slices(entries):
+            case let .slices(entries, _):
                 for entry in entries {
                     guard let path = Self.trimmed(entry.path),
                           let key = StoredSelectionPathNormalization.standardizedPath(path),

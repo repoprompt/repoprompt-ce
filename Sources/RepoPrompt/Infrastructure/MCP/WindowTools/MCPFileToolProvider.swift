@@ -398,27 +398,27 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             authority.lookupContext
         }
         try Task.checkCancellation()
-        let (worktreeScope, resolvedPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
+        let (worktreeScope, translatedLookupPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
             let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-            let resolvedPath = lookupContext.translateInputPath(path)
-            return (worktreeScope, resolvedPath)
+            let translatedLookupPath = lookupContext.translateInputPath(path)
+            return (worktreeScope, translatedLookupPath)
         }
         try Task.checkCancellation()
-        var readResult: (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
+        let unprojectedReadResult: MCPAppFileReadResult
         do {
-            readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
-                if let artifact = try await dependencies.files.readSelectedAuthorizedGitArtifact(
+            unprojectedReadResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
+                if let artifactReply = try await dependencies.files.readSelectedAuthorizedGitArtifact(
                     path,
-                    resolvedPath,
+                    translatedLookupPath,
                     startLine1Based,
                     limit,
                     metadata,
                     lookupContext
                 ) {
-                    return artifact
+                    return .nonSelecting(reply: artifactReply)
                 }
                 return try await dependencies.files.readFile(
-                    resolvedPath,
+                    translatedLookupPath,
                     startLine1Based,
                     limit,
                     lookupContext.rootScope
@@ -431,39 +431,55 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             ))
         }
         try Task.checkCancellation()
-        let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
+        let unprojectedReply = switch unprojectedReadResult {
+        case let .workspace(reply, _), let .nonSelecting(reply): reply
+        }
+        let projectedDisplayPath = unprojectedReply.displayPath.map { displayPath in
             lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
         }
-        readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
+        let readResult: MCPAppFileReadResult = try await EditFlowPerf.measure(
+            EditFlowPerf.Stage.ReadFile.providerReplyProjection
+        ) {
             let reply = try await MCPReadFileToolProjection.projectReply(
-                readResult.reply,
+                unprojectedReply,
                 displayPath: projectedDisplayPath,
                 worktreeScope: worktreeScope
             )
-            return (reply, readResult.shouldAutoSelect)
+            return switch unprojectedReadResult {
+            case let .workspace(_, absolutePhysicalPath):
+                .workspace(reply: reply, absolutePhysicalPath: absolutePhysicalPath)
+            case .nonSelecting:
+                .nonSelecting(reply: reply)
+            }
         }
         try Task.checkCancellation()
+        let autoSelectOutcome = switch readResult {
+        case .workspace: "attempted"
+        case .nonSelecting: "skipped"
+        }
         try await EditFlowPerf.measure(
             EditFlowPerf.Stage.ReadFile.providerAutoSelect,
-            EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
+            EditFlowPerf.Dimensions(outcome: autoSelectOutcome)
         ) {
-            if readResult.shouldAutoSelect {
-                let reply = readResult.reply
+            if case let .workspace(reply, absolutePhysicalPath) = readResult {
                 try await sideEffects.submitAndWait(fingerprint: "read_file_auto_selection") { [weak self] in
                     guard let self else { throw CancellationError() }
                     try await applyReadFileSideEffect(
                         reply: reply,
                         requestedPath: path,
-                        resolvedPath: resolvedPath,
+                        absolutePhysicalPath: absolutePhysicalPath,
                         metadata: metadata
                     )
                 }
             }
         }
         try Task.checkCancellation()
+        let projectedReply = switch readResult {
+        case let .workspace(reply, _), let .nonSelecting(reply): reply
+        }
         let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
             try await MCPProviderProjectionWorker.encode(
-                readResult.reply,
+                projectedReply,
                 toolName: MCPWindowToolName.readFile
             )
         }
@@ -884,13 +900,13 @@ final class MCPFileToolProvider: MCPAppToolProviding {
     private func applyReadFileSideEffect(
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String,
-        resolvedPath: String,
+        absolutePhysicalPath: String,
         metadata: MCPServerViewModel.RequestMetadata
     ) async throws {
         try await dependencies.files.enqueueReadFileAutoSelection(
             reply,
             requestedPath,
-            resolvedPath,
+            absolutePhysicalPath,
             metadata
         )
         // Historical read_file completion guaranteed queue admission, not completion of the
