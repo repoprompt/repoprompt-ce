@@ -321,16 +321,67 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             invocationID: UUID()
         )
         XCTAssertEqual(runSecurity.authorizedCanonicalRoots, [fixture.alternateWorktree.path])
-        let conversationRequest = try DomainPhysicalToolRequest(
-            argumentsJSON: JSONEncoder().encode(["message": Value.string("Report the working directory.")]),
-            securityContext: runSecurity
+        let contextBuilderSecurity = DomainToolInvocationSecurityContext(
+            principal: runSecurity.principal,
+            connectionID: runSecurity.connectionID,
+            connectionGeneration: runSecurity.connectionGeneration,
+            invocationID: UUID(),
+            runtimeID: runSecurity.runtimeID,
+            runtimeGeneration: runSecurity.runtimeGeneration,
+            workspaceID: runSecurity.workspaceID,
+            workspaceRevision: runSecurity.workspaceRevision,
+            authorizedCanonicalRoots: runSecurity.authorizedCanonicalRoots,
+            hasAuthoritativeRoutingContext: runSecurity.hasAuthoritativeRoutingContext,
+            ephemeralGrantedToolNames: runSecurity.ephemeralGrantedToolNames,
+            ephemeralGrantedOperations: runSecurity.ephemeralGrantedOperations.union([
+                "context_builder.ai_cost",
+                "context_builder.external_process"
+            ])
         )
-        let (_, conversationText) = try await prepared.providerCoordinator.createConversation(
-            providerID: nil,
-            message: "Report the working directory.",
-            model: nil,
-            request: conversationRequest
+        let preparedConversationCarrier = try await prepared.childLaunchCoordinator.prepare(
+            toolName: "context_builder",
+            arguments: ["instructions": .string("Report the working directory.")],
+            securityContext: contextBuilderSecurity
         )
+        let conversationCarrier = try XCTUnwrap(preparedConversationCarrier)
+        XCTAssertEqual(conversationCarrier.runID, sessionID)
+        let callbackPrincipal = DomainClientPrincipal(
+            principalID: UUID(),
+            stableKey: "test-conversation-callback",
+            displayName: "Test conversation callback",
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            processID: nil,
+            runID: conversationCarrier.runID,
+            provider: "test"
+        )
+        let callbackSecurity = await DirectHeadlessMCPService.securityContext(
+            prepared: prepared,
+            connection: DirectHeadlessMCPService.ConnectionContext(
+                connectionID: prepared.connectionID,
+                connectionGeneration: prepared.connectionGeneration,
+                principal: callbackPrincipal,
+                policyProfile: .direct,
+                restrictedToolNames: [],
+                additionalToolNames: [],
+                ephemeralGrantedOperations: []
+            ),
+            invocationID: UUID()
+        )
+        XCTAssertEqual(callbackSecurity.authorizedCanonicalRoots, [fixture.alternateWorktree.path])
+
+        let contextBuilderResolution = try await prepared.runtime.domainHost.resolve(
+            toolName: "context_builder",
+            scope: .standalone(id: prepared.scopeID)
+        )
+        let contextBuilderValue = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
+            invocationID: contextBuilderSecurity.invocationID,
+            connectionID: prepared.connectionID,
+            resolution: contextBuilderResolution,
+            arguments: ["instructions": .string("Report the working directory.")],
+            securityContext: contextBuilderSecurity
+        ))
+        let conversationText = try XCTUnwrap(contextBuilderValue.objectValue?["response"]?.stringValue)
         XCTAssertEqual(
             URL(fileURLWithPath: conversationText)
                 .standardizedFileURL.resolvingSymlinksInPath().path,

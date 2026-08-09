@@ -6,6 +6,62 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class DirectHeadlessChildEndpointTests: XCTestCase {
+    func testSessionStartsUseFreshRunIDsWhileProviderContinuationsReuseCallerScope() {
+        let parentRunID = UUID()
+        let securityContext = DomainToolInvocationSecurityContext(
+            principal: DomainClientPrincipal(
+                principalID: UUID(),
+                stableKey: "nested-parent",
+                displayName: "Nested parent",
+                kind: .runScoped,
+                assurance: .hostLaunchToken,
+                processID: nil,
+                runID: parentRunID,
+                provider: "test"
+            ),
+            connectionID: UUID(),
+            connectionGeneration: 1,
+            invocationID: UUID(),
+            runtimeID: UUID(),
+            runtimeGeneration: 1,
+            ephemeralGrantedToolNames: []
+        )
+
+        let firstAgentRunID = DirectHeadlessChildLaunchCoordinator.resolvedRunID(
+            toolName: "agent_run",
+            arguments: ["op": .string("start")],
+            securityContext: securityContext
+        )
+        let secondAgentRunID = DirectHeadlessChildLaunchCoordinator.resolvedRunID(
+            toolName: "agent_run",
+            arguments: ["op": .string("start")],
+            securityContext: securityContext
+        )
+        XCTAssertNotEqual(firstAgentRunID, parentRunID)
+        XCTAssertNotEqual(secondAgentRunID, parentRunID)
+        XCTAssertNotEqual(firstAgentRunID, secondAgentRunID)
+        XCTAssertNotEqual(
+            DirectHeadlessChildLaunchCoordinator.resolvedRunID(
+                toolName: "agent_explore",
+                arguments: ["op": .string("start")],
+                securityContext: securityContext
+            ),
+            parentRunID
+        )
+
+        for toolName in ["ask_oracle", "oracle_send", "context_builder"] {
+            XCTAssertEqual(
+                DirectHeadlessChildLaunchCoordinator.resolvedRunID(
+                    toolName: toolName,
+                    arguments: [:],
+                    securityContext: securityContext
+                ),
+                parentRunID,
+                toolName
+            )
+        }
+    }
+
     func testExplicitCarrierBridgesNestedProcessThroughPrivateEndpoint() async throws {
         let directory = URL(fileURLWithPath: "/tmp/rpce-child-test-\(UUID().uuidString.prefix(8))", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
