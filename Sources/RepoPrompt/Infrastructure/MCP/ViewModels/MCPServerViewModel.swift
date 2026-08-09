@@ -3979,7 +3979,7 @@ final class MCPServerViewModel: ObservableObject {
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
-                        workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
+                        workspaceDirectoryPath: targetWindow.workspaceManager.featureArtifactDirectory(for: workspace).path,
                         store: targetWindow.promptManager.workspaceFileContextStore
                     )
                 } catch {

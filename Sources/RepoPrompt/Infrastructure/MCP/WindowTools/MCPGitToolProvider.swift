@@ -466,7 +466,7 @@ final class MCPGitToolProvider {
         guard let workspace = routedWorkspace else {
             throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
         }
-        let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
+        let workspaceDirectory = workspaceManager.featureArtifactDirectory(for: workspace)
         let store = GitDiffSnapshotStore()
         let vcsService = VCSService.shared
 

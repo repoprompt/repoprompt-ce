@@ -423,7 +423,9 @@ extension AgentModeViewModel {
         )
         try await requireAuthorizedWorktreeMergeEndpoint(targetEndpoint, roots: authorizedRoots, label: "Target")
         let directory = workspaceDirectory
-            ?? workspaceManager?.activeWorkspace?.customStoragePath
+            ?? workspaceManager.flatMap { manager in
+                manager.activeWorkspace.map { manager.featureArtifactDirectory(for: $0) }
+            }
             ?? FileManager.default.temporaryDirectory
         let preview = try await VCSService.shared.previewGitWorktreeMerge(.init(
             source: source,

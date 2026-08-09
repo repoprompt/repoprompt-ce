@@ -1124,7 +1124,7 @@ class PromptViewModel: ObservableObject {
         guard let workspaceManager else {
             throw GitArtifactPublishError.noActiveWorkspace
         }
-        let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
+        let workspaceDirectory = workspaceManager.featureArtifactDirectory(for: workspace)
         let compareDisplay = compareSpec.displayString
 
         // Publish the artifacts
@@ -3146,7 +3146,7 @@ class PromptViewModel: ObservableObject {
               let manager = workspaceManager,
               let workspace = manager.activeWorkspace else { return }
 
-        let workspaceDir = manager.workspaceDirectory(for: workspace)
+        let workspaceDir = manager.featureArtifactDirectory(for: workspace)
 
         // Run cleanup in background with a single batch scan
         Task(priority: .utility) {
@@ -5715,7 +5715,7 @@ extension PromptViewModel {
         }
         return await FrozenPromptGitReviewContext.make(
             workspaceID: workspace.id,
-            workspaceDirectoryPath: manager.workspaceDirectory(for: workspace).path,
+            workspaceDirectoryPath: manager.featureArtifactDirectory(for: workspace).path,
             workspaceRootPaths: workspace.repoPaths,
             tabID: creatorTabID,
             sessionID: sessionID,

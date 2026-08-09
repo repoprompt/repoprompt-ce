@@ -858,6 +858,7 @@ actor AgentSessionDataService {
         for workspace: WorkspaceModel,
         mode: AgentSessionMetadataIndexLoadMode
     ) async throws -> AgentSessionMetadataIndex? {
+        guard workspace.persistenceDisposition == .persistent else { return nil }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         switch mode {
         case .fast:
@@ -874,6 +875,7 @@ actor AgentSessionDataService {
     }
 
     func fastMetadataRecordsIfAvailable(for workspace: WorkspaceModel) async throws -> FastMetadataRecordsResult? {
+        guard workspace.persistenceDisposition == .persistent else { return nil }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let key = canonicalMetadataFolderKey(folder)
         if let cached = metadataIndexCacheByFolder[key] {
@@ -912,6 +914,7 @@ actor AgentSessionDataService {
     }
 
     func metadataRecordForSessionID(_ id: UUID, for workspace: WorkspaceModel) async throws -> AgentSessionMetadataRecord? {
+        guard workspace.persistenceDisposition == .persistent else { return nil }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: id, in: folder)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
@@ -940,6 +943,7 @@ actor AgentSessionDataService {
     }
 
     func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
+        guard workspace.persistenceDisposition == .persistent else { return [] }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         if let index = await readMetadataIndexIfAvailable(folder: folder) {
             scheduleMetadataIndexReconciliationIfNeeded(
@@ -963,6 +967,9 @@ actor AgentSessionDataService {
         preparation: SavePreparation = .canonicalize,
         trustedCanonicalItemCount: Int? = nil
     ) async throws -> URL {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
 
         let filename = "AgentSession-\(session.id.uuidString).json"
@@ -1140,6 +1147,7 @@ actor AgentSessionDataService {
 
     /// Returns a list of AgentSession files in the workspace's AgentSessions folder, sorted by mod date desc.
     func listAgentSessions(for workspace: WorkspaceModel) async throws -> [URL] {
+        guard workspace.persistenceDisposition == .persistent else { return [] }
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
 
         let contents = try FileManager.default.contentsOfDirectory(
@@ -1291,6 +1299,7 @@ actor AgentSessionDataService {
 
     /// Load an agent session by ID without scanning the session directory.
     func loadAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
+        guard workspace.persistenceDisposition == .persistent else { return nil }
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let filename = "AgentSession-\(id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
@@ -1457,6 +1466,9 @@ actor AgentSessionDataService {
 
     /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.
     private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
+        guard workspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
         let baseFolder = try workspaceFolderURL(for: workspace)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
 
