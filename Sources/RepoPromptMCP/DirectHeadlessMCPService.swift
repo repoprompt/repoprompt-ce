@@ -174,7 +174,7 @@ actor DirectHeadlessMCPService {
             let context = DirectHeadlessDomainContext(
                 runtime: runtime,
                 scopeID: scopeID,
-                processRootMappings: initialRoute.rootMappings
+                processRootOverlay: initialRoute.rootOverlay
             )
             let workspace = DirectHeadlessWorkspaceBackend(context: context)
             let global = DirectHeadlessGlobalBackend(runtime: runtime, scopeID: scopeID, context: context)

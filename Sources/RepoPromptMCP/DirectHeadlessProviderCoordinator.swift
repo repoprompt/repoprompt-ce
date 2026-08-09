@@ -33,7 +33,7 @@ actor DirectHeadlessProviderCoordinator {
         var name: String?
         let parentSessionID: UUID?
         let worktreeBindings: [DomainAgentRunSnapshot.WorktreeBinding]
-        var latestText: String?
+        var latestSnapshot: DomainAgentRunSnapshot?
         var task: Task<Void, Never>?
     }
 
@@ -126,7 +126,7 @@ actor DirectHeadlessProviderCoordinator {
             arguments: arguments,
             input: Data(message.utf8),
             environment: childEnvironment,
-            currentDirectory: snapshot.roots.first
+            currentDirectory: snapshot.activeRoot
         )
         return Self.finalAssistantText(from: output)
     }
@@ -148,7 +148,7 @@ actor DirectHeadlessProviderCoordinator {
         }
         let requestedParentSessionID = request.securityContext?.principal.runID
         let parentSessionID = requestedParentSessionID.flatMap { agents[$0] == nil ? nil : $0 }
-        let rootMappingPreparation = try await context.prepareSessionRootMappings(
+        let rootOverlayPreparation = try await context.prepareSessionRootOverlay(
             sessionID: sessionID,
             sourceSessionID: parentSessionID,
             arguments: args,
@@ -160,11 +160,11 @@ actor DirectHeadlessProviderCoordinator {
         switch await beginEpoch(registration, activationID) {
         case let .accepted(value): epoch = value
         case let .rejected(reason):
-            await context.rollbackSessionRootMappings(rootMappingPreparation)
+            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
             await runtime.agentSessionStore.cleanup(registration: registration)
             throw MCPError.internalError(reason)
         case .stale:
-            await context.rollbackSessionRootMappings(rootMappingPreparation)
+            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
             await runtime.agentSessionStore.cleanup(registration: registration)
             throw MCPError.internalError("agent epoch changed during start")
         }
@@ -177,18 +177,20 @@ actor DirectHeadlessProviderCoordinator {
             model: args["model"]?.stringValue,
             name: name,
             parentSessionID: parentSessionID,
-            worktreeBindings: rootMappingPreparation.bindings,
-            latestText: nil,
+            worktreeBindings: rootOverlayPreparation.bindings,
+            latestSnapshot: nil,
             task: nil
         )
-        agents[sessionID] = record
+        var runningRecord = record
         let running = snapshot(
-            record: record,
+            record: runningRecord,
             status: .running,
             statusText: "Running",
             assistantText: nil,
             failure: nil
         )
+        runningRecord.latestSnapshot = running
+        agents[sessionID] = runningRecord
         await runtime.agentSessionStore.noteSnapshot(
             running,
             cursor: DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
@@ -210,10 +212,14 @@ actor DirectHeadlessProviderCoordinator {
             } catch is CancellationError {
                 await finishAgent(sessionID: sessionID, outcome: .cancelled())
             } catch {
-                await finishAgent(
-                    sessionID: sessionID,
-                    outcome: .failed(assistantText: error.localizedDescription)
-                )
+                if Task.isCancelled {
+                    await finishAgent(sessionID: sessionID, outcome: .cancelled())
+                } else {
+                    await finishAgent(
+                        sessionID: sessionID,
+                        outcome: .failed(assistantText: error.localizedDescription)
+                    )
+                }
             }
         }
         agents[sessionID]?.task = task
@@ -234,7 +240,7 @@ actor DirectHeadlessProviderCoordinator {
         }
         if timeout <= 0 {
             return await runtime.agentSessionStore.snapshot(for: record.registration)
-                ?? DomainAgentRunSnapshot.expired(sessionID: sessionID)
+                ?? retainedSnapshot(record)
         }
         return await waitAgent(sessionID: sessionID, timeout: timeout)
     }
@@ -252,15 +258,15 @@ actor DirectHeadlessProviderCoordinator {
             return wake.snapshot
         case .timedOut:
             return await runtime.agentSessionStore.snapshot(for: record.registration)
-                ?? DomainAgentRunSnapshot.expired(sessionID: sessionID, statusText: "wait timed out")
+                ?? retainedSnapshot(record)
         case .cancelled:
             return DomainAgentRunSnapshot.expired(sessionID: sessionID, statusText: "wait cancelled")
         case .expired:
-            return DomainAgentRunSnapshot.expired(sessionID: sessionID)
+            return retainedSnapshot(record)
         case let .epochAdvanced(epoch, _):
             return await runtime.agentSessionStore.snapshot(
                 for: DomainAgentSessionWaitCursor(registration: record.registration, epoch: epoch)
-            ) ?? DomainAgentRunSnapshot.expired(sessionID: sessionID)
+            ) ?? retainedSnapshot(record)
         case let .terminalPublicationRejected(_, reason):
             return DomainAgentRunSnapshot.expired(sessionID: sessionID, statusText: reason)
         }
@@ -274,7 +280,7 @@ actor DirectHeadlessProviderCoordinator {
         var values: [Value] = []
         for record in agents.values {
             let current = await runtime.agentSessionStore.snapshot(for: record.registration)
-                ?? awaitSnapshot(record)
+                ?? retainedSnapshot(record)
             values.append(current.toValue())
         }
         let activeIDs = Set(agents.keys)
@@ -291,9 +297,18 @@ actor DirectHeadlessProviderCoordinator {
 
     func updateStatus(sessionID: UUID, name: String?) async throws -> Value {
         guard var record = agents[sessionID] else { throw MCPError.invalidParams("unknown session_id") }
+        let previous = await runtime.agentSessionStore.snapshot(for: record.registration)
+            ?? retainedSnapshot(record)
         record.name = name
+        let current = snapshot(
+            record: record,
+            status: previous.status,
+            statusText: previous.statusText,
+            assistantText: previous.latestAssistantPreview,
+            failure: previous.failureReason
+        )
+        record.latestSnapshot = current
         agents[sessionID] = record
-        let current = awaitSnapshot(record)
         await runtime.agentSessionStore.noteSnapshot(
             current,
             cursor: DomainAgentSessionWaitCursor(registration: record.registration, epoch: record.epoch)
@@ -303,9 +318,9 @@ actor DirectHeadlessProviderCoordinator {
 
     func shareThoughts(sessionID: UUID, text: String) async throws -> Value {
         guard var record = agents[sessionID] else { throw MCPError.invalidParams("unknown session_id") }
-        record.latestText = text
-        agents[sessionID] = record
         let current = snapshot(record: record, status: .waitingForInput, statusText: "Thoughts shared", assistantText: text, failure: nil)
+        record.latestSnapshot = current
+        agents[sessionID] = record
         await runtime.agentSessionStore.noteSnapshotAndWakeWaiters(
             current,
             cursor: DomainAgentSessionWaitCursor(registration: record.registration, epoch: record.epoch),
@@ -383,9 +398,7 @@ actor DirectHeadlessProviderCoordinator {
         outcome: DomainAgentRunTerminalOutcome
     ) async {
         guard var record = agents[sessionID] else { return }
-        record.latestText = outcome.assistantText
         record.task = nil
-        agents[sessionID] = record
         let terminal = snapshot(
             record: record,
             status: outcome.snapshotStatus,
@@ -393,6 +406,8 @@ actor DirectHeadlessProviderCoordinator {
             assistantText: outcome.assistantText,
             failure: outcome.failureReason
         )
+        record.latestSnapshot = terminal
+        agents[sessionID] = record
         _ = await runtime.agentSessionStore.publishTerminal(
             DomainAgentRunTerminalPublicationEnvelope(epoch: record.epoch, snapshot: terminal),
             registration: record.registration,
@@ -401,12 +416,12 @@ actor DirectHeadlessProviderCoordinator {
         )
     }
 
-    private func awaitSnapshot(_ record: AgentRecord) -> DomainAgentRunSnapshot {
-        snapshot(
+    private func retainedSnapshot(_ record: AgentRecord) -> DomainAgentRunSnapshot {
+        record.latestSnapshot ?? snapshot(
             record: record,
-            status: record.task == nil ? .completed : .running,
-            statusText: record.task == nil ? "Completed" : "Running",
-            assistantText: record.latestText,
+            status: .running,
+            statusText: "Running",
+            assistantText: nil,
             failure: nil
         )
     }

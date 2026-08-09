@@ -3,10 +3,10 @@ import MCP
 import RepoPromptDomainRuntime
 
 actor DirectHeadlessDomainContext {
-    struct SessionRootMappingPreparation {
+    struct SessionRootOverlayPreparation {
         let sessionID: UUID
-        let resolvedMappings: [DirectHeadlessRootMapping]
-        let previousMappings: [DirectHeadlessRootMapping]?
+        let resolvedOverlay: DirectHeadlessRootOverlay
+        let previousOverlay: DirectHeadlessRootOverlay?
         let bindings: [DomainAgentRunSnapshot.WorktreeBinding]
     }
 
@@ -41,26 +41,36 @@ actor DirectHeadlessDomainContext {
         let identity: DomainContextIdentity
         let workspace: DomainWorkspaceSnapshot
         let context: DomainContextSnapshot
-        let canonicalRoots: [URL]
-        let rootMappings: [DirectHeadlessRootMapping]
-        let roots: [URL]
+        let rootOverlay: DirectHeadlessRootOverlay
         let prompt: String
         let selection: [String]
+
+        var canonicalRoots: [URL] {
+            rootOverlay.mappings.map(\.canonicalRoot)
+        }
+
+        var roots: [URL] {
+            rootOverlay.mappings.map(\.physicalRoot)
+        }
+
+        var activeRoot: URL? {
+            rootOverlay.activeRoot
+        }
     }
 
     let runtime: MCPDomainRuntime
     let scopeID: DomainStandaloneScopeID
-    private let processRootMappings: [DirectHeadlessRootMapping]
-    private var sessionRootMappings: [UUID: [DirectHeadlessRootMapping]] = [:]
+    private let processRootOverlay: DirectHeadlessRootOverlay
+    private var sessionRootOverlays: [UUID: DirectHeadlessRootOverlay] = [:]
 
     init(
         runtime: MCPDomainRuntime,
         scopeID: DomainStandaloneScopeID,
-        processRootMappings: [DirectHeadlessRootMapping] = []
+        processRootOverlay: DirectHeadlessRootOverlay = .init(mappings: [], activeRoot: nil)
     ) {
         self.runtime = runtime
         self.scopeID = scopeID
-        self.processRootMappings = processRootMappings
+        self.processRootOverlay = processRootOverlay
     }
 
     func snapshot(for request: DomainPhysicalToolRequest) async throws -> Snapshot {
@@ -106,17 +116,18 @@ actor DirectHeadlessDomainContext {
             }
             return url
         }
-        let rootMappings = try await resolveRootMappings(
+        let rootOverlay = try await resolveRootOverlay(
             canonicalRoots: canonicalRoots,
             sessionID: sessionID
         )
-        let roots = try rootMappings.map { mapping -> URL in
-            let physical = mapping.physicalRoot.standardizedFileURL.resolvingSymlinksInPath()
+        for mapping in rootOverlay.mappings {
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: physical.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                throw DomainStandaloneScopeError.invalidWorkingDirectory(physical.path)
+            guard FileManager.default.fileExists(
+                atPath: mapping.physicalRoot.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw DomainStandaloneScopeError.invalidWorkingDirectory(mapping.physicalRoot.path)
             }
-            return physical
         }
         let contextObject = try Self.contextObject(from: workspace, contextID: identity.contextID)
         let prompt = contextObject["prompt"] as? String ?? ""
@@ -127,54 +138,52 @@ actor DirectHeadlessDomainContext {
             identity: identity,
             workspace: workspace,
             context: context,
-            canonicalRoots: canonicalRoots,
-            rootMappings: rootMappings,
-            roots: roots,
+            rootOverlay: rootOverlay,
             prompt: prompt,
             selection: selection
         )
     }
 
-    func prepareSessionRootMappings(
+    func prepareSessionRootOverlay(
         sessionID: UUID,
         sourceSessionID: UUID?,
         arguments: [String: Value],
         connectionID: UUID
-    ) async throws -> SessionRootMappingPreparation {
-        let current = try await snapshot(connectionID: connectionID)
+    ) async throws -> SessionRootOverlayPreparation {
+        let processSnapshot = try await snapshot(connectionID: connectionID)
         let inherits = arguments["inherit_worktree"]?.boolValue ?? true
         let selectorIntent = try DirectHeadlessWorktreeRouting.parseSessionSelector(arguments: arguments)
-        let inheritedMappings = inherits && !selectorIntent.isExplicit
-            ? sourceSessionID.flatMap { sessionRootMappings[$0] }
+        let inheritedOverlay = inherits
+            ? sourceSessionID.flatMap { sessionRootOverlays[$0] }
             : nil
-        let baseMappings = inheritedMappings ?? current.rootMappings
-        let resolved = try await DirectHeadlessWorktreeRouting.resolveSessionMappings(
+        let baseOverlay = inheritedOverlay ?? processSnapshot.rootOverlay
+        let resolved = try await DirectHeadlessWorktreeRouting.resolveSessionOverlay(
             arguments: arguments,
             selectorIntent: selectorIntent,
-            canonicalRoots: current.canonicalRoots,
-            baseMappings: baseMappings
+            canonicalRoots: processSnapshot.canonicalRoots,
+            baseOverlay: baseOverlay
         )
-        let previousMappings = sessionRootMappings.updateValue(resolved, forKey: sessionID)
-        let bindings = resolved.compactMap {
+        let previousOverlay = sessionRootOverlays.updateValue(resolved, forKey: sessionID)
+        let bindings = resolved.mappings.compactMap {
             DirectHeadlessWorktreeRouting.binding(
                 mapping: $0,
-                source: inheritedMappings == nil ? "direct-headless-session-overlay" : "direct-headless-inherited-overlay"
+                source: inheritedOverlay == nil ? "direct-headless-session-overlay" : "direct-headless-inherited-overlay"
             )
         }
-        return SessionRootMappingPreparation(
+        return SessionRootOverlayPreparation(
             sessionID: sessionID,
-            resolvedMappings: resolved,
-            previousMappings: previousMappings,
+            resolvedOverlay: resolved,
+            previousOverlay: previousOverlay,
             bindings: bindings
         )
     }
 
-    func rollbackSessionRootMappings(_ preparation: SessionRootMappingPreparation) {
-        guard sessionRootMappings[preparation.sessionID] == preparation.resolvedMappings else { return }
-        if let previousMappings = preparation.previousMappings {
-            sessionRootMappings[preparation.sessionID] = previousMappings
+    func rollbackSessionRootOverlay(_ preparation: SessionRootOverlayPreparation) {
+        guard sessionRootOverlays[preparation.sessionID] == preparation.resolvedOverlay else { return }
+        if let previousOverlay = preparation.previousOverlay {
+            sessionRootOverlays[preparation.sessionID] = previousOverlay
         } else {
-            sessionRootMappings.removeValue(forKey: preparation.sessionID)
+            sessionRootOverlays.removeValue(forKey: preparation.sessionID)
         }
     }
 
@@ -191,17 +200,18 @@ actor DirectHeadlessDomainContext {
             }
             return url
         }
-        _ = try await resolveRootMappings(canonicalRoots: canonicalRoots, sessionID: nil)
+        _ = try await resolveRootOverlay(canonicalRoots: canonicalRoots, sessionID: nil)
     }
 
-    private func resolveRootMappings(
+    private func resolveRootOverlay(
         canonicalRoots: [URL],
         sessionID: UUID?
-    ) async throws -> [DirectHeadlessRootMapping] {
-        let preferredMappings = sessionID.flatMap { sessionRootMappings[$0] } ?? processRootMappings
-        let rootMappings: [DirectHeadlessRootMapping]
-        if preferredMappings.isEmpty {
-            rootMappings = canonicalRoots.map {
+    ) async throws -> DirectHeadlessRootOverlay {
+        let preferred = sessionID.flatMap { sessionRootOverlays[$0] } ?? processRootOverlay
+        let mappings: [DirectHeadlessRootMapping]
+        let activeRoot: URL?
+        if preferred.mappings.isEmpty {
+            mappings = canonicalRoots.map {
                 DirectHeadlessRootMapping(
                     canonicalRoot: $0,
                     physicalRoot: $0,
@@ -210,11 +220,12 @@ actor DirectHeadlessDomainContext {
                     visualColorHex: nil
                 )
             }
+            activeRoot = mappings.first?.physicalRoot
         } else {
-            guard preferredMappings.count == canonicalRoots.count else { throw Error.rootMappingUnavailable }
+            guard preferred.mappings.count == canonicalRoots.count else { throw Error.rootMappingUnavailable }
             var physicalPaths: Set<String> = []
-            rootMappings = try canonicalRoots.map { canonicalRoot in
-                let matches = preferredMappings.filter {
+            mappings = try canonicalRoots.map { canonicalRoot in
+                let matches = preferred.mappings.filter {
                     $0.canonicalRoot.standardizedFileURL.resolvingSymlinksInPath().path == canonicalRoot.path
                 }
                 guard matches.count == 1, let match = matches.first,
@@ -222,9 +233,13 @@ actor DirectHeadlessDomainContext {
                 else { throw Error.rootMappingUnavailable }
                 return match
             }
+            activeRoot = preferred.activeRoot?.standardizedFileURL.resolvingSymlinksInPath()
+            guard activeRoot.map({ physicalPaths.contains($0.path) }) == !mappings.isEmpty else {
+                throw Error.rootMappingUnavailable
+            }
         }
-        try await DirectHeadlessWorktreeRouting.verifyMappingsAtUse(rootMappings)
-        return rootMappings
+        try await DirectHeadlessWorktreeRouting.verifyMappingsAtUse(mappings)
+        return DirectHeadlessRootOverlay(mappings: mappings, activeRoot: activeRoot)
     }
 
     func mutate(

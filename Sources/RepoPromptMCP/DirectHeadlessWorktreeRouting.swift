@@ -12,9 +12,14 @@ struct DirectHeadlessRootMapping: Equatable {
     let visualColorHex: String?
 }
 
+struct DirectHeadlessRootOverlay: Equatable {
+    let mappings: [DirectHeadlessRootMapping]
+    let activeRoot: URL?
+}
+
 struct DirectHeadlessInitialRoute: Equatable {
     let bindingWorkingDirectories: [URL]
-    let rootMappings: [DirectHeadlessRootMapping]
+    let rootOverlay: DirectHeadlessRootOverlay
 }
 
 struct DirectHeadlessGitWorktree: Equatable {
@@ -32,10 +37,6 @@ struct DirectHeadlessSessionSelector {
     let selector: String?
     let worktreeID: String?
     let create: Bool
-
-    var isExplicit: Bool {
-        selector != nil || worktreeID != nil || create
-    }
 }
 
 enum DirectHeadlessWorktreeRouting {
@@ -44,7 +45,10 @@ enum DirectHeadlessWorktreeRouting {
         catalog: DomainWorkspaceCatalogSnapshot
     ) async throws -> DirectHeadlessInitialRoute {
         guard !workingDirectories.isEmpty else {
-            return DirectHeadlessInitialRoute(bindingWorkingDirectories: [], rootMappings: [])
+            return DirectHeadlessInitialRoute(
+                bindingWorkingDirectories: [],
+                rootOverlay: DirectHeadlessRootOverlay(mappings: [], activeRoot: nil)
+            )
         }
 
         let physicalRoots = workingDirectories.map(canonicalPath)
@@ -73,7 +77,10 @@ enum DirectHeadlessWorktreeRouting {
             else { continue }
             candidates.append(DirectHeadlessInitialRoute(
                 bindingWorkingDirectories: canonicalRoots,
-                rootMappings: mappings
+                rootOverlay: DirectHeadlessRootOverlay(
+                    mappings: mappings,
+                    activeRoot: physicalRoots.first
+                )
             ))
         }
         if candidates.count > 1 {
@@ -84,26 +91,29 @@ enum DirectHeadlessWorktreeRouting {
         guard let route = candidates.first else {
             return DirectHeadlessInitialRoute(
                 bindingWorkingDirectories: physicalRoots,
-                rootMappings: physicalRoots.map {
-                    DirectHeadlessRootMapping(
-                        canonicalRoot: $0,
-                        physicalRoot: $0,
-                        worktree: nil,
-                        visualLabel: nil,
-                        visualColorHex: nil
-                    )
-                }
+                rootOverlay: DirectHeadlessRootOverlay(
+                    mappings: physicalRoots.map {
+                        DirectHeadlessRootMapping(
+                            canonicalRoot: $0,
+                            physicalRoot: $0,
+                            worktree: nil,
+                            visualLabel: nil,
+                            visualColorHex: nil
+                        )
+                    },
+                    activeRoot: physicalRoots.first
+                )
             )
         }
         return route
     }
 
-    static func resolveSessionMappings(
+    static func resolveSessionOverlay(
         arguments: [String: Value],
         selectorIntent: DirectHeadlessSessionSelector,
         canonicalRoots: [URL],
-        baseMappings: [DirectHeadlessRootMapping]
-    ) async throws -> [DirectHeadlessRootMapping] {
+        baseOverlay: DirectHeadlessRootOverlay
+    ) async throws -> DirectHeadlessRootOverlay {
         let selector = selectorIntent.selector
         let worktreeID = selectorIntent.worktreeID
         let visualLabel = normalized(arguments["worktree_label"]?.stringValue)
@@ -124,7 +134,7 @@ enum DirectHeadlessWorktreeRouting {
         if selector == nil, worktreeID == nil, selectorOnlyKeys.contains(where: { arguments[$0] != nil }) {
             throw MCPError.invalidParams("worktree_repo_root, worktree_label, and worktree_color require an existing worktree selector")
         }
-        guard selector != nil || worktreeID != nil else { return baseMappings }
+        guard selector != nil || worktreeID != nil else { return baseOverlay }
         if let visualColorHex, !isHexColor(visualColorHex) {
             throw MCPError.invalidParams("worktree_color must be a valid #RRGGBB value")
         }
@@ -132,9 +142,9 @@ enum DirectHeadlessWorktreeRouting {
         let logicalRoot = try selectLogicalRoot(
             arguments["worktree_repo_root"]?.stringValue,
             canonicalRoots: canonicalRoots,
-            mappings: baseMappings
+            mappings: baseOverlay.mappings
         )
-        let currentPhysicalRoot = baseMappings.first(where: {
+        let currentPhysicalRoot = baseOverlay.mappings.first(where: {
             canonicalPath($0.canonicalRoot).path == canonicalPath(logicalRoot).path
         })?.physicalRoot ?? logicalRoot
         let worktrees = try await listWorktrees(repositoryRoot: logicalRoot)
@@ -149,7 +159,7 @@ enum DirectHeadlessWorktreeRouting {
         }
         try await verifyWorktree(selected)
 
-        var result = baseMappings.filter {
+        var result = baseOverlay.mappings.filter {
             canonicalPath($0.canonicalRoot).path != canonicalPath(logicalRoot).path
         }
         result.append(DirectHeadlessRootMapping(
@@ -159,7 +169,7 @@ enum DirectHeadlessWorktreeRouting {
             visualLabel: visualLabel,
             visualColorHex: visualColorHex?.uppercased()
         ))
-        return try canonicalRoots.map { canonical in
+        let mappings = try canonicalRoots.map { canonical in
             let matches = result.filter {
                 canonicalPath($0.canonicalRoot).path == canonicalPath(canonical).path
             }
@@ -168,6 +178,10 @@ enum DirectHeadlessWorktreeRouting {
             }
             return match
         }
+        return DirectHeadlessRootOverlay(
+            mappings: mappings,
+            activeRoot: canonicalPath(selected.path)
+        )
     }
 
     static func parseSessionSelector(arguments: [String: Value]) throws -> DirectHeadlessSessionSelector {
