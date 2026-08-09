@@ -17,12 +17,15 @@ the downloaded asset checksum and provenance are recorded under
 ## OpenAI Codex
 
 RepoPrompt CE bundles the complete official OpenAI Codex 0.147.0 standalone
-package for the selected macOS architecture. Codex is licensed under the
-Apache License, Version 2.0. Its copied license and notice are included under
-[`ThirdPartyLicenses/codex/`](ThirdPartyLicenses/codex/), and the exact release
-archives, checksums, layouts, architectures, and upstream macOS signing
-identities are pinned in [`Vendor/Codex/manifest.json`](Vendor/Codex/manifest.json).
-The complete Codex package also contains Zsh 5.9 at
+package for the selected macOS architecture and installs the official
+`@openai/codex@0.147.0` platform package in the Linux headless container image.
+Codex is licensed under the Apache License, Version 2.0. Its copied license and
+notice are included under [`ThirdPartyLicenses/codex/`](ThirdPartyLicenses/codex/)
+and copied into the container image. The exact macOS release archives,
+checksums, layouts, architectures, and upstream signing identities are pinned
+in [`Vendor/Codex/manifest.json`](Vendor/Codex/manifest.json); the Linux image
+pin and extraction contract live in [`Dockerfile.headless`](Dockerfile.headless).
+The complete Codex packages also contain Zsh 5.9 at
 `codex-resources/zsh/bin/zsh`; its upstream licence is copied as
 [`ThirdPartyLicenses/codex/ZSH-LICENCE`](ThirdPartyLicenses/codex/ZSH-LICENCE).
 

@@ -60,10 +60,26 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
 
         XCTAssertFalse(arguments.contains("--full-auto"))
-        XCTAssertEqual(
-            Array(arguments.suffix(5)),
-            ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        XCTAssertEqual(arguments, [
+            "--ask-for-approval", "never",
+            "--sandbox", "workspace-write",
+            "exec", "--ephemeral", "--skip-git-repo-check", "--json", "-"
+        ])
+    }
+
+    func testHeadlessCodexExecUsesExplicitExternalSandboxContractInContainer() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(
+            model: nil,
+            externallySandboxed: true
         )
+
+        XCTAssertTrue(arguments.contains("--dangerously-bypass-approvals-and-sandbox"))
+        XCTAssertFalse(arguments.contains("--ask-for-approval"))
+        XCTAssertFalse(arguments.contains("--sandbox"))
+        XCTAssertEqual(arguments, [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "exec", "--ephemeral", "--skip-git-repo-check", "--json", "-"
+        ])
     }
 
     func testHeadlessChildLaunchUsesPhysicalCodexProviderForDirectRoleAliases() {
@@ -93,7 +109,9 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             [
                 "--model", "gpt-5.6-terra",
                 "-c", "model_reasoning_effort=high",
-                "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"
+                "--ask-for-approval", "never",
+                "--sandbox", "workspace-write",
+                "exec", "--ephemeral", "--skip-git-repo-check", "--json", "-"
             ]
         )
     }
@@ -107,7 +125,9 @@ final class DirectHeadlessCompositionTests: XCTestCase {
                 "--model", "gpt-5.4",
                 "-c", "model_reasoning_effort=high",
                 "-c", "service_tier=fast",
-                "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"
+                "--ask-for-approval", "never",
+                "--sandbox", "workspace-write",
+                "exec", "--ephemeral", "--skip-git-repo-check", "--json", "-"
             ]
         )
     }

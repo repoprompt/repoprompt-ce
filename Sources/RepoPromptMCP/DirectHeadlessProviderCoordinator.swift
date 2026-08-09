@@ -69,7 +69,10 @@ actor DirectHeadlessProviderCoordinator {
         ]
     }
 
-    static func codexExecArguments(model: String?) -> [String] {
+    static func codexExecArguments(
+        model: String?,
+        externallySandboxed: Bool = false
+    ) -> [String] {
         var arguments: [String] = []
         if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
             if let selection = try? DomainAppSettingsCatalog.secondaryOracleModelSelection(raw: model) {
@@ -86,7 +89,12 @@ actor DirectHeadlessProviderCoordinator {
                 arguments += ["--model", model]
             }
         }
-        arguments += ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        if externallySandboxed {
+            arguments.append("--dangerously-bypass-approvals-and-sandbox")
+        } else {
+            arguments += ["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+        }
+        arguments += ["exec", "--ephemeral", "--skip-git-repo-check", "--json", "-"]
         return arguments
     }
 
@@ -131,7 +139,10 @@ actor DirectHeadlessProviderCoordinator {
         } else {
             invocationRoute = try await resolveRoute(for: request)
         }
-        let arguments = Self.codexExecArguments(model: model)
+        let arguments = Self.codexExecArguments(
+            model: model,
+            externallySandboxed: environment["REPOPROMPT_CODEX_EXTERNALLY_SANDBOXED"] == "1"
+        )
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }

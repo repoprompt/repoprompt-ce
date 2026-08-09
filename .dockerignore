@@ -1,6 +1,13 @@
 .build
 .git
+.codex
+.env
+.env.*
 .derivedData
 DerivedData
+**/.codex
+**/.env
+**/.env.*
+**/auth.json
 *.xcuserstate
 .DS_Store

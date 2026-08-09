@@ -14,6 +14,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "HOME": "/tmp/home",
             "TMPDIR": "/tmp/",
             "LANG": "en_US.UTF-8",
+            "CODEX_API_KEY": "secret-codex",
             "LC_CTYPE": "en_US.UTF-8",
             "OPENAI_API_KEY": "secret-openai",
             "AWS_SECRET_ACCESS_KEY": "secret-aws",
@@ -29,20 +30,32 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "REPOPROMPT_MCP_PROVIDER_IDENTIFIER": "codex",
             "REPOPROMPT_MCP_RUN_ID": UUID().uuidString
         ]
-        let overrides = inherited.merging(carrier) { _, supplied in supplied }
+        var overrides = carrier
+        overrides["CODEX_API_KEY"] = inherited["CODEX_API_KEY"]
         let child = DirectProcess.childEnvironment(inherited: inherited, overrides: overrides)
 
         XCTAssertEqual(child["PATH"], inherited["PATH"])
         XCTAssertEqual(child["HOME"], inherited["HOME"])
+        XCTAssertEqual(child["CODEX_API_KEY"], inherited["CODEX_API_KEY"])
         XCTAssertEqual(child["LC_CTYPE"], inherited["LC_CTYPE"])
         XCTAssertEqual(child["GIT_TERMINAL_PROMPT"], "0")
         XCTAssertEqual(child["LC_ALL"], "C")
         for (key, value) in carrier {
             XCTAssertEqual(child[key], value, "carrier key=\(key)")
         }
-        for key in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "DYLD_INSERT_LIBRARIES", "REPOPROMPT_CODEX_COMMAND"] {
+        let rejectedKeys = [
+            "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK",
+            "DYLD_INSERT_LIBRARIES", "REPOPROMPT_CODEX_COMMAND"
+        ]
+        for key in rejectedKeys {
             XCTAssertNil(child[key], "unexpected inherited key=\(key)")
         }
+
+        let ambientOnly = DirectProcess.childEnvironment(inherited: inherited)
+        XCTAssertNil(
+            ambientOnly["CODEX_API_KEY"],
+            "ambient provider credentials must require an explicit invocation override"
+        )
     }
 
     func testDirectProcessStripsStalePrivateCarrierBeforeCurrentCarrierMerge() {

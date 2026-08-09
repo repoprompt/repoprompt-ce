@@ -119,20 +119,52 @@ Or build the non-root container image:
 ```bash
 docker build -f Dockerfile.headless -t repoprompt-ce-headless .
 docker run --rm -i \
+  --env CODEX_API_KEY \
   -v "$PWD:/workspace" \
   -v repoprompt-ce-state:/data \
   repoprompt-ce-headless
 ```
 
+The image includes the complete official Codex CLI 0.147.0 Linux package, but
+never includes credentials. `--env CODEX_API_KEY` forwards an already-exported
+key only when the container starts; omit it when Oracle calls are not needed.
+Never pass a credential as a Docker build argument or place it in the build
+context. To use a ChatGPT login instead, authenticate the image's non-root user
+into a runtime-only named volume, then mount that same volume when starting the
+server:
+
+```bash
+docker run --rm -it \
+  --entrypoint /opt/codex/bin/codex \
+  -v repoprompt-ce-codex:/home/repoprompt/.codex \
+  repoprompt-ce-headless login --device-auth
+
+docker run --rm -i \
+  -v "$PWD:/workspace" \
+  -v repoprompt-ce-state:/data \
+  -v repoprompt-ce-codex:/home/repoprompt/.codex \
+  repoprompt-ce-headless
+```
+
+The process runs as uid/gid 65532. A bind-mounted workspace therefore needs to
+be readable by that principal, and writable by it if Codex or an authorized MCP
+mutation should edit files. Live provider calls also require outbound HTTPS;
+the credential-free contract harness uses an intentionally offline fake Codex
+provider.
+
 The Linux product does not contain the macOS app proxy, `auto`, interactive, or
-exec modes. Oracle tools launch Codex from `PATH`, or from the executable named
-by `REPOPROMPT_CODEX_COMMAND`. Set the nullable
+exec modes. The image fixes `REPOPROMPT_CODEX_COMMAND` to its bundled Codex
+executable; native deployments can still resolve Codex from `PATH` or override
+that variable. Set the nullable
 `models.secondary_oracle_model` key with `app_settings` to enable paired
 Primary/Secondary Oracle execution; setting it back to `null` restores the
 single-Oracle response contract. Use a recognized `codex_cli_*` raw model ID
 (or a configured `codex_custom_*` ID); the runtime translates it to Codex CLI
 model/reasoning arguments. Provider launches remain subject to the normal
-explicit cost and external-process grants. See
+explicit cost and external-process grants. Inside the container, Codex treats
+the non-root Docker boundary as its external sandbox instead of attempting a
+nested Linux namespace sandbox. Only paths and network access exposed to the
+container are available to it. See
 [`docs/architecture/headless-mcp-runtime.md`](docs/architecture/headless-mcp-runtime.md).
 
 ### Develop in Xcode

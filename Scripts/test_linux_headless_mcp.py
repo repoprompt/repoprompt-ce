@@ -16,27 +16,41 @@ from typing import Any
 import uuid
 
 
-EXPECTED_TOOLS = {
-    "agent_manage",
-    "agent_run",
+EXPECTED_TOOL_ORDER = [
     "app_settings",
-    "apply_edits",
     "bind_context",
-    "context_builder",
+    "manage_workspaces",
+    "manage_selection",
     "file_actions",
-    "file_search",
     "get_code_structure",
     "get_file_tree",
-    "git",
-    "history",
-    "manage_selection",
-    "manage_workspaces",
-    "manage_worktree",
-    "oracle_send",
-    "oracle_utils",
-    "prompt",
     "read_file",
+    "file_search",
     "workspace_context",
+    "prompt",
+    "apply_edits",
+    "oracle_utils",
+    "oracle_send",
+    "git",
+    "manage_worktree",
+    "context_builder",
+    "agent_run",
+    "agent_manage",
+    "history",
+]
+EXPECTED_TOOLS = set(EXPECTED_TOOL_ORDER)
+
+HIDDEN_DIRECT_TOOLS: dict[str, dict[str, Any]] = {
+    "ask_oracle": {"message": "must-not-run"},
+    "oracle_chat_log": {},
+    "ask_user": {"questions": [{"id": "q", "question": "must not present"}]},
+    "agent_explore": {
+        "op": "poll",
+        "session_id": "00000000-0000-0000-0000-000000000099",
+    },
+    "share_thoughts": {"thoughts": "must-not-publish"},
+    "set_status": {},
+    "wait_for_next_user_instruction": {"timeout_seconds": 1},
 }
 
 PRIMARY_MODEL = "codex_cli_gpt-5.6-sol-medium"
@@ -97,7 +111,7 @@ esac
 printf '{"item":{"type":"agent_message","text":"%s:%s"}}\n' "$model" "$turn"
 """
 
-FAKE_LAUNCHER_SCRIPT = """#!/bin/sh
+FAKE_LAUNCHER_SCRIPT = r"""#!/bin/sh
 set -eu
 
 server=$1
@@ -107,9 +121,9 @@ if [ "$profile" != "default" ]; then
     printf '%s\n' 'test launcher requires the default isolated profile' >&2
     exit 2
 fi
-profile_root=${REPOPROMPT_MCP_HEADLESS_PROFILE_DIR:?missing headless profile directory}
-primary_root=${REPOPROMPT_MCP_WORKING_DIRS:?missing primary working directory}
-secondary_root=$primary_root/secondary-workspace
+profile_root=$(readlink -f "${REPOPROMPT_MCP_HEADLESS_PROFILE_DIR:?missing headless profile directory}")
+primary_root=$(readlink -f "${REPOPROMPT_MCP_WORKING_DIRS:?missing primary working directory}")
+secondary_root=$(readlink -f "$primary_root/secondary-workspace")
 parent_executable=$(readlink -f "/proc/$PPID/exe")
 parent_identity=$(stat -Lc '%d|%i' "$parent_executable")
 principal_fingerprint=$(printf '%s|%s' "$parent_executable" "$parent_identity" | sha256sum | cut -d ' ' -f 1)
@@ -119,7 +133,15 @@ mkdir -p "$settings_dir"
 now=$(( $(date +%s) - 978307200 ))
 expires=$(( now + 3600 ))
 umask 077
-printf '%s\n' "{\"headlessGrants\":[{\"allowedOperations\":[\"bind_context.bind\",\"context_builder.ai_cost\",\"context_builder.external_process\",\"oracle_send.ai_cost\",\"oracle_send.external_process\"],\"canonicalRoots\":[\"$primary_root\",\"$secondary_root\"],\"expiresAt\":$expires,\"id\":\"00000000-0000-0000-0000-000000000001\",\"issuedAt\":$now,\"principalKey\":\"$principal_fingerprint\",\"revision\":1,\"workspaceIDs\":[]}],\"profileIdentifier\":\"default\",\"revision\":1,\"updatedAt\":$now,\"version\":2}" > "$settings_dir/protected-mutations.json"
+policy_tmp=$settings_dir/protected-mutations.json.tmp
+cat > "$policy_tmp" <<EOF
+{"headlessGrants":[{"allowedOperations":["agent_run.ai_cost","agent_run.external_process","bind_context.bind","context_builder.ai_cost","context_builder.external_process","oracle_send.ai_cost","oracle_send.external_process"],"canonicalRoots":["$primary_root","$secondary_root"],"expiresAt":$expires,"id":"00000000-0000-0000-0000-000000000001","issuedAt":$now,"principalKey":"$principal_fingerprint","provider":null,"revision":1,"revokedAt":null,"workspaceIDs":[]}],"profileIdentifier":"default","revision":1,"updatedAt":$now,"version":2}
+EOF
+mv "$policy_tmp" "$settings_dir/protected-mutations.json"
+
+if [ "${REPOPROMPT_MCP_TEST_GIT_SAFE_DIRECTORY:-0}" = "1" ]; then
+    git config --global --add safe.directory "$primary_root"
+fi
 
 exec "$server" "$@"
 """
@@ -147,6 +169,8 @@ def command_for(mode: str, target: str, workspace: Path, profile: Path) -> list[
             "REPOPROMPT_MCP_WORKING_DIRS=/workspace",
             "--env",
             "XDG_CACHE_HOME=/workspace",
+            "--env",
+            "REPOPROMPT_MCP_TEST_GIT_SAFE_DIRECTORY=1",
             "--entrypoint",
             "/usr/bin/tini",
             target,
@@ -262,7 +286,7 @@ def call_tool(
     )["result"]
 
 
-def tool_object(result: dict[str, Any], *, operation: str) -> dict[str, Any]:
+def tool_value(result: dict[str, Any], *, operation: str) -> Any:
     if result.get("isError", False):
         raise AssertionError(f"{operation} returned a tool error: {result}")
     for item in result.get("content", []):
@@ -272,9 +296,53 @@ def tool_object(result: dict[str, Any], *, operation: str) -> dict[str, Any]:
             value = json.loads(item["text"])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
-            return value
-    raise AssertionError(f"{operation} did not return one JSON object: {result}")
+        return value
+    raise AssertionError(f"{operation} did not return one JSON value: {result}")
+
+
+def tool_object(result: dict[str, Any], *, operation: str) -> dict[str, Any]:
+    value = tool_value(result, operation=operation)
+    if not isinstance(value, dict):
+        raise AssertionError(f"{operation} did not return one JSON object: {result}")
+    return value
+
+
+def tool_error_text(result: dict[str, Any], *, operation: str) -> str:
+    if not result.get("isError", False):
+        raise AssertionError(f"{operation} unexpectedly succeeded: {result}")
+    text_items = [
+        item["text"]
+        for item in result.get("content", [])
+        if item.get("type") == "text" and isinstance(item.get("text"), str)
+    ]
+    if not text_items:
+        raise AssertionError(f"{operation} did not return an error message: {result}")
+    return "\n".join(text_items)
+
+
+def initialize_git_fixture(workspace: Path, fixture: Path) -> None:
+    commands = [
+        ["git", "-C", str(workspace), "init", "--initial-branch=main"],
+        ["git", "-C", str(workspace), "add", fixture.name],
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=RepoPrompt Contract",
+            "-c",
+            "user.email=contract@repoprompt.invalid",
+            "commit",
+            "--message",
+            "Create headless contract fixture",
+        ],
+    ]
+    for command in commands:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"failed to initialize Git fixture with {command}: {completed.stderr.strip()}"
+            )
 
 
 def set_secondary_model(
@@ -527,7 +595,11 @@ def main() -> int:
             ],
         )
         fixture = workspace / "sample.swift"
-        fixture.write_text("struct LinuxHeadlessFixture {}\n", encoding="utf-8")
+        fixture.write_text(
+            'struct LinuxHeadlessFixture { let marker = "RPCE_TOOL_MATRIX_SENTINEL" }\n',
+            encoding="utf-8",
+        )
+        initialize_git_fixture(workspace, fixture)
         fake_codex = workspace / FAKE_CODEX_NAME
         fake_codex.write_text(FAKE_CODEX_SCRIPT, encoding="utf-8")
         fake_codex.chmod(0o755)
@@ -543,7 +615,8 @@ def main() -> int:
             # changing the image's production user contract.
             workspace.chmod(0o755)
             profile.chmod(0o777)
-            workspace_documents.chmod(0o777)
+            for profile_entry in profile.rglob("*"):
+                profile_entry.chmod(0o777 if profile_entry.is_dir() else 0o666)
 
         environment = os.environ.copy()
         environment["REPOPROMPT_MCP_HEADLESS_PROFILE"] = "default"
@@ -575,10 +648,15 @@ def main() -> int:
             )
             listed = request(process, 2, "tools/list", {})
             tools = listed["result"]["tools"]
-            names = {tool["name"] for tool in tools}
+            ordered_names = [tool["name"] for tool in tools]
+            names = set(ordered_names)
             if names != EXPECTED_TOOLS:
                 raise AssertionError(
                     f"canonical tool surface drifted: missing={sorted(EXPECTED_TOOLS - names)} extra={sorted(names - EXPECTED_TOOLS)}"
+                )
+            if ordered_names != EXPECTED_TOOL_ORDER:
+                raise AssertionError(
+                    f"canonical tool order drifted: expected={EXPECTED_TOOL_ORDER} actual={ordered_names}"
                 )
 
             bind_schema = next(tool["inputSchema"] for tool in tools if tool["name"] == "bind_context")
@@ -620,6 +698,332 @@ def main() -> int:
             if not invalid_secondary.get("isError", False):
                 raise AssertionError(f"unknown Secondary Oracle model was accepted: {invalid_secondary}")
             set_planning_model(process, 53, PRIMARY_MODEL)
+
+            matrix_covered: set[str] = set()
+
+            def matrix_call(
+                identifier: int,
+                name: str,
+                arguments: dict[str, Any],
+            ) -> dict[str, Any]:
+                if name in matrix_covered:
+                    raise AssertionError(f"duplicate exhaustive matrix fixture for {name}")
+                matrix_covered.add(name)
+                return call_tool(process, identifier, name, arguments)
+
+            settings = tool_object(
+                matrix_call(
+                    200,
+                    "app_settings",
+                    {"op": "list", "group": "models", "detailed": True},
+                ),
+                operation="matrix app_settings",
+            )
+            if (
+                settings.get("backend") != "headless"
+                or settings.get("profile") != "default"
+                or not settings.get("settings")
+            ):
+                raise AssertionError(f"app_settings matrix result drifted: {settings}")
+
+            binding = tool_object(
+                matrix_call(201, "bind_context", {"op": "status"}),
+                operation="matrix bind_context",
+            )
+            if binding.get("backend") != "headless" or binding.get("binding", {}).get("kind") != "context":
+                raise AssertionError(f"bind_context matrix result drifted: {binding}")
+
+            workspace_catalog = tool_object(
+                matrix_call(202, "manage_workspaces", {"action": "list"}),
+                operation="matrix manage_workspaces",
+            )
+            workspace_ids = {
+                item.get("workspace_id")
+                for item in workspace_catalog.get("workspaces", [])
+                if isinstance(item, dict)
+            }
+            if (
+                workspace_catalog.get("backend") != "headless"
+                or workspace_ids != {primary_workspace_id, secondary_workspace_id}
+            ):
+                raise AssertionError(f"manage_workspaces matrix result drifted: {workspace_catalog}")
+
+            selection = tool_object(
+                matrix_call(
+                    203,
+                    "manage_selection",
+                    {"op": "set", "paths": ["sample.swift"], "strict": True},
+                ),
+                operation="matrix manage_selection",
+            )
+            if (
+                selection.get("operation") != "set"
+                or selection.get("count") != 1
+                or selection.get("selection") != ["sample.swift"]
+            ):
+                raise AssertionError(f"manage_selection matrix result drifted: {selection}")
+
+            matrix_denied_path = "/workspace/denied-create.txt" if mode == "docker" else str(
+                workspace / "denied-create.txt"
+            )
+            denied_create = matrix_call(
+                204,
+                "file_actions",
+                {"action": "create", "path": matrix_denied_path, "content": "DENIED"},
+            )
+            if "grantMissing" not in tool_error_text(
+                denied_create,
+                operation="matrix file_actions denial",
+            ) or (workspace / "denied-create.txt").exists():
+                raise AssertionError(f"file_actions matrix mutation did not fail closed: {denied_create}")
+
+            structure = tool_object(
+                matrix_call(
+                    205,
+                    "get_code_structure",
+                    {"paths": [fixture_path], "signatures": True},
+                ),
+                operation="matrix get_code_structure",
+            )
+            structure_files = structure.get("files")
+            if (
+                structure.get("backend") != "headless"
+                or structure.get("updates_pending") is not False
+                or not isinstance(structure_files, list)
+                or len(structure_files) != 1
+                or structure_files[0].get("path") != fixture_path
+            ):
+                raise AssertionError(f"get_code_structure matrix result drifted: {structure}")
+
+            tree = tool_value(
+                matrix_call(206, "get_file_tree", {"type": "roots"}),
+                operation="matrix get_file_tree",
+            )
+            if not isinstance(tree, str) or primary_repo_path not in tree.splitlines():
+                raise AssertionError(f"get_file_tree matrix result drifted: {tree!r}")
+
+            matrix_read = tool_value(
+                matrix_call(
+                    207,
+                    "read_file",
+                    {"path": fixture_path, "start_line": 1, "limit": 20},
+                ),
+                operation="matrix read_file",
+            )
+            if not isinstance(matrix_read, str) or "RPCE_TOOL_MATRIX_SENTINEL" not in matrix_read:
+                raise AssertionError(f"read_file matrix result drifted: {matrix_read!r}")
+
+            search = tool_object(
+                matrix_call(
+                    208,
+                    "file_search",
+                    {
+                        "pattern": "RPCE_TOOL_MATRIX_SENTINEL",
+                        "path": "sample.swift",
+                        "regex": False,
+                        "max_results": 5,
+                    },
+                ),
+                operation="matrix file_search",
+            )
+            if search.get("count") != 1 or search.get("matches", [{}])[0].get("path") != "sample.swift":
+                raise AssertionError(f"file_search matrix result drifted: {search}")
+
+            workspace_context = tool_object(
+                matrix_call(209, "workspace_context", {"op": "snapshot"}),
+                operation="matrix workspace_context",
+            )
+            if (
+                workspace_context.get("workspace_id") != primary_workspace_id
+                or workspace_context.get("context_id") != primary_context_id
+                or workspace_context.get("roots") != [primary_repo_path]
+                or workspace_context.get("selection") != ["sample.swift"]
+            ):
+                raise AssertionError(f"workspace_context matrix result drifted: {workspace_context}")
+
+            prompt = tool_object(
+                matrix_call(
+                    210,
+                    "prompt",
+                    {"op": "set", "text": "RPCE_PROMPT_MATRIX"},
+                ),
+                operation="matrix prompt",
+            )
+            if prompt.get("operation") != "set" or prompt.get("prompt") != "RPCE_PROMPT_MATRIX":
+                raise AssertionError(f"prompt matrix result drifted: {prompt}")
+
+            fixture_before_denied_edit = fixture.read_bytes()
+            denied_edit = matrix_call(
+                211,
+                "apply_edits",
+                {
+                    "path": fixture_path,
+                    "search": "LinuxHeadlessFixture",
+                    "replace": "MUTATED",
+                },
+            )
+            if "grantMissing" not in tool_error_text(
+                denied_edit,
+                operation="matrix apply_edits denial",
+            ) or fixture.read_bytes() != fixture_before_denied_edit:
+                raise AssertionError(f"apply_edits matrix mutation did not fail closed: {denied_edit}")
+
+            models = tool_object(
+                matrix_call(212, "oracle_utils", {"op": "models"}),
+                operation="matrix oracle_utils",
+            )
+            model_catalog = models.get("models", [])
+            if (
+                models.get("backend") != "headless"
+                or len(model_catalog) != 1
+                or model_catalog[0].get("id") != "codexExec"
+                or model_catalog[0].get("available") is not True
+            ):
+                raise AssertionError(f"oracle_utils matrix result drifted: {models}")
+
+            matrix_oracle = tool_object(
+                matrix_call(
+                    213,
+                    "oracle_send",
+                    {"message": "oracle-contract-matrix", "new_chat": True},
+                ),
+                operation="matrix oracle_send",
+            )
+            assert_legacy_oracle_result(
+                matrix_oracle,
+                expected_response=f"{PRIMARY_CLI_MODEL}:legacy",
+            )
+
+            git_status = tool_object(
+                matrix_call(
+                    214,
+                    "git",
+                    {"op": "status", "repo_root": primary_repo_path},
+                ),
+                operation="matrix git",
+            )
+            repositories = git_status.get("repositories", [])
+            if (
+                git_status.get("op") != "status"
+                or len(repositories) != 1
+                or repositories[0].get("repo_root") != primary_repo_path
+                or "## main" not in repositories[0].get("output", "")
+            ):
+                raise AssertionError(f"git matrix result drifted: {git_status}")
+
+            worktrees = tool_object(
+                matrix_call(
+                    215,
+                    "manage_worktree",
+                    {"op": "list", "repo_root": primary_repo_path},
+                ),
+                operation="matrix manage_worktree",
+            )
+            if worktrees.get("op") != "list" or f"worktree {primary_repo_path}" not in worktrees.get("output", ""):
+                raise AssertionError(f"manage_worktree matrix result drifted: {worktrees}")
+
+            matrix_context = tool_object(
+                matrix_call(
+                    216,
+                    "context_builder",
+                    {"instructions": "oracle-contract-context-matrix"},
+                ),
+                operation="matrix context_builder",
+            )
+            assert_legacy_oracle_result(
+                matrix_context,
+                expected_response=f"{PRIMARY_CLI_MODEL}:context",
+            )
+
+            agent_start = tool_object(
+                matrix_call(
+                    217,
+                    "agent_run",
+                    {
+                        "op": "start",
+                        "model_id": "codexExec",
+                        "session_name": "Headless tool matrix",
+                        "message": "agent-contract-matrix",
+                        "detach": True,
+                    },
+                ),
+                operation="matrix agent_run start",
+            )
+            agent_session_id = agent_start.get("session_id")
+            if not isinstance(agent_session_id, str) or not uuid.UUID(agent_session_id):
+                raise AssertionError(f"agent_run matrix start omitted session_id: {agent_start}")
+            agent_wait = tool_object(
+                call_tool(
+                    process,
+                    218,
+                    "agent_run",
+                    {"op": "wait", "session_id": agent_session_id, "timeout": 30},
+                ),
+                operation="matrix agent_run wait",
+            )
+            if (
+                agent_wait.get("status") != "completed"
+                or agent_wait.get("assistant_text") != "default:legacy"
+                or agent_wait.get("agent", {}).get("id") != "codexExec"
+            ):
+                raise AssertionError(f"agent_run matrix completion drifted: {agent_wait}")
+
+            agents = tool_object(
+                matrix_call(
+                    219,
+                    "agent_manage",
+                    {"op": "list_agents", "roles_only": True},
+                ),
+                operation="matrix agent_manage",
+            )
+            agent_catalog = agents.get("agents", [])
+            if (
+                agents.get("backend") != "headless"
+                or len(agent_catalog) != 1
+                or agent_catalog[0].get("id") != "codexExec"
+                or agent_catalog[0].get("available") is not True
+            ):
+                raise AssertionError(f"agent_manage matrix result drifted: {agents}")
+
+            history = tool_object(
+                matrix_call(
+                    220,
+                    "history",
+                    {"op": "list_sessions", "limit": 10},
+                ),
+                operation="matrix history",
+            )
+            history_ids = {
+                item.get("session_id")
+                for item in history.get("sessions", [])
+                if isinstance(item, dict)
+            }
+            if history.get("profile") != "default" or agent_session_id not in history_ids:
+                raise AssertionError(f"history matrix result drifted: {history}")
+
+            if matrix_covered != EXPECTED_TOOLS:
+                raise AssertionError(
+                    f"exhaustive matrix drifted: missing={sorted(EXPECTED_TOOLS - matrix_covered)} "
+                    f"extra={sorted(matrix_covered - EXPECTED_TOOLS)}"
+                )
+
+            capture_before_hidden_calls = fake_capture.read_text(encoding="utf-8")
+            for offset, (hidden_name, hidden_arguments) in enumerate(HIDDEN_DIRECT_TOOLS.items()):
+                hidden = call_tool(
+                    process,
+                    230 + offset,
+                    hidden_name,
+                    hidden_arguments,
+                )
+                expected_error = f"Tool is unavailable for this client policy: {hidden_name}"
+                error_text = tool_error_text(hidden, operation=f"hidden tool {hidden_name}")
+                if error_text != expected_error:
+                    raise AssertionError(
+                        f"hidden tool policy drifted for {hidden_name}: expected={expected_error!r} actual={error_text!r}"
+                    )
+            if fake_capture.read_text(encoding="utf-8") != capture_before_hidden_calls:
+                raise AssertionError("hidden direct tools launched a provider process")
+
             legacy = tool_object(
                 call_tool(
                     process,

@@ -29,8 +29,12 @@ The default Linux state root is `$XDG_DATA_HOME/repoprompt-ce`, falling back to
 `~/.local/share/repoprompt-ce`. Automation should use the existing
 `REPOPROMPT_MCP_HEADLESS_PROFILE_DIR` isolation boundary and provide canonical
 workspace roots through `REPOPROMPT_MCP_WORKING_DIRS`. The container fixes
-these to `/data` and `/workspace`, runs as uid/gid 65532, disables networking in
-the final contract harness, and invokes the same explicit backend flag.
+these to `/data` and `/workspace`, runs as uid/gid 65532, and invokes the same
+explicit backend flag. It ships the official Codex CLI 0.147.0 Linux standalone
+tree at `/opt/codex`, with a writable, initially empty `CODEX_HOME` at
+`/home/repoprompt/.codex`. The final contract harness disables networking and
+uses a fake provider; a live provider invocation requires runtime credentials
+and outbound HTTPS.
 
 `Scripts/test_linux_headless_native.sh` owns the native Swift build and domain
 tests. `Scripts/test_linux_headless_mcp.py` owns the process-level MCP contract:
@@ -63,11 +67,23 @@ Direct mode installs one MCP SDK `Server` over `MCPStdioServerTransport`; it doe
 Long-running Agent and Context Builder providers receive an explicit run-scoped carrier. The carrier contains a private Unix endpoint, single-use launch token, verified principal/provider identity, and run ID. The endpoint directory is owner-only, the socket is identity-fenced, and token redemption checks runtime generation, peer PID, expiry, scope, and replay before registering a child connection. App-spawned provider children receive explicit `--backend app`; direct-runtime children use the private run-scoped endpoint and never auto-probe the app.
 
 The direct Oracle provider resolves Codex from `PATH` or the explicit
-`REPOPROMPT_CODEX_COMMAND` executable. The container intentionally keeps
-provider installation and credentials outside the image; mount or extend the
-image with a Linux Codex executable and set that variable when Oracle calls are
-needed. Oracle and Context Builder launches still require the normal explicit
-`ai_cost` and `external_process` mutation grants.
+`REPOPROMPT_CODEX_COMMAND` executable. The container pins that executable to the
+bundled official Codex CLI 0.147.0 package while keeping credentials strictly
+outside the image. Supply `CODEX_API_KEY` only when the container starts, or
+mount a runtime-authenticated Codex home at `/home/repoprompt/.codex`. The MCP
+provider subprocess inherits the narrowly scoped `CODEX_API_KEY` and
+`CODEX_HOME` variables, but continues to filter unrelated parent credentials
+and loader controls. Oracle and Context Builder launches still require the
+normal explicit `ai_cost` and `external_process` mutation grants.
+
+Codex normally applies its own Linux namespace sandbox. Creating that nested
+sandbox is incompatible with the capabilities and seccomp profile of an
+ordinary non-privileged Docker container. The image therefore sets the explicit
+`REPOPROMPT_CODEX_EXTERNALLY_SANDBOXED=1` contract: provider launches bypass the
+nested Codex sandbox and rely on the non-root container boundary. This mode is
+not the native Linux default and does not grant access beyond the files,
+devices, or network made available to the container. Do not add `--privileged`,
+`SYS_ADMIN`, or a relaxed seccomp profile to restore the nested sandbox.
 
 Headless dual Oracle uses the same nullable
 `models.secondary_oracle_model` setting as the app. `null` or blank retains the
@@ -88,6 +104,13 @@ Provider roots are created in dedicated POSIX process groups; cancellation
 terminates the group with a bounded TERM-to-KILL escalation so same-group
 descendants cannot retain a private carrier after the Oracle turn ends. The
 container uses `tini` as PID 1 to reap any resulting orphaned processes.
+
+No Docker build argument, layer, or context path carries provider credentials.
+`.dockerignore` excludes `.env`, `.codex`, and `auth.json` material. The image's
+Codex home is created empty and owner-only; a named volume preserves a device
+login without placing it in the image. An environment-injected key remains
+visible to the Docker daemon for the lifetime of the container, so use
+short-lived `--rm` runs and normal host-level secret controls.
 
 ## State roots and security defaults
 

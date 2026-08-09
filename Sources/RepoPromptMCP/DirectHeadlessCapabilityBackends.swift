@@ -1067,6 +1067,13 @@ enum DirectProcess {
         "XDG_DATA_HOME"
     ]
 
+    /// Credentials are accepted only when a caller deliberately supplies them for a
+    /// specific child invocation. Ambient credentials must not leak into unrelated git
+    /// subprocesses that also use `DirectProcess`.
+    private static let explicitEnvironmentKeys: Set<String> = [
+        "CODEX_API_KEY"
+    ]
+
     private static let childLaunchEnvironmentKeys: Set<String> = [
         DomainChildLaunchCarrier.endpointEnvironmentKey,
         DomainChildLaunchCarrier.launchTokenEnvironmentKey,
@@ -1090,6 +1097,7 @@ enum DirectProcess {
             inheritedEnvironmentKeys.contains(key) || key.hasPrefix("LC_")
         }
         for (key, value) in overrides where inheritedEnvironmentKeys.contains(key)
+            || explicitEnvironmentKeys.contains(key)
             || childLaunchEnvironmentKeys.contains(key)
             || key.hasPrefix("LC_")
         {
