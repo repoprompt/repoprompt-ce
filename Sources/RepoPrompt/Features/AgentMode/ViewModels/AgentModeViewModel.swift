@@ -1523,6 +1523,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private weak var oracleViewModel: OracleViewModel?
 
+    private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
+        ClaudeAgentModeCoordinator.HostCapabilities(
+            setAgentRunActive: { [weak self] session, isActive in
+                self?.setAgentRunActive(session, isActive: isActive)
+            },
+            requestUIRefresh: { [weak self] session, urgent in
+                guard let self, sessions[session.tabID] === session else { return }
+                requestUIRefresh(tabID: session.tabID, urgent: urgent)
+            },
+            scheduleSave: { [weak self] session in
+                self?.scheduleSave(for: session)
+            },
+            stageClaudeResumeRecoveryHandoff: { [weak self] session in
+                await self?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session)
+            },
+            prependPendingHandoff: { [weak self] text, session in
+                self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+            }
+        )
+    }
+
     init(
         windowID: Int,
         promptManager: PromptViewModel,
@@ -1681,7 +1702,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         codexCoordinator.attach(viewModel: self)
-        claudeCoordinator.attach(viewModel: self)
+        claudeCoordinator.installHostCapabilities(
+            makeClaudeCoordinatorHostCapabilities(),
+            providerBindingService: providerBindingService
+        )
         runInteractionStateObserver = codexCoordinator
         mcpServer.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
             guard let self else { return .unavailable }
@@ -1865,7 +1889,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             providerBindingService = AgentModeProviderBindingService()
             codexCoordinator.attach(viewModel: self)
-            claudeCoordinator.attach(viewModel: self)
+            claudeCoordinator.installHostCapabilities(
+                makeClaudeCoordinatorHostCapabilities(),
+                providerBindingService: providerBindingService
+            )
             runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
                 guard let self else { return .unavailable }

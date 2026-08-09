@@ -711,6 +711,23 @@ for path in "${terminal_session_neutral_files[@]}"; do
     grep -n -E 'AgentModeViewModel\.AttachmentTurnDisposition|AgentModeRunService\.CancellationCompletion' "$path"
 done
 
+# Claude runtime coordination must use its closed host capability surface rather
+# than retaining or attaching the concrete AgentModeViewModel. TabSession remains
+# intentionally nested until the separately scoped session-type extraction.
+claude_coordinator_source="Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift"
+if [[ ! -f "$claude_coordinator_source" ]]; then
+  fail "required Claude agent-mode coordinator source missing: $claude_coordinator_source"
+else
+  print_matches \
+    "ClaudeAgentModeCoordinator stores concrete AgentModeViewModel authority" \
+    grep -n -E '(^|[[:space:]])(weak[[:space:]]+)?(var|let)[[:space:]]+[[:alnum:]_]+[[:space:]]*:[[:space:]]*AgentModeViewModel[?]?[[:space:]]*$' \
+      "$claude_coordinator_source"
+  print_matches \
+    "ClaudeAgentModeCoordinator reintroduced attach(viewModel:)" \
+    grep -n -E 'func[[:space:]]+attach\(viewModel:[[:space:]]*AgentModeViewModel[?]?\)' \
+      "$claude_coordinator_source"
+fi
+
 # 7. Removed IDE-era Prompt selected-files panel and Prompt-owned preset bottom bar
 # artifacts must not return. The live compact selected-files surface is
 # SelectedFilesGrid/FilePreviewPopover, and Settings owns its chat preset picker.

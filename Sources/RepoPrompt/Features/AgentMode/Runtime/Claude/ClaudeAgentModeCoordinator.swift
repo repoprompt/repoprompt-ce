@@ -18,6 +18,24 @@ final class ClaudeAgentModeCoordinator {
     typealias MCPActiveToolQuery = (_ runID: UUID) -> Bool
     typealias ActiveAgentRunWaitQuery = (_ runID: UUID) -> Bool
 
+    struct HostCapabilities {
+        let setAgentRunActive: @MainActor (_ session: AgentModeViewModel.TabSession, _ isActive: Bool) -> Void
+        let requestUIRefresh: @MainActor (_ session: AgentModeViewModel.TabSession, _ urgent: Bool) -> Void
+        let scheduleSave: @MainActor (_ session: AgentModeViewModel.TabSession) -> Void
+        let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentModeViewModel.TabSession) async -> Void
+        let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentModeViewModel.TabSession) -> String
+
+        static var noOp: Self {
+            Self(
+                setAgentRunActive: { _, _ in },
+                requestUIRefresh: { _, _ in },
+                scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in },
+                prependPendingHandoff: { text, _ in text }
+            )
+        }
+    }
+
     private enum SteeringInterruptSafePointResult {
         case ready
         case cancelled
@@ -48,7 +66,8 @@ final class ClaudeAgentModeCoordinator {
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
     private static let flagSettingsLogger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeFlagSettings")
 
-    private weak var viewModel: AgentModeViewModel?
+    private weak var providerBindingService: AgentModeProviderBindingService?
+    private var hostCapabilities: HostCapabilities = .noOp
     private let windowID: Int
     private let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
     private let claudeControllerFactory: ClaudeControllerFactory
@@ -140,12 +159,16 @@ final class ClaudeAgentModeCoordinator {
         )
         guard scheduleSave else { return true }
         session.isDirty = true
-        viewModel?.scheduleSave(for: session.tabID)
+        hostCapabilities.scheduleSave(session)
         return true
     }
 
-    func attach(viewModel: AgentModeViewModel) {
-        self.viewModel = viewModel
+    func installHostCapabilities(
+        _ hostCapabilities: HostCapabilities,
+        providerBindingService: AgentModeProviderBindingService
+    ) {
+        self.hostCapabilities = hostCapabilities
+        self.providerBindingService = providerBindingService
     }
 
     func stop() {
@@ -181,10 +204,10 @@ final class ClaudeAgentModeCoordinator {
         session.runState = state
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
-        viewModel?.setAgentRunActive(session.tabID, isActive: false)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        hostCapabilities.setAgentRunActive(session, false)
+        hostCapabilities.requestUIRefresh(session, true)
         if save {
-            viewModel?.scheduleSave(for: session.tabID)
+            hostCapabilities.scheduleSave(session)
         }
     }
 
@@ -428,7 +451,7 @@ final class ClaudeAgentModeCoordinator {
             session.providerSessionID = nil
             session.providerCleanupHandle = nil
             session.isDirty = true
-            viewModel?.scheduleSave(for: session.tabID)
+            hostCapabilities.scheduleSave(session)
         }
         _ = await retireClaudeController(
             detached,
@@ -576,7 +599,7 @@ final class ClaudeAgentModeCoordinator {
                 throw error
             }
 
-            await viewModel?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session)
+            await hostCapabilities.stageClaudeResumeRecoveryHandoff(session)
             guard sessionOwnsClaudeController(controller, for: session) else {
                 await controller.shutdown()
                 throw ControllerLifecycleError.superseded
@@ -599,7 +622,7 @@ final class ClaudeAgentModeCoordinator {
             session.providerSessionID = nil
             session.providerCleanupHandle = nil
             session.isDirty = true
-            viewModel?.scheduleSave(for: session.tabID)
+            hostCapabilities.scheduleSave(session)
 
             let freshRunID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
             let retryWorkspacePath = try workspacePathProvider(session)
@@ -810,8 +833,8 @@ final class ClaudeAgentModeCoordinator {
         session.runState = .running
         var handler = toolHandler(for: session)
         handler.resetTurnState(for: session)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        hostCapabilities.setAgentRunActive(session, true)
+        hostCapabilities.requestUIRefresh(session, true)
 
         for _ in 0 ..< 3 {
             await ensureClaudeNativeSession(session: session)
@@ -897,11 +920,7 @@ final class ClaudeAgentModeCoordinator {
             }
 
             do {
-                let outboundText: String = if let viewModel {
-                    viewModel.prependPendingHandoffIfNeeded(text, session: session)
-                } else {
-                    text
-                }
+                let outboundText = hostCapabilities.prependPendingHandoff(text, session)
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
                 let turnID = try await controller.sendUserMessage(providerBoundText)
@@ -987,7 +1006,7 @@ final class ClaudeAgentModeCoordinator {
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus("Thinking…", source: .transport)
         session.runState = .running
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        hostCapabilities.requestUIRefresh(session, true)
         Task { [controller] in
             await controller.respondToPermissionRequest(id: requestID, decision: decision)
         }
@@ -1324,7 +1343,7 @@ final class ClaudeAgentModeCoordinator {
     private func effectiveClaudeRuntimePermission(
         for session: AgentModeViewModel.TabSession
     ) -> ClaudeControllerLaunchPolicy {
-        guard let providerBindingService = viewModel?.providerBindingService else {
+        guard let providerBindingService else {
             return ClaudeControllerLaunchPolicy(
                 permissionMode: session.permissionProfile.claudePermissionMode,
                 allowNativeBashTool: session.permissionProfile == .mcpSafeDefaults ? false : nil,
@@ -1377,7 +1396,7 @@ final class ClaudeAgentModeCoordinator {
     }
 
     private func currentClaudeEffortLevel(for session: AgentModeViewModel.TabSession) -> ClaudeCodeEffortLevel {
-        viewModel?.providerBindingService.claudeEffortLevel(
+        providerBindingService?.claudeEffortLevel(
             forModelRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent
         ) ?? ClaudeAgentToolPreferences.effortLevel(
