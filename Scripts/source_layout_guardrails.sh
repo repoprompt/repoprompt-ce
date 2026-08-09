@@ -692,19 +692,19 @@ print_matches \
   "WorkspaceFilesViewModel references removed recursive eager loading seam" \
   grep -n -E 'loadContentsRecursively' Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift
 
-# Agent Mode terminal settlement stays independent of the app's concrete tab
-# session type. Concrete binding is allowed only in the app-host adapter.
+# Agent Mode terminal settlement stays free of the app's concrete TabSession
+# type. Other narrow nested vocabulary remains an explicit follow-up boundary.
 terminal_session_neutral_files=(
   "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalSessionBinding.swift"
   "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift"
 )
 for path in "${terminal_session_neutral_files[@]}"; do
   if [[ ! -f "$path" ]]; then
-    fail "required session-neutral terminal settlement source missing: $path"
+      fail "required TabSession-neutral terminal settlement source missing: $path"
     continue
   fi
   print_matches \
-    "session-neutral terminal settlement source references AgentModeViewModel.TabSession: $path" \
+      "TabSession-neutral terminal settlement source references AgentModeViewModel.TabSession: $path" \
     grep -n -F 'AgentModeViewModel.TabSession' "$path"
 done
 

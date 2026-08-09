@@ -3,10 +3,14 @@ import RepoPromptDomainRuntime
 
 /// Exact-object-bound capabilities used by the terminal settlement spine.
 ///
-/// This value carries no app session type and performs no lookup by `tabID`.
-/// The app host partially applies its concrete session at the run/settlement
-/// edge, while the terminal barrier operates only on this capability surface
-/// and `AgentRunAttemptLifecycle`.
+/// This value carries no concrete `TabSession` and performs no lookup by
+/// `tabID`. The app host partially applies its exact session at the
+/// run/settlement edge, while the terminal barrier operates only on this
+/// capability surface and `AgentRunAttemptLifecycle`.
+///
+/// This slice is intentionally `TabSession`-neutral, not yet independent of all
+/// app-owned nested vocabulary: `AttachmentTurnDisposition` remains a narrow
+/// follow-up boundary rather than being hoisted in this PR.
 @MainActor
 struct AgentRunTerminalSessionBinding {
     struct Hooks {

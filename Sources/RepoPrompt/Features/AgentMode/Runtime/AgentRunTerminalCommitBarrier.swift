@@ -43,6 +43,9 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     struct Request {
+        // This request is concrete-TabSession-free. The remaining app-owned
+        // AttachmentTurnDisposition and CancellationCompletion vocabulary is a
+        // deliberately deferred contract-hoisting boundary for a later slice.
         let binding: AgentRunTerminalSessionBinding
         let ownership: AgentRunOwnership
         let expectedRunID: UUID?

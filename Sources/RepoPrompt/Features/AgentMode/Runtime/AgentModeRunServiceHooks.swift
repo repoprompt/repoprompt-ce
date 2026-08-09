@@ -17,7 +17,7 @@ import RepoPromptDomainRuntime
 // - `AgentModeViewModel.TabSession` remains at broader app-host orchestration
 //   hooks because the app is the only adopter today. Terminal settlement does
 //   not receive that type: `bindTerminalSession(_:)` partially applies the
-//   exact originating object into a session-neutral capability value.
+//   exact originating object into a `TabSession`-neutral capability value.
 
 extension AgentModeRunService {
     /// Token/usage accounting projection for non-Codex turns.

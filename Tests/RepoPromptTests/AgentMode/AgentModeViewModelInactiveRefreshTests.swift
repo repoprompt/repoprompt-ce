@@ -2133,6 +2133,46 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTFail("Timed out waiting for condition")
     }
 
+    func testRecycledTabStaleSessionGuardsDoNotMutateOrDispatchSuccessor() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+
+        let predecessor = AgentModeViewModel.TabSession(tabID: tabID)
+        predecessor.activeAgentRunStartedAt = Date(timeIntervalSince1970: 1)
+        predecessor.mcpFollowUpRunPending = true
+        predecessor.saveRequestGeneration = 7
+        viewModel.test_installLiveSession(predecessor)
+
+        let successor = AgentModeViewModel.TabSession(tabID: tabID)
+        let successorStartedAt = Date(timeIntervalSince1970: 2)
+        successor.activeAgentRunStartedAt = successorStartedAt
+        successor.saveRequestGeneration = 41
+        viewModel.test_installLiveSession(successor)
+        viewModel.setAgentRunActive(successor, isActive: true)
+
+        viewModel.setAgentRunActive(predecessor, isActive: false)
+        viewModel.scheduleSave(for: predecessor)
+        await viewModel.test_startFollowUpRun(
+            for: predecessor,
+            initialMessage: "must not reach recycled successor"
+        )
+
+        XCTAssertNil(predecessor.activeAgentRunStartedAt)
+        XCTAssertEqual(predecessor.saveRequestGeneration, 7)
+        XCTAssertNil(predecessor.saveDebounceTask)
+        XCTAssertFalse(predecessor.mcpFollowUpRunPending)
+
+        XCTAssertEqual(successor.activeAgentRunStartedAt, successorStartedAt)
+        XCTAssertTrue(viewModel.isTabRunning(tabID))
+        XCTAssertEqual(successor.saveRequestGeneration, 41)
+        XCTAssertNil(successor.saveDebounceTask)
+        XCTAssertEqual(successor.runState, .idle)
+        XCTAssertNil(successor.runID)
+        XCTAssertNil(successor.activeRunOwnership)
+        XCTAssertNil(successor.agentTask)
+        XCTAssertTrue(successor.items.isEmpty)
+    }
+
     private func makeViewModel() -> AgentModeViewModel {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in InactiveRefreshFakeCodexController() }
