@@ -20,9 +20,20 @@ final class WebSearchToolCardTests: XCTestCase {
 
     func testToolNamePolicyAppliesToLiveMutationsAndPersistedDecoding() throws {
         let oversizedName = String(repeating: "x", count: AgentToolNamePolicy.maximumUTF8Length + 1)
+        let factoryItem = AgentChatItem.toolCall(name: oversizedName, argsJSON: nil)
+        XCTAssertNil(factoryItem.toolName)
+        XCTAssertEqual(factoryItem.text, "Using tool")
+
         var item = AgentChatItem.toolCall(name: "search", argsJSON: nil)
         item.toolName = oversizedName
         XCTAssertNil(item.toolName)
+
+        let encodedItem = try JSONEncoder().encode(AgentChatItem.toolCall(name: "search", argsJSON: nil))
+        var itemObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encodedItem) as? [String: Any])
+        itemObject["toolName"] = oversizedName
+        let oversizedItemData = try JSONSerialization.data(withJSONObject: itemObject)
+        let decodedItem = try JSONDecoder().decode(AgentChatItem.self, from: oversizedItemData)
+        XCTAssertNil(decodedItem.toolName)
 
         let persisted = AgentChatItemPersist(from: AgentChatItem.toolCall(name: "search", argsJSON: nil))
         let encoded = try JSONEncoder().encode(persisted)

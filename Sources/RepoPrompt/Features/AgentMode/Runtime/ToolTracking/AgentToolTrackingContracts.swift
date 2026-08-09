@@ -121,17 +121,19 @@ struct AgentToolTrackingHooks {
 enum AgentToolTrackingSupport {
     /// Whether the tool name belongs to a RepoPrompt MCP tool (any naming convention).
     static func isRepoPromptTool(_ name: String) -> Bool {
-        MCPIntegrationHelper.isRepoPromptToolName(name)
+        guard let name = AgentToolNamePolicy.accepted(name) else { return false }
+        return MCPIntegrationHelper.isRepoPromptToolName(name)
     }
 
     /// Whether the tool name uses the explicit server-prefixed RepoPrompt naming.
     static func isExplicitRepoPromptTool(_ name: String) -> Bool {
-        MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(name)
+        guard let name = AgentToolNamePolicy.accepted(name) else { return false }
+        return MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(name)
     }
 
     /// Whether a tool should be hidden from the agent transcript UI.
     static func shouldHideToolFromTranscript(_ name: String?) -> Bool {
-        AgentTranscriptIO.shouldHideToolFromTranscript(name)
+        AgentTranscriptIO.shouldHideToolFromTranscript(AgentToolNamePolicy.accepted(name))
     }
 
     /// Whether a provider tool event should be suppressed in favor of tracker-sourced events.
@@ -154,6 +156,7 @@ enum AgentToolTrackingSupport {
     ) -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
         guard invocationID == nil else { return false }
+        guard let toolName = AgentToolNamePolicy.accepted(toolName) else { return false }
         return toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "read"
     }
 

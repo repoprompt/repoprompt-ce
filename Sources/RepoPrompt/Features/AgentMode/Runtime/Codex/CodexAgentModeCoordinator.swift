@@ -648,6 +648,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private func isRepoPromptTrackerToolName(_ toolName: String) -> Bool {
+        guard let toolName = AgentToolNamePolicy.accepted(toolName) else { return false }
         if AgentToolTrackingSupport.isRepoPromptTool(toolName) {
             return true
         }
@@ -6893,6 +6894,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         case let .toolCall(toolName, invocationID, argsJSON):
             guard session.runState.isActive else { return }
+            let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             noteCodexNativeToolCall(
@@ -6933,6 +6935,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.requestUIRefresh(tabID: session.tabID)
         case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError):
             guard session.runState.isActive else { return }
+            let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             if AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName) {
@@ -7339,7 +7342,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private static func normalizedExternalToolName(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard let acceptedName = AgentToolNamePolicy.accepted(raw) else { return nil }
+        let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
         let lowered = raw.lowercased()
         if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
             return webCanonical

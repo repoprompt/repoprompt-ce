@@ -5,6 +5,7 @@ enum AgentToolNamePolicy {
     /// Tool names are identifiers, not payloads. This keeps all downstream work bounded while
     /// leaving ample room for namespaced MCP and provider tool names.
     static let maximumUTF8Length = 512
+    static let fallbackName = "tool"
 
     static func accepted(_ raw: String?) -> String? {
         guard let raw else { return nil }
