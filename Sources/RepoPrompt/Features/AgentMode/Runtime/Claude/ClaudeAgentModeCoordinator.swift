@@ -466,8 +466,7 @@ final class ClaudeAgentModeCoordinator {
     private func retireClaudeController(
         _ detached: DetachedClaudeController,
         for session: AgentModeViewModel.TabSession,
-        captureProviderSessionID: Bool,
-        scheduleProviderSessionSave: Bool = true
+        captureProviderSessionID: Bool
     ) async -> Bool {
         let generation = UUID()
         controllerRetirementGenerationByTabID[session.tabID] = generation
@@ -478,8 +477,7 @@ final class ClaudeAgentModeCoordinator {
             {
                 updateProviderSessionIDIfNeeded(
                     sessionRef.sessionID,
-                    for: session,
-                    scheduleSave: scheduleProviderSessionSave
+                    for: session
                 )
             }
         }
@@ -1078,8 +1076,7 @@ final class ClaudeAgentModeCoordinator {
     }
 
     func awaitPendingClaudeResumeTransferIfNeeded(
-        for session: AgentModeViewModel.TabSession,
-        scheduleProviderSessionSave: Bool = true
+        for session: AgentModeViewModel.TabSession
     ) async {
         let retiredTasks = retiredResumeTransferTasksByTabID.removeValue(forKey: session.tabID) ?? []
         for task in retiredTasks {
@@ -1097,8 +1094,7 @@ final class ClaudeAgentModeCoordinator {
         pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
         updateProviderSessionIDIfNeeded(
             sessionRef.sessionID,
-            for: session,
-            scheduleSave: scheduleProviderSessionSave
+            for: session
         )
     }
 
@@ -1156,28 +1152,27 @@ final class ClaudeAgentModeCoordinator {
         await shutdownClaudeSession(session)
     }
 
-    func shutdownClaudeSession(
-        _ session: AgentModeViewModel.TabSession,
-        clearTabScopedCoordinatorState: Bool = true,
-        detachedRunID: UUID? = nil
-    ) async {
-        await awaitPendingClaudeResumeTransferIfNeeded(
-            for: session,
-            scheduleProviderSessionSave: clearTabScopedCoordinatorState
-        )
+    /// Tab/context-terminal shutdown with force semantics: every caller is
+    /// tab-terminal (window/tab close, session delete, execution-location
+    /// change), so any run present — including one that started during the
+    /// awaits below — must not survive. Workspace-switch discard does not use
+    /// this path; it transfers ownership synchronously via
+    /// `detachForWorkspaceSwitchFinalizeSync` and retires the handle in the
+    /// background.
+    func shutdownClaudeSession(_ session: AgentModeViewModel.TabSession) async {
+        await awaitPendingClaudeResumeTransferIfNeeded(for: session)
         if let controller = session.claudeController {
             guard let detached = detachClaudeController(
                 controller,
                 from: session,
-                removeToolTracking: clearTabScopedCoordinatorState
+                removeToolTracking: true
             ) else {
                 return
             }
             guard await retireClaudeController(
                 detached,
                 for: session,
-                captureProviderSessionID: true,
-                scheduleProviderSessionSave: clearTabScopedCoordinatorState
+                captureProviderSessionID: true
             ) else {
                 return
             }
@@ -1185,58 +1180,57 @@ final class ClaudeAgentModeCoordinator {
             invalidateControllerRetirement(for: session)
             clearClaudeControllerLaunchMetadata(for: session)
         }
-        if clearTabScopedCoordinatorState {
-            // Force semantics: every tab-scoped caller is tab/context-terminal
-            // (window/tab close, session delete, execution-location change), so
-            // any run present — including one that started during the awaits
-            // above — must not survive.
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-        } else {
-            // Detached background teardown owns only the run it was handed. If
-            // a different live identity is visible (the discarded session was
-            // re-adopted or gained a successor during the awaits above), skip
-            // the session-state tail entirely — preserving only the ID while
-            // clearing adjacent run/presentation state would be split-brain.
-            // Only the detached run's tool tracking still needs reaping, and
-            // that cleanup is run-scoped.
-            let detachedIdentityCurrent: Bool = {
-                guard let detachedRunID else { return session.runID == nil }
-                if session.clearRunID(ifCurrent: detachedRunID) { return true }
-                // Common path: an earlier authoritative teardown (user cancel,
-                // workspace-switch cancel) already cleared this run's identity.
-                return session.runID == nil
-            }()
-            guard detachedIdentityCurrent else {
-                await clearClaudeToolTracking(for: session, matchingRunID: detachedRunID)
-                return
-            }
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        session.setRunningStatus(nil, source: nil)
+        await clearClaudeToolTracking(for: session)
+    }
+
+    /// Synchronous half of workspace-switch discard: transfers ownership of the
+    /// session's Claude runtime (controller + tool tracker) into a detached
+    /// handle and clears the coordinator's tab-scoped metadata for the tab.
+    /// Runs on the main actor with no suspension, after all cancellation awaits
+    /// and before the session map is cleared, so the captured handle is provably
+    /// the discarded session's own. The caller retires the handle with
+    /// `retireDetachedControllerForWorkspaceSwitch`.
+    func detachForWorkspaceSwitchFinalizeSync(
+        _ session: AgentModeViewModel.TabSession
+    ) -> DetachedClaudeController? {
+        invalidateControllerRetirement(for: session)
+        invalidatePendingClaudeResumeTransfer(for: session)
+        let detached = session.claudeController.flatMap {
+            detachClaudeController($0, from: session, removeToolTracking: true)
+        }
+        if detached == nil {
+            clearClaudeControllerLaunchMetadata(for: session)
         }
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
-        if clearTabScopedCoordinatorState {
-            await clearClaudeToolTracking(for: session)
-        } else {
-            await clearClaudeToolTracking(for: session, matchingRunID: detachedRunID)
-        }
+        return detached
+    }
+
+    /// Background half of workspace-switch discard: retires a handle captured by
+    /// `detachForWorkspaceSwitchFinalizeSync`. Instance-scoped only — reads no
+    /// live session state and touches no tab-keyed coordinator registries, so a
+    /// same-tab successor can never be affected. `discardedSession` is the
+    /// discarded session object the tool tracker was correlated with; it is no
+    /// longer reachable from the session map.
+    func retireDetachedControllerForWorkspaceSwitch(
+        _ detached: DetachedClaudeController,
+        discardedSession session: AgentModeViewModel.TabSession
+    ) async {
+        await detached.controller.shutdown()
+        await stopToolTracking(detached, for: session)
     }
 
     private func clearClaudeToolTracking(
         for session: AgentModeViewModel.TabSession
     ) async {
         guard let handler = toolHandlerByTabID.removeValue(forKey: session.tabID) else { return }
-        await handler.stopTracking(for: session)
-    }
-
-    private func clearClaudeToolTracking(
-        for session: AgentModeViewModel.TabSession,
-        matchingRunID runID: UUID?
-    ) async {
-        guard let runID else { return }
-        guard let handler = toolHandlerByTabID[session.tabID] else { return }
-        guard handler.currentTrackedRunID == runID else { return }
-        toolHandlerByTabID.removeValue(forKey: session.tabID)
         await handler.stopTracking(for: session)
     }
 

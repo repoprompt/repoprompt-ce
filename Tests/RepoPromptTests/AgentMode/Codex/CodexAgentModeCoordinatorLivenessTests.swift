@@ -2966,33 +2966,44 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(controller.shutdownCountSync(), 1)
     }
 
-    func testDetachedShutdownScopesRunIdentityClearToDetachedRun() async {
+    func testWorkspaceSwitchFinalizeDetachCapturesCodexControllerAndRetiresHandleOnly() async {
         let controller = LivenessFakeCodexController(snapshot: .idle)
         let viewModel = makeViewModel(controller: controller)
         let session = viewModel.session(for: UUID())
         session.selectedAgent = .codexExec
-        let detachedRunID = UUID()
+        let preparedRunID = UUID()
+        session.installRunID(preparedRunID)
+        session.codexController = controller
+
+        let detached = viewModel.test_codexCoordinator.detachForWorkspaceSwitchFinalizeSync(
+            session,
+            runIDs: [preparedRunID]
+        )
+        XCTAssertNotNil(detached)
+        XCTAssertNil(session.codexController)
+        XCTAssertEqual(
+            controller.shutdownCountSync(),
+            0,
+            "finalize detach is synchronous; the process shuts down at retire time"
+        )
+
+        // Successor state installed after finalize must not be touched by the
+        // handle-only retire.
         let successorRunID = UUID()
         session.installRunID(successorRunID)
+        let successorController = LivenessFakeCodexController(snapshot: .idle)
+        session.codexController = successorController
 
-        await viewModel.test_codexCoordinator.shutdownCodexSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: detachedRunID
-        )
+        guard let detached else { return }
+        await viewModel.test_codexCoordinator.retireDetachedControllerForWorkspaceSwitch(detached)
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
         XCTAssertEqual(
             session.runID,
             successorRunID,
-            "detached teardown owns only the run it was handed"
+            "handle retire must not clear a successor's run identity"
         )
-
-        session.installRunID(detachedRunID)
-        await viewModel.test_codexCoordinator.shutdownCodexSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: detachedRunID
-        )
-        XCTAssertNil(session.runID, "detached teardown clears its own run when still current")
+        XCTAssertTrue((session.codexController as AnyObject) === successorController)
+        XCTAssertEqual(successorController.shutdownCountSync(), 0)
     }
 
     private func makeCommandToolItem(
