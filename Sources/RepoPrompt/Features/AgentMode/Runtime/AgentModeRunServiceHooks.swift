@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - Authority-classified run execution hooks
 
@@ -128,7 +129,8 @@ extension AgentModeRunService {
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
             AgentSessionRunState,
-            UUID?
+            UUID?,
+            DomainAgentRunSnapshot.FailureReason?
         ) -> AgentRunTerminalPublicationEnvelope?
         let publishTerminalCommit: (
             AgentModeViewModel.TabSession,

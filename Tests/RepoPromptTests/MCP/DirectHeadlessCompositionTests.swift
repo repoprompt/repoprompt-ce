@@ -190,6 +190,16 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertFalse(prompt.contains("Dismiss a completed session"))
     }
 
+    func testHeadlessCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-headless-worktree-fence-\(UUID().uuidString)", isDirectory: true)

@@ -625,7 +625,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             sequenceIndex: inactiveSession.nextSequenceIndex
         )
         inactiveSession.appendItem(bashItem)
-        inactiveSession.runID = runID
+        inactiveSession.installRunID(runID)
         inactiveSession.runState = .running
         inactiveSession.runningStatusText = "Background work"
         inactiveSession.activeAgentRunStartedAt = startedAt

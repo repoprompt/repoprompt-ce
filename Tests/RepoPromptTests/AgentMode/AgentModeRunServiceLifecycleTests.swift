@@ -36,7 +36,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 sequenceIndex: 3
             )
         ], reason: .persistedSessionHydration)
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.correlationIndex")
 
@@ -159,7 +159,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.runState = .running
-            session.runID = UUID()
+            session.installRunID(UUID())
             let ownership = session.beginRunAttempt(source: "test.reusedCodexVariant")
 
             let outcome = await harness.service.startRun(
@@ -703,7 +703,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let staleOwnership = session.beginRunAttempt(source: "test.stale")
         session.endRunAttempt(ifCurrent: staleOwnership, source: "test.rotate")
@@ -730,10 +730,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let codexOwnership = session.beginRunAttempt(source: "test.codex")
-        session.providerTerminalDrainGeneration = 4
+        for _ in 0 ..< 4 {
+            session.bumpProviderTerminalDrainGeneration()
+        }
+        XCTAssertEqual(session.providerTerminalDrainGeneration, 4)
         _ = session.endRunAttempt(ifCurrent: codexOwnership, source: "test.rotate")
 
         let claudeOwnership = session.beginRunAttempt(source: "test.claude")
@@ -822,7 +825,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.codexBufferedCancellation")
         let baselineDrainGeneration = session.providerTerminalDrainGeneration
         session.codexController = controller
@@ -896,7 +899,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.retryPublication")
         let request = AgentRunTerminalCommitBarrier.Request(
@@ -921,6 +924,70 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(publicationAttempts, 2)
         XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
         XCTAssertEqual(recorder.events.count(where: { $0 == "assistant-flush" }), 1)
+    }
+
+    func testFailedTerminalCommitStampsFailureReasonAndDuplicateSettlementPreservesIt() async throws {
+        let recorder = LifecycleRecorder()
+        var envelopeFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+        var publishedFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+        var publicationAttempts = 0
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, revision, _ in
+                publicationAttempts += 1
+                publishedFailureReasons.append(revision.failureReason)
+                return publicationAttempts == 1
+                    ? .rejected(reason: "test_transient_rejection")
+                    : .accepted(successorEpoch: nil)
+            },
+            makeTerminalPublicationEnvelope: { _, _, _, _, failureReason in
+                envelopeFailureReasons.append(failureReason)
+                return nil
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.installRunID(UUID())
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.failureReasonStamp")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("Provider request timed out after 60 seconds", sequenceIndex: 1)
+            ],
+            compact: false
+        )
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .failed,
+            source: "test.failureReasonStamp",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        )
+
+        let firstResult = await barrier.commit(request)
+        let first = try XCTUnwrap(firstResult)
+        XCTAssertEqual(first.failureReason, .timeout)
+        XCTAssertEqual(envelopeFailureReasons, [.timeout])
+        XCTAssertEqual(publishedFailureReasons, [.timeout])
+
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("transport closed unexpectedly", sequenceIndex: 1)
+            ],
+            compact: false
+        )
+        let duplicateResult = await barrier.commit(request)
+        let duplicate = try XCTUnwrap(duplicateResult)
+        XCTAssertEqual(duplicate, first)
+        XCTAssertEqual(duplicate.failureReason, .timeout)
+        XCTAssertEqual(envelopeFailureReasons, [.timeout])
+        XCTAssertEqual(publishedFailureReasons, [.timeout, .timeout])
     }
 
     func testQueuedFollowUpStartsOnlyAfterCanonicalSuccessorPublicationResolves() async {
@@ -955,14 +1022,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ? .rejected(reason: "test_transient_rejection")
                     : .accepted(successorEpoch: successor)
             },
-            makeTerminalPublicationEnvelope: { _, _, _, _ in
+            makeTerminalPublicationEnvelope: { _, _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
             startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         session.pendingInstructions = ["continue"]
         let ownership = session.beginRunAttempt(source: "test.followUpPublication")
@@ -1004,7 +1071,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         session.pendingInstructions = ["unrelated generic instruction"]
         let ownership = session.beginRunAttempt(source: "test.providerSuccessor")
@@ -1057,7 +1124,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.blockedPublication")
 
         let firstCancelTask = Task {
@@ -1112,7 +1179,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.slowDisposal")
         session.provider = provider
 
@@ -1155,7 +1222,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.awaitTeardown")
         session.provider = provider
 
@@ -1198,7 +1265,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.lateAwaitTeardown")
         session.provider = provider
 
@@ -1242,7 +1309,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.executionLocation")
         session.provider = provider
 
@@ -1284,7 +1351,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.runState = .running
-            session.runID = UUID()
+            session.installRunID(UUID())
             session.beginRunAttempt(source: "test")
 
             switch row {
@@ -1389,7 +1456,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .codexExec
-        session.runID = runID
+        session.installRunID(runID)
         session.runState = .running
         session.codexConversationID = "lifecycle"
         session.codexController = controller
@@ -1606,7 +1673,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
             AgentSessionRunState,
-            UUID?
+            UUID?,
+            AgentRunMCPSnapshot.FailureReason?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
         startFollowUpRun: ((UUID, String) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
@@ -1667,7 +1735,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ),
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-                makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
+                makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _, _ in nil },
                 publishTerminalCommit: { session, revision, successorKind in
                     if let publishTerminalCommitResult {
                         return await publishTerminalCommitResult(session, revision, successorKind)
@@ -1715,7 +1783,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .openCode
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .completed
         session.acpController = controller
         return RetainedACPFixture(
@@ -1730,7 +1798,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         session.claudeController = controller
         return session
@@ -1757,7 +1825,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .openCode
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         session.acpController = controller
         return session

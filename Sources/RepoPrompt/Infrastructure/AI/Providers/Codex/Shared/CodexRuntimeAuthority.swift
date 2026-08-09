@@ -6,7 +6,7 @@ import Foundation
 /// only user-configurable external fallback is an absolute path supplied through
 /// `REPOPROMPT_CODEX_EXECUTABLE`; ordinary PATH lookup is intentionally not consulted.
 enum CodexRuntimeAuthority {
-    static let bundledVersion = Version(major: 0, minor: 145, patch: 0)
+    static let bundledVersion = Version(major: 0, minor: 147, patch: 0)
     static let minimumExternalVersion = bundledVersion
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
@@ -94,20 +94,44 @@ enum CodexRuntimeAuthority {
         let major: Int
         let minor: Int
         let patch: Int
+        let prerelease: String?
+
+        init(major: Int, minor: Int, patch: Int, prerelease: String? = nil) {
+            self.major = major
+            self.minor = minor
+            self.patch = patch
+            self.prerelease = prerelease
+        }
 
         var description: String {
-            "\(major).\(minor).\(patch)"
+            let core = "\(major).\(minor).\(patch)"
+            return prerelease.map { "\(core)-\($0)" } ?? core
         }
 
         static func < (lhs: Version, rhs: Version) -> Bool {
-            (lhs.major, lhs.minor, lhs.patch) < (rhs.major, rhs.minor, rhs.patch)
+            let lhsCore = (lhs.major, lhs.minor, lhs.patch)
+            let rhsCore = (rhs.major, rhs.minor, rhs.patch)
+            if lhsCore != rhsCore {
+                return lhsCore < rhsCore
+            }
+
+            switch (lhs.prerelease, rhs.prerelease) {
+            case (nil, nil):
+                return false
+            case (nil, .some):
+                return false
+            case (.some, nil):
+                return true
+            case let (.some(lhsPrerelease), .some(rhsPrerelease)):
+                return comparePrerelease(lhsPrerelease, rhsPrerelease)
+            }
         }
 
         static func parse(_ text: String) -> Version? {
-            let pattern = #"(?<![0-9])([0-9]+)\.([0-9]+)\.([0-9]+)(?![0-9])"#
+            let pattern = #"(?<![0-9A-Za-z.+-])([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?![0-9A-Za-z.+-])"#
             guard let regex = try? NSRegularExpression(pattern: pattern),
                   let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                  match.numberOfRanges == 4,
+                  match.numberOfRanges == 5,
                   let majorRange = Range(match.range(at: 1), in: text),
                   let minorRange = Range(match.range(at: 2), in: text),
                   let patchRange = Range(match.range(at: 3), in: text),
@@ -117,7 +141,33 @@ enum CodexRuntimeAuthority {
             else {
                 return nil
             }
-            return Version(major: major, minor: minor, patch: patch)
+            let prerelease = Range(match.range(at: 4), in: text).map { String(text[$0]) }
+            if let prerelease {
+                let hasInvalidNumericIdentifier = prerelease.split(separator: ".").contains { identifier in
+                    identifier.count > 1 && identifier.first == "0" && identifier.allSatisfy(\.isNumber)
+                }
+                guard !hasInvalidNumericIdentifier else { return nil }
+            }
+            return Version(major: major, minor: minor, patch: patch, prerelease: prerelease)
+        }
+
+        private static func comparePrerelease(_ lhs: String, _ rhs: String) -> Bool {
+            let lhsIdentifiers = lhs.split(separator: ".", omittingEmptySubsequences: false)
+            let rhsIdentifiers = rhs.split(separator: ".", omittingEmptySubsequences: false)
+            for (lhsIdentifier, rhsIdentifier) in zip(lhsIdentifiers, rhsIdentifiers) {
+                guard lhsIdentifier != rhsIdentifier else { continue }
+                switch (Int(lhsIdentifier), Int(rhsIdentifier)) {
+                case let (.some(lhsNumber), .some(rhsNumber)):
+                    return lhsNumber < rhsNumber
+                case (.some, nil):
+                    return true
+                case (nil, .some):
+                    return false
+                case (nil, nil):
+                    return lhsIdentifier < rhsIdentifier
+                }
+            }
+            return lhsIdentifiers.count < rhsIdentifiers.count
         }
     }
 
