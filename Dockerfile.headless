@@ -1,0 +1,48 @@
+FROM swift:6.2.1-noble AS build
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        g++ \
+        git \
+        libstdc++-14-dev \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+ARG SWIFT_JOBS=4
+RUN swift test --jobs "$SWIFT_JOBS" \
+    && swift build \
+        --configuration release \
+        --jobs "$SWIFT_JOBS" \
+        --product repoprompt-mcp \
+        --static-swift-stdlib \
+    && BINARY="$(swift build --configuration release --show-bin-path)/repoprompt-mcp" \
+    && "$BINARY" --version \
+    && python3 Scripts/test_linux_headless_mcp.py binary "$BINARY" \
+    && install -D -m 0755 "$BINARY" /out/repoprompt-mcp
+
+FROM ubuntu:24.04 AS runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git libcurl4t64 tini \
+    && groupadd --gid 65532 repoprompt \
+    && useradd --uid 65532 --gid 65532 --home-dir /home/repoprompt --create-home --shell /usr/sbin/nologin repoprompt \
+    && install -d -o 65532 -g 65532 /data /workspace \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/repoprompt-mcp /usr/local/bin/repoprompt-mcp
+
+RUN ! ldd /usr/local/bin/repoprompt-mcp | grep -q "not found"
+
+ENV HOME=/home/repoprompt \
+    REPOPROMPT_MCP_HEADLESS_PROFILE_DIR=/data \
+    REPOPROMPT_MCP_WORKING_DIRS=/workspace
+
+WORKDIR /workspace
+USER 65532:65532
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/repoprompt-mcp"]
+CMD ["--backend", "headless"]

@@ -73,6 +73,36 @@ if grep -E -q '(^|[^[:alnum:]_])StdioTransport\(' "$direct_sources/DirectHeadles
   exit 1
 fi
 
+if ! grep -q '#if os(Linux)' Package.swift \
+  || ! grep -q '"DirectHeadlessMCPService.swift"' Package.swift \
+  || ! grep -q '"LinuxHeadlessMain.swift"' Package.swift; then
+  echo "error: Linux product must compile the upstream direct headless backend" >&2
+  exit 1
+fi
+
+if [[ -d Sources/RepoPromptMCPRuntime ]]; then
+  echo "error: Linux support must not restore the retired parallel headless runtime" >&2
+  exit 1
+fi
+
+if ! grep -q 'Usage: repoprompt-mcp --backend headless' "$direct_sources/LinuxHeadlessMain.swift" \
+  || ! grep -q 'CMD \["--backend", "headless"\]' Dockerfile.headless; then
+  echo "error: Linux entrypoints must select the explicit upstream headless backend" >&2
+  exit 1
+fi
+
+if ! grep -q 'libcurl4t64' Dockerfile.headless \
+  || ! grep -q 'ldd /usr/local/bin/repoprompt-mcp' Dockerfile.headless; then
+  echo "error: final Linux image must install and verify the headless binary runtime libraries" >&2
+  exit 1
+fi
+
+version_declarations="$(grep -R -h --include='*.swift' '^let CLI_VERSION = "' "$direct_sources" | wc -l | tr -d ' ')"
+if [[ "$version_declarations" != "1" ]]; then
+  echo "error: MCP products must share exactly one CLI_VERSION declaration" >&2
+  exit 1
+fi
+
 canonical_workspace_service="$runtime_sources/MCPDomainCanonicalWorkspaceService.swift"
 direct_workspace_adapter="$direct_sources/DirectHeadlessWorkspaceBackends.swift"
 if [[ ! -f "$canonical_workspace_service" ]] \

@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
 package enum DomainWorkspaceStoragePath {
@@ -10,7 +14,7 @@ package enum DomainWorkspaceStoragePath {
     }
 }
 
-package struct DomainContextIdentity: Codable, Hashable {
+package struct DomainContextIdentity: Codable, Hashable, Sendable {
     package let workspaceID: UUID
     package let contextID: UUID
 

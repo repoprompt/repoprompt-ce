@@ -1,5 +1,13 @@
-import CryptoKit
-import Darwin
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import Logging
 import MCP
@@ -168,17 +176,30 @@ actor DirectHeadlessMCPService {
         )
         let context = DirectHeadlessDomainContext(runtime: runtime, scopeID: scopeID)
         let workspace = DirectHeadlessWorkspaceBackend(context: context)
-        let global = DirectHeadlessGlobalBackend(runtime: runtime, scopeID: scopeID, context: context)
+        let settingsStore = DomainDirectSettingsStore(
+            persistence: runtime.persistenceCoordinator,
+            profileIdentifier: runtime.configuration.profileIdentifier
+        )
+        let global = DirectHeadlessGlobalBackend(
+            runtime: runtime,
+            scopeID: scopeID,
+            context: context,
+            settingsStore: settingsStore
+        )
         let providerCoordinator = DirectHeadlessProviderCoordinator(
             runtime: runtime,
             context: context,
             environment: environment
         )
+        let oracleCoordinator = DirectHeadlessOracleCoordinator(
+            providerCoordinator: providerCoordinator,
+            settingsStore: settingsStore
+        )
         let backends = MCPDomainStandaloneCapabilityBackends(
             global: global,
             workspace: workspace,
             filesystem: DirectHeadlessFilesystemBackend(context: context),
-            conversation: DirectHeadlessConversationBackend(coordinator: providerCoordinator),
+            conversation: DirectHeadlessConversationBackend(coordinator: oracleCoordinator),
             versionControl: DirectHeadlessVersionControlBackend(runtime: runtime, context: context),
             agent: DirectHeadlessAgentBackend(coordinator: providerCoordinator),
             history: DirectHeadlessHistoryBackend(runtime: runtime)
@@ -205,7 +226,7 @@ actor DirectHeadlessMCPService {
         let principal = DomainClientPrincipal(
             principalID: connectionID,
             stableKey: "headless-stdio:\(parentProcessID)",
-            displayName: CLIEventLogger.detectClientName() ?? "headless-stdio-client",
+            displayName: DirectHeadlessClientIdentity.detectParentExecutableName() ?? "headless-stdio-client",
             kind: .runScoped,
             assurance: verifiedFingerprint == nil ? .displayNameOnly : .verifiedProcess,
             processID: verifiedFingerprint == nil ? nil : parentProcessID,
@@ -287,10 +308,16 @@ actor DirectHeadlessMCPService {
                     scope: scope
                 )
                 let invocationID = UUID()
+                let ephemeralGrantedToolNames = Self.policyAdmittedEphemeralToolNames(
+                    toolName: params.name,
+                    visibleToolNames: visibleNames,
+                    policyAdditionalToolNames: additionalNames
+                )
                 let security = await Self.securityContext(
                     prepared: prepared,
                     connection: connection,
-                    invocationID: invocationID
+                    invocationID: invocationID,
+                    ephemeralGrantedToolNames: ephemeralGrantedToolNames
                 )
                 let result = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
                     invocationID: invocationID,
@@ -327,7 +354,7 @@ actor DirectHeadlessMCPService {
               runID == handshake.runID
         else {
             logger.warning("Rejected private child launch token", metadata: ["result": "\(redemption)"])
-            Darwin.shutdown(fd, SHUT_RDWR)
+            rpShutdownReadWrite(fd)
             return
         }
 
@@ -395,10 +422,25 @@ actor DirectHeadlessMCPService {
         )
     }
 
+    nonisolated static func policyAdmittedEphemeralToolNames(
+        toolName: String,
+        visibleToolNames: Set<String>,
+        policyAdditionalToolNames: Set<String>
+    ) -> Set<String> {
+        guard visibleToolNames.contains(toolName),
+              MCPClientToolPolicyCatalog.policyGatedToolNames.contains(toolName),
+              policyAdditionalToolNames.contains(toolName)
+        else {
+            return []
+        }
+        return [toolName]
+    }
+
     private static func securityContext(
         prepared: PreparedRuntime,
         connection: ConnectionContext,
-        invocationID: UUID
+        invocationID: UUID,
+        ephemeralGrantedToolNames: Set<String>
     ) async -> DomainToolInvocationSecurityContext {
         let snapshot = try? await prepared.context.snapshot(connectionID: connection.connectionID)
         return DomainToolInvocationSecurityContext(
@@ -412,7 +454,7 @@ actor DirectHeadlessMCPService {
             workspaceRevision: snapshot?.workspace.revisions.workingRevision,
             authorizedCanonicalRoots: Set(snapshot?.roots.map(\.path) ?? []),
             hasAuthoritativeRoutingContext: snapshot != nil,
-            ephemeralGrantedToolNames: connection.additionalToolNames,
+            ephemeralGrantedToolNames: ephemeralGrantedToolNames,
             ephemeralGrantedOperations: connection.ephemeralGrantedOperations
         )
     }
@@ -420,9 +462,8 @@ actor DirectHeadlessMCPService {
     /// Binds the kernel-observed parent PID to the executable identity currently on disk.
     /// Display names and initialize metadata never participate in mutation authority.
     nonisolated static func verifiedExecutableFingerprint(processID: Int32) -> String? {
-        var buffer = [CChar](repeating: 0, count: 4096)
-        guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
-        let path = URL(fileURLWithPath: String(cString: buffer)).standardizedFileURL.path
+        guard let executablePath = rpExecutablePath(processID: processID) else { return nil }
+        let path = URL(fileURLWithPath: executablePath).standardizedFileURL.path
         var info = stat()
         guard lstat(path, &info) == 0 else { return nil }
         let material = "\(path)|\(info.st_dev)|\(info.st_ino)"

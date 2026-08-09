@@ -4,7 +4,9 @@ import RepoPromptShared
     import Synchronization
 #endif
 #if DEBUG || EDIT_FLOW_PERF
-    import os
+    #if canImport(os)
+        import os
+    #endif
 #endif
 
 /// Lightweight, gated instrumentation for hot-path diagnostics.
@@ -28,7 +30,9 @@ package enum EditFlowPerf {
 
     #if DEBUG || EDIT_FLOW_PERF
         package struct IntervalState {
-            let signpostState: OSSignpostIntervalState?
+            #if canImport(os)
+                let signpostState: OSSignpostIntervalState?
+            #endif
             #if DEBUG
                 let debugCaptureEpoch: UInt64?
                 let debugCaptureStartNanoseconds: UInt64?
@@ -1245,8 +1249,10 @@ package enum EditFlowPerf {
     #endif
 
     #if DEBUG || EDIT_FLOW_PERF
-        private static let signposter = OSSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
-        private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
+        #if canImport(os)
+            private static let signposter = OSSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
+            private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
+        #endif
         private static let environmentEnabled: Bool = {
             guard let raw = ProcessInfo.processInfo.environment["REPOPROMPT_EDIT_FLOW_PERF"] else {
                 return false
@@ -1268,20 +1274,39 @@ package enum EditFlowPerf {
         }
 
         private static func makeIntervalState(_ name: StaticString, dimensions: Dimensions) -> IntervalState? {
-            let signpostState = isEnabled ? signposter.beginInterval(name) : nil
+            #if canImport(os)
+                let signpostState = isEnabled ? signposter.beginInterval(name) : nil
+            #endif
             #if DEBUG
                 let debugCaptureStart = debugCaptureRecorder.startTimestampIfActive()
-                guard signpostState != nil || debugCaptureStart != nil else { return nil }
-                return IntervalState(
-                    signpostState: signpostState,
-                    debugCaptureEpoch: debugCaptureStart?.epoch,
-                    debugCaptureStartNanoseconds: debugCaptureStart?.startNanoseconds,
-                    debugCaptureStageName: String(describing: name),
-                    debugCaptureDimensions: dimensions.logDescription
-                )
+                #if canImport(os)
+                    guard signpostState != nil || debugCaptureStart != nil else { return nil }
+                #else
+                    guard debugCaptureStart != nil else { return nil }
+                #endif
+                #if canImport(os)
+                    return IntervalState(
+                        signpostState: signpostState,
+                        debugCaptureEpoch: debugCaptureStart?.epoch,
+                        debugCaptureStartNanoseconds: debugCaptureStart?.startNanoseconds,
+                        debugCaptureStageName: String(describing: name),
+                        debugCaptureDimensions: dimensions.logDescription
+                    )
+                #else
+                    return IntervalState(
+                        debugCaptureEpoch: debugCaptureStart?.epoch,
+                        debugCaptureStartNanoseconds: debugCaptureStart?.startNanoseconds,
+                        debugCaptureStageName: String(describing: name),
+                        debugCaptureDimensions: dimensions.logDescription
+                    )
+                #endif
             #else
-                guard signpostState != nil else { return nil }
-                return IntervalState(signpostState: signpostState)
+                #if canImport(os)
+                    guard signpostState != nil else { return nil }
+                    return IntervalState(signpostState: signpostState)
+                #else
+                    return nil
+                #endif
             #endif
         }
 
@@ -1315,9 +1340,11 @@ package enum EditFlowPerf {
                     )
                 }
             #endif
-            if let signpostState = state.signpostState {
-                signposter.endInterval(name, signpostState)
-            }
+            #if canImport(os)
+                if let signpostState = state.signpostState {
+                    signposter.endInterval(name, signpostState)
+                }
+            #endif
         }
 
         package static func end(_ name: StaticString, _ state: IntervalState?, _ dimensions: @autoclosure () -> Dimensions) {
@@ -1338,20 +1365,26 @@ package enum EditFlowPerf {
                     )
                 }
             #endif
-            if let signpostState = state.signpostState {
-                signposter.endInterval(name, signpostState)
-            }
+            #if canImport(os)
+                if let signpostState = state.signpostState {
+                    signposter.endInterval(name, signpostState)
+                }
+            #endif
         }
 
         package static func event(_ name: StaticString) {
             guard isEnabled else { return }
-            signposter.emitEvent(name)
+            #if canImport(os)
+                signposter.emitEvent(name)
+            #endif
         }
 
         package static func event(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) {
             guard isEnabled else { return }
             logDimensions(dimensions())
-            signposter.emitEvent(name)
+            #if canImport(os)
+                signposter.emitEvent(name)
+            #endif
         }
 
         package static func makeLifecycleCorrelationIfActive(
@@ -1390,7 +1423,9 @@ package enum EditFlowPerf {
             let renderedDimensions = dimensions()
             if isEnabled {
                 logDimensions(renderedDimensions)
-                signposter.emitEvent(name)
+                #if canImport(os)
+                    signposter.emitEvent(name)
+                #endif
             }
             #if DEBUG
                 if shouldRecord {
@@ -1443,7 +1478,11 @@ package enum EditFlowPerf {
 
         private static func logDimensions(_ dimensions: Dimensions) {
             guard !dimensions.isEmpty else { return }
-            logger.debug("dimensions \(dimensions.logDescription, privacy: .public)")
+            #if canImport(os)
+                logger.debug("dimensions \(dimensions.logDescription, privacy: .public)")
+            #else
+                _ = dimensions
+            #endif
         }
     #else
         package static var isEnabled: Bool {

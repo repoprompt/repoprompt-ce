@@ -1,0 +1,53 @@
+name: Linux Headless MCP
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - linux-headless-mcp
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-headless-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native Ubuntu headless backend
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Swift 6.2.1
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
+        with:
+          swift-version: "6.2.1"
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends g++ git libstdc++-14-dev pkg-config python3
+
+      - name: Build and exercise upstream headless backend
+        env:
+          SWIFT_JOBS: "4"
+        run: bash Scripts/test_linux_headless_native.sh
+
+  docker:
+    name: Docker headless backend
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Build and exercise final image
+        run: bash Scripts/test_linux_headless_docker.sh "repoprompt-ce-headless:${GITHUB_SHA}"

@@ -1,5 +1,9 @@
-import Darwin
-import Darwin.POSIX.fcntl
+#if canImport(Darwin)
+    import Darwin
+    import Darwin.POSIX.fcntl
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 public enum POSIXDescriptorConfigurationError: Error, Equatable, Sendable {
     case invalidFileDescriptor(fd: Int32)
@@ -34,6 +38,6 @@ public enum POSIXDescriptorSupport {
 
     public static func shutdownSocketReadWrite(_ fd: Int32) {
         guard fd >= 0 else { return }
-        _ = shutdown(fd, SHUT_RDWR)
+        _ = shutdown(fd, Int32(SHUT_RDWR))
     }
 }

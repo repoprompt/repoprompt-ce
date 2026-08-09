@@ -2,6 +2,14 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+struct DirectHeadlessProviderRoute: Hashable, Sendable {
+    let identity: DomainContextIdentity
+    let expectedContextRevision: UInt64
+    let roots: [URL]
+
+    var workingDirectory: URL? { roots.first }
+}
+
 actor DirectHeadlessProviderCoordinator {
     struct ProviderDescriptor {
         let id: String
@@ -30,18 +38,10 @@ actor DirectHeadlessProviderCoordinator {
         var task: Task<Void, Never>?
     }
 
-    private struct Conversation {
-        let id: UUID
-        let providerID: String
-        var messages: [(role: String, text: String)]
-        var updatedAt: Date
-    }
-
     private let runtime: MCPDomainRuntime
     private let context: DirectHeadlessDomainContext
     private let environment: [String: String]
     private var agents: [UUID: AgentRecord] = [:]
-    private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
 
     init(
@@ -72,10 +72,44 @@ actor DirectHeadlessProviderCoordinator {
     static func codexExecArguments(model: String?) -> [String] {
         var arguments: [String] = []
         if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
-            arguments += ["--model", model]
+            if let selection = try? DomainAppSettingsCatalog.secondaryOracleModelSelection(raw: model) {
+                arguments += ["--model", selection.cliBaseModel]
+                if let reasoningEffort = selection.reasoningEffort {
+                    arguments += ["-c", "model_reasoning_effort=\(reasoningEffort)"]
+                }
+                if let serviceTier = selection.serviceTier {
+                    arguments += ["-c", "service_tier=\(serviceTier)"]
+                }
+            } else {
+                // Preserve the pre-pair direct contract for explicit provider
+                // specifiers that are not persisted Oracle model raw IDs.
+                arguments += ["--model", model]
+            }
         }
         arguments += ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
         return arguments
+    }
+
+    func resolveRoute(for request: DomainPhysicalToolRequest) async throws -> DirectHeadlessProviderRoute {
+        let snapshot: DirectHeadlessDomainContext.Snapshot
+        if let carrier = DomainChildLaunchContext.current,
+           let identity = carrier.context,
+           let expectedRevision = carrier.expectedContextRevision
+        {
+            snapshot = try await context.snapshot(identity: identity)
+            guard snapshot.context.revisions.workingRevision == expectedRevision else {
+                throw MCPError.invalidRequest(
+                    "The bound Oracle context changed after its child launch was authorized; retry the request."
+                )
+            }
+        } else {
+            snapshot = try await context.snapshot(for: request)
+        }
+        return Self.route(from: snapshot)
+    }
+
+    func resolveRoute(for request: DomainPhysicalReadRequest) async throws -> DirectHeadlessProviderRoute {
+        Self.route(from: try await context.snapshot(for: request))
     }
 
     func runProviderOnce(
@@ -83,6 +117,7 @@ actor DirectHeadlessProviderCoordinator {
         providerID: String?,
         model: String?,
         request: DomainPhysicalToolRequest,
+        route: DirectHeadlessProviderRoute? = nil,
         carrierEnvironment: [String: String]? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
@@ -90,7 +125,12 @@ actor DirectHeadlessProviderCoordinator {
         guard let executable = descriptor.executable else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
-        let snapshot = try await context.snapshot(for: request)
+        let invocationRoute: DirectHeadlessProviderRoute
+        if let route {
+            invocationRoute = route
+        } else {
+            invocationRoute = try await resolveRoute(for: request)
+        }
         let arguments = Self.codexExecArguments(model: model)
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
@@ -100,9 +140,19 @@ actor DirectHeadlessProviderCoordinator {
             arguments: arguments,
             input: Data(message.utf8),
             environment: childEnvironment,
-            currentDirectory: snapshot.roots.first
+            currentDirectory: invocationRoute.workingDirectory
         )
         return Self.finalAssistantText(from: output)
+    }
+
+    private nonisolated static func route(
+        from snapshot: DirectHeadlessDomainContext.Snapshot
+    ) -> DirectHeadlessProviderRoute {
+        DirectHeadlessProviderRoute(
+            identity: snapshot.identity,
+            expectedContextRevision: snapshot.context.revisions.workingRevision,
+            roots: snapshot.roots
+        )
     }
 
     func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
@@ -269,56 +319,6 @@ actor DirectHeadlessProviderCoordinator {
             reason: .instructionDelivered
         )
         return current.toValue()
-    }
-
-    func createConversation(providerID: String?, message: String, model: String?, request: DomainPhysicalToolRequest) async throws -> (UUID, String) {
-        let descriptor = try resolveProvider(providerID)
-        let text = try await runProviderOnce(message: message, providerID: descriptor.id, model: model, request: request)
-        let id = UUID()
-        conversations[id] = Conversation(
-            id: id,
-            providerID: descriptor.id,
-            messages: [("user", message), ("assistant", text)],
-            updatedAt: Date()
-        )
-        return (id, text)
-    }
-
-    func continueConversation(id: UUID, message: String, model: String?, request: DomainPhysicalToolRequest) async throws -> String {
-        guard var conversation = conversations[id] else { throw MCPError.invalidParams("unknown chat_id") }
-        let history = conversation.messages.map { "\($0.role): \($0.text)" }.joined(separator: "\n\n")
-        let prompt = history + "\n\nuser: " + message
-        let text = try await runProviderOnce(
-            message: prompt,
-            providerID: conversation.providerID,
-            model: model,
-            request: request
-        )
-        conversation.messages.append(("user", message))
-        conversation.messages.append(("assistant", text))
-        conversation.updatedAt = Date()
-        conversations[id] = conversation
-        return text
-    }
-
-    func conversationLog(id: UUID?, limit: Int) throws -> Value {
-        let conversation: Conversation
-        if let id {
-            guard let found = conversations[id] else { throw MCPError.invalidParams("unknown chat_id") }
-            conversation = found
-        } else {
-            guard let latest = conversations.values.max(by: { $0.updatedAt < $1.updatedAt }) else {
-                return .object(["messages": .array([])])
-            }
-            conversation = latest
-        }
-        let messages = conversation.messages.suffix(max(1, min(limit, 50))).map {
-            Value.object(["role": .string($0.role), "text": .string($0.text)])
-        }
-        return .object([
-            "chat_id": .string(conversation.id.uuidString),
-            "messages": .array(Array(messages))
-        ])
     }
 
     func shutdown() async {

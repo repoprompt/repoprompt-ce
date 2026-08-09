@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 package struct MCPDomainResponseDeliverySnapshot: Equatable, Sendable {

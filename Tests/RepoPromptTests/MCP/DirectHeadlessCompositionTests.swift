@@ -6,6 +6,56 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testChildPolicyGrantIsLimitedToExactAdmittedPolicyGatedInvocation() {
+        let childPolicy = MCPClientToolPolicyCatalog.classification(for: .agentModeCodexEngineer)
+        let policyAdditionalToolNames = MCPDomainToolCatalog.toolNames(
+            for: childPolicy.grantedCapabilities
+        )
+        let visibleToolNames = Set(
+            MCPClientToolPolicyCatalog.resolvedToolNames(for: .agentModeCodexEngineer)
+        )
+
+        XCTAssertTrue(visibleToolNames.contains(MCPWindowToolName.askOracle))
+        XCTAssertTrue(visibleToolNames.contains(MCPWindowToolName.oracleChatLog))
+        XCTAssertEqual(
+            DirectHeadlessMCPService.policyAdmittedEphemeralToolNames(
+                toolName: MCPWindowToolName.askOracle,
+                visibleToolNames: visibleToolNames,
+                policyAdditionalToolNames: policyAdditionalToolNames
+            ),
+            [MCPWindowToolName.askOracle]
+        )
+        XCTAssertEqual(
+            DirectHeadlessMCPService.policyAdmittedEphemeralToolNames(
+                toolName: MCPWindowToolName.oracleChatLog,
+                visibleToolNames: visibleToolNames,
+                policyAdditionalToolNames: policyAdditionalToolNames
+            ),
+            [MCPWindowToolName.oracleChatLog]
+        )
+        XCTAssertEqual(
+            DirectHeadlessMCPService.policyAdmittedEphemeralToolNames(
+                toolName: MCPWindowToolName.askOracle,
+                visibleToolNames: visibleToolNames,
+                policyAdditionalToolNames: []
+            ),
+            []
+        )
+
+        let directVisibleToolNames = Set(
+            MCPClientToolPolicyCatalog.resolvedToolNames(for: .direct)
+        )
+        XCTAssertTrue(directVisibleToolNames.contains(MCPWindowToolName.contextBuilder))
+        XCTAssertEqual(
+            DirectHeadlessMCPService.policyAdmittedEphemeralToolNames(
+                toolName: MCPWindowToolName.contextBuilder,
+                visibleToolNames: directVisibleToolNames,
+                policyAdditionalToolNames: [MCPWindowToolName.contextBuilder]
+            ),
+            []
+        )
+    }
+
     func testHeadlessCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
         let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
 
@@ -13,6 +63,52 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(
             Array(arguments.suffix(5)),
             ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
+    func testHeadlessChildLaunchUsesPhysicalCodexProviderForDirectRoleAliases() {
+        XCTAssertEqual(
+            DirectHeadlessChildLaunchCoordinator.providerIdentifier(arguments: [:]),
+            "codexExec"
+        )
+        XCTAssertEqual(
+            DirectHeadlessChildLaunchCoordinator.providerIdentifier(
+                arguments: ["model_id": .string("pair")]
+            ),
+            "codexExec"
+        )
+        XCTAssertEqual(
+            DirectHeadlessChildLaunchCoordinator.providerIdentifier(
+                arguments: ["provider": .string("custom-provider")]
+            ),
+            "custom-provider"
+        )
+    }
+
+    func testHeadlessCodexExecTranslatesCanonicalRawModelAndReasoningEffort() {
+        XCTAssertEqual(
+            DirectHeadlessProviderCoordinator.codexExecArguments(
+                model: "codex_cli_gpt-5.6-terra-high"
+            ),
+            [
+                "--model", "gpt-5.6-terra",
+                "-c", "model_reasoning_effort=high",
+                "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"
+            ]
+        )
+    }
+
+    func testHeadlessCodexExecTranslatesCustomFastServiceTier() {
+        XCTAssertEqual(
+            DirectHeadlessProviderCoordinator.codexExecArguments(
+                model: "codex_custom_gpt-5.4-fast-high"
+            ),
+            [
+                "--model", "gpt-5.4",
+                "-c", "model_reasoning_effort=high",
+                "-c", "service_tier=fast",
+                "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"
+            ]
         )
     }
 

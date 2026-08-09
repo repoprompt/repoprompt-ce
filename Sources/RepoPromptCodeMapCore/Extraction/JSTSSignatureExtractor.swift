@@ -5,6 +5,7 @@
 //  Created by Claude on 2026-01-29.
 //
 
+import CoreFoundation
 import Foundation
 
 /// Context for JS/TS signature extraction - determines how braces are interpreted

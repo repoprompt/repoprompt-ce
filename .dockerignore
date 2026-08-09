@@ -1,0 +1,6 @@
+.build
+.git
+.derivedData
+DerivedData
+*.xcuserstate
+.DS_Store

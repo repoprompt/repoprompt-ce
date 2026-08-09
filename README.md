@@ -102,6 +102,39 @@ another Mac or redistributed.
 - Xcode 26, or matching Command Line Tools with the macOS 26 SDK. The Finder
   debug launcher and local production installer require the full Xcode app.
 
+### Run the headless MCP server on Linux
+
+Linux builds only the canonical direct MCP runtime that also ships inside the
+macOS CLI. Select it explicitly with the upstream backend flag:
+
+```bash
+swift build --configuration release --product repoprompt-mcp
+REPOPROMPT_MCP_HEADLESS_PROFILE_DIR="$PWD/.rpce-state" \
+REPOPROMPT_MCP_WORKING_DIRS="$PWD" \
+.build/release/repoprompt-mcp --backend headless
+```
+
+Or build the non-root container image:
+
+```bash
+docker build -f Dockerfile.headless -t repoprompt-ce-headless .
+docker run --rm -i \
+  -v "$PWD:/workspace" \
+  -v repoprompt-ce-state:/data \
+  repoprompt-ce-headless
+```
+
+The Linux product does not contain the macOS app proxy, `auto`, interactive, or
+exec modes. Oracle tools launch Codex from `PATH`, or from the executable named
+by `REPOPROMPT_CODEX_COMMAND`. Set the nullable
+`models.secondary_oracle_model` key with `app_settings` to enable paired
+Primary/Secondary Oracle execution; setting it back to `null` restores the
+single-Oracle response contract. Use a recognized `codex_cli_*` raw model ID
+(or a configured `codex_custom_*` ID); the runtime translates it to Codex CLI
+model/reasoning arguments. Provider launches remain subject to the normal
+explicit cost and external-process grants. See
+[`docs/architecture/headless-mcp-runtime.md`](docs/architecture/headless-mcp-runtime.md).
+
 ### Develop in Xcode
 
 Generate and open the disposable contributor workspace with:
