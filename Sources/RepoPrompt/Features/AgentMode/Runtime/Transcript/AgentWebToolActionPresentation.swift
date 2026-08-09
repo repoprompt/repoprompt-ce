@@ -90,7 +90,7 @@ enum AgentWebToolCanonicalNames {
 
     static func isWebSearchName(_ name: String) -> Bool {
         guard let name = AgentToolNamePolicy.accepted(name) else { return false }
-        switch normalizedName(name) {
+        return switch normalizedName(name) {
         case "search", "web_search", "web_search_request", "google_web_search", "search_web", "websearch":
             true
         default:
@@ -100,7 +100,7 @@ enum AgentWebToolCanonicalNames {
 
     static func isWebReadName(_ name: String) -> Bool {
         guard let name = AgentToolNamePolicy.accepted(name) else { return false }
-        switch normalizedName(name) {
+        return switch normalizedName(name) {
         case "webfetch", "web_fetch", "web_read", "read_web", "browser.open", "browser_open", "open_url",
              "read_url", "fetch_url", "web_page", "webpage", "read_web_page":
             true
