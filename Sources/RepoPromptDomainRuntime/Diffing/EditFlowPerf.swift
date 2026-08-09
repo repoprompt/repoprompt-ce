@@ -1504,10 +1504,11 @@ package enum EditFlowPerf {
         }
 
         /// Compatibility barrier for https://github.com/repoprompt/repoprompt-ce/issues/301.
-        /// Optimizing nested generic async passthroughs around MCP limiter and TaskLocal scopes can
-        /// abort in `swift_task_dealloc` on macOS 14 release builds. Keep this boundary until the
-        /// upstream Swift ownership miscompile is resolved. This stack is distinct from
-        /// https://github.com/swiftlang/swift/issues/86204; no `Task.sleep` specialization is present.
+        /// The deterministic macOS 14 release crash unwinds through these generic async passthroughs
+        /// around MCP limiter and TaskLocal scopes. Preserve a non-inlined boundary pending Sonoma
+        /// verification and resolution of the underlying compiler/runtime interaction. The reported
+        /// stack is distinct from https://github.com/swiftlang/swift/issues/86204: no `Task.sleep`
+        /// specialization is present.
         @inline(never)
         package static func measure<T>(
             _ name: StaticString,
