@@ -155,6 +155,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             } else {
                 throw MCPError.invalidParams("headless bind requires context_id or working_dirs")
             }
+            try await context.validateBinding(identity)
             let snapshot = try await runtime.standaloneScopeCoordinator.bind(scopeID: scopeID, context: identity)
             return try .object(["binding": bindingValue(snapshot.binding), "backend": .string("headless")])
         default:
@@ -189,6 +190,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             else {
                 throw MCPError.invalidParams("workspace has no contexts")
             }
+            try await context.validateBinding(chosen.metadata.identity)
             let snapshot = try await runtime.standaloneScopeCoordinator.bind(
                 scopeID: scopeID,
                 context: chosen.metadata.identity
@@ -253,6 +255,9 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             let fileURL = runtime.configuration.workspaceStorageDirectory
                 .appendingPathComponent("\(workspaceID.uuidString).json", isDirectory: false)
             let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
+            if !document.metadata.repoPaths.isEmpty {
+                try await context.validateWorkspaceRoots(document.metadata.repoPaths)
+            }
             try await MCPDomainMutationCommitContext.willCommit()
             let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
                 operationID: operationID,
@@ -390,6 +395,9 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             documentBytes: bytes,
             fileURL: workspace.document.fileURL
         )
+        if action == "add_folder" || action == "remove_folder" || selectedContextID != nil {
+            try await context.validateWorkspaceRoots(replacement.metadata.repoPaths)
+        }
         try await MCPDomainMutationCommitContext.willCommit()
         let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
             operationID: operationID,

@@ -3,6 +3,13 @@ import MCP
 import RepoPromptDomainRuntime
 
 actor DirectHeadlessDomainContext {
+    struct SessionRootMappingPreparation {
+        let sessionID: UUID
+        let resolvedMappings: [DirectHeadlessRootMapping]
+        let previousMappings: [DirectHeadlessRootMapping]?
+        let bindings: [DomainAgentRunSnapshot.WorktreeBinding]
+    }
+
     enum Error: Swift.Error, LocalizedError {
         case routingUnavailable
         case workspaceUnavailable
@@ -99,32 +106,10 @@ actor DirectHeadlessDomainContext {
             }
             return url
         }
-        let preferredMappings = sessionID.flatMap { sessionRootMappings[$0] } ?? processRootMappings
-        let rootMappings: [DirectHeadlessRootMapping]
-        if preferredMappings.isEmpty {
-            rootMappings = canonicalRoots.map {
-                DirectHeadlessRootMapping(
-                    canonicalRoot: $0,
-                    physicalRoot: $0,
-                    worktree: nil,
-                    visualLabel: nil,
-                    visualColorHex: nil
-                )
-            }
-        } else {
-            guard preferredMappings.count == canonicalRoots.count else { throw Error.rootMappingUnavailable }
-            var physicalPaths: Set<String> = []
-            rootMappings = try canonicalRoots.map { canonicalRoot in
-                let matches = preferredMappings.filter {
-                    $0.canonicalRoot.standardizedFileURL.resolvingSymlinksInPath().path == canonicalRoot.path
-                }
-                guard matches.count == 1, let match = matches.first,
-                      physicalPaths.insert(match.physicalRoot.path).inserted
-                else { throw Error.rootMappingUnavailable }
-                return match
-            }
-        }
-        try await DirectHeadlessWorktreeRouting.verifyMappingsAtUse(rootMappings)
+        let rootMappings = try await resolveRootMappings(
+            canonicalRoots: canonicalRoots,
+            sessionID: sessionID
+        )
         let roots = try rootMappings.map { mapping -> URL in
             let physical = mapping.physicalRoot.standardizedFileURL.resolvingSymlinksInPath()
             var isDirectory: ObjCBool = false
@@ -155,28 +140,91 @@ actor DirectHeadlessDomainContext {
         sourceSessionID: UUID?,
         arguments: [String: Value],
         connectionID: UUID
-    ) async throws -> [DomainAgentRunSnapshot.WorktreeBinding] {
+    ) async throws -> SessionRootMappingPreparation {
         let current = try await snapshot(connectionID: connectionID)
         let inherits = arguments["inherit_worktree"]?.boolValue ?? true
-        let hasExplicitSelector = arguments["worktree"] != nil
-            || arguments["worktree_id"] != nil
-            || arguments["worktree_create"]?.boolValue == true
-        let inheritedMappings = inherits && !hasExplicitSelector
+        let selectorIntent = try DirectHeadlessWorktreeRouting.parseSessionSelector(arguments: arguments)
+        let inheritedMappings = inherits && !selectorIntent.isExplicit
             ? sourceSessionID.flatMap { sessionRootMappings[$0] }
             : nil
         let baseMappings = inheritedMappings ?? current.rootMappings
         let resolved = try await DirectHeadlessWorktreeRouting.resolveSessionMappings(
             arguments: arguments,
+            selectorIntent: selectorIntent,
             canonicalRoots: current.canonicalRoots,
             baseMappings: baseMappings
         )
-        sessionRootMappings[sessionID] = resolved
-        return resolved.compactMap {
+        let previousMappings = sessionRootMappings.updateValue(resolved, forKey: sessionID)
+        let bindings = resolved.compactMap {
             DirectHeadlessWorktreeRouting.binding(
                 mapping: $0,
                 source: inheritedMappings == nil ? "direct-headless-session-overlay" : "direct-headless-inherited-overlay"
             )
         }
+        return SessionRootMappingPreparation(
+            sessionID: sessionID,
+            resolvedMappings: resolved,
+            previousMappings: previousMappings,
+            bindings: bindings
+        )
+    }
+
+    func rollbackSessionRootMappings(_ preparation: SessionRootMappingPreparation) {
+        guard sessionRootMappings[preparation.sessionID] == preparation.resolvedMappings else { return }
+        if let previousMappings = preparation.previousMappings {
+            sessionRootMappings[preparation.sessionID] = previousMappings
+        } else {
+            sessionRootMappings.removeValue(forKey: preparation.sessionID)
+        }
+    }
+
+    func validateBinding(_ identity: DomainContextIdentity) async throws {
+        _ = try await snapshot(identity: identity)
+    }
+
+    func validateWorkspaceRoots(_ rawRoots: [String]) async throws {
+        let canonicalRoots = try rawRoots.map { raw -> URL in
+            let url = URL(fileURLWithPath: raw).standardizedFileURL.resolvingSymlinksInPath()
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw DomainStandaloneScopeError.invalidWorkingDirectory(raw)
+            }
+            return url
+        }
+        _ = try await resolveRootMappings(canonicalRoots: canonicalRoots, sessionID: nil)
+    }
+
+    private func resolveRootMappings(
+        canonicalRoots: [URL],
+        sessionID: UUID?
+    ) async throws -> [DirectHeadlessRootMapping] {
+        let preferredMappings = sessionID.flatMap { sessionRootMappings[$0] } ?? processRootMappings
+        let rootMappings: [DirectHeadlessRootMapping]
+        if preferredMappings.isEmpty {
+            rootMappings = canonicalRoots.map {
+                DirectHeadlessRootMapping(
+                    canonicalRoot: $0,
+                    physicalRoot: $0,
+                    worktree: nil,
+                    visualLabel: nil,
+                    visualColorHex: nil
+                )
+            }
+        } else {
+            guard preferredMappings.count == canonicalRoots.count else { throw Error.rootMappingUnavailable }
+            var physicalPaths: Set<String> = []
+            rootMappings = try canonicalRoots.map { canonicalRoot in
+                let matches = preferredMappings.filter {
+                    $0.canonicalRoot.standardizedFileURL.resolvingSymlinksInPath().path == canonicalRoot.path
+                }
+                guard matches.count == 1, let match = matches.first,
+                      physicalPaths.insert(match.physicalRoot.path).inserted
+                else { throw Error.rootMappingUnavailable }
+                return match
+            }
+        }
+        try await DirectHeadlessWorktreeRouting.verifyMappingsAtUse(rootMappings)
+        return rootMappings
     }
 
     func mutate(

@@ -3,6 +3,11 @@ import MCP
 import RepoPromptDomainRuntime
 
 actor DirectHeadlessProviderCoordinator {
+    typealias BeginEpoch = @Sendable (
+        _ registration: DomainAgentSessionRegistration,
+        _ activationID: UUID
+    ) async -> DomainAgentRunSessionStore.EpochBeginResult
+
     struct ProviderDescriptor {
         let id: String
         let displayName: String
@@ -42,6 +47,7 @@ actor DirectHeadlessProviderCoordinator {
     private let runtime: MCPDomainRuntime
     private let context: DirectHeadlessDomainContext
     private let environment: [String: String]
+    private let beginEpoch: BeginEpoch
     private var agents: [UUID: AgentRecord] = [:]
     private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
@@ -49,11 +55,21 @@ actor DirectHeadlessProviderCoordinator {
     init(
         runtime: MCPDomainRuntime,
         context: DirectHeadlessDomainContext,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        beginEpoch: BeginEpoch? = nil
     ) {
         self.runtime = runtime
         self.context = context
         self.environment = environment
+        let sessionStore = runtime.agentSessionStore
+        self.beginEpoch = beginEpoch ?? { registration, activationID in
+            await sessionStore.beginEpoch(
+                registration: registration,
+                activationID: activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: .initial
+            )
+        }
     }
 
     func providerCatalog() -> [ProviderDescriptor] {
@@ -132,7 +148,7 @@ actor DirectHeadlessProviderCoordinator {
         }
         let requestedParentSessionID = request.securityContext?.principal.runID
         let parentSessionID = requestedParentSessionID.flatMap { agents[$0] == nil ? nil : $0 }
-        let worktreeBindings = try await context.prepareSessionRootMappings(
+        let rootMappingPreparation = try await context.prepareSessionRootMappings(
             sessionID: sessionID,
             sourceSessionID: parentSessionID,
             arguments: args,
@@ -141,15 +157,16 @@ actor DirectHeadlessProviderCoordinator {
         let registration = await runtime.agentSessionStore.register(sessionID: sessionID)
         let activationID = UUID()
         let epoch: DomainAgentRunTurnEpoch
-        switch await runtime.agentSessionStore.beginEpoch(
-            registration: registration,
-            activationID: activationID,
-            expectedCurrentEpoch: nil,
-            transitionKind: .initial
-        ) {
+        switch await beginEpoch(registration, activationID) {
         case let .accepted(value): epoch = value
-        case let .rejected(reason): throw MCPError.internalError(reason)
-        case .stale: throw MCPError.internalError("agent epoch changed during start")
+        case let .rejected(reason):
+            await context.rollbackSessionRootMappings(rootMappingPreparation)
+            await runtime.agentSessionStore.cleanup(registration: registration)
+            throw MCPError.internalError(reason)
+        case .stale:
+            await context.rollbackSessionRootMappings(rootMappingPreparation)
+            await runtime.agentSessionStore.cleanup(registration: registration)
+            throw MCPError.internalError("agent epoch changed during start")
         }
         let name = args["session_name"]?.stringValue
         let record = AgentRecord(
@@ -160,7 +177,7 @@ actor DirectHeadlessProviderCoordinator {
             model: args["model"]?.stringValue,
             name: name,
             parentSessionID: parentSessionID,
-            worktreeBindings: worktreeBindings,
+            worktreeBindings: rootMappingPreparation.bindings,
             latestText: nil,
             task: nil
         )

@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -27,11 +28,21 @@ struct DirectHeadlessGitWorktree: Equatable {
     let isMain: Bool
 }
 
+struct DirectHeadlessSessionSelector {
+    let selector: String?
+    let worktreeID: String?
+    let create: Bool
+
+    var isExplicit: Bool {
+        selector != nil || worktreeID != nil || create
+    }
+}
+
 enum DirectHeadlessWorktreeRouting {
     static func resolveInitialRoute(
         workingDirectories: [URL],
         catalog: DomainWorkspaceCatalogSnapshot
-    ) async -> DirectHeadlessInitialRoute {
+    ) async throws -> DirectHeadlessInitialRoute {
         guard !workingDirectories.isEmpty else {
             return DirectHeadlessInitialRoute(bindingWorkingDirectories: [], rootMappings: [])
         }
@@ -65,7 +76,12 @@ enum DirectHeadlessWorktreeRouting {
                 rootMappings: mappings
             ))
         }
-        guard candidates.count == 1, let route = candidates.first else {
+        if candidates.count > 1 {
+            throw MCPError.invalidRequest(
+                "working directories match multiple saved workspaces after existing-worktree resolution"
+            )
+        }
+        guard let route = candidates.first else {
             return DirectHeadlessInitialRoute(
                 bindingWorkingDirectories: physicalRoots,
                 rootMappings: physicalRoots.map {
@@ -84,19 +100,15 @@ enum DirectHeadlessWorktreeRouting {
 
     static func resolveSessionMappings(
         arguments: [String: Value],
+        selectorIntent: DirectHeadlessSessionSelector,
         canonicalRoots: [URL],
         baseMappings: [DirectHeadlessRootMapping]
     ) async throws -> [DirectHeadlessRootMapping] {
-        let selector = normalized(arguments["worktree"]?.stringValue)
-        let worktreeID = normalized(arguments["worktree_id"]?.stringValue)
+        let selector = selectorIntent.selector
+        let worktreeID = selectorIntent.worktreeID
         let visualLabel = normalized(arguments["worktree_label"]?.stringValue)
         let visualColorHex = normalized(arguments["worktree_color"]?.stringValue)
-        let create = arguments["worktree_create"]?.boolValue == true
-        let selectorCount = [selector != nil, worktreeID != nil, create].count(where: { $0 })
-        guard selectorCount <= 1 else {
-            throw MCPError.invalidParams("worktree, worktree_id, and worktree_create are mutually exclusive for agent_run start")
-        }
-        if create {
+        if selectorIntent.create {
             throw MCPError.invalidRequest("direct headless agent_run does not create worktrees; pass an exact existing worktree selector")
         }
         let creationOnlyKeys = [
@@ -156,6 +168,27 @@ enum DirectHeadlessWorktreeRouting {
             }
             return match
         }
+    }
+
+    static func parseSessionSelector(arguments: [String: Value]) throws -> DirectHeadlessSessionSelector {
+        let selector = normalized(arguments["worktree"]?.stringValue)
+        let worktreeID = normalized(arguments["worktree_id"]?.stringValue)
+        if arguments["worktree"] != nil, selector == nil {
+            throw MCPError.invalidParams("worktree must be a non-empty string")
+        }
+        if arguments["worktree_id"] != nil, worktreeID == nil {
+            throw MCPError.invalidParams("worktree_id must be a non-empty string")
+        }
+        let create = arguments["worktree_create"]?.boolValue == true
+        let selectorCount = [selector != nil, worktreeID != nil, create].count(where: { $0 })
+        guard selectorCount <= 1 else {
+            throw MCPError.invalidParams("worktree, worktree_id, and worktree_create are mutually exclusive for agent_run start")
+        }
+        return DirectHeadlessSessionSelector(
+            selector: selector,
+            worktreeID: worktreeID,
+            create: create
+        )
     }
 
     static func listWorktrees(repositoryRoot: URL) async throws -> [DirectHeadlessGitWorktree] {
@@ -449,13 +482,37 @@ enum DirectHeadlessWorktreeRouting {
     }
 
     private static func smallMetadataString(at url: URL) -> String? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber,
-              size.intValue > 0,
-              size.intValue <= 4096,
-              let data = try? Data(contentsOf: url, options: .mappedIfSafe)
+        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_size > 0,
+              metadata.st_size <= 4096
         else { return nil }
+        var data = Data(count: 4097)
+        let count = data.withUnsafeMutableBytes { buffer -> Int in
+            guard let baseAddress = buffer.baseAddress else { return -1 }
+            var total = 0
+            while total < buffer.count {
+                let result = read(
+                    descriptor,
+                    baseAddress.advanced(by: total),
+                    buffer.count - total
+                )
+                if result > 0 {
+                    total += result
+                } else if result == 0 {
+                    break
+                } else if errno != EINTR {
+                    return -1
+                }
+            }
+            return total
+        }
+        guard count > 0, count <= 4096 else { return nil }
+        data.removeSubrange(count ..< data.count)
         return String(data: data, encoding: .utf8)
     }
 
