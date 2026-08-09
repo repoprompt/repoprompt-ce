@@ -292,6 +292,10 @@ actor DirectHeadlessMCPService {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
             do {
+                let arguments = try Self.validatedCallArguments(
+                    toolName: params.name,
+                    arguments: params.arguments ?? [:]
+                )
                 let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
                     ? .application
                     : .standalone(id: prepared.scopeID)
@@ -309,7 +313,7 @@ actor DirectHeadlessMCPService {
                     invocationID: invocationID,
                     connectionID: connection.connectionID,
                     resolution: resolution,
-                    arguments: params.arguments ?? [:],
+                    arguments: arguments,
                     securityContext: security
                 ))
                 return Self.successResult(result)
@@ -531,5 +535,26 @@ actor DirectHeadlessMCPService {
             content: [.text(text: message, annotations: nil, _meta: nil)],
             isError: true
         )
+    }
+
+    nonisolated static func validatedCallArguments(
+        toolName: String,
+        arguments: [String: Value]
+    ) throws -> [String: Value] {
+        let supportedOperations: Set<String>
+        switch toolName {
+        case "agent_run":
+            supportedOperations = ["start", "poll", "wait", "cancel", "steer", "respond"]
+        case "agent_explore":
+            supportedOperations = ["start", "poll", "wait", "cancel"]
+        default:
+            return arguments
+        }
+        guard let operation = arguments["op"]?.stringValue,
+              supportedOperations.contains(operation)
+        else {
+            throw MCPError.invalidParams("\(toolName) requires a supported string op")
+        }
+        return arguments
     }
 }

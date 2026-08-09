@@ -5,6 +5,36 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
+    func testDirectHeadlessAgentLifecycleRequiresAdvertisedOperation() throws {
+        let supportedOperations = [
+            "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
+            "agent_explore": ["start", "poll", "wait", "cancel"]
+        ]
+        for (toolName, operations) in supportedOperations {
+            XCTAssertThrowsError(try DirectHeadlessMCPService.validatedCallArguments(
+                toolName: toolName,
+                arguments: [:]
+            ))
+            for invalidOperation in [Value.null, .bool(true), .int(1), .string(" start "), .string("unknown")] {
+                XCTAssertThrowsError(try DirectHeadlessMCPService.validatedCallArguments(
+                    toolName: toolName,
+                    arguments: ["op": invalidOperation]
+                ))
+            }
+            for operation in operations {
+                let validated = try DirectHeadlessMCPService.validatedCallArguments(
+                    toolName: toolName,
+                    arguments: ["op": .string(operation)]
+                )
+                XCTAssertEqual(validated["op"]?.stringValue, operation)
+            }
+        }
+        XCTAssertTrue(try DirectHeadlessMCPService.validatedCallArguments(
+            toolName: "get_file_tree",
+            arguments: [:]
+        ).isEmpty)
+    }
+
     func testDefaultProfileUsesCanonicalAppStorageAndNeverFallsBackToCWD() throws {
         let home = temporaryDirectory("home")
         let cwd = temporaryDirectory("cwd")
@@ -260,8 +290,18 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         let workspaceCatalog = await prepared.runtime.workspaceStore.snapshot()
         XCTAssertEqual(workspaceCatalog.workspaces.count, 1)
 
+        let invocationPrincipal = DomainClientPrincipal(
+            principalID: UUID(),
+            stableKey: "test-top-level-principal",
+            displayName: "Test top-level",
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            processID: nil,
+            runID: prepared.scopeID.rawValue,
+            provider: "test"
+        )
         let security = DomainToolInvocationSecurityContext(
-            principal: prepared.principal,
+            principal: invocationPrincipal,
             connectionID: prepared.connectionID,
             connectionGeneration: prepared.connectionGeneration,
             invocationID: UUID(),
@@ -309,6 +349,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         }
         let result = try await invokeAgentRun(
             [
+                "op": .string("start"),
                 "message": .string("Report the working directory."),
                 "worktree": .string("@branch:route-alternate"),
                 "worktree_label": .string("Alternate route"),
@@ -362,7 +403,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 principal: runPrincipal,
                 policyProfile: .direct,
                 restrictedToolNames: [],
-                additionalToolNames: [],
+                additionalToolNames: ["agent_run"],
                 ephemeralGrantedOperations: []
             ),
             invocationID: UUID()
@@ -497,6 +538,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
 
         let secondTopLevelStart = try await invokeAgentRun(
             [
+                "op": .string("start"),
                 "message": .string("Report the second top-level working directory."),
                 "detach": .bool(true)
             ],
@@ -520,6 +562,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
 
         let childStart = try await invokeAgentRun(
             [
+                "op": .string("start"),
                 "message": .string("Report the inherited working directory."),
                 "detach": .bool(true)
             ],
@@ -575,6 +618,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
 
         let optedOutStart = try await invokeAgentRun(
             [
+                "op": .string("start"),
                 "message": .string("Report the process working directory."),
                 "inherit_worktree": .bool(false),
                 "detach": .bool(true)
