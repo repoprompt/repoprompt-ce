@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
     let tabID: UUID
@@ -484,11 +485,9 @@ extension AgentModeViewModel {
         }
     }
 
-    enum AttachmentTurnDisposition: Equatable {
-        case restoreToPending
-        case deleteFiles
-        case keepFiles
-    }
+    /// Compatibility alias for app call sites while terminal settlement uses the
+    /// provider-neutral domain command vocabulary directly.
+    typealias AttachmentTurnDisposition = DomainAgentRunAttachmentTurnDisposition
 
     enum AttachmentTurnState: Equatable {
         case idle

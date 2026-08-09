@@ -70,9 +70,12 @@ final class AgentModeRunService {
     ) {
         self.dependencies = dependencies
         self.hooks = hooks
-        let terminalCommitBarrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let terminalCommitBarrier = AgentRunTerminalCommitBarrier()
         self.terminalCommitBarrier = terminalCommitBarrier
-        dependencies.codexCoordinator.installTerminalCommitBarrier(terminalCommitBarrier)
+        dependencies.codexCoordinator.installTerminalCommitBarrier(
+            terminalCommitBarrier,
+            terminalSessionBinder: { hooks.bindTerminalSession($0) }
+        )
         headlessRunner = HeadlessAgentModeRunner(
             headlessProviderFactory: dependencies.headlessProviderFactory,
             hooks: hooks,
@@ -432,7 +435,7 @@ final class AgentModeRunService {
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .failed,
@@ -561,13 +564,13 @@ final class AgentModeRunService {
                 session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
             }
             session.mcpFollowUpRunPending = true
-            hooks.continuation.startFollowUpRun(tabID, first)
+            hooks.continuation.startFollowUpRun(session, first)
             return
         }
         session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
         session.isDirty = true
         hooks.bindingObservation.updateBindings(session)
-        hooks.persistence.scheduleSave(tabID)
+        hooks.persistence.scheduleSave(session)
     }
 
     /// Claims superseding protection for the currently outstanding Claude turn when
@@ -905,12 +908,12 @@ final class AgentModeRunService {
         {
             await terminalCommitBarrier.awaitTerminalPublication(
                 for: revision.ownership,
-                session: session
+                lifecycle: session.runLifecycle
             )
             if completion == .terminalTeardownCompleted {
                 await terminalCommitBarrier.awaitTerminalTeardown(
                     for: revision.ownership,
-                    session: session
+                    lifecycle: session.runLifecycle
                 )
             }
             return
@@ -979,7 +982,7 @@ final class AgentModeRunService {
         }
 
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: expectedRunID,
             terminalState: .cancelled,
@@ -1035,7 +1038,7 @@ final class AgentModeRunService {
         if completion == .terminalTeardownCompleted {
             await terminalCommitBarrier.awaitTerminalTeardown(
                 for: ownership,
-                session: session
+                lifecycle: session.runLifecycle
             )
         }
     }

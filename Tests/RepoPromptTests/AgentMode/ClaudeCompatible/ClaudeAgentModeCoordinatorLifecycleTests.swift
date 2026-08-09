@@ -385,6 +385,85 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(recorder.contains("stale-send:shutdown"))
     }
 
+    func testClaudeSendFailureFinalizesThroughCapabilitiesWithoutViewModel() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "no-vm",
+            failSend: true
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "lifecycle-claude-session"
+        var projectedSessions: [AgentModeViewModel.TabSession] = []
+        var projectedStates: [AgentSessionRunState] = []
+        let capabilities = ClaudeAgentModeCoordinator.HostCapabilities(
+            setAgentRunActive: { projectedSession, isActive in
+                projectedSessions.append(projectedSession)
+                projectedStates.append(projectedSession.runState)
+                recorder.record("host:active:\(isActive)")
+            },
+            requestUIRefresh: { projectedSession, urgent in
+                projectedSessions.append(projectedSession)
+                projectedStates.append(projectedSession.runState)
+                recorder.record("host:refresh:\(urgent)")
+            },
+            scheduleSave: { projectedSession in
+                projectedSessions.append(projectedSession)
+                projectedStates.append(projectedSession.runState)
+                recorder.record("host:save")
+            },
+            stageClaudeResumeRecoveryHandoff: { _ in },
+            prependPendingHandoff: { outboundText, projectedSession in
+                projectedSessions.append(projectedSession)
+                projectedStates.append(projectedSession.runState)
+                recorder.record("host:prepend")
+                return outboundText
+            }
+        )
+        let providerBindingService = AgentModeProviderBindingService()
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: 1,
+            workspacePathProvider: { _ in "/workspace" },
+            claudeControllerFactory: { _, _, _, _ in controller }
+        )
+        coordinator.installHostCapabilities(
+            capabilities,
+            providerBindingService: providerBindingService
+        )
+
+        let didSend = await coordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "fail deterministically",
+            attachments: []
+        )
+        withExtendedLifetime(providerBindingService) {}
+
+        XCTAssertFalse(didSend)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertNil(session.runningStatusText)
+        XCTAssertNil(session.runningStatusSource)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
+        XCTAssertTrue(projectedSessions.allSatisfy { $0 === session })
+        XCTAssertEqual(
+            projectedStates,
+            [.running, .running, .running, .failed, .failed, .failed]
+        )
+        XCTAssertEqual(
+            recorder.events,
+            [
+                "host:active:true",
+                "host:refresh:true",
+                "no-vm:start",
+                "host:prepend",
+                "no-vm:send",
+                "host:active:false",
+                "host:refresh:true",
+                "host:save"
+            ]
+        )
+    }
+
     func testInvalidatedClaudeResumeTransferCannotRestoreClearedSessionID() async {
         let recorder = LifecycleRecorder()
         let sessionRefGate = LifecycleAsyncGate()

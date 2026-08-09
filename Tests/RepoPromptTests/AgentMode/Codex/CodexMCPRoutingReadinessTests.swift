@@ -599,7 +599,11 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         )
         retainedHosts.append(host)
         let coordinator = host.test_codexCoordinator
-        coordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder)))
+        let hooks = makeHooks(recorder: recorder)
+        coordinator.installTerminalCommitBarrier(
+            AgentRunTerminalCommitBarrier(),
+            terminalSessionBinder: { hooks.bindTerminalSession($0) }
+        )
         return coordinator
     }
 

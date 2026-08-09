@@ -163,6 +163,23 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
     }
 
+    func testClaudeOpus48BaseAndEncodedSelectionsFallBackToOneMillionTokenContextWindow() {
+        let store = AgentRuntimeMetricsUIStore()
+
+        for selectedModelRaw in ["claude-opus-4-8", "claude-opus-4-8:xhigh"] {
+            store.update(
+                transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+                codexUsage: nil,
+                liveSelectedFileCount: nil,
+                selectedAgent: .claudeCode,
+                selectedModelRaw: selectedModelRaw
+            )
+
+            XCTAssertNil(store.runtimeVM.snapshot.contextWindowTokens)
+            XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000, selectedModelRaw)
+        }
+    }
+
     func testEncodedClaudeEffortSelectionResolvesContextWindowFallback() {
         let store = AgentRuntimeMetricsUIStore()
         store.update(

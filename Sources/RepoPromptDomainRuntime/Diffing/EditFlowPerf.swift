@@ -1503,7 +1503,13 @@ package enum EditFlowPerf {
             try operation()
         }
 
-        @inline(__always)
+        /// Compatibility barrier for https://github.com/repoprompt/repoprompt-ce/issues/301.
+        /// The deterministic macOS 14 release crash unwinds through these generic async passthroughs
+        /// around MCP limiter and TaskLocal scopes. Preserve a non-inlined boundary pending Sonoma
+        /// verification and resolution of the underlying compiler/runtime interaction. The reported
+        /// stack is distinct from https://github.com/swiftlang/swift/issues/86204: no `Task.sleep`
+        /// specialization is present.
+        @inline(never)
         package static func measure<T>(
             _ name: StaticString,
             operation: () async throws -> T
@@ -1511,7 +1517,8 @@ package enum EditFlowPerf {
             try await operation()
         }
 
-        @inline(__always)
+        // Keep the dimensions overload behind the same issue #301 optimizer barrier.
+        @inline(never)
         package static func measure<T>(
             _ name: StaticString,
             _ dimensions: @autoclosure () -> Dimensions,

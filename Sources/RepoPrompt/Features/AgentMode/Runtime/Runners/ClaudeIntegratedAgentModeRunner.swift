@@ -87,7 +87,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.claudeExpectedTurnIDs.removeAll()
-        hooks.presentation.setAgentRunActive(tabID, true)
+        hooks.presentation.setAgentRunActive(session, true)
         hooks.bindingObservation.updateBindings(session)
 
         session.agentTask = Task { [weak self, weak session] in
@@ -218,7 +218,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         codexRolloutPath: session.codexRolloutPath
                     )
                     session.isDirty = true
-                    hooks.persistence.scheduleSave(session.tabID)
+                    hooks.persistence.scheduleSave(session)
                 }
                 if status.isRepoPromptServerFailed {
                     return ConsumeEventsOutcome(
@@ -265,7 +265,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     if !session.runState.isActive {
                         session.runState = .running
                     }
-                    hooks.presentation.setAgentRunActive(session.tabID, true)
+                    hooks.presentation.setAgentRunActive(session, true)
                     hooks.bindingObservation.updateBindings(session)
                     continue eventLoop
                 }
@@ -293,7 +293,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)
                     hooks.bindingObservation.updateBindings(session)
-                    hooks.persistence.scheduleSave(session.tabID)
+                    hooks.persistence.scheduleSave(session)
                 }
             }
         }
@@ -323,7 +323,7 @@ final class ClaudeIntegratedAgentModeRunner {
     ) async {
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -347,7 +347,7 @@ final class ClaudeIntegratedAgentModeRunner {
         shouldShutdownSession: Bool = false
     ) async {
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: terminalState,
