@@ -35,6 +35,7 @@ final class DiffGenerationUtilityRoutingTests: XCTestCase {
         let selectorText = "calculate total for selected invoice line items"
         let selector = DiffGenerationUtility.processLine(selectorText, precision: .high)
         let minimumMatchIndex = 401
+        let maxFuzzyKeys = 400
         let prefix = (0 ..< minimumMatchIndex).map {
             "calculate total for selected invoice line item \($0)"
         }
@@ -42,7 +43,7 @@ final class DiffGenerationUtilityRoutingTests: XCTestCase {
             DiffGenerationUtility.processLine($0, precision: .high)
         }
         let prefixIndex = DiffGenerationUtility.buildLineIndexMapHigh(content: processedPrefix)
-        let fuzzyAliases = (0 ..< 4_096).map {
+        let fuzzyAliases = (0 ..< (maxFuzzyKeys * 10)).map {
             "calculate total for selected invoice line item candidate \(String($0, radix: 36))"
         }
         let fuzzyCandidate = try XCTUnwrap(
@@ -73,7 +74,7 @@ final class DiffGenerationUtilityRoutingTests: XCTestCase {
             selector: [selector],
             content: content,
             lineIndex: lineIndex,
-            maxFuzzyKeys: 400,
+            maxFuzzyKeys: maxFuzzyKeys,
             fuzzyThreshold: 0.80,
             minimumMatchIndex: minimumMatchIndex
         )
