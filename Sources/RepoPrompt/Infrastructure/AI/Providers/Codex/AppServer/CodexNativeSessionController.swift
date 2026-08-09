@@ -3691,6 +3691,10 @@ final class CodexNativeSessionController {
             parseTokenUsagePayload(from: params)
         }
 
+        static func test_normalizedExternalToolName(_ raw: String?) -> String? {
+            normalizedExternalToolName(raw)
+        }
+
         static func test_parseErrorNotification(from params: [String: Any]) -> ErrorNotification? {
             parseErrorNotification(from: params)
         }
@@ -6509,8 +6513,8 @@ final class CodexNativeSessionController {
     }
 
     private static func normalizedExternalToolName(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let acceptedName = AgentToolNamePolicy.accepted(raw) else { return nil }
+        let trimmed = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let lowered = trimmed.lowercased()
         let suffix = lowered.split(separator: ".").last.map(String.init) ?? lowered
