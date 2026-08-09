@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
@@ -9,7 +10,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.1.2"
+let CLI_VERSION = "1.2.0"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -2538,9 +2539,10 @@ func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
 
 /// CLI operating mode
 enum CLIMode {
-    case proxy
+    case proxy(MCPBackend)
     case interactive(InteractiveOptions)
     case exec(ExecOptions)
+    case policyAdministration([String])
 }
 
 private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
@@ -2553,18 +2555,50 @@ private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
 /// Parses command line arguments to determine CLI mode
 func parseCLIMode() -> CLIMode {
     let args = CommandLine.arguments.dropFirst() // Skip executable name
-    let hasUserArgs = !args.isEmpty
+    var hasNonBackendUserArgs = false
+    if args.first == "policy" {
+        return .policyAdministration(Array(args.dropFirst()))
+    }
     var interactiveOptions = InteractiveOptions()
     var execOptions = ExecOptions()
     var isInteractive = false
     var isExec = false
+    var backend = MCPBackend.app
+    var backendOptionWasExplicit = false
 
     var i = args.startIndex
     while i < args.endIndex {
         let arg = args[i]
 
         switch arg {
+        case "--backend":
+            guard !backendOptionWasExplicit else {
+                fputs("Error: --backend may be specified only once.\n", stderr)
+                exit(2)
+            }
+            i = args.index(after: i)
+            guard i < args.endIndex, let parsed = MCPBackend(rawValue: args[i].lowercased()) else {
+                fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
+                exit(2)
+            }
+            backend = parsed
+            backendOptionWasExplicit = true
+
+        case let value where value.hasPrefix("--backend="):
+            guard !backendOptionWasExplicit else {
+                fputs("Error: --backend may be specified only once.\n", stderr)
+                exit(2)
+            }
+            let raw = String(value.dropFirst("--backend=".count)).lowercased()
+            guard let parsed = MCPBackend(rawValue: raw) else {
+                fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
+                exit(2)
+            }
+            backend = parsed
+            backendOptionWasExplicit = true
+
         case "--raw-json":
+            hasNonBackendUserArgs = true
             interactiveOptions.rawJSON = true
             execOptions.rawJSON = true
 
@@ -2842,7 +2876,15 @@ func parseCLIMode() -> CLIMode {
             }
         }
 
+        if !arg.hasPrefix("--backend="), arg != "--backend" {
+            hasNonBackendUserArgs = true
+        }
         i = args.index(after: i)
+    }
+
+    if backendOptionWasExplicit, backend != .app, isExec || isInteractive {
+        fputs("Error: --backend \(backend.rawValue) is available only for MCP stdio server mode; interactive and exec remain app-backed.\n", stderr)
+        exit(2)
     }
 
     // Exec mode takes precedence if any exec flags were used
@@ -2855,14 +2897,14 @@ func parseCLIMode() -> CLIMode {
 
     // Proxy mode is reserved for MCP hosts launching the binary with no CLI args.
     // Any explicit args that don't select exec/interactive are invalid user input.
-    if hasUserArgs {
+    if hasNonBackendUserArgs {
         fputs("Error: no command or mode specified.\n", stderr)
         fputs("Use -e/--exec for commands, -i for REPL, or --help for usage.\n\n", stderr)
         printUsage()
         exit(2)
     }
 
-    return .proxy
+    return .proxy(backend)
 }
 
 /// Returns true when stdin is suitable for MCP host stdio transport.
@@ -3553,6 +3595,62 @@ signal(SIGPIPE, SIG_IGN)
 /// Parse CLI mode
 let mode = parseCLIMode()
 
+if case let .policyAdministration(arguments) = mode {
+    await exit(RuntimePolicyAdministration.run(arguments: arguments))
+}
+
+if DirectHeadlessChildBridge.isRequested() {
+    do {
+        try await DirectHeadlessChildBridge.run()
+        exit(MCPCLIExitCode.ok.rawValue)
+    } catch {
+        fputs("RepoPrompt MCP private child bridge: \(error)\n", stderr)
+        exit(MCPCLIExitCode.connectionFailed.rawValue)
+    }
+}
+
+if case .proxy = mode {
+    // Proxy/direct MCP mode is for a host-owned pipe or socket. Keep the ordinary terminal
+    // help behavior independent of the selected backend, including an explicit `auto` path.
+    // Do not use a positive-timeout stdin probe here: hosts may send initialize later.
+    let stdinIsTTY = isatty(STDIN_FILENO) != 0
+    let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
+    let hasNoUserArgs = CommandLine.arguments.count <= 1
+    if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
+        let usage = """
+        RepoPrompt MCP CLI
+
+        This command is designed to be used as an MCP server by host applications
+        (Claude Desktop, Cursor, etc.) or with explicit mode flags.
+
+        Quick start:
+          __RPCE_CLI__ -l                    # List available tools
+          __RPCE_CLI__ -e 'tree'             # Execute a command
+          __RPCE_CLI__ -i                    # Interactive REPL
+          __RPCE_CLI__ --help                # Full help
+
+        """.replacingOccurrences(of: "__RPCE_CLI__", with: cliDisplayCommand())
+        fputs(usage, stderr)
+        exit(0)
+    }
+}
+
+let resolvedBackend: MCPResolvedBackend? = if case let .proxy(requestedBackend) = mode {
+    MCPBackendSelection.resolve(requested: requestedBackend)
+} else {
+    nil
+}
+
+if let resolvedBackend {
+    log.debug(
+        "Selected MCP backend before initialize",
+        metadata: [
+            "requested": "\(String(describing: mode))",
+            "selected": "\(resolvedBackend.rawValue)"
+        ]
+    )
+}
+
 // Exec mode is a bounded one-shot command runner. Run it directly instead of
 // through ServiceGroup so completion exits deterministically.
 if case let .exec(options) = mode {
@@ -3582,40 +3680,30 @@ if case let .exec(options) = mode {
     }
 }
 
+if resolvedBackend == .headless {
+    do {
+        try await DirectHeadlessMCPService(logger: log).run()
+        exit(MCPCLIExitCode.ok.rawValue)
+    } catch {
+        fputs("RepoPrompt MCP headless: \(error)\n", stderr)
+        exit(MCPCLIExitCode.unknownError.rawValue)
+    }
+}
+
 /// Create appropriate service based on mode
 let service: any Service
 switch mode {
 case .proxy:
-    // In proxy mode, only show help when directly launched from a terminal.
-    // IMPORTANT: Do not infer "user mode" from a short stdin poll timeout.
-    // MCP hosts can legitimately take >200ms before sending initialize, and
-    // timing-based detection causes false exits during startup races.
-    let stdinIsTTY = isatty(STDIN_FILENO) != 0
-    let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
-    let hasNoUserArgs = CommandLine.arguments.count <= 1
-
-    if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
-        let usage = """
-        RepoPrompt MCP CLI
-
-        This command is designed to be used as an MCP server by host applications
-        (Claude Desktop, Cursor, etc.) or with explicit mode flags.
-
-        Quick start:
-          __RPCE_CLI__ -l                    # List available tools
-          __RPCE_CLI__ -e 'tree'             # Execute a command
-          __RPCE_CLI__ -i                    # Interactive REPL
-          __RPCE_CLI__ --help                # Full help
-
-        """.replacingOccurrences(of: "__RPCE_CLI__", with: cliDisplayCommand())
-        fputs(usage, stderr)
-        exit(0)
+    guard resolvedBackend == .app else {
+        fatalError("Headless direct service exits before app service composition")
     }
     service = MCPService()
 case let .interactive(options):
     service = InteractiveMCPService(options: options, logger: log)
 case let .exec(options):
     service = ExecMCPService(options: options, logger: log)
+case .policyAdministration:
+    fatalError("Policy administration exits before service composition")
 }
 
 /// Use a quiet logger for ServiceLifecycle to suppress internal debug output

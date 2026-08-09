@@ -493,6 +493,20 @@ actor CodexAppServerClient {
         return runtime
     }
 
+    private static func processEnvironmentForCurrentLaunch(
+        _ baseEnvironment: [String: String]
+    ) -> [String: String] {
+        DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: baseEnvironment)
+    }
+
+    #if DEBUG
+        static func testProcessEnvironmentForCurrentLaunch(
+            baseEnvironment: [String: String]
+        ) -> [String: String] {
+            processEnvironmentForCurrentLaunch(baseEnvironment)
+        }
+    #endif
+
     func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
         expectedAgentPIDRegistration = registration
         guard registration != nil else {
@@ -1365,7 +1379,7 @@ actor CodexAppServerClient {
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        let environment = launchContext.environment
+        let environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
         let resolution = launchContext.resolution
         if provisionsRepoPromptMCPOnStart {
             let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)

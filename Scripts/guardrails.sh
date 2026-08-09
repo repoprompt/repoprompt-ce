@@ -8,3 +8,4 @@ cd "$ROOT_DIR"
 ./Scripts/contributor_allowlist_guardrails.sh
 ./Scripts/swiftpm_notice_guardrails.sh
 ./Scripts/codex_vendor_guardrails.sh
+./Scripts/headless_runtime_guardrails.sh

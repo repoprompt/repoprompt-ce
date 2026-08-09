@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -38,6 +39,50 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         #endif
     }
 
+    func testSharedServerLeaseNestedAcquisitionFailsWithOwnerDiagnostics() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: "outer-lease") { _ in
+                do {
+                    try await MCPSharedServerTestLease.shared.withLease(
+                        owner: "nested-lease",
+                        acquisitionTimeout: .milliseconds(50)
+                    ) { _ in
+                        XCTFail("A nested shared-server lease must not acquire while its outer owner is active.")
+                    }
+                    XCTFail("A nested shared-server lease must fail with a bounded diagnostic.")
+                } catch {
+                    let description = String(describing: error)
+                    XCTAssertTrue(description.contains("nested-lease"), description)
+                    XCTAssertTrue(description.contains("outer-lease"), description)
+                }
+
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                XCTAssertEqual(waiterCount, 0)
+            }
+
+            try await withSharedServerLeaseTimeout(timeout: .seconds(2)) {
+                try await MCPSharedServerTestLease.shared.withLease(owner: "post-timeout-successor") { _ in }
+            }
+        #else
+            throw XCTSkip("Shared MCP server lease nesting regression requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
+    func testSharedServerLeaseRestoresInheritedTransportState() async throws {
+        #if DEBUG
+            let manager = ServerNetworkManager.shared
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                let inherited = await manager.debugTransportState()
+                await manager.setEnabled(!inherited.isEnabled)
+                let mutated = await manager.debugTransportState()
+                XCTAssertEqual(mutated.isRunning, inherited.isRunning)
+                XCTAssertEqual(mutated.isEnabled, !inherited.isEnabled)
+            }
+        #else
+            throw XCTSkip("Shared MCP transport restoration requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -53,6 +98,49 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             }
         #else
             throw XCTSkip("Distinct MCP connection socketpair integration requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
+    func testFixtureBootstrapRestoresRequiredCatalogAfterPriorFullShutdown() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let requiredTools: Set<String> = [
+                    MCPGlobalToolName.bindContext,
+                    MCPWindowToolName.readFile,
+                    MCPWindowToolName.search
+                ]
+
+                let first = try await PersistentMCPTestFixture.make(lease: lease)
+                do {
+                    let firstNames = try await first.endpointA().listedToolNames()
+                    XCTAssertFalse(firstNames.isEmpty)
+                    XCTAssertTrue(requiredTools.isSubset(of: firstNames), "First fixture catalog: \(firstNames.sorted())")
+                    await first.cleanup()
+                    try await first.assertCleanedUp()
+                } catch {
+                    await first.cleanup()
+                    throw error
+                }
+
+                let afterShutdown = await AppDomainRuntimeComposition.shared.catalogSnapshot()
+                XCTAssertTrue(MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                    afterShutdown.activeScopesByToolName[toolName]?.contains(.application) == true
+                })
+
+                let second = try await PersistentMCPTestFixture.make(lease: lease)
+                do {
+                    let secondNames = try await second.endpointA().listedToolNames()
+                    XCTAssertFalse(secondNames.isEmpty)
+                    XCTAssertTrue(requiredTools.isSubset(of: secondNames), "Second fixture catalog: \(secondNames.sorted())")
+                    await second.cleanup()
+                    try await second.assertCleanedUp()
+                } catch {
+                    await second.cleanup()
+                    throw error
+                }
+            }
+        #else
+            throw XCTSkip("Persistent MCP fixture bootstrap regression requires DEBUG diagnostics helpers.")
         #endif
     }
 
@@ -1441,7 +1529,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         let rootURL: URL
         let contextA: PersistentMCPTestContext
         let contextB: PersistentMCPTestContext
-        let ownedRoutingService: WindowRoutingService?
         private var firstPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
         private var secondPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
         private var queuedSearchPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
@@ -1453,21 +1540,22 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private init(
             rootURL: URL,
             contextA: PersistentMCPTestContext,
-            contextB: PersistentMCPTestContext,
-            ownedRoutingService: WindowRoutingService?
+            contextB: PersistentMCPTestContext
         ) {
             self.rootURL = rootURL
             self.contextA = contextA
             self.contextB = contextB
-            self.ownedRoutingService = ownedRoutingService
         }
 
         static func make(
             lease: MCPSharedServerTestLease.Ownership,
+            domainRuntime: MCPDomainRuntime? = nil,
             contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
             contextASearchFileCount: Int = 1
         ) async throws -> PersistentMCPTestFixture {
             _ = lease
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentMCPDistinctConnectionConcurrencyTests", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1475,12 +1563,18 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let windowA = if let contextBuilderProviderFactory {
+            let windowA = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else if let contextBuilderProviderFactory {
                 WindowState(contextBuilderProviderFactory: contextBuilderProviderFactory)
             } else {
                 WindowState()
             }
-            let windowB = WindowState()
+            let windowB = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else {
+                WindowState()
+            }
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -1489,7 +1583,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
             var contextA: PersistentMCPTestContext?
             var contextB: PersistentMCPTestContext?
-            var ownedRoutingService: WindowRoutingService?
             var constructedFixture: PersistentMCPTestFixture?
             do {
                 contextA = try await makeContext(
@@ -1510,13 +1603,13 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     label: "B",
                     searchFileCount: 1
                 )
-                let routing = try await ensureRoutingService()
-                ownedRoutingService = routing.owned ? routing.service : nil
+                try await ensureRequiredCatalogAndEnableTransport(
+                    contexts: [XCTUnwrap(contextA), XCTUnwrap(contextB)]
+                )
                 let fixture = try PersistentMCPTestFixture(
                     rootURL: rootURL,
                     contextA: XCTUnwrap(contextA),
-                    contextB: XCTUnwrap(contextB),
-                    ownedRoutingService: ownedRoutingService
+                    contextB: XCTUnwrap(contextB)
                 )
                 constructedFixture = fixture
                 fixture.firstPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a", networkManager: fixture.networkManager)
@@ -1531,7 +1624,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 } else {
                     if let contextB { await cleanupContext(contextB) }
                     if let contextA { await cleanupContext(contextA) }
-                    if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
                     WindowStatesManager.shared.unregisterWindowState(windowB)
                     WindowStatesManager.shared.unregisterWindowState(windowA)
                     try? FileManager.default.removeItem(at: rootURL)
@@ -1641,15 +1733,14 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await contextB.window.tearDown()
             await contextA.window.tearDown()
             await contextA.window.mcpServer.shutdownListener()
-            ServiceRegistry.unregister(contextB.catalogService)
-            ServiceRegistry.unregister(contextA.catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(contextB.catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(contextA.catalogService)
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
             contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
             contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
-            if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
             try? FileManager.default.removeItem(at: rootURL)
         }
 
@@ -1726,7 +1817,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw ClientFixtureError.exactAbsoluteCatalogMiss
             }
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            ServiceRegistry.register(catalogService)
+            try await AppDomainRuntimeComposition.shared.register(catalogService)
             return PersistentMCPTestContext(
                 rootURL: rootURL,
                 fileURL: fileURL,
@@ -1740,25 +1831,58 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             )
         }
 
-        private static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-            if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
-                return (existing, false)
+        private static func ensureRequiredCatalogAndEnableTransport(
+            contexts: [PersistentMCPTestContext]
+        ) async throws {
+            let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
+            let globalsReady = MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
             }
-            let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
-            for _ in 0 ..< 100 {
-                let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
-                let names = await service.tools.map(\.name)
-                if registered, names.contains("bind_context") {
-                    return (service, true)
+            let windowsReady = contexts.allSatisfy { context in
+                let scope = MCPDomainToolRegistrationScope.window(id: context.window.windowID)
+                return MCPAppToolGroup.orderedToolNames.allSatisfy { toolName in
+                    snapshot.activeScopesByToolName[toolName]?.contains(scope) == true
                 }
-                try await Task.sleep(for: .milliseconds(10))
             }
-            ServiceRegistry.unregister(service)
-            throw ClientFixtureError.routingServiceUnavailable
+            guard globalsReady, windowsReady else {
+                throw ClientFixtureError.routingServiceUnavailable
+            }
+
+            // Direct socketpair requests require advertisement even after an earlier
+            // fixture performed full shutdown. The enclosing shared-server lease records
+            // and restores the inherited transport state; this fixture never owns global
+            // registration handles.
+            await ServerNetworkManager.shared.setEnabled(true)
+        }
+
+        func registerDomainWorkspace(_ context: PersistentMCPTestContext) async throws {
+            let workspace = try XCTUnwrap(
+                context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+            )
+            try await registerDomainWorkspace(
+                workspace,
+                rootURL: context.rootURL,
+                windowID: context.window.windowID
+            )
+        }
+
+        func registerDomainWorkspace(
+            _ workspace: WorkspaceModel,
+            rootURL: URL,
+            windowID: Int
+        ) async throws {
+            let client = DomainWorkspaceAuthorityClient(
+                store: AppDomainRuntimeComposition.shared.runtime.workspaceStore,
+                windowID: windowID
+            )
+            _ = try await client.registerForRead(
+                workspace,
+                fileURL: rootURL.appendingPathComponent("fixture.repoprompt-workspace")
+            )
         }
 
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {
-            ServiceRegistry.unregister(context.catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(context.catalogService)
             await context.window.workspaceFileContextStore.unloadRoot(id: context.rootID)
             context.window.workspaceManager.workspaces.removeAll { $0.id == context.workspaceID }
             try? FileManager.default.removeItem(at: context.rootURL)
@@ -1775,7 +1899,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         let workspaceID: UUID
         let tabID: UUID
         let sentinel: String
-        let catalogService: MCPWindowToolCatalogService
+        let catalogService: MCPAppToolCatalogRegistration
 
         init(
             rootURL: URL,
@@ -1786,7 +1910,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             workspaceID: UUID,
             tabID: UUID,
             sentinel: String,
-            catalogService: MCPWindowToolCatalogService
+            catalogService: MCPAppToolCatalogRegistration
         ) {
             self.rootURL = rootURL
             self.fileURL = fileURL
@@ -1805,7 +1929,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         let capabilityToken: String?
         let ready: Bool
         let viable: Bool
-        let peerPID: Int
+        let peerPID: Int?
         let selectedWindowID: Int?
         let restrictedTools: Set<String>
         let additionalTools: Set<String>
@@ -1870,6 +1994,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 connectionID: connectionID,
                 sessionToken: sessionToken,
                 clientPid: Int(getpid()),
+                observedKernelPeerPID: Int(getpid()),
                 clientName: clientName,
                 purpose: .unknown,
                 codeMapsDisabled: false,
@@ -1918,9 +2043,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 try await startTask.value
                 try client.sendNotification(method: "notifications/initialized", params: [:])
                 let tools = try await client.request(method: "tools/list", params: [:])
-                let names = try Self.toolNames(from: tools)
-                for requiredToolName in requiredToolNames {
-                    XCTAssertTrue(names.contains(requiredToolName), "Missing required tool \(requiredToolName): \(names)")
+                let names = try Set(Self.toolNames(from: tools))
+                let missing = requiredToolNames.subtracting(names)
+                guard missing.isEmpty else {
+                    throw ClientFixtureError.requiredToolsMissing(missing.sorted())
                 }
                 return endpoint
             } catch {
@@ -1932,6 +2058,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 _ = try? await startTask.value
                 throw error
             }
+        }
+
+        func listedToolNames() async throws -> Set<String> {
+            let response = try await client.request(method: "tools/list", params: [:])
+            return try Set(Self.toolNames(from: response))
         }
 
         func callTool(
@@ -2006,6 +2137,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
         func nextRequestIDForTesting() -> Int {
             withStateLock { nextRequestID }
+        }
+
+        func isClosedForTesting() -> Bool {
+            withStateLock { isClosed }
         }
 
         func installResponseInterceptor(
@@ -2395,6 +2530,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case broadSearchDidNotStart
         case exactAbsoluteCatalogMiss
+        case requiredToolsMissing([String])
         case routingServiceUnavailable
         case toolReturnedError(String)
     }

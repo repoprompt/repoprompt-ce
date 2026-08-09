@@ -47,6 +47,7 @@ struct TokenCalculationResult {
     let codeMapContent: String // NEW – raw code-map block text
     let codeMapFileCount: Int
     let codeMapTokenCount: Int
+    let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]
 }
 
 struct TokenComponentBreakdown {
@@ -79,10 +80,12 @@ struct PromptEntriesEvaluation {
 
     struct EntryResult {
         let fileID: UUID
+        let renderedDisplayPath: String
         let renderMode: RenderMode
         let displayTokens: Int
         let fullTokens: Int
         let codemapTokens: Int
+        let displayLineCount: Int?
     }
 
     let entryResultsByFileID: [UUID: EntryResult]
@@ -343,7 +346,8 @@ actor TokenCalculationService {
                 fileTreeTokenCountRaw: fileTreeTokens,
                 codeMapContent: evaluation.codeMapContent,
                 codeMapFileCount: evaluation.codeMapFileCount,
-                codeMapTokenCount: evaluation.codeMapTokenCount
+                codeMapTokenCount: evaluation.codeMapTokenCount,
+                entryResultsByFileID: evaluation.entryResultsByFileID
             )
         }
 
@@ -418,6 +422,7 @@ actor TokenCalculationService {
             let displayTokens: Int
             let fullTokenCount: Int
             let charCountContribution: Int
+            let displayLineCount: Int?
             if let assembly {
                 renderMode = .slice
                 displayTokens = Self.estimateTokens(for: assembly.combinedText)
@@ -425,6 +430,7 @@ actor TokenCalculationService {
                     ?? entry.loadedContent.map(Self.estimateTokens(for:))
                     ?? displayTokens
                 charCountContribution = assembly.totalCharacters
+                displayLineCount = WorkspaceTextLineCounter.countLines(in: assembly.combinedText)
                 sliceCount += 1
                 sliceTokens += displayTokens
             } else {
@@ -435,16 +441,19 @@ actor TokenCalculationService {
                 fullTokenCount = resolvedTokens
                 charCountContribution = entry.loadedContent?.count
                     ?? (resolvedTokens > 0 ? Int(Double(resolvedTokens) * 4.0) : 0)
+                displayLineCount = entry.loadedContent.map(WorkspaceTextLineCounter.countLines(in:))
                 fullCount += 1
                 fullTokens += displayTokens
             }
 
             entryResultsByFileID[entry.fileID] = .init(
                 fileID: entry.fileID,
+                renderedDisplayPath: entry.renderedDisplayPath,
                 renderMode: renderMode,
                 displayTokens: displayTokens,
                 fullTokens: fullTokenCount,
-                codemapTokens: entry.availableCodeMapTokenCount
+                codemapTokens: entry.availableCodeMapTokenCount,
+                displayLineCount: displayLineCount
             )
             totalChars += charCountContribution
             let folderPath = extractFolderPath(from: entry.relativePath)
@@ -459,10 +468,12 @@ actor TokenCalculationService {
             codemapTokens += apiTokens
             entryResultsByFileID[entry.fileID] = .init(
                 fileID: entry.fileID,
+                renderedDisplayPath: entry.renderedDisplayPath,
                 renderMode: .codemap,
                 displayTokens: apiTokens,
                 fullTokens: entry.cachedFullTokenCount ?? entry.loadedContent.map(Self.estimateTokens(for:)) ?? 0,
-                codemapTokens: apiTokens
+                codemapTokens: apiTokens,
+                displayLineCount: entry.codeMapContent.map(WorkspaceTextLineCounter.countLines(in:))
             )
             let folderPath = extractFolderPath(from: entry.relativePath)
             folderTokenAccum[folderPath, default: 0] += apiTokens
@@ -473,10 +484,12 @@ actor TokenCalculationService {
             codemapCount += 1
             entryResultsByFileID[entry.fileID] = .init(
                 fileID: entry.fileID,
+                renderedDisplayPath: entry.renderedDisplayPath,
                 renderMode: .codemap,
                 displayTokens: 0,
                 fullTokens: entry.cachedFullTokenCount ?? entry.loadedContent.map(Self.estimateTokens(for:)) ?? 0,
-                codemapTokens: 0
+                codemapTokens: 0,
+                displayLineCount: nil
             )
         }
 
@@ -533,7 +546,8 @@ actor TokenCalculationService {
             fileTreeTokenCountRaw: 0,
             codeMapContent: "",
             codeMapFileCount: 0,
-            codeMapTokenCount: 0
+            codeMapTokenCount: 0,
+            entryResultsByFileID: [:]
         )
     }
 }

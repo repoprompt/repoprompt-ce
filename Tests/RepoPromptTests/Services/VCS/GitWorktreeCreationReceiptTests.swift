@@ -1482,6 +1482,49 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
     }
 
     #if DEBUG
+        func testAppManagedWorktreeCreateRejectsPreCommitSymlinkReplacementWithoutBackendMutation() async throws {
+            let fixture = try ReceiptFixture()
+            defer { fixture.cleanup() }
+            let safe = fixture.worktrees.appendingPathComponent("safe", isDirectory: true)
+            let outside = fixture.sandbox.appendingPathComponent("outside", isDirectory: true)
+            let link = fixture.worktrees.appendingPathComponent("link", isDirectory: true)
+            try FileManager.default.createDirectory(at: safe, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: safe)
+
+            let marker = fixture.sandbox.appendingPathComponent("git-invoked")
+            let fakeGit = fixture.sandbox.appendingPathComponent("fake-git")
+            try "#!/bin/sh\ntouch '\(marker.path)'\nexit 99\n"
+                .write(to: fakeGit, atomically: true, encoding: .utf8)
+            XCTAssertEqual(chmod(fakeGit.path, 0o755), 0)
+
+            let request = GitWorktreeCreateRequest(
+                path: link.appendingPathComponent("child", isDirectory: true),
+                branch: "precommit-swap-\(UUID().uuidString)",
+                baseRef: "HEAD",
+                appManagedContainer: fixture.worktrees,
+                mainWorktreeRoot: fixture.root,
+                knownWorktreeRoots: [fixture.root]
+            )
+            let git = GitService(
+                gitExecutableURL: fakeGit,
+                workspaceStateAuthority: GitWorkspaceStateAuthority()
+            )
+            await git.setWorktreeMutationLockAcquiredHandlerForTesting { _ in
+                try? FileManager.default.removeItem(at: link)
+                try? FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+            }
+            do {
+                _ = try await git.createWorktreeWithResult(request: request, at: fixture.root)
+                XCTFail("Expected the mutation-boundary symlink swap to be rejected")
+            } catch {
+                // The containment guard must fail before Git is spawned.
+            }
+            await git.setWorktreeMutationLockAcquiredHandlerForTesting(nil)
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        }
+
         func testQueuedMutationLockCancellationRecordsOneTerminalDecisionWithoutReceipt() async throws {
             let fixture = try ReceiptFixture()
             defer { fixture.cleanup() }

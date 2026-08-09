@@ -339,11 +339,13 @@ struct ChatPresetMappings: Codable, Equatable {
 class ModelPresetsManager: ObservableObject {
     static let shared = ModelPresetsManager()
 
-    private let presetFileStore = PresetFileStore.shared
+    private let presetFileStore: PresetFileStore
 
     @Published var presets: [ModelPreset] = []
+    @Published private(set) var persistenceErrorMessage: String?
 
-    private init() {
+    init(presetFileStore: PresetFileStore = .shared) {
+        self.presetFileStore = presetFileStore
         loadPresets()
     }
 
@@ -353,42 +355,68 @@ class ModelPresetsManager: ObservableObject {
     }
 
     /// Saves presets to Application Support JSON.
-    private func savePresets() {
-        presetFileStore.saveModelPresets(
+    private func savePresets() throws {
+        try presetFileStore.saveModelPresets(
             PresetFileStore.ModelPresetDocument(modelPresets: presets)
         )
     }
 
     /// Adds a new preset
-    func addPreset(_ preset: ModelPreset) {
-        presets.append(preset)
-        savePresets()
+    @discardableResult
+    func addPreset(_ preset: ModelPreset) -> Bool {
+        mutateAndPersist {
+            presets.append(preset)
+        }
     }
 
     /// Updates an existing preset
     func updatePreset(_ preset: ModelPreset) {
         if let index = presets.firstIndex(where: { $0.id == preset.id }) {
-            presets[index] = preset
-            savePresets()
+            mutateAndPersist {
+                presets[index] = preset
+            }
         }
     }
 
     /// Removes a preset
     func removePreset(_ preset: ModelPreset) {
-        presets.removeAll { $0.id == preset.id }
-        savePresets()
+        mutateAndPersist {
+            presets.removeAll { $0.id == preset.id }
+        }
     }
 
     /// Removes presets at the specified offsets
     func removePresets(at offsets: IndexSet) {
-        presets.remove(atOffsets: offsets)
-        savePresets()
+        mutateAndPersist {
+            presets.remove(atOffsets: offsets)
+        }
     }
 
     /// Moves presets for reordering
     func movePresets(from source: IndexSet, to destination: Int) {
-        presets.move(fromOffsets: source, toOffset: destination)
-        savePresets()
+        mutateAndPersist {
+            presets.move(fromOffsets: source, toOffset: destination)
+        }
+    }
+
+    func clearPersistenceError() {
+        persistenceErrorMessage = nil
+    }
+
+    @discardableResult
+    private func mutateAndPersist(_ mutation: () -> Void) -> Bool {
+        let previousPresets = presets
+        mutation()
+
+        do {
+            try savePresets()
+            persistenceErrorMessage = nil
+            return true
+        } catch {
+            presets = previousPresets
+            persistenceErrorMessage = "Your model preset change wasn't saved and has been reverted. \(error.localizedDescription)"
+            return false
+        }
     }
 
     /// Returns available presets for a specific mode

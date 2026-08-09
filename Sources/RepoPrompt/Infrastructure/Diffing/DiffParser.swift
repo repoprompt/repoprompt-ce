@@ -1,10 +1,9 @@
 // File: RepoPrompt/Models/DiffParserUtils.swift
 
 import Foundation
-import SwiftUI
 
 /// Central on/off switch for every debug print in the diff-parser stack.
-enum DebugFlags { static var parser = false }
+enum DebugFlags { nonisolated(unsafe) static var parser = false }
 
 /// Convenience wrapper so we can write `dprint("…")` instead of
 /// `if DebugFlags.parser { print("…") }`.
@@ -91,7 +90,7 @@ enum DiffParserUtils {
         escapeString(input)
     }
 
-    static var isDebugEnabled: Bool = false
+    nonisolated(unsafe) static var isDebugEnabled: Bool = false
     private static let backtickTags: Set<String> = ["start_selector", "end_selector", "content", "search"]
 
     // MARK: - Fence Seam and Sibling Boundary Cleanup
@@ -1066,6 +1065,10 @@ enum DiffParserUtils {
     }
 }
 
+import Foundation
+import RepoPromptDomainRuntime
+import SwiftUI
+
 class DiffParser {
     private let fileManager: WorkspaceFilesViewModel
 
@@ -1533,17 +1536,6 @@ struct Change: Identifiable {
             }
         }
         print("")
-    }
-}
-
-enum FileAction: String {
-    case modify
-    case create
-    case delete
-    case rewrite
-
-    func printDetails() {
-        print("File Action: \(rawValue)")
     }
 }
 

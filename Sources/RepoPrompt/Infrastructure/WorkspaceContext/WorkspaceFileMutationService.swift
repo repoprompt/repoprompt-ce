@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 enum WorkspaceFileCreatePathResolutionPolicy {
     case literalPreferredIfStronger
@@ -97,7 +98,15 @@ struct WorkspaceFileMutationService {
     }
 
     @discardableResult
-    func overwrite(file: WorkspaceFileRecord, content: String) async throws -> WorkspaceFileMutationWriteResult {
+    func overwrite(
+        file: WorkspaceFileRecord,
+        content: String,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
+    ) async throws -> WorkspaceFileMutationWriteResult {
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            [file.standardizedFullPath],
+            rootMappings: mutationRootMappings
+        )
         let result = try await store.editFile(rootID: file.rootID, relativePath: file.standardizedRelativePath, newContent: content)
         if let result {
             return .fromCatalogMaterialization(result)
@@ -110,14 +119,16 @@ struct WorkspaceFileMutationService {
         content: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         selectedFileFullPaths: Set<String> = [],
-        pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger
+        pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
     ) async throws -> WorkspaceFileRecord {
         let result = try await createFileWithPostcondition(
             userPath: userPath,
             content: content,
             rootScope: rootScope,
             selectedFileFullPaths: selectedFileFullPaths,
-            pathResolutionPolicy: pathResolutionPolicy
+            pathResolutionPolicy: pathResolutionPolicy,
+            mutationRootMappings: mutationRootMappings
         )
         if let file = result.materializedFile {
             return file
@@ -133,7 +144,8 @@ struct WorkspaceFileMutationService {
         content: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         selectedFileFullPaths: Set<String> = [],
-        pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger
+        pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
     ) async throws -> WorkspaceFileMutationWriteResult {
         guard await store.rootScopeAvailability(rootScope) == .available else {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(
@@ -165,6 +177,7 @@ struct WorkspaceFileMutationService {
                 userPath: userPath,
                 content: content,
                 rootScope: rootScope,
+                mutationRootMappings: mutationRootMappings,
                 skipCatalogExistenceChecks: true
             )
         }
@@ -176,7 +189,8 @@ struct WorkspaceFileMutationService {
                 using: literal,
                 userPath: userPath,
                 content: content,
-                rootScope: rootScope
+                rootScope: rootScope,
+                mutationRootMappings: mutationRootMappings
             )
         }
 
@@ -221,7 +235,8 @@ struct WorkspaceFileMutationService {
                 using: result,
                 userPath: userPath,
                 content: content,
-                rootScope: rootScope
+                rootScope: rootScope,
+                mutationRootMappings: mutationRootMappings
             )
         }
     }
@@ -231,6 +246,7 @@ struct WorkspaceFileMutationService {
         userPath: String,
         content: String,
         rootScope: WorkspaceLookupRootScope,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping],
         skipCatalogExistenceChecks: Bool = false
     ) async throws -> WorkspaceFileMutationWriteResult {
         guard await store.rootScopeAvailability(rootScope) == .available else {
@@ -252,6 +268,10 @@ struct WorkspaceFileMutationService {
                 throw FileManagerError.fileSystemServiceNotFoundWithContext("path already exists: \(userPath)")
             }
         }
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            [absolutePath],
+            rootMappings: mutationRootMappings
+        )
         let result = try await store.createFile(
             rootID: root.id,
             relativePath: relativePath,

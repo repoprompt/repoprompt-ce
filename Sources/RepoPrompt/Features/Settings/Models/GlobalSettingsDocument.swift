@@ -550,10 +550,13 @@ struct GlobalScalarPreferences: Codable, Equatable {
         // DEPRECATED: Auto-Expand Tool Cards was removed in 2026-04.
         // Kept temporarily for decode/rollback compatibility only; do not read from UI/runtime.
         var agentAutoExpandToolCards: Bool?
+        // DEPRECATED: The background Agent compose-tab limit was removed in 2026-08.
+        // Kept for decode/rollback compatibility and round-trip preservation only.
         var maxBackgroundAgentComposeTabs: Int?
         var showBuiltInWorkflowCleanupGuidance: Bool?
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
+        var codexMemoriesEnabled: Bool?
         var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         var agentSessionHandoffInstructions: String?
@@ -568,6 +571,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             showBuiltInWorkflowCleanupGuidance: Bool? = nil,
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
+            codexMemoriesEnabled: Bool? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil
@@ -581,6 +585,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
+            self.codexMemoriesEnabled = codexMemoriesEnabled
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions

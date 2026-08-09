@@ -1830,10 +1830,6 @@ extension ToolOutputFormatter {
             let flags: [String] = [binding.explicit == true ? "explicit" : nil, binding.runScoped == true ? "run-scoped" : nil].compactMap(\.self)
             let flagSuffix = flags.isEmpty ? "" : " • " + flags.joined(separator: ", ")
             return "Tab context \(tab) in \(window)\(workspace)\(flagSuffix)"
-        case "window":
-            let window = binding.windowID.map { "window \($0)" } ?? "unknown window"
-            let workspace = binding.workspaceName.map { " • workspace \($0)" } ?? ""
-            return "Window-only affinity to \(window)\(workspace)"
         default:
             return "Unbound"
         }
@@ -1934,7 +1930,7 @@ extension ToolOutputFormatter {
             out.append("")
             out.append("### Next Steps")
             out.append("- Use `bind_context` with `op=bind` and a `context_id` to bind a specific tab context.")
-            out.append("- Or use `bind_context` with `op=bind` and a `window_id` to set window affinity.")
+            out.append("- Or use `bind_context` with `op=bind` and a `window_id` to capture and bind that window's current tab context.")
             if let windows = dto.windows, windows.count > 1 {
                 out.append("- Use `window_id` filter on `op=list` to see all tabs in a specific window.")
             }

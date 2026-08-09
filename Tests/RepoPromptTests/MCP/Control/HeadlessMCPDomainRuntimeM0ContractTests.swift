@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -13,7 +14,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let allTools = globals + windows
 
         XCTAssertEqual(globals, MCPGlobalToolName.orderedToolNames)
-        XCTAssertEqual(windows, MCPWindowToolGroup.orderedToolNames)
+        XCTAssertEqual(windows, MCPAppToolGroup.orderedToolNames)
         XCTAssertEqual(allTools.count, 27)
         XCTAssertEqual(Set(allTools).count, allTools.count)
 
@@ -29,6 +30,22 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let actionEvidence = try dictionary(catalog, key: "action_execution_evidence")
         XCTAssertEqual(try string(actionEvidence, key: "status"), "explicitly_unmeasured_in_m0")
         XCTAssertEqual(actionEvidence["wire_envelope_claim"] as? Bool, false)
+
+        let protectedMutations = try dictionary(catalog, key: "m4_" + "protected_mutations")
+        XCTAssertEqual(try string(protectedMutations, key: "construction_stage"), "m4b")
+        XCTAssertEqual(
+            try strings(protectedMutations, key: "gate_4a_families"),
+            ["manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces"]
+        )
+        XCTAssertEqual(
+            try strings(protectedMutations, key: "gate_4b_families"),
+            ["file_actions", "apply_edits", "manage_worktree"]
+        )
+        let registrySource = try source("Sources/RepoPrompt/App/AppDomainRuntimeRegistration.swift")
+        XCTAssertTrue(registrySource.contains("protectedMutationProvider.protectedBinding"))
+        XCTAssertEqual(registrySource.components(separatedBy: "protectedMutationProvider.protectedBinding").count - 1, 1)
+        let compositionSource = try source("Sources/RepoPrompt/App/AppDomainRuntimeComposition.swift")
+        XCTAssertFalse(compositionSource.contains("protectedMutationStage"))
 
         let window = makeWindowWithoutAutoStart()
         addTeardownBlock { @MainActor in
@@ -158,6 +175,14 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             )
         }
 
+        let annotationProfiles = try stringDictionary(policy, key: "client_annotation_profiles")
+        XCTAssertEqual(
+            annotationProfiles,
+            Dictionary(uniqueKeysWithValues: MCPClientToolPolicyProfile.allCases.map { profile in
+                (profile.rawValue, MCPClientToolPolicyCatalog.classification(for: profile).annotationProfile.rawValue)
+            })
+        )
+
         XCTAssertEqual(
             try string(policy, key: "resolved_tool_policy_projection_classification"),
             "production_policy_projection_not_runtime_registry_evidence"
@@ -220,29 +245,40 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
 
         let dependencies = try dictionary(manifest, key: "dependencies")
-        let expectedDependencies = try strings(dependencies, key: "stored_dependencies")
-        let sourceDependencies = try storedPropertyNames(
-            inStructNamed: "MCPWindowToolDependencies",
-            source: source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift")
+        let expectedFamilies = try strings(dependencies, key: "families")
+        let adaptersSource = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppPhysicalCapabilityAdapters.swift"
         )
-        XCTAssertEqual(sourceDependencies, expectedDependencies)
-        XCTAssertEqual(expectedDependencies.count, try integer(dependencies, key: "stored_dependency_count"))
+        XCTAssertTrue(adaptersSource.contains("enum MCPAppPhysicalCapabilityAdapters"))
+        XCTAssertFalse(adaptersSource.contains("@dynamicMemberLookup"))
+        XCTAssertEqual(expectedFamilies.count, try integer(dependencies, key: "family_count"))
+        for family in expectedFamilies {
+            XCTAssertTrue(adaptersSource.contains("struct \(family)"), "Missing typed capability family \(family)")
+        }
     }
 
-    func testEveryExecutableEvidenceCitationResolvesInCuratedTestLedger() throws {
+    func testEveryExecutableEvidenceCitationResolvesInDeclaredSourceFile() throws {
         let artifactPaths = [
             "Scripts/Fixtures/headless_mcp_domain_runtime_m0_contract.json",
             "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
         ]
         var citations = Set<String>()
+        var declaredSources: [String: Set<String>] = [:]
         for path in artifactPaths {
-            try citations.formUnion(executableTestCitations(in: loadJSONObject(path)))
+            let artifact = try loadJSONObject(path)
+            citations.formUnion(executableTestCitations(in: artifact))
+            for (citation, sources) in executableTestCitationSources(in: artifact) {
+                declaredSources[citation, default: []].formUnion(sources)
+            }
         }
 
         XCTAssertEqual(citations.count, 6, "Update the reviewed M0 citation inventory when evidence is added or removed")
-        let ledgerEntries = try curatedTestLedgerEntries()
-        let missing = citations.filter { ledgerEntries[$0] == nil }.sorted()
-        XCTAssertTrue(missing.isEmpty, "M0 executable citations missing from the curated test ledger: \(missing)")
+        XCTAssertEqual(Set(declaredSources.keys), citations, "Every M0 executable citation must declare its source_file")
+        for citation in citations.union(declaredSources.keys).sorted() {
+            let sourceFiles = try XCTUnwrap(declaredSources[citation], citation)
+            XCTAssertEqual(sourceFiles.count, 1, "Each citation must resolve to one declared source_file: \(citation)")
+            try assertExecutableTestCitation(citation, sourceFile: XCTUnwrap(sourceFiles.first))
+        }
     }
 
     func testSDKCredentialAndPrivateChildContractsAreFailClosedEvidence() throws {
@@ -304,17 +340,36 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(try string(endpoint, key: "admission"), "single_use_expected_child_or_descendant")
         XCTAssertEqual(try string(endpoint, key: "cleanup"), "identity_fenced_idempotent_settlement")
         let token = try dictionary(child, key: "domain_run_launch_token_contract")
-        XCTAssertEqual(try string(token, key: "status"), "frozen_contract_only_not_implemented")
+        XCTAssertEqual(
+            try string(token, key: "status"),
+            "host_authority_implemented_private_endpoint_and_carriers_deferred"
+        )
+        XCTAssertEqual(try string(token, key: "private_endpoint_status"), "deferred")
+        XCTAssertEqual(try string(token, key: "provider_carrier_wiring_status"), "deferred")
         XCTAssertEqual(try strings(token, key: "child_material"), ["opaque_random_capability"])
         XCTAssertEqual(try string(token, key: "policy_selection_authority"), "host_only")
         XCTAssertTrue(try strings(token, key: "host_record_bindings").contains("restricted_tools"))
         XCTAssertTrue(try Set(strings(token, key: "rules")).isSuperset(of: ["single_use", "memory_only", "never_logged", "never_persisted"]))
 
         let packageManifest = try source("Package.swift")
-        XCTAssertFalse(packageManifest.contains("HeadlessMCPDomainRuntime"))
-        XCTAssertFalse(packageManifest.contains("RepoPromptDomainRuntime"))
-        let productionSwift = try allSwiftSource()
-        XCTAssertFalse(productionSwift.contains("DomainRunLaunchToken"))
+        XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntime\""))
+        XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntimeTests\""))
+        let hostAuthority = try dictionary(token, key: "host_authority")
+        XCTAssertEqual(try string(hostAuthority, key: "milestone"), "M2")
+        XCTAssertEqual(try strings(hostAuthority, key: "operations"), ["issue", "redeem", "revoke"])
+        XCTAssertEqual(
+            try string(hostAuthority, key: "routing_test"),
+            "RepoPromptDomainRuntimeTests.DomainWorkspaceContextAuthorityTests/testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse"
+        )
+        for declaration in try dictionaries(hostAuthority, key: "production_declaration_sites") {
+            let path = try string(declaration, key: "path")
+            let kind = try string(declaration, key: "kind")
+            let symbol = try string(declaration, key: "symbol")
+            XCTAssertTrue(
+                try containsSwiftTypeDeclaration(kind: kind, named: symbol, in: source(path)),
+                "\(kind) \(symbol) at \(path)"
+            )
+        }
     }
 
     func testPersistenceApprovalMainActorAndPerformanceInventoriesRemainComplete() throws {
@@ -345,10 +400,33 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             try strings(approval, key: "workspace_operations")
         )
         XCTAssertEqual(try string(approval, key: "cancellation_result"), "denied")
+        XCTAssertEqual(try string(approval, key: "authority"), "DomainMutationApprovalBroker")
+        XCTAssertEqual(try string(approval, key: "presenter"), "WorkspaceApprovalManager")
+        XCTAssertEqual(try string(approval, key: "late_response"), "ignored")
         let approvalManager = try source("Sources/RepoPrompt/Infrastructure/MCP/WorkspaceApproval/WorkspaceApprovalManager.swift")
-        XCTAssertTrue(approvalManager.contains("continuation.resume(returning: .denied)"))
+        XCTAssertTrue(approvalManager.contains("AppKit presenter and compatibility-policy façade"))
+        XCTAssertTrue(approvalManager.contains("case .denied, .cancelled, .presenterUnavailable:"))
+        let approvalBroker = try source("Sources/RepoPromptDomainRuntime/DomainMutationApproval.swift")
+        XCTAssertTrue(approvalBroker.contains("package actor DomainMutationApprovalBroker"))
+        XCTAssertTrue(approvalBroker.contains("guard active?.request.id == requestID else { return }"))
 
         let actorInventory = try dictionary(manifest, key: "main_actor")
+        XCTAssertEqual(
+            try strings(actorInventory, key: "m4_non_main_actor_authorities"),
+            ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "DomainMutationJournal", "DomainMutationPathFence", "MCPDomainProtectedMutationToolProvider"]
+        )
+        let journalSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationJournal.swift")
+        XCTAssertTrue(journalSource.contains("package actor DomainMutationJournal"))
+        XCTAssertTrue(journalSource.contains("case indeterminateAfterCommit"))
+        XCTAssertFalse(journalSource.contains("import AppKit"))
+        let pathFenceSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPathFence.swift")
+        XCTAssertTrue(pathFenceSource.contains("rootIdentityChanged"))
+        XCTAssertTrue(pathFenceSource.contains("pathResolutionChanged"))
+        XCTAssertFalse(pathFenceSource.contains("import AppKit"))
+        XCTAssertEqual(try string(actorInventory, key: "m4_" + "main_actor_presenter"), "WorkspaceApprovalManager")
+        let policySource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPolicy.swift")
+        XCTAssertTrue(policySource.contains("package actor DomainMutationPolicyStore"))
+        XCTAssertFalse(policySource.contains("import AppKit"))
         let scannerFixture = """
         @MainActor final class InlineActor {}
           @MainActor
@@ -363,6 +441,23 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(scannerFixtureSites.compactMap { $0["symbol"] as? String }), ["InlineActor", "IndentedActor", "AttributedActor", "ExtendedActor"])
 
         let expectedLocalSiteRows = try dictionaries(actorInventory, key: "mcp_local_declaration_sites")
+        let presentationOnlySites = expectedLocalSiteRows.filter {
+            $0["actor_boundary_classification"] != nil
+        }
+        XCTAssertEqual(
+            presentationOnlySites.map(mainActorSiteKey),
+            [
+                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift|class|DomainWorkspacePresentationBridge"
+            ]
+        )
+        let presentationBridge = try XCTUnwrap(presentationOnlySites.first)
+        XCTAssertEqual(presentationBridge["actor_boundary_classification"] as? String, "presentation_only")
+        XCTAssertEqual(
+            presentationBridge["presentation_role"] as? String,
+            "snapshot_projection_and_default_bootstrap_command_client"
+        )
+        XCTAssertEqual(presentationBridge["mutable_domain_authority"] as? Bool, false)
+        XCTAssertEqual(presentationBridge["executable_tool_hop"] as? Bool, false)
         let expectedLocalSites = expectedLocalSiteRows.map(mainActorSiteKey).sorted()
         let actualLocalSites = try mainActorDeclarationSites(
             under: "Sources/RepoPrompt/Infrastructure/MCP"
@@ -383,22 +478,138 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let allTools = try strings(dictionary(manifest, key: "catalog"), key: "global_tools")
             + strings(dictionary(manifest, key: "catalog"), key: "window_tools")
         XCTAssertEqual(Set(perToolHops.keys), Set(allTools))
+        let executableHopSymbols = Set(perToolHops.values.flatMap(\.self))
+        let presentationOnlySymbols = Set(presentationOnlySites.compactMap { $0["symbol"] as? String })
+        XCTAssertTrue(executableHopSymbols.isDisjoint(with: presentationOnlySymbols))
+        let bridgePath = "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift"
+        let mcpBoundarySources = try swiftSources(under: "Sources/RepoPrompt/Infrastructure/MCP")
+        XCTAssertTrue(mcpBoundarySources.contains { $0.path == bridgePath })
+        let bridgeReferenceBoundary = mcpBoundarySources.filter { $0.path != bridgePath }
+        XCTAssertFalse(bridgeReferenceBoundary.isEmpty)
+        for file in bridgeReferenceBoundary {
+            XCTAssertFalse(file.contents.contains("DomainWorkspacePresentationBridge"), file.path)
+        }
+        let m3NonMainActorHops = try strings(actorInventory, key: "m3_non_main_actor_hops")
+        let m3SharedReadTools = try Set(strings(actorInventory, key: "m3_shared_read_tools"))
+        let m3ContextRequirements = try stringArrays(actorInventory, key: "m3_context_requirements")
+        XCTAssertEqual(try Set(XCTUnwrap(m3ContextRequirements["workspace_independent"])), ["history", "oracle_chat_log"])
+        XCTAssertEqual(try Set(XCTUnwrap(m3ContextRequirements["workspace_optional"])), ["get_file_tree", "git"])
+        XCTAssertEqual(
+            try Set(XCTUnwrap(m3ContextRequirements["workspace_required"])),
+            ["get_code_structure", "read_file", "file_search", "workspace_context", "prompt"]
+        )
+        let m3CaptureContract = try dictionary(actorInventory, key: "m3_main_actor_capture_contract")
+        XCTAssertEqual(try integer(m3CaptureContract, key: "scoped_authority_captures_per_invocation"), 1)
+        XCTAssertEqual(try integer(m3CaptureContract, key: "workspace_independent_authority_captures_per_invocation"), 0)
+        XCTAssertEqual(m3CaptureContract["refresh_runs_on_main_actor"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["read_mutates_presentation_descriptor"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["app_execution_snapshot_registered_and_released"] as? Bool, true)
+        XCTAssertEqual(m3CaptureContract["required_context_allows_nil_handle"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["direct_test_fallback_uses_domain_handle"] as? Bool, true)
+        XCTAssertEqual(
+            m3CaptureContract["post_drain_refresh"] as? String,
+            "bound_workspace_tab_selection_and_revision_only"
+        )
+        let domainReadRouting = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+DomainRouting.swift"
+        )
+        let resolverStart = try XCTUnwrap(domainReadRouting.range(of: "func resolveDomainReadContext"))
+        let resolverEnd = try XCTUnwrap(
+            domainReadRouting.range(of: "/// Runs before the server is stopped", range: resolverStart.upperBound ..< domainReadRouting.endIndex)
+        )
+        let resolver = domainReadRouting[resolverStart.lowerBound ..< resolverEnd.lowerBound]
+        XCTAssertTrue(resolver.contains("requirement != .workspaceIndependent"))
+        XCTAssertTrue(resolver.contains("registerForRead"))
+        XCTAssertFalse(resolver.contains("registerWindow"))
+        XCTAssertFalse(resolver.contains("publishDomainRoutingBinding"))
+        XCTAssertFalse(domainReadRouting.contains("validateDomainReadContext"))
+        XCTAssertTrue(domainReadRouting.contains("domainReadAppExecutionContexts[invocation.invocationID]"))
+        XCTAssertTrue(domainReadRouting.contains("releaseDomainReadAppExecutionContext"))
+        XCTAssertTrue(domainReadRouting.contains("WindowStatesManager.shared.window(withID: context.windowID)"))
+        XCTAssertTrue(domainReadRouting.contains("targetWorkspaceAuthorityClient.registerForRead"))
+        XCTAssertTrue(domainReadRouting.contains("lookupContext: targetServer.lookupContext(for: context)"))
+        let serverViewModel = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift"
+        )
+        XCTAssertTrue(serverViewModel.contains("window(withID: appContext.targetWindowID)?.mcpServer"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.fileToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.promptContextToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.gitToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("ServerNetworkManager.currentToolDispatchAuthorization"))
+        XCTAssertTrue(serverViewModel.contains("oracleExecutionServer.oracleToolProvider.executeDomainOracleChatLog"))
+        let fileReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
+        )
+        XCTAssertTrue(fileReadBackend.contains("readAuthority(appContext)"))
+        let promptReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift"
+        )
+        XCTAssertTrue(promptReadBackend.contains("appContext.resolvedTabContext"))
+        XCTAssertTrue(promptReadBackend.contains("simplePromptReply(tabContext.promptText"))
+        let gitReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
+        )
+        // Git domain reads execute against resolve-time captured authority: metadata, lookup
+        // context, routed workspace, and tab context all come from the invocation snapshot, and
+        // the artifact side effects advertise against the same captured context instead of
+        // re-resolving the current request.
+        XCTAssertTrue(gitReadBackend.contains("appContext.metadata"))
+        XCTAssertTrue(gitReadBackend.contains("appContext.lookupContext"))
+        XCTAssertTrue(gitReadBackend.contains("appContext?.resolvedTabContext"))
+        XCTAssertTrue(gitReadBackend.contains("capturedWorkspaceID"))
+        let tabContextExtension = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift"
+        )
+        XCTAssertTrue(tabContextExtension.contains("capturedContext: DomainReadAppExecutionContext? = nil"))
+        XCTAssertTrue(tabContextExtension.contains("capturedContext.resolvedTabContext.snapshot"))
+        // The primary artifact commit is the third advertisement-adjacent seam: it must accept
+        // the captured context and fail closed when the captured connection identity is missing.
+        XCTAssertTrue(tabContextExtension.contains("Connection identity is unavailable for Git artifact publication"))
+        let physicalCapabilityAdapters = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppPhysicalCapabilityAdapters.swift"
+        )
+        XCTAssertEqual(
+            physicalCapabilityAdapters.components(
+                separatedBy: "_ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?"
+            ).count - 1,
+            3,
+            "Commit, replace, and invalidate git artifact seams must all carry the captured domain read context."
+        )
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
+            .union(m3NonMainActorHops)
         for tool in allTools {
             let hops = try XCTUnwrap(perToolHops[tool], tool)
             XCTAssertFalse(hops.isEmpty, tool)
             XCTAssertTrue(Set(hops).isSubset(of: inventoriedSymbols), tool)
-            if MCPWindowToolGroup.orderedToolNames.contains(tool) {
+            if MCPAppToolGroup.orderedToolNames.contains(tool) {
                 XCTAssertTrue(hops.contains("MCPServerViewModel"), tool)
-                XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
-                let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
-                let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
-                    guard (site["symbol"] as? String) == provider else { return nil }
-                    return site["path"] as? String
-                }
                 let marker = "name: MCPWindowToolName.\(swiftToolIdentifier(tool))"
-                XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+                if m3SharedReadTools.contains(tool) {
+                    XCTAssertTrue(hops.contains("MCPDomainReadToolProvider"), tool)
+                    XCTAssertTrue(hops.contains("MCPAppToolBinder"), tool)
+                    XCTAssertNotNil(
+                        MCPDomainCanonicalToolDefinitions.definition(named: tool),
+                        "\(tool) shared schema"
+                    )
+                    let appProviders = hops.filter { $0.hasSuffix("ToolProvider") && $0 != "MCPDomainReadToolProvider" }
+                    XCTAssertFalse(appProviders.isEmpty, "\(tool) app backend")
+                    for provider in appProviders {
+                        let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                            guard (site["symbol"] as? String) == provider else { return nil }
+                            return site["path"] as? String
+                        }
+                        XCTAssertFalse(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) duplicate schema in \(provider)")
+                    }
+                } else {
+                    XCTAssertTrue(hops.contains("MCPAppToolBinder"), tool)
+                    let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
+                    let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                        guard (site["symbol"] as? String) == provider else { return nil }
+                        return site["path"] as? String
+                    }
+                    XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+                }
             }
         }
         XCTAssertTrue(try XCTUnwrap(perToolHops["manage_worktree"]).contains("MCPWorktreeToolProvider"))
@@ -433,6 +644,19 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         try String(contentsOf: RepoRoot.url().appendingPathComponent(relativePath), encoding: .utf8)
     }
 
+    private func swiftSources(under relativeDirectory: String) throws -> [(path: String, contents: String)] {
+        let root = try RepoRoot.url()
+        let directory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
+        return try enumerator.compactMap { item -> (path: String, contents: String)? in
+            guard let url = item as? URL, url.pathExtension == "swift" else { return nil }
+            return try (
+                path: String(url.path.dropFirst(root.path.count + 1)),
+                contents: String(contentsOf: url, encoding: .utf8)
+            )
+        }.sorted { $0.path < $1.path }
+    }
+
     private func sdkCheckoutSource(_ relativePath: String) throws -> String {
         let checkout = try RepoRoot.url()
             .appendingPathComponent(".build/checkouts/swift-sdk", isDirectory: true)
@@ -460,6 +684,10 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         try XCTUnwrap(object[key] as? [String: [String]], key)
     }
 
+    private func stringDictionary(_ object: [String: Any], key: String) throws -> [String: String] {
+        try XCTUnwrap(object[key] as? [String: String], key)
+    }
+
     private func dictionariesByKey(_ object: [String: Any], key: String) throws -> [String: [String: Any]] {
         try XCTUnwrap(object[key] as? [String: [String: Any]], key)
     }
@@ -485,32 +713,238 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         return [string]
     }
 
-    private func curatedTestLedgerEntries() throws -> [String: String] {
-        let ledger = try source("Scripts/Fixtures/test-suite-contract-ledger.tsv")
-        let lines = ledger.split(separator: "\n", omittingEmptySubsequences: true)
-        let header = try XCTUnwrap(lines.first, "test ledger header")
-            .split(separator: "\t", omittingEmptySubsequences: false)
-            .map(String.init)
-        let methodIDIndex = try XCTUnwrap(header.firstIndex(of: "method_id"))
-        let fileIndex = try XCTUnwrap(header.firstIndex(of: "file"))
-        var entries: [String: String] = [:]
-        entries.reserveCapacity(lines.count - 1)
-
-        for line in lines.dropFirst() {
-            let columns = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            guard columns.indices.contains(methodIDIndex), columns.indices.contains(fileIndex) else {
-                XCTFail("Malformed curated test ledger row: \(line.prefix(120))")
-                continue
+    private func executableTestCitationSources(in value: Any) -> [String: Set<String>] {
+        if let dictionary = value as? [String: Any] {
+            var result = dictionary.values.reduce(into: [String: Set<String>]()) { result, child in
+                for (citation, sources) in executableTestCitationSources(in: child) {
+                    result[citation, default: []].formUnion(sources)
+                }
             }
-            let ledgerID = columns[methodIDIndex]
-            guard let separator = ledgerID.firstIndex(of: "/") else {
-                XCTFail("Malformed curated test ledger method_id: \(ledgerID)")
-                continue
+            let citation = (dictionary["citation"] as? String) ?? (dictionary["evidence"] as? String)
+            if let citation,
+               let sourceFile = dictionary["source_file"] as? String
+            {
+                result[citation, default: []].insert(sourceFile)
             }
-            let citation = String(ledgerID[ledgerID.index(after: separator)...])
-            XCTAssertNil(entries.updateValue(columns[fileIndex], forKey: citation), "Duplicate curated test ledger ID: \(citation)")
+            return result
         }
-        return entries
+        if let array = value as? [Any] {
+            return array.reduce(into: [String: Set<String>]()) { result, child in
+                for (citation, sources) in executableTestCitationSources(in: child) {
+                    result[citation, default: []].formUnion(sources)
+                }
+            }
+        }
+        return [:]
+    }
+
+    private enum SwiftLexicalState {
+        case code
+        case lineComment
+        case blockComment(depth: Int)
+        case string(hashCount: Int, quoteCount: Int)
+    }
+
+    private func assertExecutableTestCitation(_ citation: String, sourceFile: String) throws {
+        let citationExpression = try NSRegularExpression(
+            pattern: #"\A(RepoPromptTests|RepoPromptClaudeCompatibleProviderTests)\.([A-Za-z_][A-Za-z0-9_]*)/(test[A-Za-z0-9_]*)\z"#
+        )
+        let citationMatch = try XCTUnwrap(
+            citationExpression.firstMatch(
+                in: citation,
+                range: NSRange(citation.startIndex..., in: citation)
+            ),
+            "Executable citation must be Module.Suite/testMethod with an approved test-module prefix: \(citation)"
+        )
+        let module = try capture(citationMatch, group: 1, in: citation)
+        let suite = try capture(citationMatch, group: 2, in: citation)
+        let method = try capture(citationMatch, group: 3, in: citation)
+        let expectedSourceRoot = switch module {
+        case "RepoPromptTests":
+            "Tests/RepoPromptTests/"
+        case "RepoPromptClaudeCompatibleProviderTests":
+            "Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests/"
+        default:
+            try XCTUnwrap(nil as String?, "Unsupported executable citation module: \(module)")
+        }
+        XCTAssertTrue(
+            sourceFile.hasPrefix(expectedSourceRoot) && sourceFile.hasSuffix(".swift"),
+            "Citation module \(module) does not own declared source_file: \(sourceFile)"
+        )
+
+        let code = try sanitizedSwiftSource(source(sourceFile))
+        let suitePattern = NSRegularExpression.escapedPattern(for: suite)
+        let declarationExpression = try NSRegularExpression(
+            pattern: #"(?m)^[ \t]*(?:(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\([^\n]*\))?)\s+|(?:public|package|internal|private|fileprivate|open|final)\s+)*class\s+"#
+                + suitePattern
+                + #"\s*:\s*XCTestCase(?:\s*,[^\{\n]+)?\s*\{"#
+        )
+        let declarations = declarationExpression.matches(
+            in: code,
+            range: NSRange(code.startIndex..., in: code)
+        )
+        XCTAssertEqual(
+            declarations.count,
+            1,
+            "Declared source_file must contain exactly one XCTestCase declaration for \(suite): \(sourceFile)"
+        )
+        let declaration = try XCTUnwrap(declarations.first, suite)
+        let declarationRange = try XCTUnwrap(Range(declaration.range, in: code), suite)
+        let openingBrace = try XCTUnwrap(code[declarationRange].lastIndex(of: "{"), suite)
+        let closingBrace = try XCTUnwrap(
+            matchingClosingBrace(in: code, openingBrace: openingBrace),
+            "Unterminated XCTestCase declaration for \(suite): \(sourceFile)"
+        )
+        let body = topLevelTypeBody(code[code.index(after: openingBrace) ..< closingBrace])
+        let methodPattern = NSRegularExpression.escapedPattern(for: method)
+        let methodExpression = try NSRegularExpression(
+            pattern: #"(?m)^[ \t]*(?:(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\([^\n]*\))?)\s+|(?:public|package|internal|private|fileprivate|open|final|override|static|class|mutating|nonmutating|nonisolated|required|convenience|distributed)\s+)*func\s+"#
+                + methodPattern
+                + #"\s*\("#
+        )
+        XCTAssertEqual(
+            methodExpression.numberOfMatches(
+                in: body,
+                range: NSRange(body.startIndex..., in: body)
+            ),
+            1,
+            "Declared XCTestCase \(suite) must contain exactly one func \(method)( declaration: \(sourceFile)"
+        )
+    }
+
+    private func capture(_ match: NSTextCheckingResult, group: Int, in text: String) throws -> String {
+        let range = try XCTUnwrap(Range(match.range(at: group), in: text))
+        return String(text[range])
+    }
+
+    private func sanitizedSwiftSource(_ source: String) -> String {
+        let input = Array(source)
+        var output = input
+        var state = SwiftLexicalState.code
+        var index = 0
+
+        func blank(_ position: Int) {
+            if input[position] != "\n" {
+                output[position] = " "
+            }
+        }
+
+        while index < input.count {
+            switch state {
+            case .code:
+                if input[index] == "/", index + 1 < input.count, input[index + 1] == "/" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = .lineComment
+                } else if input[index] == "/", index + 1 < input.count, input[index + 1] == "*" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = .blockComment(depth: 1)
+                } else if input[index] == "\"" {
+                    var hashCount = 0
+                    var hashIndex = index
+                    while hashIndex > 0, input[hashIndex - 1] == "#" {
+                        hashIndex -= 1
+                        hashCount += 1
+                        blank(hashIndex)
+                    }
+                    let quoteCount = index + 2 < input.count && input[index + 1] == "\"" && input[index + 2] == "\"" ? 3 : 1
+                    for position in index ..< index + quoteCount {
+                        blank(position)
+                    }
+                    index += quoteCount
+                    state = .string(hashCount: hashCount, quoteCount: quoteCount)
+                } else {
+                    index += 1
+                }
+            case .lineComment:
+                if input[index] == "\n" {
+                    index += 1
+                    state = .code
+                } else {
+                    blank(index)
+                    index += 1
+                }
+            case let .blockComment(depth):
+                if input[index] == "/", index + 1 < input.count, input[index + 1] == "*" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = .blockComment(depth: depth + 1)
+                } else if input[index] == "*", index + 1 < input.count, input[index + 1] == "/" {
+                    blank(index)
+                    blank(index + 1)
+                    index += 2
+                    state = depth == 1 ? .code : .blockComment(depth: depth - 1)
+                } else {
+                    blank(index)
+                    index += 1
+                }
+            case let .string(hashCount, quoteCount):
+                if isSwiftStringTerminator(input, at: index, hashCount: hashCount, quoteCount: quoteCount) {
+                    for position in index ..< index + quoteCount + hashCount {
+                        blank(position)
+                    }
+                    index += quoteCount + hashCount
+                    state = .code
+                } else {
+                    blank(index)
+                    index += 1
+                }
+            }
+        }
+        return String(output)
+    }
+
+    private func isSwiftStringTerminator(
+        _ characters: [Character],
+        at index: Int,
+        hashCount: Int,
+        quoteCount: Int
+    ) -> Bool {
+        guard index + quoteCount + hashCount <= characters.count else { return false }
+        guard (0 ..< quoteCount).allSatisfy({ characters[index + $0] == "\"" }) else { return false }
+        guard (0 ..< hashCount).allSatisfy({ characters[index + quoteCount + $0] == "#" }) else { return false }
+        if hashCount > 0 { return true }
+
+        var backslashCount = 0
+        var cursor = index
+        while cursor > 0, characters[cursor - 1] == "\\" {
+            backslashCount += 1
+            cursor -= 1
+        }
+        return backslashCount.isMultiple(of: 2)
+    }
+
+    private func matchingClosingBrace(in source: String, openingBrace: String.Index) -> String.Index? {
+        var depth = 1
+        var index = source.index(after: openingBrace)
+        while index < source.endIndex {
+            if source[index] == "{" {
+                depth += 1
+            } else if source[index] == "}" {
+                depth -= 1
+                if depth == 0 { return index }
+            }
+            index = source.index(after: index)
+        }
+        return nil
+    }
+
+    private func topLevelTypeBody(_ body: Substring) -> String {
+        var depth = 0
+        return String(body.map { character in
+            defer {
+                if character == "{" {
+                    depth += 1
+                } else if character == "}" {
+                    depth -= 1
+                }
+            }
+            return depth == 0 || character == "\n" ? character : " "
+        })
     }
 
     private func assertSubstantiveEditFlowPerfEvidence(in baseline: [String: Any]) throws {
@@ -518,10 +952,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             try string(baseline, key: "classification"),
             "deterministic_contract_evidence_index_not_live_latency_baseline"
         )
-        XCTAssertEqual(
-            try string(baseline, key: "curated_test_ledger"),
-            "Scripts/Fixtures/test-suite-contract-ledger.tsv"
-        )
+        XCTAssertEqual(try string(baseline, key: "citation_provenance"), "declared_source_file")
 
         let constraints = try dictionary(baseline, key: "capture_constraints")
         XCTAssertEqual(try string(constraints, key: "live_mcp_round_trip_status"), "not_observed_task_prohibited")
@@ -542,7 +973,6 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         )
         XCTAssertTrue(try isLowercaseHexIdentifier(string(checkout, key: "base_commit"), length: 7 ... 40))
 
-        let ledgerEntries = try curatedTestLedgerEntries()
         let stages = try dictionaries(baseline, key: "guarded_stage_contracts")
         let expectedStages: Set = ["queue", "main_actor", "execution", "persistence", "response"]
         XCTAssertEqual(stages.count, expectedStages.count)
@@ -553,12 +983,12 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             let stage = try string(stageRecord, key: "stage")
             XCTAssertEqual(
                 try string(stageRecord, key: "evidence_kind"),
-                "curated_ledger_executable_contract_reference",
+                "source_file_executable_contract_reference",
                 stage
             )
             let citation = try string(stageRecord, key: "evidence")
             let sourceFile = try string(stageRecord, key: "source_file")
-            XCTAssertEqual(ledgerEntries[citation], sourceFile, "\(stage) evidence provenance")
+            try assertExecutableTestCitation(citation, sourceFile: sourceFile)
             evidenceCitations.insert(citation)
             let observations = try dictionary(stageRecord, key: "observations")
 
@@ -730,13 +1160,9 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
     }
 
     private func mainActorDeclarationSites(under relativeDirectory: String) throws -> [[String: Any]] {
-        let root = try RepoRoot.url()
-        let directory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
-        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
         var sites: [[String: Any]] = []
-        for case let url as URL in enumerator where url.pathExtension == "swift" {
-            let relativePath = String(url.path.dropFirst(root.path.count + 1))
-            try sites.append(contentsOf: mainActorDeclarationSites(in: String(contentsOf: url, encoding: .utf8), path: relativePath))
+        for file in try swiftSources(under: relativeDirectory) {
+            try sites.append(contentsOf: mainActorDeclarationSites(in: file.contents, path: file.path))
         }
         return sites
     }
@@ -757,14 +1183,17 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
     }
 
-    private func allSwiftSource() throws -> String {
-        let sources = try RepoRoot.url().appendingPathComponent("Sources", isDirectory: true)
-        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil))
-        var content = ""
-        for case let url as URL in enumerator where url.pathExtension == "swift" {
-            content += try String(contentsOf: url, encoding: .utf8)
-        }
-        return content
+    private func containsSwiftTypeDeclaration(
+        kind: String,
+        named typeName: String,
+        in source: String
+    ) throws -> Bool {
+        let escapedKind = NSRegularExpression.escapedPattern(for: kind)
+        let escapedName = NSRegularExpression.escapedPattern(for: typeName)
+        let expression = try NSRegularExpression(
+            pattern: "(?m)^[ \\t]*(?:(?:public|package|internal|private|fileprivate|open|final|indirect|nonisolated)\\s+)*\(escapedKind)\\s+\(escapedName)\\b"
+        )
+        return expression.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) != nil
     }
 
     private func makeWindowWithoutAutoStart() -> WindowState {

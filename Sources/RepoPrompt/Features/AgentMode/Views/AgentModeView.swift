@@ -46,6 +46,9 @@ struct AgentModeView: View {
                     suspended: suspended
                 )
             },
+            retryCodemapGraphIndex: { rootID in
+                await windowState.workspaceFilesViewModel.prioritizeCodemapGraphIndexNow(rootID: rootID)
+            },
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))
@@ -160,8 +163,17 @@ struct AgentModeView: View {
         }
     }
 
-    private func codexManagedLoginAction(openURL: @MainActor @escaping (URL) -> Void) async throws -> Bool {
-        try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
+    private var codexManagedLoginAction: CodexManagedLoginAction {
+        CodexManagedLoginAction(
+            browser: { openURL in
+                try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
+            },
+            deviceCode: { presentDeviceCode in
+                try await windowState.apiSettingsViewModel.startCodexManagedChatgptDeviceCodeLogin(
+                    presentDeviceCode: presentDeviceCode
+                )
+            }
+        )
     }
 }
 
@@ -173,6 +185,7 @@ struct AgentModeChatDetailView: View {
     @ObservedObject var transcriptUI: AgentTranscriptUIStore
     @ObservedObject var runInteractionUI: AgentRunInteractionUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let isContextBuilderQuestionPresented: Bool
     let oracleViewModel: OracleViewModel
@@ -1867,6 +1880,7 @@ struct AgentModeChatDetailView: View {
                     agentModeVM: agentModeVM,
                     composerUI: agentModeVM.ui.composer,
                     statusPillsUI: agentModeVM.ui.statusPills,
+                    openContextDrawerFiles: openContextDrawerFiles,
                     oracleViewModel: oracleViewModel,
                     promptManager: promptManager,
                     workspaceSearchService: workspaceSearchService,

@@ -88,13 +88,18 @@ enum WorkspaceInteractiveReadProcessor {
         let first: Int
         let lastExclusive: Int
         if let startLine1Based, startLine1Based < 0 {
-            first = max(0, total - abs(startLine1Based))
+            let tailCount = startLine1Based == Int.min ? Int.max : abs(startLine1Based)
+            first = total - min(total, tailCount)
             lastExclusive = total
         } else {
             let start = max(0, (startLine1Based ?? 1) - 1)
             first = start
             lastExclusive = if let lineCount, lineCount >= 0 {
-                min(total, start + lineCount)
+                if start >= total {
+                    total
+                } else {
+                    start + min(lineCount, total - start)
+                }
             } else {
                 total
             }

@@ -112,6 +112,7 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
     func readyArtifactDemand(
         store: WorkspaceFileContextStore,
         forFileID fileID: UUID,
+        priority: CodeMapArtifactBuildPriority = .demand,
         timeout: Duration = .seconds(30),
         file: StaticString = #filePath,
         line: UInt = #line
@@ -120,7 +121,7 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         let deadline = clock.now.advanced(by: timeout)
         var lastNonReadyResult: WorkspaceCodemapArtifactDemandResult?
         while clock.now < deadline {
-            let initial = await store.requestCodemapArtifact(forFileID: fileID)
+            let initial = await store.requestCodemapArtifact(forFileID: fileID, priority: priority)
             switch initial {
             case let .pending(ticket):
                 let result = try await settledResult(store: store, ticket: ticket)
@@ -830,14 +831,23 @@ final class CodemapLockedCounter: @unchecked Sendable {
 }
 
 final class CodemapLockedValues<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [Value] = []
+    private let condition = AsyncTestCondition<[Value]>([])
 
     var values: [Value] {
-        lock.withLock { storage }
+        condition.snapshot()
     }
 
     func append(_ value: Value) {
-        lock.withLock { storage.append(value) }
+        condition.update { $0.append(value) }
+    }
+
+    func waitUntilCount(
+        _ expectedCount: Int,
+        timeout: TimeInterval = TestFenceDefaults.enterWait
+    ) async throws {
+        try await condition.waitUntil(
+            "codemap recorded value count \(expectedCount)",
+            timeout: timeout
+        ) { $0.count >= expectedCount }
     }
 }

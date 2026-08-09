@@ -368,7 +368,7 @@ final class CLIProcessRunner {
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
         // Hold the permit for the entire lifetime of the child process
         ProcessDiagnostics.log("🔵 [GATE] Acquiring gate...")
-        await gate.acquire()
+        guard await gate.acquire() else { throw CancellationError() }
         ProcessDiagnostics.log("🟢 [GATE] Acquired")
 
         // If the caller cancelled before we even start heavy work, bail out now.

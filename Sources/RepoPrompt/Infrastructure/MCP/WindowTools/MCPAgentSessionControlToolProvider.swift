@@ -5,15 +5,15 @@ import Ontology
 import RepoPromptShared
 
 @MainActor
-final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .agentSessionControl
+final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .agentSessionControl
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {
@@ -128,7 +128,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
 
     private static func executeShareThoughts(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         guard let thoughts = args["thoughts"]?.stringValue else {
             throw MCPError.invalidParams("thoughts is required")
@@ -137,22 +137,26 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
 
         let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.shareThoughts)
         let targetWindow = try dependencies.requireTargetWindow()
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .shareThoughts)
 
         // Invariant: background tool updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
-            targetWindow.agentModeViewModel.shareThoughts(thoughts, title: title, tabID: tabID)
+        try await MainActor.run {
+            try targetWindow.agentModeViewModel.shareThoughts(
+                thoughts,
+                title: title,
+                target: target
+            )
         }
 
         return .object([
             "ok": .bool(true),
-            "context_id": .string(tabID.uuidString)
+            "context_id": .string(target.tabID.uuidString)
         ])
     }
 
     private static func executeSetStatus(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.setStatus)
         let trimmedSessionName = args["session_name"]?.stringValue?
@@ -160,18 +164,21 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
         let sessionNameToApply = (trimmedSessionName?.isEmpty == false) ? trimmedSessionName : nil
 
         let targetWindow = try dependencies.requireTargetWindow()
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .setStatus)
 
         // Invariant: background status updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
+        try await MainActor.run {
             if let sessionNameToApply {
-                targetWindow.agentModeViewModel.renameSession(tabID: tabID, to: sessionNameToApply)
+                try targetWindow.agentModeViewModel.renameSession(
+                    target: target,
+                    to: sessionNameToApply
+                )
             }
         }
 
         var result: [String: Value] = [
             "ok": .bool(true),
-            "context_id": .string(tabID.uuidString),
+            "context_id": .string(target.tabID.uuidString),
             "session_name_applied": .bool(sessionNameToApply != nil)
         ]
         if let sessionNameToApply {
@@ -190,18 +197,18 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
 
     private static func executeWaitForNextInstruction(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         let prompt = args["prompt"]?.stringValue
         let timeout = try resolvedInstructionWaitTimeoutSeconds(args["timeout_seconds"])
 
         let targetWindow = try dependencies.requireTargetWindow()
         let connectionID = ServerNetworkManager.currentConnectionID
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .waitForInstruction)
 
         // Invariant: waiting state is stored on the target session; do not switch tabs here.
         let response = try await targetWindow.agentModeViewModel.waitForNextUserInstruction(
-            tabID: tabID,
+            target: target,
             prompt: prompt,
             timeoutSeconds: timeout
         )

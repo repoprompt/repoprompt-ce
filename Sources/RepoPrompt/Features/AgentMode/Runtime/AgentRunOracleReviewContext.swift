@@ -37,7 +37,7 @@ enum AgentRunOracleReviewUnavailableReason: Equatable, LocalizedError {
 enum AgentRunOracleReviewLaunchRoute: Equatable {
     case runScoped
     case explicitTabContext
-    case windowOnlyActiveCompose
+    case explicitWindowActiveCompose
 }
 
 /// Request-time value snapshot of the exact compose tab delegated to a child Agent run.

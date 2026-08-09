@@ -34,6 +34,11 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(userInfo["workspaceID"] as? UUID, workspaceID)
         XCTAssertEqual(userInfo["tabID"] as? UUID, tabID)
         XCTAssertEqual(userInfo["chatID"] as? String, "review-chat")
+        XCTAssertEqual(userInfo["presentation"] as? String, "generated_answer_read_only")
+        XCTAssertEqual(
+            AgentOraclePopoverRoute(notificationUserInfo: userInfo)?.presentation,
+            .generatedAnswerReadOnly
+        )
     }
 
     func testContextBuilderOperationRoutingRejectsMissingOrBlankChatIDWithoutAmbientFallback() {
@@ -54,6 +59,63 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             openContext: AgentOracleOpenContext(windowID: 42, workspaceID: UUID(), tabID: nil),
             chatID: "exact-chat"
         ))
+    }
+
+    func testDrawerBuilderGeneratedAnswerRoutingAndTooltipsUseAnswerWording() throws {
+        let route = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: UUID(),
+            tabID: UUID(),
+            chatID: "  generated-answer-chat  "
+        )
+        let changedWorkspaceID = UUID()
+        let changedTabID = UUID()
+        XCTAssertNotEqual(changedWorkspaceID, route.workspaceID)
+        XCTAssertNotEqual(changedTabID, route.tabID)
+
+        let ready = ContextBuilderPlanStatus.ready(route: route, previewText: "Generated answer")
+        var callbackRoute: ContextBuilderGeneratedAnswerRoute?
+        if case let .ready(readyRoute, _) = ready {
+            let openGeneratedAnswerChat: (ContextBuilderGeneratedAnswerRoute) -> Void = {
+                callbackRoute = $0
+            }
+            openGeneratedAnswerChat(readyRoute)
+        }
+        XCTAssertEqual(callbackRoute, route)
+
+        let userInfo = try XCTUnwrap(agentContextDrawerGeneratedAnswerPopoverUserInfo(
+            windowID: 8,
+            route: route
+        ))
+
+        XCTAssertEqual(Set(userInfo.keys.compactMap { $0 as? String }), [
+            "windowID",
+            "workspaceID",
+            "tabID",
+            "chatID",
+            "presentation"
+        ])
+        XCTAssertEqual(userInfo["windowID"] as? Int, 8)
+        XCTAssertEqual(userInfo["workspaceID"] as? UUID, route.workspaceID)
+        XCTAssertEqual(userInfo["tabID"] as? UUID, route.tabID)
+        XCTAssertEqual(userInfo["chatID"] as? String, "generated-answer-chat")
+        XCTAssertEqual(userInfo["presentation"] as? String, "generated_answer_read_only")
+        let decodedRoute = try XCTUnwrap(AgentOraclePopoverRoute(notificationUserInfo: userInfo))
+        XCTAssertEqual(decodedRoute.chatID, "generated-answer-chat")
+        XCTAssertEqual(decodedRoute.presentation, .generatedAnswerReadOnly)
+
+        let tooltips = [
+            ContextBuilderGeneratedAnswerActionText.useAsPromptTooltip,
+            ContextBuilderGeneratedAnswerActionText.copyTooltip,
+            ContextBuilderGeneratedAnswerActionText.previewTooltip,
+            ContextBuilderGeneratedAnswerActionText.viewInChatTooltip
+        ]
+        XCTAssertEqual(tooltips, [
+            "Use the generated answer as your prompt",
+            "Copy answer to clipboard",
+            "Preview the generated answer",
+            "Open answer in chat view"
+        ])
+        XCTAssertFalse(tooltips.contains { $0.localizedCaseInsensitiveContains("plan") })
     }
 
     func testOracleLatestPopoverRouteOmitsChatIDAndPreservesScope() throws {
@@ -131,12 +193,14 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(route.workspaceID, workspaceID)
         XCTAssertEqual(route.tabID, overrideTabID)
         XCTAssertEqual(route.chatID, "exact-short-id")
+        XCTAssertEqual(route.presentation, .standard)
 
         let userInfo = route.notificationUserInfo
         XCTAssertEqual(userInfo["windowID"] as? Int, 42)
         XCTAssertEqual(userInfo["workspaceID"] as? UUID, workspaceID)
         XCTAssertEqual(userInfo["tabID"] as? UUID, overrideTabID)
         XCTAssertEqual(userInfo["chatID"] as? String, "exact-short-id")
+        XCTAssertNil(userInfo["presentation"])
         XCTAssertEqual(AgentOraclePopoverRoute(notificationUserInfo: userInfo), route)
 
         let stringCompatibleRoute = try XCTUnwrap(AgentOraclePopoverRoute(notificationUserInfo: [
@@ -149,6 +213,17 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(stringCompatibleRoute.workspaceID, workspaceID)
         XCTAssertEqual(stringCompatibleRoute.tabID, contextTabID)
         XCTAssertEqual(stringCompatibleRoute.chatID, "short-chat")
+        XCTAssertEqual(stringCompatibleRoute.presentation, .standard)
+
+        let readOnlyRoute = try XCTUnwrap(AgentOraclePopoverRoute(
+            openContext: openContext,
+            chatID: "exact-short-id",
+            tabID: overrideTabID,
+            presentation: .generatedAnswerReadOnly
+        ))
+        XCTAssertNotEqual(readOnlyRoute, route)
+        XCTAssertEqual(readOnlyRoute.notificationUserInfo["presentation"] as? String, "generated_answer_read_only")
+        XCTAssertEqual(AgentOraclePopoverRoute(notificationUserInfo: readOnlyRoute.notificationUserInfo), readOnlyRoute)
 
         let chatUUID = UUID()
         let uuidChatRoute = try XCTUnwrap(AgentOraclePopoverRoute(notificationUserInfo: [
@@ -209,6 +284,12 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertNil(AgentOraclePopoverRoute(notificationUserInfo: malformed))
         malformed = valid
         malformed["chatID"] = 42
+        XCTAssertNil(AgentOraclePopoverRoute(notificationUserInfo: malformed))
+        malformed = valid
+        malformed["presentation"] = "unknown"
+        XCTAssertNil(AgentOraclePopoverRoute(notificationUserInfo: malformed))
+        malformed = valid
+        malformed["presentation"] = 42
         XCTAssertNil(AgentOraclePopoverRoute(notificationUserInfo: malformed))
     }
 

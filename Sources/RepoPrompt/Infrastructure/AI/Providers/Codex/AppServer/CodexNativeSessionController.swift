@@ -565,6 +565,7 @@ final class CodexNativeSessionController {
         var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
+        var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
@@ -594,6 +595,7 @@ final class CodexNativeSessionController {
             suppressThirdPartyMCPServers: Bool = false,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
             Options(
@@ -603,6 +605,7 @@ final class CodexNativeSessionController {
                         (
                             goalSupportEnabled: goalSupportEnabledProvider(),
                             reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
+                            memoriesEnabled: memoriesEnabledProvider(),
                             computerUseEnabled: computerUseEnabledProvider()
                         )
                     }
@@ -611,6 +614,7 @@ final class CodexNativeSessionController {
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
+                        memoriesEnabled: featurePolicy.memoriesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled
                     )
                 },
@@ -621,6 +625,7 @@ final class CodexNativeSessionController {
                 processModelReasoningSummary: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
+                memoriesEnabledProvider: memoriesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider
             )
         }
@@ -629,6 +634,11 @@ final class CodexNativeSessionController {
     enum ClientShutdownBehavior {
         case none
         case stopOnShutdown
+    }
+
+    private enum ThreadMemoryMode: String {
+        case enabled
+        case disabled
     }
 
     private enum LifecycleState {
@@ -1279,6 +1289,16 @@ final class CodexNativeSessionController {
             }
             await ensureInboundStreamsStarted()
 
+            if let resumeThreadID {
+                let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {
+                    guard let memoriesEnabledProvider = options.memoriesEnabledProvider else { return nil }
+                    return memoriesEnabledProvider() ? .enabled : .disabled
+                }
+                if let desiredMemoryMode {
+                    try await setThreadMemoryMode(desiredMemoryMode, threadID: resumeThreadID)
+                }
+            }
+
             let configOverrides = await options.configOverridesProvider()
             let result: [String: Any]
             #if DEBUG
@@ -1375,7 +1395,7 @@ final class CodexNativeSessionController {
             try markStartOrResumeSucceeded()
             return sessionRef
         } catch {
-            try? await eventHandlingMutex.withLock {
+            try? await eventHandlingMutex.withLockIgnoringCancellation {
                 cancelBindingSession()
             }
             markStartOrResumeFailed()
@@ -1384,6 +1404,17 @@ final class CodexNativeSessionController {
             }
             throw error
         }
+    }
+
+    private func setThreadMemoryMode(_ mode: ThreadMemoryMode, threadID: String) async throws {
+        _ = try await performRequest(
+            method: "thread/memoryMode/set",
+            params: [
+                "threadId": threadID,
+                "mode": mode.rawValue
+            ],
+            timeout: options.requestTimeout
+        )
     }
 
     func readThreadSnapshot(
@@ -2132,6 +2163,7 @@ final class CodexNativeSessionController {
         await MainActor.run {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
+                memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
                 computerUseEnabled: options.computerUseEnabledProvider()
             )
         }
@@ -3785,6 +3817,12 @@ final class CodexNativeSessionController {
             }
             try? markStartOrResumeSucceeded()
             return sessionRef
+        }
+
+        func test_bindingBufferState() async throws -> (isBinding: Bool, bufferedCount: Int) {
+            try await eventHandlingMutex.withLock {
+                (isBindingSession, bufferedInbound.count)
+            }
         }
 
         func test_simulateTransportStreamEnded(source: String) async {
@@ -8259,6 +8297,7 @@ final class CodexNativeSessionController {
         suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
+        memoriesEnabled: Bool = false,
         computerUseEnabled: Bool = false
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
@@ -8273,7 +8312,11 @@ final class CodexNativeSessionController {
         )
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,
-            featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled)
+            featurePolicy: .resolved(
+                goalsEnabled: goalSupportEnabled,
+                memoriesEnabled: memoriesEnabled,
+                computerUseEnabled: computerUseEnabled
+            )
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,

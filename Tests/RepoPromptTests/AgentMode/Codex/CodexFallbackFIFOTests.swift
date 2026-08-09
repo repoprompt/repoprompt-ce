@@ -168,7 +168,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertNil(controller.test_authoritativeLifecycleTurnID)
 
         let nextRunID = UUID()
-        session.runID = nextRunID
+        session.installRunID(nextRunID)
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback.reuse")
         session.codexPendingTurnKind = .user
@@ -873,7 +873,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         let session = viewModel.session(for: UUID())
         let runID = UUID()
         session.selectedAgent = .codexExec
-        session.runID = runID
+        session.installRunID(runID)
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback")
         session.codexController = controller
@@ -894,7 +894,8 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
         return (viewModel, session)
     }
@@ -921,7 +922,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         }
         let runID = UUID()
         session.selectedAgent = .codexExec
-        session.runID = runID
+        session.installRunID(runID)
         session.runState = .running
         session.beginRunAttempt(source: "test.codexFallback.mcp")
         session.codexController = controller
@@ -942,7 +943,8 @@ final class CodexFallbackFIFOTests: XCTestCase {
         session.codexControllerFeatureState = .init(
             computerUseEnabled: false,
             goalSupportEnabled: CodexGoalSupport.isEnabled,
-            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
+            memoriesEnabled: CodexMemories.isEnabled
         )
         return (viewModel, session, sessionID)
     }

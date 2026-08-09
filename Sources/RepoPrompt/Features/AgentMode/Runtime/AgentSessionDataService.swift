@@ -472,7 +472,7 @@ actor AgentSessionDataService {
     }
 
     private func agentSessionID(fromFilename filename: String) -> UUID? {
-        guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else { return nil }
+        guard filename.hasPrefix("AgentSession-"), filename.hasSuffix(".json") else { return nil }
         let prefixLength = "AgentSession-".count
         let suffixLength = ".json".count
         guard filename.count > prefixLength + suffixLength else { return nil }
@@ -674,7 +674,7 @@ actor AgentSessionDataService {
         )
         let jsonFiles = contents.filter {
             $0.pathExtension.lowercased() == "json"
-                && $0.lastPathComponent.starts(with: "AgentSession-")
+                && $0.lastPathComponent.hasPrefix("AgentSession-")
         }
         let sorted = jsonFiles.sorted { lhs, rhs in
             let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
@@ -1380,8 +1380,8 @@ actor AgentSessionDataService {
             candidateFilesByPath[fileURL.path] = fileURL
         }
 
-        for fileURL in candidateFilesByPath.values {
-            try? await deleteSessionFileDurably(fileURL.standardizedFileURL)
+        for fileURL in candidateFilesByPath.values.sorted(by: { $0.path < $1.path }) {
+            try await deleteSessionFileDurably(fileURL.standardizedFileURL)
         }
         await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
     }

@@ -33,9 +33,41 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         return lines[..<firstHeaderIndex].filter { $0.contains("tool_output_token_limit") }
     }
 
+    func testCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: [],
+            fullAccess: false
+        ).args
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertEqual(
+            Array(arguments.suffix(4)),
+            ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
+        )
+    }
+
+    func testCodexExecUsesBypassOnlyForExplicitFullAccess() {
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: [],
+            fullAccess: true
+        ).args
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertFalse(arguments.contains("--sandbox"))
+        XCTAssertTrue(arguments.contains("--dangerously-bypass-approvals-and-sandbox"))
+    }
+
     private func occurrences(of needle: String, in haystack: String) -> Int {
         guard !needle.isEmpty else { return 0 }
         return haystack.components(separatedBy: needle).count - 1
+    }
+
+    func testAppSpawnedMCPConfigurationPinsAppBackend() {
+        XCTAssertEqual(RepoPromptMCPServerConfiguration.repoPrompt.args, ["--backend", "app"])
     }
 
     func testDiscoveryEnsureWritesBareRepoPromptCEServerHeader() throws {
@@ -53,13 +85,13 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         let content = lines.joined(separator: "\n")
         XCTAssertTrue(content.contains(repoPromptHeader))
         XCTAssertTrue(content.contains("command = \"\(serverCommand)\""))
-        XCTAssertTrue(content.contains("args = []"))
+        XCTAssertTrue(content.contains("args = [\"--backend\", \"app\"]"))
         XCTAssertTrue(content.contains("tool_timeout_sec = 10000"))
         XCTAssertTrue(content.contains("supports_parallel_tool_calls = true"))
         XCTAssertTrue(content.contains("enabled = false"))
         XCTAssertTrue(
             content.contains(
-                "command = \"\(serverCommand)\"\nargs = []\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = true\nenabled = false"
+                "command = \"\(serverCommand)\"\nargs = [\"--backend\", \"app\"]\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = true\nenabled = false"
             )
         )
 
@@ -580,7 +612,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
 
         XCTAssertFalse(result.changed)
         XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.145.0") == true)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.147.0") == true)
         XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
     }
 

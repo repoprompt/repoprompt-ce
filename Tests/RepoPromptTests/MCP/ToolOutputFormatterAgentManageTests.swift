@@ -4,6 +4,16 @@ import XCTest
 
 final class ToolOutputFormatterAgentManageTests: XCTestCase {
     func testListAgentsCollapsesGpt56MaxUltraVariantsWithoutInvalidNestedIDs() throws {
+        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: .none)
+        XCTAssertFalse(discoveryAgents.isEmpty)
+        for agent in discoveryAgents {
+            XCTAssertTrue(
+                agent.capabilities.contains("agent_session_control"),
+                "\(agent.agent.rawValue) must preserve the list_agents capability wire value"
+            )
+            XCTAssertFalse(agent.capabilities.contains("status_publication"))
+        }
+
         let value: Value = .object([
             "agents": .array([
                 .object([

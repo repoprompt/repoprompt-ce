@@ -19,6 +19,12 @@ enum KeyboardShortcutCatalog {
             bindings: [
                 .init(id: "agent-new", title: "New Agent chat", detail: nil, name: .agentNewChat),
                 .init(id: "toggle-sidebar", title: "Toggle session sidebar", detail: "Show or hide the Agent sessions list.", name: .toggleNavigationSidebar),
+                .init(
+                    id: "toggle-compose",
+                    title: "Toggle Compose",
+                    detail: "Show or hide the Compose inspector.",
+                    name: .toggleComposeInspector
+                ),
                 .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
                 .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD)
             ]

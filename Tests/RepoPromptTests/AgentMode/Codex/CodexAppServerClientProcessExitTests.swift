@@ -14,6 +14,86 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    func testStderrCaptureCancellationDuringWaiterRegistrationReturnsFalse() async {
+        let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
+        let started = expectation(description: "stderr wait started")
+        let wait = Task {
+            started.fulfill()
+            return await capture.waitUntilFinished(timeout: 60)
+        }
+
+        await fulfillment(of: [started], timeout: 1)
+        wait.cancel()
+
+        let promptResult = await waitForStderrResult(wait)
+        XCTAssertEqual(promptResult, false)
+
+        capture.finish()
+        let result = await wait.value
+        XCTAssertFalse(result)
+    }
+
+    func testStderrCaptureCancellationRemovesOnlyCancelledWaiter() async {
+        let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
+        let cancelledStarted = expectation(description: "cancelled stderr wait started")
+        let finishingStarted = expectation(description: "finishing stderr wait started")
+        let cancelledWait = Task {
+            cancelledStarted.fulfill()
+            return await capture.waitUntilFinished(timeout: 60)
+        }
+        let finishingWait = Task {
+            finishingStarted.fulfill()
+            return await capture.waitUntilFinished(timeout: 60)
+        }
+
+        await fulfillment(of: [cancelledStarted, finishingStarted], timeout: 1)
+        await Task.yield()
+        cancelledWait.cancel()
+
+        let cancelledPromptResult = await waitForStderrResult(cancelledWait)
+        XCTAssertEqual(cancelledPromptResult, false)
+
+        capture.finish()
+        let cancelledResult = await cancelledWait.value
+        let finishingResult = await finishingWait.value
+        XCTAssertFalse(cancelledResult)
+        XCTAssertTrue(finishingResult)
+    }
+
+    func testStderrCaptureZeroTimeoutAndFinishedSemanticsRemainDistinct() async {
+        let capture = CodexProcessStderrCapture(byteLimit: 8 * 1024)
+
+        let timedOut = await capture.waitUntilFinished(timeout: 0)
+        XCTAssertFalse(timedOut)
+
+        capture.finish()
+        let finished = await capture.waitUntilFinished(timeout: 0)
+        XCTAssertTrue(finished)
+    }
+
+    private func waitForStderrResult(
+        _ task: Task<Bool, Never>,
+        timeoutNanoseconds: UInt64 = 1_000_000_000
+    ) async -> Bool? {
+        await withCheckedContinuation { continuation in
+            let gate = StderrResultGate(continuation: continuation)
+            Task {
+                let result = await task.value
+                gate.complete(result)
+            }
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    try Task.checkCancellation()
+                    gate.complete(nil)
+                } catch {
+                    return
+                }
+            }
+            gate.install(timeoutTask: timeoutTask)
+        }
+    }
+
     func testStderrCaptureRetainsExactRawSuffixAtEveryBoundary() async {
         let invalidUTF8 = Data([0x66, 0x80, 0x67])
         let scenarios: [[Data]] = [
@@ -655,7 +735,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         import signal
         import sys
         import time
-
         sys.stdin.readline()
         os.write(2, base64.b64decode(\(String(reflecting: stderr.base64EncodedString()))))
         release_path = \(releasePath.map(String.init(reflecting:)) ?? "None")
@@ -685,7 +764,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         import json
         import os
         import sys
-
         attempt_path = \(String(reflecting: attemptURL.path))
         try:
             with open(attempt_path, "r", encoding="utf-8") as handle:
@@ -695,7 +773,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         attempt += 1
         with open(attempt_path, "w", encoding="utf-8") as handle:
             handle.write(str(attempt))
-
         for line in sys.stdin:
             request = json.loads(line)
             method = request.get("method")
@@ -722,7 +799,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         import os
         import sys
         import time
-
         sys.stdin.readline()
         os.close(1)
         while True:
@@ -737,7 +813,6 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         #!/usr/bin/env python3
         import os
         import sys
-
         sys.stdin.readline()
         os.write(2, os.getcwd().encode("utf-8"))
         os.close(1)
@@ -789,7 +864,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
     private func writeExecutable(_ script: String, to url: URL) throws -> URL {
         let versionAwareScript = script.replacingOccurrences(
             of: "#!/usr/bin/env python3\n",
-            with: "#!/usr/bin/env python3\nimport sys\n\nif sys.argv[1:] == [\"--version\"]:\n    print(\"codex 0.145.0\")\n    raise SystemExit(0)\n\n",
+            with: "#!/usr/bin/env python3\nimport sys\n\nif sys.argv[1:] == [\"--version\"]:\n    print(\"codex 0.147.0\")\n    raise SystemExit(0)\n\n",
             options: .anchored
         )
         try versionAwareScript.write(to: url, atomically: true, encoding: .utf8)
@@ -843,6 +918,45 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         throw WaitUntilError.timedOut(label)
+    }
+}
+
+private final class StderrResultGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool?, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var didComplete = false
+
+    init(continuation initialContinuation: CheckedContinuation<Bool?, Never>) {
+        continuation = initialContinuation
+    }
+
+    func install(timeoutTask newTimeoutTask: Task<Void, Never>) {
+        lock.lock()
+        if didComplete {
+            lock.unlock()
+            newTimeoutTask.cancel()
+            return
+        }
+        timeoutTask = newTimeoutTask
+        lock.unlock()
+    }
+
+    func complete(_ result: Bool?) {
+        lock.lock()
+        guard !didComplete else {
+            lock.unlock()
+            return
+        }
+        didComplete = true
+        let storedContinuation = continuation
+        continuation = nil
+        let storedTimeoutTask = timeoutTask
+        timeoutTask = nil
+        lock.unlock()
+
+        storedTimeoutTask?.cancel()
+        storedContinuation?.resume(returning: result)
     }
 }
 

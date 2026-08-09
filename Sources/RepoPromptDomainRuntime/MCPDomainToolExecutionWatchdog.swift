@@ -1,0 +1,517 @@
+import Foundation
+
+package enum MCPToolExecutionSettlement: String, Equatable, Sendable {
+    case success
+    case cancellation
+    case error
+}
+
+package enum MCPToolExecutionCancellationOrigin: String, Equatable, Sendable {
+    case watchdogDeadline = "watchdog_deadline"
+    case requestCancellation = "request_cancellation"
+}
+
+package struct MCPToolExecutionCancelledError: Error, Equatable, LocalizedError, Sendable {
+    package init() {}
+
+    package var errorDescription: String? {
+        "Tool execution was cancelled."
+    }
+
+    package static func matches(_ error: Error) -> Bool {
+        error is CancellationError || error is MCPToolExecutionCancelledError
+    }
+}
+
+package enum MCPToolExecutionWatchdogEvent: Equatable, Sendable {
+    case deadlineExpired
+    case cancellationRequested(origin: MCPToolExecutionCancellationOrigin)
+    case settledDuringGrace(
+        MCPToolExecutionSettlement,
+        cancellationRequested: Bool
+    )
+    case cleanupGraceExpired(resolvedDisposition: MCPToolExecutionCleanupDisposition)
+    case detachedForSettlement
+}
+
+package enum MCPToolExecutionWatchdogError: Error, Equatable, Sendable {
+    case executionTimedOut(settlement: MCPToolExecutionSettlement)
+    case executionDetached
+    case cleanupUnresponsive
+}
+
+package enum MCPToolExecutionWatchdogSchedulingPoint: Equatable, Sendable {
+    case operationCompleted
+    case deadlineExpired
+    case cleanupGraceExpired
+}
+
+package struct MCPToolExecutionWatchdogEnvironment: Sendable {
+    package let now: @Sendable () -> Duration
+    package let sleep: @Sendable (Duration) async throws -> Void
+    package let eventDidProduce: @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void
+    package let beforeEventConsumption: @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void
+    package let beforeCleanupGraceTaskRegistration: @Sendable () async -> Void
+    package let beforeDetachActivation: @Sendable () -> Void
+
+    package init(
+        now: @escaping @Sendable () -> Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        eventDidProduce: @escaping @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void = { _ in },
+        beforeEventConsumption: @escaping @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void = { _ in },
+        beforeCleanupGraceTaskRegistration: @escaping @Sendable () async -> Void = {},
+        beforeDetachActivation: @escaping @Sendable () -> Void = {}
+    ) {
+        self.now = now
+        self.sleep = sleep
+        self.eventDidProduce = eventDidProduce
+        self.beforeEventConsumption = beforeEventConsumption
+        self.beforeCleanupGraceTaskRegistration = beforeCleanupGraceTaskRegistration
+        self.beforeDetachActivation = beforeDetachActivation
+    }
+
+    package static func continuous() -> Self {
+        let clock = ContinuousClock()
+        let origin = clock.now
+        return Self(
+            now: { origin.duration(to: clock.now) },
+            sleep: { duration in
+                try await Task.sleep(for: duration)
+            }
+        )
+    }
+}
+
+package enum MCPToolExecutionWatchdog {
+    private struct ResultBox<T>: @unchecked Sendable {
+        let result: Result<T, Error>
+        let completionTime: Duration
+    }
+
+    private enum Event<T>: @unchecked Sendable {
+        case operationCompleted(ResultBox<T>)
+        case deadlineExpired
+        case cleanupGraceExpired
+    }
+
+    private final class DeliveredCompletionMailbox<T>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completion: ResultBox<T>?
+
+        func store(_ box: ResultBox<T>) {
+            lock.withLock {
+                precondition(completion == nil, "Delivered watchdog completion stored more than once")
+                completion = box
+            }
+        }
+
+        func take() -> ResultBox<T>? {
+            lock.withLock {
+                defer { completion = nil }
+                return completion
+            }
+        }
+    }
+
+    private final class OperationState<T>: @unchecked Sendable {
+        enum RecordAction {
+            case deliver
+            case deferred
+            case settleDetached
+            case settleAbandoned
+        }
+
+        enum DetachPreparation {
+            case completed(ResultBox<T>)
+            case ready
+        }
+
+        private enum Mode {
+            case running
+            case detaching
+            case detached
+            case abandoned
+        }
+
+        private let lock = NSLock()
+        private var mode: Mode = .running
+        private var completed: ResultBox<T>?
+
+        func recordCompletion(_ box: ResultBox<T>) -> RecordAction {
+            lock.withLock {
+                switch mode {
+                case .running:
+                    completed = box
+                    return .deliver
+                case .detaching:
+                    completed = box
+                    return .deferred
+                case .detached:
+                    return .settleDetached
+                case .abandoned:
+                    return .settleAbandoned
+                }
+            }
+        }
+
+        func consumeDeliveredCompletion() {
+            lock.withLock {
+                completed = nil
+            }
+        }
+
+        func takeDeliveredCompletion() -> ResultBox<T>? {
+            lock.withLock {
+                guard case .running = mode else { return nil }
+                defer { completed = nil }
+                return completed
+            }
+        }
+
+        func prepareDetach() -> DetachPreparation {
+            lock.withLock {
+                if let completed {
+                    self.completed = nil
+                    return .completed(completed)
+                }
+                mode = .detaching
+                return .ready
+            }
+        }
+
+        func activateDetach() -> ResultBox<T>? {
+            lock.withLock {
+                guard case .detaching = mode else { return nil }
+                mode = .detached
+                defer { completed = nil }
+                return completed
+            }
+        }
+
+        func abandon() -> ResultBox<T>? {
+            lock.withLock {
+                switch mode {
+                case .detached, .abandoned:
+                    return nil
+                case .running, .detaching:
+                    mode = .abandoned
+                    defer { completed = nil }
+                    return completed
+                }
+            }
+        }
+    }
+
+    private final class TaskStore: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tasks: [Task<Void, Never>] = []
+        private var isCancelled = false
+
+        func append(_ task: Task<Void, Never>) {
+            let shouldCancel = lock.withLock {
+                guard !isCancelled else { return true }
+                tasks.append(task)
+                return false
+            }
+            if shouldCancel {
+                task.cancel()
+            }
+        }
+
+        func cancelAll() {
+            let captured = lock.withLock {
+                isCancelled = true
+                defer { tasks.removeAll() }
+                return tasks
+            }
+            captured.forEach { $0.cancel() }
+        }
+    }
+
+    package static func execute<T: Sendable>(
+        deadline: Duration,
+        cancellationGrace: Duration,
+        cleanupDisposition: MCPToolExecutionCleanupDisposition = .forceDisconnect,
+        settlementSlot: MCPCodeStructureSettlementRegistry.Slot? = nil,
+        environment: MCPToolExecutionWatchdogEnvironment = .continuous(),
+        onEvent: @escaping @Sendable (MCPToolExecutionWatchdogEvent) async -> Void = { _ in },
+        onSynchronousSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
+        onDetachedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
+        onAbandonedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
+        onForceDisconnectedSettlement: @escaping @Sendable (MCPToolExecutionSettlement) async -> Void = { _ in },
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let deadlineInstant = environment.now() + deadline
+        let (stream, continuation) = AsyncStream<Event<T>>.makeStream()
+        let tasks = TaskStore()
+        let operationState = settlementSlot == nil ? OperationState<T>() : nil
+        let deliveredCompletionMailbox = settlementSlot == nil ? nil : DeliveredCompletionMailbox<T>()
+
+        func completedBeforeDeadline(_ box: ResultBox<T>) -> Bool {
+            box.completionTime < deadlineInstant
+        }
+
+        @Sendable func settlement(for box: ResultBox<T>) -> MCPToolExecutionSettlement {
+            switch box.result {
+            case .success:
+                .success
+            case let .failure(error):
+                MCPToolExecutionCancelledError.matches(error) ? .cancellation : .error
+            }
+        }
+
+        let operationTask = Task {
+            let result: Result<T, Error>
+            do {
+                result = try await .success(operation())
+            } catch {
+                result = .failure(error)
+            }
+            let completionTime = environment.now()
+            let box = ResultBox(result: result, completionTime: completionTime)
+            if let settlementSlot {
+                let operationSettlement = settlement(for: box)
+                switch settlementSlot.recordCompletion(operationSettlement) {
+                case .deliver:
+                    deliveredCompletionMailbox?.store(box)
+                    await environment.eventDidProduce(.operationCompleted)
+                    continuation.yield(.operationCompleted(box))
+                case .deferred:
+                    break
+                case .settleDetached:
+                    await onDetachedSettlement(operationSettlement)
+                case .settleAbandoned:
+                    await onAbandonedSettlement(operationSettlement)
+                case .settleForceDisconnected:
+                    await onForceDisconnectedSettlement(operationSettlement)
+                case .ignored:
+                    break
+                }
+            } else if let operationState {
+                switch operationState.recordCompletion(box) {
+                case .deliver:
+                    await environment.eventDidProduce(.operationCompleted)
+                    continuation.yield(.operationCompleted(box))
+                case .deferred:
+                    break
+                case .settleDetached:
+                    await onDetachedSettlement(settlement(for: box))
+                case .settleAbandoned:
+                    await onAbandonedSettlement(settlement(for: box))
+                }
+            }
+        }
+        tasks.append(operationTask)
+
+        let deadlineTask = Task {
+            do {
+                try await environment.sleep(deadline)
+                guard !Task.isCancelled else { return }
+                await environment.eventDidProduce(.deadlineExpired)
+                continuation.yield(.deadlineExpired)
+            } catch {
+                // Cancellation is the normal completion path when the operation wins.
+            }
+        }
+        tasks.append(deadlineTask)
+
+        return try await withTaskCancellationHandler {
+            var iterator = stream.makeAsyncIterator()
+            var deadlineDidExpire = false
+
+            while let event = await iterator.next() {
+                let schedulingPoint: MCPToolExecutionWatchdogSchedulingPoint = switch event {
+                case .operationCompleted:
+                    .operationCompleted
+                case .deadlineExpired:
+                    .deadlineExpired
+                case .cleanupGraceExpired:
+                    .cleanupGraceExpired
+                }
+                await environment.beforeEventConsumption(schedulingPoint)
+                try Task.checkCancellation()
+
+                // Completion timestamps are the sole success/timeout authority.
+                // `deadlineDidExpire` tracks only whether cancellation grace and escalation began.
+                switch event {
+                case let .operationCompleted(box):
+                    if let operationState {
+                        operationState.consumeDeliveredCompletion()
+                    } else {
+                        _ = deliveredCompletionMailbox?.take()
+                    }
+                    tasks.cancelAll()
+                    continuation.finish()
+                    let operationSettlement = settlement(for: box)
+                    if completedBeforeDeadline(box) {
+                        await onSynchronousSettlement(operationSettlement)
+                        return try box.result.get()
+                    }
+                    if !deadlineDidExpire {
+                        deadlineDidExpire = true
+                        await onEvent(.deadlineExpired)
+                        await onSynchronousSettlement(operationSettlement)
+                        await onEvent(.settledDuringGrace(
+                            operationSettlement,
+                            cancellationRequested: false
+                        ))
+                    } else {
+                        await onSynchronousSettlement(operationSettlement)
+                        await onEvent(.settledDuringGrace(
+                            operationSettlement,
+                            cancellationRequested: true
+                        ))
+                    }
+                    throw MCPToolExecutionWatchdogError.executionTimedOut(
+                        settlement: operationSettlement
+                    )
+
+                case .deadlineExpired:
+                    let completed = deliveredCompletionMailbox?.take()
+                        ?? operationState?.takeDeliveredCompletion()
+                    if let completed {
+                        tasks.cancelAll()
+                        continuation.finish()
+                        let operationSettlement = settlement(for: completed)
+                        if completedBeforeDeadline(completed) {
+                            await onSynchronousSettlement(operationSettlement)
+                            return try completed.result.get()
+                        }
+                        deadlineDidExpire = true
+                        await onEvent(.deadlineExpired)
+                        await onSynchronousSettlement(operationSettlement)
+                        await onEvent(.settledDuringGrace(
+                            operationSettlement,
+                            cancellationRequested: false
+                        ))
+                        throw MCPToolExecutionWatchdogError.executionTimedOut(
+                            settlement: operationSettlement
+                        )
+                    }
+                    guard !deadlineDidExpire else { continue }
+                    deadlineDidExpire = true
+                    operationTask.cancel()
+                    await environment.beforeCleanupGraceTaskRegistration()
+                    let graceTask = Task {
+                        do {
+                            try await environment.sleep(cancellationGrace)
+                            guard !Task.isCancelled else { return }
+                            await environment.eventDidProduce(.cleanupGraceExpired)
+                            continuation.yield(.cleanupGraceExpired)
+                        } catch {
+                            // Cancellation is the normal path when the operation settles.
+                        }
+                    }
+                    tasks.append(graceTask)
+                    await onEvent(.deadlineExpired)
+                    await onEvent(.cancellationRequested(origin: .watchdogDeadline))
+
+                case .cleanupGraceExpired:
+                    guard deadlineDidExpire else { continue }
+
+                    if let settlementSlot {
+                        switch settlementSlot.resolveGraceExpiry() {
+                        case .settled:
+                            continue
+
+                        case .forceDisconnect:
+                            tasks.cancelAll()
+                            continuation.finish()
+                            await onEvent(.cleanupGraceExpired(resolvedDisposition: .forceDisconnect))
+                            throw MCPToolExecutionWatchdogError.cleanupUnresponsive
+
+                        case .detach:
+                            environment.beforeDetachActivation()
+                            let activation = settlementSlot.activateDetach()
+                            switch activation {
+                            case .notActivated:
+                                continue
+                            case let .settled(operationSettlement):
+                                tasks.cancelAll()
+                                continuation.finish()
+                                await onSynchronousSettlement(operationSettlement)
+                                await onEvent(.settledDuringGrace(
+                                    operationSettlement,
+                                    cancellationRequested: true
+                                ))
+                                throw MCPToolExecutionWatchdogError.executionTimedOut(
+                                    settlement: operationSettlement
+                                )
+                            case .activated:
+                                await onEvent(.cleanupGraceExpired(resolvedDisposition: .detachAndSettle))
+                                await onEvent(.detachedForSettlement)
+                            }
+                            tasks.cancelAll()
+                            continuation.finish()
+                            throw MCPToolExecutionWatchdogError.executionDetached
+                        }
+                    }
+
+                    switch cleanupDisposition {
+                    case .forceDisconnect:
+                        tasks.cancelAll()
+                        continuation.finish()
+                        await onEvent(.cleanupGraceExpired(resolvedDisposition: .forceDisconnect))
+                        throw MCPToolExecutionWatchdogError.cleanupUnresponsive
+
+                    case .detachAndSettle:
+                        guard let operationState else {
+                            preconditionFailure("Generic detach cleanup requires operation state")
+                        }
+                        switch operationState.prepareDetach() {
+                        case let .completed(box):
+                            tasks.cancelAll()
+                            continuation.finish()
+                            let operationSettlement = settlement(for: box)
+                            await onSynchronousSettlement(operationSettlement)
+                            await onEvent(.settledDuringGrace(
+                                operationSettlement,
+                                cancellationRequested: true
+                            ))
+                            throw MCPToolExecutionWatchdogError.executionTimedOut(
+                                settlement: operationSettlement
+                            )
+
+                        case .ready:
+                            await onEvent(.cleanupGraceExpired(resolvedDisposition: .detachAndSettle))
+                            await onEvent(.detachedForSettlement)
+                            if let completed = operationState.activateDetach() {
+                                await onDetachedSettlement(settlement(for: completed))
+                            }
+                            tasks.cancelAll()
+                            continuation.finish()
+                            throw MCPToolExecutionWatchdogError.executionDetached
+                        }
+                    }
+                }
+            }
+
+            tasks.cancelAll()
+            throw CancellationError()
+        } onCancel: {
+            Task {
+                await onEvent(.cancellationRequested(origin: .requestCancellation))
+            }
+            if let settlementSlot {
+                switch settlementSlot.cancel() {
+                case let .abandoned(completedSettlement):
+                    if let completedSettlement {
+                        Task { await onAbandonedSettlement(completedSettlement) }
+                    }
+                case .alreadyDetached, .settled:
+                    break
+                case let .forceDisconnect(completedSettlement):
+                    if let completedSettlement {
+                        Task { await onForceDisconnectedSettlement(completedSettlement) }
+                    }
+                }
+            } else if let completed = operationState?.abandon() {
+                Task {
+                    await onAbandonedSettlement(settlement(for: completed))
+                }
+            }
+            tasks.cancelAll()
+            continuation.finish()
+        }
+    }
+}

@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -72,6 +73,141 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             }
         #else
             throw XCTSkip("Bootstrap socket listener descriptor seam is DEBUG-only")
+        #endif
+    }
+
+    func testBootstrapHandshakeSeparatesKernelObservedPIDFromClaimedPID() async throws {
+        #if DEBUG
+            let fixture = try TemporarySocketFixture.make(prefix: "peer-identity-success")
+            defer { fixture.removeOwnedDirectory() }
+            let claimedPID = 41001
+            let observedPID = Int(getpid())
+            let recorder = BootstrapProcessIdentityRecorder()
+            let server = BootstrapSocketServer(
+                socketURL: fixture.socketURL,
+                peerPIDResolver: { _ in observedPID }
+            )
+            try await server.start { _, _, processIdentity, _ in
+                await recorder.record(processIdentity)
+                return .reject()
+            }
+            do {
+                let clientFD = try Self.connectRawUnixClient(to: fixture.socketURL)
+                defer { Self.closeIfOpen(clientFD) }
+                try Self.writeBootstrapRequest(to: clientFD, clientPid: claimedPID)
+                _ = try Self.readBootstrapResponse(from: clientFD)
+                let recorded = await Self.waitUntil { await recorder.value != nil }
+                XCTAssertTrue(recorded)
+                let identity = await recorder.value
+                XCTAssertEqual(identity?.claimedPID, claimedPID)
+                XCTAssertEqual(identity?.observedKernelPID, observedPID)
+                XCTAssertEqual(identity?.admissionPID, observedPID)
+                await server.stop()
+            } catch {
+                await server.stop()
+                throw error
+            }
+        #else
+            throw XCTSkip("Bootstrap socket peer identity seam is DEBUG-only")
+        #endif
+    }
+
+    func testBootstrapHandshakeDoesNotVerifySpoofedClaimedPIDWhenKernelLookupFails() async throws {
+        #if DEBUG
+            let fixture = try TemporarySocketFixture.make(prefix: "peer-identity-failure")
+            defer { fixture.removeOwnedDirectory() }
+            let spoofedClaimedPID = Int(getpid())
+            let recorder = BootstrapProcessIdentityRecorder()
+            let server = BootstrapSocketServer(
+                socketURL: fixture.socketURL,
+                peerPIDResolver: { _ in nil }
+            )
+            try await server.start { _, _, processIdentity, _ in
+                await recorder.record(processIdentity)
+                return .reject()
+            }
+            do {
+                let clientFD = try Self.connectRawUnixClient(to: fixture.socketURL)
+                defer { Self.closeIfOpen(clientFD) }
+                try Self.writeBootstrapRequest(to: clientFD, clientPid: spoofedClaimedPID)
+                _ = try Self.readBootstrapResponse(from: clientFD)
+                let recorded = await Self.waitUntil { await recorder.value != nil }
+                XCTAssertTrue(recorded)
+                let identity = await recorder.value
+                XCTAssertEqual(identity?.claimedPID, spoofedClaimedPID)
+                XCTAssertNil(identity?.observedKernelPID)
+                XCTAssertEqual(identity?.admissionPID, spoofedClaimedPID)
+                await server.stop()
+            } catch {
+                await server.stop()
+                throw error
+            }
+        #else
+            throw XCTSkip("Bootstrap socket peer identity seam is DEBUG-only")
+        #endif
+    }
+
+    func testAppProxyFastPathDeniesClaimedPIDWhenKernelPeerLookupFails() async throws {
+        #if DEBUG
+            try await Self.withIsolatedManagerSocket(
+                prefix: "app-proxy-peer-identity",
+                bootstrapPeerPIDResolver: { _ in nil }
+            ) { manager, socketURL in
+                await manager.setConnectionApprovalHandler { _, _ in true }
+                await manager.start()
+                let listenerReady = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(listenerReady)
+
+                let sessionToken = "app-proxy-peer-identity-\(UUID().uuidString)"
+                let claimedPID = Int(getpid())
+                let clientFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(clientFD) }
+                try Self.writeBootstrapRequest(
+                    to: clientFD,
+                    sessionToken: sessionToken,
+                    clientPid: claimedPID,
+                    clientName: "spoofed-app-proxy"
+                )
+                let response = try Self.readBootstrapResponse(from: clientFD)
+                XCTAssertEqual(response.type, "accepted")
+
+                let registered = await Self.waitUntil {
+                    await manager.debugConnectionIDForSessionToken(sessionToken) != nil
+                }
+                XCTAssertTrue(registered)
+                let registeredConnectionID = await manager.debugConnectionIDForSessionToken(sessionToken)
+                let connectionID = try XCTUnwrap(registeredConnectionID)
+                let bootstrapIdentity = await manager.debugBootstrapProcessIdentityForTesting(
+                    connectionID: connectionID
+                )
+                XCTAssertEqual(bootstrapIdentity?.claimedPID, claimedPID)
+                XCTAssertNil(bootstrapIdentity?.observedKernelPID)
+                let observedPeerPID = await manager.peerPID(for: connectionID)
+                XCTAssertNil(observedPeerPID)
+
+                let context = await manager.debugDomainInvocationSecurityContextForTesting(
+                    connectionID: connectionID,
+                    toolName: "file_actions"
+                )
+                XCTAssertEqual(context.principal.kind, .appProxy)
+                XCTAssertEqual(context.principal.assurance, .displayNameOnly)
+                XCTAssertNil(context.principal.processID)
+                XCTAssertEqual(context.principal.claimedProcessID, Int32(claimedPID))
+                XCTAssertNil(context.principal.verifiedIdentityFingerprint)
+                do {
+                    _ = try await AppDomainRuntimeComposition.shared.runtime.mutationPolicyStore.authorize(
+                        context: context,
+                        toolName: "file_actions",
+                        action: "create",
+                        canonicalRoots: []
+                    )
+                    XCTFail("Client-declared PID must not enter the verified appProxy fast path")
+                } catch {
+                    XCTAssertEqual(error as? DomainMutationPolicyError, .principalUnverified)
+                }
+            }
+        #else
+            throw XCTSkip("Bootstrap socket peer identity seam is DEBUG-only")
         #endif
     }
 
@@ -512,19 +648,19 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.socketURL.path))
     }
 
-    func testFullStopTombstonesPublishedChildListenerBeforeQueuedStartCanBind() async throws {
+    func testFullStopTombstonesRegisteredStartupCandidateBeforeQueuedStartCanBind() async throws {
         #if DEBUG
-            try await Self.withIsolatedManagerSocket(prefix: "published-tombstone") { manager, socketURL in
-                await manager.debugSuspendNextLifecycleFenceCheckpoint(.listenerPublishedBeforeStartInvocation)
+            try await Self.withIsolatedManagerSocket(prefix: "candidate-tombstone") { manager, socketURL in
+                await manager.debugSuspendNextLifecycleFenceCheckpoint(.listenerCandidateRegisteredBeforeStartInvocation)
                 let staleStartTask = Task { await manager.start() }
-                let listenerPublished = await Self.waitUntil {
-                    await manager.debugIsLifecycleFenceCheckpointSuspended(.listenerPublishedBeforeStartInvocation)
+                let candidateRegistered = await Self.waitUntil {
+                    await manager.debugIsLifecycleFenceCheckpointSuspended(.listenerCandidateRegisteredBeforeStartInvocation)
                 }
-                XCTAssertTrue(listenerPublished)
+                XCTAssertTrue(candidateRegistered)
                 XCTAssertFalse(FileManager.default.fileExists(atPath: socketURL.path))
 
                 await manager.stop()
-                await manager.debugResumeLifecycleFenceCheckpoint(.listenerPublishedBeforeStartInvocation)
+                await manager.debugResumeLifecycleFenceCheckpoint(.listenerCandidateRegisteredBeforeStartInvocation)
                 await staleStartTask.value
 
                 let runningAfterStaleStart = await manager.isRunning()
@@ -668,9 +804,165 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
+    func testReadinessTimeoutReportsDegradedKeepsMaintenanceAndLaterSelfHeals() async throws {
+        #if DEBUG
+            let clock = BootstrapLifecycleTestClock()
+            let restartGate = BootstrapRestartSleepGate()
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.035,
+                monotonicNow: { clock.now() },
+                readinessSleep: { delay in
+                    clock.advance(by: delay)
+                    await Task.yield()
+                },
+                restartSleep: { _ in await restartGate.waitUntilReleased() }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "readiness-timeout",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
+                let blocker = BootstrapSocketServer(socketURL: socketURL)
+                try await blocker.start { _, _, _, _ in .reject() }
+
+                let outcome = await manager.start()
+                XCTAssertEqual(outcome, .degraded(.readinessTimedOut))
+                let degradedStatus = ServerController.runningStatus(for: outcome)
+                XCTAssertEqual(
+                    degradedStatus,
+                    "Running (Degraded: bootstrap listener readiness timed out; maintenance recovery active)"
+                )
+                XCTAssertNotEqual(degradedStatus, "Running")
+                let maintenanceAfterTimeout = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterTimeout)
+
+                // A repeated start/enable join must preserve degradation until diagnostics are
+                // actually ready; it may replace, but never drop, same-generation maintenance.
+                let repeatedOutcome = await manager.start()
+                XCTAssertEqual(repeatedOutcome, .degraded(.readinessTimedOut))
+                XCTAssertNotEqual(ServerController.runningStatus(for: repeatedOutcome), "Running")
+                let maintenanceAfterRepeatedStart = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterRepeatedStart)
+                let boundedFailureCount = await manager.debugBootstrapStartFailureCountForLifecycleFenceTest()
+                XCTAssertGreaterThanOrEqual(boundedFailureCount, 1)
+                XCTAssertLessThanOrEqual(boundedFailureCount, 2)
+
+                await blocker.stop()
+                await restartGate.release()
+                let recovered = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(recovered)
+                try Self.assertBootstrapAdmissionAccepted(at: socketURL)
+
+                // Exercise the same maintenance tick owned by the live task after a later path
+                // loss. Monotonic advancement clears health/restart throttles deterministically.
+                clock.advance(by: 10)
+                XCTAssertEqual(Darwin.unlink(socketURL.path), 0)
+                await manager.debugRunMaintenanceTickForLifecycleFenceTest()
+                let selfHealed = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(selfHealed)
+                let maintenanceAfterSelfHeal = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterSelfHeal)
+                try Self.assertBootstrapAdmissionAccepted(at: socketURL)
+            }
+        #else
+            throw XCTSkip("Bootstrap manager lifecycle timing seams are DEBUG-only")
+        #endif
+    }
+
+    func testCancelledReadinessWaitReportsDegradedUntilStopInvalidatesMaintenanceGeneration() async throws {
+        #if DEBUG
+            let clock = BootstrapLifecycleTestClock()
+            let restartGate = BootstrapRestartSleepGate()
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.02,
+                monotonicNow: { clock.now() },
+                readinessSleep: { _ in try await Task.sleep(for: .milliseconds(1)) },
+                restartSleep: { _ in await restartGate.waitUntilReleased() }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "readiness-cancel",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
+                let blocker = BootstrapSocketServer(socketURL: socketURL)
+                try await blocker.start { _, _, _, _ in .reject() }
+
+                let startTask = Task { await manager.start() }
+                let maintenanceStarted = await Self.waitUntil {
+                    await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                }
+                XCTAssertTrue(maintenanceStarted)
+                startTask.cancel()
+                let outcome = await startTask.value
+                XCTAssertEqual(outcome, .degraded(.readinessWaitCancelled))
+                let maintenanceAfterCancellation = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterCancellation)
+
+                let runningGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
+                await manager.stop()
+                let stoppedGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
+                XCTAssertGreaterThan(stoppedGeneration, runningGeneration)
+                let runningAfterStop = await manager.isRunning()
+                let maintenanceAfterStop = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertFalse(runningAfterStop)
+                XCTAssertFalse(maintenanceAfterStop)
+
+                await blocker.stop()
+                await restartGate.release()
+                await Task.yield()
+                let listenerAfterStaleRestart = await manager.debugHasCurrentBootstrapListenerForLifecycleFenceTest()
+                XCTAssertFalse(listenerAfterStaleRestart)
+            }
+        #else
+            throw XCTSkip("Bootstrap manager lifecycle timing seams are DEBUG-only")
+        #endif
+    }
+
+    func testReadinessFailureRetriesRemainBackedOffAndBounded() async throws {
+        #if DEBUG
+            let clock = BootstrapLifecycleTestClock(readIncrement: 0.001)
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.04,
+                monotonicNow: { clock.now() },
+                readinessSleep: { delay in
+                    clock.recordSleepAndAdvance(by: delay)
+                    await Task.yield()
+                },
+                restartSleep: { _ in await Task.yield() }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "readiness-backoff",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
+                let blocker = BootstrapSocketServer(socketURL: socketURL)
+                try await blocker.start { _, _, _, _ in .reject() }
+
+                let outcome = await manager.start()
+                XCTAssertEqual(outcome, .degraded(.readinessTimedOut))
+                let failureCount = await manager.debugBootstrapStartFailureCountForLifecycleFenceTest()
+                XCTAssertLessThanOrEqual(failureCount, 6)
+                XCTAssertGreaterThanOrEqual(clock.sleepCount(), 1)
+                let maintenanceAfterBoundedRetries = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterBoundedRetries)
+
+                await blocker.stop()
+            }
+        #else
+            throw XCTSkip("Bootstrap manager lifecycle timing seams are DEBUG-only")
+        #endif
+    }
+
     func testFullStopResolvesOldConnectionWaitersBeforeOverlappingReplacementLifecycleStarts() async throws {
         #if DEBUG
-            try await Self.withIsolatedManagerSocket(prefix: "stale-waiter") { manager, socketURL in
+            let clock = BootstrapLifecycleTestClock()
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.02,
+                monotonicNow: { clock.now() },
+                readinessSleep: { _ in try await Task.sleep(for: .milliseconds(1)) },
+                restartSleep: { delay in try await Task.sleep(for: .seconds(delay)) }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "stale-waiter",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
                 await manager.start()
                 let initialLifecycleGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
                 let waiterTask = Task {
@@ -693,14 +985,45 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                 XCTAssertNil(staleWaiterResult)
                 XCTAssertEqual(waiterCountAfterStopInvalidation, 0)
 
-                await manager.start()
+                // The replacement start must join ready publication rather than returning
+                // while the stopped predecessor still occupies the ready slot.
+                await manager.debugSuspendNextLifecycleFenceCheckpoint(.listenerStartedBeforeReadyPublication)
+                let replacementStartCompletion = AsyncCounter()
+                let replacementStartTask = Task {
+                    await manager.start()
+                    await replacementStartCompletion.increment()
+                }
+                let replacementLifecycleStarted = await Self.waitUntil {
+                    await manager.debugLifecycleGenerationForLifecycleFenceTest() != initialLifecycleGeneration
+                }
+                XCTAssertTrue(replacementLifecycleStarted)
                 let replacementLifecycleGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
                 XCTAssertNotEqual(replacementLifecycleGeneration, initialLifecycleGeneration)
+                let completionWhilePredecessorOwnsSlot = await replacementStartCompletion.value
+                XCTAssertEqual(completionWhilePredecessorOwnsSlot, 0)
+
+                // The old teardown clears only its own ready slot, then schedules the current
+                // lifecycle's replacement. Hold that replacement after it is accepting but
+                // before ready publication to prove the two states cannot be conflated.
                 await manager.debugResumeLifecycleFenceCheckpoint(.listenerStopReturnedBeforeConditionalClear)
                 await stopTask.value
+                let replacementStarted = await Self.waitUntil {
+                    await manager.debugIsLifecycleFenceCheckpointSuspended(.listenerStartedBeforeReadyPublication)
+                }
+                XCTAssertTrue(replacementStarted)
+                let prematurelyPublished = await manager.debugHasCurrentBootstrapListenerForLifecycleFenceTest()
+                XCTAssertFalse(prematurelyPublished)
+                let completionBeforeReadyPublication = await replacementStartCompletion.value
+                XCTAssertEqual(completionBeforeReadyPublication, 0)
+                try Self.assertUnixSocketExists(at: socketURL)
+                try Self.assertBootstrapAdmissionAccepted(at: socketURL)
 
+                await manager.debugResumeLifecycleFenceCheckpoint(.listenerStartedBeforeReadyPublication)
+                await replacementStartTask.value
                 let replacementListenerReady = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
                 XCTAssertTrue(replacementListenerReady)
+                let completionAfterReadyPublication = await replacementStartCompletion.value
+                XCTAssertEqual(completionAfterReadyPublication, 1)
                 try Self.assertBootstrapAdmissionAccepted(at: socketURL)
             }
         #else
@@ -1009,11 +1332,16 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
         private static func withIsolatedManagerSocket(
             prefix: String,
+            bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
+            bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil,
             operation: (ServerNetworkManager, URL) async throws -> Void
         ) async throws {
             let fixture = try TemporarySocketFixture.make(prefix: prefix)
             defer { fixture.removeOwnedDirectory() }
-            let manager = ServerNetworkManager()
+            let manager = ServerNetworkManager(
+                bootstrapLifecycleTiming: bootstrapLifecycleTiming,
+                bootstrapPeerPIDResolver: bootstrapPeerPIDResolver
+            )
             try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
 
             func stopAndRestoreManager() async throws {
@@ -1079,11 +1407,12 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
     private static func writeBootstrapRequest(
         to fd: Int32,
         sessionToken: String = "fd-hardening-\(UUID().uuidString)",
+        clientPid: Int = Int(getpid()),
         clientName: String = "fd-hardening-test"
     ) throws {
         var payload = try JSONEncoder().encode(MCPBootstrapRequest(
             sessionToken: sessionToken,
-            clientPid: Int(getpid()),
+            clientPid: clientPid,
             clientName: clientName
         ))
         payload.append(UInt8(ascii: "\n"))
@@ -1270,6 +1599,73 @@ private final class SynchronousFDRecorder: @unchecked Sendable {
         self.descriptors.removeAll()
         lock.unlock()
         descriptors.forEach { Darwin.close($0) }
+    }
+}
+
+#if DEBUG
+    private final class BootstrapLifecycleTestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var time: TimeInterval = 0
+        private var sleeps = 0
+        private let readIncrement: TimeInterval
+
+        init(readIncrement: TimeInterval = 0) {
+            self.readIncrement = readIncrement
+        }
+
+        func now() -> TimeInterval {
+            lock.lock()
+            time += readIncrement
+            let value = time
+            lock.unlock()
+            return value
+        }
+
+        func advance(by duration: TimeInterval) {
+            lock.lock()
+            time += duration
+            lock.unlock()
+        }
+
+        func recordSleepAndAdvance(by duration: TimeInterval) {
+            lock.lock()
+            sleeps += 1
+            time += duration
+            lock.unlock()
+        }
+
+        func sleepCount() -> Int {
+            lock.lock()
+            let value = sleeps
+            lock.unlock()
+            return value
+        }
+    }
+
+    private actor BootstrapRestartSleepGate {
+        private var released = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func waitUntilReleased() async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+        }
+    }
+#endif
+
+private actor BootstrapProcessIdentityRecorder {
+    private(set) var value: BootstrapClientProcessIdentity?
+
+    func record(_ value: BootstrapClientProcessIdentity) {
+        self.value = value
     }
 }
 

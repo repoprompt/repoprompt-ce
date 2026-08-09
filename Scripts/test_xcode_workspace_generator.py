@@ -111,14 +111,29 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
-            {"RepoPromptApp", "RepoPromptCodeMapCore", "RepoPromptMCP", "RepoPromptShared"},
+            {"RepoPromptApp", "RepoPromptCodeMapCore", "RepoPromptDomainRuntime", "RepoPromptMCP", "RepoPromptShared"},
         )
         self.assertNotIn("RepoPrompt", generator._by_name_dependencies(targets["RepoPromptTests"]))
+
+        self.assertEqual(targets["RepoPromptDomainRuntime"]["type"], "regular")
+        self.assertEqual(targets["RepoPromptDomainRuntime"]["path"], "Sources/RepoPromptDomainRuntime")
+        self.assertEqual(
+            generator._by_name_dependencies(targets["RepoPromptDomainRuntime"]),
+            ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"],
+        )
+        self.assertEqual(targets["RepoPromptDomainRuntimeTests"]["type"], "test")
+        self.assertEqual(targets["RepoPromptDomainRuntimeTests"]["path"], "Tests/RepoPromptDomainRuntimeTests")
+        self.assertEqual(
+            generator._by_name_dependencies(targets["RepoPromptDomainRuntimeTests"]),
+            ["RepoPromptDomainRuntime"],
+        )
 
     def test_generation_metadata_records_internal_app_target(self) -> None:
         metadata = json.loads(self.outputs[Path("generation.json")])
         self.assertIn("RepoPrompt", metadata["package"]["targets"])
         self.assertIn("RepoPromptApp", metadata["package"]["targets"])
+        self.assertIn("RepoPromptDomainRuntime", metadata["package"]["targets"])
+        self.assertIn("RepoPromptDomainRuntimeTests", metadata["package"]["targets"])
 
     def test_project_has_exactly_three_convenience_targets(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()

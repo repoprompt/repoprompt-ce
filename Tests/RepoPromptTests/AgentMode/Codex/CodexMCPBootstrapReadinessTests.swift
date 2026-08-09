@@ -138,6 +138,9 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         XCTAssertFalse(processRunning, "a cancelled start must not launch the app-server process")
         XCTAssertEqual(requests.methods, [], "a cancelled start must send no thread request")
         XCTAssertEqual(registrar.registeredCount, 0, "a cancelled start must register no expected-agent PID")
+        let bindingState = try await controller.test_bindingBufferState()
+        XCTAssertFalse(bindingState.isBinding, "a cancelled start must leave binding mode")
+        XCTAssertEqual(bindingState.bufferedCount, 0, "a cancelled start must discard buffered inbound events")
     }
 
     // MARK: - Successful provisioner proceeds, in order
@@ -274,7 +277,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
             if version_probe_path is not None:
                 with open(version_probe_path, "a", encoding="utf-8") as handle:
                     handle.write("probe\\n")
-            print("codex 0.145.0")
+            print("codex 0.147.0")
             raise SystemExit(0)
         environment_path = \(environmentPath)
         if environment_path is not None:

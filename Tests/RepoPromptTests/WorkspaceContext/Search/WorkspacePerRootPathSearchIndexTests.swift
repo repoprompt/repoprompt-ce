@@ -431,13 +431,20 @@ import XCTest
             let store = makeStore()
             let rootA = try await loadStoppedRoot(in: store, path: rootAURL.path)
             let rootB = try await loadStoppedRoot(in: store, path: rootBURL.path)
-            let service = WorkspaceSearchService(automaticIndexBuildDelayNanoseconds: 300_000_000)
+            let service = WorkspaceSearchService()
+            let rebuildGate = AsyncGate()
+            await service.setAutomaticRebuildDidStartHandler { generation in
+                await rebuildGate.enter(generation: generation)
+            }
             await service.prepareIndex(from: store.searchCatalogSnapshot(rootScope: .visibleWorkspace))
             await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
 
             await store.unloadRoot(id: rootA.id)
             let targetGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-            try await waitForPendingGeneration(targetGeneration, service: service)
+            let rebuildingGeneration = await rebuildGate.waitUntilEntered()
+            XCTAssertEqual(rebuildingGeneration, targetGeneration)
+            let pendingGeneration = await service.pendingGeneration
+            XCTAssertEqual(pendingGeneration, targetGeneration)
 
             let dropped = await service.search("DropTarget", limit: 10)
             let kept = await service.search("KeepTarget", limit: 10)
@@ -446,6 +453,8 @@ import XCTest
             XCTAssertTrue(kept.isIndexReady)
             XCTAssertTrue(kept.isStale)
 
+            await rebuildGate.open()
+            await service.setAutomaticRebuildDidStartHandler(nil)
             try await waitForIndexedGeneration(targetGeneration, service: service)
             let finalKept = await service.search("KeepTarget", limit: 10)
             XCTAssertEqual(finalKept.results.map(\.rootID), [rootB.id])
@@ -557,21 +566,6 @@ import XCTest
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             XCTFail("Timed out waiting for indexed generation \(expected)", file: file, line: line)
-        }
-
-        private func waitForPendingGeneration(
-            _ expected: UInt64,
-            service: WorkspaceSearchService,
-            timeout: TimeInterval = 2.0,
-            file: StaticString = #filePath,
-            line: UInt = #line
-        ) async throws {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                if await service.pendingGeneration == expected { return }
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-            XCTFail("Timed out waiting for pending generation \(expected)", file: file, line: line)
         }
 
         private func makeTemporaryRoot(name: String) throws -> URL {

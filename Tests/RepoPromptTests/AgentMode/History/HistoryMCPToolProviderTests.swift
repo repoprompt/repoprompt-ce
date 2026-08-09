@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -17,27 +18,17 @@ final class HistoryMCPToolProviderTests: XCTestCase {
         try fixture.install([spec], in: workspace)
         let scanner = fixture.makeScanner()
 
-        let capture = ProviderRuntimeCapture()
-        let runtime = MCPWindowToolRuntime(windowID: 42) { name, _, arguments, implementation in
-            await capture.record(toolName: name, arguments: arguments)
-            return try await implementation(MCPWindowToolContext(toolName: name, windowID: 42), arguments)
+        let runtime = MCPAppToolBinder(windowID: 42) { _, _, arguments, implementation in
+            try await implementation(MCPAppToolInvocation(toolName: MCPWindowToolName.history, windowID: 42), arguments)
         }
         let provider = MCPHistoryToolProvider(runtime: runtime, scannerFactory: { scanner })
-        let tool = try XCTUnwrap(provider.buildTools().first)
+        let context = Self.makeDomainContext()
 
-        XCTAssertEqual(tool.name, MCPWindowToolName.history)
-        XCTAssertEqual(tool.annotations.readOnlyHint, true)
-        XCTAssertEqual(tool.annotations.idempotentHint, true)
-
-        let listValue = try await tool([
+        let listValue = try await provider.executeDomainRead(context: context, args: [
             "op": .string("list_sessions"),
             "limit": .int(10)
         ])
         let listObject = try XCTUnwrap(listValue.objectValue)
-        var runtimeSnapshot = await capture.snapshot()
-        XCTAssertEqual(runtimeSnapshot.toolName, MCPWindowToolName.history)
-        XCTAssertEqual(runtimeSnapshot.arguments["op"]?.stringValue, "list_sessions")
-        XCTAssertEqual(runtimeSnapshot.arguments["limit"]?.intValue, 10)
         XCTAssertEqual(listObject["total_sessions"]?.intValue, 1)
 
         let sessions = try XCTUnwrap(listObject["sessions"]?.arrayValue)
@@ -48,7 +39,7 @@ final class HistoryMCPToolProviderTests: XCTestCase {
         XCTAssertEqual(row["tool_call_count"]?.intValue, 2)
         XCTAssertEqual(row["files_touched"]?.arrayValue?.compactMap(\.stringValue), ["Sources/Provider.swift"])
 
-        let searchValue = try await tool([
+        let searchValue = try await provider.executeDomainRead(context: context, args: [
             "op": .string("search"),
             "query": .string("test"),
             "limit": .int(10),
@@ -56,42 +47,21 @@ final class HistoryMCPToolProviderTests: XCTestCase {
             "source": .string("activities")
         ])
         let searchObject = try XCTUnwrap(searchValue.objectValue)
-        runtimeSnapshot = await capture.snapshot()
-        XCTAssertEqual(runtimeSnapshot.arguments["op"]?.stringValue, "search")
-        XCTAssertEqual(runtimeSnapshot.arguments["query"]?.stringValue, "test")
-        XCTAssertEqual(runtimeSnapshot.arguments["limit"]?.intValue, 10)
-        XCTAssertEqual(runtimeSnapshot.arguments["date_from"]?.stringValue, "2026-01-15")
-        XCTAssertEqual(runtimeSnapshot.arguments["source"]?.stringValue, "activities")
         XCTAssertNotNil(searchObject["total_matches"])
         XCTAssertNotNil(searchObject["results"])
 
-        let timeValue = try await tool([
+        let timeValue = try await provider.executeDomainRead(context: context, args: [
             "op": .string("time"),
             "group_by": .string("day"),
             "include_details": .bool(true),
             "workspace": .string("ProviderProject")
         ])
         let timeObject = try XCTUnwrap(timeValue.objectValue)
-        runtimeSnapshot = await capture.snapshot()
-        XCTAssertEqual(runtimeSnapshot.arguments["op"]?.stringValue, "time")
-        XCTAssertEqual(runtimeSnapshot.arguments["group_by"]?.stringValue, "day")
-        XCTAssertEqual(runtimeSnapshot.arguments["include_details"]?.boolValue, true)
-        XCTAssertEqual(runtimeSnapshot.arguments["workspace"]?.stringValue, "ProviderProject")
         XCTAssertNotNil(timeObject["total_sessions"])
         XCTAssertNotNil(timeObject["groups"])
     }
-}
 
-private actor ProviderRuntimeCapture {
-    private var toolName: String?
-    private var arguments: [String: Value] = [:]
-
-    func record(toolName: String, arguments: [String: Value]) {
-        self.toolName = toolName
-        self.arguments = arguments
-    }
-
-    func snapshot() -> (toolName: String?, arguments: [String: Value]) {
-        (toolName, arguments)
+    private static func makeDomainContext() -> DomainReadInvocationContext {
+        DomainReadInvocationContext(handle: nil, connectionID: nil)
     }
 }

@@ -40,7 +40,7 @@ This spec proposes a new MCP tool group — **`history`** — that queries past 
 - MCP response size is capped; all tools must truncate and report.
 - Tool group is named `history` (not `session_history`).
 - Single MCP tool named `history` with `op` dispatch: `list_sessions` | `search` | `time` | `get_session`. Follows the established convention used by `prompt`, `git`, `manage_worktree`, `agent_manage`.
-- Registered as a window-scoped MCP tool (in `MCPWindowToolGroup.history`) that queries across all workspaces. Follows the `agent_manage.list_sessions` precedent — window tool registration with cross-workspace behavior.
+- Registered as a window-scoped MCP tool (in `MCPAppToolGroup.history`) that queries across all workspaces. Follows the `agent_manage.list_sessions` precedent — window tool registration with cross-workspace behavior.
 - Parameter naming follows existing RP-CE conventions (descriptive snake_case: `date_from`, `agent_kind`, `touched_file`, `session_id`).
 - Active duration is derived at query time from stored, threshold-independent interval primitives (the union of merged turn-active intervals and the positive gaps between those intervals). The idle threshold is an integer in the inclusive range 0–1440 minutes. An omitted or null value uses the settings-backed app default (`history.idle_threshold_minutes`, currently 10 minutes when unset), while an out-of-range or non-integer value is a validation error (not clamped). An out-of-range stored default (for example, written out-of-band via `defaults`) is clamped to 0–1440. A gap strictly greater than the threshold is idle and excluded; a gap less than or equal is active. A threshold of 0 means every positive gap is idle, so `active_duration_seconds` equals the merged-interval duration. The same threshold applies to every active-duration field an operation returns (`total_active_duration_seconds`, per-group, and per-detail). The gap between merged active intervals is an approximation of idle time — it conflates user think-time, agent pauses, and time away from the app; it is not strictly "time waiting for user input."
 - **Date bounds**: `date_from`/`date_to` accept ISO 8601 datetimes (exact instant) or date-only values (`YYYY-MM-DD`). For date-only values, `date_from` resolves to start-of-day (`00:00:00 UTC`) and `date_to` resolves to end-of-day (`23:59:59 UTC`), so both bounds are inclusive of the named day. An unparseable date string returns the history tool's normal `{"error": ...}` DTO. Calendar `time` grouping (`day`/`week`/`month`) applies bounds per turn after transcript loading, not only at session selection.
@@ -222,7 +222,7 @@ Read a bounded, noise-reduced transcript window for one session. Intended follow
 
 ### Registration
 
-The `history` tool is registered as a window-scoped MCP tool in `MCPWindowToolGroup.history`. Despite being window-scoped at the MCP protocol level, its handler scans all workspace directories to provide cross-workspace results. This follows the same pattern as `agent_manage.list_sessions`.
+The `history` tool is registered as a window-scoped MCP tool in `MCPAppToolGroup.history`. Despite being window-scoped at the MCP protocol level, its handler scans all workspace directories to provide cross-workspace results. This follows the same pattern as `agent_manage.list_sessions`.
 
 ### Search text fields
 

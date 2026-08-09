@@ -257,6 +257,8 @@ struct AgentModeSessionsListView: View {
     let currentTabID: UUID?
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
+    @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
+    private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -294,91 +296,20 @@ struct AgentModeSessionsListView: View {
         fontPreset.scaledClamped(4, max: 6)
     }
 
-    private struct SidebarListSnapshot {
-        let filteredSessions: [AgentModeViewModel.SidebarSession]
-        let pagedSessions: [AgentModeViewModel.SidebarSession]
-        let effectiveVisibleSessionCount: Int
-        let archivedSessionTabsForHeader: [StashedTab]
-        let sortedArchivedSessionTabsForRows: [StashedTab]
-        let archivedDateInfoByStashedTabID: [UUID: AgentModeViewModel.SidebarSessionDateInfo]
-
-        var hasMoreSessions: Bool {
-            filteredSessions.count > effectiveVisibleSessionCount
-        }
-
-        var remainingSessionCount: Int {
-            max(0, filteredSessions.count - effectiveVisibleSessionCount)
-        }
-    }
-
-    /// Session-first sidebar list. Sessions remain stable regardless of tab switching.
-    private var sidebarListSnapshot: SidebarListSnapshot {
-        #if DEBUG
-            let snapshotStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
-        #endif
-        let sidebarSnapshot = sidebarUI.snapshot
-        let filteredSessions = agentModeVM.displaySidebarSessions(
-            for: promptManager.currentComposeTabs,
-            currentTabID: currentTabID,
-            searchText: sidebarSnapshot.searchText,
-            diagnosticSource: "listSnapshot"
-        )
-        let effectiveVisibleSessionCount = agentModeVM.effectiveSidebarVisibleSessionCount(
-            filteredSessions: filteredSessions,
-            currentTabID: currentTabID,
-            visibleSessionCount: sidebarSnapshot.visibleSessionCount
-        )
-        let pagedSessions = agentModeVM.pagedSidebarSessions(
-            filteredSessions: filteredSessions,
-            currentTabID: currentTabID,
-            visibleSessionCount: effectiveVisibleSessionCount
-        )
-        let archivedSessionTabs = agentModeVM.archivedSessionTabsForSidebarSnapshot(
-            promptManager.currentStashedTabs,
-            searchText: sidebarSnapshot.searchText,
-            prepareSortedRows: archivedSessionsExpanded
-        )
-        let archivedSessionTabsForHeader = archivedSessionTabs.filteredTabs
-        let sortedArchivedSessionTabsForRows = archivedSessionTabs.sortedTabs
-        let snapshot = SidebarListSnapshot(
-            filteredSessions: filteredSessions,
-            pagedSessions: pagedSessions,
-            effectiveVisibleSessionCount: effectiveVisibleSessionCount,
-            archivedSessionTabsForHeader: archivedSessionTabsForHeader,
-            sortedArchivedSessionTabsForRows: sortedArchivedSessionTabsForRows,
-            archivedDateInfoByStashedTabID: archivedSessionTabs.dateInfoByStashedTabID
-        )
-        #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
-                "sidebar.listSnapshot",
-                startMS: snapshotStartMS,
-                fields: [
-                    "archivedCount": String(archivedSessionTabsForHeader.count),
-                    "archivedFilteredCount": String(archivedSessionTabsForHeader.count),
-                    "archivedSortedCount": String(sortedArchivedSessionTabsForRows.count),
-                    "archivedSortedPrepared": String(archivedSessionsExpanded),
-                    "composeTabCount": String(promptManager.currentComposeTabs.count),
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "effectiveVisibleSessionCount": String(effectiveVisibleSessionCount),
-                    "filteredCount": String(filteredSessions.count),
-                    "pagedCount": String(pagedSessions.count),
-                    "searchActive": String(!sidebarSnapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
-                    "stashedTabCount": String(promptManager.currentStashedTabs.count)
-                ]
-            )
-        #endif
-        return snapshot
-    }
-
     var body: some View {
         #if DEBUG
             let _ = Self.recordBodyMetric()
         #endif
-        let snapshot = sidebarListSnapshot
-        let defaultCollapseSeedKeys = agentModeVM.defaultCollapsedSidebarThreadKeys(
-            for: promptManager.currentComposeTabs,
-            searchText: sidebarUI.snapshot.searchText
+        let sidebarSnapshot = sidebarUI.snapshot
+        let snapshot = agentModeVM.sidebarListProjection(
+            composeTabs: promptManager.currentComposeTabs,
+            stashedTabs: promptManager.currentStashedTabs,
+            currentTabID: currentTabID,
+            sidebarSnapshot: sidebarSnapshot,
+            archivedSessionsExpanded: archivedSessionsExpanded,
+            showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions
         )
+        let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
         let firstActiveSectionID = activeSections.first?.id
         ScrollView {
@@ -391,14 +322,32 @@ struct AgentModeSessionsListView: View {
 
                     ForEach(section.groups) { group in
                         ForEach(group.rows, id: \.id) { session in
+                            let hasAgentSession = session.sessionID != nil
+                            let runState: AgentSessionRunState = hasAgentSession
+                                ? agentModeVM.runState(for: session.tabID)
+                                : .idle
+                            let attentionRunState: AgentSessionRunState? = hasAgentSession
+                                ? sidebarUI.snapshot.attentionRunStateByTabID[session.tabID]
+                                : nil
+                            let toggleThreadAction: (() -> Void)? = session.hasThreadChildren
+                                ? { agentModeVM.requestSidebarThreadDisclosureToggle(for: session) }
+                                : nil
+                            // Archived Sessions excludes tabs without indexed conversation content,
+                            // so stashing a session-less tab would hide it from both sidebar lists.
+                            let stashAction: (() -> Void)? = hasAgentSession
+                                ? { Task { await promptManager.stashTab(session.tabID) } }
+                                : nil
+                            let dismissAttentionAction: (() -> Void)? = hasAgentSession
+                                ? { agentModeVM.dismissSidebarRunAttention(tabID: session.tabID) }
+                                : nil
+
                             AgentSessionRow(
                                 title: session.title,
                                 isActive: session.tabID == currentTabID,
                                 isPinned: session.isPinned,
                                 isMCPControlled: session.isMCPControlled,
-                                runState: agentModeVM.runState(for: session.tabID),
-                                isWaiting: agentModeVM.isTabWaiting(session.tabID),
-                                attentionRunState: sidebarUI.snapshot.attentionRunStateByTabID[session.tabID],
+                                runState: runState,
+                                attentionRunState: attentionRunState,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
                                 threadDepth: session.depth,
@@ -406,20 +355,14 @@ struct AgentModeSessionsListView: View {
                                 isThreadCollapsed: session.isThreadCollapsed,
                                 hiddenThreadDescendantCount: session.hiddenThreadDescendantCount,
                                 hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
-                                onToggleThreadCollapse: session.hasThreadChildren
-                                    ? {
-                                        agentModeVM.requestSidebarThreadDisclosureToggle(for: session)
-                                    }
-                                    : nil,
+                                onToggleThreadCollapse: toggleThreadAction,
                                 onSelect: {
                                     Task { await promptManager.switchComposeTab(session.tabID) }
                                 },
                                 onTogglePin: {
                                     promptManager.toggleComposeTabPinned(session.tabID)
                                 },
-                                onStash: {
-                                    Task { await promptManager.stashTab(session.tabID) }
-                                },
+                                onStash: stashAction,
                                 onDelete: {
                                     #if DEBUG
                                         agentModeVM.debugBeginSidebarDeleteRequest(
@@ -433,9 +376,7 @@ struct AgentModeSessionsListView: View {
                                 onRename: { newName in
                                     agentModeVM.renameSession(tabID: session.tabID, to: newName)
                                 },
-                                onDismissAttention: {
-                                    agentModeVM.dismissSidebarRunAttention(tabID: session.tabID)
-                                }
+                                onDismissAttention: dismissAttentionAction
                             )
                         }
                     }

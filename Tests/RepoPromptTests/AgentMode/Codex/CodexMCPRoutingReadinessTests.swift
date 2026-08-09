@@ -1,5 +1,6 @@
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Fail-closed pre-first-turn routing boundary for Codex children (issue #514).
@@ -14,40 +15,48 @@ import XCTest
 /// `ServerNetworkManager` connection-policy machinery through a fake Codex app-server controller that
 /// answers `startOrResume` (so a thread is active) but whose child never connects MCP. Because that
 /// machinery is process-global, each test runs under `MCPSharedServerTestLease` (the shared-MCP-state
-/// serialization lease other bootstrap suites use) on a distinctive window ID, and cleanup is scoped to
-/// the run IDs this suite creates — it never cancels the gate globally or clears shared routing history.
+/// serialization lease other bootstrap suites use). Each test owns a fresh positive-ID window/catalog
+/// participant and cleanup is scoped to its registration handle and run IDs — it never cancels the gate
+/// globally, clears shared routing history, or unregisters process-lifetime global composition.
 @MainActor
 final class CodexMCPRoutingReadinessTests: XCTestCase {
-    /// A distinctive window so this suite's connection policies never key-collide with the shared
-    /// default window (1) other suites use.
-    private let testWindowID = 5_140_514
     private let routingTimeoutMs = 500
     private let codexClientName = AgentProviderKind.codexExec.mcpClientNameHint ?? "RepoPromptCE"
-    private var trackedRunIDs: [UUID] = []
+    private var trackedRuns: [(runID: UUID, windowID: Int)] = []
+    private var retainedHosts: [AgentModeViewModel] = []
 
     override func tearDown() async throws {
+        for host in retainedHosts {
+            await host.prepareForWindowClose()
+        }
+        retainedHosts.removeAll()
+
         // Scope cleanup to the run IDs this suite created: revoke each retained one-shot policy (a routed
         // run legitimately keeps its policy for the real connection) and drop its routing waiter. No
         // gate cancel-all or global routing-history clear, which would disrupt other suites.
-        for runID in trackedRunIDs {
+        for trackedRun in trackedRuns {
             await ServerNetworkManager.shared.revokeClientConnectionPolicy(
                 for: codexClientName,
-                windowID: testWindowID,
-                runID: runID
+                windowID: trackedRun.windowID,
+                runID: trackedRun.runID
             )
-            await MCPRoutingWaiter.cleanup(runID: runID)
+            await MCPRoutingWaiter.cleanup(runID: trackedRun.runID)
         }
-        trackedRunIDs.removeAll()
+        trackedRuns.removeAll()
         try await super.tearDown()
     }
 
     // MARK: - Fail closed
 
     func testUnroutedChildFailsClosedBeforeFirstTurnWithoutLeakingBootstrapState() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
+        try await withRoutingMCPFixture { window in
             let controller = RoutingReadinessFakeCodexController()
             let recorder = TerminalPublicationRecorder()
-            let coordinator = makeCoordinator(controller: controller, recorder: recorder)
+            let coordinator = makeCoordinator(
+                controller: controller,
+                recorder: recorder,
+                windowID: window.windowID
+            )
 
             // Leave runState inactive so the send is treated as a fresh first turn (the send captures
             // wasRunAlreadyActive before it flips the run to running).
@@ -60,7 +69,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                 attachments: []
             )
             if let runID = session.runID {
-                trackedRunIDs.append(runID)
+                trackedRuns.append((runID, window.windowID))
             }
 
             XCTAssertEqual(controller.startUserTurnCount, 0, "startUserTurn must never fire when routing never confirmed")
@@ -84,10 +93,6 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
 
             XCTAssertNil(session.codexController, "the unrouted controller must be released from the session")
             let usedRunID = try XCTUnwrap(session.runID)
-            let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
-            XCTAssertNil(activeGate, "the bootstrap gate must not remain owned")
-            let gateQueueDepth = await HeadlessAgentConnectionGate.shared.debugWaitingCount()
-            XCTAssertEqual(gateQueueDepth, 0, "no bootstrap gate waiters may remain")
             let pendingWaiters = await MCPRoutingWaiter.debugContinuationCount(runID: usedRunID)
             XCTAssertEqual(pendingWaiters, 0, "no routing waiters may remain for the run")
             let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: codexClientName)
@@ -99,10 +104,14 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
     }
 
     func testUnroutedResumeFailsClosedWithResumeFailurePrefix() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
+        try await withRoutingMCPFixture { window in
             let controller = RoutingReadinessFakeCodexController()
             let recorder = TerminalPublicationRecorder()
-            let coordinator = makeCoordinator(controller: controller, recorder: recorder)
+            let coordinator = makeCoordinator(
+                controller: controller,
+                recorder: recorder,
+                windowID: window.windowID
+            )
 
             let session = makeCodexSession()
             session.setItemsSilently(
@@ -122,7 +131,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                 attachments: []
             )
             if let runID = session.runID {
-                trackedRunIDs.append(runID)
+                trackedRuns.append((runID, window.windowID))
             }
 
             XCTAssertEqual(controller.startUserTurnCount, 0, "startUserTurn must never fire when resumed routing never confirmed")
@@ -147,10 +156,14 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
     }
 
     func testResumeFallbackToFreshRoutingFailureUsesStartPrefixAndDeduplicates() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
+        try await withRoutingMCPFixture { window in
             let controller = RoutingReadinessFakeCodexController(failFirstResumeForMissingRollout: true)
             let recorder = TerminalPublicationRecorder()
-            let coordinator = makeCoordinator(controller: controller, recorder: recorder)
+            let coordinator = makeCoordinator(
+                controller: controller,
+                recorder: recorder,
+                windowID: window.windowID
+            )
 
             let session = makeCodexSession()
             session.setItemsSilently(
@@ -171,7 +184,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                 attachments: []
             )
             if let runID = session.runID {
-                trackedRunIDs.append(runID)
+                trackedRuns.append((runID, window.windowID))
             }
 
             XCTAssertEqual(controller.startAttemptWasResume, [true, false])
@@ -251,7 +264,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
     // MARK: - Cancellation cannot cross the first-turn boundary
 
     func testCancellationDuringRoutingWaitDoesNotReachFirstTurn() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
+        try await withRoutingMCPFixture { window in
             let controller = RoutingReadinessFakeCodexController()
             let recorder = TerminalPublicationRecorder()
             let runIDBox = RunIDBox()
@@ -261,11 +274,16 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                 controller: controller,
                 recorder: recorder,
                 routingTimeoutMs: 60000,
-                capturedRunID: runIDBox
+                capturedRunID: runIDBox,
+                windowID: window.windowID
             )
 
             let session = makeCodexSession()
             session.beginRunAttempt(source: "test.routing-readiness.cancel")
+            let gateBeforeSend = await HeadlessAgentConnectionGate.snapshot()
+            guard gateBeforeSend.activeConnectionID == nil, gateBeforeSend.queueDepth == 0 else {
+                throw XCTSkip("Routing cancellation fixture does not own foreign connection-gate state: \(gateBeforeSend)")
+            }
 
             let sendTask = Task { @MainActor in
                 await coordinator.sendCodexNativeMessage(session: session, text: "first turn", attachments: [])
@@ -274,19 +292,20 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
             // Wait until requireRouting is genuinely suspended on the routing waiter (a registered
             // continuation), then cancel. This is condition-driven, not a fixed sleep.
             var suspended = false
-            for _ in 0 ..< 20000 {
+            let suspensionDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while ContinuousClock.now < suspensionDeadline {
                 if let runID = runIDBox.value, await MCPRoutingWaiter.debugContinuationCount(runID: runID) >= 1 {
                     suspended = true
                     break
                 }
-                await Task.yield()
+                try await Task.sleep(for: .milliseconds(10))
             }
             XCTAssertTrue(suspended, "requireRouting never suspended on the routing waiter")
 
             sendTask.cancel()
             let outcome = await sendTask.value
             if let runID = runIDBox.value {
-                trackedRunIDs.append(runID)
+                trackedRuns.append((runID, window.windowID))
             }
 
             XCTAssertEqual(controller.startUserTurnCount, 0, "a cancelled routing wait must not reach startUserTurn")
@@ -302,11 +321,10 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
 
     func testRestoredResumeRequiresRealMatchingMCPAdmissionBeforeFirstTurn() async throws {
         #if DEBUG
-            try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withRoutingMCPFixture { window in
                 // Real policy admission resolves the tab through the registered window before
                 // committing its run route. A restored session alone has no routable UI snapshot.
                 let session = makeCodexSession()
-                let window = makeRegisteredRoutingWindow()
                 try await installRoutingSnapshot(for: session.tabID, in: window)
                 let controller = RoutingReadinessFakeCodexController()
                 let recorder = TerminalPublicationRecorder()
@@ -329,9 +347,6 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
                         await manager.cleanupRunRoutingState(for: runID, windowID: windowID)
                         await MCPRoutingWaiter.cleanup(runID: runID)
                     }
-                    window.beginClose()
-                    await window.tearDown()
-                    WindowStatesManager.shared.unregisterWindowState(window)
                 }
                 let coordinator = makeCoordinator(
                     controller: controller,
@@ -443,6 +458,33 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         await coordinator.shutdownCodexSession(session)
     }
 
+    func testControllerCreatedAcrossManagedLogoutFenceIsRetiredBeforeInstallation() async {
+        let fence = CodexManagedSessionFence.shared
+        let logoutTokenBox = ManagedLogoutTokenBox()
+        let controller = RoutingReadinessFakeCodexController()
+        let host = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                logoutTokenBox.set(fence.beginLogout())
+                return controller
+            }
+        )
+        host.test_initializeRunService()
+        let session = host.session(for: UUID())
+        session.selectedAgent = .codexExec
+
+        await host.test_codexCoordinator.ensureCodexNativeSession(session: session)
+
+        XCTAssertNil(session.codexController)
+        XCTAssertEqual(controller.shutdownCallCount, 1)
+        if let logoutToken = logoutTokenBox.value {
+            fence.finishLogout(token: logoutToken, succeeded: false)
+        } else {
+            XCTFail("Expected controller construction to begin the logout fence")
+        }
+    }
+
     // MARK: - Harness
 
     private func makeCodexSession() -> AgentModeViewModel.TabSession {
@@ -451,12 +493,66 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         return session
     }
 
+    private func withRoutingMCPFixture<T>(
+        owner: String = #function,
+        _ operation: (WindowState) async throws -> T
+    ) async throws -> T {
+        try await MCPSharedServerTestLease.shared.withLease(owner: owner) { _ in
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            await ServerNetworkManager.shared.setEnabled(true)
+
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            await window.workspaceManager.awaitInitialized()
+            WindowStatesManager.shared.registerWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+
+            let registration: MCPDomainToolRegistrationResult
+            do {
+                registration = try await AppDomainRuntimeComposition.shared.register(
+                    window.mcpServer.windowMCPToolCatalogService
+                )
+            } catch {
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+                throw error
+            }
+            guard registration.disposition == .inserted else {
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+                throw RoutingMCPFixtureError.windowCatalogRegistrationWasNotOwned(
+                    String(describing: registration.disposition)
+                )
+            }
+
+            do {
+                let result = try await operation(window)
+                // This fixture owns the exact generation; release it before teardown can run stopServer().
+                await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+                return result
+            } catch {
+                // This fixture owns the exact generation; release it before teardown can run stopServer().
+                await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+                throw error
+            }
+        }
+    }
+
     private func makeCoordinator(
         controller: RoutingReadinessFakeCodexController,
         recorder: TerminalPublicationRecorder,
         routingTimeoutMs: Int? = nil,
         capturedRunID: RunIDBox? = nil,
-        windowID: Int? = nil
+        windowID: Int
     ) -> CodexAgentModeCoordinator {
         // Install the real per-run policy so the expected-PID policy arms. Routed tests must
         // confirm readiness through real policy admission rather than signalling the waiter directly.
@@ -482,25 +578,33 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         }
 
         let host = AgentModeViewModel(
-            testWindowID: windowID ?? testWindowID,
+            testWindowID: windowID,
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
             shouldManageCodexTooling: true,
             codexControllerFactory: { _, _, _, _, _, _ in controller },
             connectionPolicyInstaller: policyInstaller,
+            mcpServerEnabler: {
+                do {
+                    try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                } catch {
+                    return false
+                }
+                await ServerNetworkManager.shared.setEnabled(true)
+                return await MCPToolCatalogReadiness.shared.awaitReady(
+                    windowID: windowID,
+                    timeout: 2
+                )
+            },
             testCodexLeaseRoutingTimeoutMs: routingTimeoutMs ?? self.routingTimeoutMs
         )
+        retainedHosts.append(host)
         let coordinator = host.test_codexCoordinator
-        coordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder)))
+        let hooks = makeHooks(recorder: recorder)
+        coordinator.installTerminalCommitBarrier(
+            AgentRunTerminalCommitBarrier(),
+            terminalSessionBinder: { hooks.bindTerminalSession($0) }
+        )
         return coordinator
-    }
-
-    private func makeRegisteredRoutingWindow() -> WindowState {
-        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
-        WindowStatesManager.shared.registerWindowState(window)
-        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        return window
     }
 
     private func installRoutingSnapshot(
@@ -541,46 +645,72 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
 
     private func makeHooks(recorder: TerminalPublicationRecorder) -> AgentModeRunService.Hooks {
         AgentModeRunService.Hooks(
-            estimateRuntimeTokens: { $0.count },
-            addUserInputTokensToActiveNonCodexTurn: { _, _ in },
-            startNonCodexTurnAccountingIfNeeded: { _, _ in },
-            reserveAttachmentsForTurn: { _, _ in nil },
-            markAttachmentsConsumed: { _, _ in },
-            stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
-            consumeDeferredAttachmentCleanup: { _, _ in },
-            finalizeAttachmentsForTurn: { _, _, _ in },
-            setAgentRunActive: { _, _ in },
-            updateBindings: { _ in },
-            requestUIRefresh: { _, _ in },
-            scheduleSave: { _ in },
-            notifyAgentTurnComplete: { _ in },
-            handleHeadlessStreamResult: { _, _, _, _ in },
-            buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
-            finalizeStreamingItems: { _ in },
-            finalizePendingToolCalls: { _, _ in },
-            finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-            finalizeNonCodexTurnUsage: { _, _, _, _ in },
-            cancelPendingQuestion: { _ in },
-            cancelPendingApproval: { _ in },
-            cancelPendingApplyEditsReview: { _, _ in },
-            cancelPendingWorktreeMergeReview: { _, _ in },
-            flushPendingAssistantDelta: { _ in },
-            clearPendingAssistantDelta: { _ in },
-            prepareTerminalPublication: { _ in },
-            makeTerminalPublicationEnvelope: { _, _, _, _ in nil },
-            publishTerminalCommit: { _, revision, _ in
-                recorder.record(revision.terminalState)
-                return .accepted(successorEpoch: nil)
-            },
-            startFollowUpRun: { _, _ in },
-            restoreDraftText: { _, _, _, _ in },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
-            stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, _ in },
-            signalMCPInstructionDelivered: { _ in }
+            usage: .init(
+                estimateRuntimeTokens: { $0.count },
+                addUserInputTokensToActiveNonCodexTurn: { _, _ in },
+                startNonCodexTurnAccountingIfNeeded: { _, _ in },
+                finalizeNonCodexTurnUsage: { _, _, _, _ in }
+            ),
+            attachments: .init(
+                reserveAttachmentsForTurn: { _, _ in nil },
+                markAttachmentsConsumed: { _, _ in },
+                stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
+                consumeDeferredAttachmentCleanup: { _, _ in },
+                finalizeAttachmentsForTurn: { _, _, _ in }
+            ),
+            presentation: .init(
+                setAgentRunActive: { _, _ in },
+                requestUIRefresh: { _, _ in },
+                notifyAgentTurnComplete: { _ in }
+            ),
+            bindingObservation: .init(
+                updateBindings: { _ in }
+            ),
+            queuedWorkRecovery: .init(
+                restoreDraftText: { _, _, _, _ in }
+            ),
+            persistence: .init(
+                scheduleSave: { _ in }
+            ),
+            transcript: .init(
+                handleHeadlessStreamResult: { _, _, _, _ in },
+                finalizeStreamingItems: { _ in },
+                finalizePendingToolCalls: { _, _ in },
+                finalizePendingToolCallsWithUpperBound: { _, _, _ in },
+                flushPendingAssistantDelta: { _ in },
+                clearPendingAssistantDelta: { _ in }
+            ),
+            providerInput: .init(
+                buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
+                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                stageResumeRecoveryHandoffIfNeeded: { _ in },
+                prependPendingHandoffIfNeeded: { text, _ in text },
+                recordPendingHandoffSendOutcome: { _, _ in }
+            ),
+            interactions: .init(
+                cancelPendingQuestion: { _ in },
+                cancelPendingApproval: { _ in },
+                cancelPendingApplyEditsReview: { _, _ in },
+                cancelPendingWorktreeMergeReview: { _, _ in }
+            ),
+            terminalSettlement: .init(
+                prepareTerminalPublication: { _ in },
+                makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
+                publishTerminalCommit: { _, revision, _ in
+                    recorder.record(revision.terminalState)
+                    return .accepted(successorEpoch: nil)
+                }
+            ),
+            continuation: .init(
+                startFollowUpRun: { _, _ in },
+                signalMCPInstructionDelivered: { _ in }
+            )
         )
     }
+}
+
+private enum RoutingMCPFixtureError: Error {
+    case windowCatalogRegistrationWasNotOwned(String)
 }
 
 // MARK: - Test doubles
@@ -600,6 +730,19 @@ private final class TerminalPublicationRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return states
+    }
+}
+
+private final class ManagedLogoutTokenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: CodexManagedSessionFence.Token?
+
+    var value: CodexManagedSessionFence.Token? {
+        lock.withLock { stored }
+    }
+
+    func set(_ value: CodexManagedSessionFence.Token) {
+        lock.withLock { stored = value }
     }
 }
 

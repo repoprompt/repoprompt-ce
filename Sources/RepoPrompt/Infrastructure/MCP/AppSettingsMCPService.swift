@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptDomainRuntime
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///
@@ -8,6 +9,8 @@ import MCP
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
     static let toolName = MCPGlobalToolName.appSettings
+
+    let domainRegistrationID = MCPDomainToolRegistrationID()
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter

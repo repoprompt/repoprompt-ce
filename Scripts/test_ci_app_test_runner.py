@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import io
-import json
 import tempfile
 import threading
 import time
@@ -18,14 +17,26 @@ import ci_app_test_runner
 class FakeProcess:
     next_pid = 1000
 
-    def __init__(self, lines: list[str] | None = None, *, returncode: int | None = None) -> None:
+    def __init__(
+        self,
+        lines: list[str] | None = None,
+        *,
+        returncode: int | None = None,
+        returncode_after_output: int | None = None,
+    ) -> None:
         self.lines = lines or []
         self.returncode = returncode
+        self.returncode_after_output = returncode_after_output
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
-        self.stdout = iter(self.lines)
+        self.stdout = self.iter_lines()
         self.kill_called = False
         self.wait_called = False
+
+    def iter_lines(self):
+        yield from self.lines
+        if self.returncode_after_output is not None:
+            self.returncode = self.returncode_after_output
 
     def poll(self) -> int | None:
         return self.returncode
@@ -46,61 +57,6 @@ class FakeProcess:
 
 
 class CIAppTestRunnerTests(unittest.TestCase):
-    def write_policy(self, directory: Path, groups: dict[str, dict[str, str]] | None = None) -> Path:
-        path = directory / "policy.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "default_mode": "parallel_eligible",
-                    "groups": groups
-                    or {
-                        "WindowStatesManager": {
-                            "lane": "app_window_state",
-                            "reason": "shared windows",
-                        },
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        return path
-
-    def write_ledger(self, directory: Path, rows: list[dict[str, str]]) -> Path:
-        path = directory / "ledger.tsv"
-        columns = [
-            "method_id",
-            "target",
-            "file",
-            "suite",
-            "method",
-            "domain",
-            "primary_contract_id",
-            "secondary_contract_tags",
-            "validation_class",
-            "layer",
-            "execution_tier",
-            "scenario_count",
-            "fixture_ids",
-            "observable_oracle",
-            "failure_risk",
-            "runtime_seconds",
-            "resource_cost_tags",
-            "shared_state_tags",
-            "lifecycle_owner",
-            "current_disposition",
-            "replacement_method_id",
-            "preserved_scenario_delta",
-            "notes",
-        ]
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            handle.write("\t".join(columns) + "\n")
-            for row in rows:
-                values = {column: "" for column in columns}
-                values.update(row)
-                handle.write("\t".join(values[column] for column in columns) + "\n")
-        return path
-
     def stop_fake_process(self, stopped: list[FakeProcess]):
         def stop(process: FakeProcess) -> None:
             stopped.append(process)
@@ -108,358 +64,73 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         return stop
 
-    def test_parse_suites_returns_unique_sorted_suite_names(self) -> None:
+    def test_parse_suite_method_counts_returns_unique_sorted_counts(self) -> None:
         output = "\n".join(
             [
                 "RepoPromptTests.B/testTwo",
                 "RepoPromptTests.A/testOne",
                 "RepoPromptTests.B/testThree",
+                "RepoPromptTests.B/testTwo",
                 "noise without slash",
+                "RepoPromptTests.Empty/",
                 "",
             ]
         )
 
         self.assertEqual(
-            ci_app_test_runner.parse_suites(output),
-            ["RepoPromptTests.A", "RepoPromptTests.B"],
+            ci_app_test_runner.parse_suite_method_counts(output),
+            {
+                "RepoPromptTests.A": 1,
+                "RepoPromptTests.B": 2,
+            },
         )
-
-    def test_serial_group_policy_accepts_valid_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = self.write_policy(Path(temp))
-
-            policy = ci_app_test_runner.load_serial_group_policy(path)
-
-        self.assertEqual(policy["WindowStatesManager"].lane, "app_window_state")
-
-    def test_serial_group_policy_rejects_unknown_version(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "policy.json"
-            path.write_text(
-                json.dumps({"version": 99, "default_mode": "parallel_eligible", "groups": {}}),
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "unsupported serial group policy version"):
-                ci_app_test_runner.load_serial_group_policy(path)
-
-    def test_serial_group_policy_rejects_malformed_group(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "policy.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "default_mode": "parallel_eligible",
-                        "groups": {"WindowStatesManager": {"lane": "app_window_state"}},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "must define a non-empty reason"):
-                ci_app_test_runner.load_serial_group_policy(path)
-
-    def test_ledger_aggregation_classifies_suites_by_serial_policy_tags(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "method_id": "root/RepoPromptTests.A/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.A",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                        "runtime_seconds": "1.5",
-                        "shared_state_tags": "WindowStatesManager;GlobalSettingsStore",
-                        "resource_cost_tags": "temp_directory;git_subprocess",
-                    },
-                    {
-                        "method_id": "root/RepoPromptTests.A/testTwo",
-                        "target": "root",
-                        "suite": "RepoPromptTests.A",
-                        "method": "testTwo",
-                        "execution_tier": "diagnostic",
-                        "runtime_seconds": "2.0",
-                        "shared_state_tags": "WindowStatesManager",
-                    },
-                    {
-                        "method_id": "root/RepoPromptTests.B/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.B",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                        "runtime_seconds": "0.5",
-                        "resource_cost_tags": "UserDefaults.standard",
-                    },
-                ],
-            )
-            policy = self.write_policy(
-                root,
-                {
-                    "WindowStatesManager": {
-                        "lane": "app_window_state",
-                        "reason": "shared windows",
-                    },
-                    "UserDefaults.standard": {
-                        "lane": "user_defaults",
-                        "reason": "shared defaults",
-                    },
-                },
-            )
-
-            plan = ci_app_test_runner.build_suite_plan(
-                ["RepoPromptTests.B", "RepoPromptTests.A"],
-                ledger_suites=ci_app_test_runner.read_ledger_suites(ledger),
-                serial_policy=ci_app_test_runner.load_serial_group_policy(policy),
-            )
 
         self.assertEqual(
-            [suite.suite for suite in plan.pinned_serial],
-            ["RepoPromptTests.A", "RepoPromptTests.B"],
-        )
-        self.assertEqual([suite.suite for suite in plan.parallel_eligible], [])
-        self.assertEqual(plan.pinned_serial[0].estimated_runtime_seconds, 3.5)
-        self.assertTrue(plan.pinned_serial[0].heavy_tier_present)
-        self.assertEqual(plan.pinned_serial[1].matched_serial_tags, ("UserDefaults.standard",))
-
-    def test_main_print_suite_plan_json_emits_stable_groups(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "method_id": "root/RepoPromptTests.Pinned/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.Pinned",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                        "shared_state_tags": "WindowStatesManager",
-                    },
-                    {
-                        "method_id": "root/RepoPromptTests.Free/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.Free",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Pinned", "RepoPromptTests.Free"],
+            ci_app_test_runner.parse_suite_methods(output),
+            {
+                "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                "RepoPromptTests.B": (
+                    "RepoPromptTests.B/testThree",
+                    "RepoPromptTests.B/testTwo",
                 ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--strict-ledger",
-                        "--print-suite-plan-json",
-                    ]
-                )
+            },
+        )
 
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(output.getvalue())
+    def test_lpt_sharding_is_deterministic_with_stable_name_ties(self) -> None:
+        method_counts = {
+            "RepoPromptTests.E": 1,
+            "RepoPromptTests.D": 2,
+            "RepoPromptTests.C": 3,
+            "RepoPromptTests.B": 5,
+            "RepoPromptTests.A": 5,
+        }
+
+        first = ci_app_test_runner.assign_suites_to_shards(method_counts, 3)
+        second = ci_app_test_runner.assign_suites_to_shards(dict(reversed(list(method_counts.items()))), 3)
+
+        self.assertEqual(first, second)
         self.assertEqual(
-            [suite["suite"] for suite in payload["pinned_serial"]],
-            ["RepoPromptTests.Pinned"],
-        )
-        self.assertEqual(
-            [suite["suite"] for suite in payload["parallel_eligible"]],
-            ["RepoPromptTests.Free"],
-        )
-
-    def test_main_print_suite_plan_json_rejects_missing_suite_when_strict(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "suite": "RepoPromptTests.Known",
-                        "method": "testOne",
-                        "runtime_seconds": "1.0",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--strict-ledger",
-                        "--print-suite-plan-json",
-                    ]
-                )
-
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(
-            output.getvalue().strip(),
-            "::error::ledger is missing discovered suites: ['RepoPromptTests.Unknown']",
+            first,
+            (
+                [["RepoPromptTests.A", "RepoPromptTests.E"], ["RepoPromptTests.B"], ["RepoPromptTests.C", "RepoPromptTests.D"]],
+                [6, 5, 5],
+            ),
         )
 
-    def test_main_print_suite_plan_json_rejects_missing_suite_with_parallel_workers(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "suite": "RepoPromptTests.Known",
-                        "method": "testOne",
-                        "runtime_seconds": "1.0",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
+    def test_four_lpt_shards_are_disjoint_and_cover_every_discovered_suite(self) -> None:
+        method_counts = {
+            f"RepoPromptTests.Suite{index:02d}": (index % 5) + 1
+            for index in range(17)
+        }
 
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--workers",
-                        "2",
-                        "--print-suite-plan-json",
-                    ]
-                )
+        shards, loads = ci_app_test_runner.assign_suites_to_shards(method_counts, 4)
+        flattened = [suite for shard in shards for suite in shard]
 
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(
-            output.getvalue().strip(),
-            "::error::ledger is missing discovered suites: ['RepoPromptTests.Unknown']",
-        )
-
-    def test_main_print_suite_plan_json_preserves_non_strict_missing_suite_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            ledger = self.write_ledger(
-                root,
-                [
-                    {
-                        "suite": "RepoPromptTests.Known",
-                        "method": "testOne",
-                        "runtime_seconds": "1.0",
-                    },
-                ],
-            )
-            policy = self.write_policy(root)
-            output = io.StringIO()
-
-            with (
-                mock.patch.object(
-                    ci_app_test_runner,
-                    "list_suites",
-                    return_value=["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ),
-                mock.patch("sys.stdout", output),
-            ):
-                exit_code = ci_app_test_runner.main(
-                    [
-                        "--ledger",
-                        str(ledger),
-                        "--serial-group-policy",
-                        str(policy),
-                        "--print-suite-plan-json",
-                    ]
-                )
-
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(output.getvalue())
-        unknown = next(
-            suite
-            for suite in payload["parallel_eligible"]
-            if suite["suite"] == "RepoPromptTests.Unknown"
-        )
-        self.assertEqual(unknown["method_count"], 0)
-        self.assertEqual(unknown["classification"], "parallel_eligible")
-
-    def test_main_reports_missing_ledger_file(self) -> None:
-        output = io.StringIO()
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(ci_app_test_runner, "list_suites", return_value=["RepoPromptTests.A"]),
-            mock.patch("sys.stdout", output),
-        ):
-            policy = self.write_policy(Path(temp))
-            exit_code = ci_app_test_runner.main(
-                [
-                    "--ledger",
-                    str(Path(temp) / "missing.tsv"),
-                    "--serial-group-policy",
-                    str(policy),
-                    "--print-suite-plan-json",
-                ]
-            )
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("ledger file does not exist", output.getvalue())
-
-    def test_main_reports_missing_serial_group_policy_file(self) -> None:
-        output = io.StringIO()
-        with (
-            tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(ci_app_test_runner, "list_suites", return_value=["RepoPromptTests.A"]),
-            mock.patch("sys.stdout", output),
-        ):
-            ledger = self.write_ledger(
-                Path(temp),
-                [
-                    {
-                        "method_id": "root/RepoPromptTests.A/testOne",
-                        "target": "root",
-                        "suite": "RepoPromptTests.A",
-                        "method": "testOne",
-                        "execution_tier": "routine",
-                    },
-                ],
-            )
-            exit_code = ci_app_test_runner.main(
-                [
-                    "--ledger",
-                    str(ledger),
-                    "--serial-group-policy",
-                    str(Path(temp) / "missing.json"),
-                    "--print-suite-plan-json",
-                ]
-            )
-
-        self.assertEqual(exit_code, 1)
-        self.assertIn("serial group policy file does not exist", output.getvalue())
+        self.assertEqual(len(shards), 4)
+        self.assertEqual(len(loads), 4)
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertEqual(set(flattened), set(method_counts))
+        self.assertEqual(sum(loads), sum(method_counts.values()))
 
     def test_xctest_failure_detection_matches_xctest_issue_lines_only(self) -> None:
         self.assertTrue(
@@ -507,15 +178,17 @@ class CIAppTestRunnerTests(unittest.TestCase):
             ci_app_test_runner.os.getpgrp = original_getpgrp
             ci_app_test_runner.os.getpgid = original_getpgid
 
-    def test_fail_fast_stops_after_first_xctest_issue(self) -> None:
+    def test_xctest_assertion_does_not_stop_suite_process_early(self) -> None:
         stopped: list[FakeProcess] = []
         output = io.StringIO()
         fake = FakeProcess(
             [
                 "Test Case '-[RepoPromptTests.S testExample]' started.\n",
                 "/tmp/File.swift:10: error: -[RepoPromptTests.S testExample] : XCTAssert failed\n",
-                "line that would have appeared before a hang\n",
-            ]
+                "Test Case '-[RepoPromptTests.S testLater]' started.\n",
+                "/tmp/File.swift:20: error: -[RepoPromptTests.S testLater] : XCTAssertEqual failed\n",
+            ],
+            returncode_after_output=1,
         )
 
         result = ci_app_test_runner.run_suite(
@@ -530,9 +203,10 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         self.assertEqual(result.state, "failed")
         self.assertEqual(result.exit_code, 1)
-        self.assertEqual(result.last_started_test, "RepoPromptTests.S testExample")
+        self.assertEqual(result.last_started_test, "RepoPromptTests.S testLater")
         self.assertIn("XCTAssert failed", result.first_failure_line or "")
-        self.assertEqual(stopped, [fake])
+        self.assertIn("XCTAssertEqual failed", output.getvalue())
+        self.assertEqual(stopped, [])
 
     def test_nonzero_process_exit_returns_process_status(self) -> None:
         result = ci_app_test_runner.run_suite(
@@ -980,7 +654,7 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("No XCTest bundle found for suite target UnknownTarget", output.getvalue())
 
-    def test_workers_one_preserves_current_serial_execution_order(self) -> None:
+    def test_run_all_suites_preserves_deterministic_serial_order(self) -> None:
         calls: list[str] = []
 
         def fake_run_suite(suite, **kwargs):
@@ -1006,61 +680,18 @@ class CIAppTestRunnerTests(unittest.TestCase):
                 swift_binary="swift",
                 cwd=None,
                 output=output,
-                workers=1,
             )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, ["RepoPromptTests.A", "RepoPromptTests.B"])
 
-    def test_workers_never_schedule_pinned_suites_in_worker_pool(self) -> None:
-        pinned = ci_app_test_runner.PlannedSuite(
-            suite="RepoPromptTests.Pinned",
-            classification="pinned_serial",
-            serial_lanes=("app_window_state",),
-            matched_serial_tags=("WindowStatesManager",),
-            shared_state_tags=("WindowStatesManager",),
-            resource_cost_tags=(),
-            execution_tiers=("routine",),
-            estimated_runtime_seconds=1.0,
-            method_count=1,
-            heavy_tier_present=False,
-        )
-        eligible = ci_app_test_runner.PlannedSuite(
-            suite="RepoPromptTests.Free",
-            classification="parallel_eligible",
-            serial_lanes=(),
-            matched_serial_tags=(),
-            shared_state_tags=(),
-            resource_cost_tags=(),
-            execution_tiers=("routine",),
-            estimated_runtime_seconds=1.0,
-            method_count=1,
-            heavy_tier_present=False,
-        )
-        buffered_calls: list[str] = []
-        direct_calls: list[str] = []
+    def test_run_all_suites_method_isolates_process_global_smoke_suite(self) -> None:
+        calls: list[str] = []
 
-        def fake_buffered(group, **kwargs):
-            buffered_calls.append(group.label)
-            return (
-                ci_app_test_runner.SuiteRunResult(
-                    suite=group.label,
-                    state="passed",
-                    exit_code=0,
-                    elapsed_seconds=0.2,
-                    output_seen=True,
-                    first_failure_line=None,
-                    last_started_test=None,
-                    timed_out_after_seconds=None,
-                    attempts=1,
-                ),
-                f"{group.label} buffered\n",
-            )
-
-        def fake_direct(group, **kwargs):
-            direct_calls.append(group.label)
+        def fake_run_suite(suite, **kwargs):
+            calls.append(suite)
             return ci_app_test_runner.SuiteRunResult(
-                suite=group.label,
+                suite=suite,
                 state="passed",
                 exit_code=0,
                 elapsed_seconds=0.1,
@@ -1071,150 +702,133 @@ class CIAppTestRunnerTests(unittest.TestCase):
                 attempts=1,
             )
 
-        with (
-            mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered),
-            mock.patch.object(
-                ci_app_test_runner,
-                "run_suite_group_and_report",
-                side_effect=fake_direct,
-            ),
-        ):
+        suite = "RepoPromptTests.WorktreeAPISmokeHarnessTests"
+        methods = (
+            f"{suite}/testContextBuilderExport",
+            f"{suite}/testManageWorktreeAndAgentRun",
+        )
+        output = io.StringIO()
+        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
             exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.Pinned", "RepoPromptTests.Free"],
+                [suite],
                 timeout_seconds=1.0,
                 silent_timeout_retries=0,
                 swift_binary="swift",
                 cwd=None,
-                output=io.StringIO(),
-                suite_plan=ci_app_test_runner.SuitePlan((eligible, pinned)),
-                workers=2,
+                output=output,
+                method_counts={suite: len(methods)},
+                suite_methods={suite: methods},
             )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(direct_calls, ["RepoPromptTests.Pinned"])
-        self.assertEqual(buffered_calls, ["RepoPromptTests.Free"])
+        self.assertEqual(calls, list(methods))
+        self.assertIn("Method-isolating", output.getvalue())
 
-    def test_parallel_fail_fast_stops_submitting_new_eligible_work(self) -> None:
-        suites = [
-            ci_app_test_runner.PlannedSuite(
-                suite=name,
-                classification="parallel_eligible",
-                serial_lanes=(),
-                matched_serial_tags=(),
-                shared_state_tags=(),
-                resource_cost_tags=(),
-                execution_tiers=("routine",),
-                estimated_runtime_seconds=1.0,
-                method_count=1,
-                heavy_tier_present=False,
-            )
-            for name in ["RepoPromptTests.AFail", "RepoPromptTests.BNotSubmitted", "RepoPromptTests.CAlsoNotSubmitted"]
-        ]
+    def test_run_all_suites_collects_failures_and_continues(self) -> None:
         calls: list[str] = []
 
-        def fake_buffered(group, **kwargs):
-            calls.append(group.label)
-            state = "failed" if group.label == "RepoPromptTests.AFail" else "passed"
-            return (
-                ci_app_test_runner.SuiteRunResult(
-                    suite=group.label,
-                    state=state,
-                    exit_code=7 if state == "failed" else 0,
+        def fake_run_suite(suite, **kwargs):
+            calls.append(suite)
+            if suite == "RepoPromptTests.A":
+                return ci_app_test_runner.SuiteRunResult(
+                    suite=suite,
+                    state="failed",
+                    exit_code=1,
                     elapsed_seconds=0.1,
                     output_seen=True,
-                    first_failure_line=None,
-                    last_started_test=None,
+                    first_failure_line="A failed",
+                    last_started_test="RepoPromptTests.A testFailure",
                     timed_out_after_seconds=None,
                     attempts=1,
-                ),
-                f"{group.label} {state}\n",
-            )
-
-        with mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered):
-            exit_code = ci_app_test_runner.run_all_suites(
-                [suite.suite for suite in suites],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=io.StringIO(),
-                suite_plan=ci_app_test_runner.SuitePlan(tuple(suites)),
-                workers=1 + 1,
-            )
-
-        self.assertEqual(exit_code, 7)
-        self.assertIn("RepoPromptTests.AFail", calls)
-        self.assertNotIn("RepoPromptTests.CAlsoNotSubmitted", calls)
-
-    def test_parallel_fail_fast_ignores_cancelled_peers_for_first_failure(self) -> None:
-        """Cancelled worker results must not steal first_failure / exit code.
-
-        When workers>1, peers observe the cancellation event and return
-        state=cancelled with exit 130. Those results can land in the same
-        futures batch as the real failure and sort first by group label.
-        Attribution must stay with the non-cancelled failure.
-        """
-        suites = [
-            ci_app_test_runner.PlannedSuite(
-                suite=name,
-                classification="parallel_eligible",
-                serial_lanes=(),
-                matched_serial_tags=(),
-                shared_state_tags=(),
-                resource_cost_tags=(),
-                execution_tiers=("routine",),
-                estimated_runtime_seconds=1.0,
-                method_count=1,
-                heavy_tier_present=False,
-            )
-            for name in ["RepoPromptTests.APeer", "RepoPromptTests.ZFail"]
-        ]
-
-        def fake_buffered(group, **kwargs):
-            if group.label == "RepoPromptTests.ZFail":
-                return (
-                    ci_app_test_runner.SuiteRunResult(
-                        suite=group.label,
-                        state="failed",
-                        exit_code=7,
-                        elapsed_seconds=0.1,
-                        output_seen=True,
-                        first_failure_line="XCTAssert failed: real failure",
-                        last_started_test=None,
-                        timed_out_after_seconds=None,
-                        attempts=1,
-                    ),
-                    f"{group.label} failed\n",
                 )
-            # Peer cancelled due to fail-fast; label sorts before ZFail.
-            return (
-                ci_app_test_runner.SuiteRunResult(
-                    suite=group.label,
-                    state="cancelled",
-                    exit_code=130,
-                    elapsed_seconds=0.05,
+            if suite == "RepoPromptTests.C":
+                return ci_app_test_runner.SuiteRunResult(
+                    suite=suite,
+                    state="timed_out",
+                    exit_code=ci_app_test_runner.TIMEOUT_EXIT_CODE,
+                    elapsed_seconds=1.0,
                     output_seen=True,
                     first_failure_line=None,
-                    last_started_test=None,
-                    timed_out_after_seconds=None,
+                    last_started_test="RepoPromptTests.C testTimeout",
+                    timed_out_after_seconds=1.0,
                     attempts=1,
-                ),
-                f"{group.label} cancelled\n",
+                )
+            return ci_app_test_runner.SuiteRunResult(
+                suite=suite,
+                state="passed",
+                exit_code=0,
+                elapsed_seconds=0.2,
+                output_seen=True,
+                first_failure_line=None,
+                last_started_test=None,
+                timed_out_after_seconds=None,
+                attempts=1,
             )
 
-        with mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered):
+        output = io.StringIO()
+        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
             exit_code = ci_app_test_runner.run_all_suites(
-                [suite.suite for suite in suites],
+                ["RepoPromptTests.C", "RepoPromptTests.B", "RepoPromptTests.A"],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            calls,
+            ["RepoPromptTests.A", "RepoPromptTests.B", "RepoPromptTests.C"],
+        )
+        summary = output.getvalue().split("Failed app test suites:\n", 1)[1]
+        self.assertIn("2 failed suite(s)", output.getvalue())
+        self.assertIn("RepoPromptTests.A: failed", summary)
+        self.assertIn("RepoPromptTests.C: timed_out", summary)
+
+    def test_run_all_suites_executes_only_the_selected_lpt_shard(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_suite(suite, **kwargs):
+            calls.append(suite)
+            return ci_app_test_runner.SuiteRunResult(
+                suite=suite,
+                state="passed",
+                exit_code=0,
+                elapsed_seconds=0.1,
+                output_seen=True,
+                first_failure_line=None,
+                last_started_test=None,
+                timed_out_after_seconds=None,
+                attempts=1,
+            )
+
+        method_counts = {
+            "RepoPromptTests.A": 8,
+            "RepoPromptTests.B": 5,
+            "RepoPromptTests.C": 3,
+            "RepoPromptTests.D": 2,
+        }
+        expected, _ = ci_app_test_runner.select_shard(
+            method_counts,
+            shard_count=2,
+            shard_index=2,
+        )
+        with mock.patch.object(ci_app_test_runner, "run_suite", side_effect=fake_run_suite):
+            exit_code = ci_app_test_runner.run_all_suites(
+                method_counts,
                 timeout_seconds=1.0,
                 silent_timeout_retries=0,
                 swift_binary="swift",
                 cwd=None,
                 output=io.StringIO(),
-                suite_plan=ci_app_test_runner.SuitePlan(tuple(suites)),
-                workers=2,
+                method_counts=method_counts,
+                shard_count=2,
+                shard_index=2,
             )
 
-        self.assertEqual(exit_code, 7)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, expected)
 
     def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
         captured_args: list[list[str]] = []
@@ -1253,8 +867,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch.object(ci_app_test_runner, "discover_test_bundles", return_value=bundles),
             mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
@@ -1281,8 +898,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch.object(
                 ci_app_test_runner,
@@ -1323,8 +943,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch.object(
                 ci_app_test_runner,
@@ -1351,8 +974,11 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+                "list_suite_methods",
+                return_value={
+                    "RepoPromptTests.A": ("RepoPromptTests.A/testOne",),
+                    "RepoPromptWorkspaceTests.B": ("RepoPromptWorkspaceTests.B/testOne",),
+                },
             ),
             mock.patch("sys.stdout", output),
         ):
@@ -1366,8 +992,8 @@ class CIAppTestRunnerTests(unittest.TestCase):
         with (
             mock.patch.object(
                 ci_app_test_runner,
-                "list_suites",
-                return_value=["RepoPromptWorkspaceTests.A"],
+                "list_suite_methods",
+                return_value={"RepoPromptWorkspaceTests.A": ("RepoPromptWorkspaceTests.A/testOne",)},
             ),
             mock.patch.object(ci_app_test_runner, "discover_test_bundle", return_value=None),
             mock.patch.object(ci_app_test_runner, "run_all_suites") as run_all_suites,
@@ -1379,291 +1005,6 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertIn("did not match any built XCTest bundle", output.getvalue())
         run_all_suites.assert_not_called()
 
-    def write_ledger(self, directory: Path, rows: list[dict[str, str]]) -> Path:
-        header = [
-            "method_id",
-            "target",
-            "file",
-            "suite",
-            "method",
-            "domain",
-            "primary_contract_id",
-            "secondary_contract_tags",
-            "validation_class",
-            "layer",
-            "execution_tier",
-            "scenario_count",
-            "fixture_ids",
-            "observable_oracle",
-            "failure_risk",
-            "runtime_seconds",
-            "resource_cost_tags",
-            "shared_state_tags",
-            "lifecycle_owner",
-            "current_disposition",
-            "replacement_method_id",
-            "preserved_scenario_delta",
-            "notes",
-        ]
-        path = directory / "ledger.tsv"
-        lines = ["\t".join(header)]
-        for row in rows:
-            complete = {key: "" for key in header}
-            complete.update(
-                {
-                    "method_id": f"root/{row['suite']}/{row['method']}",
-                    "target": "root",
-                    "file": "Tests/Fake.swift",
-                    "domain": "Root",
-                    "primary_contract_id": "contract",
-                    "validation_class": "unit",
-                    "layer": "root_swiftpm",
-                    "execution_tier": "fast",
-                    "scenario_count": "1",
-                    "observable_oracle": "oracle",
-                    "failure_risk": "low",
-                    "lifecycle_owner": "owner",
-                    "current_disposition": "retain",
-                    "preserved_scenario_delta": "0",
-                }
-            )
-            complete.update(row)
-            lines.append("\t".join(complete[key] for key in header))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
-
-    def test_plan_selected_suites_uses_runtime_balanced_shard_and_slow_first(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Slow", "method": "testOne", "runtime_seconds": "10.0"},
-                {"suite": "RepoPromptTests.Medium", "method": "testOne", "runtime_seconds": "6.0"},
-                {"suite": "RepoPromptTests.Fast", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            selected, plan = ci_app_test_runner.plan_selected_suites(
-                ["RepoPromptTests.Fast", "RepoPromptTests.Medium", "RepoPromptTests.Slow"],
-                ledger=ledger,
-                shard_count=2,
-                shard_index=2,
-                strict_ledger=True,
-                slow_first=True,
-                batch_max_seconds=5.0,
-                require_runtime_for_batching=True,
-            )
-
-        self.assertIsNotNone(plan)
-        self.assertEqual(
-            [entry.suite for entry in selected],
-            ["RepoPromptTests.Medium", "RepoPromptTests.Fast"],
-        )
-
-    def test_strict_ledger_rejects_missing_discovered_suite(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            with self.assertRaisesRegex(ValueError, "missing discovered suites"):
-                ci_app_test_runner.plan_selected_suites(
-                    ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                    ledger=ledger,
-                    shard_count=1,
-                    shard_index=1,
-                    strict_ledger=True,
-                    slow_first=False,
-                    batch_max_seconds=5.0,
-                    require_runtime_for_batching=True,
-                )
-
-    def test_workers_greater_than_one_enables_strict_ledger(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            output = io.StringIO()
-            exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=output,
-                workers=2,
-                ledger=ledger,
-                strict_ledger=False,
-            )
-
-        self.assertEqual(exit_code, 1)
-        text = output.getvalue()
-        self.assertIn("enables --strict-ledger", text)
-        self.assertIn("missing discovered suites", text)
-
-    def test_non_strict_ledger_includes_missing_discovered_suite_with_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            ledger = self.write_ledger(Path(tmp), [
-                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
-            ])
-            selected, plan = ci_app_test_runner.plan_selected_suites(
-                ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-                ledger=ledger,
-                shard_count=1,
-                shard_index=1,
-                strict_ledger=False,
-                slow_first=False,
-                batch_max_seconds=5.0,
-                require_runtime_for_batching=True,
-            )
-
-        self.assertIsNotNone(plan)
-        self.assertEqual(
-            [entry.suite for entry in selected],
-            ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
-        )
-        missing = next(entry for entry in selected if entry.suite == "RepoPromptTests.Unknown")
-        self.assertEqual(missing.estimated_seconds, 1.0)
-        self.assertFalse(missing.batch_eligible)
-
-    def test_batch_suite_entries_groups_only_adjacent_eligible_same_bundle(self) -> None:
-        entries = [
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.A", 1.0, True),
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.B", 1.5, True),
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.C", 1.0, False),
-            ci_app_test_runner.SuitePlanEntry("OtherTests.D", 1.0, True),
-        ]
-        groups = ci_app_test_runner.batch_suite_entries(
-            entries,
-            batch_fast_suites=True,
-            batch_max_suites=4,
-            batch_max_seconds=5.0,
-            bundle_selector=lambda suite: (
-                Path("/fake/RepoPromptTests.xctest")
-                if suite.startswith("RepoPrompt")
-                else Path("/fake/OtherTests.xctest")
-            ),
-        )
-
-        self.assertEqual(
-            [group.suites for group in groups],
-            [
-                ("RepoPromptTests.A", "RepoPromptTests.B"),
-                ("RepoPromptTests.C",),
-                ("OtherTests.D",),
-            ],
-        )
-
-    def test_create_suite_group_process_uses_single_comma_separated_xctest_filter_for_batch(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        bundle = Path("/fake/Tests.xctest")
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_group_process(
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-                swift_binary="swift",
-                cwd=None,
-                test_bundle=bundle,
-                xctest_binary=["/usr/bin/xctest"],
-            )
-
-        self.assertEqual(
-            captured_args[0],
-            [
-                "/usr/bin/xctest",
-                "-XCTest",
-                "RepoPromptTests.A,RepoPromptTests.B",
-                str(bundle),
-            ],
-        )
-
-    def test_run_all_suites_batches_multiple_xctest_filters_through_one_process(self) -> None:
-        launched: list[tuple[tuple[str, ...], Path | None]] = []
-
-        def fake_create_suite_group_process(suites, **kwargs):
-            launched.append((tuple(suites), kwargs["test_bundle"]))
-            return FakeProcess([
-                "Test Case '-[RepoPromptTests.A testOne]' started.\n",
-                "Test Case '-[RepoPromptTests.B testOne]' started.\n",
-            ], returncode=0)
-
-        entries = [
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.A", 1.0, True),
-            ci_app_test_runner.SuitePlanEntry("RepoPromptTests.B", 1.0, True),
-        ]
-        output = io.StringIO()
-        with (
-            mock.patch.object(
-                ci_app_test_runner,
-                "plan_selected_suites",
-                return_value=(entries, None),
-            ),
-            mock.patch.object(
-                ci_app_test_runner,
-                "create_suite_group_process",
-                side_effect=fake_create_suite_group_process,
-            ),
-        ):
-            exit_code = ci_app_test_runner.run_all_suites(
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-                timeout_seconds=1.0,
-                silent_timeout_retries=0,
-                swift_binary="swift",
-                cwd=None,
-                output=output,
-                test_bundle=Path("/fake/RepoPromptCEPackageTests.xctest"),
-                xctest_binary=["/usr/bin/xctest"],
-                batch_fast_suites=True,
-                batch_max_suites=4,
-                batch_max_seconds=5.0,
-            )
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            launched,
-            [(("RepoPromptTests.A", "RepoPromptTests.B"), Path("/fake/RepoPromptCEPackageTests.xctest"))],
-        )
-        self.assertIn("::group::RepoPromptTests.A+RepoPromptTests.B", output.getvalue())
-        self.assertIn("RepoPromptTests.B testOne", output.getvalue())
-
-    def test_suite_filter_regex_matches_swiftpm_suite_method_identifiers(self) -> None:
-        pattern = ci_app_test_runner.suite_filter_regex(["RepoPromptTests.A", "RepoPromptTests.B"])
-
-        self.assertRegex("RepoPromptTests.A/testOne", pattern)
-        self.assertRegex("RepoPromptTests.B/testTwo", pattern)
-        self.assertRegex("RepoPromptTests.A", pattern)
-        self.assertNotRegex("RepoPromptTests.Ab/testOne", pattern)
-        self.assertNotRegex("OtherTests.A/testOne", pattern)
-
-    def test_create_suite_group_process_uses_suite_prefix_swift_filter_without_bundle(self) -> None:
-        captured_args: list[list[str]] = []
-
-        class FakePopen:
-            def __init__(self, args, **kwargs) -> None:
-                captured_args.append(args)
-                self.pid = -1
-                self.stdout = None
-                self.returncode = 0
-
-        with mock.patch.object(ci_app_test_runner.subprocess, "Popen", side_effect=FakePopen):
-            ci_app_test_runner.create_suite_group_process(
-                ["RepoPromptTests.A", "RepoPromptTests.B"],
-                swift_binary="swift",
-                cwd=None,
-            )
-
-        self.assertEqual(
-            captured_args[0],
-            [
-                "swift",
-                "test",
-                "--skip-build",
-                "--filter",
-                "^(?:RepoPromptTests\\.A|RepoPromptTests\\.B)(/|$)",
-            ],
-        )
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ struct AgentInputBar: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     let oracleViewModel: OracleViewModel
     let promptManager: PromptViewModel
     let workspaceSearchService: WorkspaceSearchService
@@ -164,6 +165,7 @@ struct AgentInputBar: View {
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
             statusPillsUI: statusPillsUI,
+            openContextDrawerFiles: openContextDrawerFiles,
             oracleViewModel: oracleViewModel,
             promptManager: promptManager,
             selectionCoordinator: selectionCoordinator,
@@ -656,7 +658,7 @@ struct AgentComposerView: View, Equatable {
                 transaction.animation = nil
             }
 
-            // Right side: Attach + Context indicator + Send/Cancel button
+            // Right side: Attach + Send/Cancel button
             HStack(spacing: 8) {
                 Button(action: pickImages) {
                     Image(systemName: "photo.badge.plus")
@@ -1269,6 +1271,14 @@ struct AgentComposerView: View, Equatable {
                         }
                     ))
                     .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
+
+                    Toggle("Local Memories", isOn: Binding(
+                        get: { codexTools.memoriesEnabled },
+                        set: { newValue in
+                            actions.applyCodexToolSettingMutation(.memories(enabled: newValue))
+                        }
+                    ))
+                    .hoverTooltip("Let Codex generate and reuse local memories across Agent Mode chats. Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.")
                 } header: {
                     Text("Tools")
                 }

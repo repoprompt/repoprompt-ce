@@ -113,10 +113,12 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptC",
         "CSwiftPCRE2",
         "RepoPromptWorkspaceCore",
+        "RepoPromptDomainRuntime",
         "RepoPromptRegexCore",
         "RepoPromptCodeMapCore",
         "TreeSitterScannerSupport",
         "RepoPromptWorkspaceCoreTests",
+        "RepoPromptDomainRuntimeTests",
         "RepoPromptRegexCoreTests",
         "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
@@ -156,6 +158,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     expected_test_dependencies = {
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
+        "RepoPromptDomainRuntime",
         "RepoPromptMCP",
         "RepoPromptShared",
     }
@@ -163,8 +166,39 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
-            "RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptDomainRuntime, RepoPromptMCP, and RepoPromptShared"
         )
+
+    domain_runtime = targets["RepoPromptDomainRuntime"]
+    if domain_runtime.get("type") != "regular":
+        raise GeneratorError("RepoPromptDomainRuntime must remain an internal regular target")
+    if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime":
+        raise GeneratorError("RepoPromptDomainRuntime target path drifted")
+    domain_runtime_products = {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in domain_runtime.get("dependencies", [])
+        if dependency.get("product")
+    }
+    if (
+        _by_name_dependencies(domain_runtime)
+        != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"]
+        or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
+        or len(domain_runtime.get("dependencies", [])) != 5
+    ):
+        raise GeneratorError(
+            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, "
+            "RepoPromptCodeMapCore, Logging, and pinned MCP"
+        )
+
+    domain_runtime_tests = targets["RepoPromptDomainRuntimeTests"]
+    if domain_runtime_tests.get("type") != "test":
+        raise GeneratorError("RepoPromptDomainRuntimeTests must remain a test target")
+    if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests":
+        raise GeneratorError("RepoPromptDomainRuntimeTests target path drifted")
+    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime"]:
+        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime")
+    if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
+        raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 
     unsafe_flags: list[list[str]] = []
     for setting in repo_prompt_app.get("settings", []):

@@ -4,19 +4,36 @@ import MCP
 import Ontology
 
 @MainActor
-final class MCPSelectionToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .selection
+final class MCPSelectionToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .selection
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private typealias Dependencies = (
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    )
+
+    private let dependencies: Dependencies
 
     private struct ArtifactCommitConflict: Error {
         let reason: String
     }
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, context: MCPAppPhysicalCapabilityAdapters.Context, selection: MCPAppPhysicalCapabilityAdapters.Selection, files: MCPAppPhysicalCapabilityAdapters.Files) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = (context: context, selection: selection, files: files)
+    }
+
+    nonisolated static func invalidOnlySelectionError(
+        invalidPaths: [String],
+        fallback: String
+    ) -> MCPError {
+        .invalidParams(
+            invalidPaths.isEmpty
+                ? fallback
+                : "Invalid selection inputs: \(invalidPaths.joined(separator: ", "))"
+        )
     }
 
     func buildTools() -> [Tool] {
@@ -109,8 +126,8 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
 
     private func executeManageSelection(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
         #if DEBUG
-            let metadata = await dependencies.captureRequestMetadata()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let metadata = await dependencies.context.captureRequestMetadata()
+            let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
             let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
                 WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
                     agentSessionID: $0
@@ -144,12 +161,12 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         try Task.checkCancellation()
         let op = (args["op"]?.stringValue ?? "get").lowercased()
         let rawPaths = args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        let parsedInputs = dependencies.parseManageSelectionInputs(rawPaths, args["slices"])
+        let parsedInputs = dependencies.selection.parseManageSelectionInputs(rawPaths, args["slices"])
         let selectionPaths = parsedInputs.paths
         let sliceInputs = parsedInputs.sliceInputs
         let sliceParseErrors = parsedInputs.sliceErrors
         let mode = args["mode"]?.stringValue?.lowercased() ?? "full"
-        if await dependencies.promptVM.codeMapsGloballyDisabled, mode == "codemap_only" || op == "demote" {
+        if await dependencies.context.promptVM.codeMapsGloballyDisabled, mode == "codemap_only" || op == "demote" {
             throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
         }
         try Task.checkCancellation()
@@ -157,37 +174,35 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         let strict = args["strict"]?.boolValue ?? false
         let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
         let includeBlocks = view == "content"
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata = await dependencies.context.captureRequestMetadata()
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionAutoSelectionDrain)
         let drainRequirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement = op == "get"
             ? .canonicalSelection
             : .mirroredSelectionAndMetrics
-        guard await dependencies.drainReadFileAutoSelection(metadata, drainRequirement) == .completed else {
+        guard try await dependencies.files.drainReadFileAutoSelection(metadata, drainRequirement) == .completed else {
             throw CancellationError()
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionAutoSelectionDrain, transition: .completed)
         try Task.checkCancellation()
-        var resolvedContext = try dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageSelection, .allowLegacyImplicitRouting)
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        var resolvedContext = try dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageSelection)
+        let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
         try Task.checkCancellation()
         let lookupRootScope = lookupContext.rootScope
         if op != "get" {
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionIngressWait)
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupRootScope)
+            _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupRootScope)
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionIngressWait, transition: .completed)
         }
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction)
-        if !resolvedContext.usesActiveTabCompatibility {
-            resolvedContext.snapshot.selection = await dependencies.stabilizedVirtualSelection(resolvedContext.snapshot)
-            try Task.checkCancellation()
-        }
+        resolvedContext.snapshot.selection = await dependencies.selection.stabilizedVirtualSelection(resolvedContext.snapshot)
+        try Task.checkCancellation()
         resolvedContext.snapshot.selection = lookupContext.physicalizeSelection(resolvedContext.snapshot.selection)
         let frozenReviewContext: FrozenPromptGitReviewContext?
         let artifactResolution: MCPManageSelectionArtifactResolution
         if ["add", "remove", "set", "preview"].contains(op) {
-            let frozen = await dependencies.freezePromptGitReviewContext(resolvedContext.snapshot)
+            let frozen = await dependencies.selection.freezePromptGitReviewContext(resolvedContext.snapshot)
             frozenReviewContext = frozen
             let identity = resolvedContext.snapshot.workspaceID.map {
                 WorkspaceSelectionIdentity(
@@ -195,7 +210,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                     tabID: resolvedContext.snapshot.tabID
                 )
             }
-            artifactResolution = await dependencies.resolveManageSelectionArtifactInputs(
+            artifactResolution = await dependencies.selection.resolveManageSelectionArtifactInputs(
                 MCPManageSelectionArtifactResolutionRequest(
                     paths: parsedInputs.paths,
                     sliceInputs: parsedInputs.sliceInputs,
@@ -242,7 +257,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction, transition: .completed)
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
-            let reply = try await dependencies.buildCurrentSelectionReply(includeBlocks, display, extraInvalid, view, resolvedContext, lookupContext)
+            let reply = try await dependencies.selection.buildCurrentSelectionReply(includeBlocks, display, extraInvalid, view, resolvedContext, lookupContext)
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction, transition: .completed)
             try Task.checkCancellation()
             return reply
@@ -251,7 +266,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             if mode == "codemap_only", !physicalSliceInputs.isEmpty {
                 throw MCPError.invalidParams("mode 'codemap_only' cannot be used with slices")
             }
-            let buildResult = await dependencies.buildManageSelectionSetSelection(
+            let buildResult = await dependencies.selection.buildManageSelectionSetSelection(
                 physicalParsedInputs,
                 mode,
                 context.selection,
@@ -259,7 +274,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 lookupRootScope
             )
             try Task.checkCancellation()
-            let selectionWithArtifacts = dependencies.mutatePreResolvedFullFilePaths(
+            let selectionWithArtifacts = dependencies.selection.mutatePreResolvedFullFilePaths(
                 buildResult.selection,
                 artifactResolution.absolutePaths,
                 .add
@@ -274,11 +289,11 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             for error in extraInvalid where !combinedInvalid.contains(error) {
                 combinedInvalid.append(error)
             }
-            let previewCodeMapOverride: CodeMapUsage? = (!resolvedContext.usesActiveTabCompatibility && context.runID != nil) ? .auto : nil
+            let previewCodeMapOverride: CodeMapUsage? = context.runID != nil ? .auto : nil
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction, transition: .completed)
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
-            let previewReply = try await dependencies.buildSelectionPreviewReply(
+            let previewReply = try await dependencies.selection.buildSelectionPreviewReply(
                 previewSelectionFinal,
                 includeBlocks,
                 display,
@@ -286,11 +301,11 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 view,
                 previewCodeMapOverride,
                 lookupContext,
-                resolvedContext.usesActiveTabCompatibility ? nil : context,
+                context,
                 frozenReviewContext
             )
             if let fence = artifactResolution.fence {
-                let fenceIsCurrent = await dependencies.validateManageSelectionArtifactFence(fence)
+                let fenceIsCurrent = await dependencies.selection.validateManageSelectionArtifactFence(fence)
                 if !fenceIsCurrent {
                     throw ArtifactCommitConflict(reason: "Git artifact advertisement changed during preview")
                 }
@@ -319,7 +334,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                             hintInputs.append(candidate)
                         }
                     }
-                    let hint = await dependencies.makeSelectionHintError(hintInputs, "preview", lookupContext)
+                    let hint = await dependencies.selection.makeSelectionHintError(hintInputs, "preview", lookupContext)
                     throw MCPError.invalidParams(hint)
                 }
             }
@@ -330,7 +345,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             if mode == "codemap_only", !physicalSliceInputs.isEmpty {
                 throw MCPError.invalidParams("mode 'codemap_only' cannot be used with slices")
             }
-            let setBuildResult = await dependencies.buildManageSelectionSetSelection(
+            let setBuildResult = await dependencies.selection.buildManageSelectionSetSelection(
                 physicalParsedInputs,
                 mode,
                 context.selection,
@@ -338,7 +353,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 lookupRootScope
             )
             try Task.checkCancellation()
-            let currentSelection = dependencies.mutatePreResolvedFullFilePaths(
+            let currentSelection = dependencies.selection.mutatePreResolvedFullFilePaths(
                 setBuildResult.selection,
                 artifactResolution.absolutePaths,
                 .add
@@ -380,7 +395,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 throw MCPError.invalidParams("mode 'codemap_only' cannot be used with slices")
             }
             if !physicalSelectionPaths.isEmpty {
-                let addResult = await dependencies.addStoredSelectionPaths(currentSelection, physicalSelectionPaths, rawPaths, mode, lookupRootScope)
+                let addResult = await dependencies.selection.addStoredSelectionPaths(currentSelection, physicalSelectionPaths, rawPaths, mode, lookupRootScope)
                 try Task.checkCancellation()
                 currentSelection = addResult.selection
                 invalid.append(contentsOf: addResult.invalidPaths)
@@ -395,7 +410,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 var sliceMutated = false
                 var sliceInvalid = false
                 if !physicalSliceInputs.isEmpty {
-                    let sliceResult = await dependencies.computeSelectionSlicesVirtual(currentSelection, physicalSliceInputs, .add, lookupRootScope)
+                    let sliceResult = await dependencies.selection.computeSelectionSlicesVirtual(currentSelection, physicalSliceInputs, .add, lookupRootScope)
                     try Task.checkCancellation()
                     currentSelection = sliceResult.selection
                     invalid.append(contentsOf: sliceResult.result.invalidPaths)
@@ -415,7 +430,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                         )
                     }
                     if !selectionPaths.isEmpty {
-                        let hint = await dependencies.makeSelectionHintError(rawPaths, "add", lookupContext)
+                        let hint = await dependencies.selection.makeSelectionHintError(rawPaths, "add", lookupContext)
                         throw MCPError.invalidParams(hint)
                     } else if !sliceInvalid {
                         throw MCPError.invalidParams("Provided slices did not match any files")
@@ -429,10 +444,10 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                         artifactResolution.invalidDiagnostics.joined(separator: "; ")
                     )
                 }
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "add", lookupContext)
+                let hint = await dependencies.selection.makeSelectionHintError(rawPaths, "add", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
-            currentSelection = dependencies.mutatePreResolvedFullFilePaths(
+            currentSelection = dependencies.selection.mutatePreResolvedFullFilePaths(
                 currentSelection,
                 artifactResolution.absolutePaths,
                 .add
@@ -470,7 +485,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             var pathMutated = false
             var currentSelection = context.selection
             if !physicalSelectionPaths.isEmpty {
-                let result = await dependencies.removeStoredSelectionPaths(currentSelection, physicalSelectionPaths, rawPaths, mode, lookupRootScope)
+                let result = await dependencies.selection.removeStoredSelectionPaths(currentSelection, physicalSelectionPaths, rawPaths, mode, lookupRootScope)
                 try Task.checkCancellation()
                 currentSelection = result.0
                 invalid.append(contentsOf: result.1)
@@ -483,7 +498,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             var sliceMutated = false
             var sliceInvalid = false
             if !physicalSliceInputs.isEmpty {
-                let sliceResult = await dependencies.computeSelectionSlicesVirtual(currentSelection, physicalSliceInputs, .remove, lookupRootScope)
+                let sliceResult = await dependencies.selection.computeSelectionSlicesVirtual(currentSelection, physicalSliceInputs, .remove, lookupRootScope)
                 try Task.checkCancellation()
                 currentSelection = sliceResult.selection
                 invalid.append(contentsOf: sliceResult.result.invalidPaths)
@@ -505,11 +520,11 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                         artifactResolution.invalidDiagnostics.joined(separator: "; ")
                     )
                 } else {
-                    let hint = await dependencies.makeSelectionHintError(rawPaths, "remove", lookupContext)
+                    let hint = await dependencies.selection.makeSelectionHintError(rawPaths, "remove", lookupContext)
                     throw MCPError.invalidParams(hint)
                 }
             }
-            currentSelection = dependencies.mutatePreResolvedFullFilePaths(
+            currentSelection = dependencies.selection.mutatePreResolvedFullFilePaths(
                 currentSelection,
                 artifactResolution.absolutePaths,
                 .remove
@@ -539,23 +554,25 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             selectionLog("[Virtual] manage_selection op=promote paths=\(selectionPaths.count) tab=\(context.tabID)")
             if physicalSelectionPaths.isEmpty { throw MCPError.invalidParams("paths required for promote") }
             if !physicalSliceInputs.isEmpty { throw MCPError.invalidParams("promote does not support slices") }
-            let (newSelection, invalid, mutated) = await dependencies.promoteStoredSelectionPaths(context.selection, physicalSelectionPaths, rawPaths, strict, lookupRootScope)
+            let promoteResult = await dependencies.selection.promoteStoredSelectionPaths(context.selection, physicalSelectionPaths, rawPaths, strict, lookupRootScope)
             try Task.checkCancellation()
-            var combinedInvalid = invalid
+            var combinedInvalid = promoteResult.invalidPaths
             for error in extraInvalid where !combinedInvalid.contains(error) {
                 combinedInvalid.append(error)
             }
-            if strict, !mutated {
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "promote", lookupContext)
-                throw MCPError.invalidParams(hint)
+            if promoteResult.validCandidateCount == 0 {
+                let hint = combinedInvalid.isEmpty
+                    ? await dependencies.selection.makeSelectionHintError(rawPaths, "promote", lookupContext)
+                    : ""
+                throw Self.invalidOnlySelectionError(invalidPaths: combinedInvalid, fallback: hint)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: newSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: promoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view, mutated: promoteResult.mutated)
         case "demote":
             let context = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=demote paths=\(selectionPaths.count) tab=\(context.tabID)")
             if physicalSelectionPaths.isEmpty { throw MCPError.invalidParams("paths required for demote") }
             if !physicalSliceInputs.isEmpty { throw MCPError.invalidParams("demote does not support slices") }
-            let demoteResult = await dependencies.demoteStoredSelectionPaths(context.selection, physicalSelectionPaths, rawPaths, strict, lookupRootScope)
+            let demoteResult = await dependencies.selection.demoteStoredSelectionPaths(context.selection, physicalSelectionPaths, rawPaths, strict, lookupRootScope)
             try Task.checkCancellation()
             var combinedInvalid = demoteResult.invalidPaths
             for error in extraInvalid where !combinedInvalid.contains(error) {
@@ -564,11 +581,13 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             for msg in demoteResult.codemapUnavailable where !combinedInvalid.contains(msg) {
                 combinedInvalid.append(msg)
             }
-            if strict, !demoteResult.mutated {
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "demote", lookupContext)
-                throw MCPError.invalidParams(hint)
+            if demoteResult.validCandidateCount == 0 {
+                let hint = combinedInvalid.isEmpty
+                    ? await dependencies.selection.makeSelectionHintError(rawPaths, "demote", lookupContext)
+                    : ""
+                throw Self.invalidOnlySelectionError(invalidPaths: combinedInvalid, fallback: hint)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view, mutated: demoteResult.mutated)
         case "clear":
             let baseContext = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=clear mode=\(mode) tab=\(baseContext.tabID)")
@@ -589,12 +608,13 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         resolvedContext: inout MCPServerViewModel.ResolvedTabContextSnapshot,
         metadata: MCPServerViewModel.RequestMetadata,
         lookupContext: WorkspaceLookupContext,
-        baseContext: MCPServerViewModel.TabScopedContext,
+        baseContext: MCPServerViewModel.TabContextSnapshot,
         selection: StoredSelection,
         includeBlocks: Bool,
         display: FilePathDisplay,
         extraInvalid: [String],
         view: String,
+        mutated: Bool = true,
         artifactFence: MCPManageSelectionArtifactAuthorizationFence? = nil,
         reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async throws -> ToolResultDTOs.SelectionReply {
@@ -604,7 +624,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionPersistence)
         let canonicalSelection: StoredSelection
         if let artifactFence {
-            let result = await dependencies.commitManageSelectionArtifactMutation(
+            let result = await dependencies.selection.commitManageSelectionArtifactMutation(
                 resolvedContext,
                 metadata,
                 baseContext.selection,
@@ -622,8 +642,8 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                     "Selection persistence handoff failed for manage_selection: \(reason)."
                 )
             }
-        } else {
-            let verification = await dependencies.persistResolvedTabContextSnapshot(
+        } else if mutated {
+            let verification = await dependencies.selection.persistResolvedTabContextSnapshot(
                 resolvedContext,
                 metadata,
                 true
@@ -635,21 +655,23 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 operation: "manage_selection",
                 recovery: "Retry manage_selection for the same context_id or rebind the tab context before continuing."
             )
+        } else {
+            canonicalSelection = baseContext.selection
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionPersistence, transition: .completed)
         try Task.checkCancellation()
-        let codeMapOverride: CodeMapUsage? = (!resolvedContext.usesActiveTabCompatibility && baseContext.runID != nil) ? .auto : nil
+        let codeMapOverride: CodeMapUsage? = baseContext.runID != nil ? .auto : nil
         var replyContext = baseContext
         replyContext.selection = canonicalSelection
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
-        let reply = try await dependencies.buildSelectionMutationReply(
+        let reply = try await dependencies.selection.buildSelectionMutationReply(
             canonicalSelection,
             includeBlocks,
             display,
             extraInvalid,
             view,
             codeMapOverride,
-            resolvedContext.usesActiveTabCompatibility ? nil : replyContext,
+            replyContext,
             lookupContext,
             reviewGitContext
         )

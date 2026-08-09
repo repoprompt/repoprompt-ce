@@ -3,6 +3,7 @@ import Foundation
 struct PromptFileEntrySnapshot {
     let fileID: UUID
     let relativePath: String
+    let renderedDisplayPath: String
     let isCodemapRequested: Bool
     let ranges: [LineRange]?
     let cachedFullTokenCount: Int?

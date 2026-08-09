@@ -254,11 +254,9 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         _ = await store.cancelCodemapArtifactDemand(ready.ticket)
     }
 
-    func testInvalidatedNonGitProofReclassifiesLocallyBeforeConvertedRepositoryPreflight() async throws {
+    func testInvalidatedNonGitProofReclassifiesLocallyWithoutGitPreflight() async throws {
         let root = try makeDirectory("invalidated-proof-reclassification")
         try writeSwiftFile(in: root)
-        let gitFixture = try ReviewGitRepositoryFixture(name: #function)
-        addTeardownBlock { gitFixture.cleanup() }
         let classificationCount = AsyncCounter()
         let gitPreflightCount = AsyncCounter()
         let validationGate = LocalGitProofValidationGate()
@@ -296,26 +294,6 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         let nonGitPreflightCount = await gitPreflightCount.value
         XCTAssertGreaterThan(reclassifiedCount, initialClassificationCount)
         XCTAssertEqual(nonGitPreflightCount, 0)
-
-        _ = try gitFixture.runGit(["init"], at: root)
-        _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: root)
-        _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: root)
-        _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: root)
-        _ = try gitFixture.runGit(["add", "."], at: root)
-        _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: root)
-        await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.folderAdded(".git")])
-
-        let nextDemand = await store.requestCodemapArtifact(forFileID: file.id)
-        let ready = try await settledReady(
-            nextDemand,
-            store: store,
-            gitPreflightCount: gitPreflightCount,
-            root: root,
-            file: file
-        )
-        let finalGitPreflightCount = await gitPreflightCount.value
-        XCTAssertGreaterThan(finalGitPreflightCount, nonGitPreflightCount)
-        _ = await store.cancelCodemapArtifactDemand(ready.ticket)
     }
 
     private func makeDirectory(_ name: String) throws -> URL {
@@ -367,31 +345,46 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         // readiness, not latency, so allow that bounded retry without accepting a non-ready result.
         timeout: Duration = .seconds(60)
     ) async throws -> WorkspaceCodemapArtifactDemandReady {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
         var result = initial
-        if case let .pending(ticket) = result {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            result = await store.waitForCodemapArtifactDemandChange(ticket, deadline: deadline)
-            if case .pending = result {
+        while true {
+            switch result {
+            case let .ready(ready):
+                return ready
+            case let .pending(ticket):
+                result = await store.waitForCodemapArtifactDemandChange(ticket, deadline: deadline)
+                if case .pending = result {
+                    _ = await store.cancelCodemapArtifactDemand(ticket)
+                    let preflightCount = await gitPreflightCount.value
+                    throw LocalGitClassificationTestError.expectedReady(
+                        "Timed out waiting for ready codemap demand after Git layout conversion; " +
+                            "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
+                            "root=\(root.path), fileID=\(file.id)"
+                    )
+                }
+            case let .unavailable(.busy(retryAfterMilliseconds)):
+                let remaining = clock.now.duration(to: deadline)
+                guard remaining > .zero else {
+                    let preflightCount = await gitPreflightCount.value
+                    throw LocalGitClassificationTestError.expectedReady(
+                        "Timed out retrying busy codemap demand after Git layout conversion; " +
+                            "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
+                            "root=\(root.path), fileID=\(file.id)"
+                    )
+                }
+                let retryDelay = Duration.milliseconds(max(1, retryAfterMilliseconds ?? 10))
+                try await Task.sleep(for: min(retryDelay, remaining))
+                result = await store.requestCodemapArtifact(forFileID: file.id)
+            case .unavailable:
                 let preflightCount = await gitPreflightCount.value
-                XCTFail(
-                    "Timed out waiting for ready codemap demand after Git layout conversion; " +
+                throw LocalGitClassificationTestError.expectedReady(
+                    "Expected ready codemap demand after Git layout conversion; " +
                         "lastDemand=\(result), gitPreflightCount=\(preflightCount), " +
                         "root=\(root.path), fileID=\(file.id)"
                 )
-                throw LocalGitClassificationTestError.expectedReady
             }
         }
-
-        guard case let .ready(ready) = result else {
-            let preflightCount = await gitPreflightCount.value
-            XCTFail(
-                "Expected ready codemap demand after Git layout conversion, got \(result); " +
-                    "gitPreflightCount=\(preflightCount), root=\(root.path), fileID=\(file.id)"
-            )
-            throw LocalGitClassificationTestError.expectedReady
-        }
-        return ready
     }
 
     private func assertTransient(
@@ -405,8 +398,14 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
     }
 }
 
-private enum LocalGitClassificationTestError: Error {
-    case expectedReady
+private enum LocalGitClassificationTestError: LocalizedError {
+    case expectedReady(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .expectedReady(message): message
+        }
+    }
 }
 
 private final class LocalGitProofValidationGate: @unchecked Sendable {

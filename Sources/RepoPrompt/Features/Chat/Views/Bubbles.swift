@@ -282,6 +282,7 @@ struct MessageBubble: View {
     let message: AIChatMessage
     @ObservedObject var viewModel: OracleViewModel
     let isLatestMessage: Bool
+    let actionPolicy: ChatTranscriptActionPolicy
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     // Flags for hover states
@@ -391,20 +392,21 @@ struct MessageBubble: View {
             // Buttons below the bubble
             HStack { // Outer container to align trailing without forcing inner to expand
                 HStack(spacing: 8) {
-                    // Token indicator for user messages - always render to prevent layout shifts
-                    Group {
-                        if let inTok = message.promptTokens,
-                           let outTok = message.completionTokens
-                        {
-                            TokenUsageIndicator(inputTokens: inTok, outputTokens: outTok, modelName: nil)
-                        } else {
-                            // Invisible placeholder with same height to maintain stable layout
-                            Color.clear
-                                .frame(width: 0, height: 20)
+                    if actionPolicy.showsTokenUsage {
+                        // Token indicator for user messages - always render to prevent layout shifts
+                        Group {
+                            if let inTok = message.promptTokens,
+                               let outTok = message.completionTokens
+                            {
+                                TokenUsageIndicator(inputTokens: inTok, outputTokens: outTok, modelName: nil)
+                            } else {
+                                // Invisible placeholder with same height to maintain stable layout
+                                Color.clear
+                                    .frame(width: 0, height: 20)
+                            }
                         }
                     }
 
-                    // Always show copy for user messages
                     CopyButtonOverlay(
                         message: message,
                         viewModel: viewModel,
@@ -413,21 +415,22 @@ struct MessageBubble: View {
                         showingDeleteConfirmation: $showingDeleteConfirmation
                     )
 
-                    // Edit button for user messages
-                    EditButtonOverlay(
-                        isHoveringEdit: $isHoveringEdit,
-                        isEditingMessage: $isEditingMessage,
-                        editedText: $editedText,
-                        messageContent: message.content,
-                        isDisabled: viewModel.isSessionStreaming(viewModel.currentSessionID)
-                    )
+                    if actionPolicy.allowsMutatingActions {
+                        EditButtonOverlay(
+                            isHoveringEdit: $isHoveringEdit,
+                            isEditingMessage: $isEditingMessage,
+                            editedText: $editedText,
+                            messageContent: message.content,
+                            isDisabled: viewModel.isSessionStreaming(viewModel.currentSessionID)
+                        )
 
-                    DeleteButtonOverlay(
-                        message: message,
-                        viewModel: viewModel,
-                        isHoveringDelete: $isHoveringDelete,
-                        showingConfirmation: $showingDeleteConfirmation
-                    )
+                        DeleteButtonOverlay(
+                            message: message,
+                            viewModel: viewModel,
+                            isHoveringDelete: $isHoveringDelete,
+                            showingConfirmation: $showingDeleteConfirmation
+                        )
+                    }
                 }
                 .padding(.vertical, 4)
                 .padding(.horizontal, 8)
@@ -479,24 +482,27 @@ struct MessageBubble: View {
                         showingDeleteConfirmation: $showingDeleteConfirmation
                     )
 
-                    ForkButtonOverlay(
-                        message: message,
-                        viewModel: viewModel,
-                        isHoveringFork: $isHoveringFork
-                    )
+                    if actionPolicy.allowsMutatingActions {
+                        ForkButtonOverlay(
+                            message: message,
+                            viewModel: viewModel,
+                            isHoveringFork: $isHoveringFork
+                        )
 
-                    DeleteButtonOverlay(
-                        message: message,
-                        viewModel: viewModel,
-                        isHoveringDelete: $isHoveringDelete,
-                        showingConfirmation: $showingDeleteConfirmation
-                    )
+                        DeleteButtonOverlay(
+                            message: message,
+                            viewModel: viewModel,
+                            isHoveringDelete: $isHoveringDelete,
+                            showingConfirmation: $showingDeleteConfirmation
+                        )
 
-                    if message.selectedFileCount > 0 {
-                        FileSelectionIndicator(message: message, viewModel: viewModel)
+                        if message.selectedFileCount > 0 {
+                            FileSelectionIndicator(message: message, viewModel: viewModel)
+                        }
                     }
 
-                    if let inTok = message.promptTokens,
+                    if actionPolicy.showsTokenUsage,
+                       let inTok = message.promptTokens,
                        let outTok = message.completionTokens
                     {
                         TokenUsageIndicator(

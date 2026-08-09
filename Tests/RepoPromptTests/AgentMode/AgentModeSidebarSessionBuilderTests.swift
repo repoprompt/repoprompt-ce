@@ -451,14 +451,108 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         )
     }
 
+    func testSessionlessComposeTabDoesNotConsumeUnboundLiveSessionMetadata() throws {
+        let tabID = id(60)
+        let phantomParentID = id(160)
+        let composeTab = tab(tabID, sessionID: nil, name: "T9", lastModified: date(20))
+        let unboundSession = AgentModeViewModel.TabSession(tabID: tabID)
+        unboundSession.parentSessionID = phantomParentID
+        unboundSession.hasLoadedPersistedState = true
+        unboundSession.lastActivityAt = date(200)
+
+        let rows = build(
+            tabs: [composeTab],
+            sessions: [tabID: unboundSession],
+            sessionIndex: [:]
+        )
+
+        let sessionlessRow = try row(for: tabID, in: rows)
+        XCTAssertEqual(sessionlessRow.title, "New Chat")
+        XCTAssertNil(sessionlessRow.sessionID)
+        XCTAssertNil(sessionlessRow.parentSessionID)
+        XCTAssertEqual(sessionlessRow.depth, 0)
+        XCTAssertNil(sessionlessRow.lastUserMessageAt)
+        XCTAssertEqual(sessionlessRow.activityDate, date(20))
+        XCTAssertNil(sessionlessRow.worktree)
+        XCTAssertNil(sessionlessRow.worktreeMergeAttention)
+        let identifiers = sessionlessRow.searchFields.fields
+            .filter { $0.kind == .identifier }
+            .map(\.text)
+        XCTAssertEqual(identifiers, [tabID.uuidString])
+    }
+
+    func testSessionlessRootDoesNotChangeValidSessionHierarchy() {
+        let sessionlessTabID = id(61)
+        let parentTabID = id(62)
+        let childTabID = id(63)
+        let grandchildTabID = id(64)
+        let parentSessionID = id(161)
+        let childSessionID = id(162)
+        let grandchildSessionID = id(163)
+        let tabs = [
+            tab(sessionlessTabID, sessionID: nil, lastModified: date(50)),
+            tab(parentTabID, sessionID: parentSessionID),
+            tab(childTabID, sessionID: childSessionID),
+            tab(grandchildTabID, sessionID: grandchildSessionID)
+        ]
+        let index = sessionIndex([
+            entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(30)),
+            entry(childSessionID, tabID: childTabID, parentSessionID: parentSessionID, lastUserMessageAt: date(20)),
+            entry(
+                grandchildSessionID,
+                tabID: grandchildTabID,
+                parentSessionID: childSessionID,
+                lastUserMessageAt: date(10)
+            )
+        ])
+
+        let rows = build(tabs: tabs, sessionIndex: index)
+
+        XCTAssertEqual(rows.map(\.tabID), [sessionlessTabID, parentTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(rows.map(\.depth), [0, 0, 1, 2])
+    }
+
+    func testSessionlessRowsPreserveFrozenSessionRestoreOrder() {
+        let pinnedSessionlessTabID = id(65)
+        let unpinnedSessionlessTabID = id(66)
+        let firstSessionTabID = id(67)
+        let secondSessionTabID = id(68)
+        let firstSessionID = id(164)
+        let secondSessionID = id(165)
+        let tabs = [
+            tab(unpinnedSessionlessTabID, sessionID: nil, lastModified: date(100)),
+            tab(secondSessionTabID, sessionID: secondSessionID),
+            tab(pinnedSessionlessTabID, sessionID: nil, isPinned: true, lastModified: date(200)),
+            tab(firstSessionTabID, sessionID: firstSessionID)
+        ]
+        let index = sessionIndex([
+            entry(firstSessionID, tabID: firstSessionTabID, lastUserMessageAt: date(10)),
+            entry(secondSessionID, tabID: secondSessionTabID, lastUserMessageAt: date(20))
+        ])
+
+        let rows = build(
+            tabs: tabs,
+            sessionIndex: index,
+            sessionListCacheReady: false,
+            frozenOrderByTabID: [firstSessionTabID: 0, secondSessionTabID: 1]
+        )
+
+        XCTAssertEqual(
+            rows.map(\.tabID),
+            [pinnedSessionlessTabID, firstSessionTabID, secondSessionTabID, unpinnedSessionlessTabID]
+        )
+    }
+
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
-        sessionIndex: [UUID: AgentSessionIndexEntry]
+        sessionIndex: [UUID: AgentSessionIndexEntry],
+        sessionListCacheReady: Bool = true,
+        frozenOrderByTabID: [UUID: Int] = [:]
     ) -> [AgentModeViewModel.SidebarSession] {
         AgentModeSidebarSessionBuilder(
             allTabs: tabs,
-            linkedTabs: tabs,
+            rowTabs: tabs,
             sessions: sessions,
             authoritativeSessionIDByTabID: Dictionary(
                 uniqueKeysWithValues: tabs.compactMap { tab in
@@ -467,8 +561,8 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             ),
             sessionIndex: sessionIndex,
             sessionListSortDates: [:],
-            sessionListCacheReady: true,
-            sidebarRestoreFrozenOrderByTabID: [:],
+            sessionListCacheReady: sessionListCacheReady,
+            sidebarRestoreFrozenOrderByTabID: frozenOrderByTabID,
             mcpControlledTabIDs: []
         ).build()
     }
@@ -490,13 +584,14 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
 
     private func tab(
         _ tabID: UUID,
-        sessionID: UUID,
+        sessionID: UUID?,
+        name: String? = nil,
         isPinned: Bool = false,
         lastModified: Date? = nil
     ) -> ComposeTabState {
         ComposeTabState(
             id: tabID,
-            name: "Tab \(tabID.uuidString.suffix(4))",
+            name: name ?? "Tab \(tabID.uuidString.suffix(4))",
             lastModified: lastModified ?? date(1),
             isPinned: isPinned,
             activeAgentSessionID: sessionID

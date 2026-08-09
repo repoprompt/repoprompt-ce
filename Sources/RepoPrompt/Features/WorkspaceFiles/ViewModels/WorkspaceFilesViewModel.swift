@@ -850,7 +850,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var sliceRebaseSourceSnapshotByFullPath: [String: SliceRebaseSourceSnapshot] = [:]
     private var sliceRebaseCommitTasksByFullPath: [String: Task<Void, Never>] = [:]
     private var sliceRebaseCommitIDsByFullPath: [String: UUID] = [:]
-    private var sessionWorktreeBindingsProvider: (@MainActor (UUID) -> [AgentSessionWorktreeBinding])?
+    private var sessionWorktreeBindingStatesProvider: (@MainActor (Set<UUID>) -> [UUID: AgentSessionWorktreeBindingState])?
     private var hiddenSessionHandledGenerationByRootLifetime: [HiddenSessionRootLifetimeKey: UInt64] = [:]
     private var hiddenSessionRootLifetimeByPhysicalPath: [String: HiddenSessionRootLifetimeKey] = [:]
     /// Monotonic revision incremented for any partition save seen in the current workspace.
@@ -1346,10 +1346,26 @@ class WorkspaceFilesViewModel: ObservableObject {
         fileSystemSettingsCancellable?.cancel()
     }
 
+    /// Compatibility setter for narrow callers. Production composition installs
+    /// the batch provider below so a multi-tab projection shares one authority scan.
     func setSessionWorktreeBindingsProvider(
         _ provider: @escaping @MainActor (UUID) -> [AgentSessionWorktreeBinding]
     ) {
-        sessionWorktreeBindingsProvider = provider
+        sessionWorktreeBindingStatesProvider = { sessionIDs in
+            Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
+                (sessionID, .hydrated(provider(sessionID)))
+            })
+        }
+    }
+
+    func setSessionWorktreeBindingStatesProvider(
+        _ provider: @escaping @MainActor (Set<UUID>) -> [UUID: AgentSessionWorktreeBindingState]
+    ) {
+        sessionWorktreeBindingStatesProvider = provider
+    }
+
+    private func sessionWorktreeBindingState(for sessionID: UUID) -> AgentSessionWorktreeBindingState {
+        sessionWorktreeBindingStatesProvider?([sessionID])[sessionID] ?? .unavailable
     }
 
     func attachSelectionCoordinator(_ coordinator: WorkspaceSelectionCoordinator) {
@@ -1634,13 +1650,19 @@ class WorkspaceFilesViewModel: ObservableObject {
             return true
         }
 
+        let modifiedFileIDs = Set(event.modifiedFileIDs)
+        let modifiedFilesByID: [UUID: WorkspaceFileRecord] = Dictionary(uniqueKeysWithValues: snapshot.files.compactMap { file in
+            guard modifiedFileIDs.contains(file.id), file.rootID == event.rootID else { return nil }
+            return (file.id, file)
+        })
+        let targetsByFileID = await hiddenSessionSliceRebaseTargets(
+            physicalRootPath: snapshot.root.standardizedFullPath,
+            modifiedFilesByID: modifiedFilesByID
+        ) ?? [:]
+
         for fileID in event.modifiedFileIDs {
-            guard let file = snapshot.files.first(where: { $0.id == fileID }),
-                  file.rootID == event.rootID,
-                  let targets = await hiddenSessionSliceRebaseTargets(
-                      physicalRootPath: snapshot.root.standardizedFullPath,
-                      physicalFullPath: file.standardizedFullPath
-                  ),
+            guard let file = modifiedFilesByID[fileID],
+                  let targets = targetsByFileID[fileID],
                   !targets.isEmpty
             else { continue }
             let eventSource = event.modifiedFileSourceSnapshotsByID[fileID]
@@ -1674,15 +1696,42 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func hiddenSessionSliceRebaseTargets(
         physicalRootPath: String,
-        physicalFullPath: String
-    ) async -> [HiddenSessionSliceRebaseTarget]? {
-        guard let provider = sessionWorktreeBindingsProvider,
-              let workspace = workspaceManager?.activeWorkspace
+        modifiedFilesByID: [UUID: WorkspaceFileRecord]
+    ) async -> [UUID: [HiddenSessionSliceRebaseTarget]]? {
+        guard let provider = sessionWorktreeBindingStatesProvider,
+              let workspace = workspaceManager?.activeWorkspace,
+              !modifiedFilesByID.isEmpty
         else { return nil }
-        var targets: [HiddenSessionSliceRebaseTarget] = []
-        for tab in workspace.composeTabs {
-            guard let sessionID = tab.activeAgentSessionID else { continue }
-            let bindings = provider(sessionID)
+
+        // Slice presence and relative-path eligibility are independent of binding
+        // authority. Apply them first so the expensive global binding snapshot is
+        // requested only for tabs that can target at least one modified file.
+        let candidateTabs = workspace.composeTabs.compactMap { tab -> (
+            tab: ComposeTabState,
+            sessionID: UUID,
+            slices: [String: [LineRange]],
+            candidateFileIDs: Set<UUID>
+        )? in
+            guard let sessionID = tab.activeAgentSessionID else { return nil }
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            guard !slices.isEmpty else { return nil }
+            let slicePaths = Array(slices.keys)
+            let candidateFileIDs = Set(modifiedFilesByID.compactMap { fileID, file -> UUID? in
+                let relativePath = file.standardizedRelativePath
+                guard slicePaths.contains(where: {
+                    $0 == relativePath || $0.hasSuffix("/\(relativePath)")
+                }) else { return nil }
+                return fileID
+            })
+            guard !candidateFileIDs.isEmpty else { return nil }
+            return (tab, sessionID, slices, candidateFileIDs)
+        }
+        guard !candidateTabs.isEmpty else { return [:] }
+
+        let bindingStates = provider(Set(candidateTabs.map(\.sessionID)))
+        var targetsByFileID: [UUID: [HiddenSessionSliceRebaseTarget]] = [:]
+        for candidate in candidateTabs {
+            guard case let .hydrated(bindings) = bindingStates[candidate.sessionID] else { continue }
             let matchingBindings = bindings.filter {
                 StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath) == physicalRootPath
             }
@@ -1692,24 +1741,29 @@ class WorkspaceFilesViewModel: ObservableObject {
             })
             let fingerprint = AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
             guard await workspaceFileContextStore.sessionWorktreeOwnershipCovers(
-                ownerID: sessionID,
+                ownerID: candidate.sessionID,
                 bindingFingerprint: fingerprint,
                 physicalRootPaths: physicalRootPaths
-            ), let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
-                forPhysicalPath: physicalFullPath,
-                binding: binding
             ) else { continue }
-            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
-            guard slices[logicalFullPath]?.isEmpty == false else { continue }
-            targets.append(HiddenSessionSliceRebaseTarget(
-                identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
-                logicalFullPath: logicalFullPath,
-                agentSessionID: sessionID,
-                bindingFingerprint: fingerprint,
-                physicalRootPaths: physicalRootPaths
-            ))
+
+            for fileID in candidate.candidateFileIDs {
+                guard let file = modifiedFilesByID[fileID],
+                      let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
+                          forPhysicalPath: file.standardizedFullPath,
+                          binding: binding
+                      ),
+                      candidate.slices[logicalFullPath]?.isEmpty == false
+                else { continue }
+                targetsByFileID[fileID, default: []].append(HiddenSessionSliceRebaseTarget(
+                    identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: candidate.tab.id),
+                    logicalFullPath: logicalFullPath,
+                    agentSessionID: candidate.sessionID,
+                    bindingFingerprint: fingerprint,
+                    physicalRootPaths: physicalRootPaths
+                ))
+            }
         }
-        return targets
+        return targetsByFileID
     }
 
     @MainActor
@@ -1932,14 +1986,13 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func hiddenSessionSliceRangesIfTargetCurrent(
         _ target: HiddenSessionSliceRebaseTarget
     ) async -> [LineRange]? {
-        guard let provider = sessionWorktreeBindingsProvider,
-              let manager = workspaceManager,
+        guard let manager = workspaceManager,
               let tab = manager.composeTab(for: target.identity),
               tab.activeAgentSessionID == target.agentSessionID,
               let ranges = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)[target.logicalFullPath],
-              !ranges.isEmpty
+              !ranges.isEmpty,
+              case let .hydrated(bindings) = sessionWorktreeBindingState(for: target.agentSessionID)
         else { return nil }
-        let bindings = provider(target.agentSessionID)
         guard AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings) == target.bindingFingerprint,
               Set(bindings.map {
                   StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath)

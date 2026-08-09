@@ -41,13 +41,13 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         do {
             let caseLabel = "testProviderTranslationPrecedesScopedReadDependencyCall"
             let providerSource = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
-            let translation = try XCTUnwrap(providerSource.range(of: "let resolvedPath = lookupContext.translateInputPath(path)"), caseLabel)
+            let translation = try XCTUnwrap(providerSource.range(of: "let translatedLookupPath = lookupContext.translateInputPath(path)"), caseLabel)
             let authorizedRead = try XCTUnwrap(
-                providerSource.range(of: "dependencies.readSelectedAuthorizedGitArtifact("),
+                providerSource.range(of: "dependencies.files.readSelectedAuthorizedGitArtifact("),
                 caseLabel
             )
             let scopedRead = try XCTUnwrap(
-                providerSource.range(of: "dependencies.readFile("),
+                providerSource.range(of: "dependencies.files.readFile("),
                 caseLabel
             )
             XCTAssertLessThan(translation.lowerBound, authorizedRead.lowerBound, caseLabel)

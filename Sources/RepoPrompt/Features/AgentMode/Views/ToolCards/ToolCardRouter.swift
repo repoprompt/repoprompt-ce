@@ -41,12 +41,14 @@ enum AgentOracleToolRouting {
     static func operationPopoverUserInfo(
         openContext: AgentOracleOpenContext?,
         chatID: String?,
-        tabID: UUID? = nil
+        tabID: UUID? = nil,
+        presentation: AgentOraclePopoverPresentation = .standard
     ) -> [AnyHashable: Any]? {
         AgentOraclePopoverRoute(
             openContext: openContext,
             chatID: chatID,
-            tabID: tabID
+            tabID: tabID,
+            presentation: presentation
         )?.notificationUserInfo
     }
 

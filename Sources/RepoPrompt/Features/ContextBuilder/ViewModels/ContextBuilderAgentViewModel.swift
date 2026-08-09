@@ -39,6 +39,13 @@ struct AgentRun: Identifiable {
 
 // DiscoveryQuestion and UserQuestionResponse are defined in Models/Agent/UserInteractionModels.swift
 
+/// Immutable origin of a generated Context Builder answer
+struct ContextBuilderGeneratedAnswerRoute: Equatable {
+    let workspaceID: UUID
+    let tabID: UUID
+    let chatID: String
+}
+
 /// Selected follow-up type for discovery auto-generate
 enum ContextBuilderFollowUpType: String, CaseIterable, Codable {
     case plan
@@ -222,8 +229,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         @Published var contextBuilderInstructions: String
         /// Selected context builder prompt IDs for this tab
         @Published var selectedContextBuilderPromptIDs: Set<UUID> = []
-        /// Chat session ID from plan generation (wiped on new discovery run)
-        @Published var generatedPlanChatID: String?
+        /// Immutable origin of the generated answer (wiped on new discovery run)
+        @Published var generatedAnswerRoute: ContextBuilderGeneratedAnswerRoute?
 
         // Per-tab plan UI state
         @Published var isBackgroundPlanGenerating: Bool
@@ -378,7 +385,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             didUserCancelActiveContextBuilderRun = false
             runHistory = []
             contextBuilderInstructions = ""
-            generatedPlanChatID = nil
+            generatedAnswerRoute = nil
             isBackgroundPlanGenerating = false
             backgroundPlanError = nil
             backgroundPlanResponseText = nil
@@ -710,8 +717,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Track last processed tab to detect changes
     private var lastProcessedTabID: UUID?
-    /// Chat session ID from plan generation (synced from active TabSession)
-    @Published private(set) var generatedPlanChatID: String?
+    /// Immutable generated-answer origin synced from the active tab session
+    @Published private(set) var generatedAnswerRoute: ContextBuilderGeneratedAnswerRoute?
 
     // MARK: - Background Plan Generation State
 
@@ -886,6 +893,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     private var currentWorkspaceID: UUID? {
         workspaceManager?.activeWorkspaceID
+    }
+
+    private func workspaceID(containing tabID: UUID) -> UUID? {
+        workspaceManager?.workspaces.first { workspace in
+            workspace.composeTabs.contains { $0.id == tabID }
+        }?.id
     }
 
     private var currentWorkspacePath: String? {
@@ -1126,6 +1139,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
+                    guard snapshot.isAuthorizedForPublication else { return }
                     self?.codexDynamicModels = snapshot.models
                 }
             }
@@ -1373,7 +1387,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         runHistory = session.runHistory
         runAgentKind = session.lastRunAgentKind
         runModelRaw = session.lastRunModelRaw
-        generatedPlanChatID = session.generatedPlanChatID
+        generatedAnswerRoute = session.generatedAnswerRoute
         applyBackgroundPlanBindings(from: session)
         // Per-tab MCP control flag
         isMCPControlledRun = session.isMCPControlledRun
@@ -1402,7 +1416,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         runHistory = []
         runAgentKind = nil
         runModelRaw = nil
-        generatedPlanChatID = nil
+        generatedAnswerRoute = nil
         // Per-tab plan UI state
         isBackgroundPlanGenerating = false
         backgroundPlanError = nil
@@ -1445,7 +1459,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         runHistory = session.runHistory
         runAgentKind = session.lastRunAgentKind
         runModelRaw = session.lastRunModelRaw
-        generatedPlanChatID = session.generatedPlanChatID
+        generatedAnswerRoute = session.generatedAnswerRoute
         applyBackgroundPlanBindings(from: session)
         // Per-tab MCP control flag
         isMCPControlledRun = session.isMCPControlledRun
@@ -2437,7 +2451,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         session.resetLog()
-        session.generatedPlanChatID = nil
+        session.generatedAnswerRoute = nil
         session.backgroundPlanError = nil
         session.backgroundPlanResponseText = nil
         session.backgroundPlanReasoningText = nil
@@ -3976,8 +3990,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let path = args["path"] as? String {
             var pathPart = (path as NSString).lastPathComponent
             if let startLine = args["start_line"] as? Int {
-                if let limit = args["limit"] as? Int {
-                    pathPart += ":\(startLine)-\(startLine + limit - 1)"
+                if let limit = args["limit"] as? Int, limit > 0 {
+                    let (endLine, overflow) = startLine.addingReportingOverflow(limit - 1)
+                    pathPart += overflow ? ":\(startLine)" : ":\(startLine)-\(endLine)"
                 } else {
                     pathPart += ":\(startLine)"
                 }
@@ -4275,11 +4290,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     ) {
         // Session must exist - caller ensures tab is valid
         let session = session(for: tabID)
+        guard let originWorkspaceID = workspaceID(containing: tabID) else {
+            session.backgroundPlanError = ContextBuilderGenerationError.missingWorkspace.errorDescription
+            updateRuntimeBindings(from: session)
+            return
+        }
 
         // Cancel any existing background plan task for THIS tab only
         session.backgroundPlanTask?.cancel()
 
-        session.generatedPlanChatID = nil
+        session.generatedAnswerRoute = nil
         session.isBackgroundPlanGenerating = true
         session.backgroundPlanError = nil
         session.backgroundPlanResponseText = nil
@@ -4295,11 +4315,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             do {
                 let reply = try await generatePlanFromDiscovery(
                     tabID: tabID,
+                    originWorkspaceID: originWorkspaceID,
                     oracleViewModel: oracleViewModel,
                     chatName: chatName,
                     mode: mode
                 )
-                // generatedPlanChatID is set inside generatePlanFromDiscovery
+                // generatedAnswerRoute is set inside generatePlanFromDiscovery
                 session.isBackgroundPlanGenerating = false
                 if let response = reply.response, !response.isEmpty {
                     session.backgroundPlanResponseText = response
@@ -4352,7 +4373,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.backgroundPlanError = nil
         session.backgroundPlanResponseText = nil
         session.backgroundPlanReasoningText = nil
-        session.generatedPlanChatID = nil
+        session.generatedAnswerRoute = nil
         session.followUpOracleSessionID = nil
         clearPendingBackgroundPlanUIRefresh(for: targetTabID)
         applyPlanPreview(to: session)
@@ -4364,7 +4385,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     func clearBackgroundPlanState(forTabID tabID: UUID? = nil) {
         cancelBackgroundPlanGeneration(forTabID: tabID)
-        // generatedPlanChatID is cleared in cancelBackgroundPlanGeneration
+        // generatedAnswerRoute is cleared in cancelBackgroundPlanGeneration
     }
 
     /// Claims generation-safe MCP control ownership for discovery plus any follow-up generation.
@@ -4427,7 +4448,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Set the prompt text
         promptManager.promptText = planText
 
-        // Clear plan state for this tab (keep generatedPlanChatID for "View in Chat" if desired)
+        // Clear plan state for this tab (keep generatedAnswerRoute for "View in Chat" if desired)
         session.backgroundPlanResponseText = nil
         session.backgroundPlanReasoningText = nil
         session.backgroundPlanError = nil
@@ -4446,9 +4467,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let error = session.backgroundPlanError {
             return .error(error)
         }
-        if let chatID = session.generatedPlanChatID {
+        if let route = session.generatedAnswerRoute {
             let preview = session.backgroundPlanResponsePreviewText ?? session.backgroundPlanResponseText
-            return .ready(chatID: chatID, previewText: preview)
+            return .ready(route: route, previewText: preview)
         }
         return .idle
     }
@@ -4457,9 +4478,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     func currentFollowUpOracleChatID(for tabID: UUID?) -> String? {
         if let id = tabID {
-            return sessions[id]?.generatedPlanChatID
+            return sessions[id]?.generatedAnswerRoute?.chatID
         }
-        return generatedPlanChatID
+        return generatedAnswerRoute?.chatID
     }
 
     // MARK: - MCP Plan/Question Generation
@@ -4481,7 +4502,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         sessionID: UUID,
         progressReporter: ContextBuilderMCPProgressReporter?,
         activityReporter: ContextBuilderMCPActivityReporter?
-    ) async throws {
+    ) async throws -> String {
         let (activityEvents, activityContinuation) = AsyncStream<OracleMessageLifecycleActivityEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(32)
         )
@@ -4493,10 +4514,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             activityContinuation.finish()
         }
 
-        try await ContextBuilderFollowUpFinalizationMonitor.wait(
+        return try await ContextBuilderFollowUpFinalizationMonitor.wait(
             activityEvents: activityEvents,
             waitForFinalization: {
-                try await oracleViewModel.waitUntilMessageFinalised(queryID)
+                try await oracleViewModel.waitForContextBuilderCompletion(queryID)
             },
             cancelStreaming: {
                 await oracleViewModel.cancelStreaming(in: sessionID)
@@ -4515,6 +4536,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     private func runFollowUpOracleStream(
         for tabID: UUID,
+        originWorkspaceID: UUID,
         oracleViewModel: OracleViewModel,
         mode: HeadlessMode,
         prompt: String,
@@ -4536,7 +4558,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let session = session(for: tabID)
 
         // Set initial UI state
-        session.generatedPlanChatID = nil
+        session.generatedAnswerRoute = nil
         session.isBackgroundPlanGenerating = true
         session.backgroundPlanError = nil
         session.backgroundPlanResponseText = nil
@@ -4592,7 +4614,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             oracleViewModel.pinSession(createdSession.id)
             defer { oracleViewModel.unpinSession(createdSession.id) }
             session.followUpOracleSessionID = createdSession.id
-            session.generatedPlanChatID = createdSession.shortID
+            session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+                workspaceID: originWorkspaceID,
+                tabID: tabID,
+                chatID: createdSession.shortID
+            )
             updateRuntimeBindings(from: session)
 
             try Task.checkCancellation()
@@ -4612,7 +4638,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             await progressReporter?(.messageSend)
-            await oracleViewModel.sendMessage(
+            guard let queryId = await oracleViewModel.sendMessage(
                 prompt,
                 sessionID: createdSession.id,
                 overrideModel: model,
@@ -4622,6 +4648,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectionOverride: selection,
                 lookupContextOverride: lookupContext,
                 overrideAIMessage: aiMessage,
+                completionPolicy: .contextBuilderStrict,
                 onProgress: { [weak self] text, reasoning in
                     guard let self,
                           let session = sessions[tabID],
@@ -4632,17 +4659,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     requestBackgroundPlanUIRefresh(for: tabID)
                     onProgress?(text, reasoning)
                 }
-            )
+            ) else {
+                throw ChatToolError.internalError("Failed to start follow-up stream")
+            }
 
             guard session.isBackgroundPlanGenerating else {
                 throw CancellationError()
             }
             await progressReporter?(.activeQueryAcquisition)
-            guard let queryId = oracleViewModel.activeQueryId(for: createdSession.id) else {
-                throw ChatToolError.internalError("Failed to start follow-up stream")
-            }
             await progressReporter?(.streaming)
-            try await waitForFollowUpFinalization(
+            let responseText = try await waitForFollowUpFinalization(
                 in: oracleViewModel,
                 queryID: queryId,
                 sessionID: createdSession.id,
@@ -4653,8 +4679,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
 
-            let aiMsg = oracleViewModel.getChatMessage(withId: queryId).flatMap { $0.isUser ? nil : $0 }
-            let responseText = aiMsg?.content
             let reply = ChatSendReply(
                 chatId: createdSession.id,
                 shortId: createdSession.shortID,
@@ -4665,7 +4689,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
             session.isBackgroundPlanGenerating = false
             session.followUpOracleSessionID = nil
-            session.generatedPlanChatID = reply.shortId
+            session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+                workspaceID: originWorkspaceID,
+                tabID: tabID,
+                chatID: reply.shortId
+            )
             if let response = reply.response, !response.isEmpty {
                 session.backgroundPlanResponseText = response
             }
@@ -4683,9 +4711,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             if error is CancellationError {
                 session.backgroundPlanResponseText = nil
                 session.backgroundPlanReasoningText = nil
-                session.generatedPlanChatID = nil
+                session.generatedAnswerRoute = nil
                 session.backgroundPlanError = nil
             } else {
+                session.backgroundPlanResponseText = nil
+                session.backgroundPlanReasoningText = nil
                 session.backgroundPlanError = error.asFriendlyString()
             }
             session.isBackgroundPlanGenerating = false
@@ -4731,6 +4761,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
         #endif
 
+        guard let originWorkspaceID = workspaceID(containing: tabID) else {
+            throw ContextBuilderGenerationError.missingWorkspace
+        }
+
         let modeName = mode.mcpModeName
         await progressReporter?(.modelResolution)
         let modelSelection: (
@@ -4768,6 +4802,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         if workspaceManager?.activeWorkspaceID != identity.workspaceID {
             let session = session(for: tabID)
+            session.generatedAnswerRoute = nil
             session.isBackgroundPlanGenerating = true
             session.backgroundPlanError = nil
             session.backgroundPlanResponseText = nil
@@ -4789,6 +4824,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     finalReviewAuthorization: finalReviewAuthorization,
                     agentModeSessionID: agentModeSessionID,
                     agentModeRunID: agentModeRunID,
+                    completionPolicy: .contextBuilderStrict,
                     onProgress: { [weak self] text, reasoning in
                         guard let self, let session = sessions[tabID], session.isBackgroundPlanGenerating else { return }
                         session.backgroundPlanResponseText = text
@@ -4796,7 +4832,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     }
                 )
                 session.isBackgroundPlanGenerating = false
-                session.generatedPlanChatID = reply.shortId
+                session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+                    workspaceID: identity.workspaceID,
+                    tabID: tabID,
+                    chatID: reply.shortId
+                )
                 session.backgroundPlanResponseText = reply.response
                 workspaceManager?.setActiveChatSessionID(reply.chatId, for: identity)
                 updateRuntimeBindings(from: session)
@@ -4806,6 +4846,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
                 session.backgroundPlanResponseText = nil
                 session.backgroundPlanReasoningText = nil
+                session.generatedAnswerRoute = nil
                 updateRuntimeBindings(from: session)
                 throw error
             }
@@ -4813,6 +4854,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         return try await runFollowUpOracleStream(
             for: tabID,
+            originWorkspaceID: originWorkspaceID,
             oracleViewModel: oracleViewModel,
             mode: mode,
             prompt: prompt,
@@ -4907,18 +4949,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         updateRuntimeBindings(from: session)
     }
 
-    @MainActor
-    func setGeneratedPlanChatID(_ chatID: String, forTabID tabID: UUID? = nil) {
-        let targetTabID = tabID ?? currentTabID
-        guard let targetTabID, let session = sessions[targetTabID] else {
-            // Fallback: update published property directly
-            generatedPlanChatID = chatID
-            return
-        }
-        session.generatedPlanChatID = chatID
-        updateRuntimeBindings(from: session)
-    }
-
     /// Generate an implementation plan using the built context.
     /// Called from UI when user clicks "Generate Plan" after Context Builder completes.
     ///
@@ -4932,6 +4962,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     func generatePlanFromDiscovery(
         tabID: UUID,
+        originWorkspaceID: UUID,
         oracleViewModel: OracleViewModel,
         chatName: String? = nil,
         mode: HeadlessMode = .plan,
@@ -4966,6 +4997,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         return try await runFollowUpOracleStream(
             for: tabID,
+            originWorkspaceID: originWorkspaceID,
             oracleViewModel: oracleViewModel,
             mode: mode,
             prompt: prompt,
@@ -5028,6 +5060,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Ask the user one structured ask_user interaction and wait for their response.
     @MainActor
+    func canPresentAskUserInteraction(tabID: UUID, runID: UUID) -> Bool {
+        guard sessions[tabID] != nil,
+              let record = runRegistry.activeRecord(tabID: tabID)
+        else {
+            return false
+        }
+        return record.runID == runID
+    }
+
     func askUserInteraction(
         tabID: UUID,
         interaction: AgentAskUserInteraction,
@@ -5093,15 +5134,32 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         updateAgentLogBinding(from: session)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            session.askUserContinuation = continuation
-            schedulePendingAskUserTimeout(
-                for: session,
-                interactionID: interaction.id,
-                runID: record.runID,
-                timeoutSeconds: interaction.timeoutSeconds,
-                startedAt: interaction.askedAt
-            )
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else {
+                    session.pendingAskUser = nil
+                    session.pendingAskUserRunID = nil
+                    updateRuntimeBindings(from: session)
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                session.askUserContinuation = continuation
+                schedulePendingAskUserTimeout(
+                    for: session,
+                    interactionID: interaction.id,
+                    runID: record.runID,
+                    timeoutSeconds: interaction.timeoutSeconds,
+                    startedAt: interaction.askedAt
+                )
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelAskUserInteraction(
+                    tabID: tabID,
+                    interactionID: interaction.id,
+                    runID: record.runID
+                )
+            }
         }
     }
 
@@ -5208,6 +5266,26 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             pending.timeoutStartedAt = nil
             session.pendingAskUser = pending
         }
+    }
+
+    @discardableResult
+    func cancelAskUserInteraction(
+        tabID: UUID,
+        interactionID: UUID,
+        runID: UUID
+    ) -> Bool {
+        guard let session = sessions[tabID],
+              session.pendingAskUserRunID == runID,
+              session.pendingAskUser?.interaction.id == interactionID,
+              let continuation = session.askUserContinuation
+        else { return false }
+        invalidatePendingAskUserTimeout(for: session)
+        session.pendingAskUser = nil
+        session.pendingAskUserRunID = nil
+        session.askUserContinuation = nil
+        updateRuntimeBindings(from: session)
+        continuation.resume(throwing: CancellationError())
+        return true
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
@@ -5381,7 +5459,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 enum ContextBuilderPlanStatus: Equatable {
     case idle
     case generating
-    case ready(chatID: String, previewText: String?)
+    case ready(route: ContextBuilderGeneratedAnswerRoute, previewText: String?)
     case error(String)
 
     static func == (lhs: ContextBuilderPlanStatus, rhs: ContextBuilderPlanStatus) -> Bool {
@@ -5403,12 +5481,14 @@ enum ContextBuilderPlanStatus: Equatable {
 enum ContextBuilderGenerationError: LocalizedError {
     case emptyPrompt
     case missingTab
+    case missingWorkspace
     case askUserAlreadyPending
 
     var errorDescription: String? {
         switch self {
         case .emptyPrompt: "Context Builder has no prompt to generate from."
         case .missingTab: "Unable to locate the Context Builder tab."
+        case .missingWorkspace: "Unable to locate the Context Builder workspace."
         case .askUserAlreadyPending: "ask_user is already waiting for a response in this Context Builder session."
         }
     }

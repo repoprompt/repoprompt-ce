@@ -17,17 +17,37 @@ packaged Mach-O architecture sets before and after signing and after ZIP
 extraction. Debug packages and local self-signed production packages remain
 host-native.
 
+The packaged `repoprompt-mcp` exposes one final backend selector:
+`--backend app|headless|auto`. **`app` remains the release default.** Explicit
+`auto` performs one bounded, connect-only probe of the well-known app socket
+before reading the MCP `initialize` request. A successful probe selects the app
+proxy; an unavailable socket selects the direct headless runtime. That choice is
+immutable for the process lifetime—release validation must reject any
+implementation that falls back or switches backends after initialization.
+Interactive and one-shot exec modes remain app-backed and reject headless/auto.
+
+A future default cutover to `auto` requires separately reviewed live and release
+evidence. Release-candidate validation must exercise all three explicit MCP
+selections: an app-backed smoke against a running packaged app, a headless smoke
+with no app dependency, and an `auto` smoke in each availability state. It must
+also prove immutable selection across app-socket availability changes and
+app/headless contract parity for every advertised tool. These checks complement
+the package architecture/signature verification; they do not permit a release
+job to launch or replace a developer's visible app implicitly. Until that
+evidence is accepted, release scripts, package metadata, installers, provider
+emitters, and documentation must preserve `app` as the default.
+
 RepoPrompt CE starts a new public release line at `1.0.0 (1)`. Its separate
 bundle identifier, Sparkle key pair, and appcast intentionally do not inherit
 the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.145.0
+Debug and release packaging include the complete official OpenAI Codex 0.147.0
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.145.0` release](https://github.com/openai/codex/releases/tag/rust-v0.145.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package_SHA256SUMS),
+official [`rust-v0.147.0` release](https://github.com/openai/codex/releases/tag/rust-v0.147.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -78,7 +98,7 @@ rejects this policy, stop rather than silently re-signing the upstream payload.
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
 selection never falls through to the user's shell `PATH`. Advanced users may set
 one explicit absolute external override with `REPOPROMPT_CODEX_EXECUTABLE`.
-RepoPrompt rejects overrides older than 0.145.0, matching the bundled runtime and
+RepoPrompt rejects overrides older than 0.147.0, matching the bundled runtime and
 the documented app-server contract floor. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
@@ -104,7 +124,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.145.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.147.0/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -126,8 +146,8 @@ does not edit or replace `Vendor/Codex/manifest.json`. Select exactly one explic
 stable version/tag, or opt in explicitly to GitHub's latest stable release:
 
 ```bash
-make codex-update-candidate CODEX_CANDIDATE_VERSION=0.146.0
-make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.146.0
+make codex-update-candidate CODEX_CANDIDATE_VERSION=0.148.0
+make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.148.0
 make codex-update-candidate CODEX_CANDIDATE_LATEST=1
 ```
 
@@ -149,13 +169,13 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.145.0 pin remains authoritative
+0.147.0 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.145.0 rotation is verified Codex 0.144.6
-(`rust-v0.144.6`; arm64 archive SHA-256
-`bcbfa76650b6c581505aa5178c1e799d37ff12fc43a35ff16c90b97fa757e63f`, x86_64
-archive SHA-256 `daa3df37c8a041280f52a2198dbe7acbead64936b23f8b660edf9d886df5f9da`).
+The known-good rollback for the 0.147.0 rotation is verified Codex 0.145.0
+(`rust-v0.145.0`; arm64 package archive SHA-256
+`ece937169d4c9e910d60826a6ea4ae7848a16c089403d122e70e7da4ac41ba34`, x86_64
+package archive SHA-256 `9d402c9ca814655fddc07b548d7086491c0afcebe1f746cdeba1045fd6f62646`).
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 

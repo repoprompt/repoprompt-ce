@@ -545,6 +545,36 @@ actor WorkspaceFileContextStore {
             }
         }
 
+        func wait() async {
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else {
+                        continuation.resume()
+                        return
+                    }
+
+                    lock.lock()
+                    guard !didComplete else {
+                        lock.unlock()
+                        continuation.resume()
+                        return
+                    }
+                    waitersByID[waiterID] = Waiter(
+                        continuation: continuation,
+                        deadlineTask: nil
+                    )
+                    lock.unlock()
+
+                    if Task.isCancelled {
+                        resume(waiterID)
+                    }
+                }
+            } onCancel: {
+                self.resume(waiterID)
+            }
+        }
+
         func resolve() {
             lock.lock()
             guard !didComplete else {
@@ -638,6 +668,7 @@ actor WorkspaceFileContextStore {
             WorkspaceCodemapFrozenPresentationBundleID: CodemapPresentationRecord
         ] = [:]
         var graphStatusTask: Task<Void, Never>?
+        var graphWorkerRecoveryStatusTask: Task<Void, Never>?
         var selectionGraph: WorkspaceCodemapSelectionGraph?
     }
 
@@ -650,6 +681,7 @@ actor WorkspaceFileContextStore {
         let setupTask: Task<CodemapSetupDisposition, Never>?
         let demandTasks: [Task<Void, Never>]
         let graphStatusTask: Task<Void, Never>?
+        let graphWorkerRecoveryStatusTask: Task<Void, Never>?
         let selectionGraph: WorkspaceCodemapSelectionGraph?
         let preloadLaunchTask: Task<Void, Never>?
         let eligibilityTask: Task<CodemapEligibilityResolution, Never>?
@@ -1847,6 +1879,22 @@ actor WorkspaceFileContextStore {
             return await owner.engine.accounting()
         }
 
+        func debugSetCodemapGraphIndexWorkerRecoveryStateForTesting(
+            rootID: UUID,
+            state: WorkspaceCodemapGraphIndexWorkerRecoveryState
+        ) -> Bool {
+            guard let root = rootStatesByID[rootID] else { return false }
+            let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: root.lifetimeID)
+            switch state {
+            case .available:
+                codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
+            case .exhausted:
+                codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.insert(rootEpoch)
+            }
+            publishCodemapRootStatusesIfChanged()
+            return true
+        }
+
         private func debugCodemapBindingEngine(
             rootID: UUID
         ) -> (rootEpoch: WorkspaceCodemapRootEpoch, engine: WorkspaceCodemapBindingEngine)? {
@@ -2798,6 +2846,7 @@ actor WorkspaceFileContextStore {
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
         private var codemapPathInvalidationStageHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
+        private var discardedCodemapPathFenceReleaseCounterForTesting = 0
     #endif
     private var codemapCleanupFlightsByRootID: [UUID: CodemapCleanupFlight] = [:]
     private var codemapPathInvalidationFlightsByRootEpoch: [
@@ -2819,6 +2868,7 @@ actor WorkspaceFileContextStore {
     private var codemapGraphAccountingByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIncrementalAccounting
     ] = [:]
+    private var codemapGraphIndexWorkerRecoveryExhaustedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var codemapRootStatusCoverageBaselinesByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapRootStatusCoverageBaseline
     ] = [:]
@@ -3037,6 +3087,7 @@ actor WorkspaceFileContextStore {
                 demand.task?.cancel()
             }
             session.graphStatusTask?.cancel()
+            session.graphWorkerRecoveryStatusTask?.cancel()
             for bundle in session.bundlesByRequestID.values {
                 bundle.close()
             }
@@ -3954,6 +4005,7 @@ actor WorkspaceFileContextStore {
                  .requestedWatermarkPredatesCapture, .requestedWatermarkNotYetAccepted:
                 .pendingIngressSequenceGap
             case .invalidJournalCut: .witnessGap
+            case .watcherActivationTimedOut: .watcherActivationFailure
             case .watcherAlreadyActive, .initializationAlreadyActive,
                  .initializationNotCurrent, .inventoryNotInstalled,
                  .invalidSeedInventoryPath, .replayAlreadyCompleted:
@@ -9907,6 +9959,9 @@ actor WorkspaceFileContextStore {
         )
         if let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine {
             let disposition = await engine.prioritizeGraphIndexNow(rootEpoch: rootEpoch)
+            if disposition != .unavailable {
+                codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
+            }
             publishCodemapRootStatusesIfChanged()
             return disposition
         }
@@ -9954,10 +10009,14 @@ actor WorkspaceFileContextStore {
         let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
         let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
-        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = switch launchPhase {
-        case .terminalNonGit: .notGitRepository
-        case .retryExhausted: .retryExhausted
-        default: nil
+        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
+            .workerRecoveryExhausted
+        } else {
+            switch launchPhase {
+            case .terminalNonGit: .notGitRepository
+            case .retryExhausted: .retryExhausted
+            default: nil
+            }
         }
         let availability: WorkspaceCodemapRootAvailability = if accounting?.revocationReason != nil {
             .revoked
@@ -10699,6 +10758,7 @@ actor WorkspaceFileContextStore {
             codemapSuspendedRootEpochs.remove(rootEpoch)
             codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
+            codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
             codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
             publishCodemapRootStatusesIfChanged()
             if let cleanup = detachCodemapSession(
@@ -13066,6 +13126,7 @@ actor WorkspaceFileContextStore {
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
         bundle?.close()
         if let engine = session.engine {
+            await codemapCancellationCleanupHook(ticket)
             _ = await engine.cancel(owner: record.owner)
         }
         guard !Task.isCancelled else { return .unavailable(.cancelled) }
@@ -14056,6 +14117,21 @@ actor WorkspaceFileContextStore {
             codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?.count ?? 0
         }
 
+        func codemapPathFenceCountForTesting(rootID: UUID, relativePath: String) -> Int {
+            let path = StandardizedPath.relative(relativePath)
+            return codemapPathFenceTokensByID.values.count { token in
+                token.rootEpoch.rootID == rootID && token.standardizedRelativePaths.contains(path)
+            }
+        }
+
+        func discardedCodemapPathFenceReleaseCountForTesting() -> Int {
+            discardedCodemapPathFenceReleaseCounterForTesting
+        }
+
+        func pendingCodemapGraphIndexRescheduleCountForTesting() -> Int {
+            codemapGraphIndexBuildReschedulePendingRootEpochs.count
+        }
+
         func revokeReadyCodemapArtifactContributionForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) async -> Bool {
@@ -14126,6 +14202,25 @@ actor WorkspaceFileContextStore {
                 codemapTicketsShareDemand(record.ticket, ticket)
             else { return 0 }
             return record.completion.waiterCount
+        }
+
+        func waitForCodemapArtifactDemandCompletionForTesting(
+            _ ticket: WorkspaceCodemapArtifactDemandTicket
+        ) async -> WorkspaceCodemapArtifactDemandResult {
+            guard codemapDemandIsCurrent(ticket),
+                  let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  record.retainIDs.contains(ticket.retainID)
+            else {
+                return .unavailable(.staleCurrentness)
+            }
+            let current = codemapDemandResult(record.result, for: ticket)
+            guard case .pending = current, record.task != nil else {
+                return current
+            }
+            await record.completion.wait()
+            return codemapArtifactDemandStatus(ticket)
         }
 
         func codemapArtifactDemandRetainCountForTesting(
@@ -14336,6 +14431,7 @@ actor WorkspaceFileContextStore {
               session.engine === engine
         else { return }
         session.graphStatusTask?.cancel()
+        session.graphWorkerRecoveryStatusTask?.cancel()
         let task = Task { [weak self] in
             guard let graph = await engine.selectionGraph(rootEpoch: authority.rootEpoch) else { return }
             let stream = await graph.statusUpdates()
@@ -14350,6 +14446,17 @@ actor WorkspaceFileContextStore {
             }
         }
         session.graphStatusTask = task
+        session.graphWorkerRecoveryStatusTask = Task { [weak self] in
+            let stream = await engine.graphIndexWorkerRecoveryUpdates(rootEpoch: authority.rootEpoch)
+            for await state in stream {
+                guard !Task.isCancelled else { return }
+                await self?.acceptCodemapGraphIndexWorkerRecoveryState(
+                    state,
+                    authority: authority,
+                    engine: engine
+                )
+            }
+        }
         codemapSessionsByRootEpoch[authority.rootEpoch] = session
     }
 
@@ -14367,6 +14474,27 @@ actor WorkspaceFileContextStore {
         else { return }
         codemapGraphAccountingByRootEpoch[authority.rootEpoch] = accounting
         publishCodemapRootStatusesIfChanged()
+    }
+
+    private func acceptCodemapGraphIndexWorkerRecoveryState(
+        _ state: WorkspaceCodemapGraphIndexWorkerRecoveryState,
+        authority: CodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine
+    ) {
+        guard let session = codemapSessionsByRootEpoch[authority.rootEpoch],
+              session.authority == authority,
+              session.engine === engine,
+              codemapAuthorityIsCurrent(authority)
+        else { return }
+        let changed = switch state {
+        case .available:
+            codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(authority.rootEpoch) != nil
+        case .exhausted:
+            codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.insert(authority.rootEpoch).inserted
+        }
+        if changed {
+            publishCodemapRootStatusesIfChanged()
+        }
     }
 
     private func performCodemapDemand(
@@ -15637,8 +15765,9 @@ actor WorkspaceFileContextStore {
         return true
     }
 
-    private func removeCodemapPathFenceToken(id: UUID) {
-        codemapPathFenceTokensByID.removeValue(forKey: id)
+    @discardableResult
+    private func removeCodemapPathFenceToken(id: UUID) -> Bool {
+        codemapPathFenceTokensByID.removeValue(forKey: id) != nil
     }
 
     private func finishCodemapPathInvalidationWithoutAuthority(
@@ -15673,7 +15802,12 @@ actor WorkspaceFileContextStore {
         didCommitMutation: Bool = true
     ) {
         guard let token else { return }
-        removeCodemapPathFenceToken(id: token.id)
+        guard removeCodemapPathFenceToken(id: token.id) else {
+            #if DEBUG
+                discardedCodemapPathFenceReleaseCounterForTesting += 1
+            #endif
+            return
+        }
         // The fence itself advanced projection/path authority and cancelled old work. A failed
         // disk mutation still needs one restoration preload, while committed work needs the same
         // reschedule against the new public catalog.
@@ -15683,6 +15817,17 @@ actor WorkspaceFileContextStore {
         _ = didCommitMutation
         schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: token.rootEpoch)
         resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: token.rootEpoch)
+    }
+
+    private func retainCodemapPathFenceUntilMutationDrain(
+        _ token: CodemapPathFenceToken?,
+        service: FileSystemService,
+        relativePaths: Set<String>
+    ) {
+        Task { [weak self] in
+            await service.awaitMutationDrain(conflictingWith: relativePaths)
+            await self?.releaseCodemapPathFence(token, didCommitMutation: true)
+        }
     }
 
     private func cancelCodemapGraphIndexBuildLaunchForInvalidation(
@@ -15727,6 +15872,7 @@ actor WorkspaceFileContextStore {
         )
         let session = codemapSessionsByRootEpoch.removeValue(forKey: rootEpoch)
         codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.remove(rootEpoch)
         codemapRootStatusCoverageBaselinesByRootEpoch.removeValue(forKey: rootEpoch)
         publishCodemapRootStatusesIfChanged()
         if let session, !session.markerReadinessByFileID.isEmpty {
@@ -15768,6 +15914,7 @@ actor WorkspaceFileContextStore {
             : authorityGeneration + 1
         session?.setupTask?.cancel()
         session?.graphStatusTask?.cancel()
+        session?.graphWorkerRecoveryStatusTask?.cancel()
         let demandRecords = session.map { Array($0.demandsByFileID.values) } ?? []
         for record in demandRecords {
             record.task?.cancel()
@@ -15786,6 +15933,7 @@ actor WorkspaceFileContextStore {
             setupTask: session?.setupTask,
             demandTasks: demandRecords.compactMap(\.task),
             graphStatusTask: session?.graphStatusTask,
+            graphWorkerRecoveryStatusTask: session?.graphWorkerRecoveryStatusTask,
             selectionGraph: session?.selectionGraph,
             preloadLaunchTask: launch?.task,
             eligibilityTask: eligibilityFlight?.task,
@@ -15812,6 +15960,9 @@ actor WorkspaceFileContextStore {
             }
             if let graphStatusTask = detached.graphStatusTask {
                 await graphStatusTask.value
+            }
+            if let graphWorkerRecoveryStatusTask = detached.graphWorkerRecoveryStatusTask {
+                await graphWorkerRecoveryStatusTask.value
             }
             await detached.selectionGraph?.shutdown(reason: detached.graphInvalidationReason)
             if let registry = detached.registry, let routeToken = detached.routeToken {
@@ -16176,13 +16327,26 @@ actor WorkspaceFileContextStore {
             commands: [.modified([standardizedRelativePath])]
         )
         var didCommitCatalogMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCatalogMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCatalogMutation
+                )
+            }
         }
-        try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
+        do {
+            try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
+        }
         let result = try await materializeCatalogFileAfterDiskWrite(
             rootID: rootID,
             relativePath: standardizedRelativePath,
@@ -16204,11 +16368,14 @@ actor WorkspaceFileContextStore {
             commands: [.modified([standardizedRelativePath])]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         let deferredPublicationToken: FileSystemDeferredEditPublicationToken
         do {
@@ -16223,6 +16390,14 @@ actor WorkspaceFileContextStore {
             }
             deferredPublicationToken = token
             didCommitCodemapMutation = true
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
         } catch FileSystemError.fileNotFound {
             didCommitCodemapMutation = withCodemapPathLocalCatalogMutation(rootID: rootID) {
                 pruneCatalogFileMissingOnDisk(
@@ -16301,18 +16476,31 @@ actor WorkspaceFileContextStore {
             commands: [.renamed(from: oldPath, to: newPath)]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         let oldFile = file(rootID: rootID, relativePath: oldPath)
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
-        try await state.service.moveFile(
-            atRelativePath: oldPath,
-            toRelativePath: newPath
-        )
+        do {
+            try await state.service.moveFile(
+                atRelativePath: oldPath,
+                toRelativePath: newPath
+            )
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [oldPath, newPath]
+            )
+            throw CancellationError()
+        }
         didCommitCodemapMutation = true
         let destinationEligibility = await state.service.registerExplicitlyManagedRegularFile(relativePath: newPath)
         let destinationManagedOnly: Bool
@@ -16344,16 +16532,27 @@ actor WorkspaceFileContextStore {
             commands: [.deleted([standardizedRelativePath])]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         let oldFile = file(rootID: rootID, relativePath: standardizedRelativePath)
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         do {
             try await state.service.deleteFile(atRelativePath: standardizedRelativePath)
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
         } catch FileSystemError.fileNotFound {
             if oldFile != nil {
                 didCommitCodemapMutation = withCodemapPathLocalCatalogMutation(rootID: rootID) {
@@ -16394,14 +16593,25 @@ actor WorkspaceFileContextStore {
             commands: [.deleted(affectedPaths)]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         do {
             try await state.service.moveItemToTrash(atRelativePath: standardizedRelativePath)
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
         } catch FileSystemError.fileNotFound {
             if oldFile != nil || oldFolder != nil {
                 didCommitCodemapMutation = withCodemapPathLocalCatalogMutation(rootID: rootID) {

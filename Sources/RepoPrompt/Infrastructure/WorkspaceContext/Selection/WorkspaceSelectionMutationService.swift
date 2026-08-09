@@ -31,6 +31,7 @@ struct WorkspaceDemoteSelectionResult: Equatable {
     let invalidPaths: [String]
     let codemapUnavailable: [String]
     let mutated: Bool
+    let validCandidateCount: Int
 }
 
 struct WorkspaceSliceSelectionMutationResult: Equatable {
@@ -91,6 +92,24 @@ struct WorkspaceCodemapAutomaticSelectionWaiter {
     }
 }
 
+struct WorkspaceCodemapAutomaticSelectionClock {
+    let now: @Sendable () -> ContinuousClock.Instant
+
+    static let production = Self { ContinuousClock.now }
+}
+
+struct WorkspaceCodemapAutomaticSelectionDemandChangeWaiter {
+    let wait: @Sendable (
+        WorkspaceFileContextStore,
+        WorkspaceCodemapArtifactDemandTicket,
+        ContinuousClock.Instant
+    ) async -> WorkspaceCodemapArtifactDemandResult
+
+    static let production = Self { store, ticket, deadline in
+        await store.waitForCodemapArtifactDemandChange(ticket, deadline: deadline)
+    }
+}
+
 private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
     private var retainedTargetTickets = Set<WorkspaceCodemapArtifactDemandTicket>()
 
@@ -100,6 +119,25 @@ private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
             retainedTargetTickets.insert(ticket)
         case .notAcquired:
             break
+        }
+    }
+
+    func owns(_ ticket: WorkspaceCodemapArtifactDemandTicket) -> Bool {
+        retainedTargetTickets.contains(ticket)
+    }
+
+    func replaceConsumed(
+        _ oldTicket: WorkspaceCodemapArtifactDemandTicket,
+        with result: WorkspaceCodemapArtifactDemandResult
+    ) {
+        retainedTargetTickets.remove(oldTicket)
+        let replacement: WorkspaceCodemapArtifactDemandTicket? = switch result {
+        case let .pending(ticket): ticket
+        case let .ready(ready): ready.ticket
+        case .unavailable: nil
+        }
+        if let replacement {
+            retainedTargetTickets.insert(replacement)
         }
     }
 
@@ -115,19 +153,28 @@ struct WorkspaceSelectionMutationService {
     let codemapsGloballyDisabledMessage: String
     let automaticSelectionPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     let automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
+    let automaticSelectionClock: WorkspaceCodemapAutomaticSelectionClock
+    let automaticSelectionDemandChangeWaiter: WorkspaceCodemapAutomaticSelectionDemandChangeWaiter
+    let removePathsDidCaptureExistingHook: @Sendable (StoredSelection) async -> Void
 
     init(
         store: WorkspaceFileContextStore,
         codemapsGloballyDisabled: Bool = false,
         codemapsGloballyDisabledMessage: String = "Code maps are disabled for this tool.",
         automaticSelectionPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .default,
-        automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production
+        automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production,
+        automaticSelectionClock: WorkspaceCodemapAutomaticSelectionClock = .production,
+        automaticSelectionDemandChangeWaiter: WorkspaceCodemapAutomaticSelectionDemandChangeWaiter = .production,
+        removePathsDidCaptureExistingHook: @escaping @Sendable (StoredSelection) async -> Void = { _ in }
     ) {
         self.store = store
         self.codemapsGloballyDisabled = codemapsGloballyDisabled
         self.codemapsGloballyDisabledMessage = codemapsGloballyDisabledMessage
         self.automaticSelectionPolicy = automaticSelectionPolicy
         self.automaticSelectionWaiter = automaticSelectionWaiter
+        self.automaticSelectionClock = automaticSelectionClock
+        self.automaticSelectionDemandChangeWaiter = automaticSelectionDemandChangeWaiter
+        self.removePathsDidCaptureExistingHook = removePathsDidCaptureExistingHook
     }
 
     func buildSelection(
@@ -502,6 +549,7 @@ struct WorkspaceSelectionMutationService {
         mode: String = "full",
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceRemoveSelectionResult {
+        await removePathsDidCaptureExistingHook(existing)
         if mode == "codemap_only" {
             let resolution = await resolveSelectionCandidates(
                 paths: paths,
@@ -556,7 +604,7 @@ struct WorkspaceSelectionMutationService {
         paths: [String],
         rawPaths: [String],
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool) {
+    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool, validCandidateCount: Int) {
         let resolution = await resolveSelectionCandidates(paths: paths, rawPaths: rawPaths, expandFolders: false, rootScope: rootScope)
         var selectedPaths = existing.selectedPaths
         var manualCodemapPaths = existing.manualCodemapPaths
@@ -581,7 +629,12 @@ struct WorkspaceSelectionMutationService {
             slices: slices,
             codemapAutoEnabled: existing.codemapAutoEnabled
         )
-        return (selection, resolution.invalidPaths, selection != existing || mutated)
+        return (
+            selection,
+            resolution.invalidPaths,
+            selection != existing || mutated,
+            resolution.candidates.count
+        )
     }
 
     func demotePaths(
@@ -601,7 +654,8 @@ struct WorkspaceSelectionMutationService {
                 selection: existing,
                 invalidPaths: resolution.invalidPaths,
                 codemapUnavailable: resolution.codemapUnavailable,
-                mutated: false
+                mutated: false,
+                validCandidateCount: resolution.candidates.count
             )
         }
         var selectedPaths = existing.selectedPaths
@@ -624,7 +678,8 @@ struct WorkspaceSelectionMutationService {
             selection: selection,
             invalidPaths: resolution.invalidPaths,
             codemapUnavailable: resolution.codemapUnavailable,
-            mutated: selection != existing
+            mutated: selection != existing,
+            validCandidateCount: resolution.candidates.count
         )
     }
 
@@ -635,13 +690,17 @@ struct WorkspaceSelectionMutationService {
         allowEmptyFolderExpansion: Bool = false,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceResolvedCandidates {
-        let rawLookup = rawLookup(rawPaths)
+        let rawLookup = rawLookup(rawPaths, matching: paths)
         let ordered = orderedInputs(paths)
+        let roots = await store.rootRefs(scope: rootScope)
         var invalid: [String] = []
         var preflight: [String] = []
         for key in ordered {
+            let raw = rawLookup[key] ?? key
             if let issue = await store.exactPathResolutionIssue(for: key, kind: expandFolders ? .either : .file, rootScope: rootScope) {
-                invalid.append(PathResolutionIssueRenderer.message(for: issue))
+                invalid.append(pathResolutionMessage(for: issue, rawPath: raw))
+            } else if isAbsolutePathOutsideRoots(key, roots: roots) {
+                invalid.append(raw)
             } else {
                 preflight.append(key)
             }
@@ -665,7 +724,7 @@ struct WorkspaceSelectionMutationService {
                         if allowEmptyFolderExpansion {
                             resolvedMap[raw] = resolvedMap[raw] ?? (folder.displayPath ?? key)
                         } else if let issue = folder.issue {
-                            invalid.append(PathResolutionIssueRenderer.message(for: issue))
+                            invalid.append(pathResolutionMessage(for: issue, rawPath: raw))
                         } else {
                             invalid.append(raw)
                         }
@@ -678,7 +737,7 @@ struct WorkspaceSelectionMutationService {
                     continue
                 }
                 if let issue = folder.issue {
-                    invalid.append(PathResolutionIssueRenderer.message(for: issue))
+                    invalid.append(pathResolutionMessage(for: issue, rawPath: raw))
                     continue
                 }
             }
@@ -693,13 +752,17 @@ struct WorkspaceSelectionMutationService {
         expandFolders: Bool,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceCodemapOnlyCandidates {
-        let rawLookup = rawLookup(rawPaths)
+        let rawLookup = rawLookup(rawPaths, matching: paths)
         let ordered = orderedInputs(paths)
+        let roots = await store.rootRefs(scope: rootScope)
         var invalid: [String] = []
         var preflight: [String] = []
         for key in ordered {
+            let raw = rawLookup[key] ?? key
             if let issue = await store.exactPathResolutionIssue(for: key, kind: expandFolders ? .either : .file, rootScope: rootScope) {
-                invalid.append(PathResolutionIssueRenderer.message(for: issue))
+                invalid.append(pathResolutionMessage(for: issue, rawPath: raw))
+            } else if isAbsolutePathOutsideRoots(key, roots: roots) {
+                invalid.append(raw)
             } else {
                 preflight.append(key)
             }
@@ -727,7 +790,7 @@ struct WorkspaceSelectionMutationService {
                 let folder = await store.expandFolderInputToFiles(key, rootScope: rootScope)
                 if folder.handled {
                     if folder.files.isEmpty {
-                        if let issue = folder.issue { invalid.append(PathResolutionIssueRenderer.message(for: issue)) } else { invalid.append(raw) }
+                        if let issue = folder.issue { invalid.append(pathResolutionMessage(for: issue, rawPath: raw)) } else { invalid.append(raw) }
                     } else {
                         var supported = 0
                         var unsupported = 0
@@ -749,7 +812,7 @@ struct WorkspaceSelectionMutationService {
                     continue
                 }
                 if let issue = folder.issue {
-                    invalid.append(PathResolutionIssueRenderer.message(for: issue))
+                    invalid.append(pathResolutionMessage(for: issue, rawPath: raw))
                     continue
                 }
             }
@@ -861,12 +924,18 @@ struct WorkspaceSelectionMutationService {
                 resultsByTarget[target] = owned.result
             }
 
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: automaticSelectionPolicy.maximumTotalWait)
+            let deadline = automaticSelectionClock.now().advanced(
+                by: automaticSelectionPolicy.maximumTotalWait
+            )
             for round in 0 ..< automaticSelectionPolicy.maximumReadinessRounds {
                 try Task.checkCancellation()
                 var waiting = false
+                var hasBusy = false
                 var retryAfter: [Int] = []
+                var pendingTickets: [(
+                    target: WorkspaceCodemapAutomaticSelectionTarget,
+                    ticket: WorkspaceCodemapArtifactDemandTicket
+                )] = []
                 for (target, current) in resultsByTarget {
                     let refreshed: WorkspaceCodemapArtifactDemandResult = switch current {
                     case let .pending(ticket):
@@ -876,10 +945,12 @@ struct WorkspaceSelectionMutationService {
                     }
                     resultsByTarget[target] = refreshed
                     switch refreshed {
-                    case .pending:
+                    case let .pending(ticket):
                         waiting = true
+                        pendingTickets.append((target, ticket))
                     case let .unavailable(.busy(milliseconds)):
                         waiting = true
+                        hasBusy = true
                         if let milliseconds { retryAfter.append(milliseconds) }
                     case .ready, .unavailable:
                         break
@@ -887,22 +958,64 @@ struct WorkspaceSelectionMutationService {
                 }
                 guard waiting,
                       round + 1 < automaticSelectionPolicy.maximumReadinessRounds,
-                      clock.now < deadline
+                      automaticSelectionClock.now() < deadline
                 else { break }
+
+                if !pendingTickets.isEmpty, !hasBusy {
+                    let firstCompletion: (
+                        target: WorkspaceCodemapAutomaticSelectionTarget,
+                        result: WorkspaceCodemapArtifactDemandResult
+                    )? = try await withThrowingTaskGroup(
+                        of: (
+                            target: WorkspaceCodemapAutomaticSelectionTarget,
+                            result: WorkspaceCodemapArtifactDemandResult
+                        ).self
+                    ) { group in
+                        for pending in pendingTickets {
+                            group.addTask {
+                                try Task.checkCancellation()
+                                let result = await automaticSelectionDemandChangeWaiter.wait(
+                                    store,
+                                    pending.ticket,
+                                    deadline
+                                )
+                                try Task.checkCancellation()
+                                return (pending.target, result)
+                            }
+                        }
+                        guard let first = try await group.next() else { return nil }
+                        group.cancelAll()
+                        return first
+                    }
+                    if let firstCompletion {
+                        resultsByTarget[firstCompletion.target] = firstCompletion.result
+                    }
+                    continue
+                }
+
                 try await waitForAutomaticSelectionReadiness(
                     round: round,
                     suggestedMilliseconds: retryAfter,
-                    clock: clock,
                     deadline: deadline
                 )
                 for (target, current) in resultsByTarget {
                     guard case .unavailable(.busy) = current,
                           let rootReceipt = rootReceiptByEpoch[target.rootEpoch]
                     else { continue }
-                    if let priorTicket = ticketsByTarget.removeValue(forKey: target) {
-                        _ = await store.cancelCodemapArtifactDemand(priorTicket)
-                    }
-                    if let owned = await store.requestAutomaticCodemapTargetWithOwnership(
+                    if let priorTicket = ticketsByTarget[target],
+                       await ownership.owns(priorTicket)
+                    {
+                        let retried = await store.retryBusyCodemapArtifactDemand(
+                            priorTicket,
+                            priority: .background
+                        )
+                        let oldStatus = await store.codemapArtifactDemandStatus(priorTicket)
+                        if case .unavailable(.staleCurrentness) = oldStatus {
+                            await ownership.replaceConsumed(priorTicket, with: retried)
+                            ticketsByTarget[target] = automaticSelectionTicket(from: retried)
+                        }
+                        resultsByTarget[target] = retried
+                    } else if let owned = await store.requestAutomaticCodemapTargetWithOwnership(
                         target: target,
                         rootReceipt: rootReceipt,
                         rootScope: rootScope,
@@ -1025,10 +1138,19 @@ struct WorkspaceSelectionMutationService {
         }
     }
 
+    private func automaticSelectionTicket(
+        from result: WorkspaceCodemapArtifactDemandResult
+    ) -> WorkspaceCodemapArtifactDemandTicket? {
+        switch result {
+        case let .pending(ticket): ticket
+        case let .ready(ready): ready.ticket
+        case .unavailable: nil
+        }
+    }
+
     private func waitForAutomaticSelectionReadiness(
         round: Int,
         suggestedMilliseconds: [Int],
-        clock: ContinuousClock,
         deadline: ContinuousClock.Instant
     ) async throws {
         let shift = min(round, 20)
@@ -1037,7 +1159,7 @@ struct WorkspaceSelectionMutationService {
         let suggested = suggestedMilliseconds.max() ?? 0
         let milliseconds = max(bounded, suggested)
         let proposed = Duration.milliseconds(milliseconds)
-        let remaining = clock.now.duration(to: deadline)
+        let remaining = automaticSelectionClock.now().duration(to: deadline)
         guard remaining > .zero else { return }
         try await automaticSelectionWaiter.sleep(min(proposed, remaining))
     }
@@ -1070,6 +1192,56 @@ struct WorkspaceSelectionMutationService {
             lookup[trimmed] = raw
         }
         return lookup
+    }
+
+    private func rawLookup(_ rawPaths: [String], matching paths: [String]) -> [String: String] {
+        var lookup = rawLookup(rawPaths)
+        let orderedPaths = orderedInputs(paths)
+        let orderedRawPaths = orderedInputs(rawPaths)
+        guard orderedPaths.count == orderedRawPaths.count else { return lookup }
+        for (path, raw) in zip(orderedPaths, orderedRawPaths) {
+            lookup[path] = raw
+        }
+        return lookup
+    }
+
+    private func isAbsolutePathOutsideRoots(
+        _ path: String,
+        roots: [WorkspaceRootRef]
+    ) -> Bool {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return false }
+        let standardized = StandardizedPath.absolute(expanded)
+        return !roots.contains { root in
+            standardized == root.standardizedFullPath
+                || StandardizedPath.isDescendant(standardized, of: root.standardizedFullPath)
+        }
+    }
+
+    private func pathResolutionMessage(
+        for issue: PathResolutionIssue,
+        rawPath: String
+    ) -> String {
+        switch issue {
+        case .emptyInput:
+            PathResolutionIssueRenderer.message(for: issue)
+        case let .invalidPathCharacters(_, reason):
+            PathResolutionIssueRenderer.message(for: .invalidPathCharacters(input: rawPath, reason: reason))
+        case let .ambiguousAlias(alias, matchingRoots):
+            PathResolutionIssueRenderer.message(for: .ambiguousAlias(alias: alias, matchingRoots: matchingRoots))
+        case let .ambiguousRootMatch(_, candidateRoots):
+            PathResolutionIssueRenderer.message(for: .ambiguousRootMatch(input: rawPath, candidateRoots: candidateRoots))
+        case let .pathOutsideWorkspace(_, visibleRoots):
+            PathResolutionIssueRenderer.message(for: .pathOutsideWorkspace(input: rawPath, visibleRoots: visibleRoots))
+        case let .destinationOutsideSourceRoot(_, sourceRoot):
+            PathResolutionIssueRenderer.message(for: .destinationOutsideSourceRoot(input: rawPath, sourceRoot: sourceRoot))
+        case .unsupportedPseudoAbsoluteAlias:
+            PathResolutionIssueRenderer.message(for: .unsupportedPseudoAbsoluteAlias(input: rawPath))
+        case .unresolved:
+            PathResolutionIssueRenderer.message(for: .unresolved(input: rawPath))
+        }
     }
 
     private func normalizeSlices(_ slices: [String: [LineRange]]) -> [String: [LineRange]] {

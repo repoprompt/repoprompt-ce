@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -535,7 +536,7 @@ import XCTest
         }
 
         @MainActor
-        func testClosingWindowRejectsCapturedDispatchIdentityBeforeOwnershipOperation() async {
+        func testClosingWindowRejectsCapturedDispatchIdentityBeforeOwnershipOperation() async throws {
             let manager = ServerNetworkManager()
             let connectionID = UUID()
             let bodyRan = LimiterTestFlag()
@@ -552,11 +553,13 @@ import XCTest
                 totalToolCalls: 0,
                 createdAt: .distantPast
             )
+            let catalogService = window.mcpServer.windowMCPToolCatalogService
+            let catalogHandle = try await AppDomainRuntimeComposition.shared.register(catalogService).handle
             let identity = ServerNetworkManager.WindowToolDispatchIdentity(
                 windowID: window.windowID,
                 windowStateIdentity: ObjectIdentifier(window),
                 serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
-                catalogServiceIdentity: ObjectIdentifier(window.mcpServer.windowMCPToolCatalogService)
+                catalogRegistrationHandle: catalogHandle
             )
             window.beginClose()
 
@@ -577,6 +580,7 @@ import XCTest
             XCTAssertFalse(didRunBody)
 
             await manager.debugRemoveConnection(connectionID)
+            await AppDomainRuntimeComposition.shared.unregister(catalogService)
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
         }

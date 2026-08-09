@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 @MainActor
 struct WindowStateComposition {
@@ -21,6 +22,7 @@ struct WindowStateComposition {
     let aiQueriesService: AIQueriesService
     let chatDataService: ChatDataService
     let workspaceManager: WorkspaceManagerViewModel
+    let domainWorkspacePresentationBridge: DomainWorkspacePresentationBridge?
 }
 
 @MainActor
@@ -29,6 +31,7 @@ enum WindowStateCompositionFactory {
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
+        domainRuntime: MCPDomainRuntime? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
@@ -73,13 +76,21 @@ enum WindowStateCompositionFactory {
             settingsManager: settingsManager
         )
 
-        // 7) Create the workspace manager
+        // 7) Create the workspace manager with construction-time runtime persistence ownership.
+        let domainWorkspaceClient = domainRuntime.map {
+            DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID)
+        }
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy
         )
+        let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
+            DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
+        }
+        domainWorkspacePresentationBridge?.start()
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,
             store: workspaceFileContextStore
@@ -132,6 +143,10 @@ enum WindowStateCompositionFactory {
                     workspaceManager: workspaceManager
                 )
             },
+            domainRoutingCoordinator: domainRuntime?.routingCoordinator,
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
+            domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
+            domainReadRuntimeIdentity: domainRuntime?.identity,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
         let closeCoordinator = WindowCloseCoordinator()
@@ -155,8 +170,8 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
-        workspaceFilesViewModel.setSessionWorktreeBindingsProvider { [weak agentModeViewModel] sessionID in
-            agentModeViewModel?.worktreeBindings(forAgentSessionID: sessionID) ?? []
+        workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
+            agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
         }
         if deferredInitialAgentSystemWorkspaceRefresh {
             agentModeViewModel.deferInitialSystemWorkspaceSessionListRefresh(reason: "programmaticNewWindowWorkspaceSwitch")
@@ -212,7 +227,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 aiQueriesService: aiQueriesService,
                 chatDataService: chatDataService,
-                workspaceManager: workspaceManager
+                workspaceManager: workspaceManager,
+                domainWorkspacePresentationBridge: domainWorkspacePresentationBridge
             )
         #else
             return WindowStateComposition(
@@ -231,7 +247,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 aiQueriesService: aiQueriesService,
                 chatDataService: chatDataService,
-                workspaceManager: workspaceManager
+                workspaceManager: workspaceManager,
+                domainWorkspacePresentationBridge: domainWorkspacePresentationBridge
             )
         #endif
     }

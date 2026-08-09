@@ -451,7 +451,7 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(
+                try await prepareAppServerClient(
                     appServerClient: appServerClient,
                     requestTimeout: requestTimeout
                 )
@@ -658,7 +658,7 @@ final class CodexCLIProvider: AIProvider {
 
         do {
             let text = try await withTaskCancellationHandler(operation: {
-                try await ensureAppServerReady(
+                try await prepareAppServerClient(
                     appServerClient: appServerClient,
                     requestTimeout: requestTimeout
                 )
@@ -792,13 +792,12 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
-    private func ensureAppServerReady(
+    private func prepareAppServerClient(
         appServerClient: CodexAppServerClient?,
         requestTimeout: TimeInterval
     ) async throws {
         if let appServerReadyHook {
             try await appServerReadyHook()
-            return
         }
         guard let appServerClient else { return }
         if enableDebugLogging {
@@ -812,7 +811,7 @@ final class CodexCLIProvider: AIProvider {
             )
         }
         await appServerClient.updateDefaultRequestTimeout(requestTimeout)
-        try await appServerClient.startIfNeeded()
+        // The controller applies the non-Agent feature policy before it starts the process.
     }
 
     private func startTurnTimeoutMonitor(
@@ -922,6 +921,7 @@ final class CodexCLIProvider: AIProvider {
             authTokensRefreshHandler: nil,
             goalSupportEnabledProvider: { false },
             reasoningSummariesEnabledProvider: { false },
+            memoriesEnabledProvider: { false },
             computerUseEnabledProvider: { false }
         )
 
@@ -978,10 +978,13 @@ final class CodexCLIProvider: AIProvider {
         )
     }
 
-    private func interactiveConfigOverrides(excludeServers: Set<String>) -> [String: Any] {
+    func interactiveConfigOverrides(excludeServers: Set<String>) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let toolPolicy = Self.interactiveToolPolicy()
-        var overrides = CodexOverrides.appServerConfigMap(toolPolicy: toolPolicy)
+        var overrides = CodexOverrides.appServerConfigMap(
+            toolPolicy: toolPolicy,
+            featurePolicy: .defaultDisabled
+        )
         let mcpOverrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .disableAll(exceptBroken: excludeServers)

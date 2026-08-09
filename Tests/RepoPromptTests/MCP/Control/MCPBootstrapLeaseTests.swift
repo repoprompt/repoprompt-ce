@@ -574,6 +574,43 @@ final class MCPBootstrapLeaseTests: XCTestCase {
 
     func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {
         #if DEBUG
+            do {
+                let runID = UUID()
+                let recorder = PolicyRecorder()
+                await HeadlessAgentConnectionGate.cancelAll()
+                await MCPRoutingWaiter.cleanup(runID: runID)
+
+                let lease = MCPBootstrapLease(
+                    spec: MCPBootstrapLeaseSpec(
+                        runID: runID,
+                        gateID: UUID(),
+                        windowID: 1,
+                        tabID: UUID(),
+                        clientName: "bootstrap-lease-enabler-failure",
+                        restrictedTools: [],
+                        additionalTools: nil,
+                        oneShot: true,
+                        reason: "MCP enabler failure regression",
+                        ttl: 10,
+                        purpose: .agentModeRun,
+                        taskLabelKind: nil,
+                        allowsAgentExternalControlTools: false,
+                        requiresExpectedAgentPID: false
+                    ),
+                    mcpServerEnabler: { false },
+                    policyInstaller: { _ in await recorder.recordInstall() }
+                )
+
+                let acquired = await lease.acquire()
+                let installCount = await recorder.installCount
+                let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                XCTAssertFalse(acquired)
+                XCTAssertEqual(installCount, 0)
+                XCTAssertEqual(waiterCount, 0)
+                XCTAssertNil(activeGate)
+            }
+
             let runID = UUID()
             let gateID = UUID()
             let recorder = PolicyRecorder()
@@ -764,7 +801,6 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             await window.workspaceManager.awaitInitialized()
 
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            var ownedRoutingService: WindowRoutingService?
             var lease: MCPBootstrapLease?
             var loadedRootID: UUID?
 
@@ -786,10 +822,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await MCPRoutingWaiter.cleanup(runID: runID)
                 await HeadlessAgentConnectionGate.cancelAll()
-                ServiceRegistry.unregister(catalogService)
-                if let ownedRoutingService {
-                    ServiceRegistry.unregister(ownedRoutingService)
-                }
+                await AppDomainRuntimeComposition.shared.unregister(catalogService)
                 if let loadedRootID {
                     await window.workspaceFileContextStore.unloadRoot(id: loadedRootID)
                 }
@@ -825,9 +858,8 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 loadedRootID = loadedRoot.id
 
-                ServiceRegistry.register(catalogService)
-                let routing = try await Self.ensureRoutingService()
-                ownedRoutingService = routing.owned ? routing.service : nil
+                try await AppDomainRuntimeComposition.shared.register(catalogService)
+                try await Self.ensureRoutingService()
 
                 let cursorAdditionalTools = AgentModeMCPPolicyInstaller.additionalTools(for: .cursor)
                 XCTAssertTrue(cursorAdditionalTools.contains(MCPWindowToolName.oracleChatLog))
@@ -1226,21 +1258,12 @@ private extension MCPBootstrapLeaseTests {
     #endif
 
     @MainActor
-    static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-        if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
-            return (existing, false)
+    static func ensureRoutingService() async throws {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
+        guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
+            throw MCPBootstrapLeaseTestError.routingServiceUnavailable
         }
-        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
-        for _ in 0 ..< 100 {
-            let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
-            let names = await service.tools.map(\.name)
-            if registered, names.contains("bind_context") {
-                return (service, true)
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        ServiceRegistry.unregister(service)
-        throw MCPBootstrapLeaseTestError.routingServiceUnavailable
     }
 }
 

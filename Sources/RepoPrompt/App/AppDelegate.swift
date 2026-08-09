@@ -1,8 +1,11 @@
 import Cocoa
 import Combine
 import Darwin
+import Logging
 import Sparkle
 import SwiftUI
+
+private let appDelegateLog = Logger(label: "com.repoprompt.app.delegate")
 
 #if DEBUG
     private var appDelegateDebugLoggingEnabled = false
@@ -16,13 +19,23 @@ import SwiftUI
 
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
+    typealias GlobalMCPRegistrationOperation = @MainActor @Sendable () async throws -> Void
+    typealias DomainRuntimeShutdownOperation = @Sendable () async -> Void
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
 
-    // New global routing/settings services (kept alive by the AppDelegate)
-    private var windowRoutingService: WindowRoutingService?
-    private var appSettingsMCPService: AppSettingsMCPService?
+    /// App startup owns one explicit registration attempt; readiness only observes it.
+    private var domainRuntimeStartupTask: Task<Void, Never>?
+    private(set) var domainRuntimeStartupFailureDescription: String?
+    private var globalMCPRegistrationOperation: GlobalMCPRegistrationOperation = {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        try await WindowState.sharedMCPService.start()
+    }
+
+    private var domainRuntimeShutdownOperation: DomainRuntimeShutdownOperation = {
+        _ = await AppDomainRuntimeComposition.shared.runtime.shutdown()
+    }
 
     // MARK: - Global references
 
@@ -64,6 +77,48 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         super.init()
     }
 
+    // MARK: - Global MCP startup
+
+    /// The production startup seam for process-owned application registrations.
+    /// Repeated callers join the one app-lifetime attempt instead of retrying or logging.
+    @discardableResult
+    func startGlobalMCPServiceRegistration() -> Task<Void, Never> {
+        if let domainRuntimeStartupTask { return domainRuntimeStartupTask }
+
+        domainRuntimeStartupFailureDescription = nil
+        let registrationOperation = globalMCPRegistrationOperation
+        let task = Task { @MainActor [weak self, registrationOperation] in
+            do {
+                try await registrationOperation()
+            } catch {
+                let description = String(reflecting: error)
+                self?.domainRuntimeStartupFailureDescription = description
+                appDelegateLog.error("Global MCP domain service registration failed: \(description)")
+            }
+        }
+        domainRuntimeStartupTask = task
+        return task
+    }
+
+    #if DEBUG
+        func setGlobalMCPRegistrationOperationForTesting(
+            _ operation: @escaping GlobalMCPRegistrationOperation
+        ) {
+            precondition(domainRuntimeStartupTask == nil, "Registration operation must be injected before startup")
+            globalMCPRegistrationOperation = operation
+        }
+
+        func setDomainRuntimeShutdownOperationForTesting(
+            _ operation: @escaping DomainRuntimeShutdownOperation
+        ) {
+            domainRuntimeShutdownOperation = operation
+        }
+
+        func shutdownDomainRuntimeForTerminationForTesting() async {
+            await shutdownDomainRuntimeForTermination()
+        }
+    #endif
+
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -83,16 +138,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         AppearanceController.shared.applyFromGlobalSettings()
 
         // ───────────────────────────────────────────────────
-        // Register global MCP app-wide helpers
-        let appSettingsMCPService = AppSettingsMCPService()
-        ServiceRegistry.register(appSettingsMCPService)
-        self.appSettingsMCPService = appSettingsMCPService
-
-        // Register global MCP window-routing helpers
-        windowRoutingService = WindowRoutingService(
-            windowStates: WindowStatesManager.shared,
-            networkMgr: ServerNetworkManager.shared
-        )
+        // Start the runtime and publish both application-scoped MCP services before
+        // any connection can report a complete catalog. Readiness is observation-only.
+        startGlobalMCPServiceRegistration()
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
             Task {
@@ -169,6 +217,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
+            await shutdownDomainRuntimeForTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
 
@@ -189,6 +238,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     // MARK: - App Teardown
+
+    private func shutdownDomainRuntimeForTermination() async {
+        domainRuntimeStartupTask?.cancel()
+        await domainRuntimeShutdownOperation()
+    }
 
     func tearDown() async {
         // Put any global-level teardown logic here

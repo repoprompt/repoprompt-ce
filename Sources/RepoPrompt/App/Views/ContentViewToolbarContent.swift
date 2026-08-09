@@ -5,10 +5,24 @@ import SwiftUI
 struct ContentViewToolbarContent: ToolbarContent {
     let windowState: WindowState
     let recommendationWizardViewModel: RecommendationWizardViewModel?
+    let isAgentModeActive: Bool
     @Binding var showRecommendationsPopover: Bool
     @Binding var showMCPServerPopover: Bool
 
     var body: some ToolbarContent {
+        // Agent Mode context drawer button
+        ToolbarItem(placement: .automatic) {
+            if isAgentModeActive {
+                Button {
+                    windowState.agentModeViewModel.ui.contextDrawer.toggle()
+                } label: {
+                    Label("Compose", systemImage: "pencil")
+                        .labelStyle(.titleAndIcon)
+                }
+                .hoverTooltip("Generate prompts from selected files")
+            }
+        }
+
         if #available(macOS 26.0, *) {
             agentChatTitleItem
                 .sharedBackgroundVisibility(.hidden)

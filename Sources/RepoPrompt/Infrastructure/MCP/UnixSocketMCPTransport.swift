@@ -9,6 +9,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 #if DEBUG
@@ -159,119 +160,7 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
     }
 }
 
-/// Tracks request/response publication at the socket boundary so lifecycle cleanup can
-/// wait for completed writes rather than closing after a handler merely returns.
-final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pendingRequestIDs: Set<JSONRPCBridgeID> = []
-    private var waiters: [CheckedContinuation<Bool, Never>] = []
-    private var isTerminal = false
-
-    func recordAcceptedClientFrame(_ frame: Data) {
-        let requestIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
-            frame,
-            direction: .clientToServer
-        ).compactMap { message -> JSONRPCBridgeID? in
-            guard message.kind == .request,
-                  let id = message.id,
-                  id != .null
-            else {
-                return nil
-            }
-            return id
-        }
-        guard !requestIDs.isEmpty else { return }
-
-        lock.lock()
-        if !isTerminal {
-            pendingRequestIDs.formUnion(requestIDs)
-        }
-        lock.unlock()
-    }
-
-    func recordDeliveredServerFrame(_ frame: Data) {
-        let responseIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
-            frame,
-            direction: .serverToClient
-        ).compactMap { message -> JSONRPCBridgeID? in
-            guard message.kind == .response,
-                  let id = message.id,
-                  id != .null
-            else {
-                return nil
-            }
-            return id
-        }
-        guard !responseIDs.isEmpty else { return }
-
-        let continuations: [CheckedContinuation<Bool, Never>]
-        lock.lock()
-        pendingRequestIDs.subtract(responseIDs)
-        if !isTerminal, pendingRequestIDs.isEmpty {
-            continuations = waiters
-            waiters.removeAll()
-        } else {
-            continuations = []
-        }
-        lock.unlock()
-        continuations.forEach { $0.resume(returning: true) }
-    }
-
-    func waitUntilDrained() async -> Bool {
-        await withCheckedContinuation { continuation in
-            let immediateResult: Bool?
-            lock.lock()
-            if isTerminal {
-                immediateResult = false
-            } else if pendingRequestIDs.isEmpty {
-                immediateResult = true
-            } else {
-                waiters.append(continuation)
-                immediateResult = nil
-            }
-            lock.unlock()
-
-            if let immediateResult {
-                continuation.resume(returning: immediateResult)
-            }
-        }
-    }
-
-    func reset() {
-        let continuations: [CheckedContinuation<Bool, Never>]
-        lock.lock()
-        continuations = waiters
-        waiters.removeAll()
-        pendingRequestIDs.removeAll()
-        isTerminal = false
-        lock.unlock()
-        continuations.forEach { $0.resume(returning: false) }
-    }
-
-    func close() {
-        let continuations: [CheckedContinuation<Bool, Never>]
-        lock.lock()
-        guard !isTerminal else {
-            lock.unlock()
-            return
-        }
-        isTerminal = true
-        continuations = waiters
-        waiters.removeAll()
-        lock.unlock()
-        continuations.forEach { $0.resume(returning: false) }
-    }
-
-    func snapshot() -> MCPResponseDeliverySnapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        return MCPResponseDeliverySnapshot(
-            pendingRequestCount: pendingRequestIDs.count,
-            waiterCount: waiters.count,
-            isTerminal: isTerminal
-        )
-    }
-}
+typealias MCPTransportResponseDeliveryGate = MCPDomainResponseDeliveryTracker
 
 /// A Transport implementation using UNIX domain sockets for local MCP communication.
 ///
@@ -380,7 +269,7 @@ public actor UnixSocketMCPTransport: Transport {
     private var fdGeneration: UInt64 = 0
 
     private var lastActivityTime: Date?
-    private let responseDeliveryGate = MCPTransportResponseDeliveryGate()
+    private let responseDeliveryGate = MCPDomainResponseDeliveryTracker()
 
     /// Connection timeout when waiting for socket to appear and accept connections
     private let connectionTimeout: TimeInterval = 30.0

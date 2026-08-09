@@ -68,6 +68,22 @@
         "required_properties": []
       }
     },
+    "m4_protected_mutations": {
+      "construction_stage": "m4b",
+      "gate_4a_families": ["manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces"],
+      "gate_4b_families": ["file_actions", "apply_edits", "manage_worktree"],
+      "definition_and_registration_authority": "MCPDomainProtectedMutationToolProvider",
+      "schema_parity": "wrapped_binding_definition_preserved",
+      "dual_mutation_prevention": "AppDomainRuntimeComposition_wraps_each_binding_once",
+      "connection_registration": "coordinator_owned_token_reacquired_after_restart_or_reregistration",
+      "principal_authority": "kernel_verified_executable_fingerprint_not_display_name",
+      "policy_visibility": "versioned_snapshot_reloaded_at_admission_and_precommit",
+      "canonical_root_scope": "all_relevant_4a_mutations_including_add_folder",
+      "gate_4b_operation_journal": "DomainMutationJournal_schema_v1_CAS_internal_request_key_public_operation_id_is_correlation_only",
+      "gate_4b_path_fence": "translated_resolved_physical_targets_and_nonexistent_parent_identity_at_admission_and_precommit",
+      "gate_4b_export_families": ["prompt.export", "workspace_context.export"],
+      "gate_4b_commit_settlement": "cancel_before_commit_retryable_after_commit_indeterminate"
+    },
     "action_execution_evidence": {
       "status": "explicitly_unmeasured_in_m0",
       "scope": "per-action success/error result and exact JSON-RPC envelope",
@@ -147,7 +163,7 @@
         "behavior": "source_declares_typed_invalid_params",
         "error_type": "ApplyEditsError.invalidParams",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/ApplyEdits/ApplyEditsRequestBuilder.swift",
+          "path": "Sources/RepoPromptDomainRuntime/ApplyEdits/ApplyEditsRequestBuilder.swift",
           "marker": "Provide exactly one of: `rewrite`, `replace`, or `edits`.",
           "type_marker": "ApplyEditsError.invalidParams"
         }
@@ -237,9 +253,9 @@
       "bounded": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "workspace_context", "prompt", "agent_manage", "share_thoughts", "set_status", "history"]
     },
     "advertisement_profiles": {
-      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "routing_advanced", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
+      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "workspace_mutate", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
       "discover_granted_capabilities": ["user_interaction"],
-      "agent_mode_restricted_capabilities": ["routing_advanced", "conversation_helper", "conversation_send"],
+      "agent_mode_restricted_capabilities": ["workspace_mutate", "conversation_helper", "conversation_send"],
       "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
       "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
       "agent_mode_claude_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
@@ -249,16 +265,16 @@
     },
     "tool_capabilities": {
       "app_settings": ["app_settings"],
-      "bind_context": ["routing_advanced"],
-      "manage_workspaces": ["routing_advanced"],
-      "manage_selection": ["context_mutate"],
+      "bind_context": ["workspace_mutate"],
+      "manage_workspaces": ["workspace_mutate"],
+      "manage_selection": ["selection_mutate"],
       "file_actions": ["file_management"],
       "get_code_structure": ["structural_explore"],
       "get_file_tree": ["structural_explore"],
-      "read_file": [],
-      "file_search": [],
-      "workspace_context": ["context_render"],
-      "prompt": ["context_mutate"],
+      "read_file": ["file_read"],
+      "file_search": ["file_search"],
+      "workspace_context": ["workspace_read"],
+      "prompt": ["prompt_mutate"],
       "apply_edits": ["file_content_edit"],
       "oracle_utils": ["conversation_helper"],
       "ask_oracle": ["agent_conversation_send"],
@@ -274,7 +290,18 @@
       "share_thoughts": ["agent_reasoning_control"],
       "set_status": ["agent_session_control"],
       "wait_for_next_user_instruction": ["agent_reasoning_control"],
-      "history": []
+      "history": ["history_read"]
+    },
+    "client_annotation_profiles": {
+      "direct": "canonical",
+      "discovery": "canonical",
+      "agent_mode_generic_explore": "canonical",
+      "agent_mode_generic_engineer": "canonical",
+      "agent_mode_generic_engineer_orchestrator": "canonical",
+      "agent_mode_claude_engineer": "canonical",
+      "agent_mode_codex_engineer": "suppress_read_only_hint",
+      "agent_mode_open_code_engineer": "canonical",
+      "agent_mode_cursor_engineer": "canonical"
     },
     "resolved_tool_policy_projection_classification": "production_policy_projection_not_runtime_registry_evidence",
     "resolved_tool_policy_projection": {
@@ -290,15 +317,25 @@
     }
   },
   "dependencies": {
-    "owner": "MCPWindowToolDependencies",
-    "stored_dependency_count": 84,
-    "stored_dependencies": ["executeOracleUtils", "executeAskOracle", "executeOracleSend", "executeOracleChatLog", "executeAgentExplore", "executeAgentRun", "executeAgentManage", "requireTargetWindow", "requireCurrentTabContext", "requireAgentModeConnection", "resolveAgentModeTabID", "resolveContextBuilderTab", "bindTabForConnection", "buildTabSelectionReply", "sendStageProgress", "makeOracleExportDestination", "resolveDefaultOracleExportPath", "writeGeneratedOracleExportFile", "beforeContextBuilderFinalReviewAuthorization", "didFinalizeContextBuilderReview", "runMCPPlanOrQuestion", "windowID", "promptVM", "workspaceManager", "selectionCoordinator", "applyEditsApprovalStore", "captureRequestMetadata", "resolveImplicitContextBuilderGitTarget", "validateContextBuilderGitArtifactSelection", "resolveTabContextSnapshot", "updateCurrentTabContext", "selectedRecordsForCurrentTabContext", "physicalSelectionForCurrentTabContext", "resolveSelectedFilesForCodeStructure", "boundTabID", "mapFileManagerErrorToMCP", "ensureGitDataRootLoaded", "logDebug", "commitPrimaryGitDiffArtifactsToCurrentTab", "replaceAdvertisedGitArtifactsForCurrentTab", "invalidateAdvertisedGitArtifactsForCurrentTab", "workspaceSearch", "parseManageSelectionInputs", "resolveFileToolLookupContext", "resolveMutationFileToolContext", "stabilizedVirtualSelection", "freezePromptGitReviewContext", "buildCurrentSelectionReply", "buildSelectionPreviewReply", "buildSelectionMutationReply", "buildManageSelectionSetSelection", "resolveManageSelectionArtifactInputs", "validateManageSelectionArtifactFence", "mutatePreResolvedFullFilePaths", "commitManageSelectionArtifactMutation", "addStoredSelectionPaths", "removeStoredSelectionPaths", "promoteStoredSelectionPaths", "demoteStoredSelectionPaths", "computeSelectionSlicesVirtual", "persistResolvedTabContextSnapshot", "makeSelectionHintError", "performFileAction", "buildCodeStructureDTO", "resolveFilesForCodeStructure", "buildStoreBackedFileTreeResult", "readSelectedAuthorizedGitArtifact", "readFile", "enqueueReadFileAutoSelection", "drainReadFileAutoSelection", "enqueueFileSearchAutoSelection", "workspaceContextMessage", "parseCopyPresetSelector", "resolveCopyPreset", "buildTabWorkspaceContext", "selectedFilesWithStats", "selectionCollectionsForCurrentTabContext", "buildCopyPresetContextDTO", "buildCopyPresetsListDTO", "copyPresetDescriptorDTO", "buildExportSelectedFileInfos", "buildTabClipboardContent", "writePromptExportFile", "latestTokenBreakdown"]
+    "owner": "MCPAppPhysicalCapabilityAdapters",
+    "family_count": 5,
+    "families": ["Execution", "Context", "Selection", "Files", "Prompt"],
+    "storage_contract": "namespace-only typed physical capability families; providers receive only their required families"
   },
   "approval": {
     "workspace_operations": ["create_workspace", "delete_workspace", "add_folder", "remove_folder"],
     "terminal_results": ["approved", "denied", "timeout"],
     "cancellation_result": "denied",
-    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay"
+    "authority": "DomainMutationApprovalBroker",
+    "presenter": "WorkspaceApprovalManager",
+    "ordering": "single_fifo_active_request",
+    "late_response": "ignored",
+    "presenter_loss": "default_deny",
+    "existing_test": {
+      "citation": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay",
+      "source_file": "Tests/RepoPromptTests/MCP/WorkspaceApprovalCancellationTests.swift"
+    },
+    "m4_owner_test": "RepoPromptDomainRuntimeTests.DomainMutationApprovalBrokerTests/testRequestsArePresentedAndSettledInFIFOOrder"
   },
   "main_actor": {
     "mcp_local_declaration_count": 42,
@@ -344,6 +381,15 @@
         "symbol": "MCPAgentRoleDefaultsStoring"
       },
       {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift",
+        "kind": "class",
+        "symbol": "DomainWorkspacePresentationBridge",
+        "actor_boundary_classification": "presentation_only",
+        "presentation_role": "snapshot_projection_and_default_bootstrap_command_client",
+        "mutable_domain_authority": false,
+        "executable_tool_hop": false
+      },
+      {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPExternalEventsMonitor.swift",
         "kind": "class",
         "symbol": "MCPExternalEventsMonitor"
@@ -357,11 +403,6 @@
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Policies/MCPGitArtifactAdvertisementRegistry.swift",
         "kind": "class",
         "symbol": "MCPGitArtifactAdvertisementRegistry"
-      },
-      {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift",
-        "kind": "enum",
-        "symbol": "ServiceRegistry"
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/ToolAvailabilityStore.swift",
@@ -484,19 +525,19 @@
         "symbol": "MCPSelectionToolProvider"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppToolCatalogRegistration.swift",
         "kind": "class",
-        "symbol": "MCPWindowToolCatalogService"
+        "symbol": "MCPAppToolCatalogRegistration"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppToolCatalogRegistration.swift",
         "kind": "protocol",
-        "symbol": "MCPWindowToolProviding"
+        "symbol": "MCPAppToolProviding"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolRuntime.swift",
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppToolBinder.swift",
         "kind": "class",
-        "symbol": "MCPWindowToolRuntime"
+        "symbol": "MCPAppToolBinder"
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWorktreeToolProvider+Merge.swift",
@@ -549,36 +590,58 @@
       }
     ],
     "non_main_actors": ["MCPBootstrapLease", "MCPReplayState", "BootstrapSocketMCPTransport"],
+    "m3_non_main_actor_hops": ["MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator"],
+    "m4_non_main_actor_authorities": ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "DomainMutationJournal", "DomainMutationPathFence", "MCPDomainProtectedMutationToolProvider"],
+    "m4_main_actor_presenter": "WorkspaceApprovalManager",
+    "m3_shared_read_tools": ["get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "oracle_chat_log", "git", "history"],
+    "m3_context_requirements": {
+      "workspace_independent": ["history", "oracle_chat_log"],
+      "workspace_optional": ["get_file_tree", "git"],
+      "workspace_required": ["get_code_structure", "read_file", "file_search", "workspace_context", "prompt"]
+    },
+    "m3_main_actor_capture_contract": {
+      "scoped_authority_captures_per_invocation": 1,
+      "workspace_independent_authority_captures_per_invocation": 0,
+      "refresh_runs_on_main_actor": false,
+      "read_mutates_presentation_descriptor": false,
+      "app_execution_snapshot_registered_and_released": true,
+      "required_context_allows_nil_handle": false,
+      "direct_test_fallback_uses_domain_handle": true,
+      "post_drain_refresh": "bound_workspace_tab_selection_and_revision_only"
+    },
     "request_hops": ["main_actor_scheduled", "main_actor_entered", "main_actor_exited"],
-    "existing_test": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+    "existing_test": {
+      "citation": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
+      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift"
+    },
     "per_tool_source_guarded_hops": {
       "app_settings": ["GlobalSettingsStore"],
       "bind_context": ["WindowRoutingService"],
       "manage_workspaces": ["WindowRoutingService"],
-      "manage_selection": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPSelectionToolProvider"],
-      "file_actions": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
-      "get_code_structure": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
-      "get_file_tree": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
-      "read_file": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
-      "file_search": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPFileToolProvider"],
-      "workspace_context": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPPromptContextToolProvider"],
-      "prompt": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPPromptContextToolProvider"],
-      "apply_edits": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPApplyEditsToolProvider"],
-      "oracle_utils": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "ask_oracle": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "oracle_send": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "oracle_chat_log": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPOracleToolProvider"],
-      "git": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPGitToolProvider"],
-      "manage_worktree": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPWorktreeToolProvider"],
-      "context_builder": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPContextBuilderToolProvider"],
-      "ask_user": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAskUserToolProvider"],
-      "agent_explore": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
-      "agent_run": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
-      "agent_manage": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentControlToolProvider"],
-      "share_thoughts": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
-      "set_status": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
-      "wait_for_next_user_instruction": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPAgentSessionControlToolProvider"],
-      "history": ["MCPServerViewModel", "MCPWindowToolRuntime", "MCPHistoryToolProvider"]
+      "manage_selection": ["MCPServerViewModel", "MCPAppToolBinder", "MCPSelectionToolProvider"],
+      "file_actions": ["MCPServerViewModel", "MCPAppToolBinder", "MCPFileToolProvider"],
+      "get_code_structure": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPFileToolProvider"],
+      "get_file_tree": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPFileToolProvider"],
+      "read_file": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPFileToolProvider"],
+      "file_search": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPFileToolProvider"],
+      "workspace_context": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPPromptContextToolProvider"],
+      "prompt": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPPromptContextToolProvider"],
+      "apply_edits": ["MCPServerViewModel", "MCPAppToolBinder", "MCPApplyEditsToolProvider"],
+      "oracle_utils": ["MCPServerViewModel", "MCPAppToolBinder", "MCPOracleToolProvider"],
+      "ask_oracle": ["MCPServerViewModel", "MCPAppToolBinder", "MCPOracleToolProvider"],
+      "oracle_send": ["MCPServerViewModel", "MCPAppToolBinder", "MCPOracleToolProvider"],
+      "oracle_chat_log": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPOracleToolProvider"],
+      "git": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator", "MCPGitToolProvider"],
+      "manage_worktree": ["MCPServerViewModel", "MCPAppToolBinder", "MCPWorktreeToolProvider"],
+      "context_builder": ["MCPServerViewModel", "MCPAppToolBinder", "MCPContextBuilderToolProvider"],
+      "ask_user": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAskUserToolProvider"],
+      "agent_explore": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "agent_run": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "agent_manage": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentControlToolProvider"],
+      "share_thoughts": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
+      "set_status": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
+      "wait_for_next_user_instruction": ["MCPServerViewModel", "MCPAppToolBinder", "MCPAgentSessionControlToolProvider"],
+      "history": ["MCPServerViewModel", "MCPAppToolBinder", "MCPDomainReadToolProvider", "MCPHistoryToolProvider"]
     },
     "reviewed_delegated_hops": {
       "evidence_status": "reviewed_non_executable_inventory",
@@ -614,7 +677,16 @@
       "actions": ["accept", "decline", "cancel"],
       "classification": "SDK-supported and client-negotiated; never assumed"
     },
-    "fallback_evidence": ["RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished", "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive"]
+    "fallback_evidence": [
+      {
+        "citation": "RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished",
+        "source_file": "Tests/RepoPromptTests/MCP/Control/JSONRPCBridgeLedgerTests.swift"
+      },
+      {
+        "citation": "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive",
+        "source_file": "Tests/RepoPromptTests/MCP/Control/ProcessLauncherDescriptorInheritanceTests.swift"
+      }
+    ]
   },
   "credential_gate": {
     "packaged_cli_path": "RepoPrompt.app/Contents/MacOS/repoprompt-mcp",
@@ -648,7 +720,19 @@
       {
         "owner": "WorkspaceApprovalManager",
         "backing": "UserDefaults",
-        "classification": "runtime_policy_migration_candidate"
+        "classification": "app_presenter_and_legacy_policy_compatibility"
+      },
+      {
+        "owner": "DomainMutationPolicyStore",
+        "backing": "versioned_file_with_compare_and_swap",
+        "path": "~/Library/Application Support/RepoPrompt CE/Settings/protected-mutations.json",
+        "classification": "protected_mutation_grant_authority"
+      },
+      {
+        "owner": "DomainMutationJournal",
+        "backing": "versioned_file_with_compare_and_swap",
+        "path": "~/Library/Application Support/RepoPrompt CE/Settings/protected-mutation-journal.json",
+        "classification": "internal_request_dedupe_and_commit_settlement_authority"
       },
       {
         "owner": "ApplyEditsApprovalStore",
@@ -704,8 +788,15 @@
       },
       {
         "state": "approval_and_tool_policy",
-        "current_authority": "UserDefaults",
+        "current_authority": "DomainMutationPolicyStore_plus_legacy_app_policy_facades",
         "dirty_revision_required": true,
+        "saved_revision_required": true,
+        "migration_milestone": "M4"
+      },
+      {
+        "state": "protected_mutation_operation_journal",
+        "current_authority": "DomainMutationJournal",
+        "dirty_revision_required": false,
         "saved_revision_required": true,
         "migration_milestone": "M4"
       },
@@ -735,7 +826,31 @@
       "failure_behavior": "fail_closed_and_revoke_endpoint_and_token"
     },
     "domain_run_launch_token_contract": {
-      "status": "frozen_contract_only_not_implemented",
+      "status": "host_authority_implemented_private_endpoint_and_carriers_deferred",
+      "host_authority": {
+        "milestone": "M2",
+        "operations": ["issue", "redeem", "revoke"],
+        "production_declaration_sites": [
+          {
+            "path": "Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift",
+            "kind": "struct",
+            "symbol": "DomainRunLaunchToken"
+          },
+          {
+            "path": "Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
+            "kind": "struct",
+            "symbol": "DomainWorkspaceStore"
+          },
+          {
+            "path": "Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
+            "kind": "struct",
+            "symbol": "DomainContextStore"
+          }
+        ],
+        "routing_test": "RepoPromptDomainRuntimeTests.DomainWorkspaceContextAuthorityTests/testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse"
+      },
+      "private_endpoint_status": "deferred",
+      "provider_carrier_wiring_status": "deferred",
       "child_material": ["opaque_random_capability"],
       "host_record_bindings": ["token_id", "secret_digest", "runtime_id", "runtime_generation", "run_id", "expected_child_pid_or_descendant", "workspace_context_identity", "client_principal", "provider", "run_purpose", "restricted_tools", "additional_tools", "issued_at", "expires_at", "nonce"],
       "rules": ["single_use", "short_lived", "memory_only", "never_logged", "never_persisted", "bound_to_private_endpoint_generation", "revoked_on_terminal_cleanup"],
