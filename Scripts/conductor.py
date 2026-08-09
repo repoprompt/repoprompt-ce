@@ -2185,7 +2185,7 @@ def _classify_socket_for_recovery(paths: Paths) -> str:
         probe.close()
 
 
-def cleanup_stale_files(paths: Paths) -> DaemonRecoveryResult:
+def cleanup_stale_files(paths: Paths, *, startup_lock_held: bool = False) -> DaemonRecoveryResult:
     evidence_paths = (paths.pid_path, paths.socket_path, paths.daemon_meta_path)
     identities = {path: _path_identity(path) for path in evidence_paths}
     if all(identity is None for identity in identities.values()):
@@ -2216,6 +2216,10 @@ def cleanup_stale_files(paths: Paths) -> DaemonRecoveryResult:
             return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed during recovery: {path}")
     registry_identity = _path_identity(paths.running_processes_path)
     if registry_identity is not None:
+        # Keep the pre-cleanup inode as a concurrency fence. Worker cleanup may
+        # remove registry-bound attempt sidecars, but it must not replace or
+        # unlink the registry itself. Refreshing this identity afterward would
+        # incorrectly bless a replacement daemon's concurrently written state.
         worker_cleanup = cleanup_running_process_groups(paths)
         if not worker_cleanup.get("safeToForget"):
             return DaemonRecoveryResult(
@@ -2223,19 +2227,34 @@ def cleanup_stale_files(paths: Paths) -> DaemonRecoveryResult:
                 False,
                 "recorded daemon is stale, but worker process-group cleanup lacks exact bounded completion evidence",
             )
-    for path, identity in (*identities.items(), (paths.running_processes_path, registry_identity)):
-        if identity is None:
-            continue
-        if _path_identity(path) != identity:
-            return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed before cleanup: {path}")
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-    cleanup_reason = "proven pid reuse" if reused_pid_proven else "dead recorded daemon"
-    return DaemonRecoveryResult(
-        "cleaned",
-        True,
-        f"removed stale daemon evidence after {cleanup_reason} and {socket_state} socket proof",
-    )
+    final_identities = (*identities.items(), (paths.running_processes_path, registry_identity))
+
+    def finalize_locked() -> DaemonRecoveryResult:
+        for path, identity in final_identities:
+            if identity is None:
+                continue
+            if _path_identity(path) != identity:
+                return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed before cleanup: {path}")
+        for path, identity in final_identities:
+            if identity is None:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        cleanup_reason = "proven pid reuse" if reused_pid_proven else "dead recorded daemon"
+        return DaemonRecoveryResult(
+            "cleaned",
+            True,
+            f"removed stale daemon evidence after {cleanup_reason} and {socket_state} socket proof",
+        )
+
+    if startup_lock_held:
+        return finalize_locked()
+    with paths.lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return finalize_locked()
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def process_start_token(pid: int) -> Optional[str]:
@@ -5750,7 +5769,11 @@ def request_daemon(paths: Paths, payload: Dict[str, Any], timeout: Optional[floa
     return payload_value
 
 
-def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Optional[Dict[str, Any]], Optional[ConductorError]]:
+def compatible_daemon_status_or_stop_idle_mismatch(
+    paths: Paths,
+    *,
+    startup_lock_held: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], Optional[ConductorError]]:
     try:
         payload = request_daemon(paths, {"type": "status"}, timeout=1.0)
     except ConductorError as exc:
@@ -5774,7 +5797,16 @@ def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Option
             f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) could not stop without force; "
             "jobs may have become active. Run './conductor daemon stop --force' after deciding it is safe"
         ) from exc
-    if not wait_until_stopped(paths, timeout=TERMINATE_GRACE_SECONDS + 5.0):
+    stopped = (
+        wait_until_stopped(
+            paths,
+            timeout=TERMINATE_GRACE_SECONDS + 5.0,
+            startup_lock_held=True,
+        )
+        if startup_lock_held
+        else wait_until_stopped(paths, timeout=TERMINATE_GRACE_SECONDS + 5.0)
+    )
+    if not stopped:
         raise ConductorError(
             f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) did not stop cleanly; "
             "run './conductor daemon stop --force' after deciding it is safe"
@@ -5812,8 +5844,11 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
 
     with paths.lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        locked_recovery = cleanup_stale_files(paths)
-        payload, locked_contact_error = compatible_daemon_status_or_stop_idle_mismatch(paths)
+        locked_recovery = cleanup_stale_files(paths, startup_lock_held=True)
+        payload, locked_contact_error = compatible_daemon_status_or_stop_idle_mismatch(
+            paths,
+            startup_lock_held=True,
+        )
         if payload is not None:
             return payload
         if locked_recovery.state == "ambiguous":
@@ -5856,10 +5891,13 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
         )
 
 
-def wait_until_stopped(paths: Paths, timeout: float) -> bool:
+def wait_until_stopped(paths: Paths, timeout: float, *, startup_lock_held: bool = False) -> bool:
     deadline = now() + timeout
     while now() < deadline:
-        cleanup_stale_files(paths)
+        if startup_lock_held:
+            cleanup_stale_files(paths, startup_lock_held=True)
+        else:
+            cleanup_stale_files(paths)
         if not paths.socket_path.exists() and not paths.pid_path.exists():
             return True
         time.sleep(0.1)

@@ -323,6 +323,119 @@ class ConductorCheckpointThreeTests(LifecycleTestCase):
         self.assertFalse(state.paths.daemon_meta_path.exists())
         self.assertFalse(state.paths.running_processes_path.exists())
 
+    def test_worker_cleanup_preserves_registry_identity_for_final_stale_evidence_check(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+        registry_identity = conductor._path_identity(state.paths.running_processes_path)
+
+        cleanup = conductor.cleanup_running_process_groups(state.paths)
+
+        self.assertTrue(cleanup["safeToForget"])
+        self.assertEqual(conductor._path_identity(state.paths.running_processes_path), registry_identity)
+
+    def test_stale_cleanup_rejects_registry_replacement_during_worker_cleanup(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+
+        def replace_registry(_paths: conductor.Paths) -> dict[str, object]:
+            conductor._atomic_write_json(
+                state.paths.running_processes_path,
+                {"version": 3, "generation": 2, "processes": []},
+            )
+            return {"safeToForget": True}
+
+        with mock.patch.object(conductor, "cleanup_running_process_groups", side_effect=replace_registry):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertFalse(result.cleaned)
+        self.assertIn("evidence changed before cleanup", result.reason)
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+        self.assertTrue(state.paths.running_processes_path.exists())
+
+    def test_stale_cleanup_start_lock_cannot_unlink_replacement_registry(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+        ready_path = state.paths.state_dir / "replacement-ready"
+        acquired_path = state.paths.state_dir / "replacement-acquired"
+        child: subprocess.Popen[str] | None = None
+        original_unlink = Path.unlink
+
+        def unlink_with_waiting_replacement(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal child
+            if path == state.paths.pid_path and child is None:
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        textwrap.dedent(
+                            """
+                            import fcntl
+                            import json
+                            import os
+                            import sys
+                            from pathlib import Path
+
+                            lock_path, registry_path, ready_path, acquired_path = map(Path, sys.argv[1:])
+                            ready_path.write_text("ready", encoding="utf-8")
+                            with lock_path.open("a+") as lock_file:
+                                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                                acquired_path.write_text("acquired", encoding="utf-8")
+                                temporary = registry_path.with_suffix(".replacement")
+                                temporary.write_text(
+                                    json.dumps({"version": 3, "generation": 2, "processes": []}),
+                                    encoding="utf-8",
+                                )
+                                os.replace(temporary, registry_path)
+                            """
+                        ),
+                        str(state.paths.lock_path),
+                        str(state.paths.running_processes_path),
+                        str(ready_path),
+                        str(acquired_path),
+                    ],
+                    text=True,
+                )
+                deadline = time.monotonic() + 2.0
+                while not ready_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready_path.exists(), "replacement process did not reach the start-lock barrier")
+                # With the cleanup transaction holding daemon.start.lock, the
+                # replacement cannot acquire or publish before stale evidence
+                # unlinking finishes. Without that lock this wait observes the
+                # replacement and the following pathname unlink deletes it.
+                deadline = time.monotonic() + 0.2
+                while not acquired_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(acquired_path.exists())
+            original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=unlink_with_waiting_replacement):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        assert child is not None
+        self.assertEqual(child.wait(timeout=2.0), 0)
+        self.assertEqual(result.state, "cleaned")
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+        replacement = json.loads(state.paths.running_processes_path.read_text(encoding="utf-8"))
+        self.assertEqual(replacement["generation"], 2)
+
     def test_recovery_signals_only_exact_pid_start_and_pgid_anchor(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
