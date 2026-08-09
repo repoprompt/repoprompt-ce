@@ -1,5 +1,29 @@
 import Foundation
 
+/// Maintains the one-to-one file-ID/path identity required by prompt accounting.
+/// The first accepted entry wins; later collisions on either key are rejected.
+struct PromptContextPhysicalFileIdentitySet {
+    private var fileIDs = Set<UUID>()
+    private var standardizedFullPaths = Set<String>()
+
+    mutating func insert(fileID: UUID, standardizedFullPath: String) -> Bool {
+        guard !fileIDs.contains(fileID),
+              !standardizedFullPaths.contains(standardizedFullPath)
+        else { return false }
+
+        fileIDs.insert(fileID)
+        standardizedFullPaths.insert(standardizedFullPath)
+        return true
+    }
+
+    mutating func insert(_ entry: ResolvedPromptFileEntry) -> Bool {
+        insert(
+            fileID: entry.file.id,
+            standardizedFullPath: entry.file.standardizedFullPath
+        )
+    }
+}
+
 struct PromptContextEntryMetric: Equatable {
     let fileID: UUID
     let standardizedFullPath: String
@@ -23,12 +47,19 @@ struct PromptContextEntryMetricsSnapshot: Equatable {
 
     init(totalSelectedDisplayTokens: Int, metrics: [PromptContextEntryMetric]) {
         self.totalSelectedDisplayTokens = totalSelectedDisplayTokens
-        metricsByFileID = Dictionary(
-            uniqueKeysWithValues: metrics.map { ($0.fileID, $0) }
-        )
-        metricsByStandardizedFullPath = Dictionary(
-            uniqueKeysWithValues: metrics.map { ($0.standardizedFullPath, $0) }
-        )
+
+        var identities = PromptContextPhysicalFileIdentitySet()
+        var metricsByFileID: [UUID: PromptContextEntryMetric] = [:]
+        var metricsByStandardizedFullPath: [String: PromptContextEntryMetric] = [:]
+        for metric in metrics where identities.insert(
+            fileID: metric.fileID,
+            standardizedFullPath: metric.standardizedFullPath
+        ) {
+            metricsByFileID[metric.fileID] = metric
+            metricsByStandardizedFullPath[metric.standardizedFullPath] = metric
+        }
+        self.metricsByFileID = metricsByFileID
+        self.metricsByStandardizedFullPath = metricsByStandardizedFullPath
     }
 
     private init(

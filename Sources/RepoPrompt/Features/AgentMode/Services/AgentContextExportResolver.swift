@@ -1250,7 +1250,10 @@ enum AgentContextExportResolver {
                 )
             }
         } else if codeMapUsage == .auto || codeMapUsage == .complete {
-            var seenIDs = Set(rowEntries.map(\.entry.id))
+            var seenPhysicalFiles = PromptContextPhysicalFileIdentitySet()
+            for rowEntry in rowEntries {
+                _ = seenPhysicalFiles.insert(rowEntry.entry)
+            }
             let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
             for rendered in codemapPresentation.orderedEntries {
                 guard !resolution.selectedFileIDs.contains(rendered.fileID),
@@ -1269,7 +1272,7 @@ enum AgentContextExportResolver {
                     canRemove: codeMapUsage == .auto,
                     removesAutomaticSourceIntent: codeMapUsage == .auto,
                     to: &rowEntries,
-                    seenIDs: &seenIDs
+                    seenPhysicalFiles: &seenPhysicalFiles
                 )
             }
         }
@@ -1708,7 +1711,7 @@ enum AgentContextExportResolver {
         var rows: [RowResolutionEntry] = []
         var missingPaths: [String] = []
         var invalidPaths: [String] = []
-        var seenIDs = Set<ResolvedPromptFileEntryID>()
+        var seenPhysicalFiles = PromptContextPhysicalFileIdentitySet()
         var selectedFileIDs = Set<UUID>()
 
         let selectedRequests = selection.selectedPaths.map {
@@ -1740,7 +1743,7 @@ enum AgentContextExportResolver {
                     rootScope: rootScope,
                     selectedFileIDs: &selectedFileIDs,
                     rows: &rows,
-                    seenIDs: &seenIDs
+                    seenPhysicalFiles: &seenPhysicalFiles
                 ) {
                     continue
                 }
@@ -1758,7 +1761,7 @@ enum AgentContextExportResolver {
                     loadedContent: nil,
                     rootFolderPath: result.location.rootPath
                 )
-                append(entry, canRemove: true, to: &rows, seenIDs: &seenIDs)
+                append(entry, canRemove: true, to: &rows, seenPhysicalFiles: &seenPhysicalFiles)
             } else if let folder = result.folder {
                 let files = await store.files(inRoot: folder.rootID)
                 let prefix = folder.standardizedRelativePath
@@ -1770,7 +1773,7 @@ enum AgentContextExportResolver {
                         loadedContent: nil,
                         rootFolderPath: result.location.rootPath
                     )
-                    append(entry, canRemove: false, to: &rows, seenIDs: &seenIDs)
+                    append(entry, canRemove: false, to: &rows, seenPhysicalFiles: &seenPhysicalFiles)
                 }
             } else {
                 invalidPaths.append(path)
@@ -1817,7 +1820,7 @@ enum AgentContextExportResolver {
                 loadedContent: nil,
                 rootFolderPath: result.location.rootPath
             )
-            append(entry, canRemove: true, to: &rows, seenIDs: &seenIDs)
+            append(entry, canRemove: true, to: &rows, seenPhysicalFiles: &seenPhysicalFiles)
         }
 
         AgentSelectedFilesDiagnostics.durationEvent(
@@ -1958,7 +1961,7 @@ enum AgentContextExportResolver {
         rootScope: WorkspaceLookupRootScope,
         selectedFileIDs: inout Set<UUID>,
         rows: inout [RowResolutionEntry],
-        seenIDs: inout Set<ResolvedPromptFileEntryID>
+        seenPhysicalFiles: inout PromptContextPhysicalFileIdentitySet
     ) async -> Bool {
         let roots = await store.rootRefs(scope: rootScope)
         var handled = false
@@ -1977,7 +1980,7 @@ enum AgentContextExportResolver {
                     loadedContent: nil,
                     rootFolderPath: root.standardizedFullPath
                 )
-                append(entry, canRemove: false, to: &rows, seenIDs: &seenIDs)
+                append(entry, canRemove: false, to: &rows, seenPhysicalFiles: &seenPhysicalFiles)
             }
         }
         return handled
@@ -2033,9 +2036,9 @@ enum AgentContextExportResolver {
         canRemove: Bool,
         removesAutomaticSourceIntent: Bool = false,
         to rows: inout [RowResolutionEntry],
-        seenIDs: inout Set<ResolvedPromptFileEntryID>
+        seenPhysicalFiles: inout PromptContextPhysicalFileIdentitySet
     ) {
-        guard seenIDs.insert(entry.id).inserted else { return }
+        guard seenPhysicalFiles.insert(entry) else { return }
         rows.append(RowResolutionEntry(
             entry: entry,
             canRemove: canRemove,

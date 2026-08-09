@@ -140,6 +140,90 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testEntryMetricsAccountingKeepsFirstSliceForDuplicatePhysicalFile() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingPhysicalIdentitySliceFirst")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        let content = "skip\nselected line\nskip\n"
+        try write(content, to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let lookup = await store.lookupPath(targetURL.path)
+        let file = try XCTUnwrap(lookup?.file)
+        let sliceRange = LineRange(start: 2, end: 2)
+        let sliceEntry = ResolvedPromptFileEntry(
+            file: file,
+            lineRanges: [sliceRange],
+            mode: .sliced,
+            loadedContent: content,
+            rootFolderPath: root.path
+        )
+        let fullEntry = ResolvedPromptFileEntry(
+            file: file,
+            mode: .fullFile,
+            loadedContent: content,
+            rootFolderPath: root.path
+        )
+
+        let snapshot = await PromptContextAccountingService().calculateEntryMetricsSnapshot(
+            entries: [sliceEntry, fullEntry],
+            store: store,
+            codemapPresentation: .empty,
+            filePathDisplay: .relative
+        )
+
+        let renderedSlice = SliceAssemblyBuilder.build(from: content, ranges: [sliceRange]).combinedText
+        let expectedTokens = TokenCalculationService.estimateTokens(for: renderedSlice)
+        let metric = try XCTUnwrap(snapshot.metric(forFileID: file.id))
+        XCTAssertEqual(snapshot.metricsByFileID.count, 1)
+        XCTAssertEqual(snapshot.metricsByStandardizedFullPath.count, 1)
+        XCTAssertEqual(snapshot.totalSelectedDisplayTokens, expectedTokens)
+        XCTAssertEqual(metric.renderMode, .slice)
+        XCTAssertEqual(metric.displayTokenCount, expectedTokens)
+        XCTAssertEqual(metric.includedLineCount, 1)
+    }
+
+    func testEntryMetricsAccountingKeepsFirstFullFileForDuplicatePhysicalFile() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingPhysicalIdentityFullFirst")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        let content = "skip\nselected line\nskip\n"
+        try write(content, to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let lookup = await store.lookupPath(targetURL.path)
+        let file = try XCTUnwrap(lookup?.file)
+        let fullEntry = ResolvedPromptFileEntry(
+            file: file,
+            mode: .fullFile,
+            loadedContent: content,
+            rootFolderPath: root.path
+        )
+        let sliceEntry = ResolvedPromptFileEntry(
+            file: file,
+            lineRanges: [LineRange(start: 2, end: 2)],
+            mode: .sliced,
+            loadedContent: content,
+            rootFolderPath: root.path
+        )
+
+        let snapshot = await PromptContextAccountingService().calculateEntryMetricsSnapshot(
+            entries: [fullEntry, sliceEntry],
+            store: store,
+            codemapPresentation: .empty,
+            filePathDisplay: .relative
+        )
+
+        let expectedTokens = TokenCalculationService.estimateTokens(for: content)
+        let metric = try XCTUnwrap(snapshot.metric(forFileID: file.id))
+        XCTAssertEqual(snapshot.metricsByFileID.count, 1)
+        XCTAssertEqual(snapshot.metricsByStandardizedFullPath.count, 1)
+        XCTAssertEqual(snapshot.totalSelectedDisplayTokens, expectedTokens)
+        XCTAssertEqual(metric.renderMode, .full)
+        XCTAssertEqual(metric.displayTokenCount, expectedTokens)
+        XCTAssertEqual(metric.includedLineCount, 3)
+    }
+
     func testSelectedCodemapUsageDoesNotLoadContentWhenCodemapExists() async throws {
         let root = try makeTemporaryRoot(name: "AccountingSelectedCodemap")
         let fileURL = root.appendingPathComponent("A.swift")
@@ -411,6 +495,97 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(sliceMetric.displayTokenCount, expectedSliceTokens)
         XCTAssertEqual(sliceMetric.displayPercentage, Double(expectedSliceTokens) / Double(expectedTotal))
         XCTAssertEqual(sliceMetric.includedLineCount, 2)
+    }
+
+    func testResolvedContentMetricsDeduplicatePhysicalFileBeforeReadingAndAccounting() async throws {
+        let root = try makeTemporaryRoot(name: "ResolvedAccountingPhysicalIdentity")
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let fileID = UUID()
+        let rootID = UUID()
+        let content = "skip\nselected line\nskip\n"
+        let location = ResolvedFileContentLocation(
+            resolvedRootURL: root,
+            resolvedFileURL: root.appendingPathComponent("Target.swift"),
+            relativePath: "Target.swift"
+        )
+        let sliceRange = LineRange(start: 2, end: 2)
+        let recorder = ResolvedAccountingReaderRecorder(contents: ["Target.swift": content])
+        let service = PromptContextAccountingService(resolvedContentReader: { location, workloadClass in
+            await recorder.read(location: location, workloadClass: workloadClass)
+        })
+
+        let snapshot = try await service.calculateEntryMetricsSnapshot(resolvedContentEntries: [
+            PromptContextResolvedContentMetricsEntry(
+                fileID: fileID,
+                rootID: rootID,
+                location: location,
+                renderedDisplayPath: "Logical/First.swift",
+                lineRanges: [sliceRange]
+            ),
+            PromptContextResolvedContentMetricsEntry(
+                fileID: fileID,
+                rootID: rootID,
+                location: location,
+                renderedDisplayPath: "Logical/Later.swift",
+                lineRanges: nil
+            )
+        ])
+
+        let inputs = await recorder.recordedInputs()
+        XCTAssertEqual(inputs.map(\.location.relativePath), ["Target.swift"])
+        let metric = try XCTUnwrap(snapshot.metric(forFileID: fileID))
+        let renderedSlice = SliceAssemblyBuilder.build(from: content, ranges: [sliceRange]).combinedText
+        let expectedTokens = TokenCalculationService.estimateTokens(for: renderedSlice)
+        XCTAssertEqual(snapshot.metricsByFileID.count, 1)
+        XCTAssertEqual(snapshot.metricsByStandardizedFullPath.count, 1)
+        XCTAssertEqual(snapshot.totalSelectedDisplayTokens, expectedTokens)
+        XCTAssertEqual(metric.renderedDisplayPath, "Logical/First.swift")
+        XCTAssertEqual(metric.renderMode, .slice)
+        XCTAssertEqual(metric.displayTokenCount, expectedTokens)
+    }
+
+    func testEntryMetricsSnapshotKeepsIndexesCoherentForIdentityConflicts() {
+        let firstID = UUID()
+        let otherID = UUID()
+        let firstPath = "/tmp/First.swift"
+        let first = PromptContextEntryMetric(
+            fileID: firstID,
+            standardizedFullPath: firstPath,
+            renderedDisplayPath: "First.swift",
+            renderMode: .full,
+            displayTokenCount: 10,
+            displayPercentage: 0.5,
+            includedLineCount: 1
+        )
+        let duplicateID = PromptContextEntryMetric(
+            fileID: firstID,
+            standardizedFullPath: "/tmp/DuplicateID.swift",
+            renderedDisplayPath: "DuplicateID.swift",
+            renderMode: .slice,
+            displayTokenCount: 20,
+            displayPercentage: 1,
+            includedLineCount: 2
+        )
+        let duplicatePath = PromptContextEntryMetric(
+            fileID: otherID,
+            standardizedFullPath: firstPath,
+            renderedDisplayPath: "DuplicatePath.swift",
+            renderMode: .codemap,
+            displayTokenCount: 30,
+            displayPercentage: 1,
+            includedLineCount: 3
+        )
+
+        let snapshot = PromptContextEntryMetricsSnapshot(
+            totalSelectedDisplayTokens: 10,
+            metrics: [first, duplicateID, duplicatePath]
+        )
+
+        XCTAssertEqual(snapshot.metricsByFileID, [firstID: first])
+        XCTAssertEqual(snapshot.metricsByStandardizedFullPath, [firstPath: first])
+        XCTAssertNil(snapshot.metric(forFileID: otherID))
+        XCTAssertNil(snapshot.metric(forStandardizedFullPath: duplicateID.standardizedFullPath))
     }
 
     func testResolvedContentReadFailureThrowsWithoutPartialSnapshot() async throws {

@@ -214,9 +214,10 @@ actor PromptContextAccountingService {
         filePathDisplay: FilePathDisplay,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) async -> PromptContextEntryMetricsSnapshot {
-        guard !entries.isEmpty else { return .empty }
+        let uniqueEntries = uniquePhysicalEntries(entries)
+        guard !uniqueEntries.isEmpty else { return .empty }
 
-        let loadedEntries = await entriesLoadingContentIfNeeded(entries, store: store)
+        let loadedEntries = await entriesLoadingContentIfNeeded(uniqueEntries, store: store)
         let snapshots = makePromptFileEntrySnapshots(
             from: loadedEntries,
             codemapPresentation: codemapPresentation,
@@ -238,11 +239,12 @@ actor PromptContextAccountingService {
         resolvedContentEntries: [PromptContextResolvedContentMetricsEntry]
     ) async throws -> PromptContextEntryMetricsSnapshot {
         try checkResolvedContentCancellation()
-        guard !resolvedContentEntries.isEmpty else { return .empty }
+        let uniqueResolvedContentEntries = uniquePhysicalEntries(resolvedContentEntries)
+        guard !uniqueResolvedContentEntries.isEmpty else { return .empty }
 
         var loadedEntries: [ResolvedPromptFileEntry] = []
-        loadedEntries.reserveCapacity(resolvedContentEntries.count)
-        for input in resolvedContentEntries {
+        loadedEntries.reserveCapacity(uniqueResolvedContentEntries.count)
+        for input in uniqueResolvedContentEntries {
             try checkResolvedContentCancellation()
             guard let content = try await resolvedContentReader(input.location, .promptAccounting) else {
                 throw PromptContextResolvedContentAccountingError.contentUnavailable(input.location)
@@ -266,7 +268,7 @@ actor PromptContextAccountingService {
         }
         try checkResolvedContentCancellation()
         let displayPathsByFileID = Dictionary(
-            uniqueKeysWithValues: resolvedContentEntries.map { ($0.fileID, $0.renderedDisplayPath) }
+            uniqueKeysWithValues: uniqueResolvedContentEntries.map { ($0.fileID, $0.renderedDisplayPath) }
         )
         let snapshots = makePromptFileEntrySnapshots(
             from: loadedEntries,
@@ -379,7 +381,7 @@ actor PromptContextAccountingService {
         var entries: [ResolvedPromptFileEntry] = []
         var missingPaths: [String] = []
         var invalidPaths: [String] = []
-        var seenIDs = Set<ResolvedPromptFileEntryID>()
+        var seenPhysicalFiles = PromptContextPhysicalFileIdentitySet()
         var selectedFileIDs = Set<UUID>()
         let orderedSlicePaths = selection.slices.keys.sorted {
             let lhs = StoredSelectionPathNormalization.standardizedPath($0) ?? $0
@@ -798,7 +800,7 @@ actor PromptContextAccountingService {
                     loadedContent: content ?? nil,
                     rootFolderPath: result.location.rootPath
                 )
-                append(entry, to: &entries, seenIDs: &seenIDs)
+                append(entry, to: &entries, seenPhysicalFiles: &seenPhysicalFiles)
                 #if DEBUG
                     PromptTokenRecountDiagnostics.event(
                         "tokenRecount.accounting.resolveEntries.selectedPath.end",
@@ -882,7 +884,7 @@ actor PromptContextAccountingService {
                         loadedContent: content ?? nil,
                         rootFolderPath: result.location.rootPath
                     )
-                    append(entry, to: &entries, seenIDs: &seenIDs)
+                    append(entry, to: &entries, seenPhysicalFiles: &seenPhysicalFiles)
                 }
                 #if DEBUG
                     PromptTokenRecountDiagnostics.event(
@@ -962,7 +964,7 @@ actor PromptContextAccountingService {
                 continue
             }
             let entry = ResolvedPromptFileEntry(file: file, lineRanges: ranges, mode: .sliced, loadedContent: content ?? nil, rootFolderPath: result.location.rootPath)
-            append(entry, to: &entries, seenIDs: &seenIDs)
+            append(entry, to: &entries, seenPhysicalFiles: &seenPhysicalFiles)
         }
 
         #if DEBUG
@@ -1002,7 +1004,7 @@ actor PromptContextAccountingService {
                     loadedContent: nil,
                     rootFolderPath: rootsByID[file.rootID]?.fullPath
                 )
-                append(entry, to: &entries, seenIDs: &seenIDs)
+                append(entry, to: &entries, seenPhysicalFiles: &seenPhysicalFiles)
             }
         }
 
@@ -1184,8 +1186,31 @@ actor PromptContextAccountingService {
         return nil
     }
 
-    private func append(_ entry: ResolvedPromptFileEntry, to entries: inout [ResolvedPromptFileEntry], seenIDs: inout Set<ResolvedPromptFileEntryID>) {
-        guard seenIDs.insert(entry.id).inserted else { return }
+    private nonisolated func uniquePhysicalEntries(
+        _ entries: [ResolvedPromptFileEntry]
+    ) -> [ResolvedPromptFileEntry] {
+        var identities = PromptContextPhysicalFileIdentitySet()
+        return entries.filter { identities.insert($0) }
+    }
+
+    private nonisolated func uniquePhysicalEntries(
+        _ entries: [PromptContextResolvedContentMetricsEntry]
+    ) -> [PromptContextResolvedContentMetricsEntry] {
+        var identities = PromptContextPhysicalFileIdentitySet()
+        return entries.filter { entry in
+            identities.insert(
+                fileID: entry.fileID,
+                standardizedFullPath: StandardizedPath.absolute(entry.location.resolvedFileURL.path)
+            )
+        }
+    }
+
+    private func append(
+        _ entry: ResolvedPromptFileEntry,
+        to entries: inout [ResolvedPromptFileEntry],
+        seenPhysicalFiles: inout PromptContextPhysicalFileIdentitySet
+    ) {
+        guard seenPhysicalFiles.insert(entry) else { return }
         entries.append(entry)
     }
 }

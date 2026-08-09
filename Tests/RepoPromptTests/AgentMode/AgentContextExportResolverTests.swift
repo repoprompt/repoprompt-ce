@@ -1683,6 +1683,56 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertTrue(model.rows.allSatisfy { !$0.canRemove })
     }
 
+    func testRowsAndMetricsUseOnePhysicalIdentityForDirectSliceAndContainingFolder() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPhysicalIdentity")
+        let sources = root.appendingPathComponent("Sources")
+        let targetURL = sources.appendingPathComponent("Target.swift")
+        let otherURL = sources.appendingPathComponent("Other.swift")
+        let targetContent = "skip\nselected line\nskip\n"
+        let otherContent = "let other = true\n"
+        try write(targetContent, to: targetURL)
+        try write(otherContent, to: otherURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let sliceRange = LineRange(start: 2, end: 2)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review physical identity",
+            selection: StoredSelection(
+                selectedPaths: [targetURL.path, sources.path],
+                slices: [targetURL.path: [sliceRange]],
+                codemapAutoEnabled: false
+            ),
+            selectedMetaPromptIDs: [],
+            tabName: "Physical Identity",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+
+        let model = try await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertEqual(model.rows.count, 2)
+        XCTAssertEqual(Set(model.rows.map(\.id.fileID)).count, 2)
+        XCTAssertEqual(Set(model.rows.map(\.physicalPath)).count, 2)
+        let targetRow = try XCTUnwrap(model.rows.first {
+            $0.physicalPath == targetURL.standardizedFileURL.path
+        })
+        XCTAssertEqual(targetRow.kind, .slices)
+        XCTAssertEqual(targetRow.lineRanges, [sliceRange])
+
+        let renderedSlice = SliceAssemblyBuilder.build(from: targetContent, ranges: [sliceRange]).combinedText
+        let expectedTotal = TokenCalculationService.estimateTokens(for: renderedSlice)
+            + TokenCalculationService.estimateTokens(for: otherContent)
+        XCTAssertEqual(model.totalSelectedDisplayTokens, expectedTotal)
+        XCTAssertEqual(targetRow.metrics.knownValues?.tokenCount, TokenCalculationService.estimateTokens(for: renderedSlice))
+    }
+
     @MainActor
     func testSourceBuilderUsesRequestedInactiveTabInsteadOfActiveSnapshot() {
         let requestedTabID = UUID()
