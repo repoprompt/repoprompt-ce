@@ -296,6 +296,19 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let targets = viewModel.test_assembleWorkspaceSwitchCleanupTargets(preparedContexts: contexts)
         XCTAssertEqual(targets.count, 2, "original and replacement objects each get exactly one target")
         XCTAssertTrue(targets.allSatisfy { $0.tabID == tabID })
+        // Authoritative-first: the replacement (current map contents) is
+        // finalized before the stale prepared object, so tabID-keyed
+        // coordinator state is captured by the object that owns the tab.
+        XCTAssertTrue(
+            targets[0].session === replacementSession,
+            "authoritative map contents must be finalized first"
+        )
+        XCTAssertTrue(
+            targets[1].session === originalSession,
+            "stale prepared objects are finalized after the authoritative pass"
+        )
+        XCTAssertEqual(targets[0].runIDs, [replacementRunID])
+        XCTAssertEqual(targets[1].runIDs, [originalRunID])
         XCTAssertNil(originalSession.claudeController)
         XCTAssertNil(replacementSession.claudeController)
         XCTAssertNil(originalSession.runID)
@@ -311,6 +324,61 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let replacementCleaned = await routing.contains(runID: replacementRunID, reason: "workspace_switch")
         XCTAssertTrue(originalCleaned)
         XCTAssertTrue(replacementCleaned)
+    }
+
+    func testFinalizeCancelsACPSteeringFlushAndClearsQueueSynchronously() async {
+        // ACP finalize slice coverage that needs no controller instance:
+        // the steering flush task is cancelled and the queued instructions are
+        // cleared synchronously at finalize, before any background drain.
+        // Full controller capture/retire coverage (finalize capturing the
+        // installed controller, background cancelPrompt/shutdown) is deferred
+        // until an ACP controller protocol seam exists: ACPAgentSessionController
+        // is a concrete non-protocol actor today, so it cannot be faked or
+        // subclassed without a production abstraction change.
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .openCode
+        session.installRunID(UUID())
+        let flushTask = Task<Void, Never> {
+            // Ends deterministically when finalize cancels it; no sleeps.
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+        }
+        // If cancellation regresses, the assertions below fail the test; this
+        // cleanup then stops the yield loop so the test neither hangs nor leaks.
+        defer { flushTask.cancel() }
+        session.acpSteeringFlushTask = flushTask
+        session.pendingACPSteeringInstructions = [
+            AgentModeViewModel.TabSession.ACPSteeringInstruction(
+                id: UUID(),
+                targetRunID: session.runID,
+                targetRunAttemptID: nil,
+                providerText: "queued",
+                interruptedPromptProviderText: nil,
+                attachments: [],
+                taggedFileAttachments: [],
+                draftText: "queued",
+                optimisticUserItemID: nil,
+                createdAt: Date()
+            )
+        ]
+
+        let context = viewModel.test_prepareWorkspaceSwitchSessionDiscard(session)
+        let target = viewModel.test_finalizeWorkspaceSwitchSessionDiscard(context)
+
+        XCTAssertTrue(flushTask.isCancelled)
+        if flushTask.isCancelled {
+            // Await termination only once cancellation is observed, so a
+            // regression fails the assertion above instead of hanging here.
+            await flushTask.value
+        }
+        XCTAssertNil(session.acpSteeringFlushTask)
+        XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertNil(session.acpController)
+        XCTAssertNil(target.acpController)
+        XCTAssertNil(session.runID)
     }
 
     func testWorkspaceSwitchFinalizeDetachesIdleWarmClaudeControllerSynchronously() async throws {

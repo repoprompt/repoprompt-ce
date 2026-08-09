@@ -10952,25 +10952,44 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// provider/controllers/run routing would leak. Late-admitted sessions get
     /// the synchronous prepare bookkeeping here and skip graceful cancellation
     /// — context-terminal semantics, equivalent to detached teardown of a run
-    /// that started during the switch. Prepared contexts are finalized exactly
+    /// that started during the switch. Each session object is finalized exactly
     /// once (object identity), so nothing is cleaned up twice.
+    ///
+    /// Order matters: the authoritative map contents are finalized FIRST, so
+    /// tabID-keyed coordinator state (Claude/Codex tool trackers, launch
+    /// metadata) is captured into the handle of the object that currently owns
+    /// the tab. Finalizing a stale same-tab predecessor first would hand that
+    /// tab-keyed state to the wrong target. Stale prepared objects — removed or
+    /// replaced during the cancellation awaits — are finalized afterwards; by
+    /// then they hold only their own instance state, which is exactly what
+    /// still needs retiring.
     private func assembleWorkspaceSwitchCleanupTargets(
         preparedContexts: [WorkspaceSwitchSessionDiscardContext],
         reason: String
     ) -> [WorkspaceSwitchSessionCleanupTarget] {
+        var contextsBySessionIdentity: [ObjectIdentifier: WorkspaceSwitchSessionDiscardContext] = [:]
+        for context in preparedContexts {
+            contextsBySessionIdentity[ObjectIdentifier(context.session)] = context
+        }
         var targets: [WorkspaceSwitchSessionCleanupTarget] = []
         var finalizedSessionIdentities = Set<ObjectIdentifier>()
-        // Prepared contexts first — including sessions removed or replaced
-        // during the cancellation awaits, whose handles still need retiring.
-        for context in preparedContexts {
+        // Authoritative map contents first: use the matching prepared context
+        // when the object identity matches; late-admitted or replacement
+        // objects get synchronous prepare bookkeeping here.
+        for session in sessions.values {
+            let identity = ObjectIdentifier(session)
+            let context = contextsBySessionIdentity[identity]
+                ?? prepareWorkspaceSwitchSessionDiscard(session, reason: reason)
             targets.append(finalizeWorkspaceSwitchSessionDiscard(context))
-            finalizedSessionIdentities.insert(ObjectIdentifier(context.session))
+            finalizedSessionIdentities.insert(identity)
         }
-        // Then any session in the authoritative map that no prepared context
-        // covers (late insertion or same-tab replacement).
-        for session in sessions.values where !finalizedSessionIdentities.contains(ObjectIdentifier(session)) {
-            let lateContext = prepareWorkspaceSwitchSessionDiscard(session, reason: reason)
-            targets.append(finalizeWorkspaceSwitchSessionDiscard(lateContext))
+        // Then prepared contexts whose objects were removed or replaced during
+        // the cancellation awaits — their instance handles still need retiring.
+        for context in preparedContexts {
+            let identity = ObjectIdentifier(context.session)
+            guard !finalizedSessionIdentities.contains(identity) else { continue }
+            targets.append(finalizeWorkspaceSwitchSessionDiscard(context))
+            finalizedSessionIdentities.insert(identity)
         }
         return targets
     }

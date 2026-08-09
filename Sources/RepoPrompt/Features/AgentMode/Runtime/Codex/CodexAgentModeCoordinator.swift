@@ -9397,7 +9397,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     /// `detachForWorkspaceSwitchFinalizeSync`. Deliberately registry-free — the
     /// controller instance is unreachable from any live session, so it is shut
     /// down directly instead of through the tab-keyed retirement queue a
-    /// same-tab successor may be using.
+    /// same-tab successor may be using. Bypassing the retirement claims cannot
+    /// double-shutdown a controller: every claiming path (`shutdownCodexSession`,
+    /// `invalidateCodexControllerForReconnect`, provider switch) synchronously
+    /// nils the session's `codexController` in the same main-actor region that
+    /// registers the claim, before any await — so the finalize detach, which
+    /// only captures `session.codexController`, can never observe an
+    /// already-claimed instance.
     func retireDetachedControllerForWorkspaceSwitch(
         _ detached: DetachedCodexController
     ) async {
