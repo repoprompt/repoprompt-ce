@@ -228,7 +228,7 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
             ],
             snapshotTurnID: "stale-turn",
             snapshotStatus: .completed,
-            canonicalCompletionDelay: 0.05
+            canonicalCompletionAfterSnapshotRead: true
         )
         let provider = makeProvider(controller: controller)
 
@@ -384,11 +384,13 @@ private final class SnapshotReconcilingCodexProviderController: CodexSessionCont
     private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
     private var _readSnapshotCount = 0
     private var _shutdownCount = 0
+    private var didYieldCanonicalCompletionAfterSnapshotRead = false
     private let snapshotTurnID: String
     private let snapshotStatus: CodexNativeSessionController.TurnStatus
     private let snapshotFailure: CodexNativeSessionController.TurnFailure?
     private let snapshotRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus
     private let snapshotActiveTurnIDs: [String]
+    private let canonicalCompletionAfterSnapshotRead: Bool
 
     let events: AsyncStream<CodexNativeSessionController.Event>
 
@@ -399,13 +401,15 @@ private final class SnapshotReconcilingCodexProviderController: CodexSessionCont
         snapshotFailure: CodexNativeSessionController.TurnFailure? = nil,
         snapshotRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus = .idle,
         snapshotActiveTurnIDs: [String] = [],
-        canonicalCompletionDelay: TimeInterval? = nil
+        canonicalCompletionDelay: TimeInterval? = nil,
+        canonicalCompletionAfterSnapshotRead: Bool = false
     ) {
         self.snapshotTurnID = snapshotTurnID
         self.snapshotStatus = snapshotStatus
         self.snapshotFailure = snapshotFailure
         self.snapshotRuntimeStatus = snapshotRuntimeStatus
         self.snapshotActiveTurnIDs = snapshotActiveTurnIDs
+        self.canonicalCompletionAfterSnapshotRead = canonicalCompletionAfterSnapshotRead
         var continuationReference: AsyncStream<CodexNativeSessionController.Event>.Continuation?
         events = AsyncStream { continuation in
             continuationReference = continuation
@@ -472,8 +476,19 @@ private final class SnapshotReconcilingCodexProviderController: CodexSessionCont
         includeTurns _: Bool,
         timeout _: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot {
-        lock.withLock {
+        let shouldYieldCanonicalCompletion = lock.withLock {
             _readSnapshotCount += 1
+            guard canonicalCompletionAfterSnapshotRead,
+                  !didYieldCanonicalCompletionAfterSnapshotRead
+            else { return false }
+            didYieldCanonicalCompletionAfterSnapshotRead = true
+            return true
+        }
+        if shouldYieldCanonicalCompletion {
+            yield(.turnCompleted(
+                turnID: "turn",
+                status: .completed
+            ))
         }
         return .init(
             conversationID: "thread",

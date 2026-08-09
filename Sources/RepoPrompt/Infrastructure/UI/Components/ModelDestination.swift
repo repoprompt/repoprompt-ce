@@ -8,11 +8,18 @@ import SwiftUI
 @MainActor
 struct ModelDestination: Identifiable {
     let id: String
+    let allowsEmptySelection: Bool
     private let getter: @MainActor () -> String
     private let applier: @MainActor (String) -> Void
 
-    init(id: String, getter: @escaping @MainActor () -> String, applier: @escaping @MainActor (String) -> Void) {
+    init(
+        id: String,
+        allowsEmptySelection: Bool = false,
+        getter: @escaping @MainActor () -> String,
+        applier: @escaping @MainActor (String) -> Void
+    ) {
         self.id = id
+        self.allowsEmptySelection = allowsEmptySelection
         self.getter = getter
         self.applier = applier
     }

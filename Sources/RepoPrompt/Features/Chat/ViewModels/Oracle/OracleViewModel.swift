@@ -312,13 +312,13 @@ enum OracleResponseCompletionPolicy: Equatable {
     case contextBuilderStrict
 }
 
-enum OracleMessageFinalizationOutcome: Equatable {
-    case providerCompleted
-    case providerTerminatedIncomplete(reason: String)
-    case streamEndedWithoutProviderCompletion
-    case interactiveWatchdog
-    case cancelled
-    case failed(message: String)
+enum ChatSendTerminalOutcome: Equatable {
+    case completed
+    case providerTerminatedIncomplete(reason: String, partialResponse: String?)
+    case streamEndedWithoutProviderCompletion(partialResponse: String?)
+    case interactiveWatchdog(partialResponse: String?)
+    case failed(message: String, partialResponse: String?)
+    case cancelled(message: String, partialResponse: String?)
 }
 
 enum OracleContextBuilderCompletionError: LocalizedError, Equatable {
@@ -350,60 +350,159 @@ enum OracleContextBuilderCompletionError: LocalizedError, Equatable {
     }
 }
 
+struct OraclePairRoute: Hashable {
+    let workspaceID: UUID
+    let tabID: UUID
+    let agentModeSessionID: UUID?
+    let agentModeRunID: UUID?
+}
+
+enum OracleSendClaimKey: Hashable {
+    case route(OraclePairRoute)
+    case workspace(UUID)
+
+    static func oracleSend(
+        workspaceID: UUID,
+        tabID: UUID?,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) -> Self {
+        guard let tabID else { return .workspace(workspaceID) }
+        return .route(OraclePairRoute(
+            workspaceID: workspaceID,
+            tabID: tabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        ))
+    }
+}
+
+enum OracleSendClaimError: Error, Equatable {
+    case conflict
+}
+
+@MainActor
+final class OracleSendClaimRegistry {
+    private var claimedKeys: Set<OracleSendClaimKey> = []
+
+    func withClaim<Result>(
+        _ keys: Set<OracleSendClaimKey>,
+        operation: @MainActor () async throws -> Result
+    ) async throws -> Result {
+        guard !keys.contains(where: conflicts(with:)) else { throw OracleSendClaimError.conflict }
+        claimedKeys.formUnion(keys)
+        defer { claimedKeys.subtract(keys) }
+        return try await operation()
+    }
+
+    private func conflicts(with requested: OracleSendClaimKey) -> Bool {
+        claimedKeys.contains { existing in
+            switch (requested, existing) {
+            case let (.route(requestedRoute), .route(existingRoute)):
+                requestedRoute == existingRoute
+            case let (.route(route), .workspace(workspaceID)),
+                 let (.workspace(workspaceID), .route(route)):
+                route.workspaceID == workspaceID
+            case let (.workspace(requestedID), .workspace(existingID)):
+                requestedID == existingID
+            }
+        }
+    }
+}
+
 actor MessageFinalisationHub {
     private struct WaiterKey: Hashable {
         let messageID: UUID
         let waiterID: UUID
     }
 
-    private var waiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+    private var waiters: [UUID: [UUID: CheckedContinuation<ChatSendTerminalOutcome?, Never>]] = [:]
     private var cancelledWaiters: Set<WaiterKey> = []
-    private var completedOutcomes: [UUID: OracleMessageFinalizationOutcome] = [:]
+    private var terminalOutcomes: [UUID: ChatSendTerminalOutcome] = [:]
 
     func register(
         _ id: UUID,
         waiterID: UUID,
-        cont: CheckedContinuation<Void, Never>
+        cont: CheckedContinuation<ChatSendTerminalOutcome?, Never>
     ) {
         let key = WaiterKey(messageID: id, waiterID: waiterID)
-        if completedOutcomes[id] != nil || cancelledWaiters.remove(key) != nil {
-            cont.resume()
+        if let outcome = terminalOutcomes[id] {
+            cont.resume(returning: outcome)
+            return
+        }
+        if cancelledWaiters.remove(key) != nil {
+            cont.resume(returning: nil)
             return
         }
         waiters[id, default: [:]][waiterID] = cont
     }
 
-    func fulfil(_ id: UUID, outcome: OracleMessageFinalizationOutcome) {
-        if completedOutcomes[id] == nil {
-            completedOutcomes[id] = outcome
-        }
+    func fulfil(_ id: UUID, outcome: ChatSendTerminalOutcome = .completed) {
+        guard terminalOutcomes[id] == nil else { return }
+        terminalOutcomes[id] = outcome
         cancelledWaiters = Set(cancelledWaiters.filter { $0.messageID != id })
         guard let list = waiters.removeValue(forKey: id) else { return }
         for continuation in list.values {
-            continuation.resume()
+            continuation.resume(returning: outcome)
         }
     }
 
     /// Cancels only the requesting task's waiter. Message completion remains authoritative
     /// for every other current or future waiter.
     func cancel(_ id: UUID, waiterID: UUID) {
-        guard completedOutcomes[id] == nil else { return }
+        guard terminalOutcomes[id] == nil else { return }
         if let continuation = waiters[id]?.removeValue(forKey: waiterID) {
             if waiters[id]?.isEmpty == true {
                 waiters.removeValue(forKey: id)
             }
-            continuation.resume()
+            continuation.resume(returning: nil)
         } else {
             cancelledWaiters.insert(WaiterKey(messageID: id, waiterID: waiterID))
         }
     }
 
     func isCompleted(_ id: UUID) -> Bool {
-        completedOutcomes[id] != nil
+        terminalOutcomes[id] != nil
     }
 
-    func outcome(for id: UUID) -> OracleMessageFinalizationOutcome? {
-        completedOutcomes[id]
+    func outcome(for id: UUID) -> ChatSendTerminalOutcome? {
+        terminalOutcomes[id]
+    }
+
+    func discard(_ id: UUID) {
+        terminalOutcomes.removeValue(forKey: id)
+    }
+
+    func discardAll() {
+        terminalOutcomes.removeAll(keepingCapacity: false)
+    }
+
+    nonisolated func waitForOutcome(
+        _ id: UUID,
+        timeout: Duration = .seconds(4 * 60 * 60)
+    ) async throws -> ChatSendTerminalOutcome? {
+        if let outcome = await outcome(for: id) { return outcome }
+        return try await withThrowingTaskGroup(of: ChatSendTerminalOutcome?.self) { group in
+            group.addTask {
+                let waiterID = UUID()
+                let outcome = await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        Task { await self.register(id, waiterID: waiterID, cont: continuation) }
+                    }
+                } onCancel: {
+                    Task { await self.cancel(id, waiterID: waiterID) }
+                }
+                try Task.checkCancellation()
+                return outcome
+            }
+            group.addTask {
+                try await ContinuousClock().sleep(for: timeout)
+                return nil
+            }
+            let result = try await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
     }
 
     /// Clean up any orphaned waiters (safety mechanism)
@@ -412,7 +511,7 @@ actor MessageFinalisationHub {
         waiters.removeAll()
         cancelledWaiters.removeAll()
         for continuation in allWaiters {
-            continuation.resume()
+            continuation.resume(returning: nil)
         }
     }
 }
@@ -452,6 +551,11 @@ class OracleViewModel: ObservableObject {
     @Published private(set) var streamingSessions: Set<UUID> = []
     @Published private(set) var messageStoreRevision: Int = 0
     @Published private(set) var currentQueryId: UUID?
+    let oracleSendClaims = OracleSendClaimRegistry()
+
+    #if DEBUG
+        var oraclePairDidCommitTestHook: (@MainActor () async -> Void)?
+    #endif
 
     /// Per-session stream state
     private var runStateBySession: [UUID: SessionRunState] = [:]
@@ -956,6 +1060,17 @@ class OracleViewModel: ObservableObject {
         (pinnedSessionRefCounts[sessionID] ?? 0) > 0
     }
 
+    @MainActor
+    private var historyRetentionProtectedSessionIDs: Set<UUID> {
+        let activeTabSessionIDs = workspaceManager.activeWorkspace?.composeTabs.compactMap {
+            workspaceManager.activeChatSessionID(forTabID: $0.id)
+        } ?? []
+        return Set(pinnedSessionRefCounts.keys)
+            .union(streamingSessions)
+            .union(currentSessionID.map { [$0] } ?? [])
+            .union(activeTabSessionIDs)
+    }
+
     #if DEBUG
         @MainActor
         func isSessionPinnedForTesting(_ sessionID: UUID) -> Bool {
@@ -1007,16 +1122,17 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func purgeMessageCaches(for messageId: UUID) {
-        // Message-scoped cleanup only; does not cancel live streams or touch session-level state.
         sessionIDByMessageId.removeValue(forKey: messageId)
         streamIDsByQueryId.removeValue(forKey: messageId)
         cancelFinalizationWatchdog(for: messageId)
         clearStreamActivityTracking(for: messageId)
         ephemeralState.clear(for: messageId)
+        Task { await finalisationHub.discard(messageId) }
     }
 
     @MainActor
     private func clearAllSessionStorage() {
+        Task { await finalisationHub.discardAll() }
         sessionSwitchGeneration += 1
         messageStore.removeAll(keepingCapacity: false)
         messageStoreRevision &+= 1
@@ -1409,7 +1525,9 @@ class OracleViewModel: ObservableObject {
                 aiResponseId: queryId,
                 sessionID: sessionID,
                 partialBuffer: content,
-                outcome: .interactiveWatchdog
+                terminalOutcome: .interactiveWatchdog(
+                    partialResponse: content.isEmpty ? nil : content
+                )
             )
         }
     }
@@ -1575,49 +1693,50 @@ class OracleViewModel: ObservableObject {
                 aiResponseId: queryId,
                 sessionID: sessionID,
                 partialBuffer: content,
-                outcome: .interactiveWatchdog
+                terminalOutcome: .interactiveWatchdog(
+                    partialResponse: content.isEmpty ? nil : content
+                )
             )
         }
     }
 
     // MARK: - Message Finalisation
 
-    nonisolated func waitForContextBuilderCompletion(_ id: UUID) async throws -> String {
-        if await finalisationHub.outcome(for: id) == nil {
-            let hasExactMessage = await MainActor.run {
-                guard let sessionID = self.sessionIDByMessageId[id],
-                      let messages = self.messageStore[sessionID]
-                else {
-                    return false
-                }
-                return messages.contains(where: { $0.id == id && !$0.isUser })
-            }
-            guard hasExactMessage else {
-                throw OracleContextBuilderCompletionError.missingExactQuery
-            }
+    nonisolated func waitForMessageFinalisationOutcome(_ id: UUID) async throws -> ChatSendTerminalOutcome {
+        guard let outcome = try await finalisationHub.waitForOutcome(id) else {
+            await cancelFinalisationAfterTimeout(messageID: id)
+            throw ChatToolError.internalError(
+                "Oracle message \(id.uuidString) did not finalize within 4 hours."
+            )
+        }
+        return outcome
+    }
 
-            let waiterID = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    Task {
-                        await finalisationHub.register(
-                            id,
-                            waiterID: waiterID,
-                            cont: cont
-                        )
-                    }
-                }
-            } onCancel: {
-                Task { await finalisationHub.cancel(id, waiterID: waiterID) }
+    @MainActor
+    private func cancelFinalisationAfterTimeout(messageID: UUID) async {
+        guard let sessionID = sessionIDByMessageId[messageID] else { return }
+        await cancelAIResponse(in: sessionID, skipPartialParseAndSave: false)
+    }
+
+    nonisolated func waitForContextBuilderCompletion(_ id: UUID) async throws -> String {
+        let hasExactMessage = await MainActor.run {
+            guard let sessionID = self.sessionIDByMessageId[id],
+                  let messages = self.messageStore[sessionID]
+            else {
+                return false
             }
-            try Task.checkCancellation()
+            return messages.contains(where: { $0.id == id && !$0.isUser })
+        }
+        guard hasExactMessage else {
+            throw OracleContextBuilderCompletionError.missingExactQuery
         }
 
-        guard let outcome = await finalisationHub.outcome(for: id) else {
+        guard let outcome = try await finalisationHub.waitForOutcome(id) else {
+            await cancelFinalisationAfterTimeout(messageID: id)
             throw OracleContextBuilderCompletionError.missingFinalizationOutcome
         }
         switch outcome {
-        case .providerCompleted:
+        case .completed:
             let content = await MainActor.run { () -> String? in
                 guard let sessionID = self.sessionIDByMessageId[id],
                       let message = self.messageStore[sessionID]?.first(where: { $0.id == id && !$0.isUser }),
@@ -1634,7 +1753,7 @@ class OracleViewModel: ObservableObject {
                 throw OracleContextBuilderCompletionError.emptyProcessedContent
             }
             return content
-        case let .providerTerminatedIncomplete(reason):
+        case let .providerTerminatedIncomplete(reason, _):
             throw OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
         case .streamEndedWithoutProviderCompletion:
             throw OracleContextBuilderCompletionError.streamEndedWithoutProviderCompletion
@@ -1642,7 +1761,7 @@ class OracleViewModel: ObservableObject {
             throw OracleContextBuilderCompletionError.interactiveWatchdogFinalization
         case .cancelled:
             throw CancellationError()
-        case let .failed(message):
+        case let .failed(message, _):
             throw OracleContextBuilderCompletionError.providerStreamFailed(message: message)
         }
     }
@@ -1652,32 +1771,17 @@ class OracleViewModel: ObservableObject {
             guard let sessionID = self.sessionIDByMessageId[id],
                   let messages = self.messageStore[sessionID],
                   let message = messages.first(where: { $0.id == id })
-            else {
-                return nil
-            }
+            else { return nil }
             return message.isFinalized
         }
-        if messageState == nil {
-            return
-        }
-        if messageState == true {
-            return
-        }
+        guard messageState == false else { return }
         let hubCompleted = await finalisationHub.isCompleted(id)
-        if hubCompleted {
-            return
-        }
+        guard !hubCompleted else { return }
 
         let waiterID = UUID()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                Task {
-                    await finalisationHub.register(
-                        id,
-                        waiterID: waiterID,
-                        cont: cont
-                    )
-                }
+        _ = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                Task { await finalisationHub.register(id, waiterID: waiterID, cont: continuation) }
             }
         } onCancel: {
             Task { await finalisationHub.cancel(id, waiterID: waiterID) }
@@ -1697,33 +1801,55 @@ class OracleViewModel: ObservableObject {
         }
     }
 
-    /// Deletes the given session from disk and memory, mimicking the old logic.
-    /// 1) If it has a file URL, we remove the file from disk via `chatData`.
-    /// 2) Animate removal from `sessions`.
-    /// 3) If this was the current session, switch to another or create a new one.
+    /// Deletes one logical chat. Paired Oracle sessions are one lifecycle unit:
+    /// every known member is cancelled, deleted, and removed from memory together.
     @MainActor
-    func deleteSession(_ session: ChatSession) async {
+    @discardableResult
+    func deleteSession(_ session: ChatSession) async -> Bool {
+        guard session.oraclePairID != nil else {
+            return await deleteLegacySession(session)
+        }
+        guard let workspaceID = session.workspaceID,
+              let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID })
+        else {
+            return await deleteLegacySession(session)
+        }
+        let claim = OracleSendClaimKey.oracleSend(
+            workspaceID: workspaceID,
+            tabID: session.composeTabID,
+            agentModeSessionID: session.agentModeSessionID,
+            agentModeRunID: session.agentModeRunID
+        )
+        do {
+            return try await oracleSendClaims.withClaim([claim]) {
+                await self.deleteClaimedSession(session, workspace: workspace)
+            }
+        } catch OracleSendClaimError.conflict {
+            return false
+        } catch {
+            print("Error claiming logical chat session deletion: \(error)")
+            return false
+        }
+    }
+
+    @MainActor
+    private func deleteLegacySession(_ session: ChatSession) async -> Bool {
         sessionSwitchGeneration += 1
         if isSessionStreaming(session.id) {
             await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
         }
-        clearMCPSessionUIState(for: session.id)
-        // 1) Attempt to delete file from disk (if it exists).
         if let fileURL = session.fileURL {
             do {
-                // Ensure we do it on background or in an actor
                 try await chatData.deleteChatSessionFile(fileURL)
             } catch {
-                print("Error deleting chat session file: \(error)")
+                print("Error deleting legacy chat session file: \(error)")
             }
         }
 
-        // 2) Remove from in-memory list with animation on the main actor
+        let deletedCurrentSession = currentSessionID == session.id
         withAnimation {
-            guard let idx = sessions.firstIndex(where: { $0.id == session.id }) else { return }
+            sessions.removeAll { $0.id == session.id }
             purgeSessionStorage(session.id)
-            sessions.remove(at: idx)
-
             if let tabID = session.composeTabID,
                workspaceManager.activeChatSessionID(forTabID: tabID) == session.id
             {
@@ -1733,48 +1859,113 @@ class OracleViewModel: ObservableObject {
                     .first
                 workspaceManager.setActiveChatSessionID(replacement?.id, forTabID: tabID)
             }
+        }
+        if deletedCurrentSession {
+            await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        }
+        return true
+    }
 
-            // If the deleted session was active, pick a new session or create one
-            if session.id == currentSessionID {
-                Task { [weak self] in
-                    await self?.ensureActiveSessionForCurrentTab(createIfMissing: true)
-                }
+    @MainActor
+    func deleteClaimedSession(_ session: ChatSession, workspace: WorkspaceModel) async -> Bool {
+        sessionSwitchGeneration += 1
+        guard let pairID = session.oraclePairID else {
+            return await deleteLegacySession(session)
+        }
+        let persistedMembers: [ChatSession]
+        do {
+            persistedMembers = try await chatData.oraclePairSessionStubs(for: workspace, pairID: pairID)
+        } catch {
+            print("Error resolving Oracle pair for deletion: \(error)")
+            return false
+        }
+        let memberIDs = Set([session.id]).union(persistedMembers.map(\.id)).union(
+            sessions.lazy.filter { $0.oraclePairID == pairID }.map(\.id)
+        )
+        guard memberIDs.count <= 2 else {
+            print("Refusing to delete malformed Oracle pair \(pairID).")
+            return false
+        }
+        let inMemoryMembers = sessions.filter { memberIDs.contains($0.id) }
+        for member in inMemoryMembers where isSessionStreaming(member.id) {
+            await cancelAIResponse(in: member.id, skipPartialParseAndSave: true)
+        }
+
+        do {
+            try await chatData.deleteOraclePairSessionFiles(memberIDs, for: workspace)
+        } catch {
+            print("Error deleting logical chat session: \(error)")
+            return false
+        }
+
+        let affectedTabIDs = Set(inMemoryMembers.compactMap(\.composeTabID))
+        let deletedCurrentSession = currentSessionID.map(memberIDs.contains) ?? false
+        withAnimation {
+            sessions.removeAll { memberIDs.contains($0.id) }
+            for memberID in memberIDs {
+                purgeSessionStorage(memberID)
+            }
+            for tabID in affectedTabIDs {
+                guard let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabID),
+                      memberIDs.contains(activeSessionID)
+                else { continue }
+                let replacement = sessions
+                    .filter { $0.composeTabID == tabID }
+                    .sorted { lhs, rhs in
+                        if lhs.savedAt != rhs.savedAt { return lhs.savedAt > rhs.savedAt }
+                        let leftLane = lhs.oracleLane == .primary ? 0 : lhs.oracleLane == .secondary ? 1 : 2
+                        let rightLane = rhs.oracleLane == .primary ? 0 : rhs.oracleLane == .secondary ? 1 : 2
+                        if leftLane != rightLane { return leftLane < rightLane }
+                        return lhs.id.uuidString < rhs.id.uuidString
+                    }
+                    .first
+                workspaceManager.setActiveChatSessionID(replacement?.id, forTabID: tabID)
             }
         }
+        if deletedCurrentSession {
+            await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        }
+        return true
     }
 
     // MARK: - Clearing All Chats
 
     @MainActor
     func clearAllChats() async {
-        await cancelAllActiveSessionStreams()
-        // 1) Identify the currently active workspace
         guard let activeWS = workspaceManager.activeWorkspace else {
             print("No active workspace found; nothing to clear.")
             return
         }
-
-        // 2) Delete chat JSON files only for this workspace
         do {
-            let files = try await chatData.listChatSessions(for: activeWS)
-            for file in files {
-                try await chatData.deleteChatSessionFile(file)
+            try await oracleSendClaims.withClaim([.workspace(activeWS.id)]) {
+                await self.clearClaimedChats(in: activeWS)
             }
+        } catch OracleSendClaimError.conflict {
+            print("Cannot clear chats while an Oracle request is active in this workspace.")
         } catch {
-            print("Error clearing chats for workspace \(activeWS.name): \(error)")
+            print("Error claiming workspace chat deletion: \(error)")
+        }
+    }
+
+    @MainActor
+    private func clearClaimedChats(in workspace: WorkspaceModel) async {
+        await cancelAllActiveSessionStreams()
+        do {
+            try await chatData.deleteAllChatSessionFiles(for: workspace)
+        } catch {
+            print("Error clearing chats for workspace \(workspace.name): \(error)")
+            return
         }
 
-        // 3) Remove from memory all sessions belonging to the active workspace
-        sessions.removeAll()
-        dropMessagesSafely()
+        let removedIDs = Set(sessions.lazy.filter { $0.workspaceID == workspace.id }.map(\.id))
+        sessions.removeAll { removedIDs.contains($0.id) }
+        for sessionID in removedIDs {
+            purgeSessionStorage(sessionID)
+        }
         cleanupShadowHolders()
-        clearAllSessionStorage()
         currentSessionID = nil
-
-        if let workspace = workspaceManager.activeWorkspace {
-            for tab in workspace.composeTabs {
-                workspaceManager.setActiveChatSessionID(nil, forTabID: tab.id)
-            }
+        for tab in workspace.composeTabs {
+            workspaceManager.setActiveChatSessionID(nil, forTabID: tab.id)
         }
 
         await startNewChatSession()
@@ -1965,7 +2156,10 @@ class OracleViewModel: ObservableObject {
             let listSessionsStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         do {
-            let files = try await chatData.listChatSessions(for: workspace)
+            let files = try await chatData.listChatSessions(
+                for: workspace,
+                protectedSessionIDs: historyRetentionProtectedSessionIDs
+            )
             #if DEBUG
                 listedFiles = files
             #endif
@@ -2109,16 +2303,18 @@ class OracleViewModel: ObservableObject {
     @discardableResult
     func startNewChatSession(
         name: String = "New Chat",
+        workspaceID: UUID? = nil,
         tabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         activateInUI: Bool = true,
-        setActiveForTab: Bool = true
+        setActiveForTab: Bool = true,
+        reuseBlankSession: Bool = true
     ) async -> UUID? {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         // If there's already a blank session with that name, just switch to it
-        if let existingIndex = sessions.firstIndex(where: {
+        if reuseBlankSession, let existingIndex = sessions.firstIndex(where: {
             $0.name == name &&
                 $0.effectiveMessageCount == 0 &&
                 $0.composeTabID == resolvedTabID &&
@@ -2168,7 +2364,7 @@ class OracleViewModel: ObservableObject {
         let selectedChatPresetId = promptViewModel.selectedChatPresetID
 
         let newSession = ChatSession(
-            workspaceID: workspaceManager.activeWorkspace?.id,
+            workspaceID: workspaceID ?? workspaceManager.activeWorkspace?.id,
             composeTabID: resolvedTabID,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
@@ -2596,7 +2792,7 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func reloadSessionFromMemory(_ session: ChatSession) async {
+    func reloadSessionFromMemory(_ session: ChatSession) async {
         let shouldAffectDisplayed = (session.id == currentSessionID)
         if shouldAffectDisplayed {
             // Clear existing messages first but maintain ephemeral state
@@ -2690,6 +2886,9 @@ class OracleViewModel: ObservableObject {
                 sessionToSave.composeTabID = session.composeTabID
                 sessionToSave.agentModeSessionID = session.agentModeSessionID
                 sessionToSave.agentModeRunID = session.agentModeRunID
+                sessionToSave.oraclePairID = session.oraclePairID
+                sessionToSave.oracleLane = session.oracleLane
+                sessionToSave.oracleHistoryDiverged = session.oracleHistoryDiverged
                 sessionToSave.selectedFilePaths = session.selectedFilePaths
                 sessionToSave.selectedPromptIDs = session.selectedPromptIDs
                 sessionToSave.preferredAIModel = session.preferredAIModel
@@ -2722,13 +2921,18 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    func autosaveChatHistory(for sessionID: UUID, force: Bool = false) {
+    @discardableResult
+    func autosaveChatHistory(
+        for sessionID: UUID,
+        force: Bool = false
+    ) -> Task<Void, Never>? {
         // ------------------------------------------------------------------
         // 0️⃣  Preconditions
         // ------------------------------------------------------------------
-        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        guard let session = sessions.first(where: { $0.id == sessionID }) else { return nil }
+        guard session.oraclePairID == nil, session.oracleLane == nil else { return nil }
         guard let liveMessages = messageStore[sessionID] ?? (sessionID == currentSessionID ? messages : nil) else {
-            return
+            return nil
         }
 
         // ------------------------------------------------------------------
@@ -2801,7 +3005,7 @@ class OracleViewModel: ObservableObject {
 
         if !force && !shouldSkipChangeCheck && nothingChanged {
             oracleViewModelDebugLog("autosaveChatHistory -> skipped (no meaningful changes)")
-            return
+            return nil
         }
 
         // ------------------------------------------------------------------
@@ -2844,7 +3048,7 @@ class OracleViewModel: ObservableObject {
         // ------------------------------------------------------------------
         // 7️⃣  Persist to disk
         // ------------------------------------------------------------------
-        Task {
+        return Task {
             do {
                 let fileURL = try await autosaveSession(sessionCopy)
                 await MainActor.run {
@@ -2979,8 +3183,13 @@ class OracleViewModel: ObservableObject {
             print("Warning: Ignoring overrideAIMessage without overrideMode.")
             return nil
         }
+        let wrappedUserMessage = """
+        <user_instructions>
+        \(newUserMessage)
+        </user_instructions>
+        """
         guard let lastUserMessage = overrideAIMessage.conversationMessages.last(where: { $0.role == .user })?.content,
-              lastUserMessage == newUserMessage
+              lastUserMessage == newUserMessage || lastUserMessage == wrappedUserMessage
         else {
             print("Warning: Ignoring overrideAIMessage because its final user message does not match the current send input.")
             return nil
@@ -2988,7 +3197,135 @@ class OracleViewModel: ObservableObject {
         return overrideAIMessage
     }
 
+    #if DEBUG
+        func acceptsOverrideAIMessageForTesting(_ message: AIMessage, userMessage: String) -> Bool {
+            validatedOverrideAIMessage(
+                message,
+                newUserMessage: userMessage,
+                selectionOverride: StoredSelection(),
+                overrideMode: .review
+            ) != nil
+        }
+    #endif
+
     // MARK: - Main Send/Receive Flow
+
+    nonisolated static func storedOracleMessages(
+        _ messages: [AIChatMessage],
+        preserving existing: [StoredMessage]
+    ) throws -> [StoredMessage] {
+        let duplicate = [messages.map(\.id), existing.map(\.id)].lazy.compactMap { ids in
+            Dictionary(grouping: ids, by: { $0 }).first(where: { $0.value.count > 1 })?.key
+        }.first
+        if let duplicate {
+            throw ChatToolError(
+                code: .conflict,
+                message: "Duplicate Oracle message identity.",
+                details: ["duplicate_id": duplicate.uuidString]
+            )
+        }
+        let existingByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        let createdAt = Date()
+        return messages.map { message in
+            StoredMessage(
+                id: message.id,
+                isUser: message.isUser,
+                rawText: message.content,
+                timestamp: existingByID[message.id]?.timestamp ?? createdAt,
+                sequenceIndex: message.sequenceIndex,
+                allowedFilePaths: message.allowedFilePaths.isEmpty ? nil : message.allowedFilePaths,
+                promptTokens: message.promptTokens,
+                completionTokens: message.completionTokens,
+                cost: message.cost,
+                modelName: message.modelName
+            )
+        }
+    }
+
+    @MainActor
+    func persistOraclePairHistories(
+        pairID: UUID,
+        primarySessionID: UUID,
+        secondarySessionID: UUID
+    ) async throws -> Bool {
+        guard primarySessionID != secondarySessionID,
+              let primaryIndex = sessions.firstIndex(where: { $0.id == primarySessionID }),
+              let secondaryIndex = sessions.firstIndex(where: { $0.id == secondarySessionID }),
+              sessions[primaryIndex].oraclePairID == pairID,
+              sessions[primaryIndex].oracleLane == .primary,
+              sessions[secondaryIndex].oraclePairID == pairID,
+              sessions[secondaryIndex].oracleLane == .secondary,
+              let workspaceID = sessions[primaryIndex].workspaceID,
+              sessions[secondaryIndex].workspaceID == workspaceID,
+              let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+              let primaryMessages = messageStore[primarySessionID],
+              let secondaryMessages = messageStore[secondarySessionID]
+        else {
+            throw ChatToolError.internalError("Failed to persist a complete Oracle pair history.")
+        }
+
+        let diverged = Self.oracleHistoriesDiverged(
+            primary: primaryMessages.filter(\.isUser).map(\.content),
+            secondary: secondaryMessages.filter(\.isUser).map(\.content)
+        )
+        let savedAt = Date()
+        var primary = sessions[primaryIndex]
+        var secondary = sessions[secondaryIndex]
+        primary.messages = try Self.storedOracleMessages(primaryMessages, preserving: primary.messages)
+        secondary.messages = try Self.storedOracleMessages(secondaryMessages, preserving: secondary.messages)
+        primary.savedAt = savedAt
+        secondary.savedAt = savedAt
+        primary.oracleHistoryDiverged = diverged
+        secondary.oracleHistoryDiverged = diverged
+
+        let fileURLs = try await chatData.saveOraclePairSessions([primary, secondary], for: workspace)
+        primary.fileURL = fileURLs[primarySessionID]
+        secondary.fileURL = fileURLs[secondarySessionID]
+
+        #if DEBUG
+            await oraclePairDidCommitTestHook?()
+        #endif
+
+        let projectionRouteIsCurrent = sessions.contains {
+            $0.id == primarySessionID &&
+                $0.oraclePairID == pairID &&
+                $0.oracleLane == .primary &&
+                $0.workspaceID == workspaceID
+        } && sessions.contains {
+            $0.id == secondarySessionID &&
+                $0.oraclePairID == pairID &&
+                $0.oracleLane == .secondary &&
+                $0.workspaceID == workspaceID
+        }
+        for member in [primary, secondary] {
+            if let index = sessions.firstIndex(where: { $0.id == member.id }) {
+                sessions[index] = member
+            } else {
+                sessions.append(member)
+            }
+        }
+        if !projectionRouteIsCurrent {
+            throw ChatToolError(
+                code: .conflict,
+                message: "Oracle pair histories were committed, but in-memory state changed during projection; durable state was restored.",
+                details: ["durable_commit": "true"]
+            )
+        }
+        return diverged
+    }
+
+    @MainActor
+    func removeOraclePairSessionState(_ sessionIDs: Set<UUID>) {
+        sessions.removeAll { sessionIDs.contains($0.id) }
+        for sessionID in sessionIDs {
+            purgeSessionStorage(sessionID)
+        }
+    }
+
+    @MainActor
+    func oracleUserHistory(in sessionID: UUID) -> [String]? {
+        messageStore[sessionID]?.filter(\.isUser).map(\.content)
+    }
 
     @MainActor
     @discardableResult
@@ -3008,7 +3345,6 @@ class OracleViewModel: ObservableObject {
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async -> UUID? {
         guard !newUserMessage.isEmpty else { return nil }
-        _ = true
 
         let targetSessionID: UUID
         if let sessionID {
@@ -3031,18 +3367,15 @@ class OracleViewModel: ObservableObject {
 
         ensureSessionStorage(targetSessionID)
 
-        // Create the user message
-        let userId = UUID()
+        let userID = UUID()
         let userMessage = AIChatMessage(
-            id: userId,
+            id: userID,
             content: newUserMessage,
             isUser: true,
             sequenceIndex: nextSequenceIndex(for: targetSessionID)
         )
-        withSessionMessages(targetSessionID) { msgs in
-            msgs.append(userMessage)
-        }
-        registerMessage(userId, sessionID: targetSessionID)
+        withSessionMessages(targetSessionID) { $0.append(userMessage) }
+        registerMessage(userID, sessionID: targetSessionID)
 
         let conversation = buildConversationEntries(for: targetSessionID)
 
@@ -3056,6 +3389,7 @@ class OracleViewModel: ObservableObject {
         if !promptViewModel.isModelAvailable(model) {
             // Show error in chat instead of silently falling back
             let errorMessage = AIChatMessage(
+                id: UUID(),
                 content: "Error: The model '\(model.displayName)' is not available. Please check that the \(model.providerType.displayName) API key is configured in Settings.",
                 isUser: false,
                 isFinalized: true
@@ -3067,7 +3401,7 @@ class OracleViewModel: ObservableObject {
             autosaveChatHistory(for: targetSessionID)
             await finalisationHub.fulfil(
                 errorMessage.id,
-                outcome: .failed(message: errorMessage.content)
+                outcome: .failed(message: errorMessage.content, partialResponse: nil)
             )
             return errorMessage.id
         }
@@ -3268,7 +3602,7 @@ class OracleViewModel: ObservableObject {
                                 aiResponseId: aiResponseId,
                                 sessionID: targetSessionID,
                                 partialBuffer: partialBuffer,
-                                outcome: .providerCompleted
+                                terminalOutcome: .completed
                             )
                             await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                         }
@@ -3289,17 +3623,22 @@ class OracleViewModel: ObservableObject {
                             self.updateLatestTokenCounts()
                         }
                     }
-                    let outcome: OracleMessageFinalizationOutcome = if let incompleteProviderReason {
-                        .providerTerminatedIncomplete(reason: incompleteProviderReason)
+                    let terminalOutcome: ChatSendTerminalOutcome = if let incompleteProviderReason {
+                        .providerTerminatedIncomplete(
+                            reason: incompleteProviderReason,
+                            partialResponse: partialBuffer.isEmpty ? nil : partialBuffer
+                        )
                     } else {
-                        .streamEndedWithoutProviderCompletion
+                        .streamEndedWithoutProviderCompletion(
+                            partialResponse: partialBuffer.isEmpty ? nil : partialBuffer
+                        )
                     }
                     Task {
                         await self.finalizeAIResponse(
                             aiResponseId: aiResponseId,
                             sessionID: targetSessionID,
                             partialBuffer: partialBuffer,
-                            outcome: outcome
+                            terminalOutcome: terminalOutcome
                         )
                         await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                     }
@@ -3312,7 +3651,7 @@ class OracleViewModel: ObservableObject {
                     self.clearSessionStreaming(targetSessionID)
                 }
                 Task {
-                    await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID)
+                    await self.handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID)
                     await self.cleanupOracleProviderConversation(providerCleanupHandle, model: model)
                 }
             }
@@ -3337,7 +3676,7 @@ class OracleViewModel: ObservableObject {
         aiResponseId: UUID,
         sessionID: UUID,
         partialBuffer: String,
-        outcome: OracleMessageFinalizationOutcome
+        terminalOutcome: ChatSendTerminalOutcome
     ) async {
         // Single-flight finalisation: provider stop, watchdogs, and cancellation can
         // all race to finalize the same message.
@@ -3363,7 +3702,7 @@ class OracleViewModel: ObservableObject {
             messageStore[sessionID]?.first(where: { $0.id == aiResponseId })?
                 .content ?? partialBuffer
         }
-        if case let .providerTerminatedIncomplete(reason) = outcome {
+        if case let .providerTerminatedIncomplete(reason, _) = terminalOutcome {
             let error = OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
             let incompleteContent = finalContent + "\n\n--\nError:\n\(error.localizedDescription)"
             finalContent = incompleteContent
@@ -3403,16 +3742,17 @@ class OracleViewModel: ObservableObject {
         // When finalizing after a delegate‑edit retry, force autosave so XML results persist
         // even if the assistant message text hasn't changed (avoids "no meaningful changes" skip).
         let shouldForceAutosave = (activeRetryTask != nil)
-        autosaveChatHistory(for: sessionID, force: shouldForceAutosave)
+        let autosaveTask = autosaveChatHistory(for: sessionID, force: shouldForceAutosave)
+        await autosaveTask?.value
 
         // 5️⃣ Notify observers and any waiters that this message is finalised
         emitMessageLifecycleActivity(.finalizationCompleted, for: aiResponseId)
-        await concludeFinalisation(aiResponseId, outcome: outcome)
+        await concludeFinalisation(aiResponseId, outcome: terminalOutcome)
     }
 
     private func concludeFinalisation(
         _ id: UUID,
-        outcome: OracleMessageFinalizationOutcome
+        outcome: ChatSendTerminalOutcome
     ) async {
         completionPolicies.removeValue(forKey: id)
         await finalisationHub.fulfil(id, outcome: outcome)
@@ -3435,27 +3775,36 @@ class OracleViewModel: ObservableObject {
             print("AI response was cancelled.")
             guard let index = messageStore[sessionID]?.firstIndex(where: { $0.id == aiResponseId }) else {
                 clearSessionStreaming(sessionID)
-                await concludeFinalisation(aiResponseId, outcome: .cancelled)
+                await concludeFinalisation(
+                    aiResponseId,
+                    outcome: .cancelled(message: "Request was cancelled.", partialResponse: nil)
+                )
                 return
             }
 
             if messageStore[sessionID]?[index].isFinalized == true {
                 clearSessionStreaming(sessionID)
-                await concludeFinalisation(aiResponseId, outcome: .cancelled)
+                await concludeFinalisation(
+                    aiResponseId,
+                    outcome: .cancelled(message: "Request was cancelled.", partialResponse: nil)
+                )
                 return
             }
 
             let finalContent = messageStore[sessionID]?[index].content ?? ""
             if finalContent.isEmpty {
-                await concludeFinalisation(aiResponseId, outcome: .cancelled)
                 withSessionMessages(sessionID) { msgs in
                     if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                         msgs.remove(at: idx)
                     }
                 }
-                purgeMessageCaches(for: aiResponseId)
-                clearSessionStreaming(sessionID)
                 autosaveChatHistory(for: sessionID)
+                clearSessionStreaming(sessionID)
+                await concludeFinalisation(
+                    aiResponseId,
+                    outcome: .cancelled(message: "Request was cancelled.", partialResponse: nil)
+                )
+                purgeMessageCaches(for: aiResponseId)
                 return
             }
 
@@ -3464,7 +3813,10 @@ class OracleViewModel: ObservableObject {
                     aiResponseId: aiResponseId,
                     sessionID: sessionID,
                     partialBuffer: finalContent,
-                    outcome: .cancelled
+                    terminalOutcome: .cancelled(
+                        message: "Request was cancelled.",
+                        partialResponse: finalContent.isEmpty ? nil : finalContent
+                    )
                 )
             }
             return
@@ -3475,6 +3827,10 @@ class OracleViewModel: ObservableObject {
         // Pass token count to error message handler for non-cancellation errors
         let tokenCount = promptViewModel.totalTokenCount
         let errorMessage = userFriendlyErrorMessage(for: error, tokenCount: tokenCount)
+        let partialContent = messageStore[sessionID]?
+            .first(where: { $0.id == aiResponseId })?
+            .content
+        let partialResponse = partialContent.flatMap { $0.isEmpty ? nil : $0 }
         if messageStore[sessionID]?.contains(where: { $0.id == aiResponseId }) == true {
             let appendedErrorBlock = "\n\n--\nError:\n\(errorMessage)"
             withSessionMessages(sessionID) { msgs in
@@ -3500,7 +3856,7 @@ class OracleViewModel: ObservableObject {
         clearSessionStreaming(sessionID)
         await concludeFinalisation(
             aiResponseId,
-            outcome: .failed(message: errorMessage)
+            outcome: .failed(message: errorMessage, partialResponse: partialResponse)
         )
     }
 
@@ -3680,26 +4036,35 @@ class OracleViewModel: ObservableObject {
 
         guard !skipPartialParseAndSave, let queryId = qid else {
             if let qid {
-                await concludeFinalisation(qid, outcome: .cancelled)
+                await concludeFinalisation(
+                    qid,
+                    outcome: .cancelled(message: "Request was cancelled.", partialResponse: nil)
+                )
             }
             return
         }
 
         guard let idx = messageStore[sessionID]?.firstIndex(where: { $0.id == queryId && !$0.isUser }) else {
-            await concludeFinalisation(queryId, outcome: .cancelled)
+            await concludeFinalisation(
+                queryId,
+                outcome: .cancelled(message: "Request was cancelled.", partialResponse: nil)
+            )
             return
         }
 
         let finalContent = messageStore[sessionID]?[idx].content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if finalContent.isEmpty {
-            await concludeFinalisation(queryId, outcome: .cancelled)
             withSessionMessages(sessionID) { msgs in
                 if let index = msgs.firstIndex(where: { $0.id == queryId && !$0.isUser }) {
                     msgs.remove(at: index)
                 }
             }
-            purgeMessageCaches(for: queryId)
             autosaveChatHistory(for: sessionID)
+            await concludeFinalisation(
+                queryId,
+                outcome: .cancelled(message: "Request was cancelled.", partialResponse: nil)
+            )
+            purgeMessageCaches(for: queryId)
             return
         }
 
@@ -3712,7 +4077,13 @@ class OracleViewModel: ObservableObject {
         autosaveChatHistory(for: sessionID)
 
         // Notify any waiters that this message is finalised (cancelled)
-        await concludeFinalisation(queryId, outcome: .cancelled)
+        await concludeFinalisation(
+            queryId,
+            outcome: .cancelled(
+                message: "Request was cancelled.",
+                partialResponse: finalContent.isEmpty ? nil : finalContent
+            )
+        )
     }
 
     @MainActor
@@ -3825,6 +4196,18 @@ class OracleViewModel: ObservableObject {
         }
         guard let index = sessions.firstIndex(where: { $0.id == id }) else {
             print("Session \(id) not found for renaming.")
+            return
+        }
+
+        if sessions[index].oraclePairID != nil || sessions[index].oracleLane != nil {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await persistOraclePairRename(sessionID: id, newName: newName)
+                } catch {
+                    print("Error saving renamed Oracle pair: \(error)")
+                }
+            }
             return
         }
 

@@ -45,7 +45,7 @@ final class OracleMessageFinalisationHubTests: XCTestCase {
         let futureResumedBeforeFulfilment = await futureSignal.isMarked()
         XCTAssertFalse(futureResumedBeforeFulfilment)
 
-        await hub.fulfil(messageID, outcome: .providerCompleted)
+        await hub.fulfil(messageID, outcome: .completed)
         await retainedWaiter.value
         await futureWaiter.value
 
@@ -87,21 +87,67 @@ final class OracleMessageFinalisationHubTests: XCTestCase {
         XCTAssertFalse(retainedResumedBeforeFulfilment)
         XCTAssertFalse(completedBeforeFulfilment)
 
-        await hub.fulfil(messageID, outcome: .providerCompleted)
+        await hub.fulfil(messageID, outcome: .completed)
         await retainedWaiter.value
         let retainedResumedAfterFulfilment = await retainedSignal.isMarked()
         XCTAssertTrue(retainedResumedAfterFulfilment)
     }
 
-    func testFirstTerminalOutcomeRemainsAuthoritative() async {
+    func testConcurrentWaitersReceiveTheSameTerminalOutcome() async throws {
+        let hub = MessageFinalisationHub()
+        let messageID = UUID()
+        let expected = ChatSendTerminalOutcome.failed(
+            message: "provider failed",
+            partialResponse: "partial"
+        )
+
+        async let first = hub.waitForOutcome(messageID, timeout: .seconds(1))
+        async let second = hub.waitForOutcome(messageID, timeout: .seconds(1))
+        await Task.yield()
+        await hub.fulfil(messageID, outcome: expected)
+
+        let outcomes = try await [first, second]
+        XCTAssertEqual(outcomes, [expected, expected])
+    }
+
+    func testTimeoutDoesNotPoisonLaterGenuineOutcome() async throws {
         let hub = MessageFinalisationHub()
         let messageID = UUID()
 
-        await hub.fulfil(messageID, outcome: .streamEndedWithoutProviderCompletion)
-        await hub.fulfil(messageID, outcome: .providerCompleted)
+        let timedOut = try await hub.waitForOutcome(messageID, timeout: .zero)
+        XCTAssertNil(timedOut)
+        let completedAfterTimeout = await hub.isCompleted(messageID)
+        XCTAssertFalse(completedAfterTimeout)
 
+        await hub.fulfil(messageID, outcome: .completed)
+        let later = try await hub.waitForOutcome(messageID, timeout: .seconds(1))
+        XCTAssertEqual(later, .completed)
+    }
+
+    func testTerminalOutcomeIsFirstWriterWinsAndDiscardAllowsRetry() async throws {
+        let hub = MessageFinalisationHub()
+        let messageID = UUID()
+
+        await hub.fulfil(
+            messageID,
+            outcome: .failed(message: "provider failed", partialResponse: "partial")
+        )
+        await hub.fulfil(messageID, outcome: .completed)
         let outcome = await hub.outcome(for: messageID)
-        XCTAssertEqual(outcome, .streamEndedWithoutProviderCompletion)
+        XCTAssertEqual(
+            outcome,
+            .failed(message: "provider failed", partialResponse: "partial")
+        )
+
+        await hub.discard(messageID)
+        let completedAfterDiscard = await hub.isCompleted(messageID)
+        let outcomeAfterDiscard = try await hub.waitForOutcome(messageID, timeout: .zero)
+        XCTAssertFalse(completedAfterDiscard)
+        XCTAssertNil(outcomeAfterDiscard)
+
+        await hub.fulfil(messageID, outcome: .completed)
+        let retryOutcome = try await hub.waitForOutcome(messageID, timeout: .seconds(1))
+        XCTAssertEqual(retryOutcome, .completed)
     }
 
     private func makeWaiter(
@@ -111,7 +157,7 @@ final class OracleMessageFinalisationHubTests: XCTestCase {
         signal: OracleFinalisationWaiterSignal
     ) -> Task<Void, Never> {
         Task {
-            await withCheckedContinuation { continuation in
+            _ = await withCheckedContinuation { continuation in
                 Task {
                     await hub.register(
                         messageID,

@@ -475,6 +475,10 @@ private struct ContextBuilderCompletedSummaryView: View {
         contextBuilderFollowUpChatID(for: dto)
     }
 
+    private var oracleLanes: [ContextBuilderOracleLaneSummary] {
+        contextBuilderOracleLaneSummaries(for: dto)
+    }
+
     private var detailParts: [String] {
         var parts: [String] = []
         if let fileCount = dto?.fileCount {
@@ -496,10 +500,10 @@ private struct ContextBuilderCompletedSummaryView: View {
         return selection
     }
 
-    private func openOraclePreview() {
+    private func openOraclePreview(chatID: String?) {
         guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
-            chatID: followUpChatID
+            chatID: chatID
         ) else { return }
         NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
     }
@@ -523,19 +527,37 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .lineLimit(3)
             }
 
-            if let followUpChatID, !followUpChatID.isEmpty {
-                Text("Oracle chat: \(followUpChatID)")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
+            if oracleLanes.isEmpty {
+                if let followUpChatID, !followUpChatID.isEmpty {
+                    Text("Oracle chat: \(followUpChatID)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
 
-            Button("Open Oracle", action: openOraclePreview)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(contextBuilderOraclePopoverUserInfo(
-                    openContext: oracleOpenContext,
-                    chatID: followUpChatID
-                ) == nil)
+                Button("Open Oracle") { openOraclePreview(chatID: followUpChatID) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(contextBuilderOraclePopoverUserInfo(
+                        openContext: oracleOpenContext,
+                        chatID: followUpChatID
+                    ) == nil)
+            } else {
+                ForEach(oracleLanes, id: \.lane) { lane in
+                    HStack(spacing: 6) {
+                        Text(lane.label)
+                            .font(.system(size: 10, weight: .semibold))
+                        StatusBadge(text: lane.statusLabel, status: lane.cardStatus)
+                        Spacer()
+                        Button("Open") { openOraclePreview(chatID: lane.chatID) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(contextBuilderOraclePopoverUserInfo(
+                                openContext: oracleOpenContext,
+                                chatID: lane.chatID
+                            ) == nil)
+                    }
+                }
+            }
         }
     }
 }
@@ -544,6 +566,49 @@ private enum ContextBuilderCardPhase {
     case running
     case generatingPlan
     case completed
+}
+
+struct ContextBuilderOracleLaneSummary: Equatable {
+    let lane: OracleLane
+    let status: String
+    let chatID: String?
+
+    var label: String {
+        lane == .primary ? "Primary Oracle" : "Secondary Oracle"
+    }
+
+    var statusLabel: String {
+        status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    var cardStatus: ToolCardStatus {
+        switch status.lowercased() {
+        case "completed": .success
+        case "failed": .failure
+        default: .neutral
+        }
+    }
+}
+
+func contextBuilderOracleLaneSummaries(
+    for dto: ToolResultDTOs.ContextBuilderDTO?
+) -> [ContextBuilderOracleLaneSummary] {
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return [] }
+    let followUp = switch branch {
+    case .review: dto.review
+    case .plan: dto.plan
+    }
+    guard let results = followUp?.oracleResults else { return [] }
+    return [OracleLane.primary, .secondary].compactMap { lane in
+        guard let result = results[lane.rawValue] else { return nil }
+        return ContextBuilderOracleLaneSummary(
+            lane: lane,
+            status: nonEmptyContextBuilderValue(result.status) ?? "unknown",
+            chatID: nonEmptyContextBuilderValue(result.chatID)
+        )
+    }
 }
 
 func contextBuilderOraclePopoverUserInfo(
