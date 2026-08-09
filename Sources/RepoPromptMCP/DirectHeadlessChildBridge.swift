@@ -115,7 +115,7 @@ enum DirectHeadlessChildBridge {
         }
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                rpConnect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         guard result == 0 else {
