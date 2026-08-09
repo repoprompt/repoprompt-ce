@@ -7,7 +7,7 @@ import XCTest
 final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
     func testDirectHeadlessAgentLifecycleRequiresAdvertisedOperation() throws {
         let supportedOperations = [
-            "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
+            "agent_run": ["start", "poll", "wait", "cancel"],
             "agent_explore": ["start", "poll", "wait", "cancel"]
         ]
         for (toolName, operations) in supportedOperations {
@@ -15,7 +15,15 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 toolName: toolName,
                 arguments: [:]
             ))
-            for invalidOperation in [Value.null, .bool(true), .int(1), .string(" start "), .string("unknown")] {
+            for invalidOperation in [
+                Value.null,
+                .bool(true),
+                .int(1),
+                .string(" start "),
+                .string("steer"),
+                .string("respond"),
+                .string("unknown")
+            ] {
                 XCTAssertThrowsError(try DirectHeadlessMCPService.validatedCallArguments(
                     toolName: toolName,
                     arguments: ["op": invalidOperation]
@@ -700,6 +708,38 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         XCTAssertEqual(processSnapshot.roots.map(\.path), processRoots.map(\.path))
         XCTAssertEqual(processSnapshot.activeRoot?.path, fixture.launchWorktree.path)
 
+        let primaryWorktrees = try await DirectHeadlessWorktreeRouting.listWorktrees(
+            repositoryRoot: fixture.canonicalRepo
+        )
+        let primaryWorktree = try XCTUnwrap(
+            primaryWorktrees.first { $0.path.path == fixture.alternateWorktree.path }
+        )
+        let primaryByID = try await startAgent(
+            prepared: prepared,
+            arguments: [
+                "op": .string("start"),
+                "message": .string("Report the primary selected worktree."),
+                "worktree_id": .string(primaryWorktree.worktreeID),
+                "detach": .bool(true)
+            ]
+        )
+        let primaryByIDTerminal = await prepared.providerCoordinator.waitAgent(sessionID: primaryByID, timeout: 10)
+        XCTAssertEqual(primaryByIDTerminal.status, .completed)
+        XCTAssertEqual(
+            try URL(fileURLWithPath: XCTUnwrap(primaryByIDTerminal.latestAssistantPreview))
+                .standardizedFileURL.resolvingSymlinksInPath().path,
+            fixture.alternateWorktree.path
+        )
+        let primaryByIDSnapshot = try await prepared.context.snapshot(
+            connectionID: prepared.connectionID,
+            sessionID: primaryByID
+        )
+        XCTAssertEqual(
+            primaryByIDSnapshot.roots.map(\.path),
+            [fixture.alternateWorktree.path, secondary.launchWorktree.path]
+        )
+        XCTAssertEqual(primaryByIDSnapshot.activeRoot?.path, fixture.alternateWorktree.path)
+
         let parentID = try await startAgent(
             prepared: prepared,
             arguments: [
@@ -726,6 +766,65 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             [fixture.launchWorktree.path, secondary.alternateWorktree.path]
         )
         XCTAssertEqual(parentSnapshot.activeRoot?.path, secondary.alternateWorktree.path)
+
+        let falseRepresentations: [Value] = [
+            .bool(false),
+            .string(" FALSE "),
+            .string("0"),
+            .string("No"),
+            .int(0),
+            .double(0)
+        ]
+        for representation in falseRepresentations {
+            let sessionID = UUID()
+            let preparation = try await prepared.context.prepareSessionRootOverlay(
+                sessionID: sessionID,
+                sourceSessionID: parentID,
+                arguments: ["inherit_worktree": representation],
+                connectionID: prepared.connectionID
+            )
+            let snapshot = try await prepared.context.snapshot(
+                connectionID: prepared.connectionID,
+                sessionID: sessionID
+            )
+            XCTAssertEqual(snapshot.roots.map(\.path), processRoots.map(\.path))
+            XCTAssertEqual(snapshot.activeRoot?.path, fixture.launchWorktree.path)
+            await prepared.context.rollbackSessionRootOverlay(preparation)
+        }
+
+        let nullSessionID = UUID()
+        let nullPreparation = try await prepared.context.prepareSessionRootOverlay(
+            sessionID: nullSessionID,
+            sourceSessionID: parentID,
+            arguments: ["inherit_worktree": .null],
+            connectionID: prepared.connectionID
+        )
+        let nullSnapshot = try await prepared.context.snapshot(
+            connectionID: prepared.connectionID,
+            sessionID: nullSessionID
+        )
+        XCTAssertEqual(nullSnapshot.roots.map(\.path), parentSnapshot.roots.map(\.path))
+        XCTAssertEqual(nullSnapshot.activeRoot?.path, secondary.alternateWorktree.path)
+        await prepared.context.rollbackSessionRootOverlay(nullPreparation)
+
+        let malformedSessionID = UUID()
+        do {
+            _ = try await prepared.context.prepareSessionRootOverlay(
+                sessionID: malformedSessionID,
+                sourceSessionID: parentID,
+                arguments: ["inherit_worktree": .string("sometimes")],
+                connectionID: prepared.connectionID
+            )
+            XCTFail("Expected malformed inherit_worktree to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("inherit_worktree must be a boolean"))
+        }
+        let malformedSnapshot = try await prepared.context.snapshot(
+            connectionID: prepared.connectionID,
+            sessionID: malformedSessionID
+        )
+        XCTAssertEqual(malformedSnapshot.roots.map(\.path), processRoots.map(\.path))
+        XCTAssertEqual(malformedSnapshot.activeRoot?.path, fixture.launchWorktree.path)
 
         let inheritedID = try await startAgent(
             prepared: prepared,

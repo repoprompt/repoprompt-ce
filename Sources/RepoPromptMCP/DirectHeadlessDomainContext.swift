@@ -151,7 +151,10 @@ actor DirectHeadlessDomainContext {
         connectionID: UUID
     ) async throws -> SessionRootOverlayPreparation {
         let processSnapshot = try await snapshot(connectionID: connectionID)
-        let inherits = arguments["inherit_worktree"]?.boolValue ?? true
+        let inherits = try Self.parseOptionalBool(
+            arguments["inherit_worktree"],
+            name: "inherit_worktree"
+        ) ?? true
         let selectorIntent = try DirectHeadlessWorktreeRouting.parseSessionSelector(arguments: arguments)
         let inheritedOverlay = inherits
             ? sourceSessionID.flatMap { sessionRootOverlays[$0] }
@@ -321,6 +324,32 @@ actor DirectHeadlessDomainContext {
 
     nonisolated func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {
         try Self.resolvePath(rawPath, roots: roots, allowMissingLeaf: allowMissingLeaf)
+    }
+
+    private static func parseOptionalBool(_ value: Value?, name: String) throws -> Bool? {
+        guard let value else { return nil }
+        switch value {
+        case .null:
+            return nil
+        case let .bool(boolValue):
+            return boolValue
+        case let .string(stringValue):
+            switch stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes":
+                return true
+            case "false", "0", "no":
+                return false
+            default:
+                break
+            }
+        case let .int(intValue):
+            return intValue != 0
+        case let .double(doubleValue):
+            return doubleValue != 0
+        default:
+            break
+        }
+        throw MCPError.invalidParams("\(name) must be a boolean.")
     }
 
     private static func contextObject(

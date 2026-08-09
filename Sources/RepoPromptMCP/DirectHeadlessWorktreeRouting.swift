@@ -343,12 +343,9 @@ enum DirectHeadlessWorktreeRouting {
         canonicalRoots: [URL],
         mappings: [DirectHeadlessRootMapping]
     ) throws -> URL {
-        let gitRoots = canonicalRoots.filter { root in
-            FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path)
-        }
         guard let selector = normalized(selector) else {
-            guard gitRoots.count == 1, let root = gitRoots.first else {
-                throw MCPError.invalidParams("worktree_repo_root is required when the workspace does not have exactly one Git root")
+            guard let root = canonicalRoots.first else {
+                throw MCPError.invalidParams("workspace has no declared root")
             }
             return root
         }

@@ -544,7 +544,7 @@ actor DirectHeadlessMCPService {
         let supportedOperations: Set<String>
         switch toolName {
         case "agent_run":
-            supportedOperations = ["start", "poll", "wait", "cancel", "steer", "respond"]
+            supportedOperations = ["start", "poll", "wait", "cancel"]
         case "agent_explore":
             supportedOperations = ["start", "poll", "wait", "cancel"]
         default:
