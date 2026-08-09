@@ -312,6 +312,8 @@ enum CodexDynamicModelMapper {
 
 enum CodexDynamicModelStore {
     private static let storageKey = "CodexDynamicModelRecords"
+    private static let cacheLock = NSLock()
+    private static var _cachedRecords: [CodexDynamicModelRecord]?
 
     static func canonicalRecords(from models: [CodexAppServerClient.RemoteModel]) -> [CodexDynamicModelRecord] {
         models
@@ -323,11 +325,22 @@ enum CodexDynamicModelStore {
         let records = canonicalRecords(from: models)
         guard let data = try? JSONEncoder().encode(records) else { return }
         defaults.set(data, forKey: storageKey)
+        cacheLock.lock()
+        _cachedRecords = records
+        cacheLock.unlock()
     }
 
     static func load(defaults: UserDefaults = .standard) -> [CodexDynamicModelRecord] {
+        cacheLock.lock()
+        let cached = _cachedRecords
+        cacheLock.unlock()
+        if let cached { return cached }
         guard let data = defaults.data(forKey: storageKey) else { return [] }
-        return (try? JSONDecoder().decode([CodexDynamicModelRecord].self, from: data)) ?? []
+        let records = (try? JSONDecoder().decode([CodexDynamicModelRecord].self, from: data)) ?? []
+        cacheLock.lock()
+        if _cachedRecords == nil { _cachedRecords = records }
+        cacheLock.unlock()
+        return records
     }
 
     static func modelOptions(defaults: UserDefaults = .standard) -> [CodexDynamicModelOption] {
