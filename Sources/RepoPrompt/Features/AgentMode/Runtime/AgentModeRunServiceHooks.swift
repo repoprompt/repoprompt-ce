@@ -38,7 +38,7 @@ extension AgentModeRunService {
         let markAttachmentsConsumed: (AgentModeViewModel.TabSession, UUID?) -> Void
         let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> Void
         let consumeDeferredAttachmentCleanup: (AgentModeViewModel.TabSession, Bool) -> Void
-        let finalizeAttachmentsForTurn: (AgentModeViewModel.TabSession, UUID?, AgentModeViewModel.AttachmentTurnDisposition) -> Void
+        let finalizeAttachmentsForTurn: (AgentModeViewModel.TabSession, UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void
     }
 
     /// UI-only callbacks. Never authoritative for run lifecycle decisions.

@@ -19,11 +19,26 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
         )
     }
 
+    func testAttachmentTurnDispositionCasesAreDistinctAndExhaustivelyHandled() {
+        let dispositions: [DomainAgentRunAttachmentTurnDisposition] = [
+            .restoreToPending,
+            .deleteFiles,
+            .keepFiles
+        ]
+
+        XCTAssertEqual(Set(dispositions).count, 3)
+        XCTAssertEqual(
+            dispositions.map(attachmentDispositionCaseName),
+            ["restoreToPending", "deleteFiles", "keepFiles"]
+        )
+    }
+
     func testExecutionContractTypesAreSendableValueTypes() {
         // Compile-time Sendable checks: these calls fail to compile if any
         // contract type loses Sendable conformance or value semantics.
         assertSendable(DomainAgentRunCancellationIntent.userStop)
         assertSendable(DomainAgentRunCancellationCompletion.terminalPublished)
+        assertSendable(DomainAgentRunAttachmentTurnDisposition.restoreToPending)
         assertSendable(DomainAgentRunTerminalOutcome.completed(assistantText: "done"))
     }
 
@@ -121,6 +136,16 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
 
     private func assertSendable(_ value: some Sendable & Equatable) {
         XCTAssertEqual(value, value)
+    }
+
+    private func attachmentDispositionCaseName(
+        _ disposition: DomainAgentRunAttachmentTurnDisposition
+    ) -> String {
+        switch disposition {
+        case .restoreToPending: "restoreToPending"
+        case .deleteFiles: "deleteFiles"
+        case .keepFiles: "keepFiles"
+        }
     }
 
     private func makeSnapshot(
