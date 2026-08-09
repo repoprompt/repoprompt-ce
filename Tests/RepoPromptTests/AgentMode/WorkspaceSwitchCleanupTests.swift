@@ -60,7 +60,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .openCode
         session.provider = provider
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -126,7 +126,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         )
         let session = viewModel.session(for: UUID())
         session.selectedAgent = .openCode
-        session.runID = oldRunID
+        session.installRunID(oldRunID)
         session.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -150,7 +150,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         )
         let oldSession = viewModel.session(for: tabID)
         oldSession.selectedAgent = .openCode
-        oldSession.runID = oldRunID
+        oldSession.installRunID(oldRunID)
         oldSession.mcpControlContext = makeMCPControlContext(sessionID: mcpSessionID)
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -175,14 +175,14 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         oldSession.selectedAgent = .openCode
         oldSession.provider = provider
         oldSession.providerSessionID = "old-provider-session"
-        oldSession.runID = oldRunID
+        oldSession.installRunID(oldRunID)
         oldSession.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
         let newSession = viewModel.session(for: tabID)
         newSession.selectedAgent = .openCode
         newSession.providerSessionID = "new-provider-session"
-        newSession.runID = newRunID
+        newSession.installRunID(newRunID)
         newSession.runState = .running
 
         try await provider.waitUntilDisposeIsSuspended(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)

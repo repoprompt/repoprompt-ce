@@ -202,7 +202,7 @@ final class AgentRunAttemptLifecycleTests: XCTestCase {
         XCTAssertNil(lifecycle.currentRunID)
 
         lifecycle.installRunID(firstRunID)
-        lifecycle.clearRunID()
+        lifecycle.forceClearRunID()
         XCTAssertNil(lifecycle.currentRunID)
     }
 
@@ -319,7 +319,7 @@ final class AgentRunAttemptLifecycleTests: XCTestCase {
     func testTabSessionBeginRunAttemptPreservesRunIDAndResetsDrainGeneration() {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let runID = UUID()
-        session.runID = runID
+        session.installRunID(runID)
 
         let first = session.beginRunAttempt(source: "test.forwarding")
         for _ in 0 ..< 3 {
@@ -339,7 +339,7 @@ final class AgentRunAttemptLifecycleTests: XCTestCase {
     func testTabSessionPersistentBindingTransitionInvalidatesSettledRevisionOnly() {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let runID = UUID()
-        session.runID = runID
+        session.installRunID(runID)
         let ownership = session.beginRunAttempt(source: "test.rebind")
         session.runLifecycle.stageTerminalRevision(makeRevision(ownership: ownership, expectedRunID: runID))
         session.runLifecycle.recordTerminalPublicationResult(.accepted(successorEpoch: nil))
@@ -359,9 +359,9 @@ final class AgentRunAttemptLifecycleTests: XCTestCase {
     func testTabSessionClearRunIDIfCurrentDoesNotClearSuccessorRun() {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let firstRunID = UUID()
-        session.runID = firstRunID
+        session.installRunID(firstRunID)
         let successorRunID = UUID()
-        session.runID = successorRunID
+        session.installRunID(successorRunID)
 
         XCTAssertFalse(session.clearRunID(ifCurrent: firstRunID))
         XCTAssertEqual(session.runID, successorRunID)

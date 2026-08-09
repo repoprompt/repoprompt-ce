@@ -4505,7 +4505,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             reason: "Codex queued follow-up was cancelled because the controller was replaced."
         )
         if !preserveRunID {
-            session.runID = nil
+            // Force reset: controller invalidation for reconnect is decided
+            // synchronously against the expected controller instance.
+            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         }
         if let controllerToShutdown {
             retireCodexController(
@@ -4833,9 +4835,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return existingRunID
                 }
             }
-            let freshRunID = UUID()
-            session.runID = freshRunID
-            return freshRunID
+            return AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         }()
 
         func prepareCodexController() async -> (any CodexSessionControlling)? {
@@ -8408,7 +8408,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     markCodexReconnectNeeded(for: session, source: "idle-timeout", scheduleSave: false)
                 }
                 logCodex("[AgentModeVM][CodexIdle] shutting down idle app-server for tab \(tabID) reason=\(reason)")
-                await shutdownCodexSession(session)
+                await shutdownCodexSession(session, reclaimOnlyIfStillIdle: true)
                 viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
                 viewModel?.scheduleSave(for: tabID)
             }
@@ -9233,7 +9233,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         cancelCodexThreadNameSync(for: session.tabID)
         cancelCodexTabScopedControllerTasks(for: session.tabID)
         clearCodexControllerRuntimeState(for: session)
-        session.runID = nil
+        // Force reset: user cancel is decided synchronously (expectedRunID was
+        // captured by the caller in the same main-actor region).
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         clearCodexNativeToolLiveness(session)
         settleCodexComputerUseActivationAfterTurn(session, reason: "user-cancel")
         if let controller {
@@ -9290,7 +9292,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ session: AgentModeViewModel.TabSession,
         clearTabScopedCoordinatorState: Bool = true,
         detachedRunID: UUID? = nil,
-        preserveNonCodexRunState: Bool = false
+        preserveNonCodexRunState: Bool = false,
+        reclaimOnlyIfStillIdle: Bool = false
     ) async {
         let shutdownRunID = clearTabScopedCoordinatorState ? session.runID : detachedRunID
         if clearTabScopedCoordinatorState {
@@ -9320,8 +9323,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         await awaitCodexControllerRetirement(for: session.tabID)
+        if reclaimOnlyIfStillIdle {
+            // Idle reclaim races live submission: a follow-up that started while
+            // the retirement drained owns the tab now, and it may have reused
+            // the prior run ID, so run-ID staleness cannot detect it. Skip the
+            // entire remaining tab-scoped tail unless the session is still idle.
+            guard session.activeRunOwnership == nil,
+                  !session.runState.isActive,
+                  session.codexController == nil
+            else {
+                logCodex("[AgentModeVM][CodexIdle] skipping idle reclaim tail for tab \(session.tabID); session is no longer idle")
+                return
+            }
+        }
         if !preserveNonCodexRunState {
-            session.runID = nil
+            if clearTabScopedCoordinatorState {
+                // Force semantics: tab/context-terminal callers require that no
+                // run identity survives, including a successor's.
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+            } else if let shutdownRunID {
+                // Detached background teardown owns only the run it was handed;
+                // a live successor's identity must survive.
+                session.clearRunID(ifCurrent: shutdownRunID)
+            }
         }
         if clearTabScopedCoordinatorState {
             await stopCodexToolTrackingAndWait(for: session)

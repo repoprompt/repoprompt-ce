@@ -414,6 +414,62 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(recorder.contains("claude:shutdown"))
     }
 
+    // MARK: - Shutdown run-identity scoping
+
+    func testShutdownClaudeSessionDetachedVariantScopesRunIdentityToDetachedRun() async {
+        let recorder = LifecycleRecorder()
+        let harness = makeHarness(recorder: recorder)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        let detachedRunID = UUID()
+        let successorRunID = UUID()
+        session.installRunID(successorRunID)
+        session.pendingSupersedingTurnCompletions = 3
+
+        await harness.host.claudeCoordinator.shutdownClaudeSession(
+            session,
+            clearTabScopedCoordinatorState: false,
+            detachedRunID: detachedRunID
+        )
+        XCTAssertEqual(
+            session.runID,
+            successorRunID,
+            "detached background teardown owns only the run it was handed"
+        )
+        XCTAssertEqual(
+            session.pendingSupersedingTurnCompletions,
+            3,
+            "a stale detached teardown must skip the successor's adjacent run state, not just its ID"
+        )
+
+        session.installRunID(detachedRunID)
+        await harness.host.claudeCoordinator.shutdownClaudeSession(
+            session,
+            clearTabScopedCoordinatorState: false,
+            detachedRunID: detachedRunID
+        )
+        XCTAssertNil(session.runID, "detached teardown clears its own run when still current")
+        XCTAssertEqual(
+            session.pendingSupersedingTurnCompletions,
+            0,
+            "an owning detached teardown performs the full session-state tail"
+        )
+    }
+
+    func testShutdownClaudeSessionForceClearsRunIdentityOnTabTerminalPath() async {
+        // Tab/context-terminal shutdown is a force reset by contract: any run
+        // present — including one installed after shutdown began — must not
+        // survive the transition. This pins the clobber as intent, not accident.
+        let recorder = LifecycleRecorder()
+        let harness = makeHarness(recorder: recorder)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.installRunID(UUID())
+
+        await harness.host.claudeCoordinator.shutdownClaudeSession(session)
+        XCTAssertNil(session.runID)
+    }
+
     private func resolvedClaudeLaunchPolicy(
         profile: AgentProviderPermissionProfile,
         harness: LifecycleHarness

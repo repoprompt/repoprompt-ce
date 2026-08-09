@@ -1025,7 +1025,9 @@ final class AgentModeRunService {
                     }
                 }
                 session.provider = nil
-                session.runID = nil
+                // Barrier-validated: the terminal-commit barrier re-checked
+                // expectedRunID synchronously before invoking this closure.
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 guard let provider, !hasAttemptTerminalResources else { return nil }
                 return { await provider.dispose() }
             }
