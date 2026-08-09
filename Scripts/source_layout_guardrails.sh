@@ -693,7 +693,7 @@ print_matches \
   grep -n -E 'loadContentsRecursively' Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift
 
 # Agent Mode terminal settlement stays free of the app's concrete TabSession
-# type. Other narrow nested vocabulary remains an explicit follow-up boundary.
+# type and uses provider-neutral domain terminal command vocabulary directly.
 terminal_session_neutral_files=(
   "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalSessionBinding.swift"
   "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift"
@@ -706,6 +706,9 @@ for path in "${terminal_session_neutral_files[@]}"; do
   print_matches \
       "TabSession-neutral terminal settlement source references AgentModeViewModel.TabSession: $path" \
     grep -n -F 'AgentModeViewModel.TabSession' "$path"
+  print_matches \
+      "domain-vocabulary terminal settlement source references app-nested terminal command type: $path" \
+    grep -n -E 'AgentModeViewModel\.AttachmentTurnDisposition|AgentModeRunService\.CancellationCompletion' "$path"
 done
 
 # 7. Removed IDE-era Prompt selected-files panel and Prompt-owned preset bottom bar

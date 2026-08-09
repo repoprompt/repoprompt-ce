@@ -6,11 +6,9 @@ import RepoPromptDomainRuntime
 /// This value carries no concrete `TabSession` and performs no lookup by
 /// `tabID`. The app host partially applies its exact session at the
 /// run/settlement edge, while the terminal barrier operates only on this
-/// capability surface and `AgentRunAttemptLifecycle`.
-///
-/// This slice is intentionally `TabSession`-neutral, not yet independent of all
-/// app-owned nested vocabulary: `AttachmentTurnDisposition` remains a narrow
-/// follow-up boundary rather than being hoisted in this PR.
+/// capability surface and `AgentRunAttemptLifecycle`. Attachment finalization
+/// is expressed in provider-neutral domain command vocabulary; the bound app
+/// hook remains the attachment persistence authority that applies it.
 @MainActor
 struct AgentRunTerminalSessionBinding {
     struct Hooks {
@@ -19,7 +17,7 @@ struct AgentRunTerminalSessionBinding {
         let finalizePendingToolCalls: @MainActor (AgentSessionRunState) -> Void
         let finalizeNonCodexTurnUsage: @MainActor () -> Void
         let cancelPendingInteractions: @MainActor (_ reviewReason: String) -> Void
-        let finalizeAttachments: @MainActor (UUID?, AgentModeViewModel.AttachmentTurnDisposition) -> Void
+        let finalizeAttachments: @MainActor (UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void
         let setAgentRunInactive: @MainActor () -> Void
         let prepareTerminalPublication: @MainActor () -> Void
         let makeTerminalPublicationEnvelope: @MainActor (

@@ -46,6 +46,22 @@ package enum DomainAgentRunCancellationCompletion: Equatable, Hashable {
     case terminalTeardownCompleted
 }
 
+/// What terminal settlement should do with attachment files reserved for a turn.
+///
+/// This is provider-neutral command vocabulary, not attachment lifecycle
+/// authority: the execution host applies the disposition through its attachment
+/// persistence boundary. It carries no files, session state, or presentation
+/// policy, and does not change the canonical run lifecycle authority owned by
+/// `DomainAgentRunSessionStore`.
+package enum DomainAgentRunAttachmentTurnDisposition: Equatable, Hashable, Sendable {
+    /// Return the turn's attachments to the host's pending attachment state.
+    case restoreToPending
+    /// Delete the turn's attachment files during finalization.
+    case deleteFiles
+    /// Preserve the turn's attachment files during finalization.
+    case keepFiles
+}
+
 /// Provider-neutral terminal result of one Agent run execution.
 ///
 /// Exactly one outcome may settle a run. Hosts map an outcome into their

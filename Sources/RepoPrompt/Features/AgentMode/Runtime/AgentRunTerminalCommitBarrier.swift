@@ -43,19 +43,19 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     struct Request {
-        // This request is concrete-TabSession-free. The remaining app-owned
-        // AttachmentTurnDisposition and CancellationCompletion vocabulary is a
-        // deliberately deferred contract-hoisting boundary for a later slice.
+        // This request is concrete-TabSession-free. Its domain command values
+        // carry no settlement authority; the exact-object binding applies them
+        // through host-owned capabilities.
         let binding: AgentRunTerminalSessionBinding
         let ownership: AgentRunOwnership
         let expectedRunID: UUID?
         let terminalState: AgentSessionRunState
         let source: String
-        let completion: AgentModeRunService.CancellationCompletion
+        let completion: DomainAgentRunCancellationCompletion
         let errorText: String?
         let failureReason: DomainAgentRunSnapshot.FailureReason?
         let attachmentReservationID: UUID?
-        let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition
+        let attachmentDisposition: DomainAgentRunAttachmentTurnDisposition
         let finalizeNonCodexUsage: Bool
         let supportsFollowUp: Bool
         let providerSuccessor: ProviderSuccessor?
@@ -71,11 +71,11 @@ final class AgentRunTerminalCommitBarrier {
             expectedRunID: UUID?,
             terminalState: AgentSessionRunState,
             source: String,
-            completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
+            completion: DomainAgentRunCancellationCompletion = .terminalPublished,
             errorText: String? = nil,
             failureReason: DomainAgentRunSnapshot.FailureReason? = nil,
             attachmentReservationID: UUID? = nil,
-            attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition,
+            attachmentDisposition: DomainAgentRunAttachmentTurnDisposition,
             finalizeNonCodexUsage: Bool,
             supportsFollowUp: Bool,
             providerSuccessor: ProviderSuccessor? = nil,
