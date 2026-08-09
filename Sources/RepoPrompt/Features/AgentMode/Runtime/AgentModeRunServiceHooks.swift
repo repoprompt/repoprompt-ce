@@ -14,9 +14,10 @@ import RepoPromptDomainRuntime
 // - Presentation, binding-observation, queued-work recovery, and persistence
 //   hooks are host projections. They must never become backend authority: a
 //   headless host may implement them as no-ops without changing run semantics.
-// - `AgentModeViewModel.TabSession` still appears in these signatures because
-//   the app host is the only adopter today. The grouping is the contract seam;
-//   neutralizing the session parameter is the provider-migration step (PR 3).
+// - `AgentModeViewModel.TabSession` remains at broader app-host orchestration
+//   hooks because the app is the only adopter today. Terminal settlement does
+//   not receive that type: `bindTerminalSession(_:)` partially applies the
+//   exact originating object into a `TabSession`-neutral capability value.
 
 extension AgentModeRunService {
     /// Token/usage accounting projection for non-Codex turns.
@@ -44,7 +45,7 @@ extension AgentModeRunService {
     ///
     /// Authority: presentation projection.
     struct RunPresentationHooks {
-        let setAgentRunActive: (UUID, Bool) -> Void
+        let setAgentRunActive: (AgentModeViewModel.TabSession, Bool) -> Void
         let requestUIRefresh: (UUID, Bool) -> Void
         let notifyAgentTurnComplete: (AgentModeViewModel.TabSession) -> Void
     }
@@ -73,7 +74,7 @@ extension AgentModeRunService {
     ///
     /// Authority: persistence projection.
     struct RunPersistenceHooks {
-        let scheduleSave: (UUID) -> Void
+        let scheduleSave: (AgentModeViewModel.TabSession) -> Void
     }
 
     /// Transcript projection of provider stream events and terminal finalization.
@@ -143,7 +144,7 @@ extension AgentModeRunService {
     ///
     /// Authority: lifecycle command issuance back into the host.
     struct RunContinuationHooks {
-        let startFollowUpRun: (UUID, String) -> Void
+        let startFollowUpRun: (AgentModeViewModel.TabSession, String) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
         let signalMCPInstructionDelivered: (_ session: AgentModeViewModel.TabSession) async -> Void
     }
@@ -161,5 +162,141 @@ extension AgentModeRunService {
         let interactions: RunInteractionHooks
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
+    }
+}
+
+// MARK: - Exact session partial application for terminal settlement
+
+extension AgentModeRunService.Hooks {
+    /// Binds the terminal settlement surface to the exact originating object.
+    ///
+    /// This is the app-host composition edge: the returned value retains that
+    /// object directly and never re-resolves it through the tab dictionary.
+    @MainActor
+    func bindTerminalSession(
+        _ session: AgentModeViewModel.TabSession
+    ) -> AgentRunTerminalSessionBinding {
+        let tabID = session.tabID
+        return AgentRunTerminalSessionBinding(
+            tabID: tabID,
+            lifecycle: session.runLifecycle,
+            hooks: .init(
+                flushPendingAssistantDelta: {
+                    transcript.flushPendingAssistantDelta(session)
+                },
+                finalizeStreamingItems: {
+                    transcript.finalizeStreamingItems(session)
+                },
+                finalizePendingToolCalls: { terminalState in
+                    transcript.finalizePendingToolCalls(session, terminalState)
+                },
+                finalizeNonCodexTurnUsage: {
+                    usage.finalizeNonCodexTurnUsage(session, nil, nil, nil)
+                },
+                cancelPendingInteractions: { reviewReason in
+                    interactions.cancelPendingQuestion(session)
+                    interactions.cancelPendingApproval(session)
+                    interactions.cancelPendingApplyEditsReview(session, reviewReason)
+                    interactions.cancelPendingWorktreeMergeReview(session, reviewReason)
+                },
+                finalizeAttachments: { reservationID, disposition in
+                    attachments.finalizeAttachmentsForTurn(session, reservationID, disposition)
+                },
+                setAgentRunInactive: {
+                    presentation.setAgentRunActive(session, false)
+                },
+                prepareTerminalPublication: {
+                    terminalSettlement.prepareTerminalPublication(session)
+                },
+                makeTerminalPublicationEnvelope: { ownership, terminalState, expectedRunID, failureReason in
+                    terminalSettlement.makeTerminalPublicationEnvelope(
+                        session,
+                        ownership,
+                        terminalState,
+                        expectedRunID,
+                        failureReason
+                    )
+                },
+                updateBindings: {
+                    bindingObservation.updateBindings(session)
+                },
+                notifyAgentTurnComplete: {
+                    presentation.notifyAgentTurnComplete(session)
+                },
+                scheduleSave: {
+                    persistence.scheduleSave(session)
+                },
+                publishTerminalCommit: { revision, successorKind in
+                    await terminalSettlement.publishTerminalCommit(
+                        session,
+                        revision,
+                        successorKind
+                    )
+                },
+                startFollowUpRun: { instruction in
+                    continuation.startFollowUpRun(session, instruction)
+                }
+            ),
+            validatesOwnership: { ownership, expectedRunID in
+                session.isCurrentRunAttemptForCurrentBinding(
+                    ownership,
+                    expectedRunID: expectedRunID
+                )
+            },
+            providerDrainGeneration: {
+                session.providerTerminalDrainGeneration
+            },
+            terminalTurnID: {
+                session.items.last(where: { $0.kind == .user })?.id
+            },
+            queuedFollowUp: {
+                session.pendingInstructions.first
+            },
+            setFollowUpPending: { pending in
+                session.mcpFollowUpRunPending = pending
+            },
+            removeFirstQueuedFollowUp: {
+                guard !session.pendingInstructions.isEmpty else { return nil }
+                return session.pendingInstructions.removeFirst()
+            },
+            appendError: { errorText in
+                session.appendItem(
+                    AgentChatItem.error(
+                        errorText,
+                        sequenceIndex: session.nextSequenceIndex
+                    )
+                )
+            },
+            finishActiveState: { ownership, terminalState, source in
+                session.agentTask = nil
+                session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+                session.setRunningStatus(nil, source: nil)
+                session.waitingPrompt = nil
+                session.runState = terminalState
+                _ = session.endRunAttempt(ifCurrent: ownership, source: source)
+            },
+            retainProcessRunIdentity: { runID, terminalTurnID in
+                AgentModeProcessRunIdentity.retainProcessRunID(
+                    runID,
+                    inTranscriptTurnID: terminalTurnID,
+                    for: session
+                )
+            },
+            sourceItemsRevision: {
+                session.sourceItemsRevision
+            },
+            assistantDeltaFlushGeneration: {
+                session.assistantDeltaFlushGeneration
+            },
+            latestFailureText: {
+                AgentTranscriptIO.latestErrorText(
+                    from: session.transcript,
+                    latestTurnOnly: true
+                ) ?? AgentTranscriptIO.latestErrorText(
+                    from: session.transcript,
+                    latestTurnOnly: false
+                )
+            }
+        )
     }
 }

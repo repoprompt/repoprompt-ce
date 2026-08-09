@@ -739,6 +739,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = runService
         }
 
+        func test_startFollowUpRun(
+            for session: TabSession,
+            initialMessage: String
+        ) async {
+            await startFollowUpRun(for: session, initialMessage: initialMessage)
+        }
+
         var test_isCursorModelPollingActive: Bool {
             cursorModelsSubscriptionTask != nil
         }
@@ -1198,9 +1205,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let session = session(for: tabID, createIfNeeded: false)
         if isActive {
             tabsWithActiveAgentRun.insert(tabID)
-            if session?.activeAgentRunStartedAt == nil {
-                session?.activeAgentRunStartedAt = Date()
-            }
+            applyAgentRunActivity(to: session, isActive: true)
             // A new/resumed run clears any stale "completed in background"
             // badge the user hasn't acknowledged yet. The run-state transition
             // observer also handles this on .running, but some provider paths
@@ -1209,8 +1214,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             acknowledgeSidebarRunAttention(tabID: tabID)
         } else {
             tabsWithActiveAgentRun.remove(tabID)
-            session?.activeAgentRunStartedAt = nil
-            session?.deferredActiveAgentRunTimerRollback = nil
+            applyAgentRunActivity(to: session, isActive: false)
             // Intentionally do NOT clear/mark attention here. Provider paths
             // sometimes call setAgentRunActive(false) before session.runState
             // has been mutated to its terminal/waiting value — detection must
@@ -1219,6 +1223,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         publishActiveAgentRunStartedAt(for: tabID, session: session)
         syncComposerUIState()
+    }
+
+    /// Applies run-activity projection only to the exact supplied session.
+    /// A recycled tab identifier must not let a predecessor update its successor.
+    func setAgentRunActive(_ session: TabSession, isActive: Bool) {
+        let tabID = session.tabID
+        guard sessions[tabID] === session else {
+            applyAgentRunActivity(to: session, isActive: isActive)
+            return
+        }
+        setAgentRunActive(tabID, isActive: isActive)
+    }
+
+    private func applyAgentRunActivity(to session: TabSession?, isActive: Bool) {
+        if isActive {
+            if session?.activeAgentRunStartedAt == nil {
+                session?.activeAgentRunStartedAt = Date()
+            }
+        } else {
+            session?.activeAgentRunStartedAt = nil
+            session?.deferredActiveAgentRunTimerRollback = nil
+        }
     }
 
     private func publishActiveAgentRunStartedAt(for tabID: UUID, session: TabSession?) {
@@ -2216,8 +2242,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             presentation: .init(
-                setAgentRunActive: { [weak self] tabID, isActive in
-                    self?.setAgentRunActive(tabID, isActive: isActive)
+                setAgentRunActive: { [weak self] session, isActive in
+                    self?.setAgentRunActive(session, isActive: isActive)
                 },
                 requestUIRefresh: { [weak self] tabID, urgent in
                     self?.requestUIRefresh(tabID: tabID, urgent: urgent)
@@ -2239,8 +2265,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             persistence: .init(
-                scheduleSave: { [weak self] tabID in
-                    self?.scheduleSave(for: tabID)
+                scheduleSave: { [weak self] session in
+                    self?.scheduleSave(for: session)
                 }
             ),
             transcript: .init(
@@ -2350,9 +2376,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             continuation: .init(
-                startFollowUpRun: { [weak self] tabID, initialMessage in
-                    Task { [weak self] in
-                        await self?.startAgentRun(tabID: tabID, initialMessage: initialMessage)
+                startFollowUpRun: { [weak self] session, initialMessage in
+                    Task { @MainActor [weak self, weak session] in
+                        guard let self, let session else { return }
+                        await startFollowUpRun(for: session, initialMessage: initialMessage)
                     }
                 },
                 signalMCPInstructionDelivered: { [weak self] session in
@@ -2368,6 +2395,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             hooks: hooks,
             toolTrackingHooks: toolTrackingHooks
         )
+    }
+
+    private func startFollowUpRun(
+        for session: TabSession,
+        initialMessage: String
+    ) async {
+        guard sessions[session.tabID] === session else {
+            session.mcpFollowUpRunPending = false
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.followUp.dropped.staleSession", tabID: session.tabID)
+                AgentModePerfDiagnostics.event(
+                    "run.followUp.dropped",
+                    tabID: session.tabID,
+                    fields: ["reason": "staleSession"]
+                )
+            #endif
+            handleObservedMCPStateChange(for: session)
+            return
+        }
+        await startAgentRun(tabID: session.tabID, initialMessage: initialMessage)
     }
 
     /// Build the generic orchestration hooks that provider tool tracking handlers need.
@@ -11923,6 +11970,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard !Task.isCancelled else { return }
             await self?.saveSession(for: tabID)
         }
+    }
+
+    /// Schedules persistence only while the supplied object is still the live
+    /// owner of its tab identifier. Stale predecessors must not save successors.
+    func scheduleSave(for session: TabSession) {
+        guard sessions[session.tabID] === session else { return }
+        scheduleSave(for: session.tabID)
     }
 
     func scheduleSaveForCommandOutput(tabID: UUID, minInterval: TimeInterval = 5.0) {

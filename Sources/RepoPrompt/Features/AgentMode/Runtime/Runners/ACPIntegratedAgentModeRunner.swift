@@ -107,7 +107,7 @@ final class ACPIntegratedAgentModeRunner {
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
-        hooks.presentation.setAgentRunActive(tabID, true)
+        hooks.presentation.setAgentRunActive(session, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
         let freshRunRequest = runRequest
@@ -399,7 +399,7 @@ final class ACPIntegratedAgentModeRunner {
         else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .failed,
@@ -430,7 +430,7 @@ final class ACPIntegratedAgentModeRunner {
         else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -506,7 +506,7 @@ final class ACPIntegratedAgentModeRunner {
             )
             _ = syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session)
             session.isDirty = true
-            hooks.persistence.scheduleSave(session.tabID)
+            hooks.persistence.scheduleSave(session)
             hooks.bindingObservation.updateBindings(session)
 
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
@@ -804,7 +804,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard changed else { return }
         session.isDirty = true
-        hooks.persistence.scheduleSave(session.tabID)
+        hooks.persistence.scheduleSave(session)
         hooks.bindingObservation.updateBindings(session)
     }
 
@@ -924,7 +924,7 @@ final class ACPIntegratedAgentModeRunner {
         else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -965,7 +965,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         let supportsSessionResume = terminalState == .completed && controller != nil
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: terminalState,

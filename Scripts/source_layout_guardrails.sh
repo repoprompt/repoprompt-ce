@@ -692,6 +692,22 @@ print_matches \
   "WorkspaceFilesViewModel references removed recursive eager loading seam" \
   grep -n -E 'loadContentsRecursively' Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift
 
+# Agent Mode terminal settlement stays free of the app's concrete TabSession
+# type. Other narrow nested vocabulary remains an explicit follow-up boundary.
+terminal_session_neutral_files=(
+  "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalSessionBinding.swift"
+  "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift"
+)
+for path in "${terminal_session_neutral_files[@]}"; do
+  if [[ ! -f "$path" ]]; then
+      fail "required TabSession-neutral terminal settlement source missing: $path"
+    continue
+  fi
+  print_matches \
+      "TabSession-neutral terminal settlement source references AgentModeViewModel.TabSession: $path" \
+    grep -n -F 'AgentModeViewModel.TabSession' "$path"
+done
+
 # 7. Removed IDE-era Prompt selected-files panel and Prompt-owned preset bottom bar
 # artifacts must not return. The live compact selected-files surface is
 # SelectedFilesGrid/FilePreviewPopover, and Settings owns its chat preset picker.

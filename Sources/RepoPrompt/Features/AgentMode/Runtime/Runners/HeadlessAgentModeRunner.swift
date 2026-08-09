@@ -46,12 +46,12 @@ final class HeadlessAgentModeRunner {
         session.runningStatusText = nil
         session.runningStatusSource = nil
         session.runState = .running
-        hooks.presentation.setAgentRunActive(tabID, true)
+        hooks.presentation.setAgentRunActive(session, true)
         hooks.bindingObservation.updateBindings(session)
 
         guard session.selectedAgent != .codexExec else {
             await terminalCommitBarrier.commit(.init(
-                session: session,
+                binding: hooks.bindTerminalSession(session),
                 ownership: ownership,
                 expectedRunID: runID,
                 terminalState: .failed,
@@ -137,7 +137,7 @@ final class HeadlessAgentModeRunner {
     ) async {
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -194,7 +194,7 @@ final class HeadlessAgentModeRunner {
             }
 
             await terminalCommitBarrier.commit(.init(
-                session: session,
+                binding: hooks.bindTerminalSession(session),
                 ownership: ownership,
                 expectedRunID: runID,
                 terminalState: .completed,
@@ -216,7 +216,7 @@ final class HeadlessAgentModeRunner {
             }
             hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
             await terminalCommitBarrier.commit(.init(
-                session: session,
+                binding: hooks.bindTerminalSession(session),
                 ownership: ownership,
                 expectedRunID: runID,
                 terminalState: .cancelled,
@@ -238,7 +238,7 @@ final class HeadlessAgentModeRunner {
             }
             hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
             await terminalCommitBarrier.commit(.init(
-                session: session,
+                binding: hooks.bindTerminalSession(session),
                 ownership: ownership,
                 expectedRunID: runID,
                 terminalState: .failed,
