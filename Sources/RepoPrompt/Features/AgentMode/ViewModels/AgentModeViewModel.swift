@@ -1221,6 +1221,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         syncComposerUIState()
     }
 
+    /// Applies run-activity projection only to the exact supplied session.
+    /// A recycled tab identifier must not let a predecessor update its successor.
+    func setAgentRunActive(_ session: TabSession, isActive: Bool) {
+        let tabID = session.tabID
+        guard sessions[tabID] === session else {
+            if isActive {
+                if session.activeAgentRunStartedAt == nil {
+                    session.activeAgentRunStartedAt = Date()
+                }
+            } else {
+                session.activeAgentRunStartedAt = nil
+                session.deferredActiveAgentRunTimerRollback = nil
+            }
+            return
+        }
+        setAgentRunActive(tabID, isActive: isActive)
+    }
+
     private func publishActiveAgentRunStartedAt(for tabID: UUID, session: TabSession?) {
         let nextStartedAt = session?.activeAgentRunStartedAt
         if tabID == currentTabID, activeAgentRunStartedAt != nextStartedAt {
@@ -2216,8 +2234,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             presentation: .init(
-                setAgentRunActive: { [weak self] tabID, isActive in
-                    self?.setAgentRunActive(tabID, isActive: isActive)
+                setAgentRunActive: { [weak self] session, isActive in
+                    self?.setAgentRunActive(session, isActive: isActive)
                 },
                 requestUIRefresh: { [weak self] tabID, urgent in
                     self?.requestUIRefresh(tabID: tabID, urgent: urgent)
@@ -2239,8 +2257,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             persistence: .init(
-                scheduleSave: { [weak self] tabID in
-                    self?.scheduleSave(for: tabID)
+                scheduleSave: { [weak self] session in
+                    self?.scheduleSave(for: session)
                 }
             ),
             transcript: .init(
@@ -2350,9 +2368,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             continuation: .init(
-                startFollowUpRun: { [weak self] tabID, initialMessage in
-                    Task { [weak self] in
-                        await self?.startAgentRun(tabID: tabID, initialMessage: initialMessage)
+                startFollowUpRun: { [weak self] session, initialMessage in
+                    Task { @MainActor [weak self, weak session] in
+                        guard let self, let session else { return }
+                        guard sessions[session.tabID] === session else {
+                            session.mcpFollowUpRunPending = false
+                            handleObservedMCPStateChange(for: session)
+                            return
+                        }
+                        await startAgentRun(tabID: session.tabID, initialMessage: initialMessage)
                     }
                 },
                 signalMCPInstructionDelivered: { [weak self] session in
@@ -11923,6 +11947,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard !Task.isCancelled else { return }
             await self?.saveSession(for: tabID)
         }
+    }
+
+    /// Schedules persistence only while the supplied object is still the live
+    /// owner of its tab identifier. Stale predecessors must not save successors.
+    func scheduleSave(for session: TabSession) {
+        guard sessions[session.tabID] === session else { return }
+        scheduleSave(for: session.tabID)
     }
 
     func scheduleSaveForCommandOutput(tabID: UUID, minInterval: TimeInterval = 5.0) {

@@ -249,6 +249,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private weak var viewModel: AgentModeViewModel?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
+    private var terminalSessionBinder: (@MainActor (AgentModeViewModel.TabSession) -> AgentRunTerminalSessionBinding)?
     #if DEBUG
         private var testWorkspaceResolutionFailurePublicationGate: (@Sendable () async -> Void)?
     #endif
@@ -421,8 +422,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.viewModel = viewModel
     }
 
-    func installTerminalCommitBarrier(_ barrier: AgentRunTerminalCommitBarrier) {
+    func installTerminalCommitBarrier(
+        _ barrier: AgentRunTerminalCommitBarrier,
+        terminalSessionBinder: @escaping @MainActor (AgentModeViewModel.TabSession) -> AgentRunTerminalSessionBinding
+    ) {
         terminalCommitBarrier = barrier
+        self.terminalSessionBinder = terminalSessionBinder
     }
 
     func setActiveAgentRunWaitDrain(_ drain: @escaping ActiveAgentRunWaitDrain) {
@@ -6557,7 +6562,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor? = nil
     ) async {
         guard let ownership = session.activeRunOwnership,
-              let terminalCommitBarrier
+              let terminalCommitBarrier,
+              let terminalSessionBinder
         else {
             return
         }
@@ -6601,7 +6607,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             .deleteFiles
         }
         let request = AgentRunTerminalCommitBarrier.Request(
-            session: session,
+            binding: terminalSessionBinder(session),
             ownership: ownership,
             expectedRunID: expectedRunID,
             terminalState: terminalState,
