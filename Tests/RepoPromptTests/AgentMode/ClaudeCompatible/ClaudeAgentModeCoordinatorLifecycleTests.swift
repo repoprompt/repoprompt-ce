@@ -437,6 +437,7 @@ extension AgentModeRunServiceLifecycleTests {
             text: "fail deterministically",
             attachments: []
         )
+        withExtendedLifetime(providerBindingService) {}
 
         XCTAssertFalse(didSend)
         XCTAssertEqual(session.runState, .failed)
