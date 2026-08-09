@@ -1283,7 +1283,7 @@ public class APISettingsViewModel: ObservableObject {
     private func probeCachedCodexConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
         let publicationToken = codexSessionFence.capturePublicationToken()
-        let refreshResult = await codexManagedAuthRecovery.refreshManagedAccount()
+        let refreshResult = await codexManagedAuthRecovery.checkManagedAccount()
         guard codexSessionFence.allowsAuthenticationPublication(publicationToken) else { return false }
         switch refreshResult {
         case let .recovered(account):
