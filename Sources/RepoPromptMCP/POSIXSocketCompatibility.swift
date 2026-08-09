@@ -14,6 +14,15 @@ func rpMakeUnixStreamSocket() -> Int32 {
 #endif
 }
 
+@inline(__always)
+func rpConnect(_ fd: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Int32 {
+#if canImport(Darwin)
+    Darwin.connect(fd, address, length)
+#else
+    Glibc.connect(fd, address, length)
+#endif
+}
+
 @discardableResult
 @inline(__always)
 func rpConfigureNoSIGPIPE(_ fd: Int32) -> Int32 {
@@ -71,10 +80,10 @@ func rpExecutablePath(processID: Int32) -> String? {
     guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
     return String(cString: buffer)
 #else
-    var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-    let count = readlink("/proc/\(processID)/exe", &buffer, buffer.count - 1)
+    var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+    let count = readlink("/proc/\(processID)/exe", &buffer, buffer.count)
     guard count > 0 else { return nil }
-    buffer[Int(count)] = 0
-    return String(cString: buffer)
+    let bytes = buffer.prefix(Int(count)).map { UInt8(bitPattern: $0) }
+    return String(decoding: bytes, as: UTF8.self)
 #endif
 }
