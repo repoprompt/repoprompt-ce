@@ -225,16 +225,44 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             authorizedCanonicalRoots: Set(processSnapshot.roots.map(\.path)),
             hasAuthoritativeRoutingContext: true,
             ephemeralGrantedToolNames: [],
-            ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations
+            ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations.union([
+                "agent_run.ai_cost",
+                "agent_run.external_process"
+            ])
         )
-        let request = try DomainPhysicalToolRequest(
-            argumentsJSON: JSONEncoder().encode(["op": Value.string("start")]),
-            securityContext: security
+        let agentRunResolution = try await prepared.runtime.domainHost.resolve(
+            toolName: "agent_run",
+            scope: .standalone(id: prepared.scopeID)
         )
-        let result = try await prepared.providerCoordinator.startAgent(
-            args: [
+        func invokeAgentRun(
+            _ arguments: [String: Value],
+            securityContext: DomainToolInvocationSecurityContext
+        ) async throws -> Value {
+            let invocationContext = DomainToolInvocationSecurityContext(
+                principal: securityContext.principal,
+                connectionID: securityContext.connectionID,
+                connectionGeneration: securityContext.connectionGeneration,
+                invocationID: UUID(),
+                runtimeID: securityContext.runtimeID,
+                runtimeGeneration: securityContext.runtimeGeneration,
+                workspaceID: securityContext.workspaceID,
+                workspaceRevision: securityContext.workspaceRevision,
+                authorizedCanonicalRoots: securityContext.authorizedCanonicalRoots,
+                hasAuthoritativeRoutingContext: securityContext.hasAuthoritativeRoutingContext,
+                ephemeralGrantedToolNames: securityContext.ephemeralGrantedToolNames,
+                ephemeralGrantedOperations: securityContext.ephemeralGrantedOperations
+            )
+            return try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
+                invocationID: invocationContext.invocationID,
+                connectionID: prepared.connectionID,
+                resolution: agentRunResolution,
+                arguments: arguments,
+                securityContext: invocationContext
+            ))
+        }
+        let result = try await invokeAgentRun(
+            [
                 "message": .string("Report the working directory."),
-                "workflow_name": .string("orchestrate"),
                 "worktree": .string("@branch:route-alternate"),
                 "worktree_label": .string("Alternate route"),
                 "worktree_color": .string("#3366ff"),
@@ -242,7 +270,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 "detach": .bool(true),
                 "timeout": .int(10)
             ],
-            request: request
+            securityContext: security
         )
         let resultObject = try XCTUnwrap(result.objectValue)
         XCTAssertEqual(resultObject["status"]?.stringValue, "running")
@@ -293,6 +321,21 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             invocationID: UUID()
         )
         XCTAssertEqual(runSecurity.authorizedCanonicalRoots, [fixture.alternateWorktree.path])
+        let conversationRequest = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(["message": Value.string("Report the working directory.")]),
+            securityContext: runSecurity
+        )
+        let (_, conversationText) = try await prepared.providerCoordinator.createConversation(
+            providerID: nil,
+            message: "Report the working directory.",
+            model: nil,
+            request: conversationRequest
+        )
+        XCTAssertEqual(
+            URL(fileURLWithPath: conversationText)
+                .standardizedFileURL.resolvingSymlinksInPath().path,
+            fixture.alternateWorktree.path
+        )
         XCTAssertThrowsError(
             try DirectHeadlessDomainContext.resolvePath(
                 fixture.canonicalRepo.appendingPathComponent("fixture.txt").path,
@@ -303,20 +346,41 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         XCTAssertTrue(persistedBindings.isEmpty)
         XCTAssertEqual(processSnapshot.workspace.document.documentBytes, fixture.savedWorkspaceBytes)
 
-        let childRequest = try DomainPhysicalToolRequest(
-            argumentsJSON: JSONEncoder().encode(["op": Value.string("start")]),
-            securityContext: runSecurity
+        let secondTopLevelStart = try await invokeAgentRun(
+            [
+                "message": .string("Report the second top-level working directory."),
+                "detach": .bool(true)
+            ],
+            securityContext: security
         )
-        let childStart = try await prepared.providerCoordinator.startAgent(
-            args: [
+        let secondTopLevelID = try XCTUnwrap(try UUID(
+            uuidString: XCTUnwrap(secondTopLevelStart.objectValue?["session_id"]?.stringValue)
+        ))
+        XCTAssertNotEqual(secondTopLevelID, sessionID)
+        XCTAssertNotEqual(secondTopLevelID, prepared.scopeID.rawValue)
+        let secondTopLevelTerminal = await prepared.providerCoordinator.waitAgent(
+            sessionID: secondTopLevelID,
+            timeout: 10
+        )
+        XCTAssertEqual(secondTopLevelTerminal.status, .completed)
+        XCTAssertEqual(
+            try URL(fileURLWithPath: XCTUnwrap(secondTopLevelTerminal.latestAssistantPreview))
+                .standardizedFileURL.resolvingSymlinksInPath().path,
+            fixture.launchWorktree.path
+        )
+
+        let childStart = try await invokeAgentRun(
+            [
                 "message": .string("Report the inherited working directory."),
                 "detach": .bool(true)
             ],
-            request: childRequest
+            securityContext: runSecurity
         )
         let childID = try XCTUnwrap(try UUID(
             uuidString: XCTUnwrap(childStart.objectValue?["session_id"]?.stringValue)
         ))
+        XCTAssertNotEqual(childID, sessionID)
+        XCTAssertNotEqual(childID, secondTopLevelID)
         let childTerminal = await prepared.providerCoordinator.waitAgent(sessionID: childID, timeout: 10)
         XCTAssertEqual(childTerminal.status, .completed)
         XCTAssertEqual(childTerminal.parentSessionID, sessionID)
@@ -360,13 +424,13 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             sessionID.uuidString
         )
 
-        let optedOutStart = try await prepared.providerCoordinator.startAgent(
-            args: [
+        let optedOutStart = try await invokeAgentRun(
+            [
                 "message": .string("Report the process working directory."),
                 "inherit_worktree": .bool(false),
                 "detach": .bool(true)
             ],
-            request: childRequest
+            securityContext: runSecurity
         )
         let optedOutID = try XCTUnwrap(try UUID(
             uuidString: XCTUnwrap(optedOutStart.objectValue?["session_id"]?.stringValue)
@@ -396,6 +460,58 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             arguments: ["-C", fixture.canonicalRepo.path, "worktree", "list", "--porcelain"]
         )
         XCTAssertEqual(finalWorktreeInventory, fixture.worktreeInventory)
+    }
+
+    func testSelectedWorktreeMetadataIsBoundedAndIdentityRevalidatedBeforeLaterUse() async throws {
+        let fixture = try await makeSavedWorkspaceWorktreeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-revalidation-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": fixture.profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": fixture.launchWorktree.path,
+                "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: fixture.launchWorktree
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let sessionID = UUID()
+        _ = try await prepared.context.prepareSessionRootMappings(
+            sessionID: sessionID,
+            sourceSessionID: nil,
+            arguments: [
+                "worktree": .string("@branch:route-alternate"),
+                "inherit_worktree": .bool(false)
+            ],
+            connectionID: prepared.connectionID
+        )
+
+        let gitFile = fixture.alternateWorktree.appendingPathComponent(".git")
+        let originalGitFile = try Data(contentsOf: gitFile)
+        defer { try? originalGitFile.write(to: gitFile) }
+        var oversizedGitFile = originalGitFile
+        oversizedGitFile.append(Data(repeating: 0x20, count: max(0, 4097 - oversizedGitFile.count)))
+        try oversizedGitFile.write(to: gitFile)
+
+        let worktreesAfterReplacement = try await DirectHeadlessWorktreeRouting.listWorktrees(
+            repositoryRoot: fixture.canonicalRepo
+        )
+        XCTAssertFalse(worktreesAfterReplacement.contains { $0.path.path == fixture.alternateWorktree.path })
+
+        do {
+            _ = try await prepared.context.snapshot(
+                connectionID: prepared.connectionID,
+                sessionID: sessionID
+            )
+            XCTFail("Expected replaced worktree identity to fail closed")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("selected worktree identity could not be verified"),
+                String(describing: error)
+            )
+        }
     }
 
     func testCloseTabAllowActivePreservesUnrelatedBindingForSameConnection() async throws {

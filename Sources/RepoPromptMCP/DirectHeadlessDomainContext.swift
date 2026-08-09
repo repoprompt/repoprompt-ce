@@ -124,6 +124,7 @@ actor DirectHeadlessDomainContext {
                 return match
             }
         }
+        try await DirectHeadlessWorktreeRouting.verifyMappingsAtUse(rootMappings)
         let roots = try rootMappings.map { mapping -> URL in
             let physical = mapping.physicalRoot.standardizedFileURL.resolvingSymlinksInPath()
             var isDirectory: ObjCBool = false

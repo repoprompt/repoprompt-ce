@@ -273,7 +273,7 @@ actor DirectHeadlessChildLaunchCoordinator {
         let provider = arguments["provider"]?.stringValue
             ?? arguments["model_id"]?.stringValue
             ?? "headless"
-        let runID = arguments["run_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let runID = UUID()
         let request = DomainRunLaunchReservationRequest(
             runID: runID,
             context: handle.context,

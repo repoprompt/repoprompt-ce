@@ -96,7 +96,11 @@ actor DirectHeadlessProviderCoordinator {
         guard let connectionID = request.securityContext?.connectionID else {
             throw DirectHeadlessDomainContext.Error.routingUnavailable
         }
-        let snapshot = try await context.snapshot(connectionID: connectionID, sessionID: sessionID)
+        let effectiveSessionID = sessionID ?? request.securityContext?.principal.runID
+        let snapshot = try await context.snapshot(
+            connectionID: connectionID,
+            sessionID: effectiveSessionID
+        )
         let arguments = Self.codexExecArguments(model: model)
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)

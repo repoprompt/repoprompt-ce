@@ -236,6 +236,18 @@ enum DirectHeadlessWorktreeRouting {
         )
     }
 
+    static func verifyMappingsAtUse(_ mappings: [DirectHeadlessRootMapping]) async throws {
+        for mapping in mappings {
+            guard let worktree = mapping.worktree else { continue }
+            guard canonicalPath(mapping.physicalRoot).path == worktree.path.path else {
+                throw MCPError.invalidRequest(
+                    "selected worktree path identity changed: \(mapping.physicalRoot.path)"
+                )
+            }
+            try await verifyWorktree(worktree)
+        }
+    }
+
     private static func exactMappings(
         canonicalRoots: [URL],
         physicalRoots: [URL],
@@ -400,15 +412,30 @@ enum DirectHeadlessWorktreeRouting {
     }
 
     private static func verifyWorktree(_ worktree: DirectHeadlessGitWorktree) async throws {
-        let topLevel = try await gitURL(root: worktree.path, arguments: ["rev-parse", "--show-toplevel"])
-        let gitDirectory = try await gitURL(
-            root: worktree.path,
-            arguments: ["rev-parse", "--path-format=absolute", "--git-dir"]
-        )
-        let commonDirectory = try await gitURL(
-            root: worktree.path,
-            arguments: ["rev-parse", "--path-format=absolute", "--git-common-dir"]
-        )
+        let output: String
+        do {
+            output = try await DirectProcess.run(
+                "/usr/bin/git",
+                arguments: [
+                    "-C", worktree.path.path,
+                    "rev-parse", "--path-format=absolute",
+                    "--show-toplevel", "--git-dir", "--git-common-dir"
+                ]
+            )
+        } catch {
+            throw MCPError.invalidRequest(
+                "selected worktree identity could not be verified: \(worktree.path.path)"
+            )
+        }
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        guard lines.count == 3 else {
+            throw MCPError.invalidRequest(
+                "selected worktree identity could not be verified: \(worktree.path.path)"
+            )
+        }
+        let topLevel = canonicalPath(URL(fileURLWithPath: lines[0], isDirectory: true))
+        let gitDirectory = canonicalPath(URL(fileURLWithPath: lines[1], isDirectory: true))
+        let commonDirectory = canonicalPath(URL(fileURLWithPath: lines[2], isDirectory: true))
         let isMain = gitDirectory.path == commonDirectory.path
         let stableComponent = isMain ? "main" : gitDirectory.path
         guard topLevel.path == worktree.path.path,
