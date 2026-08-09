@@ -21,6 +21,15 @@ enum StoredSelectionPathNormalization {
         return result
     }
 
+    static func orderedSlicePaths(_ slices: [String: [LineRange]]) -> [String] {
+        slices.keys.sorted {
+            let lhs = standardizedPath($0) ?? $0
+            let rhs = standardizedPath($1) ?? $1
+            if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
+            return $0.utf8.lexicographicallyPrecedes($1.utf8)
+        }
+    }
+
     static func standardizedSlices(_ slices: [String: [LineRange]]) -> [String: [LineRange]] {
         guard !slices.isEmpty else { return [:] }
 

@@ -140,6 +140,67 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testResolutionAndAccountingPreserveExplicitSliceRegardlessOfContainingFolderOrder() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingFolderSlicePrecedence")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        let otherURL = root.appendingPathComponent("Other.swift")
+        let targetContent = "skip\nselected line\nskip\n"
+        let otherContent = "let other = true\n"
+        try write(targetContent, to: targetURL)
+        try write(otherContent, to: otherURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let service = PromptContextAccountingService()
+        let sliceRange = LineRange(start: 2, end: 2)
+
+        func resolve(selectedPaths: [String]) async -> PromptContextEntryResolution {
+            await service.resolveEntries(
+                selection: StoredSelection(
+                    selectedPaths: selectedPaths,
+                    slices: [targetURL.path: [sliceRange]],
+                    codemapAutoEnabled: false
+                ),
+                store: store,
+                codeMapUsage: .none
+            )
+        }
+
+        let directFirst = await resolve(selectedPaths: [targetURL.path, root.path])
+        let folderFirst = await resolve(selectedPaths: [root.path, targetURL.path])
+
+        XCTAssertEqual(folderFirst.missingPaths, [])
+        XCTAssertEqual(folderFirst.invalidPaths, [])
+        XCTAssertEqual(folderFirst.entries.count, 2)
+        let directEntriesByID = Dictionary(uniqueKeysWithValues: directFirst.entries.map { ($0.file.id, $0) })
+        let folderEntriesByID = Dictionary(uniqueKeysWithValues: folderFirst.entries.map { ($0.file.id, $0) })
+        XCTAssertEqual(folderEntriesByID, directEntriesByID)
+        let targetEntry = try XCTUnwrap(folderFirst.entries.first {
+            $0.file.standardizedFullPath == targetURL.standardizedFileURL.path
+        })
+        XCTAssertEqual(targetEntry.mode, .sliced)
+        XCTAssertEqual(targetEntry.lineRanges, [sliceRange])
+
+        let directSnapshot = await service.calculateEntryMetricsSnapshot(
+            entries: directFirst.entries,
+            store: store,
+            codemapPresentation: .empty,
+            filePathDisplay: .relative
+        )
+        let folderSnapshot = await service.calculateEntryMetricsSnapshot(
+            entries: folderFirst.entries,
+            store: store,
+            codemapPresentation: .empty,
+            filePathDisplay: .relative
+        )
+        XCTAssertEqual(folderSnapshot, directSnapshot)
+
+        let renderedSlice = SliceAssemblyBuilder.build(from: targetContent, ranges: [sliceRange]).combinedText
+        let expectedTotal = TokenCalculationService.estimateTokens(for: renderedSlice)
+            + TokenCalculationService.estimateTokens(for: otherContent)
+        XCTAssertEqual(folderSnapshot.totalSelectedDisplayTokens, expectedTotal)
+    }
+
     func testEntryMetricsAccountingKeepsFirstSliceForDuplicatePhysicalFile() async throws {
         let root = try makeTemporaryRoot(name: "AccountingPhysicalIdentitySliceFirst")
         let targetURL = root.appendingPathComponent("Target.swift")
@@ -582,6 +643,7 @@ final class PromptContextAccountingServiceTests: XCTestCase {
             metrics: [first, duplicateID, duplicatePath]
         )
 
+        XCTAssertEqual(snapshot.totalSelectedDisplayTokens, 10)
         XCTAssertEqual(snapshot.metricsByFileID, [firstID: first])
         XCTAssertEqual(snapshot.metricsByStandardizedFullPath, [firstPath: first])
         XCTAssertNil(snapshot.metric(forFileID: otherID))

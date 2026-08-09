@@ -1683,8 +1683,8 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertTrue(model.rows.allSatisfy { !$0.canRemove })
     }
 
-    func testRowsAndMetricsUseOnePhysicalIdentityForDirectSliceAndContainingFolder() async throws {
-        let root = try makeTemporaryRoot(name: "AgentExportPhysicalIdentity")
+    func testRowsAndMetricsPreserveExplicitSliceRegardlessOfContainingFolderOrder() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportAccountingIdentity")
         let sources = root.appendingPathComponent("Sources")
         let targetURL = sources.appendingPathComponent("Target.swift")
         let otherURL = sources.appendingPathComponent("Other.swift")
@@ -1696,40 +1696,47 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)
         let sliceRange = LineRange(start: 2, end: 2)
-        let source = AgentContextExportSource(
-            tabID: UUID(),
-            promptText: "Review physical identity",
-            selection: StoredSelection(
-                selectedPaths: [targetURL.path, sources.path],
-                slices: [targetURL.path: [sliceRange]],
-                codemapAutoEnabled: false
-            ),
-            selectedMetaPromptIDs: [],
-            tabName: "Physical Identity",
-            activeAgentSessionID: nil,
-            worktreeBindings: []
-        )
 
-        let model = try await AgentContextExportResolver.resolveModel(
-            source: source,
-            store: store,
-            filePathDisplay: .relative,
-            codeMapUsage: .none
-        )
+        func resolve(selectedPaths: [String]) async throws -> AgentContextExportModel {
+            try await AgentContextExportResolver.resolveModel(
+                source: AgentContextExportSource(
+                    tabID: UUID(),
+                    promptText: "Review accounting identity",
+                    selection: StoredSelection(
+                        selectedPaths: selectedPaths,
+                        slices: [targetURL.path: [sliceRange]],
+                        codemapAutoEnabled: false
+                    ),
+                    selectedMetaPromptIDs: [],
+                    tabName: "Accounting Identity",
+                    activeAgentSessionID: nil,
+                    worktreeBindings: []
+                ),
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .none
+            )
+        }
 
-        XCTAssertEqual(model.rows.count, 2)
-        XCTAssertEqual(Set(model.rows.map(\.id.fileID)).count, 2)
-        XCTAssertEqual(Set(model.rows.map(\.physicalPath)).count, 2)
-        let targetRow = try XCTUnwrap(model.rows.first {
+        let directFirst = try await resolve(selectedPaths: [targetURL.path, sources.path])
+        let folderFirst = try await resolve(selectedPaths: [sources.path, targetURL.path])
+
+        XCTAssertEqual(folderFirst.rows, directFirst.rows)
+        XCTAssertEqual(folderFirst.totalSelectedDisplayTokens, directFirst.totalSelectedDisplayTokens)
+        XCTAssertEqual(folderFirst.rows.count, 2)
+        XCTAssertEqual(Set(folderFirst.rows.map(\.id.fileID)).count, 2)
+        XCTAssertEqual(Set(folderFirst.rows.map(\.physicalPath)).count, 2)
+        let targetRow = try XCTUnwrap(folderFirst.rows.first {
             $0.physicalPath == targetURL.standardizedFileURL.path
         })
         XCTAssertEqual(targetRow.kind, .slices)
         XCTAssertEqual(targetRow.lineRanges, [sliceRange])
+        XCTAssertTrue(targetRow.canRemove)
 
         let renderedSlice = SliceAssemblyBuilder.build(from: targetContent, ranges: [sliceRange]).combinedText
         let expectedTotal = TokenCalculationService.estimateTokens(for: renderedSlice)
             + TokenCalculationService.estimateTokens(for: otherContent)
-        XCTAssertEqual(model.totalSelectedDisplayTokens, expectedTotal)
+        XCTAssertEqual(folderFirst.totalSelectedDisplayTokens, expectedTotal)
         XCTAssertEqual(targetRow.metrics.knownValues?.tokenCount, TokenCalculationService.estimateTokens(for: renderedSlice))
     }
 
