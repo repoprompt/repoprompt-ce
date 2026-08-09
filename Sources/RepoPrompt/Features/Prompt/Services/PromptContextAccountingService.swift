@@ -508,9 +508,11 @@ actor PromptContextAccountingService {
             guard let result else { continue }
             slicePathResults[path] = result
             if let file = result.file {
-                var mergedRanges = sliceRangesByFileID[file.id, default: []]
-                mergedRanges.append(contentsOf: ranges)
-                sliceRangesByFileID[file.id] = SliceRangeMath.normalize(mergedRanges)
+                StoredSelectionPathNormalization.mergeSliceRanges(
+                    ranges,
+                    for: file.id,
+                    into: &sliceRangesByFileID
+                )
             }
         }
 

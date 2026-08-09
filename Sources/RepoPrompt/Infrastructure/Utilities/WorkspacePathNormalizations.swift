@@ -30,6 +30,23 @@ enum StoredSelectionPathNormalization {
         }
     }
 
+    static func mergeSliceRanges(
+        _ ranges: [LineRange],
+        for fileID: UUID,
+        into rangesByFileID: inout [UUID: [LineRange]]
+    ) {
+        guard var mergedRanges = rangesByFileID[fileID] else {
+            rangesByFileID[fileID] = ranges
+            return
+        }
+        mergedRanges.append(contentsOf: ranges)
+        let normalizedRanges = SliceRangeMath.normalize(mergedRanges)
+        // Empty line ranges mean full-file content downstream. Preserve the prior
+        // nonempty value if malformed decoded ranges normalize away entirely.
+        guard !normalizedRanges.isEmpty else { return }
+        rangesByFileID[fileID] = normalizedRanges
+    }
+
     static func standardizedSlices(_ slices: [String: [LineRange]]) -> [String: [LineRange]] {
         guard !slices.isEmpty else { return [:] }
 
