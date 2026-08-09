@@ -1673,7 +1673,6 @@ struct AgentImageInputAdapter {
         self.temporaryRoot = temporaryRoot
             ?? MCPFilesystemConstants.identity.temporaryRootURL(fileManager: fileManager)
             .appendingPathComponent("AgentImageInput", isDirectory: true)
-            .standardizedFileURL
     }
 
     func preparedImages(from pasteboard: NSPasteboard) -> [PreparedImage] {
