@@ -1740,6 +1740,46 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertEqual(targetRow.metrics.knownValues?.tokenCount, TokenCalculationService.estimateTokens(for: renderedSlice))
     }
 
+    func testRowsMergeSliceRangesForAliasesOfSameFile() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportSliceAliases")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        try write("one\ntwo\nthree\nfour\n", to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let aliasPath = root.path + "/./Target.swift"
+        let ranges = [
+            LineRange(start: 1, end: 1),
+            LineRange(start: 4, end: 4)
+        ]
+        let model = try await AgentContextExportResolver.resolveModel(
+            source: AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review slice aliases",
+                selection: StoredSelection(
+                    slices: [
+                        targetURL.path: [ranges[0]],
+                        aliasPath: [ranges[1]]
+                    ],
+                    codemapAutoEnabled: false
+                ),
+                selectedMetaPromptIDs: [],
+                tabName: "Slice Aliases",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            ),
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertEqual(model.rows.count, 1)
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertEqual(row.kind, .slices)
+        XCTAssertEqual(row.lineRanges, ranges)
+        XCTAssertTrue(row.canRemove)
+    }
+
     @MainActor
     func testSourceBuilderUsesRequestedInactiveTabInsteadOfActiveSnapshot() {
         let requestedTabID = UUID()

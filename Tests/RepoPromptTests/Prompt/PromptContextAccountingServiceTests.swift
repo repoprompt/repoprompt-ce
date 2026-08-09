@@ -201,6 +201,53 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(folderSnapshot.totalSelectedDisplayTokens, expectedTotal)
     }
 
+    func testResolutionMergesSliceRangesForAliasesOfSameFile() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingSliceAliases")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        let content = "one\ntwo\nthree\nfour\n"
+        try write(content, to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let service = PromptContextAccountingService()
+        let aliasPath = root.path + "/./Target.swift"
+        let ranges = [
+            LineRange(start: 1, end: 1),
+            LineRange(start: 4, end: 4)
+        ]
+
+        let resolution = await service.resolveEntries(
+            selection: StoredSelection(
+                slices: [
+                    targetURL.path: [ranges[0]],
+                    aliasPath: [ranges[1]]
+                ],
+                codemapAutoEnabled: false
+            ),
+            store: store,
+            codeMapUsage: .none
+        )
+
+        XCTAssertEqual(resolution.missingPaths, [])
+        XCTAssertEqual(resolution.invalidPaths, [])
+        XCTAssertEqual(resolution.entries.count, 1)
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(entry.mode, .sliced)
+        XCTAssertEqual(entry.lineRanges, ranges)
+
+        let snapshot = await service.calculateEntryMetricsSnapshot(
+            entries: resolution.entries,
+            store: store,
+            codemapPresentation: .empty,
+            filePathDisplay: .relative
+        )
+        let renderedSlice = SliceAssemblyBuilder.build(from: content, ranges: ranges).combinedText
+        XCTAssertEqual(
+            snapshot.totalSelectedDisplayTokens,
+            TokenCalculationService.estimateTokens(for: renderedSlice)
+        )
+    }
+
     func testEntryMetricsAccountingKeepsFirstSliceForDuplicatePhysicalFile() async throws {
         let root = try makeTemporaryRoot(name: "AccountingPhysicalIdentitySliceFirst")
         let targetURL = root.appendingPathComponent("Target.swift")
