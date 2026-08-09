@@ -14,15 +14,6 @@ func rpMakeUnixStreamSocket() -> Int32 {
 #endif
 }
 
-@inline(__always)
-func rpConnect(_ fd: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Int32 {
-#if canImport(Darwin)
-    Darwin.connect(fd, address, length)
-#else
-    Glibc.connect(fd, address, length)
-#endif
-}
-
 @discardableResult
 @inline(__always)
 func rpConfigureNoSIGPIPE(_ fd: Int32) -> Int32 {
