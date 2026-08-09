@@ -798,8 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Prepare guarded, review-only evidence for an official stable Codex runtime update"
     )
     selector = parser.add_mutually_exclusive_group(required=True)
-    selector.add_argument("--version", help="explicit stable Codex version (for example 0.146.0)")
-    selector.add_argument("--tag", help="explicit stable Codex tag (for example rust-v0.146.0)")
+    selector.add_argument("--version", help="explicit stable Codex version (for example 0.148.0)")
+    selector.add_argument("--tag", help="explicit stable Codex tag (for example rust-v0.148.0)")
     selector.add_argument(
         "--latest-stable",
         action="store_true",

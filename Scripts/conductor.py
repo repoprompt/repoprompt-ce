@@ -16,10 +16,13 @@ import dataclasses
 import errno
 import fcntl
 import hashlib
+import itertools
 import json
 import math
 import os
+import queue
 import re
+import selectors
 import signal
 import shutil
 import socket
@@ -36,10 +39,22 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 13
 TERMINAL_STATES = {"completed", "failed", "canceled"}
+JOB_PHASES = {
+    "queued",
+    "waitingGlobalHeavy",
+    "startingProcess",
+    "runningProcess",
+    "canceling",
+    "finalizingOutput",
+    "summarizing",
+    "terminal",
+}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
+LOG_TAIL_MAX_BYTES = 64 * 1024
+LOG_TAIL_FRAGMENT_MAX_BYTES = 4 * 1024
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
@@ -48,6 +63,12 @@ SUMMARY_MAX_CHARS = 16000
 SUMMARY_LINE_MAX_CHARS = 400
 SUMMARY_CONTEXT_BEFORE = 2
 SUMMARY_CONTEXT_AFTER = 4
+SUMMARY_INPUT_MAX_LINES = 100_000
+SUMMARY_INPUT_MAX_BYTES = 8 * 1024 * 1024
+SUMMARY_FILE_HEAD_BYTES = 4 * 1024 * 1024
+SUMMARY_FILE_TAIL_BYTES = 4 * 1024 * 1024
+FULL_LOG_HEAD_BYTES = 8 * 1024 * 1024
+FULL_LOG_TAIL_BYTES = 8 * 1024 * 1024
 PROGRESS_HEARTBEAT_SECONDS = 30.0
 PROGRESS_MAX_LINES_PER_POLL = 6
 MAX_TERMINAL_JOBS = 200
@@ -72,6 +93,36 @@ APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
 GLOBAL_HEAVY_SLOT_POLL_SECONDS = 0.2
 MACHINE_LOCK_POLL_SECONDS = 0.2
 MAX_GLOBAL_HEAVY_SLOTS = 64
+EXTERNAL_IO_QUEUE_DEPTH = 4096
+MAX_INFRASTRUCTURE_WARNINGS = 16
+INFRASTRUCTURE_WARNING_TTL_SECONDS = 5 * 60.0
+OUTPUT_FINALIZATION_SECONDS = 2.0
+OUTPUT_FINALIZATION_WAIT_SECONDS = 2.5
+OUTPUT_FINALIZATION_DRAIN_MAX_READS = 64
+OUTPUT_FINALIZATION_DRAIN_MAX_BYTES = 4 * 1024 * 1024
+OUTPUT_LINE_BUFFER_BYTES = 64 * 1024
+OUTPUT_PUMP_COMMAND_DEPTH = 1024
+LOG_FLUSH_WAIT_SECONDS = 5.0
+CANCEL_CLEANUP_WAIT_SECONDS = 15.0
+CANCEL_RPC_TIMEOUT_SECONDS = CANCEL_CLEANUP_WAIT_SECONDS + 5.0
+FAIR_HEAVY_RESCAN_SECONDS = 2.0
+FAIR_HEAVY_HEAD_RESCAN_SECONDS = 0.05
+FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS = 0.25
+FAIR_HEAVY_HEAD_COMPETITION_SECONDS = 3.0
+FAIR_PROCESS_SNAPSHOT_TTL_SECONDS = 1.0
+WAIT_STATUS_POLL_SECONDS = 0.5
+WAIT_RPC_CONTACT_SECONDS = 5.0
+MAX_CONSECUTIVE_WAIT_CONTACT_FAILURES = 3
+MAX_REQUEST_BYTES = 256 * 1024
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+REQUEST_READ_TIMEOUT_SECONDS = 2.0
+MAX_ACTIVE_REQUEST_HANDLERS = 32
+MAX_ACTIVE_WAIT_HANDLERS = 8
+MAX_SERVER_WAIT_SECONDS = 2.0
+MAX_JSON_DEPTH = 16
+MAX_JSON_COLLECTION_ENTRIES = 1024
+MAX_JSON_STRING_BYTES = 64 * 1024
+MAX_UNLANED_JOBS = 4
 DEBUG_APP_PROVENANCE_RELATIVE_PATH = "Contents/Resources/RepoPromptDebugProvenance.json"
 
 SHORT_TIMEOUT_SECONDS = 5 * 60
@@ -188,6 +239,14 @@ class ConductorError(Exception):
     pass
 
 
+class DaemonContactError(ConductorError):
+    """A contact failure that preserves daemon process and health truth."""
+
+    def __init__(self, message: str, health_payload: Dict[str, Any]) -> None:
+        super().__init__(message)
+        self.health_payload = health_payload
+
+
 XCTEST_PROGRESS_RE = re.compile(
     r"^Test Case '(.+)' (started|passed|failed|skipped)(?: \([^)]*\))?\.\s*$"
 )
@@ -211,82 +270,309 @@ class XCTestStallClaim:
 @dataclasses.dataclass
 class ProcessOutputTransport:
     kind: str
-    master_fd: Optional[int] = None
-    slave_fd: Optional[int] = None
-    pipe_stream: Optional[Any] = None
+    reader_fd: Optional[int]
+    writer_fd: Optional[int]
     close_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, repr=False)
+    reader_transferred: bool = False
 
     @classmethod
     def create(cls, kind: str) -> "ProcessOutputTransport":
         if kind == "pipe":
-            return cls(kind="pipe")
-        if kind != "pty":
+            reader_fd, writer_fd = os.pipe()
+        elif kind == "pty":
+            reader_fd, writer_fd = os.openpty()
+        else:
             raise ValueError(f"unsupported process output transport: {kind}")
-        master_fd, slave_fd = os.openpty()
-        return cls(kind="pty", master_fd=master_fd, slave_fd=slave_fd)
+        os.set_blocking(reader_fd, False)
+        return cls(kind=kind, reader_fd=reader_fd, writer_fd=writer_fd)
 
     @property
     def popen_stdout(self) -> Any:
-        return self.slave_fd if self.kind == "pty" else subprocess.PIPE
+        return self.writer_fd
 
     @property
     def popen_stderr(self) -> Any:
-        return self.slave_fd if self.kind == "pty" else subprocess.STDOUT
+        return self.writer_fd if self.kind == "pty" else subprocess.STDOUT
 
-    def attach_process(self, process: subprocess.Popen[bytes]) -> None:
-        if self.kind == "pty":
-            self.close_slave()
-            return
-        if process.stdout is None:
-            raise ConductorError("pipe-backed process did not expose stdout")
-        with self.close_lock:
-            self.pipe_stream = process.stdout
+    def attach_process(self, _process: subprocess.Popen[bytes]) -> None:
+        self.close_writer()
 
-    def read_chunk(self, process: subprocess.Popen[bytes]) -> bytes:
+    def transfer_reader(self) -> int:
         with self.close_lock:
-            master_fd = self.master_fd
-            pipe_stream = self.pipe_stream
-        if self.kind == "pipe":
-            if pipe_stream is None:
-                return b""
-            return pipe_stream.readline()
-        if master_fd is None:
-            return b""
-        try:
-            return os.read(master_fd, 64 * 1024)
-        except OSError as exc:
-            if exc.errno == errno.EIO:
-                return b""
-            if exc.errno == errno.EBADF:
-                with self.close_lock:
-                    if self.master_fd is None:
-                        return b""
-            raise
+            if self.reader_transferred or self.reader_fd is None:
+                raise ConductorError("process output reader ownership is unavailable")
+            reader_fd = self.reader_fd
+            self.reader_fd = None
+            self.reader_transferred = True
+            return reader_fd
 
-    def close_slave(self) -> None:
+    def close_writer(self) -> None:
         with self.close_lock:
-            slave_fd = self.slave_fd
-            self.slave_fd = None
-        if slave_fd is not None:
+            writer_fd = self.writer_fd
+            self.writer_fd = None
+        if writer_fd is not None:
             with contextlib.suppress(OSError):
-                os.close(slave_fd)
+                os.close(writer_fd)
 
     def close_reader(self) -> None:
         with self.close_lock:
-            master_fd = self.master_fd
-            pipe_stream = self.pipe_stream
-            self.master_fd = None
-            self.pipe_stream = None
-        if master_fd is not None:
+            if self.reader_transferred:
+                return
+            reader_fd = self.reader_fd
+            self.reader_fd = None
+        if reader_fd is not None:
             with contextlib.suppress(OSError):
-                os.close(master_fd)
-        if pipe_stream is not None:
-            with contextlib.suppress(OSError):
-                pipe_stream.close()
+                os.close(reader_fd)
 
     def close_all(self) -> None:
-        self.close_slave()
+        self.close_writer()
         self.close_reader()
+
+
+@dataclasses.dataclass(frozen=True)
+class ProcessOutputResult:
+    truncated: bool
+    reason: Optional[str]
+    bytes_read: int
+
+
+@dataclasses.dataclass
+class ProcessOutputChannel:
+    ticket: str
+    read_fd: int
+    kind: str
+    registered: threading.Event = dataclasses.field(default_factory=threading.Event, repr=False)
+    finalization_started: threading.Event = dataclasses.field(default_factory=threading.Event, repr=False)
+    completion: threading.Event = dataclasses.field(default_factory=threading.Event, repr=False)
+    pending: bytearray = dataclasses.field(default_factory=bytearray, repr=False)
+    finalization_deadline: Optional[float] = None
+    bytes_read: int = 0
+    result: Optional[ProcessOutputResult] = None
+
+
+class ProcessOutputPump:
+    """Owns every registered output FD through EOF or bounded finalization."""
+
+    def __init__(
+        self,
+        on_chunk: Any,
+        on_line: Any,
+        clock: Any = time.monotonic,
+        close_fd: Any = os.close,
+    ) -> None:
+        self._on_chunk = on_chunk
+        self._on_line = on_line
+        self._clock = clock
+        self._close_fd = close_fd
+        self._commands: "queue.Queue[Tuple[str, Optional[ProcessOutputChannel]]]" = queue.Queue(
+            maxsize=OUTPUT_PUMP_COMMAND_DEPTH
+        )
+        self._submission_lock = threading.Lock()
+        self._stopping = False
+        self._wake_reader, self._wake_writer = socket.socketpair()
+        self._wake_reader.setblocking(False)
+        self._wake_writer.setblocking(False)
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._wake_reader, selectors.EVENT_READ, None)
+        self._channels: Dict[int, ProcessOutputChannel] = {}
+        self._thread = threading.Thread(target=self._run, name="conductor-output-pump", daemon=True)
+        self._thread.start()
+
+    def register(self, ticket: str, read_fd: int, kind: str) -> ProcessOutputChannel:
+        channel = ProcessOutputChannel(ticket=ticket, read_fd=read_fd, kind=kind)
+        # Queue submission transfers reader ownership. Registration and finalization
+        # commands are FIFO, so job startup does not depend on pump-thread latency.
+        self._submit("register", channel)
+        return channel
+
+    def request_finalization(self, channel: ProcessOutputChannel) -> None:
+        self._submit("finalize", channel)
+
+    def close(self) -> None:
+        with self._submission_lock:
+            if self._stopping:
+                return
+            try:
+                self._commands.put_nowait(("stop", None))
+            except queue.Full:
+                self._stopping = True
+        with contextlib.suppress(BlockingIOError, OSError):
+            self._wake_writer.send(b"x")
+        self._thread.join(timeout=OUTPUT_FINALIZATION_WAIT_SECONDS)
+
+    @staticmethod
+    def wait_for_completion(channel: ProcessOutputChannel) -> ProcessOutputResult:
+        if channel.completion.is_set():
+            return channel.result or ProcessOutputResult(True, "pumpFailure", channel.bytes_read)
+        if not channel.finalization_started.wait(OUTPUT_FINALIZATION_WAIT_SECONDS):
+            if channel.completion.is_set():
+                return channel.result or ProcessOutputResult(True, "pumpFailure", channel.bytes_read)
+            return ProcessOutputResult(True, "pumpCompletionDeadline", channel.bytes_read)
+        if not channel.completion.wait(OUTPUT_FINALIZATION_WAIT_SECONDS):
+            return ProcessOutputResult(True, "pumpCompletionDeadline", channel.bytes_read)
+        return channel.result or ProcessOutputResult(True, "pumpFailure", channel.bytes_read)
+
+    def _submit(self, command: str, channel: ProcessOutputChannel) -> None:
+        with self._submission_lock:
+            if self._stopping:
+                raise ConductorError("output pump is stopped")
+            try:
+                self._commands.put_nowait((command, channel))
+            except queue.Full as exc:
+                raise ConductorError("output pump command queue is full") from exc
+        with contextlib.suppress(BlockingIOError, OSError):
+            self._wake_writer.send(b"x")
+
+    def _run(self) -> None:
+        failure_reason = "pumpShutdown"
+        try:
+            while not self._stopping:
+                timeout = self._next_timeout()
+                for key, _mask in self._selector.select(timeout):
+                    if key.data is None:
+                        self._drain_wakeup()
+                        self._drain_commands()
+                    else:
+                        self._read_available(key.data)
+                self._finish_expired_channels()
+        except Exception:
+            failure_reason = "pumpFailure"
+        finally:
+            with self._submission_lock:
+                self._stopping = True
+                for channel in list(self._channels.values()):
+                    self._finish(channel, ProcessOutputResult(True, failure_reason, channel.bytes_read))
+                self._finish_queued_channels(failure_reason)
+            with contextlib.suppress(Exception):
+                self._selector.close()
+            self._wake_reader.close()
+            self._wake_writer.close()
+
+    def _next_timeout(self) -> Optional[float]:
+        deadlines = [
+            channel.finalization_deadline
+            for channel in self._channels.values()
+            if channel.finalization_deadline is not None
+        ]
+        if not deadlines:
+            return None
+        return max(0.0, min(deadlines) - self._clock())
+
+    def _drain_wakeup(self) -> None:
+        with contextlib.suppress(BlockingIOError, OSError):
+            while self._wake_reader.recv(4096):
+                pass
+
+    def _drain_commands(self) -> None:
+        while True:
+            try:
+                command, channel = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if command == "stop":
+                    with self._submission_lock:
+                        self._stopping = True
+                elif channel is None:
+                    raise ConductorError(f"output pump command {command} is missing a channel")
+                elif command == "register":
+                    self._selector.register(channel.read_fd, selectors.EVENT_READ, channel)
+                    self._channels[channel.read_fd] = channel
+                    channel.registered.set()
+                elif command == "finalize" and channel.read_fd in self._channels:
+                    channel.finalization_deadline = self._clock() + OUTPUT_FINALIZATION_SECONDS
+                    channel.finalization_started.set()
+                elif command == "finalize" and channel.result is None:
+                    channel.finalization_started.set()
+                    self._finish(channel, ProcessOutputResult(False, None, channel.bytes_read))
+            except Exception:
+                if channel is not None:
+                    self._finish(channel, ProcessOutputResult(True, "pumpFailure", channel.bytes_read))
+                    channel.registered.set()
+            finally:
+                self._commands.task_done()
+
+    def _finish_queued_channels(self, reason: str) -> None:
+        while True:
+            try:
+                _command, channel = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if channel is not None:
+                    self._finish(channel, ProcessOutputResult(True, reason, channel.bytes_read))
+            finally:
+                self._commands.task_done()
+
+    def _read_available(self, channel: ProcessOutputChannel) -> None:
+        try:
+            chunk = os.read(channel.read_fd, 64 * 1024)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            if channel.kind == "pty" and exc.errno == errno.EIO:
+                chunk = b""
+            else:
+                self._finish(channel, ProcessOutputResult(True, "outputReadFailed", channel.bytes_read))
+                return
+        if not chunk:
+            self._finish(channel, ProcessOutputResult(False, None, channel.bytes_read))
+            return
+        channel.bytes_read += len(chunk)
+        self._on_chunk(channel.ticket, chunk)
+        channel.pending.extend(chunk)
+        while True:
+            newline = channel.pending.find(b"\n")
+            if newline < 0:
+                break
+            end = newline + 1
+            self._on_line(channel.ticket, bytes(channel.pending[:end]))
+            del channel.pending[:end]
+        if len(channel.pending) > OUTPUT_LINE_BUFFER_BYTES:
+            fragment = bytes(channel.pending[:OUTPUT_LINE_BUFFER_BYTES]) + b"... [line truncated by conductor]\n"
+            del channel.pending[:OUTPUT_LINE_BUFFER_BYTES]
+            self._on_line(channel.ticket, fragment)
+
+    def _finish_expired_channels(self) -> None:
+        timestamp = self._clock()
+        for channel in list(self._channels.values()):
+            deadline = channel.finalization_deadline
+            if deadline is None or timestamp < deadline:
+                continue
+            drained_bytes = 0
+            drain_reads = 0
+            while (
+                channel.read_fd in self._channels
+                and drain_reads < OUTPUT_FINALIZATION_DRAIN_MAX_READS
+                and drained_bytes < OUTPUT_FINALIZATION_DRAIN_MAX_BYTES
+            ):
+                before = channel.bytes_read
+                self._read_available(channel)
+                drain_reads += 1
+                drained_bytes += max(0, channel.bytes_read - before)
+                if channel.result is not None or channel.bytes_read == before:
+                    break
+            if channel.result is None:
+                self._finish(
+                    channel,
+                    ProcessOutputResult(True, "inheritedWriterDeadline", channel.bytes_read),
+                )
+
+    def _finish(self, channel: ProcessOutputChannel, result: ProcessOutputResult) -> None:
+        if channel.result is not None:
+            return
+        if channel.pending:
+            self._on_line(channel.ticket, bytes(channel.pending))
+            channel.pending.clear()
+        if channel.read_fd in self._channels:
+            with contextlib.suppress(Exception):
+                self._selector.unregister(channel.read_fd)
+            del self._channels[channel.read_fd]
+        with contextlib.suppress(OSError):
+            self._close_fd(channel.read_fd)
+        channel.result = result
+        channel.registered.set()
+        channel.completion.set()
 
 
 def is_xctest_process_command(command: str) -> bool:
@@ -517,45 +803,499 @@ def machine_exclusive_lock(lock_path: Path, metadata: Dict[str, Any], wait_label
             lock_file.close()
 
 
+@dataclasses.dataclass
+class FairHeavyLease:
+    coordinator: "FairHeavyAdmission"
+    lock_file: Any
+    lock_path: Path
+    waiter_id: str
+
+    def release(self) -> None:
+        self.coordinator.release(self)
+
+
+class FairHeavyAdmission:
+    """Persistent FIFO ordering around kernel-authoritative heavy slot flocks."""
+
+    def __init__(
+        self,
+        metadata: Dict[str, Any],
+        env: Optional[Dict[str, str]],
+        *,
+        identity_provider: Any = None,
+        clock: Any = time.monotonic,
+        on_warning: Any = None,
+    ) -> None:
+        self.metadata = dict(metadata)
+        self.env = dict(env or {})
+        self._clock = clock
+        self._on_warning = on_warning or (lambda _kind, _message: None)
+        self._remote_process_snapshot: Optional[Dict[int, Tuple[int, str]]] = None
+        self._remote_process_snapshot_at: Optional[float] = None
+        self.legacy_slot_holder: Optional[Dict[str, Any]] = None
+        self._legacy_slot_holder_observed_at: Optional[float] = None
+        self.current_rescan_seconds = FAIR_HEAVY_RESCAN_SECONDS
+        self._eligible_since: Optional[float] = None
+        self.owner_pid = os.getpid()
+        identity = identity_provider or process_start_token
+        self.owner_start = identity(self.owner_pid)
+        if not self.owner_start:
+            raise ConductorError("global-heavy admission requires an exact owner process start token")
+        self.waiter_id = uuid.uuid4().hex[:12]
+        self.root = machine_lock_dir()
+        self.queue_lock_path = self.root / "global-heavy-queue.lock"
+        self.queue_path = self.root / "global-heavy-queue.json"
+        self.waiters_dir = self.root / "heavy-waiters"
+        ensure_private_dir(self.root)
+        ensure_private_dir(self.waiters_dir)
+        self.notify_path = self.waiters_dir / f"{self.waiter_id}.sock"
+        if len(os.fsencode(self.notify_path)) >= 100:
+            self.notify_path = self.root / f"w-{self.waiter_id}.sock"
+        self.notify_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self._closed = False
+        try:
+            self.notify_socket.bind(str(self.notify_path))
+            os.chmod(self.notify_path, 0o600)
+            self.notify_socket.settimeout(FAIR_HEAVY_RESCAN_SECONDS)
+            self._enqueue()
+        except Exception:
+            self.close()
+            raise
+
+    @contextlib.contextmanager
+    def _queue_lock(self):
+        lock_file = self.queue_lock_path.open("a+", encoding="utf-8")
+        os.chmod(self.queue_lock_path, 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+
+    @staticmethod
+    def _empty_queue() -> Dict[str, Any]:
+        return {"version": 1, "generation": 0, "nextSequence": 1, "waiters": []}
+
+    def _quarantine_invalid_queue(self, reason: str) -> Dict[str, Any]:
+        quarantine = self.queue_path.with_name(
+            f"global-heavy-queue.corrupt-{int(self._clock() * 1_000_000)}-{uuid.uuid4().hex[:8]}.json"
+        )
+        try:
+            os.replace(self.queue_path, quarantine)
+        except FileNotFoundError:
+            return self._empty_queue()
+        self._on_warning("fairQueueQuarantined", f"quarantined invalid fair queue at {quarantine}: {reason}")
+        return self._empty_queue()
+
+    def _load_queue(self) -> Dict[str, Any]:
+        try:
+            info = self.queue_path.lstat()
+        except FileNotFoundError:
+            return self._empty_queue()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ConductorError(f"unsafe global-heavy queue state preserved at {self.queue_path}")
+        try:
+            payload = json.loads(self.queue_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return self._quarantine_invalid_queue(str(exc))
+        except OSError as exc:
+            raise ConductorError(f"could not read global-heavy queue state at {self.queue_path}: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("waiters"), list):
+            return self._quarantine_invalid_queue("unsupported queue schema")
+        if not isinstance(payload.get("generation"), int) or not isinstance(payload.get("nextSequence"), int):
+            return self._quarantine_invalid_queue("invalid queue counters")
+        for waiter in payload["waiters"]:
+            if not (
+                isinstance(waiter, dict)
+                and isinstance(waiter.get("waiterID"), str)
+                and waiter.get("waiterID")
+                and type(waiter.get("sequence")) is int
+                and int(waiter["sequence"]) >= 0
+                and waiter.get("state") in {"waiting", "acquired"}
+                and type(waiter.get("ownerPID")) is int
+                and int(waiter["ownerPID"]) > 0
+                and isinstance(waiter.get("ownerStartToken"), str)
+                and waiter.get("ownerStartToken")
+                and isinstance(waiter.get("notifySocketPath"), str)
+                and waiter.get("notifySocketPath")
+            ):
+                return self._quarantine_invalid_queue("invalid waiter record")
+        return payload
+
+    def _write_queue(self, payload: Dict[str, Any]) -> None:
+        temporary = self.queue_path.with_name(f".{self.queue_path.name}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        replaced = False
+        try:
+            encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write while persisting global-heavy queue")
+                remaining = remaining[written:]
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temporary, self.queue_path)
+            replaced = True
+            directory_fd = os.open(self.queue_path.parent, os.O_RDONLY)
+            try:
+                with contextlib.suppress(OSError):
+                    os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if not replaced:
+                with contextlib.suppress(FileNotFoundError):
+                    temporary.unlink()
+
+    def _notify_path_is_live(self, waiter: Dict[str, Any]) -> bool:
+        raw_path = waiter.get("notifySocketPath")
+        if not isinstance(raw_path, str) or not raw_path:
+            return False
+        path = Path(raw_path)
+        allowed_parents = {self.waiters_dir, self.root}
+        if path.parent not in allowed_parents:
+            return False
+        try:
+            info = path.lstat()
+        except OSError:
+            return False
+        return stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid()
+
+    def _cached_remote_process_snapshot(self, *, force: bool = False) -> Optional[Dict[int, Tuple[int, str]]]:
+        timestamp = self._clock()
+        if (
+            force
+            or self._remote_process_snapshot is None
+            or self._remote_process_snapshot_at is None
+            or timestamp - self._remote_process_snapshot_at >= FAIR_PROCESS_SNAPSHOT_TTL_SECONDS
+        ):
+            snapshot = process_table_snapshot()
+            if snapshot is None:
+                return None
+            self._remote_process_snapshot = snapshot
+            self._remote_process_snapshot_at = timestamp
+        return self._remote_process_snapshot
+
+    def _prune_stale(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        retained: List[Dict[str, Any]] = []
+        remote_snapshot: Optional[Dict[int, Tuple[int, str]]] = None
+        remote_snapshot_was_cached = False
+        remote_snapshot_refreshed_for_negative = False
+        remote_snapshot_inconclusive = False
+        for waiter in payload["waiters"]:
+            if not isinstance(waiter, dict) or not self._notify_path_is_live(waiter):
+                continue
+            try:
+                pid = int(waiter.get("ownerPID"))
+            except (TypeError, ValueError):
+                continue
+            token = waiter.get("ownerStartToken")
+            if not isinstance(token, str) or not token or pid <= 0:
+                continue
+            if pid == self.owner_pid and token == self.owner_start:
+                retained.append(waiter)
+                continue
+            if remote_snapshot_inconclusive:
+                retained.append(waiter)
+                continue
+            if remote_snapshot is None:
+                timestamp = self._clock()
+                remote_snapshot_was_cached = bool(
+                    self._remote_process_snapshot is not None
+                    and self._remote_process_snapshot_at is not None
+                    and timestamp - self._remote_process_snapshot_at < FAIR_PROCESS_SNAPSHOT_TTL_SECONDS
+                )
+                remote_snapshot = self._cached_remote_process_snapshot()
+            if remote_snapshot is None:
+                remote_snapshot_inconclusive = True
+                retained.append(waiter)
+                continue
+            record = remote_snapshot.get(pid)
+            if (
+                (record is None or record[1] != token)
+                and remote_snapshot_was_cached
+                and not remote_snapshot_refreshed_for_negative
+            ):
+                remote_snapshot = self._cached_remote_process_snapshot(force=True)
+                remote_snapshot_refreshed_for_negative = True
+                if remote_snapshot is None:
+                    remote_snapshot_inconclusive = True
+                    retained.append(waiter)
+                    continue
+                record = remote_snapshot.get(pid)
+            if record is not None and record[1] == token:
+                retained.append(waiter)
+        if len(retained) != len(payload["waiters"]):
+            payload["waiters"] = retained
+            payload["generation"] += 1
+        return retained
+
+    def _enqueue(self) -> None:
+        with self._queue_lock():
+            payload = self._load_queue()
+            self._prune_stale(payload)
+            sequence = int(payload["nextSequence"])
+            payload["nextSequence"] = sequence + 1
+            payload["generation"] += 1
+            payload["waiters"].append(
+                {
+                    "waiterID": self.waiter_id,
+                    "sequence": sequence,
+                    "state": "waiting",
+                    "ownerPID": self.owner_pid,
+                    "ownerStartToken": self.owner_start,
+                    "ticket": self.metadata.get("ticket"),
+                    "operation": self.metadata.get("operation"),
+                    "operationLabel": self.metadata.get("operationLabel"),
+                    "repoRoot": self.metadata.get("repoRoot"),
+                    "repoHash": self.metadata.get("repoHash"),
+                    "worktree": self.metadata.get("worktree"),
+                    "enqueuedAt": now(),
+                    "acquiredSlotPath": None,
+                    "notifySocketPath": str(self.notify_path),
+                }
+            )
+            self._write_queue(payload)
+
+    def _queue_snapshot(self) -> Tuple[Dict[str, Any], Dict[str, Any], int, List[Dict[str, Any]]]:
+        with self._queue_lock():
+            payload = self._load_queue()
+            before_generation = payload["generation"]
+            waiters = self._prune_stale(payload)
+            if payload["generation"] != before_generation:
+                self._write_queue(payload)
+            ordered = sorted(waiters, key=lambda item: int(item.get("sequence", 0)))
+            for index, waiter in enumerate(ordered):
+                if (
+                    waiter.get("waiterID") == self.waiter_id
+                    and waiter.get("ownerPID") == self.owner_pid
+                    and waiter.get("ownerStartToken") == self.owner_start
+                ):
+                    return payload, waiter, index + 1, ordered
+        raise ConductorError("global-heavy waiter identity disappeared before admission")
+
+    def _remove_own_waiter(self) -> None:
+        notify_paths: List[str] = []
+        with self._queue_lock():
+            payload = self._load_queue()
+            original = list(payload["waiters"])
+            payload["waiters"] = [
+                waiter
+                for waiter in original
+                if not (
+                    isinstance(waiter, dict)
+                    and waiter.get("waiterID") == self.waiter_id
+                    and waiter.get("ownerPID") == self.owner_pid
+                    and waiter.get("ownerStartToken") == self.owner_start
+                )
+            ]
+            if len(payload["waiters"]) != len(original):
+                payload["generation"] += 1
+                self._write_queue(payload)
+            notify_paths = [
+                str(waiter.get("notifySocketPath"))
+                for waiter in payload["waiters"]
+                if isinstance(waiter, dict) and waiter.get("state") == "waiting" and waiter.get("notifySocketPath")
+            ]
+        self._notify(notify_paths)
+
+    @staticmethod
+    def _notify(paths: Sequence[str]) -> None:
+        sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            for path in paths:
+                with contextlib.suppress(OSError):
+                    sender.sendto(b"rescan", path)
+        finally:
+            sender.close()
+
+    def wait(
+        self,
+        cancel_check: Any = lambda: False,
+        update: Any = lambda _position, _earlier: None,
+    ) -> Optional[FairHeavyLease]:
+        try:
+            return self._wait_until_acquired(cancel_check=cancel_check, update=update)
+        except BaseException:
+            self.abandon()
+            raise
+
+    def _observe_legacy_slot_holder(self, slot_path: Path) -> None:
+        observed_at = self._clock()
+        if (
+            self.legacy_slot_holder is not None
+            and self.legacy_slot_holder.get("slotPath") == str(slot_path)
+            and self._legacy_slot_holder_observed_at is not None
+            and observed_at - self._legacy_slot_holder_observed_at < FAIR_PROCESS_SNAPSHOT_TTL_SECONDS
+        ):
+            return
+        metadata = read_display_lock_metadata(slot_path)
+        self._legacy_slot_holder_observed_at = observed_at
+        self.legacy_slot_holder = (
+            {
+                "displayOnly": True,
+                "authoritative": False,
+                "classification": "legacyOrUnregistered",
+                "slotPath": str(slot_path),
+                "metadata": metadata,
+            }
+            if metadata
+            else None
+        )
+
+    def _wait_until_acquired(
+        self,
+        cancel_check: Any,
+        update: Any,
+    ) -> Optional[FairHeavyLease]:
+        slot_paths = global_heavy_slot_paths(self.env)
+        while True:
+            if cancel_check():
+                self._remove_own_waiter()
+                self.close()
+                return None
+            _payload, _waiter, position, ordered = self._queue_snapshot()
+            earlier = [
+                {
+                    "ticket": item.get("ticket"),
+                    "operationLabel": item.get("operationLabel"),
+                    "state": item.get("state"),
+                    "slotPath": item.get("acquiredSlotPath"),
+                }
+                for item in ordered[: max(0, position - 1)]
+            ]
+            eligible = position <= configured_global_heavy_slots(self.env)
+            if eligible:
+                observed_at = self._clock()
+                if self._eligible_since is None:
+                    self._eligible_since = observed_at
+                competition_age = max(0.0, observed_at - self._eligible_since)
+                self.current_rescan_seconds = (
+                    FAIR_HEAVY_HEAD_RESCAN_SECONDS
+                    if competition_age < FAIR_HEAVY_HEAD_COMPETITION_SECONDS
+                    else FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS
+                )
+            else:
+                self._eligible_since = None
+                self.current_rescan_seconds = FAIR_HEAVY_RESCAN_SECONDS
+                self.legacy_slot_holder = None
+                self._legacy_slot_holder_observed_at = None
+            update(position, earlier)
+            if eligible:
+                explained_slots = {
+                    str(item.get("acquiredSlotPath"))
+                    for item in ordered[: max(0, position - 1)]
+                    if item.get("state") == "acquired" and item.get("acquiredSlotPath")
+                }
+                observed_unexplained_holder = False
+                for slot_path in slot_paths:
+                    lock_file = slot_path.open("a+", encoding="utf-8")
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        lock_file.close()
+                        if str(slot_path) not in explained_slots and not observed_unexplained_holder:
+                            self._observe_legacy_slot_holder(slot_path)
+                            observed_unexplained_holder = True
+                        continue
+                    except OSError as exc:
+                        lock_file.close()
+                        if exc.errno == errno.EINTR:
+                            continue
+                        raise
+                    with self._queue_lock():
+                        payload = self._load_queue()
+                        ordered_now = sorted(payload["waiters"], key=lambda item: int(item.get("sequence", 0)))
+                        matching = [item for item in ordered_now if item.get("waiterID") == self.waiter_id]
+                        eligible = bool(
+                            matching
+                            and matching[0].get("ownerPID") == self.owner_pid
+                            and matching[0].get("ownerStartToken") == self.owner_start
+                            and ordered_now.index(matching[0]) < configured_global_heavy_slots(self.env)
+                        )
+                        if eligible:
+                            matching[0]["state"] = "acquired"
+                            matching[0]["acquiredSlotPath"] = str(slot_path)
+                            payload["generation"] += 1
+                            self._write_queue(payload)
+                            write_display_lock_metadata(lock_file, self.metadata)
+                            self.legacy_slot_holder = None
+                            self._legacy_slot_holder_observed_at = None
+                            return FairHeavyLease(self, lock_file, slot_path, self.waiter_id)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    lock_file.close()
+                if observed_unexplained_holder:
+                    update(position, earlier)
+            self.notify_socket.settimeout(self.current_rescan_seconds)
+            with contextlib.suppress(socket.timeout, BlockingIOError, OSError):
+                self.notify_socket.recv(64)
+
+    def abandon(self) -> None:
+        try:
+            self._remove_own_waiter()
+        except Exception:
+            # Closing removes the private notify socket. Any later queue scan then
+            # has durable proof that this waiter is abandoned, even if its removal
+            # could not be persisted during the original failure.
+            pass
+        finally:
+            self.close()
+
+    def release(self, lease: FairHeavyLease) -> None:
+        if lease.waiter_id != self.waiter_id:
+            raise ConductorError("refusing to release a different global-heavy waiter")
+        with contextlib.suppress(OSError):
+            lease.lock_file.seek(0)
+            lease.lock_file.truncate()
+            lease.lock_file.flush()
+        with contextlib.suppress(OSError):
+            fcntl.flock(lease.lock_file.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            lease.lock_file.close()
+        try:
+            self._remove_own_waiter()
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.notify_socket.close()
+        with contextlib.suppress(FileNotFoundError):
+            self.notify_path.unlink()
+
+
 @contextlib.contextmanager
 def machine_heavy_slot(metadata: Dict[str, Any], env: Optional[Dict[str, str]], wait_label: str):
-    ensure_private_dir(machine_lock_dir())
-    lock_files = [(path, path.open("a+", encoding="utf-8")) for path in global_heavy_slot_paths(env)]
+    coordinator = FairHeavyAdmission(metadata, env)
     did_log_wait = False
-    selected_file: Optional[Any] = None
+
+    def update(position: int, earlier: List[Dict[str, Any]]) -> None:
+        nonlocal did_log_wait
+        if not did_log_wait and position > configured_global_heavy_slots(env):
+            holder = earlier[0] if earlier else {}
+            print(
+                f"waiting for {wait_label}: fair queue position {position}; "
+                f"earlier={holder.get('operationLabel') or 'unknown'} ticket={holder.get('ticket') or 'unknown'}",
+                flush=True,
+            )
+            did_log_wait = True
+
+    lease = coordinator.wait(update=update)
+    if lease is None:
+        raise ConductorError(f"{wait_label} admission canceled")
     try:
-        while True:
-            for lock_path, lock_file in lock_files:
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    selected_file = lock_file
-                    write_display_lock_metadata(lock_file, metadata)
-                    print(f"acquired {wait_label}: {lock_path}", flush=True)
-                    yield lock_file
-                    return
-                except BlockingIOError:
-                    continue
-                except OSError as exc:
-                    if exc.errno == errno.EINTR:
-                        continue
-                    raise
-            if not did_log_wait:
-                holders = "; ".join(format_display_lock_holder(read_display_lock_metadata(path)) for path, _ in lock_files)
-                paths = ",".join(str(path) for path, _ in lock_files)
-                print(f"waiting for {wait_label} ({len(lock_files)} configured): {paths}; {holders}", flush=True)
-                did_log_wait = True
-            time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
+        print(f"acquired {wait_label}: {lease.lock_path}", flush=True)
+        yield lease.lock_file
     finally:
-        for _path, lock_file in lock_files:
-            if lock_file is selected_file:
-                with contextlib.suppress(OSError):
-                    lock_file.seek(0)
-                    lock_file.truncate()
-                    lock_file.flush()
-                with contextlib.suppress(OSError):
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            with contextlib.suppress(OSError):
-                lock_file.close()
+        lease.release()
 
 
 def read_pid(path: Path) -> Optional[int]:
@@ -580,13 +1320,116 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
-def cleanup_stale_files(paths: Paths) -> None:
+@dataclasses.dataclass(frozen=True)
+class DaemonRecoveryResult:
+    state: str
+    cleaned: bool
+    reason: str
+
+
+def _path_identity(path: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return (int(info.st_dev), int(info.st_ino), int(info.st_mode))
+
+
+def _read_valid_daemon_metadata(paths: Paths, pid: int) -> Optional[Dict[str, Any]]:
+    try:
+        info = paths.daemon_meta_path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            return None
+        metadata = json.loads(paths.daemon_meta_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not (
+        isinstance(metadata, dict)
+        and metadata.get("pid") == pid
+        and metadata.get("repoRoot") == str(paths.repo_root)
+        and metadata.get("repoHash") == paths.repo_hash
+        and metadata.get("script") == str(Path(__file__).resolve())
+        and isinstance(metadata.get("processStart"), str)
+        and metadata.get("processStart")
+    ):
+        return None
+    return metadata
+
+
+def _classify_socket_for_recovery(paths: Paths) -> str:
+    try:
+        socket_info = paths.socket_path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    try:
+        parent_info = paths.socket_path.parent.stat()
+    except OSError:
+        return "ambiguous"
+    if (
+        not stat.S_ISSOCK(socket_info.st_mode)
+        or socket_info.st_uid != os.getuid()
+        or parent_info.st_uid != os.getuid()
+        or parent_info.st_mode & 0o077
+    ):
+        return "ambiguous"
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+        probe.connect(str(paths.socket_path))
+        return "responsive"
+    except FileNotFoundError:
+        return "absent"
+    except ConnectionRefusedError:
+        return "refused"
+    except (socket.timeout, PermissionError, OSError):
+        return "ambiguous"
+    finally:
+        probe.close()
+
+
+def cleanup_stale_files(paths: Paths) -> DaemonRecoveryResult:
+    evidence_paths = (paths.pid_path, paths.socket_path, paths.daemon_meta_path)
+    identities = {path: _path_identity(path) for path in evidence_paths}
+    if all(identity is None for identity in identities.values()):
+        return DaemonRecoveryResult("stopped", False, "no daemon evidence")
+
     pid = read_pid(paths.pid_path)
-    if pid is not None and pid_alive(pid):
-        return
-    for path in (paths.pid_path, paths.socket_path, paths.daemon_meta_path, paths.running_processes_path):
+    if pid is None:
+        return DaemonRecoveryResult("ambiguous", False, "daemon pid evidence is missing or unsafe")
+    metadata = _read_valid_daemon_metadata(paths, pid)
+    if metadata is None:
+        return DaemonRecoveryResult("ambiguous", False, "daemon metadata is missing or unsafe")
+    reused_pid_proven = False
+    if pid_alive(pid):
+        current_start = process_start_token(pid)
+        if current_start is None:
+            return DaemonRecoveryResult("ambiguous", False, "live recorded daemon pid lacks current start-token proof")
+        if current_start == metadata["processStart"]:
+            return DaemonRecoveryResult("live", False, "recorded daemon identity is alive")
+        reused_pid_proven = True
+
+    socket_state = _classify_socket_for_recovery(paths)
+    if socket_state not in {"absent", "refused"}:
+        reason = "recorded daemon pid was reused" if reused_pid_proven else "recorded daemon is dead"
+        return DaemonRecoveryResult("ambiguous", False, f"{reason}, but daemon socket is {socket_state}")
+
+    for path, identity in identities.items():
+        if identity is not None and _path_identity(path) != identity:
+            return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed during recovery: {path}")
+    registry_identity = _path_identity(paths.running_processes_path)
+    for path, identity in (*identities.items(), (paths.running_processes_path, registry_identity)):
+        if identity is None:
+            continue
+        if _path_identity(path) != identity:
+            return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed before cleanup: {path}")
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
+    cleanup_reason = "proven pid reuse" if reused_pid_proven else "dead recorded daemon"
+    return DaemonRecoveryResult(
+        "cleaned",
+        True,
+        f"removed stale daemon evidence after {cleanup_reason} and {socket_state} socket proof",
+    )
 
 
 def process_start_token(pid: int) -> Optional[str]:
@@ -605,7 +1448,7 @@ def process_start_token(pid: int) -> Optional[str]:
     return token or None
 
 
-def process_table_snapshot() -> Dict[int, Tuple[int, str]]:
+def process_table_snapshot() -> Optional[Dict[int, Tuple[int, str]]]:
     try:
         completed = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,lstart="],
@@ -614,9 +1457,9 @@ def process_table_snapshot() -> Dict[int, Tuple[int, str]]:
             timeout=2.0,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {}
+        return None
     if completed.returncode != 0:
-        return {}
+        return None
     snapshot: Dict[int, Tuple[int, str]] = {}
     for line in completed.stdout.splitlines():
         parts = line.strip().split(None, 2)
@@ -747,6 +1590,50 @@ def terminal_exit_code(payload: Dict[str, Any]) -> int:
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+@dataclasses.dataclass(frozen=True)
+class SafeFileSample:
+    content: bytes
+    file_size: int
+    sampled_bytes: int
+    omitted_bytes: int
+
+
+def read_safe_regular_file_sample(path: Path, head_bytes: int, tail_bytes: int) -> SafeFileSample:
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ConductorError(f"refusing non-regular file {path}")
+        if info.st_uid != os.getuid():
+            raise ConductorError(f"refusing file not owned by current user {path}")
+        file_size = max(0, int(info.st_size))
+        limit = max(0, head_bytes) + max(0, tail_bytes)
+        if file_size <= limit:
+            content = os.pread(fd, file_size, 0)
+            return SafeFileSample(content, file_size, len(content), max(0, file_size - len(content)))
+
+        head = os.pread(fd, max(0, head_bytes), 0)
+        tail_offset = max(0, file_size - max(0, tail_bytes))
+        tail = os.pread(fd, max(0, tail_bytes), tail_offset)
+        head_boundary = head.rfind(b"\n")
+        if head_boundary >= 0:
+            head = head[: head_boundary + 1]
+        tail_boundary = tail.find(b"\n")
+        if tail_boundary >= 0:
+            tail = tail[tail_boundary + 1 :]
+        sampled = len(head) + len(tail)
+        omitted = max(0, file_size - sampled)
+        marker = f"\n... [conductor omitted {omitted} middle log bytes] ...\n".encode("utf-8")
+        return SafeFileSample(head + marker + tail, file_size, sampled, omitted)
+    finally:
+        os.close(fd)
+
+
 def clean_summary_line(line: str) -> str:
     cleaned = ANSI_RE.sub("", line.rstrip("\r\n"))
     if len(cleaned) > SUMMARY_LINE_MAX_CHARS:
@@ -759,20 +1646,37 @@ class SummarySectionBuilder:
         self.title = title
         self.max_lines = max_lines
         self.keep_last = keep_last
-        self.lines: List[str] = []
-        self.seen: set[str] = set()
+        self._entries: List[str] = []
+        self._counts: Dict[str, int] = {}
+        self.omitted = 0
+
+    @property
+    def lines(self) -> List[str]:
+        return [
+            line if self._counts.get(line, 1) == 1 else f"{line} (repeated {self._counts[line]} times)"
+            for line in self._entries
+        ]
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._counts.clear()
         self.omitted = 0
 
     def add(self, line: str) -> None:
         cleaned = clean_summary_line(line)
-        if not cleaned or cleaned in self.seen:
+        if not cleaned:
             return
-        self.seen.add(cleaned)
-        if len(self.lines) < self.max_lines:
-            self.lines.append(cleaned)
+        if cleaned in self._counts:
+            self._counts[cleaned] += 1
+            return
+        if len(self._entries) < self.max_lines:
+            self._entries.append(cleaned)
+            self._counts[cleaned] = 1
         elif self.keep_last:
-            self.lines.pop(0)
-            self.lines.append(cleaned)
+            removed = self._entries.pop(0)
+            del self._counts[removed]
+            self._entries.append(cleaned)
+            self._counts[cleaned] = 1
             self.omitted += 1
         else:
             self.omitted += 1
@@ -782,11 +1686,12 @@ class SummarySectionBuilder:
             self.add(line)
 
     def payload(self) -> Optional[Dict[str, Any]]:
-        if not self.lines:
+        lines = self.lines
+        if not lines:
             return None
         return {
             "title": self.title,
-            "lines": list(self.lines),
+            "lines": lines,
             "truncated": self.omitted > 0,
             "omittedLineCount": self.omitted,
         }
@@ -826,9 +1731,26 @@ class OutputSummarizer:
         log_path: Path,
     ) -> Dict[str, Any]:
         try:
-            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                return cls.summarize_lines(operation, args, state, exit_code, timed_out, handle)
-        except OSError as exc:
+            sample = read_safe_regular_file_sample(
+                log_path,
+                SUMMARY_FILE_HEAD_BYTES,
+                SUMMARY_FILE_TAIL_BYTES,
+            )
+            summary = cls.summarize_lines(
+                operation,
+                args,
+                state,
+                exit_code,
+                timed_out,
+                sample.content.decode("utf-8", errors="replace").splitlines(keepends=True),
+            )
+            summary["sampledBytes"] = sample.sampled_bytes
+            summary["omittedInputBytes"] = sample.omitted_bytes
+            if sample.omitted_bytes:
+                summary["inputTruncated"] = True
+                summary["truncated"] = True
+            return summary
+        except (OSError, ConductorError) as exc:
             return cls._minimal_summary(operation, state, exit_code, f"could not read log for summary: {exc}")
 
     @classmethod
@@ -865,6 +1787,9 @@ class OutputSummarizer:
             "Summary notes": SummarySectionBuilder("Summary notes", 5),
         }
         line_count = 0
+        input_bytes = 0
+        input_line_limit_reached = False
+        input_byte_limit_reached = False
         warning_count = 0
         error_count = 0
         tail: Deque[str] = deque(maxlen=20)
@@ -872,9 +1797,15 @@ class OutputSummarizer:
         pending_context: List[Tuple[str, int]] = []
         style_operation = operation in {"format", "format-check", "lint", "check-format-tools", "install-format-tools", "format-tools-status"}
 
-        for raw_line in lines_iterable:
+        for raw_line in itertools.islice(lines_iterable, SUMMARY_INPUT_MAX_LINES):
+            raw_text = str(raw_line)
+            raw_bytes = len(raw_text.encode("utf-8", errors="replace"))
+            if input_bytes + raw_bytes > SUMMARY_INPUT_MAX_BYTES:
+                input_byte_limit_reached = True
+                break
             line_count += 1
-            line = clean_summary_line(str(raw_line))
+            input_bytes += raw_bytes
+            line = clean_summary_line(raw_text)
             tail.append(line)
 
             if "Stopping existing RepoPrompt" in line:
@@ -927,6 +1858,19 @@ class OutputSummarizer:
 
             previous_context.append(line)
 
+        if line_count >= SUMMARY_INPUT_MAX_LINES:
+            input_line_limit_reached = True
+        input_truncated = input_line_limit_reached or input_byte_limit_reached
+        if input_truncated:
+            reached = []
+            if input_line_limit_reached:
+                reached.append(f"{SUMMARY_INPUT_MAX_LINES} line limit")
+            if input_byte_limit_reached:
+                reached.append(f"{SUMMARY_INPUT_MAX_BYTES} byte limit")
+            sections["Summary notes"].add(
+                f"Summary input bounded after reaching {' and '.join(reached)}; see the full log path."
+            )
+
         if failure:
             has_strong_failure_section = any(
                 sections[title].lines
@@ -941,7 +1885,7 @@ class OutputSummarizer:
                 sections["Recent output"].extend(list(tail))
         else:
             # Success summaries should stay artifact/phase focused and avoid raw build noise.
-            sections["Recent output"].lines.clear()
+            sections["Recent output"].clear()
 
         headline = cls._headline(state, exit_code, timed_out)
         ordered_titles = [
@@ -994,12 +1938,16 @@ class OutputSummarizer:
             "exitCode": exit_code,
             "headline": headline,
             "logLineCount": line_count,
+            "inputBytes": input_bytes,
+            "inputTruncated": input_truncated,
+            "inputLineLimitReached": input_line_limit_reached,
+            "inputByteLimitReached": input_byte_limit_reached,
             "omittedLineCount": omitted_line_count,
             "errorCount": error_count,
             "warningCount": warning_count,
             "launchLifecycle": launch_lifecycle,
             "sections": payload_sections,
-            "truncated": truncated,
+            "truncated": truncated or input_truncated,
         }
 
     @classmethod
@@ -1058,6 +2006,10 @@ def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
     )
 
 
+def job_consumes_unlaned_capacity(operation: str, lanes: Sequence[str]) -> bool:
+    return not lanes and operation != "format-tools-status"
+
+
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
     if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
         return True
@@ -1098,6 +2050,24 @@ def format_bytes(byte_count: Optional[int]) -> str:
     return f"{value:.1f} {unit}"
 
 
+@dataclasses.dataclass(frozen=True)
+class JobLease:
+    ticket: str
+    job_generation: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ProcessWorkLease:
+    ticket: str
+    job_generation: int
+    process_generation: int
+    pid: Optional[int]
+    pgid: Optional[int]
+    process_start: Optional[str]
+    process_group_identity_confirmed: bool
+    tracked_processes: Dict[int, str]
+
+
 @dataclasses.dataclass
 class Job:
     ticket: str
@@ -1111,6 +2081,10 @@ class Job:
     env: Dict[str, str]
     created_at: float
     log_path: Path
+    job_generation: int = 0
+    process_generation: int = 0
+    phase: str = "queued"
+    phase_changed_at: float = dataclasses.field(default_factory=now)
     state: str = "queued"
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -1124,10 +2098,16 @@ class Job:
     global_heavy_slot_wait_seconds: Optional[float] = None
     global_heavy_slot_path: Optional[str] = None
     global_heavy_slot_holder: Optional[str] = None
+    global_heavy_legacy_slot_holder: Optional[Dict[str, Any]] = None
+    global_heavy_admission_state: str = "notRequired"
+    global_heavy_queue_position: Optional[int] = None
+    global_heavy_waiter_id: Optional[str] = None
+    global_heavy_rescan_seconds: Optional[float] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
     result_summary: Optional[str] = None
     cancel_requested: bool = False
+    cleanup_in_flight: bool = False
     superseded_by_ticket: Optional[str] = None
     superseded_by_operation: Optional[str] = None
     timed_out: bool = False
@@ -1145,6 +2125,18 @@ class Job:
     diagnostics: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
     diagnostic_paths: List[Path] = dataclasses.field(default_factory=list, repr=False)
     output_summary: Optional[Dict[str, Any]] = None
+    summary_generation: int = 0
+    summary_in_flight: bool = False
+    infrastructure_warnings: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    log_sequence: int = 0
+    log_flushed_sequence: int = 0
+    log_settled_sequences: set[int] = dataclasses.field(default_factory=set, repr=False)
+    log_truncated: bool = False
+    log_truncation_reason: Optional[str] = None
+    output_truncated: bool = False
+    output_truncation_reason: Optional[str] = None
+    output_bytes_read: int = 0
+    tail_bytes: int = 0
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
@@ -1163,6 +2155,11 @@ class Job:
             "args": self.args,
             "lanes": self.lanes,
             "state": self.state,
+            "phase": self.phase,
+            "phaseChangedAt": self.phase_changed_at,
+            "phaseChangedAtISO": iso_timestamp(self.phase_changed_at),
+            "jobGeneration": self.job_generation,
+            "processGeneration": self.process_generation,
             "createdAt": self.created_at,
             "createdAtISO": iso_timestamp(self.created_at),
             "startedAt": self.started_at,
@@ -1182,6 +2179,24 @@ class Job:
             "globalHeavySlotWaitSeconds": self.global_heavy_slot_wait_seconds,
             "globalHeavySlotPath": self.global_heavy_slot_path,
             "globalHeavySlotHolder": self.global_heavy_slot_holder,
+            "globalHeavyAdmission": {
+                "displayOnly": True,
+                "state": self.global_heavy_admission_state,
+                "configuredSlots": configured_global_heavy_slots(self.env),
+                "queuePosition": self.global_heavy_queue_position,
+                "waiterID": self.global_heavy_waiter_id,
+                "rescanSeconds": self.global_heavy_rescan_seconds,
+                "headCompetitionSeconds": FAIR_HEAVY_HEAD_COMPETITION_SECONDS,
+                "slotPath": self.global_heavy_slot_path,
+                "waitSeconds": self.global_heavy_slot_wait_seconds,
+                "holder": self.global_heavy_slot_holder,
+                "legacySlotHolder": self.global_heavy_legacy_slot_holder,
+            },
+            "logTruncated": self.log_truncated,
+            "logTruncationReason": self.log_truncation_reason,
+            "outputTruncated": self.output_truncated,
+            "outputTruncationReason": self.output_truncation_reason,
+            "outputBytesRead": self.output_bytes_read,
             "exitCode": self.exit_code,
             "error": self.error,
             "resultSummary": self.result_summary,
@@ -1199,6 +2214,8 @@ class Job:
         }
         if self.diagnostics:
             payload["diagnostics"] = list(self.diagnostics)
+        if self.infrastructure_warnings:
+            payload["infrastructureWarnings"] = list(self.infrastructure_warnings)
         if include_summary and self.output_summary is not None:
             payload["outputSummary"] = self.output_summary
         if include_tail:
@@ -1528,6 +2545,36 @@ class OperationRegistry:
         return hashlib.sha256(json_dumps(material).encode("utf-8")).hexdigest()
 
 
+class ExternalIOWorker:
+    """Bounded daemon-owned queue for best-effort filesystem work."""
+
+    def __init__(self, on_error: Any) -> None:
+        self._on_error = on_error
+        self._tasks: "queue.Queue[Tuple[Any, Tuple[Any, ...]]]" = queue.Queue(maxsize=EXTERNAL_IO_QUEUE_DEPTH)
+        self._thread = threading.Thread(target=self._run, name="conductor-state-io", daemon=True)
+        self._thread.start()
+
+    def submit(self, function: Any, *args: Any) -> bool:
+        try:
+            self._tasks.put_nowait((function, args))
+            return True
+        except queue.Full:
+            return False
+
+    def join(self) -> None:
+        self._tasks.join()
+
+    def _run(self) -> None:
+        while True:
+            function, args = self._tasks.get()
+            try:
+                function(*args)
+            except Exception as exc:
+                self._on_error(str(exc))
+            finally:
+                self._tasks.task_done()
+
+
 class DaemonState:
     def __init__(self, paths: Paths) -> None:
         self.paths = paths
@@ -1538,14 +2585,106 @@ class DaemonState:
         self.queue: List[str] = []
         self.request_keys: Dict[str, str] = {}
         self.active_lanes: Dict[str, str] = {}
+        self.active_unlaned: set[str] = set()
+        self._worker_threads: set[threading.Thread] = set()
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
+        self._next_job_generation = 1
+        self._daemon_start_token = read_daemon_metadata(paths).get("processStart")
+        self._running_registry_generation = 0
+        self._retention_generation = 0
+        self._registry_publish_lock = threading.Lock()
+        self._daemon_infrastructure_warnings: Deque[Dict[str, Any]] = deque(maxlen=MAX_INFRASTRUCTURE_WARNINGS)
+        self._io_worker = ExternalIOWorker(self._record_io_worker_error)
+        self._output_pump = ProcessOutputPump(
+            self._submit_process_output_chunk,
+            self._submit_process_output_line,
+        )
+
+    def _record_io_worker_error(self, message: str) -> None:
+        with self.condition:
+            self._daemon_infrastructure_warnings.append(
+                {"kind": "externalIO", "message": message[:500], "observedAt": now()}
+            )
+            self.condition.notify_all()
+
+    def _warn_job_locked(self, job: Job, kind: str, message: str) -> None:
+        job.infrastructure_warnings.append(
+            {"kind": kind, "message": message[:500], "observedAt": now()}
+        )
+        if len(job.infrastructure_warnings) > MAX_INFRASTRUCTURE_WARNINGS:
+            del job.infrastructure_warnings[:-MAX_INFRASTRUCTURE_WARNINGS]
+
+    @staticmethod
+    def _set_phase_locked(job: Job, phase: str) -> None:
+        if phase not in JOB_PHASES:
+            raise ConductorError(f"invalid job phase '{phase}'")
+        if job.phase != phase:
+            job.phase = phase
+            job.phase_changed_at = now()
+
+    @staticmethod
+    def _job_lease(job: Job) -> JobLease:
+        return JobLease(job.ticket, job.job_generation)
+
+    @staticmethod
+    def _process_lease(job: Job) -> ProcessWorkLease:
+        return ProcessWorkLease(
+            ticket=job.ticket,
+            job_generation=job.job_generation,
+            process_generation=job.process_generation,
+            pid=job.process_pid,
+            pgid=job.process_pgid,
+            process_start=job.process_start,
+            process_group_identity_confirmed=job.process_group_identity_confirmed,
+            tracked_processes=dict(job.tracked_processes),
+        )
+
+    def _job_matches_lease_locked(self, lease: JobLease) -> Optional[Job]:
+        job = self.jobs.get(lease.ticket)
+        if job is None or job.job_generation != lease.job_generation:
+            return None
+        return job
+
+    def _job_matches_process_lease_locked(self, lease: ProcessWorkLease) -> Optional[Job]:
+        job = self.jobs.get(lease.ticket)
+        if (
+            job is None
+            or job.job_generation != lease.job_generation
+            or job.process_generation != lease.process_generation
+        ):
+            return None
+        return job
+
+    def _external_call_while_locked(self, function: Any, *args: Any) -> Any:
+        """Run external work with all recursive holds on the central RLock released."""
+        # RepoPrompt's conductor is macOS-CPython-only. These private RLock hooks
+        # are required to restore the exact recursive hold count around external work.
+        if not self.lock._is_owned():  # type: ignore[attr-defined]
+            return function(*args)
+        release_state = self.lock._release_save()  # type: ignore[attr-defined]
+        try:
+            return function(*args)
+        finally:
+            self.lock._acquire_restore(release_state)  # type: ignore[attr-defined]
 
     def _global_heavy_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
         return global_heavy_slot_paths(env)
 
+    def _active_daemon_warnings_locked(self) -> List[Dict[str, Any]]:
+        cutoff = now() - INFRASTRUCTURE_WARNING_TTL_SECONDS
+        retained = [
+            warning
+            for warning in self._daemon_infrastructure_warnings
+            if float(warning.get("observedAt") or 0.0) >= cutoff
+        ]
+        if len(retained) != len(self._daemon_infrastructure_warnings):
+            self._daemon_infrastructure_warnings = deque(retained, maxlen=MAX_INFRASTRUCTURE_WARNINGS)
+        return retained
+
     def status_payload(self) -> Dict[str, Any]:
         with self.lock:
+            active_warnings = self._active_daemon_warnings_locked()
             active_by_lane = {
                 lane: self._job_payload_locked(self.jobs[ticket], include_tail=False, include_summary=False)
                 for lane, ticket in sorted(self.active_lanes.items())
@@ -1556,6 +2695,7 @@ class DaemonState:
             terminal_count = sum(1 for job in self.jobs.values() if job.state in TERMINAL_STATES)
             return {
                 "protocolVersion": PROTOCOL_VERSION,
+                "running": True,
                 "pid": os.getpid(),
                 "repoRoot": str(self.paths.repo_root),
                 "repoHash": self.paths.repo_hash,
@@ -1565,11 +2705,23 @@ class DaemonState:
                 "globalHeavySlotCount": configured_global_heavy_slots(),
                 "liveAppLockPath": str(live_app_lock_path()),
                 "activeJobsByLane": active_by_lane,
+                "activeUnlanedJobs": [
+                    self._job_payload_locked(self.jobs[ticket], include_tail=False, include_summary=False)
+                    for ticket in sorted(self.active_unlaned)
+                    if ticket in self.jobs
+                ],
+                "unlanedCapacity": {"limit": MAX_UNLANED_JOBS, "activeCount": len(self.active_unlaned)},
                 "runningJobs": running_jobs,
                 "queuedJobs": queued_jobs,
                 "queueDepth": len(self.queue),
                 "retainedTerminalCount": terminal_count,
                 "shutdownRequested": self.shutdown_requested,
+                "health": {
+                    "state": "stopping" if self.shutdown_requested else ("degraded" if active_warnings else "healthy"),
+                    "rpcResponsive": True,
+                    "processIdentityVerified": True,
+                    "issues": active_warnings,
+                },
             }
 
     def _job_payload_locked(self, job: Job, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
@@ -1616,6 +2768,30 @@ class DaemonState:
                         "cancelRequested": blocker.cancel_requested,
                     }
                 )
+        if job_consumes_unlaned_capacity(job.operation, job.lanes):
+            earlier_unlaned = any(
+                ticket != job.ticket
+                and (candidate := self.jobs.get(ticket)) is not None
+                and candidate.state == "queued"
+                and job_consumes_unlaned_capacity(candidate.operation, candidate.lanes)
+                for ticket in self.queue[: self.queue.index(job.ticket)]
+            ) if job.ticket in self.queue else False
+            if len(self.active_unlaned) >= MAX_UNLANED_JOBS or earlier_unlaned:
+                blockers.append(
+                    {
+                        "kind": "unlanedCapacity",
+                        "limit": MAX_UNLANED_JOBS,
+                        "activeCount": len(self.active_unlaned),
+                        "activeJobs": [
+                            {
+                                "ticket": ticket,
+                                "operationLabel": operation_display_name(self.jobs[ticket].operation, self.jobs[ticket].args),
+                            }
+                            for ticket in sorted(self.active_unlaned)
+                            if ticket in self.jobs
+                        ],
+                    }
+                )
         return blockers
 
     def enqueue(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -1654,6 +2830,8 @@ class DaemonState:
 
             ticket = str(uuid.uuid4())
             log_path = self.paths.jobs_dir / f"{ticket}.log"
+            job_generation = self._next_job_generation
+            self._next_job_generation += 1
             job = Job(
                 ticket=ticket,
                 request_key=request_key,
@@ -1666,6 +2844,8 @@ class DaemonState:
                 env=env_snapshot,
                 created_at=now(),
                 log_path=log_path,
+                job_generation=job_generation,
+                phase="queued",
             )
             intent = latest_lifecycle_intent(job.operation, job.args)
             superseded_jobs: List[Dict[str, Any]] = []
@@ -1699,6 +2879,7 @@ class DaemonState:
             guard_delayed_launch = guard_delayed_launch or bool(old_job.args.get("guardDelayedLaunch"))
             if prior_state == "queued":
                 old_job.state = "canceled"
+                self._set_phase_locked(old_job, "terminal")
                 old_job.finished_at = now()
                 old_job.exit_code = 130
                 old_job.result_summary = f"superseded before start by {intent}"
@@ -1707,16 +2888,10 @@ class DaemonState:
                 self._append_system_line_locked(old_job, f"job superseded before start by {intent} {new_job.ticket}\n")
                 cancellation_state = "canceled"
             else:
+                self._set_phase_locked(old_job, "canceling")
                 guard_delayed_launch = guard_delayed_launch or is_launch_capable_job(old_job.operation, old_job.args)
                 reason = f"superseded by {intent} {new_job.ticket}"
-                termination_sent = bool(old_job.process_pid or old_job.process_pgid)
-                if termination_sent:
-                    self._terminate_process_group_locked(old_job, reason=reason)
-                threading.Thread(
-                    target=self._escalate_canceled_job_after_grace,
-                    args=(old_job.ticket, reason, termination_sent),
-                    daemon=True,
-                ).start()
+                self._request_process_cleanup_locked(old_job, reason=reason)
                 cancellation_state = "cancellation-requested"
             superseded.append(
                 {
@@ -1727,30 +2902,6 @@ class DaemonState:
                 }
             )
         return superseded, guard_delayed_launch
-
-    def _escalate_canceled_job_after_grace(self, ticket: str, reason: str, termination_sent: bool) -> None:
-        with self.condition:
-            job = self.jobs.get(ticket)
-            while job and job.state == "running" and not job.process_pid:
-                self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
-                job = self.jobs.get(ticket)
-            if not job or job.state != "running":
-                return
-            if not termination_sent:
-                self._terminate_process_group_locked(job, reason=reason)
-            descendants_alive = self._wait_for_process_tree_exit_locked(
-                job,
-                now() + TERMINATE_GRACE_SECONDS,
-                signal_for_new=signal.SIGTERM,
-            )
-            if descendants_alive:
-                self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
-                self._wait_for_process_tree_exit_locked(
-                    job,
-                    now() + KILL_GRACE_SECONDS,
-                    signal_for_new=signal.SIGKILL,
-                )
-            self.condition.notify_all()
 
     def list_jobs(self, state_filter: Optional[str]) -> Dict[str, Any]:
         with self.lock:
@@ -1809,6 +2960,7 @@ class DaemonState:
             if job.state == "queued":
                 job.cancel_requested = True
                 job.state = "canceled"
+                self._set_phase_locked(job, "terminal")
                 job.finished_at = now()
                 job.exit_code = 130
                 job.result_summary = "canceled before start"
@@ -1821,8 +2973,19 @@ class DaemonState:
                 return self._job_payload_locked(job, include_tail=True)
             if job.state == "running":
                 job.cancel_requested = True
-                self._cancel_running_job_locked(job, reason="cancellation requested")
-                return self._job_payload_locked(job, include_tail=True)
+                self._set_phase_locked(job, "canceling")
+                self._request_process_cleanup_locked(job, reason="cancellation requested")
+                deadline = time.monotonic() + CANCEL_CLEANUP_WAIT_SECONDS
+                while job.cleanup_in_flight:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        payload = self._job_payload_locked(job, include_tail=True)
+                        payload["cancellationPending"] = True
+                        return payload
+                    self.condition.wait(timeout=remaining)
+                payload = self._job_payload_locked(job, include_tail=True)
+                payload["cancellationPending"] = False
+                return payload
             return self._job_payload_locked(job, include_tail=True)
 
     def stop(self, force: bool) -> Dict[str, Any]:
@@ -1839,6 +3002,7 @@ class DaemonState:
                     job.cancel_requested = True
                     if job.state == "queued":
                         job.state = "canceled"
+                        self._set_phase_locked(job, "terminal")
                         job.finished_at = now()
                         job.exit_code = 130
                         job.result_summary = "canceled by daemon stop --force"
@@ -1847,7 +3011,8 @@ class DaemonState:
                         self._append_system_line_locked(job, "job canceled by daemon stop --force before start\n")
                     elif job.state == "running":
                         running_tickets.append(job.ticket)
-                        self._terminate_process_group_locked(job, reason="daemon stop --force")
+                        self._set_phase_locked(job, "canceling")
+                        self._request_process_cleanup_locked(job, reason="daemon stop --force")
                 self._write_running_processes_locked()
                 self.condition.notify_all()
             payload = self.status_payload()
@@ -1890,6 +3055,8 @@ class DaemonState:
         new_queue: List[str] = []
         to_start: List[Job] = []
         active_lane_set = set(self.active_lanes.keys())
+        active_unlaned_count = len(self.active_unlaned)
+        earlier_unlaned_blocked = False
 
         for ticket in self.queue:
             job = self.jobs.get(ticket)
@@ -1900,105 +3067,197 @@ class DaemonState:
                 blocked_lanes.update(job_lanes)
                 new_queue.append(ticket)
                 continue
+            consumes_unlaned = job_consumes_unlaned_capacity(job.operation, job.lanes)
+            if consumes_unlaned and (earlier_unlaned_blocked or active_unlaned_count >= MAX_UNLANED_JOBS):
+                earlier_unlaned_blocked = True
+                new_queue.append(ticket)
+                continue
             to_start.append(job)
             active_lane_set.update(job_lanes)
+            if consumes_unlaned:
+                active_unlaned_count += 1
 
         self.queue = new_queue
         for job in to_start:
             job.state = "running"
             job.started_at = now()
+            if operation_requires_global_heavy_slot(job.operation, job.args):
+                self._set_phase_locked(job, "waitingGlobalHeavy")
+                job.global_heavy_admission_state = "waiting"
+            else:
+                self._set_phase_locked(job, "startingProcess")
             for lane in job.lanes:
                 self.active_lanes[lane] = job.ticket
+            if job_consumes_unlaned_capacity(job.operation, job.lanes):
+                self.active_unlaned.add(job.ticket)
             thread = threading.Thread(target=self._run_job, args=(job.ticket,), daemon=True)
+            self._worker_threads.add(thread)
             thread.start()
         if to_start:
             self.condition.notify_all()
 
-    def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
+    def _terminalize_canceled_global_heavy_wait_locked(self, job: Job) -> None:
+        job.state = "canceled"
+        self._set_phase_locked(job, "terminal")
+        job.global_heavy_admission_state = "released"
+        job.exit_code = 130
+        job.result_summary = "canceled before global heavy slot"
+        job.finished_at = now()
+        self._append_system_line_locked(job, "job canceled before global heavy slot\n")
+        self.condition.notify_all()
+
+    def _acquire_global_heavy_slot(self, ticket: str) -> Optional[FairHeavyLease]:
         wait_start = now()
         with self.condition:
             job = self.jobs.get(ticket)
-            env = dict(job.env) if job else {}
-        lock_paths = self._global_heavy_slot_paths(env)
-        ensure_private_dir(machine_lock_dir())
-        lock_files = [(path, path.open("a+", encoding="utf-8")) for path in lock_paths]
-        did_log_wait = False
-        selected_path: Optional[Path] = None
-        selected_file: Optional[Any] = None
-        try:
-            while True:
-                with self.condition:
-                    job = self.jobs.get(ticket)
-                    if not job or job.state != "running":
-                        return None
-                    if job.cancel_requested:
-                        job.state = "canceled"
-                        job.exit_code = 130
-                        job.result_summary = "canceled before global heavy slot"
-                        job.finished_at = now()
-                        self._append_system_line_locked(job, "job canceled before global heavy slot\n")
-                        self.condition.notify_all()
-                        return None
-                for lock_path, lock_file in lock_files:
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        selected_path = lock_path
-                        selected_file = lock_file
-                        break
-                    except BlockingIOError:
-                        continue
-                    except OSError as exc:
-                        if exc.errno == errno.EINTR:
-                            continue
-                        raise
-                if selected_file is not None and selected_path is not None:
-                    break
-                holders = [format_display_lock_holder(read_display_lock_metadata(path)) for path, _file in lock_files]
-                with self.condition:
-                    job = self.jobs.get(ticket)
-                    if job and job.state == "running":
-                        job.global_heavy_slot_path = ",".join(str(path) for path, _file in lock_files)
-                        job.global_heavy_slot_holder = "; ".join(holders)
-                        if not did_log_wait:
-                            self._append_system_line_locked(
-                                job,
-                                f"waiting for global heavy slot ({len(lock_files)} configured): {job.global_heavy_slot_path}; {job.global_heavy_slot_holder}\n",
-                            )
-                            self.condition.notify_all()
-                            did_log_wait = True
-                time.sleep(GLOBAL_HEAVY_SLOT_POLL_SECONDS)
-            waited = now() - wait_start
+            if job is None:
+                return None
+            env = dict(job.env)
+            lease = self._job_lease(job)
+            metadata = display_lock_metadata(
+                lock_kind="global-heavy",
+                ticket=job.ticket,
+                operation=job.operation,
+                operation_label=operation_display_name(job.operation, job.args),
+                repo_root=self.paths.repo_root,
+                repo_hash=self.paths.repo_hash,
+            )
+        def admission_warning(kind: str, message: str) -> None:
             with self.condition:
-                job = self.jobs.get(ticket)
-                if job and job.state == "running":
-                    metadata = display_lock_metadata(
-                        lock_kind="global-heavy",
-                        ticket=job.ticket,
-                        operation=job.operation,
-                        operation_label=operation_display_name(job.operation, job.args),
-                        repo_root=self.paths.repo_root,
-                        repo_hash=self.paths.repo_hash,
+                current = self._job_matches_lease_locked(lease)
+                if current is not None:
+                    self._warn_job_locked(current, kind, message)
+                self._daemon_infrastructure_warnings.append(
+                    {"kind": kind, "message": message[:500], "observedAt": now()}
+                )
+                self.condition.notify_all()
+
+        coordinator = FairHeavyAdmission(metadata, env, on_warning=admission_warning)
+        with self.condition:
+            current = self._job_matches_lease_locked(lease)
+            if current is not None:
+                current.global_heavy_waiter_id = coordinator.waiter_id
+
+        def cancel_check() -> bool:
+            with self.condition:
+                current = self._job_matches_lease_locked(lease)
+                return current is None or current.state != "running" or current.cancel_requested
+
+        def update(position: int, earlier: List[Dict[str, Any]]) -> None:
+            with self.condition:
+                current = self._job_matches_lease_locked(lease)
+                if current is None or current.state != "running":
+                    return
+                current.global_heavy_queue_position = position
+                current.global_heavy_rescan_seconds = coordinator.current_rescan_seconds
+                current.global_heavy_slot_path = ",".join(str(path) for path in global_heavy_slot_paths(env))
+                fair_holders = earlier[: configured_global_heavy_slots(env)]
+                current.global_heavy_legacy_slot_holder = coordinator.legacy_slot_holder
+                if fair_holders:
+                    current.global_heavy_slot_holder = json.dumps(fair_holders, sort_keys=True)
+                elif coordinator.legacy_slot_holder:
+                    current.global_heavy_slot_holder = "non-authoritative legacy slot holder: " + json.dumps(
+                        coordinator.legacy_slot_holder.get("metadata"), sort_keys=True
                     )
-                    write_display_lock_metadata(selected_file, metadata)
-                    job.global_heavy_slot_wait_seconds = waited
-                    job.global_heavy_slot_path = str(selected_path)
-                    job.global_heavy_slot_holder = None
-                    self._append_system_line_locked(
-                        job,
-                        f"acquired global heavy slot {selected_path} after {format_duration(waited)}\n",
-                    )
-                    self.condition.notify_all()
-            return selected_file
-        finally:
-            for _path, lock_file in lock_files:
-                if lock_file is selected_file:
-                    continue
-                with contextlib.suppress(OSError):
-                    lock_file.close()
+                else:
+                    current.global_heavy_slot_holder = None
+                self.condition.notify_all()
+
+        acquired = coordinator.wait(cancel_check=cancel_check, update=update)
+        if acquired is None:
+            with self.condition:
+                current = self._job_matches_lease_locked(lease)
+                if current is not None and current.state == "running":
+                    self._terminalize_canceled_global_heavy_wait_locked(current)
+            return None
+        waited = now() - wait_start
+        release_stale_acquisition = False
+        with self.condition:
+            current = self._job_matches_lease_locked(lease)
+            if current is None or current.state != "running":
+                release_stale_acquisition = True
+            elif current.cancel_requested:
+                release_stale_acquisition = True
+                self._terminalize_canceled_global_heavy_wait_locked(current)
+            else:
+                current.global_heavy_slot_wait_seconds = waited
+                current.global_heavy_slot_path = str(acquired.lock_path)
+                current.global_heavy_slot_holder = None
+                current.global_heavy_legacy_slot_holder = None
+                current.global_heavy_admission_state = "acquired"
+                current.global_heavy_queue_position = 1
+                self._set_phase_locked(current, "startingProcess")
+                self._append_system_line_locked(
+                    current,
+                    f"acquired fair global heavy slot {acquired.lock_path} after {format_duration(waited)}\n",
+                )
+                self.condition.notify_all()
+        if release_stale_acquisition:
+            acquired.release()
+            return None
+        return acquired
+
+    def _publish_started_process_identity(self, job: Job, process: subprocess.Popen[bytes]) -> bool:
+        process_pgid: Optional[int] = None
+        with contextlib.suppress(OSError):
+            process_pgid = os.getpgid(process.pid)
+        snapshot = process_table_snapshot() or {}
+        process_record = snapshot.get(process.pid)
+        observed_process_start = process_record[1] if process_record else process_start_token(process.pid)
+        with self.condition:
+            job.process_started_at = now()
+            job.process_generation += 1
+            job.process_pid = process.pid
+            job.process_pgid = process_pgid
+            job.process_start = observed_process_start
+            job.process_group_identity_confirmed = bool(
+                observed_process_start and process_pgid == process.pid
+            )
+            if observed_process_start:
+                job.tracked_processes[process.pid] = observed_process_start
+            self._set_phase_locked(job, "runningProcess")
+            self._write_running_processes_locked()
+            cancel_after_publish = job.cancel_requested and job.superseded_by_ticket is None
+            self.condition.notify_all()
+        return cancel_after_publish
+
+    def _cleanup_failed_output_registration(self, job: Job, process: subprocess.Popen[bytes]) -> None:
+        reason = "output pump registration failed"
+        with self.condition:
+            self._terminate_process_group_locked(job, reason=reason)
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            process.terminate()
+        root_alive = False
+        try:
+            process.wait(timeout=TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            root_alive = True
+        with self.condition:
+            descendants_alive = self._wait_for_process_tree_exit_locked(
+                job,
+                now() + TERMINATE_GRACE_SECONDS,
+                signal_for_new=signal.SIGTERM,
+            )
+            if root_alive or descendants_alive:
+                self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
+        if root_alive:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=KILL_GRACE_SECONDS)
+        with self.condition:
+            self._wait_for_process_tree_exit_locked(
+                job,
+                now() + KILL_GRACE_SECONDS,
+                signal_for_new=signal.SIGKILL,
+            )
 
     @staticmethod
     def _release_global_heavy_slot(lock_file: Optional[Any]) -> None:
         if lock_file is None:
+            return
+        if isinstance(lock_file, FairHeavyLease):
+            lock_file.release()
             return
         with contextlib.suppress(OSError):
             lock_file.seek(0)
@@ -2013,6 +3272,7 @@ class DaemonState:
         job: Optional[Job] = None
         process: Optional[subprocess.Popen[bytes]] = None
         output_transport: Optional[ProcessOutputTransport] = None
+        output_channel: Optional[ProcessOutputChannel] = None
         watchdog: Optional[threading.Thread] = None
         global_heavy_slot: Optional[Any] = None
         try:
@@ -2027,6 +3287,7 @@ class DaemonState:
                 }
                 if job.cancel_requested:
                     job.state = "canceled"
+                    self._set_phase_locked(job, "terminal")
                     job.exit_code = 130
                     job.result_summary = "canceled before process start"
                     job.finished_at = now()
@@ -2039,173 +3300,199 @@ class DaemonState:
                 if global_heavy_slot is None:
                     return
             start_line = f"$ {format_argv(argv)}\n"
-            with job.log_path.open("ab") as log_file:
-                with self.lock:
-                    self._append_tail_locked(job, start_line)
-                log_file.write(start_line.encode("utf-8", errors="replace"))
-                log_file.flush()
-                output_transport = self._create_process_output_transport(job)
+            with self.condition:
+                self._append_system_line_locked(job, start_line)
+            output_transport = self._create_process_output_transport(job)
+            with self.condition:
                 job.progress_transport = output_transport.kind
-                process = subprocess.Popen(
-                    argv,
-                    cwd=str(cwd),
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=output_transport.popen_stdout,
-                    stderr=output_transport.popen_stderr,
-                    start_new_session=True,
-                )
-                output_transport.attach_process(process)
-                with self.condition:
-                    job.process_started_at = now()
-                    job.process_pid = process.pid
-                    with contextlib.suppress(OSError):
-                        job.process_pgid = os.getpgid(process.pid)
-                    snapshot = process_table_snapshot()
-                    process_record = snapshot.get(process.pid)
-                    job.process_start = process_record[1] if process_record else process_start_token(process.pid)
-                    if job.process_start:
-                        job.tracked_processes[process.pid] = job.process_start
-                    self._write_running_processes_locked()
-                    if job.cancel_requested and job.superseded_by_ticket is None:
-                        self._terminate_process_group_locked(job, reason="cancellation requested before PID assignment")
-                    self.condition.notify_all()
+            process = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=output_transport.popen_stdout,
+                stderr=output_transport.popen_stderr,
+                start_new_session=True,
+            )
+            output_transport.attach_process(process)
+            reader_fd = output_transport.transfer_reader()
+            try:
+                output_channel = self._output_pump.register(job.ticket, reader_fd, output_transport.kind)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(reader_fd)
+                self._publish_started_process_identity(job, process)
+                self._cleanup_failed_output_registration(job, process)
+                raise
 
-                reader = threading.Thread(
-                    target=self._read_process_output,
-                    args=(job.ticket, process, log_file, output_transport),
+            cancel_after_publish = self._publish_started_process_identity(job, process)
+            if cancel_after_publish:
+                with self.condition:
+                    current = self.jobs.get(job.ticket)
+                    if current is job:
+                        self._request_process_cleanup_locked(job, "cancellation requested before PID assignment")
+
+            if self._xctest_watchdog_enabled(job):
+                watchdog = threading.Thread(
+                    target=self._monitor_xctest_stall,
+                    args=(job.ticket,),
                     daemon=True,
                 )
-                reader.start()
-                if self._xctest_watchdog_enabled(job):
-                    watchdog = threading.Thread(
-                        target=self._monitor_xctest_stall,
-                        args=(job.ticket,),
-                        daemon=True,
-                    )
-                    watchdog.start()
+                watchdog.start()
+            try:
+                exit_code = process.wait(timeout=effective_timeout)
+            except subprocess.TimeoutExpired:
+                term_deadline = now() + TERMINATE_GRACE_SECONDS
+                with self.condition:
+                    job.timed_out = True
+                    job.error = f"timed out after {effective_timeout:.1f}s"
+                    self._append_system_line_locked(job, job.error + "\n")
+                    self._terminate_process_group_locked(job, reason=job.error)
+                root_alive = False
                 try:
-                    exit_code = process.wait(timeout=effective_timeout)
+                    exit_code = process.wait(timeout=TERMINATE_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
-                    term_deadline = now() + TERMINATE_GRACE_SECONDS
-                    with self.condition:
-                        job.timed_out = True
-                        job.error = f"timed out after {effective_timeout:.1f}s"
-                        self._append_system_line_locked(job, job.error + "\n")
-                        self._terminate_process_group_locked(job, reason=job.error)
-                    root_alive = False
+                    root_alive = True
+                    exit_code = 124
+                with self.condition:
+                    descendants_alive = self._wait_for_process_tree_exit_locked(
+                        job,
+                        term_deadline,
+                        signal_for_new=signal.SIGTERM,
+                    )
+                    if root_alive or descendants_alive:
+                        self._kill_process_group_locked(job, reason="SIGKILL after timeout grace period")
+                if root_alive:
                     try:
-                        exit_code = process.wait(timeout=TERMINATE_GRACE_SECONDS)
+                        exit_code = process.wait(timeout=KILL_GRACE_SECONDS)
                     except subprocess.TimeoutExpired:
-                        root_alive = True
                         exit_code = 124
-                    with self.condition:
-                        descendants_alive = self._wait_for_process_tree_exit_locked(
-                            job,
-                            term_deadline,
-                            signal_for_new=signal.SIGTERM,
-                        )
-                        if root_alive or descendants_alive:
-                            self._kill_process_group_locked(job, reason="SIGKILL after timeout grace period")
-                    if root_alive:
-                        try:
-                            exit_code = process.wait(timeout=KILL_GRACE_SECONDS)
-                        except subprocess.TimeoutExpired:
-                            exit_code = 124
-                            with self.condition:
-                                job.error = (
-                                    f"timed out after {effective_timeout:.1f}s; "
-                                    "root process did not exit after SIGKILL escalation"
-                                )
-                                self._append_system_line_locked(job, job.error + "\n")
-                    with self.condition:
-                        descendants_alive = self._wait_for_process_tree_exit_locked(
-                            job,
-                            now() + KILL_GRACE_SECONDS,
-                            signal_for_new=signal.SIGKILL,
-                        )
-                        if descendants_alive:
+                        with self.condition:
                             job.error = (
                                 f"timed out after {effective_timeout:.1f}s; "
-                                "job processes remained alive after SIGKILL escalation"
+                                "root process did not exit after SIGKILL escalation"
                             )
                             self._append_system_line_locked(job, job.error + "\n")
-                    if exit_code == 0:
-                        exit_code = 124
                 with self.condition:
-                    job.process_finished_at = now()
-                if job.cancel_requested:
-                    with self.condition:
-                        if self._process_tree_alive_locked(job):
-                            self._terminate_process_group_locked(job, reason="cancellation descendant cleanup")
-                            term_deadline = now() + TERMINATE_GRACE_SECONDS
+                    descendants_alive = self._wait_for_process_tree_exit_locked(
+                        job,
+                        now() + KILL_GRACE_SECONDS,
+                        signal_for_new=signal.SIGKILL,
+                    )
+                    if descendants_alive:
+                        job.error = (
+                            f"timed out after {effective_timeout:.1f}s; "
+                            "job processes remained alive after SIGKILL escalation"
+                        )
+                        self._append_system_line_locked(job, job.error + "\n")
+                if exit_code == 0:
+                    exit_code = 124
+
+            with self.condition:
+                job.process_finished_at = now()
+                self._set_phase_locked(job, "finalizingOutput")
+            if job.cancel_requested:
+                with self.condition:
+                    process_tree_alive = self._process_tree_alive_locked(job)
+                    if process_tree_alive is not False:
+                        self._terminate_process_group_locked(job, reason="cancellation descendant cleanup")
+                        descendants_alive = self._wait_for_process_tree_exit_locked(
+                            job,
+                            now() + TERMINATE_GRACE_SECONDS,
+                            signal_for_new=signal.SIGTERM,
+                        )
+                        if descendants_alive:
+                            self._kill_process_group_locked(
+                                job,
+                                reason="cancellation descendant cleanup; SIGKILL after grace period",
+                            )
                             descendants_alive = self._wait_for_process_tree_exit_locked(
-                                job, term_deadline, signal_for_new=signal.SIGTERM
+                                job,
+                                now() + KILL_GRACE_SECONDS,
+                                signal_for_new=signal.SIGKILL,
                             )
-                            if descendants_alive:
-                                self._kill_process_group_locked(job, reason="cancellation descendant cleanup; SIGKILL after grace period")
-                                descendants_alive = self._wait_for_process_tree_exit_locked(
-                                    job, now() + KILL_GRACE_SECONDS, signal_for_new=signal.SIGKILL
-                                )
-                            if descendants_alive:
-                                raise ConductorError("canceled job descendants remained alive after SIGKILL escalation")
-                reader.join(timeout=2.0)
-                if reader.is_alive():
-                    output_transport.close_reader()
-                    reader.join(timeout=2.0)
-                else:
-                    output_transport.close_reader()
-                with self.condition:
-                    job.xctest_process_finished = True
-                    self.condition.notify_all()
-                if watchdog is not None:
-                    watchdog.join(timeout=XCTEST_WATCHDOG_JOIN_SECONDS)
-                    if watchdog.is_alive():
-                        with self.condition:
-                            job.measurement_invalid = True
-                            job.error = "XCTest progress stall watchdog did not finish bounded diagnostics"
-                            self._append_system_line_locked(job, job.error + "\n")
-                with self.condition:
-                    self._finalize_process_exit_locked(job, exit_code)
-                    job.finished_at = now()
-        except Exception as exc:  # defensive: preserve daemon health
+                        if descendants_alive:
+                            raise ConductorError(
+                                "canceled job descendants remained alive after SIGKILL escalation"
+                            )
+
+            self._output_pump.request_finalization(output_channel)
+            output_result = self._output_pump.wait_for_completion(output_channel)
+            with self.condition:
+                job.output_truncated = output_result.truncated
+                job.output_truncation_reason = output_result.reason
+                job.output_bytes_read = output_result.bytes_read
+                if output_result.truncated:
+                    job.log_truncated = True
+                    job.log_truncation_reason = output_result.reason
+                    self._append_system_line_locked(
+                        job,
+                        f"process output truncated during bounded finalization: {output_result.reason}\n",
+                    )
+                job.xctest_process_finished = True
+                self.condition.notify_all()
+            if watchdog is not None:
+                watchdog.join(timeout=XCTEST_WATCHDOG_JOIN_SECONDS)
+                if watchdog.is_alive():
+                    with self.condition:
+                        job.measurement_invalid = True
+                        job.error = "XCTest progress stall watchdog did not finish bounded diagnostics"
+                        self._append_system_line_locked(job, job.error + "\n")
+            with self.condition:
+                self._finalize_process_exit_locked(job, exit_code)
+                self._set_phase_locked(job, "summarizing")
+                job.finished_at = now()
+        except Exception as exc:
             if job is not None:
                 with self.condition:
                     job.state = "failed"
+                    self._set_phase_locked(job, "summarizing")
                     job.exit_code = 1
                     job.error = str(exc)
                     job.result_summary = f"daemon runner error: {exc}"
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
+            if output_channel is not None and output_channel.result is None:
+                with contextlib.suppress(ConductorError):
+                    self._output_pump.request_finalization(output_channel)
+                output_result = self._output_pump.wait_for_completion(output_channel)
+                if job is not None:
+                    with self.condition:
+                        job.output_truncated = output_result.truncated
+                        job.output_truncation_reason = output_result.reason
+                        job.output_bytes_read = output_result.bytes_read
             self._release_global_heavy_slot(global_heavy_slot)
+            if job is not None and global_heavy_slot is not None:
+                with self.condition:
+                    if self.jobs.get(job.ticket) is job:
+                        job.global_heavy_admission_state = "released"
             if output_transport is not None:
                 output_transport.close_all()
             refresh_after_release = False
             with self.condition:
                 if job is not None:
                     refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
+                    if job.state in TERMINAL_STATES and not job.cleanup_in_flight:
+                        job.process_generation += 1
+                        job.tracked_processes.clear()
                     for lane in list(job.lanes):
                         if self.active_lanes.get(lane) == job.ticket:
                             del self.active_lanes[lane]
+                    self.active_unlaned.discard(job.ticket)
                     self._write_running_processes_locked()
                     self._retention_pass_locked()
+                self._worker_threads.discard(threading.current_thread())
                 self._schedule_locked()
                 self.condition.notify_all()
             if job is not None and refresh_after_release:
                 threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
 
-    @staticmethod
-    def _take_complete_output_lines(pending: bytearray, chunk: bytes) -> List[bytes]:
-        pending.extend(chunk)
-        lines: List[bytes] = []
-        while True:
-            newline = pending.find(b"\n")
-            if newline < 0:
-                return lines
-            end = newline + 1
-            lines.append(bytes(pending[:end]))
-            del pending[:end]
+    def _submit_process_output_chunk(self, ticket: str, chunk: bytes) -> None:
+        with self.condition:
+            job = self.jobs.get(ticket)
+            if job is not None:
+                self._queue_job_log_bytes_locked(job, chunk)
 
     def _submit_process_output_line(self, ticket: str, line: bytes) -> None:
         text = line.decode("utf-8", errors="replace")
@@ -2215,28 +3502,6 @@ class DaemonState:
                 self._append_tail_locked(job, text)
                 self._record_xctest_progress_locked(job, text)
                 self.condition.notify_all()
-
-    def _read_process_output(
-        self,
-        ticket: str,
-        process: subprocess.Popen[bytes],
-        log_file: Any,
-        output_transport: ProcessOutputTransport,
-    ) -> None:
-        pending = bytearray()
-        try:
-            while True:
-                chunk = output_transport.read_chunk(process)
-                if not chunk:
-                    break
-                log_file.write(chunk)
-                log_file.flush()
-                for line in self._take_complete_output_lines(pending, chunk):
-                    self._submit_process_output_line(ticket, line)
-        finally:
-            if pending:
-                self._submit_process_output_line(ticket, bytes(pending))
-            output_transport.close_reader()
 
     def _finalize_process_exit_locked(self, job: Job, exit_code: int) -> None:
         if job.cancel_requested:
@@ -2364,8 +3629,13 @@ class DaemonState:
         self,
         job: Job,
     ) -> Tuple[Optional[Tuple[int, str]], List[Dict[str, Any]]]:
-        verified, depths = self._refresh_process_tree_locked(job)
-        commands = process_command_snapshot(verified.keys())
+        verified, depths, conclusive = self._refresh_process_tree_locked(job)
+        if not conclusive:
+            return None, []
+        lease = self._process_lease(job)
+        commands = self._external_call_while_locked(process_command_snapshot, list(verified.keys()))
+        if self._job_matches_process_lease_locked(lease) is None:
+            return None, []
         entries: List[Dict[str, Any]] = []
         matches: List[Tuple[int, int, str]] = []
         for pid in sorted(verified, key=lambda candidate: (depths.get(candidate, 0), candidate)):
@@ -2388,7 +3658,8 @@ class DaemonState:
         return (pid, start_token), entries
 
     def _signal_process_identity(self, pid: int, start_token: str, sig: signal.Signals) -> bool:
-        confirmation = process_table_snapshot().get(pid)
+        snapshot = process_table_snapshot()
+        confirmation = snapshot.get(pid) if snapshot is not None else None
         if confirmation is None or confirmation[1] != start_token:
             return False
         try:
@@ -2561,55 +3832,252 @@ class DaemonState:
         self._terminate_xctest_stalled_job(job)
 
     def _refresh_output_summary(self, job: Job) -> None:
-        summary = OutputSummarizer.summarize_file(
-            job.operation,
-            job.args,
-            job.state,
-            job.exit_code,
-            job.timed_out,
-            job.log_path,
-        )
+        coalesced_deadline = time.monotonic() + LOG_FLUSH_WAIT_SECONDS
         with self.condition:
             current = self.jobs.get(job.ticket)
-            if current is job and current.output_summary is None:
-                current.output_summary = summary
+            if current is not job or current.output_summary is not None:
+                return
+            if current.summary_in_flight:
+                summary_generation = current.summary_generation
+                while True:
+                    remaining = coalesced_deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self.condition.wait(timeout=remaining)
+                    current = self.jobs.get(job.ticket)
+                    if current is not job or current.output_summary is not None:
+                        return
+                    if not current.summary_in_flight or current.summary_generation != summary_generation:
+                        return
+            current.summary_in_flight = True
+            current.summary_generation += 1
+            summary_generation = current.summary_generation
+            lease = self._job_lease(current)
+            operation = current.operation
+            args = dict(current.args)
+            state = current.state
+            exit_code = current.exit_code
+            timed_out = current.timed_out
+            log_path = current.log_path
+            target_log_sequence = current.log_sequence
+        flush_complete = self._wait_for_job_log_flush(lease, target_sequence=target_log_sequence)
+        if not flush_complete:
+            with self.condition:
+                current = self._job_matches_lease_locked(lease)
+                if current is not None:
+                    self._warn_job_locked(
+                        current,
+                        "logFlushIncomplete",
+                        f"log flush did not reach sequence {target_log_sequence} before summary deadline",
+                    )
+        summary = OutputSummarizer.summarize_file(
+            operation,
+            args,
+            state,
+            exit_code,
+            timed_out,
+            log_path,
+        )
+        with self.condition:
+            current = self._job_matches_lease_locked(lease)
+            if current is not None and current.summary_generation == summary_generation:
+                current.summary_in_flight = False
+                if current.output_summary is None:
+                    current.output_summary = summary
+                    self._set_phase_locked(current, "terminal")
                 self.condition.notify_all()
+
+    def _wait_for_job_log_flush(self, lease: JobLease, target_sequence: int) -> bool:
+        deadline = time.monotonic() + LOG_FLUSH_WAIT_SECONDS
+        with self.condition:
+            while True:
+                current = self._job_matches_lease_locked(lease)
+                if current is None:
+                    return False
+                if current.log_flushed_sequence >= target_sequence:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(timeout=remaining)
 
     def _append_tail_locked(self, job: Job, text: str) -> None:
         lines = text.splitlines(keepends=True)
         if not lines:
             return
         for line in lines:
+            encoded = line.encode("utf-8", errors="replace")
+            if len(encoded) > LOG_TAIL_FRAGMENT_MAX_BYTES:
+                marker = b"... [tail fragment truncated]\n"
+                encoded = encoded[: LOG_TAIL_FRAGMENT_MAX_BYTES - len(marker)] + marker
+                line = encoded.decode("utf-8", errors="replace")
+                encoded = line.encode("utf-8", errors="replace")
+            if job.tail.maxlen is not None and len(job.tail) >= job.tail.maxlen:
+                removed = job.tail.popleft()
+                job.tail_bytes -= len(removed.encode("utf-8", errors="replace"))
             job.tail.append(line)
+            job.tail_bytes += len(encoded)
+            while job.tail_bytes > LOG_TAIL_MAX_BYTES and job.tail:
+                removed = job.tail.popleft()
+                job.tail_bytes -= len(removed.encode("utf-8", errors="replace"))
+
+    def _queue_job_log_bytes_locked(self, job: Job, payload: bytes) -> None:
+        job.log_sequence += 1
+        lease = self._job_lease(job)
+        submitted = self._io_worker.submit(
+            self._write_job_log_record,
+            lease,
+            job.log_path,
+            job.log_sequence,
+            payload,
+        )
+        if not submitted:
+            self._settle_job_log_sequence_locked(job, job.log_sequence)
+            job.log_truncated = True
+            job.log_truncation_reason = "stateIOQueueFull"
+            self._warn_job_locked(
+                job,
+                "logQueueFull",
+                "log record dropped because the bounded state-I/O queue is full",
+            )
 
     def _append_system_line_locked(self, job: Job, text: str) -> None:
         self._append_tail_locked(job, text)
+        self._queue_job_log_bytes_locked(job, text.encode("utf-8", errors="replace"))
+
+    def _settle_job_log_sequence_locked(self, job: Job, sequence: int) -> None:
+        if sequence <= job.log_flushed_sequence:
+            return
+        job.log_settled_sequences.add(sequence)
+        while job.log_flushed_sequence + 1 in job.log_settled_sequences:
+            job.log_flushed_sequence += 1
+            job.log_settled_sequences.remove(job.log_flushed_sequence)
+        self.condition.notify_all()
+
+    def _write_job_log_record(
+        self,
+        lease: JobLease,
+        log_path: Path,
+        sequence: int,
+        payload: bytes,
+    ) -> None:
+        with self.condition:
+            job = self._job_matches_lease_locked(lease)
+            if job is None or sequence > job.log_sequence:
+                return
         try:
-            with job.log_path.open("ab") as handle:
-                handle.write(text.encode("utf-8", errors="replace"))
-        except OSError:
-            pass
+            descriptor = os.open(
+                log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ConductorError(f"refusing non-regular job log {log_path}")
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short write while appending job log")
+                    remaining = remaining[written:]
+            finally:
+                os.close(descriptor)
+        except (OSError, ConductorError) as exc:
+            with self.condition:
+                current = self._job_matches_lease_locked(lease)
+                if current is not None:
+                    current.log_truncated = True
+                    current.log_truncation_reason = "logWriteFailed"
+                    self._warn_job_locked(current, "logWriteFailed", str(exc))
+        finally:
+            with self.condition:
+                current = self._job_matches_lease_locked(lease)
+                if current is not None:
+                    self._settle_job_log_sequence_locked(current, sequence)
 
     def _write_running_processes_locked(self) -> None:
+        self._running_registry_generation += 1
+        generation = self._running_registry_generation
         processes = []
         for job in self.jobs.values():
-            if job.state == "running" and (job.process_pid or job.process_pgid):
+            if (
+                job.state == "running"
+                and job.process_pid
+                and job.process_pgid
+                and job.process_start
+            ):
                 processes.append(
                     {
                         "ticket": job.ticket,
+                        "jobGeneration": job.job_generation,
+                        "processGeneration": job.process_generation,
                         "operation": job.operation,
                         "pid": job.process_pid,
                         "pgid": job.process_pgid,
                         "processStart": job.process_start,
+                        "processGroupIdentityConfirmed": job.process_group_identity_confirmed,
                     }
                 )
-        payload = {"updatedAt": now(), "processes": processes}
+        payload = {
+            "version": 2,
+            "generation": generation,
+            "updatedAt": now(),
+            "daemon": {"pid": os.getpid(), "processStart": self._daemon_start_token},
+            "processes": processes,
+        }
+        if not self._io_worker.submit(self._publish_running_processes, generation, payload):
+            self._daemon_infrastructure_warnings.append(
+                {
+                    "kind": "registryQueueFull",
+                    "message": "running-process registry publication dropped",
+                    "observedAt": now(),
+                }
+            )
+
+    def _publish_running_processes(self, generation: int, payload: Dict[str, Any]) -> None:
+        temporary = self.paths.running_processes_path.with_name(
+            f".{self.paths.running_processes_path.name}.{generation}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        os.chmod(temporary, 0o600)
         try:
-            self.paths.running_processes_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-            with contextlib.suppress(OSError):
-                os.chmod(self.paths.running_processes_path, 0o600)
-        except OSError:
-            pass
+            with self._registry_publish_lock:
+                with self.condition:
+                    if generation != self._running_registry_generation:
+                        return
+                os.replace(temporary, self.paths.running_processes_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def _request_process_cleanup_locked(self, job: Job, reason: str) -> None:
+        if job.state != "running" or job.cleanup_in_flight:
+            return
+        job.cleanup_in_flight = True
+        self._set_phase_locked(job, "canceling")
+        lease = self._job_lease(job)
+        threading.Thread(
+            target=self._perform_requested_process_cleanup,
+            args=(lease, reason),
+            name=f"conductor-cleanup-{job.ticket[:8]}",
+            daemon=True,
+        ).start()
+
+    def _perform_requested_process_cleanup(self, lease: JobLease, reason: str) -> None:
+        with self.condition:
+            job = self._job_matches_lease_locked(lease)
+            if job is None:
+                return
+            try:
+                self._cancel_running_job_locked(job, reason)
+            finally:
+                current = self._job_matches_lease_locked(lease)
+                if current is not None:
+                    current.cleanup_in_flight = False
+                    if current.state in TERMINAL_STATES:
+                        current.process_generation += 1
+                        current.tracked_processes.clear()
+                self.condition.notify_all()
 
     def _cancel_running_job_locked(self, job: Job, reason: str) -> None:
         pid_deadline = now() + 1.0
@@ -2634,19 +4102,23 @@ class DaemonState:
         while job.state == "running" and now() < completion_deadline:
             self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
 
-    def _refresh_process_tree_locked(self, job: Job) -> Tuple[Dict[int, Tuple[int, str]], Dict[int, int]]:
-        snapshot = process_table_snapshot()
-        root_pid = job.process_pid
-        if root_pid and root_pid not in job.tracked_processes:
-            record = snapshot.get(root_pid)
-            token = job.process_start or (record[1] if record else None)
+    @staticmethod
+    def _discover_verified_processes(
+        lease: ProcessWorkLease,
+        snapshot: Dict[int, Tuple[int, str]],
+    ) -> Tuple[Dict[int, Tuple[int, str]], Dict[int, int], Dict[int, str], Optional[str]]:
+        tracked = dict(lease.tracked_processes)
+        root_start = lease.process_start
+        if lease.pid and lease.pid not in tracked:
+            record = snapshot.get(lease.pid)
+            token = root_start or (record[1] if record else None)
             if token:
-                job.process_start = token
-                job.tracked_processes[root_pid] = token
+                root_start = token
+                tracked[lease.pid] = token
 
         live_tracked = {
             pid
-            for pid, token in job.tracked_processes.items()
+            for pid, token in tracked.items()
             if snapshot.get(pid) is not None and snapshot[pid][1] == token
         }
         children_by_parent: Dict[int, List[int]] = {}
@@ -2654,42 +4126,59 @@ class DaemonState:
             children_by_parent.setdefault(ppid, []).append(pid)
 
         depths: Dict[int, int] = {pid: 0 for pid in live_tracked}
-        queue: Deque[int] = deque(live_tracked)
-        while queue:
-            parent = queue.popleft()
+        pending: Deque[int] = deque(live_tracked)
+        while pending:
+            parent = pending.popleft()
             parent_depth = depths[parent]
             for child in children_by_parent.get(parent, []):
-                child_record = snapshot.get(child)
-                if child_record is None:
+                record = snapshot.get(child)
+                if record is None:
                     continue
-                child_token = child_record[1]
-                if job.tracked_processes.get(child) != child_token:
-                    job.tracked_processes[child] = child_token
+                tracked[child] = record[1]
                 next_depth = parent_depth + 1
                 if next_depth > depths.get(child, -1):
                     depths[child] = next_depth
-                    queue.append(child)
+                    pending.append(child)
 
         verified = {
             pid: snapshot[pid]
-            for pid, token in job.tracked_processes.items()
+            for pid, token in tracked.items()
             if snapshot.get(pid) is not None and snapshot[pid][1] == token
         }
         for pid in verified:
             depths.setdefault(pid, 0)
-        return verified, depths
+        return verified, depths, tracked, root_start
 
-    def _signal_verified_processes_locked(
+    def _refresh_process_tree_locked(
         self,
         job: Job,
+    ) -> Tuple[Dict[int, Tuple[int, str]], Dict[int, int], bool]:
+        lease = self._process_lease(job)
+        snapshot = self._external_call_while_locked(process_table_snapshot)
+        if snapshot is None:
+            return {}, {}, False
+        verified, depths, tracked, root_start = self._discover_verified_processes(lease, snapshot)
+        current = self._job_matches_process_lease_locked(lease)
+        if current is None:
+            return {}, {}, False
+        current.tracked_processes = tracked
+        if root_start:
+            current.process_start = root_start
+        return verified, depths, True
+
+    @staticmethod
+    def _signal_verified_processes_external(
+        tracked: Dict[int, str],
         sig: signal.Signals,
         verified: Dict[int, Tuple[int, str]],
         depths: Dict[int, int],
     ) -> int:
         confirmation = process_table_snapshot()
+        if confirmation is None:
+            return 0
         signaled = 0
         for pid in sorted(verified, key=lambda candidate: (depths.get(candidate, 0), candidate), reverse=True):
-            token = job.tracked_processes.get(pid)
+            token = tracked.get(pid)
             if not token or confirmation.get(pid) is None or confirmation[pid][1] != token:
                 continue
             try:
@@ -2699,23 +4188,35 @@ class DaemonState:
                 continue
         return signaled
 
+    def _signal_verified_processes_locked(
+        self,
+        job: Job,
+        sig: signal.Signals,
+        verified: Dict[int, Tuple[int, str]],
+        depths: Dict[int, int],
+    ) -> int:
+        lease = self._process_lease(job)
+        signaled = self._external_call_while_locked(
+            self._signal_verified_processes_external,
+            dict(lease.tracked_processes),
+            sig,
+            dict(verified),
+            dict(depths),
+        )
+        return signaled if self._job_matches_process_lease_locked(lease) is not None else 0
+
     def _signal_process_tree_locked(self, job: Job, sig: signal.Signals) -> int:
-        verified, depths = self._refresh_process_tree_locked(job)
+        verified, depths, conclusive = self._refresh_process_tree_locked(job)
+        if not conclusive:
+            return 0
         return self._signal_verified_processes_locked(job, sig, verified, depths)
 
-    def _process_tree_alive_locked(self, job: Job) -> bool:
-        verified, _depths = self._refresh_process_tree_locked(job)
-        return bool(verified)
+    def _process_tree_alive_locked(self, job: Job) -> Optional[bool]:
+        verified, _depths, conclusive = self._refresh_process_tree_locked(job)
+        return bool(verified) if conclusive else None
 
-    def _process_group_id_alive_locked(self, job: Job) -> bool:
-        if not job.process_group_identity_confirmed:
-            return False
-        try:
-            pgid = int(job.process_pgid) if job.process_pgid is not None else 0
-        except (TypeError, ValueError):
-            return False
-        if pgid <= 0:
-            return False
+    @staticmethod
+    def _process_group_alive_external(pgid: int) -> bool:
         with contextlib.suppress(OSError):
             if pgid == os.getpgrp():
                 return False
@@ -2725,6 +4226,19 @@ class DaemonState:
         except (ProcessLookupError, PermissionError, OSError):
             return False
 
+    def _process_group_id_alive_locked(self, job: Job) -> bool:
+        lease = self._process_lease(job)
+        if not lease.process_group_identity_confirmed:
+            return False
+        try:
+            pgid = int(lease.pgid) if lease.pgid is not None else 0
+        except (TypeError, ValueError):
+            return False
+        if pgid <= 0:
+            return False
+        alive = self._external_call_while_locked(self._process_group_alive_external, pgid)
+        return bool(alive and self._job_matches_process_lease_locked(lease) is not None)
+
     def _wait_for_process_tree_exit_locked(
         self,
         job: Job,
@@ -2732,63 +4246,88 @@ class DaemonState:
         signal_for_new: signal.Signals,
     ) -> bool:
         while now() < deadline:
-            verified, depths = self._refresh_process_tree_locked(job)
+            verified, depths, conclusive = self._refresh_process_tree_locked(job)
+            group_alive = self._process_group_id_alive_locked(job)
+            if not conclusive:
+                if group_alive:
+                    self._signal_process_group_id_locked(job, signal_for_new)
+                self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
+                continue
             if not verified:
-                if not self._process_group_id_alive_locked(job):
+                if not group_alive:
                     return False
                 self._signal_process_group_id_locked(job, signal_for_new)
                 self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
                 continue
             self._signal_verified_processes_locked(job, signal_for_new, verified, depths)
             self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - now())))
-        return self._process_tree_alive_locked(job) or self._process_group_id_alive_locked(job)
+        tree_alive = self._process_tree_alive_locked(job)
+        if tree_alive is None:
+            return True
+        return tree_alive or self._process_group_id_alive_locked(job)
 
-    def _signal_process_group_id_locked(self, job: Job, sig: signal.Signals) -> bool:
+    @staticmethod
+    def _signal_process_group_external(lease: ProcessWorkLease, sig: signal.Signals) -> Tuple[bool, bool]:
         try:
-            pgid = int(job.process_pgid) if job.process_pgid is not None else 0
+            pgid = int(lease.pgid) if lease.pgid is not None else 0
         except (TypeError, ValueError):
-            return False
+            return False, False
         if pgid <= 0:
-            return False
+            return False, False
         with contextlib.suppress(OSError):
             if pgid == os.getpgrp():
-                return False
+                return False, False
 
-        # Once a start-token-verified job process is observed in the job PGID, keep
-        # trusting that PGID for this job's short TERM -> KILL cleanup window. This
-        # lets escalation reach same-PGID descendants that reparent after the root
-        # exits and are no longer discoverable by PPID tree walking.
-        group_identity_confirmed = job.process_group_identity_confirmed
-        if not group_identity_confirmed:
-            verified, _depths = self._refresh_process_tree_locked(job)
-            for pid, (_ppid, _start_token) in verified.items():
+        confirmed = lease.process_group_identity_confirmed
+        if not confirmed:
+            snapshot = process_table_snapshot()
+            if snapshot is None:
+                return False, False
+            for pid, token in lease.tracked_processes.items():
+                record = snapshot.get(pid)
+                if record is None or record[1] != token:
+                    continue
                 with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                     if os.getpgid(pid) == pgid:
-                        group_identity_confirmed = True
+                        confirmed = True
                         break
-            if group_identity_confirmed:
-                job.process_group_identity_confirmed = True
-
-        if not group_identity_confirmed:
-            return False
-
+        if not confirmed:
+            return False, False
         try:
             os.killpg(pgid, sig)
-            return True
+            return True, True
         except (ProcessLookupError, PermissionError, OSError):
+            return False, True
+
+    def _signal_process_group_id_locked(self, job: Job, sig: signal.Signals) -> bool:
+        lease = self._process_lease(job)
+        signaled, confirmed = self._external_call_while_locked(
+            self._signal_process_group_external,
+            lease,
+            sig,
+        )
+        current = self._job_matches_process_lease_locked(lease)
+        if current is None:
             return False
+        if confirmed:
+            current.process_group_identity_confirmed = True
+        return bool(signaled)
 
     def _terminate_process_group_locked(self, job: Job, reason: str) -> None:
+        verified, depths, conclusive = self._refresh_process_tree_locked(job)
         if self._signal_process_group_id_locked(job, signal.SIGTERM):
             self._append_system_line_locked(job, f"terminating process group: {reason}\n")
         self._append_system_line_locked(job, f"terminating process tree: {reason}\n")
-        self._signal_process_tree_locked(job, signal.SIGTERM)
+        if conclusive:
+            self._signal_verified_processes_locked(job, signal.SIGTERM, verified, depths)
 
     def _kill_process_group_locked(self, job: Job, reason: str) -> None:
+        verified, depths, conclusive = self._refresh_process_tree_locked(job)
         if self._signal_process_group_id_locked(job, signal.SIGKILL):
             self._append_system_line_locked(job, f"killing process group: {reason}\n")
         self._append_system_line_locked(job, f"killing process tree: {reason}\n")
-        self._signal_process_tree_locked(job, signal.SIGKILL)
+        if conclusive:
+            self._signal_verified_processes_locked(job, signal.SIGKILL, verified, depths)
 
     def _retention_pass_locked(self) -> None:
         cutoff = now() - TERMINAL_RETENTION_SECONDS
@@ -2801,47 +4340,107 @@ class DaemonState:
         excess = max(0, len(terminal_sorted) - MAX_TERMINAL_JOBS)
         for job in terminal_sorted[:excess]:
             prune.add(job.ticket)
+
+        detached_paths: List[Path] = []
         for ticket in prune:
             job = self.jobs.pop(ticket, None)
             if not job:
                 continue
-            with contextlib.suppress(FileNotFoundError):
-                job.log_path.unlink()
-            for diagnostic_path in job.diagnostic_paths:
-                with contextlib.suppress(FileNotFoundError):
-                    diagnostic_path.unlink()
+            detached_paths.append(job.log_path)
+            detached_paths.extend(job.diagnostic_paths)
             for key, mapped_ticket in list(self.request_keys.items()):
                 if mapped_ticket == ticket:
                     del self.request_keys[key]
 
+        self._retention_generation += 1
+        generation = self._retention_generation
         retained_logs = {job.log_path.name for job in self.jobs.values()}
-        with contextlib.suppress(FileNotFoundError):
-            for log_path in self.paths.jobs_dir.glob("*.log"):
-                if log_path.name not in retained_logs:
-                    try:
-                        age = now() - log_path.stat().st_mtime
-                    except OSError:
-                        continue
-                    if age > TERMINAL_RETENTION_SECONDS:
-                        with contextlib.suppress(FileNotFoundError):
-                            log_path.unlink()
-
         retained_diagnostics = {
             diagnostic_path.name
             for job in self.jobs.values()
             for diagnostic_path in job.diagnostic_paths
         }
+        submitted = self._io_worker.submit(
+            self._retention_external,
+            generation,
+            tuple(detached_paths),
+            frozenset(retained_logs),
+            frozenset(retained_diagnostics),
+        )
+        if not submitted:
+            self._daemon_infrastructure_warnings.append(
+                {
+                    "kind": "retentionQueueFull",
+                    "message": "retention cleanup deferred because the state-I/O queue is full",
+                    "observedAt": now(),
+                }
+            )
+
+    def _retention_external(
+        self,
+        generation: int,
+        detached_paths: Sequence[Path],
+        retained_logs: frozenset[str],
+        retained_diagnostics: frozenset[str],
+    ) -> None:
+        for path in detached_paths:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+        cutoff = now() - TERMINAL_RETENTION_SECONDS
+        candidates: List[Path] = []
         with contextlib.suppress(FileNotFoundError):
-            for diagnostic_path in self.paths.jobs_dir.glob("*.xctest-stall.*"):
-                if diagnostic_path.name in retained_diagnostics:
+            candidates.extend(
+                path for path in self.paths.jobs_dir.glob("*.log") if path.name not in retained_logs
+            )
+            candidates.extend(
+                path
+                for path in self.paths.jobs_dir.glob("*.xctest-stall.*")
+                if path.name not in retained_diagnostics
+            )
+        for path in candidates:
+            try:
+                stale = path.stat().st_mtime < cutoff
+            except OSError:
+                continue
+            if not stale:
+                continue
+            with self.condition:
+                if generation != self._retention_generation:
+                    return
+                current_names = {job.log_path.name for job in self.jobs.values()}
+                current_names.update(
+                    diagnostic_path.name
+                    for job in self.jobs.values()
+                    for diagnostic_path in job.diagnostic_paths
+                )
+                if path.name in current_names:
                     continue
-                try:
-                    age = now() - diagnostic_path.stat().st_mtime
-                except OSError:
-                    continue
-                if age > TERMINAL_RETENTION_SECONDS:
-                    with contextlib.suppress(FileNotFoundError):
-                        diagnostic_path.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+
+def validate_json_shape(value: Any, depth: int = 0) -> None:
+    if depth > MAX_JSON_DEPTH:
+        raise ConductorError(f"request JSON nesting exceeds {MAX_JSON_DEPTH}")
+    if isinstance(value, str):
+        if len(value.encode("utf-8", errors="replace")) > MAX_JSON_STRING_BYTES:
+            raise ConductorError(f"request string exceeds {MAX_JSON_STRING_BYTES} bytes")
+        return
+    if isinstance(value, dict):
+        if len(value) > MAX_JSON_COLLECTION_ENTRIES:
+            raise ConductorError(f"request object exceeds {MAX_JSON_COLLECTION_ENTRIES} entries")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ConductorError("request object keys must be strings")
+            validate_json_shape(key, depth + 1)
+            validate_json_shape(item, depth + 1)
+        return
+    if isinstance(value, list):
+        if len(value) > MAX_JSON_COLLECTION_ENTRIES:
+            raise ConductorError(f"request array exceeds {MAX_JSON_COLLECTION_ENTRIES} entries")
+        for item in value:
+            validate_json_shape(item, depth + 1)
 
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -2850,25 +4449,79 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
 
     def __init__(self, server_address: str, handler_cls: Any, state: DaemonState) -> None:
         self.state = state
+        self.handler_permits = threading.BoundedSemaphore(MAX_ACTIVE_REQUEST_HANDLERS)
+        self.wait_permits = threading.BoundedSemaphore(MAX_ACTIVE_WAIT_HANDLERS)
         super().__init__(server_address, handler_cls)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self.handler_permits.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.handler_permits.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.handler_permits.release()
 
 
 class RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         state: DaemonState = self.server.state  # type: ignore[attr-defined]
         request_id = "unknown"
+        wait_acquired = False
+        response: Dict[str, Any]
         try:
-            raw = self.rfile.readline(10 * 1024 * 1024)
-            if not raw:
+            self.connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+            request_bytes = bytearray()
+            while b"\n" not in request_bytes and len(request_bytes) <= MAX_REQUEST_BYTES:
+                chunk = self.connection.recv(min(64 * 1024, MAX_REQUEST_BYTES + 1 - len(request_bytes)))
+                if not chunk:
+                    break
+                request_bytes.extend(chunk)
+            if not request_bytes:
                 return
+            if len(request_bytes) > MAX_REQUEST_BYTES:
+                raise ConductorError(f"request exceeds {MAX_REQUEST_BYTES} bytes")
+            newline = request_bytes.find(b"\n")
+            if newline < 0:
+                raise ConductorError("request must be one newline-terminated JSON object")
+            if newline != len(request_bytes) - 1:
+                raise ConductorError("request contains trailing data after its JSON object")
+            raw = bytes(request_bytes)
             request = json.loads(raw.decode("utf-8"))
+            if not isinstance(request, dict):
+                raise ConductorError("request must be a JSON object")
+            validate_json_shape(request)
             request_id = str(request.get("id") or "unknown")
+            if request.get("type") == "job-wait":
+                wait_acquired = self.server.wait_permits.acquire(blocking=False)  # type: ignore[attr-defined]
+                if not wait_acquired:
+                    raise ConductorError("server wait-handler capacity exhausted; poll job status and retry")
             payload = handle_request(state, request)
             response = {"id": request_id, "ok": True, "payload": payload}
         except Exception as exc:
-            response = {"id": request_id, "ok": False, "error": str(exc)}
-        self.wfile.write((json.dumps(response) + "\n").encode("utf-8"))
-        self.wfile.flush()
+            response = {"id": request_id, "ok": False, "error": str(exc)[:4096]}
+        finally:
+            if wait_acquired:
+                self.server.wait_permits.release()  # type: ignore[attr-defined]
+        encoded = (json.dumps(response) + "\n").encode("utf-8")
+        if len(encoded) > MAX_RESPONSE_BYTES:
+            encoded = (json.dumps({
+                "id": request_id,
+                "ok": False,
+                "error": f"response exceeds {MAX_RESPONSE_BYTES} bytes",
+            }) + "\n").encode("utf-8")
+        try:
+            self.wfile.write(encoded)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+            return
 
 
 def handle_request(state: DaemonState, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -2887,10 +4540,11 @@ def handle_request(state: DaemonState, request: Dict[str, Any]) -> Dict[str, Any
         timeout = request.get("timeout")
         if timeout is not None and float(timeout) < 0:
             raise ConductorError("wait timeout must be non-negative")
+        requested_timeout = float(timeout) if timeout is not None else MAX_SERVER_WAIT_SECONDS
         return state.job_wait(
             request.get("ticket"),
             request.get("requestKey"),
-            float(timeout) if timeout is not None else None,
+            min(requested_timeout, MAX_SERVER_WAIT_SECONDS),
         )
     if req_type == "job-cancel":
         return state.job_cancel(request.get("ticket"), request.get("requestKey"))
@@ -2920,7 +4574,8 @@ def run_daemon(paths: Paths) -> int:
             for job in state.jobs.values():
                 if job.state == "running":
                     job.cancel_requested = True
-                    state._terminate_process_group_locked(job, reason=f"signal {signum}")
+                    state._set_phase_locked(job, "canceling")
+                    state._request_process_cleanup_locked(job, reason=f"signal {signum}")
             state.condition.notify_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -2945,27 +4600,89 @@ def format_argv(argv: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in argv)
 
 
+def daemon_contact_health(paths: Paths, error: BaseException) -> Dict[str, Any]:
+    pid = read_pid(paths.pid_path)
+    socket_exists = paths.socket_path.exists()
+    if pid is not None and pid_alive(pid):
+        verified = verify_daemon_pid_identity(paths, pid)
+        state = "unresponsive" if verified else "ambiguous"
+        return {
+            "running": True if verified else None,
+            "pid": pid,
+            "socketPath": str(paths.socket_path),
+            "stateDir": str(paths.state_dir),
+            "health": {
+                "state": state,
+                "rpcResponsive": False,
+                "processIdentityVerified": verified,
+                "issues": [{"kind": "contactFailure", "message": str(error)[:500]}],
+            },
+        }
+    if socket_exists or pid is not None:
+        return {
+            "running": None,
+            "pid": pid,
+            "socketPath": str(paths.socket_path),
+            "stateDir": str(paths.state_dir),
+            "health": {
+                "state": "ambiguous",
+                "rpcResponsive": False,
+                "processIdentityVerified": False,
+                "issues": [{"kind": "contactFailure", "message": str(error)[:500]}],
+            },
+        }
+    return {
+        "running": False,
+        "pid": None,
+        "socketPath": str(paths.socket_path),
+        "stateDir": str(paths.state_dir),
+        "health": {
+            "state": "stopped",
+            "rpcResponsive": False,
+            "processIdentityVerified": False,
+            "issues": [],
+        },
+    }
+
+
 def request_daemon(paths: Paths, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
     request = dict(payload)
     request.setdefault("id", str(uuid.uuid4()))
+    validate_json_shape(request)
     data = (json.dumps(request) + "\n").encode("utf-8")
+    if len(data) > MAX_REQUEST_BYTES:
+        raise ConductorError(f"request exceeds {MAX_REQUEST_BYTES} bytes")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.settimeout(timeout or 30.0)
+        sock.settimeout(30.0 if timeout is None else max(0.001, timeout))
         sock.connect(str(paths.socket_path))
         sock.sendall(data)
-        file = sock.makefile("rb")
-        line = file.readline()
+        with sock.makefile("rb") as file:
+            line = file.readline(MAX_RESPONSE_BYTES + 1)
         if not line:
             raise ConductorError("daemon closed connection without a response")
+        if len(line) > MAX_RESPONSE_BYTES:
+            raise ConductorError(f"daemon response exceeds {MAX_RESPONSE_BYTES} bytes")
+        if not line.endswith(b"\n"):
+            raise ConductorError("daemon response was not newline terminated")
         response = json.loads(line.decode("utf-8"))
+        if not isinstance(response, dict):
+            raise ConductorError("daemon response was not a JSON object")
+        if response.get("id") != request["id"]:
+            raise ConductorError("daemon response id did not match request")
     except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
-        raise ConductorError(f"could not contact daemon at {paths.socket_path}: {exc}")
+        message = f"could not contact daemon at {paths.socket_path}: {exc}"
+        raise DaemonContactError(message, daemon_contact_health(paths, exc))
+    except json.JSONDecodeError as exc:
+        raise ConductorError(f"daemon returned malformed JSON: {exc}") from exc
     finally:
         sock.close()
     if not response.get("ok"):
         raise ConductorError(response.get("error") or "daemon request failed")
-    return response.get("payload") or {}
+    payload_value = response.get("payload") or {}
+    if not isinstance(payload_value, dict):
+        raise ConductorError("daemon response payload was not an object")
+    return payload_value
 
 
 def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Optional[Dict[str, Any]], Optional[ConductorError]]:
@@ -3002,18 +4719,26 @@ def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Option
 
 def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
     ensure_state_dirs(paths)
-    cleanup_stale_files(paths)
+    recovery = cleanup_stale_files(paths)
     contact_error: Optional[ConductorError] = None
     payload, contact_error = compatible_daemon_status_or_stop_idle_mismatch(paths)
     if payload is not None:
         return payload
+    if recovery.state == "ambiguous":
+        error = contact_error or ConductorError(recovery.reason)
+        raise DaemonContactError(
+            f"refusing daemon replacement because recovery evidence is ambiguous: {recovery.reason}",
+            daemon_contact_health(paths, error),
+        )
 
     live_pid = read_pid(paths.pid_path)
     if contact_error and live_pid and pid_alive(live_pid):
-        raise ConductorError(
+        message = (
             f"daemon pid {live_pid} is alive but the socket is unresponsive; "
             "run './conductor daemon stop --force' before starting a replacement"
         )
+        health = contact_error.health_payload if isinstance(contact_error, DaemonContactError) else daemon_contact_health(paths, contact_error)
+        raise DaemonContactError(message, health)
 
     if not start_if_needed:
         if contact_error:
@@ -3022,16 +4747,24 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
 
     with paths.lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        cleanup_stale_files(paths)
+        locked_recovery = cleanup_stale_files(paths)
         payload, locked_contact_error = compatible_daemon_status_or_stop_idle_mismatch(paths)
         if payload is not None:
             return payload
+        if locked_recovery.state == "ambiguous":
+            error = locked_contact_error or ConductorError(locked_recovery.reason)
+            raise DaemonContactError(
+                f"refusing daemon replacement because recovery evidence is ambiguous: {locked_recovery.reason}",
+                daemon_contact_health(paths, error),
+            )
         locked_live_pid = read_pid(paths.pid_path)
         if locked_contact_error and locked_live_pid and pid_alive(locked_live_pid):
-            raise ConductorError(
+            message = (
                 f"daemon pid {locked_live_pid} is alive but the socket is unresponsive; "
                 "run './conductor daemon stop --force' before starting a replacement"
             )
+            health = locked_contact_error.health_payload if isinstance(locked_contact_error, DaemonContactError) else daemon_contact_health(paths, locked_contact_error)
+            raise DaemonContactError(message, health)
         script = Path(__file__).resolve()
         with paths.daemon_log_path.open("ab") as daemon_log:
             proc = subprocess.Popen(
@@ -3068,26 +4801,71 @@ def wait_until_stopped(paths: Paths, timeout: float) -> bool:
     return False
 
 
-def read_running_processes(paths: Paths) -> List[Dict[str, Any]]:
+def read_running_processes(paths: Paths, invalid: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    invalid_entries = invalid if invalid is not None else []
     try:
         payload = json.loads(paths.running_processes_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         return []
-    processes = payload.get("processes") if isinstance(payload, dict) else None
-    return [item for item in processes if isinstance(item, dict)] if isinstance(processes, list) else []
-
-
-def signal_running_process_groups(paths: Paths, sig: signal.Signals) -> None:
-    for item in read_running_processes(paths):
-        pgid = item.get("pgid") or item.get("pid")
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ConductorError(f"could not safely read running-process registry: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("version", 1) not in {1, 2}:
+        raise ConductorError("running-process registry has an unsupported schema")
+    processes = payload.get("processes")
+    if not isinstance(processes, list):
+        raise ConductorError("running-process registry processes must be an array")
+    validated: List[Dict[str, Any]] = []
+    for index, item in enumerate(processes):
+        if not isinstance(item, dict):
+            invalid_entries.append(f"entry {index}: not an object")
+            continue
         try:
-            pgid_int = int(pgid)
+            pid = int(item.get("pid"))
+            pgid = int(item.get("pgid"))
         except (TypeError, ValueError):
+            invalid_entries.append(f"entry {index}: invalid pid/pgid")
             continue
-        if pgid_int <= 0:
+        process_start = item.get("processStart")
+        if pid <= 0 or pgid <= 0 or not isinstance(process_start, str) or not process_start:
+            invalid_entries.append(f"entry {index}: missing exact identity evidence")
             continue
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pgid_int, sig)
+        validated.append(dict(item))
+    return validated
+
+
+def signal_running_process_groups(paths: Paths, sig: signal.Signals) -> Dict[str, Any]:
+    snapshot = process_table_snapshot()
+    report: Dict[str, Any] = {"verified": [], "skipped": [], "gone": [], "invalid": []}
+    own_pgid = os.getpgrp()
+    try:
+        processes = read_running_processes(paths, invalid=report["invalid"])
+    except ConductorError as exc:
+        report["invalid"].append(f"registry: {exc}")
+        processes = []
+    for item in processes:
+        pid = int(item["pid"])
+        pgid = int(item["pgid"])
+        if snapshot is None:
+            report["skipped"].append(pid)
+            continue
+        record = snapshot.get(pid)
+        if record is None:
+            report["gone"].append(pid)
+            continue
+        if record[1] != item["processStart"] or pgid == own_pgid:
+            report["skipped"].append(pid)
+            continue
+        try:
+            if os.getpgid(pid) != pgid:
+                report["skipped"].append(pid)
+                continue
+            os.killpg(pgid, sig)
+            report["verified"].append(pid)
+        except ProcessLookupError:
+            report["gone"].append(pid)
+        except (PermissionError, OSError):
+            report["skipped"].append(pid)
+    return report
 
 
 def force_stop_unresponsive_daemon(paths: Paths) -> Dict[str, Any]:
@@ -3100,14 +4878,15 @@ def force_stop_unresponsive_daemon(paths: Paths) -> Dict[str, Any]:
             f"refusing to force-stop pid {pid}: daemon identity could not be verified; "
             f"inspect {paths.pid_path} and {paths.daemon_meta_path} before removing stale files manually"
         )
-    signal_running_process_groups(paths, signal.SIGTERM)
+    term_report = signal_running_process_groups(paths, signal.SIGTERM)
+    kill_report: Optional[Dict[str, Any]] = None
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGTERM)
     deadline = now() + TERMINATE_GRACE_SECONDS
     while pid_alive(pid) and now() < deadline:
         time.sleep(0.1)
     if pid_alive(pid):
-        signal_running_process_groups(paths, signal.SIGKILL)
+        kill_report = signal_running_process_groups(paths, signal.SIGKILL)
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.kill(pid, signal.SIGKILL)
         deadline = now() + 2.0
@@ -3115,16 +4894,20 @@ def force_stop_unresponsive_daemon(paths: Paths) -> Dict[str, Any]:
             time.sleep(0.1)
     if pid_alive(pid):
         raise ConductorError(f"force-stop signaled verified daemon pid {pid}, but it is still alive; leaving pid/socket files intact")
-    cleanup_stale_files(paths)
-    with contextlib.suppress(FileNotFoundError):
-        paths.socket_path.unlink()
-    with contextlib.suppress(FileNotFoundError):
-        paths.pid_path.unlink()
-    with contextlib.suppress(FileNotFoundError):
-        paths.daemon_meta_path.unlink()
-    with contextlib.suppress(FileNotFoundError):
-        paths.running_processes_path.unlink()
-    return {"stopped": True, "pid": pid, "forced": True, "socketPath": str(paths.socket_path), "stateDir": str(paths.state_dir)}
+    recovery = cleanup_stale_files(paths)
+    if recovery.state not in {"cleaned", "stopped"}:
+        raise ConductorError(
+            f"verified daemon pid {pid} exited, but recovery evidence is {recovery.state}; "
+            "preserving pid/socket files for inspection"
+        )
+    return {
+        "stopped": True,
+        "pid": pid,
+        "forced": True,
+        "socketPath": str(paths.socket_path),
+        "stateDir": str(paths.state_dir),
+        "workerSignals": {"term": term_report, "kill": kill_report},
+    }
 
 
 def parse_json_flag(argv: List[str]) -> Tuple[bool, List[str]]:
@@ -3352,17 +5135,25 @@ def print_full_log(payload: Dict[str, Any]) -> None:
     print()
     print(f"--- raw log: {log_path} ---")
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
-            content = handle.read()
-            print(content, end="")
-            if content and not content.endswith("\n"):
-                print()
-    except OSError as exc:
-        print(f"(could not read log: {exc})")
+        sample = read_safe_regular_file_sample(
+            Path(str(log_path)),
+            FULL_LOG_HEAD_BYTES,
+            FULL_LOG_TAIL_BYTES,
+        )
+        content = sample.content.decode("utf-8", errors="replace")
+        print(content, end="")
+        if content and not content.endswith("\n"):
+            print()
+        if sample.omitted_bytes:
+            print(
+                f"(raw log rendering bounded; omitted {sample.omitted_bytes} bytes; inspect {log_path} locally)"
+            )
+    except (OSError, ConductorError) as exc:
+        print(f"(could not safely read log: {exc})")
         tail = payload.get("logTail") or []
         if tail:
-            print("--- log tail fallback ---")
-            print("".join(tail), end="")
+            print("--- bounded log tail fallback ---")
+            print("".join(tail[-LOG_TAIL_LINES:]), end="")
             if not str(tail[-1]).endswith("\n"):
                 print()
 
@@ -3439,10 +5230,19 @@ def handle_daemon_command(paths: Paths, argv: List[str]) -> int:
         try:
             payload = ensure_daemon(paths, start_if_needed=False)
         except ConductorError as exc:
+            contact = exc.health_payload if isinstance(exc, DaemonContactError) else {
+                "running": False,
+                "socketPath": str(paths.socket_path),
+                "stateDir": str(paths.state_dir),
+                "health": {"state": "stopped", "rpcResponsive": False, "processIdentityVerified": False, "issues": []},
+            }
+            contact = dict(contact)
+            contact["error"] = str(exc)
             if json_mode:
-                print_json({"running": False, "error": str(exc), "socketPath": str(paths.socket_path), "stateDir": str(paths.state_dir)})
+                print_json(contact)
             else:
-                print(f"daemon not running: {exc}")
+                health_state = (contact.get("health") or {}).get("state", "unknown")
+                print(f"daemon {health_state}: {exc}")
             return 1
         if json_mode:
             print_json(payload)
@@ -3484,12 +5284,22 @@ def handle_status_command(paths: Paths, argv: List[str]) -> int:
     try:
         payload = ensure_daemon(paths, start_if_needed=False)
     except ConductorError as exc:
+        contact = exc.health_payload if isinstance(exc, DaemonContactError) else {
+            "running": False,
+            "socketPath": str(paths.socket_path),
+            "stateDir": str(paths.state_dir),
+            "health": {"state": "stopped", "rpcResponsive": False, "processIdentityVerified": False, "issues": []},
+        }
+        contact = dict(contact)
+        contact["error"] = str(exc)
         if json_mode:
-            print_json({"running": False, "error": str(exc), "socketPath": str(paths.socket_path), "stateDir": str(paths.state_dir)})
+            print_json(contact)
         else:
-            print("conductor daemon not running")
+            health_state = (contact.get("health") or {}).get("state", "unknown")
+            print(f"conductor daemon {health_state}")
             print(f"socket: {paths.socket_path}")
-            print("start with: ./conductor daemon start")
+            if contact.get("running") is False:
+                print("start with: ./conductor daemon start")
         return 1
     if json_mode:
         print_json(payload)
@@ -3545,14 +5355,17 @@ def handle_job_command(paths: Paths, argv: List[str]) -> int:
         if sub == "wait":
             if ns.timeout is not None and ns.timeout < 0:
                 raise ConductorError("wait timeout must be non-negative")
-            if ns.timeout is None:
-                output_mode = "full" if getattr(ns, "full_log", False) else "summary"
-                payload = wait_for_terminal(paths, ns.ticket, ns.request_key, json_mode=ns.json, output_mode=output_mode)
-            else:
-                req["timeout"] = ns.timeout
-                payload = request_daemon(paths, req, timeout=ns.timeout + 5.0)
+            output_mode = "full" if getattr(ns, "full_log", False) else "summary"
+            payload = wait_for_terminal(
+                paths,
+                ns.ticket,
+                ns.request_key,
+                json_mode=ns.json,
+                output_mode=output_mode,
+                user_timeout=ns.timeout,
+            )
         else:
-            payload = request_daemon(paths, req, timeout=10.0)
+            payload = request_daemon(paths, req, timeout=CANCEL_RPC_TIMEOUT_SECONDS)
         if ns.json:
             print_json(payload_with_output_summary(payload))
         else:
@@ -3646,25 +5459,114 @@ def handle_sleep_operation(paths: Paths, operation: str, argv: List[str]) -> int
     return terminal_exit_code(final_payload)
 
 
+def _retryable_wait_contact_failure(error: ConductorError) -> bool:
+    if not isinstance(error, DaemonContactError):
+        return False
+    health_payload = error.health_payload
+    health = health_payload.get("health")
+    return bool(
+        health_payload.get("running") is True
+        and isinstance(health, dict)
+        and health.get("processIdentityVerified") is True
+    )
+
+
 def wait_for_terminal(
     paths: Paths,
     ticket: Optional[str],
     request_key: Optional[str],
     json_mode: bool,
     output_mode: str = "summary",
+    user_timeout: Optional[float] = None,
+    *,
+    clock: Any = time.monotonic,
+    poll_wait: Any = None,
 ) -> Dict[str, Any]:
+    deadline = None if user_timeout is None else clock() + user_timeout
+    pause = poll_wait or (lambda seconds: threading.Event().wait(seconds))
+    degraded_to_status = False
+    status_poll_attempted = False
+    announced_degradation = False
+    consecutive_contact_failures = 0
+    last_payload: Optional[Dict[str, Any]] = None
     last_state: Optional[str] = None
     last_tail: List[str] = []
     last_blockers: Optional[Tuple[Tuple[str, ...], ...]] = None
     printed_progress: Deque[str] = deque(maxlen=200)
     printed_progress_set: set[str] = set()
     last_progress_at = now()
+
+    def timed_out_payload(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        base = dict(last_payload or candidate or {"ticket": ticket, "requestKey": request_key, "state": "unknown"})
+        base["waitTimedOut"] = True
+        return base
+
     while True:
-        payload = request_daemon(
-            paths,
-            {"type": "job-wait", "ticket": ticket, "requestKey": request_key, "timeout": WAIT_POLL_SECONDS},
-            timeout=WAIT_POLL_SECONDS + 5.0,
-        )
+        remaining = None if deadline is None else max(0.0, deadline - clock())
+        if last_payload is not None and remaining == 0:
+            return timed_out_payload()
+
+        if degraded_to_status:
+            pause_seconds = WAIT_STATUS_POLL_SECONDS if remaining is None else min(WAIT_STATUS_POLL_SECONDS, remaining)
+            if (last_payload is not None or status_poll_attempted) and pause_seconds > 0:
+                pause(pause_seconds)
+            remaining = None if deadline is None else max(0.0, deadline - clock())
+            if last_payload is not None and remaining == 0:
+                return timed_out_payload()
+            status_poll_attempted = True
+            try:
+                payload = request_daemon(
+                    paths,
+                    {"type": "job-status", "ticket": ticket, "requestKey": request_key},
+                    timeout=WAIT_RPC_CONTACT_SECONDS,
+                )
+            except ConductorError as exc:
+                error = str(exc)
+                if error.startswith("server wait-handler capacity exhausted") or error == "daemon closed connection without a response":
+                    continue
+                if _retryable_wait_contact_failure(exc):
+                    consecutive_contact_failures += 1
+                    if consecutive_contact_failures <= MAX_CONSECUTIVE_WAIT_CONTACT_FAILURES:
+                        continue
+                raise
+        else:
+            server_wait = WAIT_POLL_SECONDS if remaining is None else min(WAIT_POLL_SECONDS, remaining)
+            transport_timeout = (
+                server_wait + WAIT_RPC_CONTACT_SECONDS
+                if remaining is None
+                else max(
+                    WAIT_RPC_CONTACT_SECONDS,
+                    min(server_wait + WAIT_RPC_CONTACT_SECONDS, remaining),
+                )
+            )
+            try:
+                payload = request_daemon(
+                    paths,
+                    {"type": "job-wait", "ticket": ticket, "requestKey": request_key, "timeout": server_wait},
+                    timeout=transport_timeout,
+                )
+            except ConductorError as exc:
+                error = str(exc)
+                retryable_contact_failure = _retryable_wait_contact_failure(exc)
+                if not (
+                    error.startswith("server wait-handler capacity exhausted")
+                    or error == "daemon closed connection without a response"
+                    or retryable_contact_failure
+                ):
+                    raise
+                if retryable_contact_failure:
+                    consecutive_contact_failures += 1
+                    if consecutive_contact_failures > MAX_CONSECUTIVE_WAIT_CONTACT_FAILURES:
+                        raise
+                degraded_to_status = True
+                if not json_mode and not announced_degradation:
+                    print("wait response unavailable; polling bounded job status instead")
+                    announced_degradation = True
+                continue
+        consecutive_contact_failures = 0
+        if deadline is not None and clock() > deadline:
+            return timed_out_payload(payload)
+        last_payload = payload
         if not json_mode:
             state = payload.get("state")
             tail = payload.get("logTail") or []
