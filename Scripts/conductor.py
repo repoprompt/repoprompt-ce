@@ -39,7 +39,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 16
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 JOB_PHASES = {
     "queued",
@@ -48,6 +48,7 @@ JOB_PHASES = {
     "runningProcess",
     "canceling",
     "finalizingOutput",
+    "publishingCache",
     "summarizing",
     "terminal",
 }
@@ -56,6 +57,29 @@ LOG_TAIL_LINES = 30
 LOG_TAIL_MAX_BYTES = 64 * 1024
 LOG_TAIL_FRAGMENT_MAX_BYTES = 4 * 1024
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
+BUILD_CACHE_SCHEMA_VERSION = 1
+BUILD_CACHE_DEFAULT_LIMIT_BYTES = 40 * 1024 * 1024 * 1024
+BUILD_CACHE_PUBLISH_THROTTLE_SECONDS = 60 * 60.0
+BUILD_CACHE_CLONE_MIN_SECONDS = 60.0
+BUILD_CACHE_CLONE_MAX_SECONDS = 10 * 60.0
+BUILD_CACHE_CLONE_SECONDS_PER_ENTRY = 0.005
+BUILD_CACHE_CLONE_SECONDS_PER_GIB = 5.0
+BUILD_CACHE_RETRY_OVERHEAD_SECONDS = 30.0
+BUILD_CACHE_FORCE_STOP_WAIT_SECONDS = 4 * BUILD_CACHE_CLONE_MAX_SECONDS + BUILD_CACHE_RETRY_OVERHEAD_SECONDS
+BUILD_CACHE_ELIGIBLE_OPERATIONS = {"swift-build", "build", "package", "test", "install-debug-cli"}
+BUILD_CACHE_ENV_KEYS = (
+    "ARCHS",
+    "CC",
+    "CXX",
+    "DEVELOPER_DIR",
+    "ONLY_ACTIVE_ARCH",
+    "OTHER_SWIFT_FLAGS",
+    "REPOPROMPT_ENABLE_SENTRY",
+    "RPCE_ENABLE_BENCHMARK_TESTS",
+    "SDKROOT",
+    "SWIFT_EXEC",
+    "SWIFTFLAGS",
+)
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
@@ -203,6 +227,8 @@ Operation commands:
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
+  ./conductor cache status [--limit <n>] [--json]  # read-only; performs no repair or cleanup
+  ./conductor cache drop <compatibility-key> [--json]
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
@@ -676,6 +702,778 @@ def ensure_state_dirs(paths: Paths) -> None:
     ensure_private_dir(paths.jobs_dir)
     ensure_private_dir(paths.socket_path.parent)
     ensure_private_dir(machine_lock_dir())
+
+
+@dataclasses.dataclass(frozen=True)
+class BuildCacheSnapshot:
+    key: str
+    payload: Dict[str, Any]
+    toolchain_signature: str
+
+
+@dataclasses.dataclass
+class BuildCacheContext:
+    snapshot: BuildCacheSnapshot
+    observed_generation: int
+    seeded: bool
+    status: Dict[str, Any]
+    outcome_path: Optional[Path] = None
+
+
+def _durable_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    directory_descriptor = -1
+    try:
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        with contextlib.suppress(OSError):
+            os.fsync(directory_descriptor)
+    except OSError:
+        # The unlink already committed. Directory fsync is a durability
+        # enhancement and must not turn successful cleanup into a failure.
+        pass
+    finally:
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    replaced = False
+    try:
+        encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        remaining = memoryview(encoded)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, f"short write for {path}")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        replaced = True
+        directory_descriptor = -1
+        try:
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            with contextlib.suppress(OSError):
+                os.fsync(directory_descriptor)
+        except OSError:
+            # The atomic replace already committed. Directory fsync is a
+            # durability enhancement and must not make callers roll back
+            # successfully published state.
+            pass
+        finally:
+            if directory_descriptor >= 0:
+                os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not replaced:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+
+class BuildCacheManager:
+    """Private immutable SwiftPM seed store; kernel locks serialize every key mutation."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        store_root: Optional[Path] = None,
+        probe_provider: Any = None,
+        clone_runner: Any = None,
+        clock: Any = time.time,
+        monotonic: Any = time.monotonic,
+        env: Optional[Dict[str, str]] = None,
+        startup_hygiene: bool = True,
+    ) -> None:
+        self.repo_root = repo_root.resolve()
+        self.env = dict(os.environ if env is None else env)
+        override = self.env.get("REPOPROMPT_DEV_BUILD_CACHE_DIR")
+        self.store_root = (store_root or (Path(override).expanduser() if override else Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "Conductor" / "BuildCache")).resolve()
+        self.locks_dir = self.store_root / "locks"
+        self._probe_provider = probe_provider or self._probe_toolchain
+        self._clone_runner = clone_runner or self._clone_cow
+        self._clock = clock
+        self._monotonic = monotonic
+        self._startup_advisory_error: Optional[str] = None
+        if startup_hygiene:
+            try:
+                self._ensure_store_dirs()
+                self._sweep_stranded_store_temporaries()
+                self._sweep_repo_build_temporaries(nonblocking=True)
+            except Exception as exc:
+                self._startup_advisory_error = str(exc)[:500]
+
+    def _ensure_store_dirs(self) -> None:
+        ensure_private_dir(self.store_root.parent)
+        ensure_private_dir(self.store_root)
+        ensure_private_dir(self.locks_dir)
+
+    @staticmethod
+    def _remove_owned_temporary(path: Path) -> None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    @staticmethod
+    def _is_store_temporary_name(name: str) -> bool:
+        return re.fullmatch(r"seed\.(?:tmp|previous)-[0-9a-f]{32}", name) is not None
+
+    @staticmethod
+    def _is_repo_temporary_name(name: str) -> bool:
+        return re.fullmatch(r"\.build\.seed-tmp-[0-9a-f]{32}", name) is not None
+
+    @contextlib.contextmanager
+    def _repo_prepare_lock(self, *, nonblocking: bool = False):
+        digest = hashlib.sha256(str(self.repo_root).encode("utf-8")).hexdigest()
+        lock_path = self.locks_dir / f"repo-{digest}.lock"
+        lock_file = lock_path.open("a+", encoding="utf-8")
+        os.chmod(lock_path, 0o600)
+        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        try:
+            fcntl.flock(lock_file.fileno(), flags)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+
+    def _remove_repo_build_temporaries_locked(self) -> int:
+        removed = 0
+        for child in self.repo_root.iterdir():
+            if self._is_repo_temporary_name(child.name):
+                self._remove_owned_temporary(child)
+                removed += 1
+        return removed
+
+    def _sweep_repo_build_temporaries(self, *, nonblocking: bool) -> int:
+        try:
+            with self._repo_prepare_lock(nonblocking=nonblocking):
+                return self._remove_repo_build_temporaries_locked()
+        except BlockingIOError:
+            return 0
+
+    def _sweep_stranded_store_temporaries(self) -> Dict[str, int]:
+        removed = 0
+        restored_previous = 0
+        skipped_locked = 0
+        for key_dir in self.store_root.iterdir():
+            if not key_dir.is_dir() or key_dir.is_symlink() or not re.fullmatch(r"[0-9a-f]{64}", key_dir.name):
+                continue
+            try:
+                with self.key_lock(key_dir.name, exclusive=True, nonblocking=True):
+                    candidates = [child for child in key_dir.iterdir() if self._is_store_temporary_name(child.name)]
+                    seed = key_dir / "seed"
+                    meta = self._meta(key_dir.name) or {}
+                    seed_valid = bool(meta and self._validate_seed_at(key_dir.name, meta, seed))
+                    if not seed_valid and meta:
+                        for previous in sorted(
+                            (child for child in candidates if child.name.startswith("seed.previous-")),
+                            key=lambda child: child.name,
+                        ):
+                            if self._validate_seed_at(key_dir.name, meta, previous):
+                                if seed.exists() or seed.is_symlink():
+                                    self._remove_owned_temporary(seed)
+                                os.replace(previous, seed)
+                                candidates.remove(previous)
+                                restored_previous += 1
+                                break
+                    for child in candidates:
+                        self._remove_owned_temporary(child)
+                        removed += 1
+            except BlockingIOError:
+                skipped_locked += 1
+        return {
+            "removed": removed,
+            "restoredPrevious": restored_previous,
+            "skippedLockedKeys": skipped_locked,
+        }
+
+    @staticmethod
+    def configuration_for(operation: str, args: Dict[str, Any]) -> str:
+        if operation == "package":
+            return str(args.get("config") or "debug")
+        return "debug"
+
+    @staticmethod
+    def eligible(operation: str, args: Dict[str, Any]) -> bool:
+        del args
+        return operation in BUILD_CACHE_ELIGIBLE_OPERATIONS
+
+    @staticmethod
+    def retry_job_timeout(
+        attempt_timeout: Optional[float],
+        cleanup_timeout: float,
+    ) -> Optional[float]:
+        if attempt_timeout is None:
+            return None
+        return (
+            max(0.0, attempt_timeout) * 2
+            + max(0.0, cleanup_timeout)
+            + BUILD_CACHE_RETRY_OVERHEAD_SECONDS
+        )
+
+    def _run_probe(self, argv: Sequence[str]) -> str:
+        completed = subprocess.run(
+            list(argv),
+            cwd=str(self.repo_root),
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            timeout=10.0,
+        )
+        if completed.returncode != 0:
+            raise ConductorError(f"build-cache probe failed: {format_argv(argv)}: {completed.stderr.strip()[:500]}")
+        return completed.stdout.strip()
+
+    def _probe_toolchain(self) -> Dict[str, Any]:
+        target_payload = json.loads(self._run_probe(["swift", "-print-target-info"]))
+        target = target_payload.get("target") or {}
+        return {
+            "swiftVersion": self._run_probe(["swift", "--version"]),
+            "sdkBuild": self._run_probe(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-build-version"]),
+            "developerDir": self._run_probe(["/usr/bin/xcode-select", "-p"]),
+            "architecture": os.uname().machine,
+            "destinationTriple": target.get("unversionedTriple") or target.get("triple"),
+        }
+
+    def _manifest_hashes(self) -> List[Dict[str, str]]:
+        candidates = {self.repo_root / "Package.swift", self.repo_root / "Package.resolved"}
+        for base in (self.repo_root / "Packages", self.repo_root / "Vendor"):
+            if base.exists():
+                candidates.update(path for path in base.rglob("Package.swift") if ".build" not in path.parts)
+        rows: List[Dict[str, str]] = []
+        for path in sorted(candidates, key=lambda candidate: str(candidate.relative_to(self.repo_root))):
+            relative = str(path.relative_to(self.repo_root))
+            if not path.is_file():
+                rows.append({"path": relative, "sha256": "missing"})
+                continue
+            rows.append({"path": relative, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        return rows
+
+    def snapshot(self, configuration: str, job_env: Dict[str, str]) -> BuildCacheSnapshot:
+        toolchain = self._probe_provider()
+        if not isinstance(toolchain, dict):
+            raise ConductorError("build-cache toolchain probe returned invalid data")
+        payload: Dict[str, Any] = {
+            "schemaVersion": BUILD_CACHE_SCHEMA_VERSION,
+            "toolchain": toolchain,
+            "configuration": configuration,
+            "environment": {key: job_env.get(key) for key in BUILD_CACHE_ENV_KEYS},
+            "manifests": self._manifest_hashes(),
+        }
+        encoded = json_dumps(payload).encode("utf-8")
+        toolchain_signature = hashlib.sha256(json_dumps(toolchain).encode("utf-8")).hexdigest()
+        return BuildCacheSnapshot(hashlib.sha256(encoded).hexdigest(), payload, toolchain_signature)
+
+    def _key_dir(self, key: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise ConductorError("invalid build-cache key")
+        return self.store_root / key
+
+    @contextlib.contextmanager
+    def key_lock(self, key: str, *, exclusive: bool, nonblocking: bool = False):
+        self._key_dir(key)
+        # The persistent per-key inode is the cross-process flock authority.
+        # Unlinking a seemingly idle lock can split exclusion when a waiter has
+        # already opened the old inode, so zero-byte lock files are retained.
+        lock_path = self.locks_dir / f"{key}.lock"
+        lock_file = lock_path.open("a+", encoding="utf-8")
+        os.chmod(lock_path, 0o600)
+        flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if nonblocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(lock_file.fileno(), flags)
+            yield lock_file
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+
+    @staticmethod
+    def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()):
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+
+    def _meta(self, key: str) -> Optional[Dict[str, Any]]:
+        return self._read_json_file(self._key_dir(key) / "meta.json")
+
+    @staticmethod
+    def _tree_deadline_for_work(entries: int, size_bytes: int) -> float:
+        scaled = (
+            BUILD_CACHE_CLONE_MIN_SECONDS
+            + max(0, entries) * BUILD_CACHE_CLONE_SECONDS_PER_ENTRY
+            + (max(0, size_bytes) / float(1024**3)) * BUILD_CACHE_CLONE_SECONDS_PER_GIB
+        )
+        return min(BUILD_CACHE_CLONE_MAX_SECONDS, max(BUILD_CACHE_CLONE_MIN_SECONDS, scaled))
+
+    @staticmethod
+    def _tree_deadline_seconds(source: Path) -> float:
+        max_entries = int(
+            (BUILD_CACHE_CLONE_MAX_SECONDS - BUILD_CACHE_CLONE_MIN_SECONDS)
+            / BUILD_CACHE_CLONE_SECONDS_PER_ENTRY
+        )
+        entries = 0
+        size_bytes = 0
+        pending = [source]
+        while pending and entries < max_entries:
+            directory = pending.pop()
+            try:
+                children = os.scandir(directory)
+            except OSError:
+                return BUILD_CACHE_CLONE_MAX_SECONDS
+            with children:
+                for child in children:
+                    entries += 1
+                    if entries >= max_entries:
+                        return BUILD_CACHE_CLONE_MAX_SECONDS
+                    try:
+                        if child.is_dir(follow_symlinks=False):
+                            pending.append(Path(child.path))
+                        else:
+                            size_bytes += child.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        return BUILD_CACHE_CLONE_MAX_SECONDS
+        return BuildCacheManager._tree_deadline_for_work(entries, size_bytes)
+
+    @staticmethod
+    def _clone_deadline_seconds(source: Path) -> float:
+        return BuildCacheManager._tree_deadline_seconds(source)
+
+    @staticmethod
+    def _clone_cow(source: Path, destination: Path) -> bool:
+        try:
+            completed = subprocess.run(
+                [
+                    "/usr/bin/ditto",
+                    "--clone",
+                    "--norsrc",
+                    "--noextattr",
+                    "--noqtn",
+                    "--noacl",
+                    str(source),
+                    str(destination),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=BuildCacheManager._clone_deadline_seconds(source),
+            )
+            return completed.returncode == 0 and destination.is_dir() and not destination.is_symlink()
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    @staticmethod
+    def _source_head(repo_root: Path) -> Optional[str]:
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(repo_root),
+                stdin=subprocess.DEVNULL,
+                text=True,
+                capture_output=True,
+                timeout=5.0,
+            )
+            value = completed.stdout.strip()
+            return value if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def _validate_seed_at(self, key: str, meta: Dict[str, Any], seed: Path) -> bool:
+        marker = self._read_json_file(seed / ".generation.json")
+        build = seed / ".build"
+        return bool(
+            marker
+            and marker.get("key") == key
+            and marker.get("generation") == meta.get("generation")
+            and build.is_dir()
+            and not build.is_symlink()
+        )
+
+    def _validate_seed(self, key: str, meta: Dict[str, Any]) -> bool:
+        return self._validate_seed_at(key, meta, self._key_dir(key) / "seed")
+
+    def _quarantine_seed(self, key: str, reason: str) -> None:
+        with self.key_lock(key, exclusive=True):
+            key_dir = self._key_dir(key)
+            meta = self._meta(key) or {"key": key, "generation": 0}
+            seed = key_dir / "seed"
+            if seed.exists() and not seed.is_symlink():
+                quarantine = key_dir / f"suspect-{int(self._clock())}-{uuid.uuid4().hex[:8]}"
+                os.replace(seed, quarantine)
+                shutil.rmtree(quarantine, ignore_errors=True)
+            meta["corruptionReason"] = reason[:500]
+            meta["quarantinedAt"] = self._clock()
+            ensure_private_dir(key_dir)
+            _atomic_write_json(key_dir / "meta.json", meta)
+
+    def _advisory_prepare_context(
+        self,
+        configuration: str,
+        error: BaseException,
+        snapshot: Optional[BuildCacheSnapshot] = None,
+        generation: int = 0,
+    ) -> BuildCacheContext:
+        build_dir = self.repo_root / ".build"
+        if build_dir.exists() or build_dir.is_symlink():
+            state = "warmLocalAdvisory" if build_dir.is_dir() and not build_dir.is_symlink() else "unsafeLocalBuildAdvisory"
+        else:
+            state = "cacheAdvisoryCold"
+        effective_snapshot = snapshot or BuildCacheSnapshot("0" * 64, {}, "")
+        status: Dict[str, Any] = {
+            "key": effective_snapshot.key,
+            "configuration": configuration,
+            "storePath": str(self.store_root),
+            "generation": generation,
+            "state": state,
+            "seeded": False,
+            "advisoryFailure": str(error)[:500],
+        }
+        return BuildCacheContext(effective_snapshot, generation, False, status)
+
+    def prepare(self, operation: str, args: Dict[str, Any], job_env: Dict[str, str]) -> Optional[BuildCacheContext]:
+        if (
+            not self.eligible(operation, args)
+            or self.env.get("REPOPROMPT_DEV_BUILD_CACHE_DISABLE") == "1"
+            or not (self.repo_root / "Package.swift").is_file()
+        ):
+            return None
+        configuration = self.configuration_for(operation, args)
+        try:
+            snapshot = self.snapshot(configuration, job_env)
+        except Exception as exc:
+            return self._advisory_prepare_context(configuration, exc)
+        build_dir = self.repo_root / ".build"
+        generation = 0
+        context = BuildCacheContext(
+            snapshot,
+            generation,
+            False,
+            {
+                "key": snapshot.key,
+                "configuration": configuration,
+                "storePath": str(self.store_root),
+                "generation": generation,
+                "state": "coldMiss",
+                "seeded": False,
+            },
+        )
+        startup_advisory_error = self._startup_advisory_error
+        temporary: Optional[Path] = None
+        try:
+            self._ensure_store_dirs()
+            self._startup_advisory_error = None
+            self._sweep_stranded_store_temporaries()
+            with self._repo_prepare_lock():
+                self._remove_repo_build_temporaries_locked()
+                with self.key_lock(snapshot.key, exclusive=False):
+                    meta = self._meta(snapshot.key) or {}
+                    generation = int(meta.get("generation") or 0)
+                    valid_seed = self._validate_seed(snapshot.key, meta) if meta else False
+                context.observed_generation = generation
+                context.status["generation"] = generation
+                if startup_advisory_error:
+                    context.status["startupAdvisoryFailure"] = startup_advisory_error
+                if build_dir.exists() or build_dir.is_symlink():
+                    context.status["state"] = (
+                        "warmLocal" if build_dir.is_dir() and not build_dir.is_symlink() else "unsafeLocalBuild"
+                    )
+                    return context
+                if meta and not valid_seed:
+                    self._quarantine_seed(snapshot.key, "seed generation or shape did not match metadata")
+                    context.status["state"] = "corruptSeedCold"
+                    return context
+                if not valid_seed:
+                    return context
+                temporary = self.repo_root / f".build.seed-tmp-{uuid.uuid4().hex}"
+                started = self._monotonic()
+                with self.key_lock(snapshot.key, exclusive=False):
+                    refreshed_meta = self._meta(snapshot.key) or {}
+                    if int(refreshed_meta.get("generation") or 0) != generation or not self._validate_seed(snapshot.key, refreshed_meta):
+                        context.status["state"] = "generationChangedCold"
+                        return context
+                    cloned = self._clone_runner(self._key_dir(snapshot.key) / "seed" / ".build", temporary)
+                if not cloned:
+                    context.status["state"] = "cloneFailedCold"
+                    return context
+                if build_dir.exists() or build_dir.is_symlink():
+                    context.status["state"] = "localBuildAppeared"
+                    return context
+                provenance = {
+                    "schemaVersion": BUILD_CACHE_SCHEMA_VERSION,
+                    "key": snapshot.key,
+                    "generation": generation,
+                    "sourceHead": meta.get("sourceHead"),
+                    "seedPath": str(self._key_dir(snapshot.key) / "seed"),
+                    "clonedAt": self._clock(),
+                }
+                _atomic_write_json(temporary / ".conductor-cache-provenance.json", provenance)
+                os.replace(temporary, build_dir)
+                temporary = None
+                duration = max(0.0, self._monotonic() - started)
+                context.status.update(
+                    {
+                        "state": "seeded",
+                        "seeded": True,
+                        "cloneSeconds": duration,
+                        "sourceHead": meta.get("sourceHead"),
+                    }
+                )
+                context.seeded = True
+                try:
+                    with self.key_lock(snapshot.key, exclusive=True):
+                        touched = self._meta(snapshot.key) or {}
+                        if int(touched.get("generation") or 0) == generation:
+                            touched["lastUsedAt"] = self._clock()
+                            _atomic_write_json(self._key_dir(snapshot.key) / "meta.json", touched)
+                except Exception as exc:
+                    context.status["advisoryFailure"] = str(exc)[:500]
+                return context
+        except Exception as exc:
+            return self._advisory_prepare_context(configuration, exc, snapshot, generation)
+        finally:
+            if temporary is not None and temporary.exists() and not temporary.is_symlink():
+                shutil.rmtree(temporary, ignore_errors=True)
+
+    @staticmethod
+    def _sanitize_seed(build_dir: Path) -> None:
+        deadline = BuildCacheManager._tree_deadline_seconds(build_dir)
+        for relative in ("xcode", "xcode-custom", ".conductor-cache-provenance.json"):
+            target = build_dir / relative
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    target.unlink()
+        for command, failure in (
+            (
+                [
+                    "/usr/bin/find",
+                    str(build_dir),
+                    "-type",
+                    "d",
+                    "-name",
+                    "ModuleCache",
+                    "-prune",
+                    "-exec",
+                    "/bin/rm",
+                    "-rf",
+                    "{}",
+                    "+",
+                ],
+                "could not exclude path-bound module caches from immutable build-cache seed",
+            ),
+            (
+                ["/usr/bin/find", str(build_dir), "-type", "f", "-name", "*.log", "-delete"],
+                "could not exclude logs from immutable build-cache seed",
+            ),
+        ):
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=deadline,
+            )
+            if completed.returncode != 0:
+                raise ConductorError(failure)
+
+    @staticmethod
+    def _disk_usage_bytes(path: Path) -> int:
+        completed = subprocess.run(
+            ["/usr/bin/du", "-sk", str(path)],
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            timeout=BuildCacheManager._tree_deadline_seconds(path),
+        )
+        if completed.returncode != 0:
+            raise ConductorError("could not measure immutable build-cache seed")
+        try:
+            return int(completed.stdout.split()[0]) * 1024
+        except (IndexError, ValueError) as exc:
+            raise ConductorError("invalid immutable build-cache disk-usage result") from exc
+
+    def publish(self, context: BuildCacheContext) -> Dict[str, Any]:
+        if not context.snapshot.payload:
+            return {"state": "publicationSkipped", "reason": "compatibility key unavailable"}
+        current = self.snapshot(str(context.snapshot.payload["configuration"]), context.snapshot.payload.get("environment") or {})
+        if current.key != context.snapshot.key:
+            return {"state": "publicationSkipped", "reason": "compatibility key changed during build"}
+        build_dir = self.repo_root / ".build"
+        if not build_dir.is_dir() or build_dir.is_symlink():
+            return {"state": "publicationSkipped", "reason": "successful build directory unavailable"}
+        self._ensure_store_dirs()
+        self._sweep_stranded_store_temporaries()
+        key = context.snapshot.key
+        next_generation = 0
+        size = 0
+        with self.key_lock(key, exclusive=True):
+            key_dir = self._key_dir(key)
+            ensure_private_dir(key_dir)
+            existing = self._meta(key) or {}
+            generation = int(existing.get("generation") or 0)
+            if generation != context.observed_generation:
+                return {"state": "publicationSkipped", "reason": "newer generation already published", "generation": generation}
+            if (
+                existing.get("publishedAt")
+                and self._validate_seed(key, existing)
+                and self._clock() - float(existing["publishedAt"]) < BUILD_CACHE_PUBLISH_THROTTLE_SECONDS
+            ):
+                return {"state": "publicationSkipped", "reason": "publication throttled", "generation": generation}
+            next_generation = generation + 1
+            temporary = key_dir / f"seed.tmp-{uuid.uuid4().hex}"
+            previous = key_dir / f"seed.previous-{uuid.uuid4().hex}"
+            seed = key_dir / "seed"
+            swapped = False
+            publication_committed = False
+            try:
+                ensure_private_dir(temporary)
+                cloned = self._clone_runner(build_dir, temporary / ".build")
+                if not cloned:
+                    return {"state": "publicationSkipped", "reason": "COW publication clone failed"}
+                self._sanitize_seed(temporary / ".build")
+                _atomic_write_json(temporary / ".generation.json", {"key": key, "generation": next_generation})
+                size = self._disk_usage_bytes(temporary / ".build")
+                source_head = self._source_head(self.repo_root)
+                meta = {
+                    "schemaVersion": BUILD_CACHE_SCHEMA_VERSION,
+                    "key": key,
+                    "generation": next_generation,
+                    "toolchainSignature": context.snapshot.toolchain_signature,
+                    "compatibility": context.snapshot.payload,
+                    "sourceHead": source_head,
+                    "publishedAt": self._clock(),
+                    "lastUsedAt": self._clock(),
+                    "sizeBytes": size,
+                    "suspectCount": 0,
+                }
+                if seed.exists():
+                    os.replace(seed, previous)
+                os.replace(temporary, seed)
+                swapped = True
+                _atomic_write_json(key_dir / "meta.json", meta)
+                publication_committed = True
+            except Exception:
+                if swapped:
+                    if previous.exists():
+                        try:
+                            self._remove_owned_temporary(seed)
+                            os.replace(previous, seed)
+                        except Exception:
+                            # Preserve the recoverable previous generation for the next
+                            # locked maintenance sweep rather than deleting it blindly.
+                            pass
+                    else:
+                        with contextlib.suppress(OSError):
+                            self._remove_owned_temporary(seed)
+                elif previous.exists() and not seed.exists():
+                    with contextlib.suppress(OSError):
+                        os.replace(previous, seed)
+                raise
+            finally:
+                if temporary.exists():
+                    with contextlib.suppress(OSError):
+                        self._remove_owned_temporary(temporary)
+                if publication_committed and previous.exists():
+                    with contextlib.suppress(OSError):
+                        self._remove_owned_temporary(previous)
+        retention = self.enforce_retention(context.snapshot.toolchain_signature)
+        return {"state": "published", "key": key, "generation": next_generation, "sizeBytes": size, "retention": retention}
+
+    def confirm_seeded_failure(self, key: str) -> Dict[str, Any]:
+        with self.key_lock(key, exclusive=True):
+            key_dir = self._key_dir(key)
+            meta = self._meta(key) or {"key": key, "generation": 0}
+            count = int(meta.get("suspectCount") or 0) + 1
+            meta["suspectCount"] = count
+            meta["lastSuspectAt"] = self._clock()
+            quarantined = False
+            seed = key_dir / "seed"
+            if count >= 2 and seed.exists() and not seed.is_symlink():
+                quarantine = key_dir / f"suspect-{int(self._clock())}-{uuid.uuid4().hex[:8]}"
+                os.replace(seed, quarantine)
+                shutil.rmtree(quarantine, ignore_errors=True)
+                meta["quarantinedAt"] = self._clock()
+                quarantined = True
+            ensure_private_dir(key_dir)
+            _atomic_write_json(key_dir / "meta.json", meta)
+            return {"suspectCount": count, "quarantined": quarantined}
+
+    def enforce_retention(self, current_toolchain_signature: str) -> Dict[str, Any]:
+        self._ensure_store_dirs()
+        hygiene = self._sweep_stranded_store_temporaries()
+        try:
+            limit = int(self.env.get("REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES") or BUILD_CACHE_DEFAULT_LIMIT_BYTES)
+        except ValueError:
+            limit = BUILD_CACHE_DEFAULT_LIMIT_BYTES
+        rows: List[Tuple[bool, float, int, str]] = []
+        for child in self.store_root.iterdir():
+            if not child.is_dir() or not re.fullmatch(r"[0-9a-f]{64}", child.name):
+                continue
+            meta = self._meta(child.name) or {}
+            rows.append((meta.get("toolchainSignature") == current_toolchain_signature, float(meta.get("lastUsedAt") or 0.0), int(meta.get("sizeBytes") or 0), child.name))
+        total = sum(row[2] for row in rows)
+        evicted: List[str] = []
+        for _same_toolchain, _used, size, key in sorted(rows):
+            if total <= max(0, limit):
+                break
+            try:
+                with self.key_lock(key, exclusive=True, nonblocking=True):
+                    key_dir = self._key_dir(key)
+                    if key_dir.exists() and not key_dir.is_symlink():
+                        shutil.rmtree(key_dir)
+                        total -= size
+                        evicted.append(key)
+            except BlockingIOError:
+                continue
+        return {"limitBytes": limit, "remainingBytes": total, "evictedKeys": evicted, "hygiene": hygiene}
+
+    def status(self, limit: int = BUILD_CACHE_DIAGNOSTIC_MAX_ROWS) -> Dict[str, Any]:
+        entries: List[Dict[str, Any]] = []
+        try:
+            children = list(self.store_root.iterdir())
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            children = []
+        for child in children:
+            if child.is_dir() and not child.is_symlink() and re.fullmatch(r"[0-9a-f]{64}", child.name):
+                meta = self._meta(child.name) or {"key": child.name, "state": "invalidMetadata"}
+                entries.append(meta)
+        entries.sort(key=lambda item: float(item.get("lastUsedAt") or item.get("publishedAt") or 0.0), reverse=True)
+        return {
+            "storePath": str(self.store_root),
+            "readOnly": True,
+            "entryCount": len(entries),
+            "entries": entries[: max(1, min(limit, 100))],
+        }
+
+    def drop(self, key: str) -> bool:
+        with self.key_lock(key, exclusive=True):
+            key_dir = self._key_dir(key)
+            if not key_dir.exists():
+                return False
+            if key_dir.is_symlink():
+                raise ConductorError("refusing symlink build-cache entry")
+            shutil.rmtree(key_dir)
+            return True
 
 
 def machine_lock_dir() -> Path:
@@ -1387,7 +2185,7 @@ def _classify_socket_for_recovery(paths: Paths) -> str:
         probe.close()
 
 
-def cleanup_stale_files(paths: Paths) -> DaemonRecoveryResult:
+def cleanup_stale_files(paths: Paths, *, startup_lock_held: bool = False) -> DaemonRecoveryResult:
     evidence_paths = (paths.pid_path, paths.socket_path, paths.daemon_meta_path)
     identities = {path: _path_identity(path) for path in evidence_paths}
     if all(identity is None for identity in identities.values()):
@@ -1417,19 +2215,46 @@ def cleanup_stale_files(paths: Paths) -> DaemonRecoveryResult:
         if identity is not None and _path_identity(path) != identity:
             return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed during recovery: {path}")
     registry_identity = _path_identity(paths.running_processes_path)
-    for path, identity in (*identities.items(), (paths.running_processes_path, registry_identity)):
-        if identity is None:
-            continue
-        if _path_identity(path) != identity:
-            return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed before cleanup: {path}")
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-    cleanup_reason = "proven pid reuse" if reused_pid_proven else "dead recorded daemon"
-    return DaemonRecoveryResult(
-        "cleaned",
-        True,
-        f"removed stale daemon evidence after {cleanup_reason} and {socket_state} socket proof",
-    )
+    if registry_identity is not None:
+        # Keep the pre-cleanup inode as a concurrency fence. Worker cleanup may
+        # remove registry-bound attempt sidecars, but it must not replace or
+        # unlink the registry itself. Refreshing this identity afterward would
+        # incorrectly bless a replacement daemon's concurrently written state.
+        worker_cleanup = cleanup_running_process_groups(paths)
+        if not worker_cleanup.get("safeToForget"):
+            return DaemonRecoveryResult(
+                "ambiguous",
+                False,
+                "recorded daemon is stale, but worker process-group cleanup lacks exact bounded completion evidence",
+            )
+    final_identities = (*identities.items(), (paths.running_processes_path, registry_identity))
+
+    def finalize_locked() -> DaemonRecoveryResult:
+        for path, identity in final_identities:
+            if identity is None:
+                continue
+            if _path_identity(path) != identity:
+                return DaemonRecoveryResult("ambiguous", False, f"daemon evidence changed before cleanup: {path}")
+        for path, identity in final_identities:
+            if identity is None:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        cleanup_reason = "proven pid reuse" if reused_pid_proven else "dead recorded daemon"
+        return DaemonRecoveryResult(
+            "cleaned",
+            True,
+            f"removed stale daemon evidence after {cleanup_reason} and {socket_state} socket proof",
+        )
+
+    if startup_lock_held:
+        return finalize_locked()
+    with paths.lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return finalize_locked()
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def process_start_token(pid: int) -> Optional[str]:
@@ -2107,6 +2932,8 @@ class Job:
     error: Optional[str] = None
     result_summary: Optional[str] = None
     cancel_requested: bool = False
+    cancellation_ignored_reason: Optional[str] = None
+    cache_attempt_record_path: Optional[Path] = dataclasses.field(default=None, repr=False)
     cleanup_in_flight: bool = False
     superseded_by_ticket: Optional[str] = None
     superseded_by_operation: Optional[str] = None
@@ -2137,6 +2964,7 @@ class Job:
     output_truncation_reason: Optional[str] = None
     output_bytes_read: int = 0
     tail_bytes: int = 0
+    build_cache: Dict[str, Any] = dataclasses.field(default_factory=dict)
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
@@ -2201,6 +3029,11 @@ class Job:
             "error": self.error,
             "resultSummary": self.result_summary,
             "cancelRequested": self.cancel_requested,
+            "cancellationIgnored": self.cancellation_ignored_reason is not None,
+            "cancellationIgnoredReason": self.cancellation_ignored_reason,
+            "cacheAttemptRecoveryRecord": (
+                str(self.cache_attempt_record_path) if self.cache_attempt_record_path is not None else None
+            ),
             "supersededByTicket": self.superseded_by_ticket,
             "supersededByOperation": self.superseded_by_operation,
             "timedOut": self.timed_out,
@@ -2211,6 +3044,7 @@ class Job:
             "lastProgressAction": self.xctest_last_progress_action,
             "lastProgressObservedAt": self.xctest_last_progress_observed_at,
             "diagnosticPaths": [str(path) for path in self.diagnostic_paths],
+            "buildCache": dict(self.build_cache),
         }
         if self.diagnostics:
             payload["diagnostics"] = list(self.diagnostics)
@@ -2254,6 +3088,10 @@ class OperationRegistry:
         "SWIFT_EXEC",
         "CC",
         "CXX",
+        "ARCHS",
+        "ONLY_ACTIVE_ARCH",
+        "OTHER_SWIFT_FLAGS",
+        "SWIFTFLAGS",
         "TMPDIR",
         "HOME",
         "USER",
@@ -2287,6 +3125,9 @@ class OperationRegistry:
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
+        "REPOPROMPT_DEV_BUILD_CACHE_DIR",
+        "REPOPROMPT_DEV_BUILD_CACHE_DISABLE",
+        "REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES",
     ]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
@@ -2412,7 +3253,7 @@ class OperationRegistry:
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
-            return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
+            return self._internal_argv("debug_app_build_then_launch", dict(args)), ["build", "liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
             if subcommand == "stop":
@@ -2423,11 +3264,11 @@ class OperationRegistry:
             if subcommand == "launch-existing":
                 return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
-                return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
+                return self._internal_argv("debug_app_build_then_launch", dict(args)), ["build", "liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
             if args.get("launch"):
-                lanes = ["liveApp"]
+                lanes = ["build", "liveApp"]
             elif args.get("packagedApp"):
                 lanes = ["liveApp"]
             smoke_args = dict(args)
@@ -2594,12 +3435,27 @@ class DaemonState:
         self._running_registry_generation = 0
         self._retention_generation = 0
         self._registry_publish_lock = threading.Lock()
+        self._cache_write_lock = threading.Lock()
+        self._cache_write_active_ticket: Optional[str] = None
+        self.build_cache: Optional[BuildCacheManager] = None
         self._daemon_infrastructure_warnings: Deque[Dict[str, Any]] = deque(maxlen=MAX_INFRASTRUCTURE_WARNINGS)
         self._io_worker = ExternalIOWorker(self._record_io_worker_error)
         self._output_pump = ProcessOutputPump(
             self._submit_process_output_chunk,
             self._submit_process_output_line,
         )
+
+    def _build_cache_manager(self, env: Optional[Dict[str, str]] = None) -> BuildCacheManager:
+        desired_env = dict(os.environ if env is None else env)
+        override = desired_env.get("REPOPROMPT_DEV_BUILD_CACHE_DIR")
+        desired_root = (
+            Path(override).expanduser().resolve()
+            if override
+            else (Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "Conductor" / "BuildCache").resolve()
+        )
+        if self.build_cache is None or self.build_cache.store_root != desired_root:
+            self.build_cache = BuildCacheManager(self.paths.repo_root, env=desired_env)
+        return self.build_cache
 
     def _record_io_worker_error(self, message: str) -> None:
         with self.condition:
@@ -2711,6 +3567,7 @@ class DaemonState:
                     if ticket in self.jobs
                 ],
                 "unlanedCapacity": {"limit": MAX_UNLANED_JOBS, "activeCount": len(self.active_unlaned)},
+                "cacheWriteLane": {"activeTicket": self._cache_write_active_ticket},
                 "runningJobs": running_jobs,
                 "queuedJobs": queued_jobs,
                 "queueDepth": len(self.queue),
@@ -2972,6 +3829,18 @@ class DaemonState:
                 self._retention_pass_locked()
                 return self._job_payload_locked(job, include_tail=True)
             if job.state == "running":
+                if job.phase == "publishingCache":
+                    job.cancellation_ignored_reason = (
+                        "build process already succeeded; immutable cache publication is non-abortable"
+                    )
+                    self._append_system_line_locked(
+                        job,
+                        f"cancellation ignored: {job.cancellation_ignored_reason}\n",
+                    )
+                    payload = self._job_payload_locked(job, include_tail=True)
+                    payload["cancellationPending"] = False
+                    self.condition.notify_all()
+                    return payload
                 job.cancel_requested = True
                 self._set_phase_locked(job, "canceling")
                 self._request_process_cleanup_locked(job, reason="cancellation requested")
@@ -2999,6 +3868,20 @@ class DaemonState:
             self.shutdown_requested = True
             if force:
                 for job in list(active_or_queued):
+                    if job.state == "running" and job.phase == "publishingCache":
+                        # Atomic seed replacement must not be interrupted after a
+                        # successful build. Force-stop waits for the publication's
+                        # already bounded filesystem operations instead of
+                        # signaling or corrupting the committed build result.
+                        job.cancellation_ignored_reason = (
+                            "build process already succeeded; immutable cache publication is non-abortable"
+                        )
+                        self._append_system_line_locked(
+                            job,
+                            f"daemon stop cancellation ignored: {job.cancellation_ignored_reason}\n",
+                        )
+                        running_tickets.append(job.ticket)
+                        continue
                     job.cancel_requested = True
                     if job.state == "queued":
                         job.state = "canceled"
@@ -3016,6 +3899,19 @@ class DaemonState:
                 self._write_running_processes_locked()
                 self.condition.notify_all()
             payload = self.status_payload()
+            if force:
+                publication_wait_tickets = [
+                    job.ticket
+                    for job in active_or_queued
+                    if job.state == "running" and job.phase == "publishingCache"
+                ]
+                payload["forceStop"] = {
+                    "requested": True,
+                    "publicationPolicy": "waitForNonAbortableAtomicPublication",
+                    "publicationWaitTickets": publication_wait_tickets,
+                    "publicationWaitTimeoutSeconds": BUILD_CACHE_FORCE_STOP_WAIT_SECONDS,
+                    "cancellationIgnored": bool(publication_wait_tickets),
+                }
         if force and running_tickets:
             threading.Thread(target=self._force_shutdown_when_canceled, args=(running_tickets,), daemon=True).start()
         else:
@@ -3032,6 +3928,24 @@ class DaemonState:
             for ticket in tickets:
                 job = self.jobs.get(ticket)
                 if not job or job.state != "running":
+                    continue
+                if job.phase == "publishingCache" and job.cancellation_ignored_reason:
+                    # Do not create a second cancellation authority inside the
+                    # atomic publication path. Wait only for the advertised
+                    # bounded allowance; on expiry, keep the daemon available
+                    # and leave the publication worker and build result intact.
+                    publication_deadline = time.monotonic() + BUILD_CACHE_FORCE_STOP_WAIT_SECONDS
+                    while job.state == "running" and job.phase == "publishingCache":
+                        remaining = publication_deadline - time.monotonic()
+                        if remaining <= 0:
+                            self.shutdown_requested = False
+                            self._warn_job_locked(
+                                job,
+                                "buildCachePublicationStopWaitExpired",
+                                "daemon stop --force left non-abortable cache publication running after bounded wait",
+                            )
+                            return
+                        self.condition.wait(timeout=min(PROCESS_TREE_POLL_SECONDS, remaining))
                     continue
                 descendants_alive = self._wait_for_process_tree_exit_locked(
                     job,
@@ -3197,7 +4111,13 @@ class DaemonState:
             return None
         return acquired
 
-    def _publish_started_process_identity(self, job: Job, process: subprocess.Popen[bytes]) -> bool:
+    def _publish_started_process_identity(
+        self,
+        job: Job,
+        process: subprocess.Popen[bytes],
+        *,
+        durable_registry: bool = False,
+    ) -> bool:
         process_pgid: Optional[int] = None
         with contextlib.suppress(OSError):
             process_pgid = os.getpgid(process.pid)
@@ -3216,9 +4136,12 @@ class DaemonState:
             if observed_process_start:
                 job.tracked_processes[process.pid] = observed_process_start
             self._set_phase_locked(job, "runningProcess")
-            self._write_running_processes_locked()
+            if not durable_registry:
+                self._write_running_processes_locked()
             cancel_after_publish = job.cancel_requested and job.superseded_by_ticket is None
             self.condition.notify_all()
+        if durable_registry:
+            self._write_running_processes_durable()
         return cancel_after_publish
 
     def _cleanup_failed_output_registration(self, job: Job, process: subprocess.Popen[bytes]) -> None:
@@ -3275,6 +4198,11 @@ class DaemonState:
         output_channel: Optional[ProcessOutputChannel] = None
         watchdog: Optional[threading.Thread] = None
         global_heavy_slot: Optional[Any] = None
+        cache_manager: Optional[BuildCacheManager] = None
+        cache_context: Optional[BuildCacheContext] = None
+        cache_publish_after_success = False
+        cache_wrapper_gate_read = -1
+        cache_wrapper_gate_write = -1
         try:
             with self.lock:
                 job = self.jobs[ticket]
@@ -3295,6 +4223,46 @@ class DaemonState:
                     return
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
             env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
+            if BuildCacheManager.eligible(job.operation, job.args) and (self.paths.repo_root / "Package.swift").is_file():
+                with self._cache_write_lock:
+                    cache_manager = self._build_cache_manager(env)
+                cache_context = cache_manager.prepare(job.operation, job.args, env)
+                if cache_context is not None:
+                    cache_context.outcome_path = job.log_path.with_suffix(".cache-outcome.json")
+                    with self.condition:
+                        job.build_cache = dict(cache_context.status)
+                        self._append_system_line_locked(
+                            job,
+                            f"build cache {cache_context.status.get('state')}: key={cache_context.status.get('key', 'unavailable')}\n",
+                        )
+                    if cache_context.seeded:
+                        attempt_timeout = effective_timeout
+                        cache_attempt_record_path = job.log_path.with_suffix(".cache-attempt.json")
+                        with self.condition:
+                            job.cache_attempt_record_path = cache_attempt_record_path
+                        cleanup_timeout = BuildCacheManager._tree_deadline_seconds(
+                            self.paths.repo_root / ".build"
+                        )
+                        argv = self.registry._internal_argv(
+                            "cache_retry",
+                            {
+                                "argv": argv,
+                                "key": cache_context.snapshot.key,
+                                "outcomePath": str(cache_context.outcome_path),
+                                "attemptTimeout": attempt_timeout,
+                                "cleanupTimeout": cleanup_timeout,
+                                "attemptRecordPath": str(cache_attempt_record_path),
+                                "ticket": job.ticket,
+                            },
+                        )
+                        effective_timeout = BuildCacheManager.retry_job_timeout(
+                            attempt_timeout,
+                            cleanup_timeout,
+                        )
+                        with self.condition:
+                            job.build_cache["attemptTimeoutSeconds"] = attempt_timeout
+                            job.build_cache["cleanupTimeoutSeconds"] = cleanup_timeout
+                            job.build_cache["retryEnvelopeTimeoutSeconds"] = effective_timeout
             if operation_requires_global_heavy_slot(job.operation, job.args):
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
@@ -3305,6 +4273,11 @@ class DaemonState:
             output_transport = self._create_process_output_transport(job)
             with self.condition:
                 job.progress_transport = output_transport.kind
+            process_pass_fds: Tuple[int, ...] = ()
+            if cache_context is not None and cache_context.seeded:
+                cache_wrapper_gate_read, cache_wrapper_gate_write = os.pipe()
+                env["REPOPROMPT_CONDUCTOR_CACHE_WRAPPER_GATE_FD"] = str(cache_wrapper_gate_read)
+                process_pass_fds = (cache_wrapper_gate_read,)
             process = subprocess.Popen(
                 argv,
                 cwd=str(cwd),
@@ -3312,8 +4285,12 @@ class DaemonState:
                 stdin=subprocess.DEVNULL,
                 stdout=output_transport.popen_stdout,
                 stderr=output_transport.popen_stderr,
+                pass_fds=process_pass_fds,
                 start_new_session=True,
             )
+            if cache_wrapper_gate_read >= 0:
+                os.close(cache_wrapper_gate_read)
+                cache_wrapper_gate_read = -1
             output_transport.attach_process(process)
             reader_fd = output_transport.transfer_reader()
             try:
@@ -3325,7 +4302,25 @@ class DaemonState:
                 self._cleanup_failed_output_registration(job, process)
                 raise
 
-            cancel_after_publish = self._publish_started_process_identity(job, process)
+            try:
+                cancel_after_publish = self._publish_started_process_identity(
+                    job,
+                    process,
+                    durable_registry=cache_wrapper_gate_write >= 0,
+                )
+                if cache_wrapper_gate_write >= 0:
+                    if os.write(cache_wrapper_gate_write, b"1") != 1:
+                        raise ConductorError("cache retry wrapper gate release was incomplete")
+                    os.close(cache_wrapper_gate_write)
+                    cache_wrapper_gate_write = -1
+            except Exception:
+                if cache_wrapper_gate_write >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(cache_wrapper_gate_write)
+                    cache_wrapper_gate_write = -1
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=KILL_GRACE_SECONDS)
+                raise
             if cancel_after_publish:
                 with self.condition:
                     current = self.jobs.get(job.ticket)
@@ -3440,8 +4435,16 @@ class DaemonState:
                         self._append_system_line_locked(job, job.error + "\n")
             with self.condition:
                 self._finalize_process_exit_locked(job, exit_code)
-                self._set_phase_locked(job, "summarizing")
-                job.finished_at = now()
+                cache_publish_after_success = bool(
+                    job.state == "completed" and cache_context is not None and cache_manager is not None
+                )
+                if cache_publish_after_success:
+                    job.state = "running"
+                    job.result_summary = "build succeeded; publishing immutable cache seed"
+                    self._set_phase_locked(job, "publishingCache")
+                else:
+                    self._set_phase_locked(job, "summarizing")
+                    job.finished_at = now()
         except Exception as exc:
             if job is not None:
                 with self.condition:
@@ -3453,6 +4456,12 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
+            if cache_wrapper_gate_read >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(cache_wrapper_gate_read)
+            if cache_wrapper_gate_write >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(cache_wrapper_gate_write)
             if output_channel is not None and output_channel.result is None:
                 with contextlib.suppress(ConductorError):
                     self._output_pump.request_finalization(output_channel)
@@ -3462,11 +4471,59 @@ class DaemonState:
                         job.output_truncated = output_result.truncated
                         job.output_truncation_reason = output_result.reason
                         job.output_bytes_read = output_result.bytes_read
+            # Deliberate ordering: cache publication no longer consumes scarce
+            # machine-wide heavy capacity, while the job retains its per-daemon
+            # build lane through immutable publication. Coordinated mutators of
+            # this checkout's .build remain blocked without stalling unrelated
+            # worktrees behind the global heavy slot.
             self._release_global_heavy_slot(global_heavy_slot)
-            if job is not None and global_heavy_slot is not None:
+            released_heavy_slot = global_heavy_slot is not None
+            global_heavy_slot = None
+            if job is not None and released_heavy_slot:
                 with self.condition:
                     if self.jobs.get(job.ticket) is job:
                         job.global_heavy_admission_state = "released"
+            if job is not None and cache_context is not None and cache_context.outcome_path is not None:
+                outcome = BuildCacheManager._read_json_file(cache_context.outcome_path)
+                if outcome:
+                    with self.condition:
+                        job.build_cache["retry"] = outcome
+                        self._apply_cache_retry_outcome_locked(job, outcome)
+                with contextlib.suppress(FileNotFoundError):
+                    cache_context.outcome_path.unlink()
+            if job is not None and cache_publish_after_success and cache_context is not None and cache_manager is not None:
+                try:
+                    with self._cache_write_lock:
+                        with self.condition:
+                            self._cache_write_active_ticket = job.ticket
+                        try:
+                            publication = cache_manager.publish(cache_context)
+                        finally:
+                            with self.condition:
+                                self._cache_write_active_ticket = None
+                                self.condition.notify_all()
+                    with self.condition:
+                        job.build_cache["publication"] = publication
+                        self._append_system_line_locked(
+                            job,
+                            f"build cache publication {publication.get('state')}: {publication.get('reason') or publication.get('generation', '')}\n",
+                        )
+                except Exception as exc:
+                    with self.condition:
+                        job.build_cache["publication"] = {"state": "publicationFailed", "error": str(exc)[:500]}
+                        self._warn_job_locked(job, "buildCachePublicationFailed", str(exc))
+                finally:
+                    with self.condition:
+                        job.state = "completed"
+                        job.exit_code = 0
+                        job.result_summary = (
+                            "completed successfully; cancellation ignored during non-abortable cache publication"
+                            if job.cancellation_ignored_reason
+                            else "completed successfully"
+                        )
+                        self._set_phase_locked(job, "summarizing")
+                        job.finished_at = now()
+                        self.condition.notify_all()
             if output_transport is not None:
                 output_transport.close_all()
             refresh_after_release = False
@@ -3502,6 +4559,23 @@ class DaemonState:
                 self._append_tail_locked(job, text)
                 self._record_xctest_progress_locked(job, text)
                 self.condition.notify_all()
+
+    @staticmethod
+    def _apply_cache_retry_outcome_locked(job: Job, outcome: Dict[str, Any]) -> None:
+        cold_attempted = bool(outcome.get("coldRetryAttempted"))
+        terminal_timed_out = bool(
+            outcome.get("coldTimedOut") if cold_attempted else outcome.get("seededTimedOut")
+        )
+        if not terminal_timed_out:
+            return
+        attempt = "cold recovery" if cold_attempted else "seeded"
+        timeout = outcome.get("attemptTimeoutSeconds")
+        suffix = f" after {float(timeout):.1f}s" if isinstance(timeout, (int, float)) else ""
+        job.timed_out = True
+        job.state = "failed"
+        job.exit_code = 124
+        job.error = f"{attempt} cache build attempt timed out{suffix}"
+        job.result_summary = job.error
 
     def _finalize_process_exit_locked(self, job: Job, exit_code: int) -> None:
         if job.cancel_requested:
@@ -3995,7 +5069,7 @@ class DaemonState:
                 if current is not None:
                     self._settle_job_log_sequence_locked(current, sequence)
 
-    def _write_running_processes_locked(self) -> None:
+    def _running_processes_payload_locked(self) -> Tuple[int, Dict[str, Any]]:
         self._running_registry_generation += 1
         generation = self._running_registry_generation
         processes = []
@@ -4016,15 +5090,24 @@ class DaemonState:
                         "pgid": job.process_pgid,
                         "processStart": job.process_start,
                         "processGroupIdentityConfirmed": job.process_group_identity_confirmed,
+                        "cacheAttemptRecord": (
+                            job.cache_attempt_record_path.name
+                            if job.cache_attempt_record_path is not None
+                            else None
+                        ),
                     }
                 )
         payload = {
-            "version": 2,
+            "version": 3,
             "generation": generation,
             "updatedAt": now(),
             "daemon": {"pid": os.getpid(), "processStart": self._daemon_start_token},
             "processes": processes,
         }
+        return generation, payload
+
+    def _write_running_processes_locked(self) -> None:
+        generation, payload = self._running_processes_payload_locked()
         if not self._io_worker.submit(self._publish_running_processes, generation, payload):
             self._daemon_infrastructure_warnings.append(
                 {
@@ -4034,21 +5117,21 @@ class DaemonState:
                 }
             )
 
+    def _write_running_processes_durable(self) -> None:
+        with self._registry_publish_lock:
+            with self.condition:
+                generation, payload = self._running_processes_payload_locked()
+            _atomic_write_json(self.paths.running_processes_path, payload)
+
     def _publish_running_processes(self, generation: int, payload: Dict[str, Any]) -> None:
-        temporary = self.paths.running_processes_path.with_name(
-            f".{self.paths.running_processes_path.name}.{generation}.{uuid.uuid4().hex}.tmp"
-        )
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        try:
-            with self._registry_publish_lock:
-                with self.condition:
-                    if generation != self._running_registry_generation:
-                        return
-                os.replace(temporary, self.paths.running_processes_path)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
+        with self._registry_publish_lock:
+            with self.condition:
+                if generation != self._running_registry_generation:
+                    return
+            # The registry is the sole enumeration authority for crash recovery.
+            # Publish it with file and directory fsync before any supplemental
+            # cache-attempt record may be trusted.
+            _atomic_write_json(self.paths.running_processes_path, payload)
 
     def _request_process_cleanup_locked(self, job: Job, reason: str) -> None:
         if job.state != "running" or job.cleanup_in_flight:
@@ -4446,6 +5529,7 @@ def validate_json_shape(value: Any, depth: int = 0) -> None:
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = MAX_ACTIVE_REQUEST_HANDLERS
 
     def __init__(self, server_address: str, handler_cls: Any, state: DaemonState) -> None:
         self.state = state
@@ -4685,7 +5769,11 @@ def request_daemon(paths: Paths, payload: Dict[str, Any], timeout: Optional[floa
     return payload_value
 
 
-def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Optional[Dict[str, Any]], Optional[ConductorError]]:
+def compatible_daemon_status_or_stop_idle_mismatch(
+    paths: Paths,
+    *,
+    startup_lock_held: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], Optional[ConductorError]]:
     try:
         payload = request_daemon(paths, {"type": "status"}, timeout=1.0)
     except ConductorError as exc:
@@ -4709,7 +5797,16 @@ def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Option
             f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) could not stop without force; "
             "jobs may have become active. Run './conductor daemon stop --force' after deciding it is safe"
         ) from exc
-    if not wait_until_stopped(paths, timeout=TERMINATE_GRACE_SECONDS + 5.0):
+    stopped = (
+        wait_until_stopped(
+            paths,
+            timeout=TERMINATE_GRACE_SECONDS + 5.0,
+            startup_lock_held=True,
+        )
+        if startup_lock_held
+        else wait_until_stopped(paths, timeout=TERMINATE_GRACE_SECONDS + 5.0)
+    )
+    if not stopped:
         raise ConductorError(
             f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) did not stop cleanly; "
             "run './conductor daemon stop --force' after deciding it is safe"
@@ -4747,8 +5844,11 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
 
     with paths.lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        locked_recovery = cleanup_stale_files(paths)
-        payload, locked_contact_error = compatible_daemon_status_or_stop_idle_mismatch(paths)
+        locked_recovery = cleanup_stale_files(paths, startup_lock_held=True)
+        payload, locked_contact_error = compatible_daemon_status_or_stop_idle_mismatch(
+            paths,
+            startup_lock_held=True,
+        )
         if payload is not None:
             return payload
         if locked_recovery.state == "ambiguous":
@@ -4791,10 +5891,13 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
         )
 
 
-def wait_until_stopped(paths: Paths, timeout: float) -> bool:
+def wait_until_stopped(paths: Paths, timeout: float, *, startup_lock_held: bool = False) -> bool:
     deadline = now() + timeout
     while now() < deadline:
-        cleanup_stale_files(paths)
+        if startup_lock_held:
+            cleanup_stale_files(paths, startup_lock_held=True)
+        else:
+            cleanup_stale_files(paths)
         if not paths.socket_path.exists() and not paths.pid_path.exists():
             return True
         time.sleep(0.1)
@@ -4809,7 +5912,7 @@ def read_running_processes(paths: Paths, invalid: Optional[List[str]] = None) ->
         return []
     except (json.JSONDecodeError, OSError) as exc:
         raise ConductorError(f"could not safely read running-process registry: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("version", 1) not in {1, 2}:
+    if not isinstance(payload, dict) or payload.get("version", 1) not in {1, 2, 3}:
         raise ConductorError("running-process registry has an unsupported schema")
     processes = payload.get("processes")
     if not isinstance(processes, list):
@@ -4833,39 +5936,290 @@ def read_running_processes(paths: Paths, invalid: Optional[List[str]] = None) ->
     return validated
 
 
-def signal_running_process_groups(paths: Paths, sig: signal.Signals) -> Dict[str, Any]:
-    snapshot = process_table_snapshot()
-    report: Dict[str, Any] = {"verified": [], "skipped": [], "gone": [], "invalid": []}
-    own_pgid = os.getpgrp()
+def _read_cache_attempt_recovery_group(
+    paths: Paths,
+    wrapper: Dict[str, Any],
+    invalid: List[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    record_name = wrapper.get("cacheAttemptRecord")
+    if record_name is None:
+        return None, None
+    ticket = wrapper.get("ticket")
+    if not isinstance(ticket, str) or not ticket or len(ticket) > 128:
+        invalid.append("cache attempt record: missing bounded ticket identity")
+        return None, None
+    expected_name = f"{ticket}.cache-attempt.json"
+    if not isinstance(record_name, str) or record_name != expected_name or Path(record_name).name != record_name:
+        invalid.append(f"cache attempt record for {ticket}: unsafe record path")
+        return None, None
+    record_path = paths.jobs_dir / record_name
     try:
-        processes = read_running_processes(paths, invalid=report["invalid"])
+        info = record_path.lstat()
+    except FileNotFoundError:
+        # The cache runner uses a pipe gate: the detached attempt cannot exec
+        # until this record has been durably replaced. A missing record therefore
+        # means there is no released attempt authority to recover.
+        return None, record_path
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        invalid.append(f"cache attempt record for {ticket}: unsafe file identity or mode")
+        return None, record_path
+    try:
+        payload = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        invalid.append(f"cache attempt record for {ticket}: unreadable: {exc}")
+        return None, record_path
+    try:
+        wrapper_pid = int(payload.get("wrapperPID"))
+        attempt_pid = int(payload.get("attemptPID"))
+        attempt_pgid = int(payload.get("attemptPGID"))
+    except (AttributeError, TypeError, ValueError):
+        invalid.append(f"cache attempt record for {ticket}: invalid pid/pgid")
+        return None, record_path
+    wrapper_start = payload.get("wrapperStartToken") if isinstance(payload, dict) else None
+    attempt_start = payload.get("attemptStartToken") if isinstance(payload, dict) else None
+    if not (
+        isinstance(payload, dict)
+        and payload.get("version") == 1
+        and payload.get("state") == "active"
+        and payload.get("ticket") == ticket
+        and wrapper_pid == int(wrapper["pid"])
+        and wrapper_start == wrapper.get("processStart")
+        and attempt_pid > 0
+        and attempt_pgid == attempt_pid
+        and isinstance(attempt_start, str)
+        and attempt_start
+    ):
+        invalid.append(f"cache attempt record for {ticket}: identity binding mismatch")
+        return None, record_path
+    return {
+        "kind": "cacheAttempt",
+        "ticket": ticket,
+        "pid": attempt_pid,
+        "pgid": attempt_pgid,
+        "startToken": attempt_start,
+    }, record_path
+
+
+def _collect_recovery_process_groups(paths: Paths) -> Tuple[List[Dict[str, Any]], List[str], List[Path]]:
+    invalid: List[str] = []
+    record_paths: List[Path] = []
+    try:
+        processes = read_running_processes(paths, invalid=invalid)
     except ConductorError as exc:
-        report["invalid"].append(f"registry: {exc}")
-        processes = []
+        return [], [f"registry: {exc}"], []
+    groups: List[Dict[str, Any]] = []
     for item in processes:
-        pid = int(item["pid"])
-        pgid = int(item["pgid"])
-        if snapshot is None:
-            report["skipped"].append(pid)
-            continue
-        record = snapshot.get(pid)
-        if record is None:
+        attempt, record_path = _read_cache_attempt_recovery_group(paths, item, invalid)
+        if record_path is not None:
+            record_paths.append(record_path)
+        groups.append(
+            {
+                "kind": "wrapper",
+                "ticket": item.get("ticket"),
+                "pid": int(item["pid"]),
+                "pgid": int(item["pgid"]),
+                "startToken": item["processStart"],
+            }
+        )
+        if attempt is not None:
+            # Stop the wrapper first so it cannot publish a successor attempt.
+            # The sidecar remains supplemental evidence bound to this registry
+            # entry and is re-read after wrapper exit before cleanup can finish.
+            groups.append(attempt)
+    return groups, invalid, record_paths
+
+
+def _signal_recovery_group(
+    group: Dict[str, Any],
+    sig: signal.Signals,
+    snapshot: Optional[Dict[int, Tuple[int, str]]],
+    own_pgid: int,
+) -> str:
+    pid = int(group["pid"])
+    pgid = int(group["pgid"])
+    if snapshot is None:
+        return "ambiguous"
+    record = snapshot.get(pid)
+    if record is None:
+        return "gone"
+    if record[1] != group["startToken"]:
+        return "stale"
+    if pgid == own_pgid:
+        return "ambiguous"
+    confirmation = process_table_snapshot()
+    if confirmation is None:
+        return "ambiguous"
+    confirmed = confirmation.get(pid)
+    if confirmed is None:
+        return "gone"
+    if confirmed[1] != group["startToken"]:
+        return "stale"
+    try:
+        if os.getpgid(pid) != pgid:
+            return "ambiguous"
+        os.killpg(pgid, sig)
+        return "verified"
+    except ProcessLookupError:
+        return "gone"
+    except (PermissionError, OSError):
+        return "ambiguous"
+
+
+def signal_running_process_groups(paths: Paths, sig: signal.Signals) -> Dict[str, Any]:
+    groups, invalid, record_paths = _collect_recovery_process_groups(paths)
+    snapshot = process_table_snapshot()
+    report: Dict[str, Any] = {
+        "verified": [],
+        "skipped": [],
+        "gone": [],
+        "invalid": invalid,
+        "groups": [],
+        "recordPaths": [str(path) for path in record_paths],
+    }
+    own_pgid = os.getpgrp()
+    for group in groups:
+        state = _signal_recovery_group(group, sig, snapshot, own_pgid)
+        pid = int(group["pid"])
+        report["groups"].append(
+            {
+                "kind": group["kind"],
+                "ticket": group.get("ticket"),
+                "pid": pid,
+                "pgid": int(group["pgid"]),
+                "startToken": group["startToken"],
+                "state": state,
+            }
+        )
+        if state == "verified":
+            report["verified"].append(pid)
+        elif state == "gone":
             report["gone"].append(pid)
-            continue
-        if record[1] != item["processStart"] or pgid == own_pgid:
+        else:
             report["skipped"].append(pid)
+    report["identityComplete"] = not invalid and all(
+        group["state"] in {"verified", "gone", "stale"} for group in report["groups"]
+    )
+    return report
+
+
+def _live_recovery_targets(targets: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    snapshot = process_table_snapshot()
+    if snapshot is None:
+        return None
+    live: List[Dict[str, Any]] = []
+    for target in targets:
+        pid = int(target["pid"])
+        record = snapshot.get(pid)
+        if record is None or record[1] != target["startToken"]:
             continue
         try:
-            if os.getpgid(pid) != pgid:
-                report["skipped"].append(pid)
-                continue
-            os.killpg(pgid, sig)
-            report["verified"].append(pid)
+            if os.getpgid(pid) != int(target["pgid"]):
+                return None
+            live.append(target)
         except ProcessLookupError:
-            report["gone"].append(pid)
+            continue
         except (PermissionError, OSError):
-            report["skipped"].append(pid)
-    return report
+            return None
+    return live
+
+
+def _wait_for_recovery_targets_exit(
+    targets: List[Dict[str, Any]],
+    timeout: float,
+) -> Optional[List[Dict[str, Any]]]:
+    if not targets:
+        return []
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        live = _live_recovery_targets(targets)
+        if live is None or not live or time.monotonic() >= deadline:
+            return live
+        time.sleep(min(PROCESS_TREE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def _signal_exact_recovery_targets(
+    targets: List[Dict[str, Any]],
+    sig: signal.Signals,
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    snapshot = process_table_snapshot()
+    own_pgid = os.getpgrp()
+    verified: List[Dict[str, Any]] = []
+    complete = True
+    for target in targets:
+        state = _signal_recovery_group(target, sig, snapshot, own_pgid)
+        if state == "verified":
+            verified.append(target)
+        elif state == "ambiguous":
+            complete = False
+    return complete, verified
+
+
+def _settle_recovery_report(
+    report: Dict[str, Any],
+    kinds: set[str],
+) -> Tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    targets = [
+        group
+        for group in report["groups"]
+        if group["state"] == "verified" and group["kind"] in kinds
+    ]
+    remaining = _wait_for_recovery_targets_exit(targets, TERMINATE_GRACE_SECONDS)
+    if remaining is None:
+        return False, None, targets
+    kill_report: Optional[Dict[str, Any]] = None
+    if remaining:
+        complete, kill_targets = _signal_exact_recovery_targets(remaining, signal.SIGKILL)
+        kill_report = {
+            "identityComplete": complete,
+            "verified": [int(target["pid"]) for target in kill_targets],
+        }
+        if not complete:
+            return False, kill_report, remaining
+        remaining = _wait_for_recovery_targets_exit(kill_targets, KILL_GRACE_SECONDS)
+        if remaining is None:
+            return False, kill_report, kill_targets
+    return not remaining, kill_report, remaining or []
+
+
+def cleanup_running_process_groups(paths: Paths) -> Dict[str, Any]:
+    # First stop and conclusively settle wrappers. Only wrappers can roll the
+    # sidecar from attempt A to B, so the registry-bound record becomes stable
+    # once their exact identities are gone.
+    initial = signal_running_process_groups(paths, signal.SIGTERM)
+    if not initial["identityComplete"]:
+        return {"safeToForget": False, "term": initial, "kill": None, "remaining": []}
+    wrappers_safe, wrapper_kill, remaining = _settle_recovery_report(initial, {"wrapper"})
+    if not wrappers_safe:
+        return {"safeToForget": False, "term": initial, "kill": wrapper_kill, "remaining": remaining}
+
+    # Re-read after wrapper exit to catch both A->B replacement and a sidecar
+    # published after the initial read. No wrapper remains able to create C.
+    attempts = signal_running_process_groups(paths, signal.SIGTERM)
+    if not attempts["identityComplete"]:
+        return {"safeToForget": False, "term": attempts, "kill": None, "remaining": []}
+    attempts_safe, attempt_kill, remaining = _settle_recovery_report(attempts, {"cacheAttempt"})
+    if not attempts_safe:
+        return {"safeToForget": False, "term": attempts, "kill": attempt_kill, "remaining": remaining}
+
+    final = signal_running_process_groups(paths, signal.SIGTERM)
+    if not final["identityComplete"]:
+        return {"safeToForget": False, "term": final, "kill": None, "remaining": []}
+    final_safe, final_kill, remaining = _settle_recovery_report(final, {"wrapper", "cacheAttempt"})
+    if not final_safe:
+        return {"safeToForget": False, "term": final, "kill": final_kill, "remaining": remaining}
+    verification = signal_running_process_groups(paths, signal.SIGTERM)
+    verified_live = [group for group in verification["groups"] if group["state"] == "verified"]
+    safe = verification["identityComplete"] and not verified_live
+    if safe:
+        for raw_path in verification.get("recordPaths") or []:
+            _durable_unlink(Path(raw_path))
+    return {
+        "safeToForget": safe,
+        "term": initial,
+        "kill": {"wrapper": wrapper_kill, "attempt": attempt_kill, "final": final_kill},
+        "remaining": verified_live,
+        "verification": verification,
+    }
 
 
 def force_stop_unresponsive_daemon(paths: Paths) -> Dict[str, Any]:
@@ -5306,6 +6660,43 @@ def handle_status_command(paths: Paths, argv: List[str]) -> int:
     else:
         render_daemon_status(payload, shorthand=True)
     return 0
+
+
+def handle_cache_command(paths: Paths, argv: List[str]) -> int:
+    if not argv or argv[0] in {"-h", "--help"}:
+        print("Usage: ./conductor cache status [--limit <n>] [--json] | cache drop <key> [--json]")
+        return 0
+    subcommand = argv[0]
+    parser = argparse.ArgumentParser(prog=f"conductor cache {subcommand}")
+    parser.add_argument("--json", action="store_true")
+    if subcommand == "status":
+        parser.add_argument("--limit", type=int, default=BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
+        ns = parser.parse_args(argv[1:])
+        if ns.limit <= 0:
+            raise ConductorError("cache status limit must be greater than zero")
+        payload = BuildCacheManager(paths.repo_root, startup_hygiene=False).status(ns.limit)
+        if ns.json:
+            print_json(payload)
+        else:
+            print(f"build cache: {payload['storePath']}")
+            print(f"entries: {payload['entryCount']}")
+            for entry in payload["entries"]:
+                print(
+                    f"  {entry.get('key')} generation={entry.get('generation')} "
+                    f"size={format_bytes(entry.get('sizeBytes'))} suspect={entry.get('suspectCount', 0)}"
+                )
+        return 0
+    if subcommand == "drop":
+        parser.add_argument("key")
+        ns = parser.parse_args(argv[1:])
+        dropped = BuildCacheManager(paths.repo_root).drop(ns.key)
+        payload = {"key": ns.key, "dropped": dropped}
+        if ns.json:
+            print_json(payload)
+        else:
+            print("dropped" if dropped else "not found")
+        return 0
+    raise ConductorError(f"unknown cache command '{subcommand}'")
 
 
 def handle_job_command(paths: Paths, argv: List[str]) -> int:
@@ -6345,7 +7736,7 @@ def directory_size_bytes(path: Path) -> Optional[int]:
                         total += stat_result.st_size
         except NotADirectoryError:
             try:
-                total += current.stat(follow_symlinks=False).st_size
+                total += current.lstat().st_size
             except OSError:
                 pass
         except OSError:
@@ -6355,7 +7746,7 @@ def directory_size_bytes(path: Path) -> Optional[int]:
 
 def latest_mtime(path: Path) -> Optional[float]:
     try:
-        return path.stat(follow_symlinks=False).st_mtime
+        return path.lstat().st_mtime
     except OSError:
         return None
 
@@ -6376,6 +7767,16 @@ def operation_diagnostics_build_cache(repo_root: Path, args: Dict[str, Any]) -> 
     current_build = repo_root / ".build"
 
     print("Build cache diagnostics", flush=True)
+    immutable = BuildCacheManager(repo_root, startup_hygiene=False).status(limit)
+    print(f"Immutable seed store: {immutable['storePath']}", flush=True)
+    print(f"Immutable seed entries: {immutable['entryCount']}", flush=True)
+    for entry in immutable["entries"]:
+        print(
+            f"  key={entry.get('key')} generation={entry.get('generation')} "
+            f"size={format_bytes(entry.get('sizeBytes'))} source={entry.get('sourceHead')} "
+            f"suspect={entry.get('suspectCount', 0)}",
+            flush=True,
+        )
     if current_build.exists():
         symlink_note = ""
         if current_build.is_symlink():
@@ -6437,6 +7838,251 @@ def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -
     return 0
 
 
+def run_cache_attempt_gate(read_fd: int, payload_json: str) -> int:
+    try:
+        argv = json.loads(payload_json)
+    except json.JSONDecodeError as exc:
+        raise ConductorError(f"cache attempt gate received invalid argv: {exc}") from exc
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item for item in argv):
+        raise ConductorError("cache attempt gate requires a non-empty argv")
+    try:
+        release = os.read(read_fd, 1)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
+    if release != b"1":
+        # The parent died or rejected identity publication before releasing the
+        # gate. No build command or descendant was started.
+        return 125
+    try:
+        os.execvpe(argv[0], list(argv), os.environ)
+    except OSError as exc:
+        raise ConductorError(f"cache attempt gate could not exec {argv[0]}: {exc}") from exc
+    return 125
+
+
+def _run_cache_attempt(
+    argv: Sequence[str],
+    repo_root: Path,
+    attempt_timeout: Optional[float],
+    attempt_record_path: Path,
+    ticket: str,
+) -> Tuple[int, bool]:
+    wrapper_start = process_start_token(os.getpid())
+    if not wrapper_start:
+        raise ConductorError("cache retry wrapper lacks an exact process start token")
+    read_fd, write_fd = os.pipe()
+    process: Optional[subprocess.Popen[bytes]] = None
+    gate_released = False
+    record_published = False
+    attempt_reaped = False
+    try:
+        gate_argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "__cache_attempt_gate",
+            str(read_fd),
+            json.dumps(list(argv), separators=(",", ":")),
+        ]
+        process = subprocess.Popen(
+            gate_argv,
+            cwd=str(repo_root),
+            stdin=subprocess.DEVNULL,
+            pass_fds=(read_fd,),
+            start_new_session=True,
+        )
+        os.close(read_fd)
+        read_fd = -1
+        attempt_start = process_start_token(process.pid)
+        try:
+            attempt_pgid = os.getpgid(process.pid)
+        except OSError as exc:
+            raise ConductorError(f"cache attempt process-group identity unavailable: {exc}") from exc
+        if not attempt_start or attempt_pgid != process.pid:
+            raise ConductorError("cache attempt lacks an exact session-leader identity")
+        _atomic_write_json(
+            attempt_record_path,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": os.getpid(),
+                "wrapperStartToken": wrapper_start,
+                "attemptPID": process.pid,
+                "attemptPGID": attempt_pgid,
+                "attemptStartToken": attempt_start,
+                "publishedAt": now(),
+            },
+        )
+        record_published = True
+        if os.write(write_fd, b"1") != 1:
+            raise ConductorError("cache attempt gate release was incomplete")
+        os.close(write_fd)
+        write_fd = -1
+        gate_released = True
+        try:
+            exit_code = process.wait(timeout=attempt_timeout)
+            attempt_reaped = True
+            return exit_code, False
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=TERMINATE_GRACE_SECONDS)
+                attempt_reaped = True
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    process.wait(timeout=KILL_GRACE_SECONDS)
+                    attempt_reaped = True
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.poll() is None:
+                raise ConductorError("timed-out cache attempt did not exit after process-group escalation")
+            attempt_reaped = True
+            return 124, True
+    finally:
+        if read_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(read_fd)
+        if write_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+        if process is not None and not gate_released:
+            # EOF keeps the detached gate from execing the real build. Reap it
+            # within a fixed allowance; no descendant can exist before release.
+            try:
+                process.wait(timeout=KILL_GRACE_SECONDS)
+                attempt_reaped = True
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    process.kill()
+                try:
+                    process.wait(timeout=KILL_GRACE_SECONDS)
+                    attempt_reaped = True
+                except subprocess.TimeoutExpired:
+                    pass
+        if record_published and attempt_reaped:
+            _durable_unlink(attempt_record_path)
+
+
+def _remove_cache_build_for_retry(build_dir: Path, cleanup_timeout: float) -> bool:
+    try:
+        completed = subprocess.run(
+            ["/bin/rm", "-rf", str(build_dir)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=cleanup_timeout,
+        )
+        return completed.returncode == 0 and not build_dir.exists() and not build_dir.is_symlink()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _await_cache_retry_wrapper_gate() -> None:
+    raw_fd = os.environ.pop("REPOPROMPT_CONDUCTOR_CACHE_WRAPPER_GATE_FD", None)
+    if raw_fd is None:
+        return
+    try:
+        read_fd = int(raw_fd)
+    except ValueError as exc:
+        raise ConductorError("cache retry wrapper gate fd is invalid") from exc
+    if read_fd < 3:
+        raise ConductorError("cache retry wrapper gate requires an inherited private fd")
+    try:
+        release = os.read(read_fd, 1)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
+    if release != b"1":
+        raise ConductorError("cache retry wrapper was not released after durable registry publication")
+
+
+def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
+    _await_cache_retry_wrapper_gate()
+    argv = args.get("argv")
+    key = str(args.get("key") or "")
+    outcome_path = Path(str(args.get("outcomePath") or ""))
+    attempt_record_path = Path(str(args.get("attemptRecordPath") or ""))
+    ticket = str(args.get("ticket") or "")
+    raw_attempt_timeout = args.get("attemptTimeout")
+    raw_cleanup_timeout = args.get("cleanupTimeout", BUILD_CACHE_CLONE_MAX_SECONDS)
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item for item in argv):
+        raise ConductorError("cache retry requires a non-empty argv")
+    if not re.fullmatch(r"[0-9a-f]{64}", key):
+        raise ConductorError("cache retry requires an exact key")
+    if not ticket or len(ticket) > 128 or attempt_record_path.name != f"{ticket}.cache-attempt.json":
+        raise ConductorError("cache retry requires a ticket-bound attempt record")
+    if attempt_record_path.parent != outcome_path.parent or not attempt_record_path.parent.is_dir():
+        raise ConductorError("cache retry attempt record must share the existing outcome directory")
+    attempt_timeout = None if raw_attempt_timeout is None else float(raw_attempt_timeout)
+    if attempt_timeout is not None and (not math.isfinite(attempt_timeout) or attempt_timeout < 0):
+        raise ConductorError("cache retry attempt timeout must be a finite non-negative number")
+    cleanup_timeout = float(raw_cleanup_timeout)
+    if not math.isfinite(cleanup_timeout) or cleanup_timeout < 0:
+        raise ConductorError("cache retry cleanup timeout must be a finite non-negative number")
+
+    first_code, first_timed_out = _run_cache_attempt(
+        argv,
+        repo_root,
+        attempt_timeout,
+        attempt_record_path,
+        ticket,
+    )
+    if first_code == 0:
+        return 0
+    build_dir = repo_root / ".build"
+    provenance = BuildCacheManager._read_json_file(build_dir / ".conductor-cache-provenance.json")
+    outcome: Dict[str, Any] = {
+        "attemptTimeoutSeconds": attempt_timeout,
+        "cleanupTimeoutSeconds": cleanup_timeout,
+        "seededExitCode": first_code,
+        "seededTimedOut": first_timed_out,
+        "coldRetryAttempted": False,
+    }
+    if not (
+        provenance
+        and provenance.get("key") == key
+        and build_dir.is_dir()
+        and not build_dir.is_symlink()
+    ):
+        outcome["reason"] = "seed provenance unavailable; cold retry refused"
+        if outcome_path.parent.is_dir():
+            _atomic_write_json(outcome_path, outcome)
+        return first_code
+
+    print("seeded build failed; removing the proven seeded .build and retrying cold once", flush=True)
+    if not _remove_cache_build_for_retry(build_dir, cleanup_timeout):
+        outcome["reason"] = "proven seeded .build removal exceeded its bounded cleanup allowance"
+        if outcome_path.parent.is_dir():
+            _atomic_write_json(outcome_path, outcome)
+        return first_code
+    outcome["coldRetryAttempted"] = True
+    cold_code, cold_timed_out = _run_cache_attempt(
+        argv,
+        repo_root,
+        attempt_timeout,
+        attempt_record_path,
+        ticket,
+    )
+    outcome["coldExitCode"] = cold_code
+    outcome["coldTimedOut"] = cold_timed_out
+    outcome["coldSucceeded"] = cold_code == 0
+    if cold_code == 0:
+        try:
+            manager = BuildCacheManager(repo_root)
+            outcome.update(manager.confirm_seeded_failure(key))
+        except Exception as exc:
+            # A successful cold build is authoritative. Suspect bookkeeping is
+            # advisory, but its failure remains visible in the retained outcome.
+            outcome["suspectBookkeepingError"] = str(exc)[:500]
+    if outcome_path.parent.is_dir():
+        _atomic_write_json(outcome_path, outcome)
+    return cold_code
+
+
 def run_operation_runner(payload_json: str) -> int:
     payload = json.loads(payload_json)
     kind = payload.get("kind")
@@ -6444,6 +8090,8 @@ def run_operation_runner(payload_json: str) -> int:
     repo_root = Path(payload.get("repoRoot") or resolve_repo_root()).resolve()
     if kind == "swift_build_all":
         return operation_swift_build_all(repo_root)
+    if kind == "cache_retry":
+        return operation_cache_retry(repo_root, args)
     if kind == "app_stop":
         return operation_app_stop(repo_root, args)
     if kind == "app_status":
@@ -6651,6 +8299,16 @@ def main(argv: List[str]) -> int:
         if len(argv) != 2:
             raise ConductorError("__operation_runner requires one JSON payload argument")
         return run_operation_runner(argv[1])
+    if argv and argv[0] == "__cache_attempt_gate":
+        if len(argv) != 3:
+            raise ConductorError("__cache_attempt_gate requires a read fd and argv JSON")
+        try:
+            read_fd = int(argv[1])
+        except ValueError as exc:
+            raise ConductorError("__cache_attempt_gate requires an integer read fd") from exc
+        if read_fd < 3:
+            raise ConductorError("__cache_attempt_gate requires an inherited private read fd")
+        return run_cache_attempt_gate(read_fd, argv[2])
     if argv and argv[0] == "__daemon":
         parser = argparse.ArgumentParser(prog="conductor.py __daemon")
         parser.add_argument("--repo-root", required=True)
@@ -6673,6 +8331,8 @@ def main(argv: List[str]) -> int:
         return handle_status_command(paths, argv[1:])
     if command == "job":
         return handle_job_command(paths, argv[1:])
+    if command == "cache":
+        return handle_cache_command(paths, argv[1:])
     if command in {"sleep", "fake-sleep"}:
         return handle_sleep_operation(paths, command, argv[1:])
     if command in IMPLEMENTED_OPERATIONS:

@@ -929,6 +929,33 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        func test_prepareWorkspaceSwitchSessionDiscard(
+            _ session: TabSession,
+            reason: String = "Cancelled due to workspace switch"
+        ) -> WorkspaceSwitchSessionDiscardContext {
+            prepareWorkspaceSwitchSessionDiscard(session, reason: reason)
+        }
+
+        func test_finalizeWorkspaceSwitchSessionDiscard(
+            _ context: WorkspaceSwitchSessionDiscardContext
+        ) -> WorkspaceSwitchSessionCleanupTarget {
+            finalizeWorkspaceSwitchSessionDiscard(context)
+        }
+
+        func test_scheduleWorkspaceSwitchBackgroundCleanup(
+            targets: [WorkspaceSwitchSessionCleanupTarget],
+            reason: String = "workspace_switch"
+        ) {
+            workspaceSwitchProvider.scheduleBackgroundCleanup(targets: targets, reason: reason)
+        }
+
+        func test_assembleWorkspaceSwitchCleanupTargets(
+            preparedContexts: [WorkspaceSwitchSessionDiscardContext],
+            reason: String = "Cancelled due to workspace switch"
+        ) -> [WorkspaceSwitchSessionCleanupTarget] {
+            assembleWorkspaceSwitchCleanupTargets(preparedContexts: preparedContexts, reason: reason)
+        }
+
         func test_setActiveWorkspaceIDForSessionIndex(_ workspaceID: UUID?) {
             test_activeWorkspaceIDForSessionIndexOverride = workspaceID
         }
@@ -10882,15 +10909,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - Workspace Handling
 
+    /// First, prepare phase of workspace-switch discard: bookkeeping and
+    /// cancellation preparation only. Provider/controller ownership is NOT
+    /// captured here — the graceful `cancelAgentRun` loop that follows still
+    /// needs the live session's provider state for interrupt, terminal
+    /// publication, and provider-session capture. Ownership transfer happens in
+    /// `finalizeWorkspaceSwitchSessionDiscard` after all cancellation awaits.
     private func prepareWorkspaceSwitchSessionDiscard(
         _ session: TabSession,
         reason: String
-    ) -> WorkspaceSwitchSessionCleanupTarget {
-        let target = WorkspaceSwitchSessionCleanupTarget(
+    ) -> WorkspaceSwitchSessionDiscardContext {
+        let context = WorkspaceSwitchSessionDiscardContext(
             tabID: session.tabID,
             session: session,
             boundSessionID: boundSessionID(for: session.tabID),
-            runID: session.runID
+            preparedRunID: session.runID
         )
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
@@ -10906,7 +10939,107 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let runID = session.runID {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
-        return target
+        return context
+    }
+
+    /// Assembles the finalize-phase cleanup targets from the prepared discard
+    /// contexts plus the current authoritative contents of `sessions`. Runs
+    /// inside the no-await ownership-transfer slice. `workspaceSwitchInFlight`
+    /// is not a universal admission fence, so a session may have been inserted
+    /// into `sessions` (new tab) or replaced (same tab, new object) while the
+    /// sequential cancellation loop was suspended; every such session is about
+    /// to be erased by `sessions.removeAll()` and must be finalized too, or its
+    /// provider/controllers/run routing would leak. Late-admitted sessions get
+    /// the synchronous prepare bookkeeping here and skip graceful cancellation
+    /// — context-terminal semantics, equivalent to detached teardown of a run
+    /// that started during the switch. Each session object is finalized exactly
+    /// once (object identity), so nothing is cleaned up twice.
+    ///
+    /// Order matters: the authoritative map contents are finalized FIRST, so
+    /// tabID-keyed coordinator state (Claude/Codex tool trackers, launch
+    /// metadata) is captured into the handle of the object that currently owns
+    /// the tab. Finalizing a stale same-tab predecessor first would hand that
+    /// tab-keyed state to the wrong target. Stale prepared objects — removed or
+    /// replaced during the cancellation awaits — are finalized afterwards; by
+    /// then they hold only their own instance state, which is exactly what
+    /// still needs retiring.
+    private func assembleWorkspaceSwitchCleanupTargets(
+        preparedContexts: [WorkspaceSwitchSessionDiscardContext],
+        reason: String
+    ) -> [WorkspaceSwitchSessionCleanupTarget] {
+        var contextsBySessionIdentity: [ObjectIdentifier: WorkspaceSwitchSessionDiscardContext] = [:]
+        for context in preparedContexts {
+            contextsBySessionIdentity[ObjectIdentifier(context.session)] = context
+        }
+        var targets: [WorkspaceSwitchSessionCleanupTarget] = []
+        var finalizedSessionIdentities = Set<ObjectIdentifier>()
+        // Authoritative map contents first: use the matching prepared context
+        // when the object identity matches; late-admitted or replacement
+        // objects get synchronous prepare bookkeeping here.
+        for session in sessions.values {
+            let identity = ObjectIdentifier(session)
+            let context = contextsBySessionIdentity[identity]
+                ?? prepareWorkspaceSwitchSessionDiscard(session, reason: reason)
+            targets.append(finalizeWorkspaceSwitchSessionDiscard(context))
+            finalizedSessionIdentities.insert(identity)
+        }
+        // Then prepared contexts whose objects were removed or replaced during
+        // the cancellation awaits — their instance handles still need retiring.
+        for context in preparedContexts {
+            let identity = ObjectIdentifier(context.session)
+            guard !finalizedSessionIdentities.contains(identity) else { continue }
+            targets.append(finalizeWorkspaceSwitchSessionDiscard(context))
+            finalizedSessionIdentities.insert(identity)
+        }
+        return targets
+    }
+
+    /// Second, finalize phase of workspace-switch discard: the ownership-transfer
+    /// point. Must run after every cancellation await and in the same
+    /// uninterrupted main-actor slice as `sessions.removeAll()` — no suspension
+    /// may separate finalize from discard, so a successor can never install or
+    /// observe state on a session between ownership transfer and discard.
+    /// Everything the background cleanup task needs is snapshotted here;
+    /// afterwards the discarded session holds no provider, controller, or run
+    /// identity.
+    private func finalizeWorkspaceSwitchSessionDiscard(
+        _ context: WorkspaceSwitchSessionDiscardContext
+    ) -> WorkspaceSwitchSessionCleanupTarget {
+        let session = context.session
+        var runIDs: [UUID] = []
+        if let preparedRunID = context.preparedRunID {
+            runIDs.append(preparedRunID)
+        }
+        if let currentRunID = session.runID, !runIDs.contains(currentRunID) {
+            // A successor run started during the cancellation awaits; its MCP
+            // routing needs cleanup alongside the prepared run's.
+            runIDs.append(currentRunID)
+        }
+        let detachedClaude = claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
+        let detachedCodex = codexCoordinator.detachForWorkspaceSwitchFinalizeSync(
+            session,
+            runIDs: runIDs
+        )
+        let provider = session.provider
+        session.provider = nil
+        session.acpSteeringFlushTask?.cancel()
+        session.acpSteeringFlushTask = nil
+        session.pendingACPSteeringInstructions.removeAll()
+        let acpController = session.acpController
+        session.acpController = nil
+        // Workspace switch is context-terminal for the discarded session: force
+        // semantics are correct here, and this slice is provably pre-successor.
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        return WorkspaceSwitchSessionCleanupTarget(
+            tabID: context.tabID,
+            session: session,
+            boundSessionID: context.boundSessionID,
+            runIDs: runIDs,
+            provider: provider,
+            acpController: acpController,
+            detachedClaude: detachedClaude,
+            detachedCodex: detachedCodex
+        )
     }
 
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
@@ -10958,21 +11091,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let teardownStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let teardownSessionCount = sessions.count
         #endif
-        let cleanupTargets = sessions.values.map {
+        let discardContexts = sessions.values.map {
             prepareWorkspaceSwitchSessionDiscard(
                 $0,
                 reason: "Cancelled due to workspace switch"
             )
         }
+        // Safe to iterate across the awaits: `sessions.values` is a
+        // copy-on-write snapshot taken when the iterator is created, so map
+        // mutations during the suspensions cannot invalidate it, and
+        // cancelAgentRun(tabID:) re-resolves the live map by tab ID.
         for session in sessions.values where session.runState.isActive {
             await cancelAgentRun(tabID: session.tabID)
         }
+        // Ownership-transfer slice: from finalize through scheduleBackgroundCleanup
+        // this must stay one uninterrupted main-actor region with no await, so a
+        // successor can never install or observe state on a discarded session
+        // between handle capture and discard. Targets are assembled from the
+        // prepared contexts plus the map's current contents, so sessions
+        // admitted or replaced during the cancellation awaits are finalized too.
+        let cleanupTargets = assembleWorkspaceSwitchCleanupTargets(
+            preparedContexts: discardContexts,
+            reason: "Cancelled due to workspace switch"
+        )
         claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
         codexCoordinator.stop()
         claudeCoordinator.stop()
-        for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
-            await releaseSessionWorktreeOwnership(sessionID: sessionID)
-        }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "agentMode.workspaceSwitch.discardPrepared",
@@ -10995,13 +11139,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         mcpControlledTabIDs.removeAll()
         tabDraftText.removeAll()
         sidebarObservedRunStateByTabID.removeAll()
-        await applyEditsApprovalStore.cleanupWindowScopes(
-            windowID: windowID,
-            reason: "Cancelled due to workspace switch"
-        )
         workspaceSwitchProvider.scheduleBackgroundCleanup(
             targets: cleanupTargets,
             reason: "workspace_switch"
+        )
+        // End of the no-await ownership-transfer slice. The awaits below are
+        // safe after discard: worktree release is keyed by session ID and does
+        // not read `sessions`, and window-scope approval cleanup is
+        // window-scoped.
+        for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
+            await releaseSessionWorktreeOwnership(sessionID: sessionID)
+        }
+        await applyEditsApprovalStore.cleanupWindowScopes(
+            windowID: windowID,
+            reason: "Cancelled due to workspace switch"
         )
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace),
               sessionIndexStore.isOwnerCurrent(owner)

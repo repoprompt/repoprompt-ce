@@ -416,44 +416,111 @@ extension AgentModeRunServiceLifecycleTests {
 
     // MARK: - Shutdown run-identity scoping
 
-    func testShutdownClaudeSessionDetachedVariantScopesRunIdentityToDetachedRun() async {
+    func testWorkspaceSwitchFinalizeDetachCapturesControllerAndRetiresHandleOnly() async {
         let recorder = LifecycleRecorder()
         let harness = makeHarness(recorder: recorder)
+        let controller = LifecycleFakeNativeController(recorder: recorder, label: "warm")
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
-        let detachedRunID = UUID()
+        session.claudeController = controller
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: "default",
+            allowNativeBashTool: nil,
+            mcpStrictMode: nil
+        )
+        session.installRunID(UUID())
+        session.pendingSupersedingTurnCompletions = 2
+
+        let detached = harness.host.claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
+        XCTAssertNotNil(detached)
+        XCTAssertNil(session.claudeController)
+        XCTAssertNil(harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session))
+        XCTAssertEqual(session.pendingSupersedingTurnCompletions, 0)
+        XCTAssertFalse(
+            recorder.contains("warm:shutdown"),
+            "finalize detach is synchronous; the process shuts down at retire time"
+        )
+
+        // Same-tab successor metadata installed after finalize must survive the
+        // background retire untouched: the retire path is handle-only.
+        let successorSettings = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard,
+            workspacePath: "/successor",
+            permissionMode: "successor",
+            allowNativeBashTool: true,
+            mcpStrictMode: true
+        )
+        harness.host.claudeCoordinator.test_setControllerLaunchSettings(successorSettings, for: session)
+
+        guard let detached else { return }
+        await harness.host.claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(
+            detached,
+            discardedSession: session
+        )
+        XCTAssertTrue(recorder.contains("warm:shutdown"))
+        XCTAssertEqual(
+            harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session),
+            successorSettings,
+            "handle retire must not touch tab-keyed coordinator registries"
+        )
+    }
+
+    func testClaudeFreshStartRetryAbortsWhenSupersededDuringControllerShutdown() async {
+        // Coordinator-level supersession coverage for the resume→fresh-start
+        // retry path: a successor that installs its own run identity while the
+        // failed controller is shutting down must abort the retry before it
+        // clears provider identity or launches a fresh controller.
+        let recorder = LifecycleRecorder()
+        let shutdownGate = LifecycleAsyncGate()
+        let failingController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "resume-fail",
+            shutdownGate: shutdownGate,
+            startOrResumeFailure: NativeAgentRuntimeControllerError.processNotRunning
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _ in
+                recorder.record("factory:claude:invocation")
+                return failingController
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "existing-session"
+        let originalRunID = UUID()
+        session.installRunID(originalRunID)
+        let initialRunState = session.runState
+
+        let ensureTask = Task { @MainActor in
+            await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+        }
+        await shutdownGate.waitUntilArrived()
         let successorRunID = UUID()
         session.installRunID(successorRunID)
-        session.pendingSupersedingTurnCompletions = 3
+        await shutdownGate.release()
+        await ensureTask.value
 
-        await harness.host.claudeCoordinator.shutdownClaudeSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: detachedRunID
-        )
+        XCTAssertTrue(recorder.contains("resume-fail:start-failed"))
         XCTAssertEqual(
             session.runID,
             successorRunID,
-            "detached background teardown owns only the run it was handed"
+            "the superseded retry must not clear or replace the successor's run identity"
         )
         XCTAssertEqual(
-            session.pendingSupersedingTurnCompletions,
-            3,
-            "a stale detached teardown must skip the successor's adjacent run state, not just its ID"
+            session.providerSessionID,
+            "existing-session",
+            "the superseded retry must not reset provider identity"
         )
-
-        session.installRunID(detachedRunID)
-        await harness.host.claudeCoordinator.shutdownClaudeSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: detachedRunID
-        )
-        XCTAssertNil(session.runID, "detached teardown clears its own run when still current")
         XCTAssertEqual(
-            session.pendingSupersedingTurnCompletions,
-            0,
-            "an owning detached teardown performs the full session-state tail"
+            recorder.events.count(where: { $0 == "factory:claude:invocation" }),
+            1,
+            "no fresh controller may launch after supersession"
         )
+        XCTAssertTrue(session.items.isEmpty, "a superseded retry is silent; no failure item")
+        XCTAssertEqual(session.runState, initialRunState)
     }
 
     func testShutdownClaudeSessionForceClearsRunIdentityOnTabTerminalPath() async {
@@ -556,6 +623,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let currentSessionRefGate: LifecycleAsyncGate?
     private let eventsStreamReadyGate: LifecycleAsyncGate?
     private let sendUserMessageGate: LifecycleAsyncGate?
+    private let shutdownGate: LifecycleAsyncGate?
+    private var pendingStartOrResumeFailure: Error?
     private let sessionRef = NativeAgentRuntimeSessionRef(sessionID: "lifecycle-claude-session")
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
@@ -566,7 +635,9 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         failSend: Bool = false,
         currentSessionRefGate: LifecycleAsyncGate? = nil,
         eventsStreamReadyGate: LifecycleAsyncGate? = nil,
-        sendUserMessageGate: LifecycleAsyncGate? = nil
+        sendUserMessageGate: LifecycleAsyncGate? = nil,
+        shutdownGate: LifecycleAsyncGate? = nil,
+        startOrResumeFailure: Error? = nil
     ) {
         self.recorder = recorder
         self.label = label
@@ -575,6 +646,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.currentSessionRefGate = currentSessionRefGate
         self.eventsStreamReadyGate = eventsStreamReadyGate
         self.sendUserMessageGate = sendUserMessageGate
+        self.shutdownGate = shutdownGate
+        pendingStartOrResumeFailure = startOrResumeFailure
         stream = AsyncStream { _ in }
     }
 
@@ -605,6 +678,11 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         effortLevel: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
+        if let failure = pendingStartOrResumeFailure {
+            pendingStartOrResumeFailure = nil
+            recorder.record("\(label):start-failed")
+            throw failure
+        }
         recorder.record("\(label):start")
         return sessionRef
     }
@@ -636,6 +714,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func shutdown() async {
+        if let shutdownGate {
+            recorder.record("\(label):shutdown-arrived")
+            await shutdownGate.arriveAndWait()
+        }
         recorder.record("\(label):shutdown")
     }
 

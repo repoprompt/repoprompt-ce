@@ -9288,18 +9288,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         await teardown?()
     }
 
+    /// Tab/context-terminal shutdown with force semantics (unless
+    /// `preserveNonCodexRunState` / `reclaimOnlyIfStillIdle` narrow it): any run
+    /// identity present after the awaits must not survive. Workspace-switch
+    /// discard does not use this path; it transfers ownership synchronously via
+    /// `detachForWorkspaceSwitchFinalizeSync` and retires the handle in the
+    /// background.
     func shutdownCodexSession(
         _ session: AgentModeViewModel.TabSession,
-        clearTabScopedCoordinatorState: Bool = true,
-        detachedRunID: UUID? = nil,
         preserveNonCodexRunState: Bool = false,
         reclaimOnlyIfStillIdle: Bool = false
     ) async {
-        let shutdownRunID = clearTabScopedCoordinatorState ? session.runID : detachedRunID
-        if clearTabScopedCoordinatorState {
-            cancelCodexThreadNameSync(for: session.tabID)
-            cancelCodexTabScopedControllerTasks(for: session.tabID)
-        }
+        cancelCodexThreadNameSync(for: session.tabID)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
         clearCodexRecoveryAttempt(for: session.runID)
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
@@ -9337,20 +9338,83 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
         if !preserveNonCodexRunState {
-            if clearTabScopedCoordinatorState {
-                // Force semantics: tab/context-terminal callers require that no
-                // run identity survives, including a successor's.
-                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            } else if let shutdownRunID {
-                // Detached background teardown owns only the run it was handed;
-                // a live successor's identity must survive.
-                session.clearRunID(ifCurrent: shutdownRunID)
-            }
+            // Force semantics: tab/context-terminal callers require that no
+            // run identity survives, including a successor's.
+            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         }
-        if clearTabScopedCoordinatorState {
-            await stopCodexToolTrackingAndWait(for: session)
-        } else {
-            await stopCodexToolTrackingAndWait(for: session, matchingRunID: shutdownRunID)
+        await stopCodexToolTrackingAndWait(for: session)
+    }
+
+    /// Ownership handle for a Codex runtime detached from a discarded session by
+    /// the synchronous workspace-switch finalize phase. Instance-scoped: retiring
+    /// it never consults live session state or tab-keyed registries.
+    struct DetachedCodexController {
+        fileprivate let controller: (any CodexSessionControlling)?
+        fileprivate let toolTracking: AgentToolTrackingController?
+        fileprivate let toolObserverRunIDs: [UUID]
+    }
+
+    /// Synchronous half of workspace-switch discard: clears the discarded
+    /// session's Codex run/turn bookkeeping and transfers the controller and
+    /// tool-tracking instances into a detached handle. Runs on the main actor
+    /// with no suspension, after all cancellation awaits and before the session
+    /// map is cleared, so every mutation here is provably pre-successor.
+    /// `runIDs` are the discarded session's run identities (prepare-time plus
+    /// finalize-time) whose tool observers need unregistering.
+    func detachForWorkspaceSwitchFinalizeSync(
+        _ session: AgentModeViewModel.TabSession,
+        runIDs: [UUID]
+    ) -> DetachedCodexController? {
+        cancelCodexThreadNameSync(for: session.tabID)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
+        for runID in runIDs {
+            clearCodexRecoveryAttempt(for: runID)
+        }
+        session.pendingCommandRunningFlushTask?.cancel()
+        session.pendingCommandRunningFlushTask = nil
+        session.pendingCommandRunningByKey.removeAll()
+        session.attachmentTurnState = .idle
+        abandonCodexFallbackQueue(
+            session: session,
+            reason: "Codex queued follow-up was cancelled because the session shut down."
+        )
+        resetTrackedCodexTurns(session)
+        session.pendingCodexComputerUseActivation = nil
+        let controller = session.codexController
+        clearCodexControllerRuntimeState(for: session)
+        let toolTracking = toolTrackingByTabID.removeValue(forKey: session.tabID)
+        guard controller != nil || toolTracking != nil || !runIDs.isEmpty else {
+            return nil
+        }
+        return DetachedCodexController(
+            controller: controller,
+            toolTracking: toolTracking,
+            toolObserverRunIDs: runIDs
+        )
+    }
+
+    /// Background half of workspace-switch discard: retires a handle captured by
+    /// `detachForWorkspaceSwitchFinalizeSync`. Deliberately registry-free — the
+    /// controller instance is unreachable from any live session, so it is shut
+    /// down directly instead of through the tab-keyed retirement queue a
+    /// same-tab successor may be using. Bypassing the retirement claims cannot
+    /// double-shutdown a controller: every claiming path (`shutdownCodexSession`,
+    /// `invalidateCodexControllerForReconnect`, provider switch) synchronously
+    /// nils the session's `codexController` in the same main-actor region that
+    /// registers the claim, before any await — so the finalize detach, which
+    /// only captures `session.codexController`, can never observe an
+    /// already-claimed instance.
+    func retireDetachedControllerForWorkspaceSwitch(
+        _ detached: DetachedCodexController
+    ) async {
+        if let controller = detached.controller {
+            await controller.shutdown()
+        }
+        if let toolTracking = detached.toolTracking {
+            await toolTracking.stopTracking()
+        }
+        for runID in detached.toolObserverRunIDs {
+            await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
         }
     }
 }

@@ -323,6 +323,119 @@ class ConductorCheckpointThreeTests(LifecycleTestCase):
         self.assertFalse(state.paths.daemon_meta_path.exists())
         self.assertFalse(state.paths.running_processes_path.exists())
 
+    def test_worker_cleanup_preserves_registry_identity_for_final_stale_evidence_check(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+        registry_identity = conductor._path_identity(state.paths.running_processes_path)
+
+        cleanup = conductor.cleanup_running_process_groups(state.paths)
+
+        self.assertTrue(cleanup["safeToForget"])
+        self.assertEqual(conductor._path_identity(state.paths.running_processes_path), registry_identity)
+
+    def test_stale_cleanup_rejects_registry_replacement_during_worker_cleanup(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+
+        def replace_registry(_paths: conductor.Paths) -> dict[str, object]:
+            conductor._atomic_write_json(
+                state.paths.running_processes_path,
+                {"version": 3, "generation": 2, "processes": []},
+            )
+            return {"safeToForget": True}
+
+        with mock.patch.object(conductor, "cleanup_running_process_groups", side_effect=replace_registry):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertFalse(result.cleaned)
+        self.assertIn("evidence changed before cleanup", result.reason)
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+        self.assertTrue(state.paths.running_processes_path.exists())
+
+    def test_stale_cleanup_start_lock_cannot_unlink_replacement_registry(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+        ready_path = state.paths.state_dir / "replacement-ready"
+        acquired_path = state.paths.state_dir / "replacement-acquired"
+        child: subprocess.Popen[str] | None = None
+        original_unlink = Path.unlink
+
+        def unlink_with_waiting_replacement(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal child
+            if path == state.paths.pid_path and child is None:
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        textwrap.dedent(
+                            """
+                            import fcntl
+                            import json
+                            import os
+                            import sys
+                            from pathlib import Path
+
+                            lock_path, registry_path, ready_path, acquired_path = map(Path, sys.argv[1:])
+                            ready_path.write_text("ready", encoding="utf-8")
+                            with lock_path.open("a+") as lock_file:
+                                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                                acquired_path.write_text("acquired", encoding="utf-8")
+                                temporary = registry_path.with_suffix(".replacement")
+                                temporary.write_text(
+                                    json.dumps({"version": 3, "generation": 2, "processes": []}),
+                                    encoding="utf-8",
+                                )
+                                os.replace(temporary, registry_path)
+                            """
+                        ),
+                        str(state.paths.lock_path),
+                        str(state.paths.running_processes_path),
+                        str(ready_path),
+                        str(acquired_path),
+                    ],
+                    text=True,
+                )
+                deadline = time.monotonic() + 2.0
+                while not ready_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready_path.exists(), "replacement process did not reach the start-lock barrier")
+                # With the cleanup transaction holding daemon.start.lock, the
+                # replacement cannot acquire or publish before stale evidence
+                # unlinking finishes. Without that lock this wait observes the
+                # replacement and the following pathname unlink deletes it.
+                deadline = time.monotonic() + 0.2
+                while not acquired_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(acquired_path.exists())
+            original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=unlink_with_waiting_replacement):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        assert child is not None
+        self.assertEqual(child.wait(timeout=2.0), 0)
+        self.assertEqual(result.state, "cleaned")
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+        replacement = json.loads(state.paths.running_processes_path.read_text(encoding="utf-8"))
+        self.assertEqual(replacement["generation"], 2)
+
     def test_recovery_signals_only_exact_pid_start_and_pgid_anchor(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -351,6 +464,337 @@ class ConductorCheckpointThreeTests(LifecycleTestCase):
         killpg.assert_called_once_with(201, signal.SIGTERM)
         self.assertEqual(report["verified"], [101])
         self.assertEqual(report["skipped"], [102])
+
+    def test_stale_daemon_cleanup_terminates_wrapper_and_detached_cache_attempt_group(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        ticket = "11111111-1111-1111-1111-111111111111"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        conductor._atomic_write_json(
+            attempt_record,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": 101,
+                "wrapperStartToken": "wrapper-start",
+                "attemptPID": 202,
+                "attemptPGID": 202,
+                "attemptStartToken": "attempt-start",
+            },
+        )
+        snapshot = {
+            101: (1, "wrapper-start"),
+            202: (101, "attempt-start"),
+            # This descendant shares attempt pgid 202; killpg(202) covers both.
+            303: (202, "descendant-start"),
+        }
+
+        def signal_group(pgid: int, _sig: signal.Signals) -> None:
+            if pgid == 101:
+                snapshot.pop(101, None)
+            elif pgid == 202:
+                snapshot.pop(202, None)
+                snapshot.pop(303, None)
+
+        with mock.patch.object(conductor, "process_table_snapshot", side_effect=lambda: dict(snapshot)), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(
+            conductor.os, "getpgid", side_effect=lambda pid: {101: 101, 202: 202}[pid]
+        ), mock.patch.object(conductor.os, "killpg", side_effect=signal_group) as killpg, mock.patch.object(
+            conductor, "_wait_for_recovery_targets_exit", return_value=[]
+        ):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "cleaned")
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(101, signal.SIGTERM), mock.call(202, signal.SIGTERM)],
+        )
+        self.assertFalse(attempt_record.exists())
+        self.assertFalse(state.paths.running_processes_path.exists())
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+
+    def assert_attempt_rollover_is_recovered(self, *, initial_record_present: bool) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        ticket = "44444444-4444-4444-4444-444444444444"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        snapshot = {101: (1, "wrapper-start")}
+        if initial_record_present:
+            conductor._atomic_write_json(
+                attempt_record,
+                {
+                    "version": 1,
+                    "state": "active",
+                    "ticket": ticket,
+                    "wrapperPID": 101,
+                    "wrapperStartToken": "wrapper-start",
+                    "attemptPID": 202,
+                    "attemptPGID": 202,
+                    "attemptStartToken": "attempt-a",
+                },
+            )
+            snapshot[202] = (101, "attempt-a")
+
+        def signal_group(pgid: int, _sig: signal.Signals) -> None:
+            if pgid == 101:
+                # Simulate the cache wrapper committing attempt B immediately
+                # before TERM takes effect. Recovery must re-read after wrapper
+                # exit instead of unlinking the newly replaced sidecar.
+                conductor._atomic_write_json(
+                    attempt_record,
+                    {
+                        "version": 1,
+                        "state": "active",
+                        "ticket": ticket,
+                        "wrapperPID": 101,
+                        "wrapperStartToken": "wrapper-start",
+                        "attemptPID": 404,
+                        "attemptPGID": 404,
+                        "attemptStartToken": "attempt-b",
+                    },
+                )
+                snapshot.pop(101, None)
+                snapshot.pop(202, None)
+                snapshot[404] = (1, "attempt-b")
+            elif pgid == 404:
+                snapshot.pop(404, None)
+
+        with mock.patch.object(conductor, "process_table_snapshot", side_effect=lambda: dict(snapshot)), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(
+            conductor.os, "getpgid", side_effect=lambda pid: {101: 101, 202: 202, 404: 404}[pid]
+        ), mock.patch.object(conductor.os, "killpg", side_effect=signal_group) as killpg, mock.patch.object(
+            conductor, "_wait_for_recovery_targets_exit", return_value=[]
+        ):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "cleaned")
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(101, signal.SIGTERM), mock.call(404, signal.SIGTERM)],
+        )
+        self.assertFalse(attempt_record.exists())
+        self.assertFalse(state.paths.running_processes_path.exists())
+
+    def test_stale_cleanup_recovers_attempt_a_to_b_rollover(self) -> None:
+        self.assert_attempt_rollover_is_recovered(initial_record_present=True)
+
+    def test_stale_cleanup_recovers_missing_to_published_attempt_transition(self) -> None:
+        self.assert_attempt_rollover_is_recovered(initial_record_present=False)
+
+    def test_reused_cache_attempt_identity_is_not_signaled(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ticket = "22222222-2222-2222-2222-222222222222"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        conductor._atomic_write_json(
+            attempt_record,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": 101,
+                "wrapperStartToken": "wrapper-start",
+                "attemptPID": 202,
+                "attemptPGID": 202,
+                "attemptStartToken": "old-attempt-start",
+            },
+        )
+        snapshot = {101: (1, "wrapper-start"), 202: (1, "reused-attempt-start")}
+
+        with mock.patch.object(conductor, "process_table_snapshot", return_value=snapshot), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(conductor.os, "getpgid", return_value=101), mock.patch.object(
+            conductor.os, "killpg"
+        ) as killpg:
+            report = conductor.signal_running_process_groups(state.paths, signal.SIGTERM)
+
+        killpg.assert_called_once_with(101, signal.SIGTERM)
+        self.assertEqual(report["verified"], [101])
+        self.assertEqual(report["skipped"], [202])
+        attempt_group = next(group for group in report["groups"] if group["kind"] == "cacheAttempt")
+        self.assertEqual(attempt_group["state"], "stale")
+        self.assertTrue(report["identityComplete"])
+
+    def test_ambiguous_cache_attempt_record_preserves_stale_daemon_evidence(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        ticket = "33333333-3333-3333-3333-333333333333"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        conductor._atomic_write_json(
+            attempt_record,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": 101,
+                "wrapperStartToken": "mismatched-wrapper",
+                "attemptPID": 202,
+                "attemptPGID": 202,
+                "attemptStartToken": "attempt-start",
+            },
+        )
+
+        with mock.patch.object(
+            conductor, "process_table_snapshot", return_value={101: (1, "wrapper-start")}
+        ), mock.patch.object(conductor.os, "getpgrp", return_value=999), mock.patch.object(
+            conductor.os, "getpgid", return_value=101
+        ), mock.patch.object(conductor.os, "killpg"):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertFalse(result.cleaned)
+        self.assertTrue(attempt_record.exists())
+        self.assertTrue(state.paths.running_processes_path.exists())
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+
+    def test_force_stop_waits_for_nonabortable_cache_publication_and_reports_policy(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "publishing", "build", {}, ["build"], job_state="running")
+        job.phase = "publishingCache"
+        state.jobs[job.ticket] = job
+        state.active_lanes["build"] = job.ticket
+        deferred: list[tuple[object, tuple[object, ...]]] = []
+
+        class DeferredThread:
+            def __init__(self, *, target: object, args: tuple[object, ...] = (), **_kwargs: object) -> None:
+                deferred.append((target, args))
+
+            def start(self) -> None:
+                return None
+
+        with mock.patch.object(conductor.threading, "Thread", DeferredThread):
+            payload = state.stop(force=True)
+
+        self.assertFalse(job.cancel_requested)
+        self.assertIn("non-abortable", job.cancellation_ignored_reason or "")
+        self.assertEqual(
+            payload["forceStop"],
+            {
+                "requested": True,
+                "publicationPolicy": "waitForNonAbortableAtomicPublication",
+                "publicationWaitTickets": [job.ticket],
+                "publicationWaitTimeoutSeconds": conductor.BUILD_CACHE_FORCE_STOP_WAIT_SECONDS,
+                "cancellationIgnored": True,
+            },
+        )
+        self.assertEqual(len(deferred), 1)
+        server = mock.Mock()
+        state.server = server
+
+        def complete_publication(*_args: object, **_kwargs: object) -> None:
+            self.assertFalse(server.shutdown.called)
+            job.state = "completed"
+            job.phase = "terminal"
+
+        with mock.patch.object(state.condition, "wait", side_effect=complete_publication) as wait, mock.patch.object(
+            conductor.time, "sleep"
+        ):
+            state._force_shutdown_when_canceled([job.ticket])
+
+        wait.assert_called_once_with(timeout=conductor.PROCESS_TREE_POLL_SECONDS)
+        server.shutdown.assert_called_once_with()
+
+    def test_force_stop_publication_wait_expiry_keeps_daemon_and_publication_intact(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "publishing-timeout", "build", {}, ["build"], job_state="running")
+        job.phase = "publishingCache"
+        job.cancellation_ignored_reason = "immutable cache publication is non-abortable"
+        state.jobs[job.ticket] = job
+        state.shutdown_requested = True
+        state.server = mock.Mock()
+
+        with mock.patch.object(conductor, "BUILD_CACHE_FORCE_STOP_WAIT_SECONDS", 0.0), mock.patch.object(
+            state, "_warn_job_locked"
+        ) as warn, mock.patch.object(conductor.time, "sleep"):
+            state._force_shutdown_when_canceled([job.ticket])
+
+        self.assertFalse(state.shutdown_requested)
+        self.assertEqual(job.state, "running")
+        self.assertEqual(job.phase, "publishingCache")
+        state.server.shutdown.assert_not_called()
+        warn.assert_called_once_with(
+            job,
+            "buildCachePublicationStopWaitExpired",
+            "daemon stop --force left non-abortable cache publication running after bounded wait",
+        )
 
     def test_concurrent_terminal_waiters_coalesce_summary_and_both_receive_result(self) -> None:
         tmp, state = self.make_state()
@@ -1296,7 +1740,10 @@ class ConductorCheckpointThreeTests(LifecycleTestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 13)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 16)
+
+    def test_server_listen_backlog_matches_bounded_handler_capacity(self) -> None:
+        self.assertEqual(conductor.ThreadedUnixServer.request_queue_size, conductor.MAX_ACTIVE_REQUEST_HANDLERS)
 
     def test_explicit_wait_timeout_survives_repeated_server_clamps(self) -> None:
         clock_value = [0.0]
@@ -1667,7 +2114,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(enqueue_launch.call_args.args[2], {"subcommand": "launch-existing", "appArgs": ["--demo"]})
 
-    def test_app_relaunch_delegates_split_internal_runner_with_live_lane_and_timeout(self) -> None:
+    def test_app_relaunch_delegates_split_internal_runner_with_build_live_lanes_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
             argv, lanes, _cwd, _env, timeout = registry.prepare(
@@ -1679,11 +2126,30 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         self.assertIn("__operation_runner", argv)
         self.assertIn("debug_app_build_then_launch", argv[-1])
-        self.assertEqual(lanes, ["liveApp"])
+        self.assertEqual(lanes, ["build", "liveApp"])
         self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
         self.assertIn("app_launch_existing", launch_existing_argv[-1])
         self.assertEqual(launch_existing_lanes, ["liveApp"])
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
+
+    def test_building_live_operations_share_build_lane_without_expanding_nonbuilding_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            mutators = (
+                {"operation": "run", "args": {}},
+                {"operation": "app", "args": {"subcommand": "relaunch"}},
+                {"operation": "smoke", "args": {"launch": True}},
+            )
+            nonmutators = (
+                {"operation": "app", "args": {"subcommand": "stop"}},
+                {"operation": "app", "args": {"subcommand": "launch-existing"}},
+                {"operation": "smoke", "args": {"packagedApp": "/tmp/RepoPrompt CE.app"}},
+            )
+            mutator_lanes = [registry.prepare(request)[1] for request in mutators]
+            nonmutator_lanes = [registry.prepare(request)[1] for request in nonmutators]
+
+        self.assertTrue(all("build" in lanes for lanes in mutator_lanes))
+        self.assertTrue(all("build" not in lanes for lanes in nonmutator_lanes))
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
