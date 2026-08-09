@@ -60,7 +60,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .openCode
         session.provider = provider
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -78,7 +78,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         XCTAssertTrue(finishedAfterDrain)
     }
 
-    func testWorkspaceSwitchReleasesSessionWorktreeOwnershipBeforeDiscardingSessions() async throws {
+    func testWorkspaceSwitchReleasesSessionWorktreeOwnershipDuringSwitch() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentModeWorkspaceSwitchOwnership-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -126,7 +126,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         )
         let session = viewModel.session(for: UUID())
         session.selectedAgent = .openCode
-        session.runID = oldRunID
+        session.installRunID(oldRunID)
         session.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -150,7 +150,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         )
         let oldSession = viewModel.session(for: tabID)
         oldSession.selectedAgent = .openCode
-        oldSession.runID = oldRunID
+        oldSession.installRunID(oldRunID)
         oldSession.mcpControlContext = makeMCPControlContext(sessionID: mcpSessionID)
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -165,6 +165,291 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         XCTAssertEqual(newSession.mcpControlContext?.sessionID, mcpSessionID)
     }
 
+    func testFinalizeCapturesSuccessorRunAndControllerInstalledAfterPrepare() async throws {
+        // Deterministic stand-in for the mid-cancel-loop race: a successor run
+        // and controller appear on the discarded session between the prepare
+        // phase and the synchronous finalize slice. Finalize must capture both
+        // run IDs for routing cleanup and transfer the late controller into the
+        // handle set.
+        let routing = RoutingRecorder()
+        let viewModel = makeViewModel(
+            mcpRunRoutingCleaner: { runID, _, reason in
+                await routing.record(runID: runID, reason: reason)
+            }
+        )
+        let recorder = LifecycleRecorder()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        let preparedRunID = UUID()
+        session.installRunID(preparedRunID)
+
+        let context = viewModel.test_prepareWorkspaceSwitchSessionDiscard(session)
+
+        let successorRunID = UUID()
+        session.installRunID(successorRunID)
+        let lateController = LifecycleFakeNativeController(recorder: recorder, label: "late")
+        session.claudeController = lateController
+
+        let target = viewModel.test_finalizeWorkspaceSwitchSessionDiscard(context)
+        XCTAssertEqual(target.runIDs, [preparedRunID, successorRunID])
+        XCTAssertNil(session.claudeController)
+        XCTAssertNil(session.runID, "finalize force-clears the discarded run identity synchronously")
+        XCTAssertNil(session.provider)
+
+        viewModel.test_scheduleWorkspaceSwitchBackgroundCleanup(targets: [target])
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(
+            timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds
+        )
+        XCTAssertTrue(recorder.contains("late:shutdown"))
+        let preparedCleaned = await routing.contains(runID: preparedRunID, reason: "workspace_switch")
+        let successorCleaned = await routing.contains(runID: successorRunID, reason: "workspace_switch")
+        XCTAssertTrue(preparedCleaned)
+        XCTAssertTrue(successorCleaned)
+    }
+
+    func testAssembleFinalizesSessionInsertedAfterPrepare() async throws {
+        // A new tab's session admitted into `sessions` while the cancellation
+        // loop was suspended has no prepared context, yet is about to be erased
+        // by sessions.removeAll(). The slice assembly must give it prepare
+        // bookkeeping (MCP tool cancellation) plus finalize, so its controller,
+        // run identity, and routing are cleaned instead of leaked.
+        let routing = RoutingRecorder()
+        let cancelled = RoutingRecorder()
+        let viewModel = makeViewModel(
+            mcpRunRoutingCleaner: { runID, _, reason in
+                await routing.record(runID: runID, reason: reason)
+            },
+            mcpRunToolCanceller: { runID, reason in
+                cancelled.recordSync(runID: runID, reason: reason ?? "nil")
+                return 1
+            }
+        )
+        let recorder = LifecycleRecorder()
+        let preparedSession = viewModel.session(for: UUID())
+        preparedSession.selectedAgent = .openCode
+        let preparedRunID = UUID()
+        preparedSession.installRunID(preparedRunID)
+        let contexts = [viewModel.test_prepareWorkspaceSwitchSessionDiscard(preparedSession)]
+
+        // Simulates admission during the cancellation awaits.
+        let lateSession = viewModel.session(for: UUID())
+        lateSession.selectedAgent = .claudeCode
+        let lateRunID = UUID()
+        lateSession.installRunID(lateRunID)
+        let lateController = LifecycleFakeNativeController(recorder: recorder, label: "late-admission")
+        lateSession.claudeController = lateController
+
+        let targets = viewModel.test_assembleWorkspaceSwitchCleanupTargets(preparedContexts: contexts)
+        XCTAssertEqual(targets.count, 2)
+        let lateTarget = targets.first { $0.tabID == lateSession.tabID }
+        XCTAssertNotNil(lateTarget)
+        XCTAssertEqual(lateTarget?.runIDs, [lateRunID])
+        XCTAssertNil(lateSession.claudeController)
+        XCTAssertNil(lateSession.runID, "late-admitted sessions get context-terminal identity clearing")
+        XCTAssertTrue(
+            cancelled.containsSync(runID: lateRunID, reason: "workspace_switch"),
+            "late-admitted sessions get the prepare-phase MCP tool cancellation"
+        )
+
+        viewModel.test_scheduleWorkspaceSwitchBackgroundCleanup(targets: targets)
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(
+            timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds
+        )
+        XCTAssertTrue(recorder.contains("late-admission:shutdown"))
+        let lateCleaned = await routing.contains(runID: lateRunID, reason: "workspace_switch")
+        let preparedCleaned = await routing.contains(runID: preparedRunID, reason: "workspace_switch")
+        XCTAssertTrue(lateCleaned)
+        XCTAssertTrue(preparedCleaned)
+    }
+
+    func testAssembleFinalizesReplacementSessionOnSameTabWithoutDuplicatingOriginal() async throws {
+        // A same-tab replacement installed during the cancellation awaits leaves
+        // the prepared context pointing at the old object. Both objects must be
+        // finalized — the old one's handles still need retiring, the new one is
+        // about to be erased — and neither may be finalized twice.
+        let routing = RoutingRecorder()
+        let viewModel = makeViewModel(
+            mcpRunRoutingCleaner: { runID, _, reason in
+                await routing.record(runID: runID, reason: reason)
+            }
+        )
+        let recorder = LifecycleRecorder()
+        let tabID = UUID()
+        let originalSession = viewModel.session(for: tabID)
+        originalSession.selectedAgent = .claudeCode
+        let originalRunID = UUID()
+        originalSession.installRunID(originalRunID)
+        let originalController = LifecycleFakeNativeController(recorder: recorder, label: "original")
+        originalSession.claudeController = originalController
+        let contexts = [viewModel.test_prepareWorkspaceSwitchSessionDiscard(originalSession)]
+
+        // Simulates a same-tab replacement during the cancellation awaits.
+        let replacementSession = AgentModeViewModel.TabSession(tabID: tabID)
+        replacementSession.selectedAgent = .claudeCode
+        let replacementRunID = UUID()
+        replacementSession.installRunID(replacementRunID)
+        let replacementController = LifecycleFakeNativeController(recorder: recorder, label: "replacement")
+        replacementSession.claudeController = replacementController
+        viewModel.test_installLiveSession(replacementSession)
+
+        let targets = viewModel.test_assembleWorkspaceSwitchCleanupTargets(preparedContexts: contexts)
+        XCTAssertEqual(targets.count, 2, "original and replacement objects each get exactly one target")
+        XCTAssertTrue(targets.allSatisfy { $0.tabID == tabID })
+        // Authoritative-first: the replacement (current map contents) is
+        // finalized before the stale prepared object, so tabID-keyed
+        // coordinator state is captured by the object that owns the tab.
+        XCTAssertTrue(
+            targets[0].session === replacementSession,
+            "authoritative map contents must be finalized first"
+        )
+        XCTAssertTrue(
+            targets[1].session === originalSession,
+            "stale prepared objects are finalized after the authoritative pass"
+        )
+        XCTAssertEqual(targets[0].runIDs, [replacementRunID])
+        XCTAssertEqual(targets[1].runIDs, [originalRunID])
+        XCTAssertNil(originalSession.claudeController)
+        XCTAssertNil(replacementSession.claudeController)
+        XCTAssertNil(originalSession.runID)
+        XCTAssertNil(replacementSession.runID)
+
+        viewModel.test_scheduleWorkspaceSwitchBackgroundCleanup(targets: targets)
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(
+            timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds
+        )
+        XCTAssertTrue(recorder.contains("original:shutdown"))
+        XCTAssertTrue(recorder.contains("replacement:shutdown"))
+        let originalCleaned = await routing.contains(runID: originalRunID, reason: "workspace_switch")
+        let replacementCleaned = await routing.contains(runID: replacementRunID, reason: "workspace_switch")
+        XCTAssertTrue(originalCleaned)
+        XCTAssertTrue(replacementCleaned)
+    }
+
+    func testFinalizeCancelsACPSteeringFlushAndClearsQueueSynchronously() async {
+        // ACP finalize slice coverage that needs no controller instance:
+        // the steering flush task is cancelled and the queued instructions are
+        // cleared synchronously at finalize, before any background drain.
+        // Full controller capture/retire coverage (finalize capturing the
+        // installed controller, background cancelPrompt/shutdown) is deferred
+        // until an ACP controller protocol seam exists: ACPAgentSessionController
+        // is a concrete non-protocol actor today, so it cannot be faked or
+        // subclassed without a production abstraction change.
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .openCode
+        session.installRunID(UUID())
+        let flushTask = Task<Void, Never> {
+            // Ends deterministically when finalize cancels it; no sleeps.
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+        }
+        // If cancellation regresses, the assertions below fail the test; this
+        // cleanup then stops the yield loop so the test neither hangs nor leaks.
+        defer { flushTask.cancel() }
+        session.acpSteeringFlushTask = flushTask
+        session.pendingACPSteeringInstructions = [
+            AgentModeViewModel.TabSession.ACPSteeringInstruction(
+                id: UUID(),
+                targetRunID: session.runID,
+                targetRunAttemptID: nil,
+                providerText: "queued",
+                interruptedPromptProviderText: nil,
+                attachments: [],
+                taggedFileAttachments: [],
+                draftText: "queued",
+                optimisticUserItemID: nil,
+                createdAt: Date()
+            )
+        ]
+
+        let context = viewModel.test_prepareWorkspaceSwitchSessionDiscard(session)
+        let target = viewModel.test_finalizeWorkspaceSwitchSessionDiscard(context)
+
+        XCTAssertTrue(flushTask.isCancelled)
+        if flushTask.isCancelled {
+            // Await termination only once cancellation is observed, so a
+            // regression fails the assertion above instead of hanging here.
+            await flushTask.value
+        }
+        XCTAssertNil(session.acpSteeringFlushTask)
+        XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertNil(session.acpController)
+        XCTAssertNil(target.acpController)
+        XCTAssertNil(session.runID)
+    }
+
+    func testWorkspaceSwitchFinalizeDetachesIdleWarmClaudeControllerSynchronously() async throws {
+        // An idle session's warm controller is skipped by the cancellation loop;
+        // only the finalize phase may capture it — synchronously, inside
+        // handleWorkspaceSwitch, before any background drain runs.
+        let recorder = LifecycleRecorder()
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        let warmController = LifecycleFakeNativeController(recorder: recorder, label: "idle-warm")
+        session.claudeController = warmController
+        session.installRunID(UUID())
+        session.runState = .idle
+
+        await viewModel.handleWorkspaceSwitch(nil)
+
+        XCTAssertTrue(viewModel.sessions.isEmpty)
+        XCTAssertNil(session.claudeController)
+        XCTAssertNil(session.runID, "finalize force-clears discarded run identity before any drain")
+        XCTAssertNil(session.provider)
+
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(
+            timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds
+        )
+        XCTAssertTrue(recorder.contains("idle-warm:shutdown"))
+    }
+
+    func testWorkspaceSwitchBackgroundRetireDoesNotTouchSuccessorCoordinatorRegistries() async throws {
+        // Switch-back cross-talk: a same-tab successor installs fresh coordinator
+        // metadata while the discarded session's background cleanup is still
+        // pending. The handle-only retire must leave the successor's registries
+        // and controller untouched.
+        let recorder = LifecycleRecorder()
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let oldSession = viewModel.session(for: tabID)
+        oldSession.selectedAgent = .claudeCode
+        oldSession.claudeController = LifecycleFakeNativeController(recorder: recorder, label: "old")
+        oldSession.installRunID(UUID())
+        oldSession.runState = .idle
+
+        await viewModel.handleWorkspaceSwitch(nil)
+
+        let newSession = viewModel.session(for: tabID)
+        newSession.selectedAgent = .claudeCode
+        let successorController = LifecycleFakeNativeController(recorder: recorder, label: "successor")
+        newSession.claudeController = successorController
+        let successorSettings = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard,
+            workspacePath: "/successor",
+            permissionMode: "successor",
+            allowNativeBashTool: true,
+            mcpStrictMode: true
+        )
+        viewModel.claudeCoordinator.test_setControllerLaunchSettings(successorSettings, for: newSession)
+
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(
+            timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds
+        )
+        XCTAssertTrue(recorder.contains("old:shutdown"))
+        XCTAssertFalse(recorder.contains("successor:shutdown"))
+        XCTAssertEqual(
+            viewModel.claudeCoordinator.test_controllerLaunchSettings(for: newSession),
+            successorSettings,
+            "background retire must not touch the successor's tab-keyed coordinator state"
+        )
+        XCTAssertTrue((newSession.claudeController as AnyObject) === successorController)
+    }
+
     func testDetachedWorkspaceSwitchCleanupDoesNotClearNewSessionOnSameTab() async throws {
         let provider = BlockingHeadlessProvider()
         let tabID = UUID()
@@ -175,14 +460,14 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         oldSession.selectedAgent = .openCode
         oldSession.provider = provider
         oldSession.providerSessionID = "old-provider-session"
-        oldSession.runID = oldRunID
+        oldSession.installRunID(oldRunID)
         oldSession.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
         let newSession = viewModel.session(for: tabID)
         newSession.selectedAgent = .openCode
         newSession.providerSessionID = "new-provider-session"
-        newSession.runID = newRunID
+        newSession.installRunID(newRunID)
         newSession.runState = .running
 
         try await provider.waitUntilDisposeIsSuspended(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)

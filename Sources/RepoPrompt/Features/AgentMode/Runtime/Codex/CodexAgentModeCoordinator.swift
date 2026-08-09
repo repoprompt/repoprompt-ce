@@ -4505,7 +4505,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             reason: "Codex queued follow-up was cancelled because the controller was replaced."
         )
         if !preserveRunID {
-            session.runID = nil
+            // Force reset: controller invalidation for reconnect is decided
+            // synchronously against the expected controller instance.
+            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         }
         if let controllerToShutdown {
             retireCodexController(
@@ -4833,9 +4835,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return existingRunID
                 }
             }
-            let freshRunID = UUID()
-            session.runID = freshRunID
-            return freshRunID
+            return AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         }()
 
         func prepareCodexController() async -> (any CodexSessionControlling)? {
@@ -6544,7 +6544,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         finalizePendingToolCalls(in: session, turnStatus: turnStatus)
         finalizeLingeringRunningCommandExecutionResults(in: session, turnStatus: turnStatus)
         reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
-        session.providerTerminalDrainGeneration &+= 1
+        session.bumpProviderTerminalDrainGeneration()
     }
 
     private func finalizeCodexRun(
@@ -8408,7 +8408,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     markCodexReconnectNeeded(for: session, source: "idle-timeout", scheduleSave: false)
                 }
                 logCodex("[AgentModeVM][CodexIdle] shutting down idle app-server for tab \(tabID) reason=\(reason)")
-                await shutdownCodexSession(session)
+                await shutdownCodexSession(session, reclaimOnlyIfStillIdle: true)
                 viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
                 viewModel?.scheduleSave(for: tabID)
             }
@@ -9233,7 +9233,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         cancelCodexThreadNameSync(for: session.tabID)
         cancelCodexTabScopedControllerTasks(for: session.tabID)
         clearCodexControllerRuntimeState(for: session)
-        session.runID = nil
+        // Force reset: user cancel is decided synchronously (expectedRunID was
+        // captured by the caller in the same main-actor region).
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         clearCodexNativeToolLiveness(session)
         settleCodexComputerUseActivationAfterTurn(session, reason: "user-cancel")
         if let controller {
@@ -9286,17 +9288,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         await teardown?()
     }
 
+    /// Tab/context-terminal shutdown with force semantics (unless
+    /// `preserveNonCodexRunState` / `reclaimOnlyIfStillIdle` narrow it): any run
+    /// identity present after the awaits must not survive. Workspace-switch
+    /// discard does not use this path; it transfers ownership synchronously via
+    /// `detachForWorkspaceSwitchFinalizeSync` and retires the handle in the
+    /// background.
     func shutdownCodexSession(
         _ session: AgentModeViewModel.TabSession,
-        clearTabScopedCoordinatorState: Bool = true,
-        detachedRunID: UUID? = nil,
-        preserveNonCodexRunState: Bool = false
+        preserveNonCodexRunState: Bool = false,
+        reclaimOnlyIfStillIdle: Bool = false
     ) async {
-        let shutdownRunID = clearTabScopedCoordinatorState ? session.runID : detachedRunID
-        if clearTabScopedCoordinatorState {
-            cancelCodexThreadNameSync(for: session.tabID)
-            cancelCodexTabScopedControllerTasks(for: session.tabID)
-        }
+        cancelCodexThreadNameSync(for: session.tabID)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
         clearCodexRecoveryAttempt(for: session.runID)
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
@@ -9320,13 +9324,97 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         await awaitCodexControllerRetirement(for: session.tabID)
-        if !preserveNonCodexRunState {
-            session.runID = nil
+        if reclaimOnlyIfStillIdle {
+            // Idle reclaim races live submission: a follow-up that started while
+            // the retirement drained owns the tab now, and it may have reused
+            // the prior run ID, so run-ID staleness cannot detect it. Skip the
+            // entire remaining tab-scoped tail unless the session is still idle.
+            guard session.activeRunOwnership == nil,
+                  !session.runState.isActive,
+                  session.codexController == nil
+            else {
+                logCodex("[AgentModeVM][CodexIdle] skipping idle reclaim tail for tab \(session.tabID); session is no longer idle")
+                return
+            }
         }
-        if clearTabScopedCoordinatorState {
-            await stopCodexToolTrackingAndWait(for: session)
-        } else {
-            await stopCodexToolTrackingAndWait(for: session, matchingRunID: shutdownRunID)
+        if !preserveNonCodexRunState {
+            // Force semantics: tab/context-terminal callers require that no
+            // run identity survives, including a successor's.
+            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        }
+        await stopCodexToolTrackingAndWait(for: session)
+    }
+
+    /// Ownership handle for a Codex runtime detached from a discarded session by
+    /// the synchronous workspace-switch finalize phase. Instance-scoped: retiring
+    /// it never consults live session state or tab-keyed registries.
+    struct DetachedCodexController {
+        fileprivate let controller: (any CodexSessionControlling)?
+        fileprivate let toolTracking: AgentToolTrackingController?
+        fileprivate let toolObserverRunIDs: [UUID]
+    }
+
+    /// Synchronous half of workspace-switch discard: clears the discarded
+    /// session's Codex run/turn bookkeeping and transfers the controller and
+    /// tool-tracking instances into a detached handle. Runs on the main actor
+    /// with no suspension, after all cancellation awaits and before the session
+    /// map is cleared, so every mutation here is provably pre-successor.
+    /// `runIDs` are the discarded session's run identities (prepare-time plus
+    /// finalize-time) whose tool observers need unregistering.
+    func detachForWorkspaceSwitchFinalizeSync(
+        _ session: AgentModeViewModel.TabSession,
+        runIDs: [UUID]
+    ) -> DetachedCodexController? {
+        cancelCodexThreadNameSync(for: session.tabID)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
+        for runID in runIDs {
+            clearCodexRecoveryAttempt(for: runID)
+        }
+        session.pendingCommandRunningFlushTask?.cancel()
+        session.pendingCommandRunningFlushTask = nil
+        session.pendingCommandRunningByKey.removeAll()
+        session.attachmentTurnState = .idle
+        abandonCodexFallbackQueue(
+            session: session,
+            reason: "Codex queued follow-up was cancelled because the session shut down."
+        )
+        resetTrackedCodexTurns(session)
+        session.pendingCodexComputerUseActivation = nil
+        let controller = session.codexController
+        clearCodexControllerRuntimeState(for: session)
+        let toolTracking = toolTrackingByTabID.removeValue(forKey: session.tabID)
+        guard controller != nil || toolTracking != nil || !runIDs.isEmpty else {
+            return nil
+        }
+        return DetachedCodexController(
+            controller: controller,
+            toolTracking: toolTracking,
+            toolObserverRunIDs: runIDs
+        )
+    }
+
+    /// Background half of workspace-switch discard: retires a handle captured by
+    /// `detachForWorkspaceSwitchFinalizeSync`. Deliberately registry-free — the
+    /// controller instance is unreachable from any live session, so it is shut
+    /// down directly instead of through the tab-keyed retirement queue a
+    /// same-tab successor may be using. Bypassing the retirement claims cannot
+    /// double-shutdown a controller: every claiming path (`shutdownCodexSession`,
+    /// `invalidateCodexControllerForReconnect`, provider switch) synchronously
+    /// nils the session's `codexController` in the same main-actor region that
+    /// registers the claim, before any await — so the finalize detach, which
+    /// only captures `session.codexController`, can never observe an
+    /// already-claimed instance.
+    func retireDetachedControllerForWorkspaceSwitch(
+        _ detached: DetachedCodexController
+    ) async {
+        if let controller = detached.controller {
+            await controller.shutdown()
+        }
+        if let toolTracking = detached.toolTracking {
+            await toolTracking.stopTracking()
+        }
+        for runID in detached.toolObserverRunIDs {
+            await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
         }
     }
 }

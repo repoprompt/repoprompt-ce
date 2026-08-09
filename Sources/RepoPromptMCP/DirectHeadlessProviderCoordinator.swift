@@ -71,6 +71,15 @@ actor DirectHeadlessProviderCoordinator {
         ]
     }
 
+    static func codexExecArguments(model: String?) -> [String] {
+        var arguments: [String] = []
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
+            arguments += ["--model", model]
+        }
+        arguments += ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        return arguments
+    }
+
     func runProviderOnce(
         message: String,
         providerID: String?,
@@ -88,11 +97,7 @@ actor DirectHeadlessProviderCoordinator {
             throw DirectHeadlessDomainContext.Error.routingUnavailable
         }
         let snapshot = try await context.snapshot(connectionID: connectionID, sessionID: sessionID)
-        var arguments: [String] = []
-        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
-            arguments += ["--model", model]
-        }
-        arguments += ["exec", "--json", "--skip-git-repo-check", "--full-auto", "-"]
+        let arguments = Self.codexExecArguments(model: model)
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }

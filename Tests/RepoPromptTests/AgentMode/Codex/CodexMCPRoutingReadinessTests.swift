@@ -691,7 +691,7 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
             ),
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in },
-                makeTerminalPublicationEnvelope: { _, _, _, _ in nil },
+                makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
                 publishTerminalCommit: { _, revision, _ in
                     recorder.record(revision.terminalState)
                     return .accepted(successorEpoch: nil)

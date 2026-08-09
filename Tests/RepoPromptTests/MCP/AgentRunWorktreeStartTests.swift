@@ -1406,7 +1406,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             in: window
         )
         let sourceRunID = UUID()
-        viewModel.session(for: sourceTabID).runID = sourceRunID
+        viewModel.session(for: sourceTabID).installRunID(sourceRunID)
         let source = AgentRunOracleReviewSource.captured(.init(
             sourceTabID: sourceTabID,
             workspaceID: workspaceID,
@@ -2549,7 +2549,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let sessionID = try XCTUnwrap(session.activeAgentSessionID)
         session.hasLoadedPersistedState = true
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.providerSessionID = "stable-provider-identity"
         session.codexConversationID = "stable-codex-identity"
         let primaryBinding = makeBinding(
@@ -2638,7 +2638,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         session.hasLoadedPersistedState = true
         session.hasSentFirstMessage = true
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         session.providerSessionID = "provider-from-old-cwd"
         session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: oldWorktree.path)]
@@ -2689,7 +2689,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let sessionID = UUID()
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.providerSessionID = "managed-old-identity"
         let oldBinding = makeBinding(logicalRoot: root.path, worktreeRoot: oldWorktree.path, worktreeID: "wt_old")
         let newBinding = makeBinding(logicalRoot: root.path, worktreeRoot: newWorktree.path, worktreeID: "wt_new")

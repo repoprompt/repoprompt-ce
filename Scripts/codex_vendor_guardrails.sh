@@ -48,7 +48,7 @@ grep -F "## OpenAI Codex" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the OpenAI Codex section"
 grep -F "codex-resources/zsh/bin/zsh" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the bundled Zsh notice"
-grep -F "rust-v0.145.0" docs/releasing.md >/dev/null ||
+grep -F "rust-v0.147.0" docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the pinned Codex release"
 grep -F 'Contents/Resources/BundledRuntimes/Codex/<target>/' docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the target-specific bundled Codex layout"
