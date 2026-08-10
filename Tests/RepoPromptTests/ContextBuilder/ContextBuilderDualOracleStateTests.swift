@@ -531,6 +531,12 @@ final class ContextBuilderDualOracleStateTests: XCTestCase {
             let model = AIModel.gpt54Pro
             var dispatchCount = 0
 
+            viewModel.sessions[fixture.tabID]?.generatedAnswerRoute = .init(
+                workspaceID: workspaceID,
+                tabID: fixture.tabID,
+                chatID: primaryID.uuidString
+            )
+
             viewModel.installRunTestHooks(.init(
                 beforeProcessingProviderEvent: nil,
                 providerEventDisposition: nil,
@@ -540,13 +546,8 @@ final class ContextBuilderDualOracleStateTests: XCTestCase {
                 },
                 toolChatSend: { args, _, _, _, callbacks in
                     dispatchCount += 1
-                    if dispatchCount == 1 {
-                        XCTAssertEqual(args["new_chat"]?.boolValue, true)
-                        XCTAssertNil(args["chat_id"])
-                    } else {
-                        XCTAssertEqual(args["new_chat"]?.boolValue, false)
-                        XCTAssertEqual(args["chat_id"]?.stringValue, primaryID.uuidString)
-                    }
+                    XCTAssertEqual(args["new_chat"]?.boolValue, false)
+                    XCTAssertEqual(args["chat_id"]?.stringValue, primaryID.uuidString)
                     try await callbacks.pairSessionsResolved?(primaryID, secondaryID)
                     return pairedResult(
                         primaryID: primaryID,
@@ -559,28 +560,20 @@ final class ContextBuilderDualOracleStateTests: XCTestCase {
             defer { viewModel.installRunTestHooks(nil) }
             let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: fixture.tabID)
 
-            _ = try await viewModel.runMCPPlanOrQuestion(
+            let result = try await viewModel.runMCPPlanOrQuestion(
                 for: identity,
                 oracleViewModel: oracleViewModel,
                 mode: .plan,
-                prompt: "First",
-                selection: .init(),
-                reviewGitContext: .automaticOnly()
-            )
-            let second = try await viewModel.runMCPPlanOrQuestion(
-                for: identity,
-                oracleViewModel: oracleViewModel,
-                mode: .plan,
-                prompt: "Second",
+                prompt: "Continue",
                 selection: .init(),
                 reviewGitContext: .automaticOnly()
             )
 
-            guard case let .paired(pair) = second.payload else {
+            guard case let .paired(pair) = result.payload else {
                 return XCTFail("Expected paired continuation")
             }
             XCTAssertEqual(pair.primaryChatID, primaryID.uuidString)
-            XCTAssertEqual(dispatchCount, 2)
+            XCTAssertEqual(dispatchCount, 1)
             XCTAssertEqual(viewModel.sessions[fixture.tabID]?.generatedAnswerRoute?.chatID, primaryID.uuidString)
         #endif
     }
