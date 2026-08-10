@@ -1,3 +1,6 @@
+import Combine
+import Foundation
+import KeyboardShortcuts
 import SwiftUI
 
 // MARK: - Context Pill
@@ -13,6 +16,8 @@ struct AgentContextPill: View {
     let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
+
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -61,6 +66,11 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
+    private var contextComposerActionText: String {
+        guard let contextComposerShortcut else { return "Click to review and edit" }
+        return "Click to review and edit · \(contextComposerShortcut)"
+    }
+
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
@@ -80,6 +90,7 @@ struct AgentContextPill: View {
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
+        lines.append(contextComposerActionText)
 
         return lines.joined(separator: "\n")
     }
@@ -97,6 +108,10 @@ struct AgentContextPill: View {
             openContextDrawerFiles()
         } label: {
             HStack(spacing: 6) {
+                Image(systemName: "square.stack.3d.up")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+
                 Text(compactFileSummaryText)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                     .foregroundStyle(.secondary)
@@ -121,6 +136,9 @@ struct AgentContextPill: View {
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
         .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
-        .accessibilityHint("Opens Compose selections")
+        .accessibilityHint("Review and edit selected context")
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
+        }
     }
 }

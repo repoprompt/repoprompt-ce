@@ -64,7 +64,7 @@ final class TooltipOverlayController {
         let arrow = Self.arrowGap * preset.scaleFactor
 
         // 3. Compute *top-left* window position for every placement
-        let topLeft: NSPoint = {
+        let proposedTopLeft: NSPoint = {
             switch cachedPlacement {
             case .top:
                 // Bubble ABOVE anchor – its bottom is arrow pts above anchor.top
@@ -112,6 +112,18 @@ final class TooltipOverlayController {
             }
         }()
 
+        guard let topLeft = Self.constrainedTopLeft(
+            proposedTopLeft,
+            bubbleSize: bubble,
+            anchor: anchor,
+            screens: NSScreen.screens.map {
+                ScreenGeometrySnapshot(frame: $0.frame, visibleFrame: $0.visibleFrame)
+            }
+        ) else {
+            hide()
+            return
+        }
+
         // Skip redundant frame sets (reduces display-cycle flush churn)
         let currentTopLeft = NSPoint(x: win.frame.origin.x, y: win.frame.origin.y + win.frame.height)
         let eps: CGFloat = 0.5
@@ -148,6 +160,26 @@ final class TooltipOverlayController {
         cachedText = nil
         cachedPlacement = .top
         cachedPreset = nil
+    }
+
+    static func constrainedTopLeft(
+        _ proposedTopLeft: NSPoint,
+        bubbleSize: NSSize,
+        anchor: NSRect,
+        screens: [ScreenGeometrySnapshot]
+    ) -> NSPoint? {
+        guard let visibleFrame = ScreenVisibleFrameResolver.selectedVisibleFrame(for: anchor, screens: screens) else {
+            return nil
+        }
+
+        var constrainedTopLeft = proposedTopLeft
+        constrainedTopLeft.x = bubbleSize.width <= visibleFrame.width
+            ? min(max(proposedTopLeft.x, visibleFrame.minX), visibleFrame.maxX - bubbleSize.width)
+            : visibleFrame.minX
+        constrainedTopLeft.y = bubbleSize.height <= visibleFrame.height
+            ? min(max(proposedTopLeft.y, visibleFrame.minY + bubbleSize.height), visibleFrame.maxY)
+            : visibleFrame.maxY
+        return constrainedTopLeft
     }
 
     // MARK: – Private
