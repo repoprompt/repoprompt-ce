@@ -715,7 +715,7 @@ done
 # Claude runtime coordination must use its closed host capability surface rather
 # than retaining or attaching the concrete AgentModeViewModel. The session type
 # is the extracted top-level AgentTabSession; AgentModeViewModel.TabSession is a
-# UI-layer source-compatibility alias only.
+# source-compatibility alias only.
 claude_coordinator_source="Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift"
 if [[ ! -f "$claude_coordinator_source" ]]; then
   fail "required Claude agent-mode coordinator source missing: $claude_coordinator_source"
