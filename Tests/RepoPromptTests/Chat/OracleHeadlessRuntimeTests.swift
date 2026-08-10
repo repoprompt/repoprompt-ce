@@ -107,11 +107,16 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
         let tabID = UUID()
         let streamID = UUID()
         let controller = OracleHeadlessTestStreamController()
+        let continuationInstalled = expectation(description: "stream continuation installed")
+        let progressObserved = expectation(description: "runtime consumed first stream chunk")
 
         let runtime = OracleHeadlessRuntime(
             sendPrompt: { _, _ in
                 let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
-                    Task { await controller.install(continuation) }
+                    Task {
+                        await controller.install(continuation)
+                        await MainActor.run { continuationInstalled.fulfill() }
+                    }
                     continuation.yield(
                         ChatStreamOutput(
                             text: "partial",
@@ -126,7 +131,8 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
                 await controller.recordCancellation(cancelledStreamID)
                 await controller.finish()
             },
-            cleanupConversation: { _, _ in }
+            cleanupConversation: { _, _ in },
+            timeout: .seconds(2)
         )
 
         let execution = Task { @MainActor in
@@ -134,22 +140,37 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
                 message: AIMessage(systemPrompt: "system", userMessage: "prompt"),
                 model: .claude4Sonnet,
                 tabID: tabID,
-                completionPolicy: .interactive
+                completionPolicy: .interactive,
+                onProgress: { _, _ in progressObserved.fulfill() }
             )
         }
 
-        for _ in 0 ..< 100 where !runtime.hasActiveStream(for: tabID) {
-            await Task.yield()
+        await fulfillment(of: [continuationInstalled, progressObserved], timeout: 1)
+        guard await controller.hasInstalledContinuation(),
+              runtime.hasActiveStream(for: tabID)
+        else {
+            await controller.finish()
+            execution.cancel()
+            _ = try? await execution.value
+            XCTFail("Expected a registered stream with an installed continuation")
+            return
         }
-        XCTAssertTrue(runtime.hasActiveStream(for: tabID))
 
-        await runtime.cancelStream(for: tabID)
-        let output = try await execution.value
+        do {
+            await runtime.cancelStream(for: tabID)
+            let output = try await execution.value
+            await controller.finish()
 
-        XCTAssertEqual(output.text, "partial")
-        let cancelledStreamIDs = await controller.cancelledStreamIDs()
-        XCTAssertEqual(cancelledStreamIDs, [streamID])
-        XCTAssertFalse(runtime.hasActiveStream(for: tabID))
+            XCTAssertEqual(output.text, "partial")
+            let cancelledStreamIDs = await controller.cancelledStreamIDs()
+            XCTAssertEqual(cancelledStreamIDs, [streamID])
+            XCTAssertFalse(runtime.hasActiveStream(for: tabID))
+        } catch {
+            await controller.finish()
+            execution.cancel()
+            _ = try? await execution.value
+            throw error
+        }
     }
 }
 
@@ -163,6 +184,10 @@ private actor OracleHeadlessTestStreamController {
 
     func recordCancellation(_ streamID: ChatStreamID) {
         cancellations.append(streamID)
+    }
+
+    func hasInstalledContinuation() -> Bool {
+        continuation != nil
     }
 
     func finish() {

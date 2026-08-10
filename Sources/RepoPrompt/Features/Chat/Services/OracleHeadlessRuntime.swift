@@ -59,7 +59,7 @@ final class OracleHeadlessRuntime {
                 )
                 #if DEBUG
                     print(
-                        "[OracleViewModel] provider conversation cleanup action=delete " +
+                        "[OracleHeadlessRuntime] provider conversation cleanup action=delete " +
                             "provider=\(handle.provider) status=\(outcome.status) " +
                             "message=\(outcome.message ?? "")"
                     )
@@ -114,7 +114,7 @@ final class OracleHeadlessRuntime {
         ) { group in
             group.addTask {
                 try await Task.sleep(for: timeout)
-                throw ChatToolError.internalError("Stream timed out after 4 hours of inactivity.")
+                throw ChatToolError.internalError("Stream timed out before completion.")
             }
 
             group.addTask { [stream, onProgress, cleanupHandleBox] in
