@@ -157,7 +157,7 @@ actor DirectHeadlessProviderCoordinator {
         let capturedCarrierEnvironment = DomainChildLaunchContext.current?.environment ?? [:]
         let task = Task { [weak self] in
             guard let self else { return }
-            do {
+            let report = await DomainAgentRunExecutionCore.execute {
                 let text = try await runProviderOnce(
                     message: message,
                     providerID: descriptor.id,
@@ -165,15 +165,10 @@ actor DirectHeadlessProviderCoordinator {
                     request: capturedRequest,
                     carrierEnvironment: capturedCarrierEnvironment
                 )
-                await finishAgent(sessionID: sessionID, outcome: .completed(assistantText: text))
-            } catch is CancellationError {
-                await finishAgent(sessionID: sessionID, outcome: .cancelled())
-            } catch {
-                await finishAgent(
-                    sessionID: sessionID,
-                    outcome: .failed(assistantText: error.localizedDescription)
-                )
+                return .completed(assistantText: text)
             }
+            guard case let .terminal(outcome) = report.result else { return }
+            await finishAgent(sessionID: sessionID, outcome: outcome)
         }
         agents[sessionID]?.task = task
         await runtime.agentSessionStore.installCancellationHandler(registration: registration) { [weak self] in

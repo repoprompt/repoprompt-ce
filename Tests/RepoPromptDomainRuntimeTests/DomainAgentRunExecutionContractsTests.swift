@@ -40,6 +40,133 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
         assertSendable(DomainAgentRunCancellationCompletion.terminalPublished)
         assertSendable(DomainAgentRunAttachmentTurnDisposition.restoreToPending)
         assertSendable(DomainAgentRunTerminalOutcome.completed(assistantText: "done"))
+        assertSendable(DomainAgentRunExecutionOperationResult.completed(assistantText: "done"))
+        assertSendable(DomainAgentRunExecutionResult.superseded)
+        assertSendable(DomainAgentRunExecutionTraceEvent.executionStarted)
+        assertSendable(DomainAgentRunExecutionReport(
+            result: .superseded,
+            trace: [.executionStarted, .executionSuperseded]
+        ))
+    }
+
+    // MARK: - Shared transient execution core
+
+    func testExecutionCoreClassifiesCompletionAndInvokesOperationOnce() async {
+        var invocationCount = 0
+
+        let report = await DomainAgentRunExecutionCore.execute {
+            invocationCount += 1
+            return .completed(assistantText: "done")
+        }
+
+        XCTAssertEqual(invocationCount, 1)
+        XCTAssertEqual(
+            report,
+            DomainAgentRunExecutionReport(
+                result: .terminal(.completed(assistantText: "done")),
+                trace: [.executionStarted, .terminalOutcomeProduced(.completed)]
+            )
+        )
+    }
+
+    func testExecutionCoreClassifiesCancellationWithoutCallingFailureMapper() async {
+        var failureMapperCallCount = 0
+
+        let report = await DomainAgentRunExecutionCore.execute(failureText: { _ in
+            failureMapperCallCount += 1
+            return "unexpected"
+        }) {
+            throw CancellationError()
+        }
+
+        XCTAssertEqual(failureMapperCallCount, 0)
+        XCTAssertEqual(
+            report,
+            DomainAgentRunExecutionReport(
+                result: .terminal(.cancelled()),
+                trace: [.executionStarted, .terminalOutcomeProduced(.cancelled)]
+            )
+        )
+    }
+
+    func testExecutionCorePreservesFailureMappingAndClassification() async {
+        var failureMapperCallCount = 0
+
+        let report = await DomainAgentRunExecutionCore.execute(
+            failureReason: .timeout,
+            failureText: { _ in
+                failureMapperCallCount += 1
+                return "mapped failure"
+            }
+        ) {
+            throw ExecutionFixtureError.failed
+        }
+
+        XCTAssertEqual(failureMapperCallCount, 1)
+        XCTAssertEqual(
+            report,
+            DomainAgentRunExecutionReport(
+                result: .terminal(.failed(assistantText: "mapped failure", reason: .timeout)),
+                trace: [.executionStarted, .terminalOutcomeProduced(.failed)]
+            )
+        )
+    }
+
+    func testExecutionCoreKeepsSupersessionExplicitAndNonterminal() async {
+        var failureMapperCallCount = 0
+
+        let report = await DomainAgentRunExecutionCore.execute(failureText: { _ in
+            failureMapperCallCount += 1
+            return "unexpected"
+        }) {
+            .superseded
+        }
+
+        XCTAssertEqual(failureMapperCallCount, 0)
+        XCTAssertEqual(
+            report,
+            DomainAgentRunExecutionReport(
+                result: .superseded,
+                trace: [.executionStarted, .executionSuperseded]
+            )
+        )
+    }
+
+    func testOneShotAndStreamingFixturesHaveDeterministicLifecycleParity() async {
+        for scenario in ExecutionFixtureScenario.allCases {
+            let oneShot = await executionFixtureReport(style: .oneShot, scenario: scenario)
+            let streaming = await executionFixtureReport(style: .streaming, scenario: scenario)
+
+            XCTAssertEqual(streaming, oneShot, "scenario: \(scenario)")
+        }
+    }
+
+    func testExecutionCorePreservesCallerActorIsolation() async {
+        let mainActorProbe = await MainActorExecutionProbe()
+        let mainActorReport = await mainActorProbe.execute()
+        let actorProbe = ExecutionActorProbe()
+        let actorReport = await actorProbe.execute()
+        let mainActorInvocationCount = await mainActorProbe.invocationCount
+        let actorInvocationCount = await actorProbe.invocationCount
+
+        XCTAssertEqual(mainActorInvocationCount, 1)
+        XCTAssertEqual(actorInvocationCount, 1)
+        XCTAssertEqual(mainActorReport.trace, [.executionStarted, .terminalOutcomeProduced(.completed)])
+        XCTAssertEqual(actorReport.trace, mainActorReport.trace)
+    }
+
+    func testExecutionCoreDoesNotReinterpretAlreadyCancelledTask() async {
+        let report = await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await DomainAgentRunExecutionCore.execute {
+                .completed(assistantText: "provider returned normally")
+            }
+        }.value
+
+        XCTAssertEqual(
+            report.result,
+            .terminal(.completed(assistantText: "provider returned normally"))
+        )
     }
 
     // MARK: - Terminal outcome result contracts
@@ -134,6 +261,52 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
 
     // MARK: - Helpers
 
+    private enum ExecutionFixtureError: Error {
+        case failed
+    }
+
+    private enum ExecutionFixtureStyle {
+        case oneShot
+        case streaming
+    }
+
+    private enum ExecutionFixtureScenario: CaseIterable {
+        case completed
+        case cancelled
+        case failed
+        case superseded
+    }
+
+    private func executionFixtureReport(
+        style: ExecutionFixtureStyle,
+        scenario: ExecutionFixtureScenario
+    ) async -> DomainAgentRunExecutionReport {
+        await DomainAgentRunExecutionCore.execute(failureText: { _ in "fixture failure" }) {
+            switch scenario {
+            case .completed:
+                if style == .streaming {
+                    let events = AsyncStream<Int> { continuation in
+                        continuation.yield(1)
+                        continuation.yield(2)
+                        continuation.finish()
+                    }
+                    var consumed: [Int] = []
+                    for await event in events {
+                        consumed.append(event)
+                    }
+                    XCTAssertEqual(consumed, [1, 2])
+                }
+                return .completed(assistantText: "fixture complete")
+            case .cancelled:
+                throw CancellationError()
+            case .failed:
+                throw ExecutionFixtureError.failed
+            case .superseded:
+                return .superseded
+            }
+        }
+    }
+
     private func assertSendable(_ value: some Sendable & Equatable) {
         XCTAssertEqual(value, value)
     }
@@ -204,5 +377,28 @@ final class DomainAgentRunExecutionContractsTests: XCTestCase {
             persistence: DomainPersistenceCoordinator(configuration: configuration, identity: identity),
             profileIdentifier: profile
         )
+    }
+}
+
+@MainActor
+private final class MainActorExecutionProbe {
+    private(set) var invocationCount = 0
+
+    func execute() async -> DomainAgentRunExecutionReport {
+        await DomainAgentRunExecutionCore.execute {
+            invocationCount += 1
+            return .completed(assistantText: nil)
+        }
+    }
+}
+
+private actor ExecutionActorProbe {
+    private(set) var invocationCount = 0
+
+    func execute() async -> DomainAgentRunExecutionReport {
+        await DomainAgentRunExecutionCore.execute {
+            invocationCount += 1
+            return .completed(assistantText: nil)
+        }
     }
 }
