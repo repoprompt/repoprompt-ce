@@ -99,6 +99,7 @@ final class ContextBuilderOracleResultTests: XCTestCase {
             payload: .paired(.init(
                 pairID: pairID,
                 mode: "plan",
+                primarySessionID: primaryID,
                 primaryChatID: "primary-chat",
                 secondaryChatID: "secondary-chat",
                 primaryModel: .gpt54Pro,

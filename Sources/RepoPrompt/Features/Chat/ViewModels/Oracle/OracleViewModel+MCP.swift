@@ -1746,11 +1746,11 @@ extension OracleViewModel {
             let result = OracleSendResult(payload: .paired(pair), route: route)
             // Fail closed whenever Primary fails (including incomplete). Secondary-only
             // failure stays a returned partial_failure so callers can keep Primary text.
-            if case .failure = pair.result.primary, let failureSummary = pair.failureSummary {
-                throw OracleSendFailure(result: result, message: failureSummary)
-            }
-            if pair.status == .failed, let failureSummary = pair.failureSummary {
-                throw OracleSendFailure(result: result, message: failureSummary)
+            if case let .failure(failure) = pair.result.primary {
+                throw OracleSendFailure(
+                    result: result,
+                    message: pair.failureSummary ?? failure.message
+                )
             }
             return result
         }
@@ -1906,6 +1906,7 @@ extension OracleViewModel {
         return OraclePairSendReply(
             pairID: pair.pairID,
             mode: mode,
+            primarySessionID: pair.primary.id,
             primaryChatID: pair.primary.shortID,
             secondaryChatID: pair.secondary.shortID,
             primaryModel: primarySelection.model,

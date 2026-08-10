@@ -1125,6 +1125,7 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func purgeMessageCaches(for messageId: UUID) {
+        // Message-scoped cleanup only; does not cancel live streams or touch session-level state.
         sessionIDByMessageId.removeValue(forKey: messageId)
         streamIDsByQueryId.removeValue(forKey: messageId)
         cancelFinalizationWatchdog(for: messageId)
@@ -3370,6 +3371,7 @@ class OracleViewModel: ObservableObject {
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async -> UUID? {
         guard !newUserMessage.isEmpty else { return nil }
+        _ = true
 
         let targetSessionID: UUID
         if let sessionID {
@@ -3392,15 +3394,18 @@ class OracleViewModel: ObservableObject {
 
         ensureSessionStorage(targetSessionID)
 
-        let userID = UUID()
+        // Create the user message
+        let userId = UUID()
         let userMessage = AIChatMessage(
-            id: userID,
+            id: userId,
             content: newUserMessage,
             isUser: true,
             sequenceIndex: nextSequenceIndex(for: targetSessionID)
         )
-        withSessionMessages(targetSessionID) { $0.append(userMessage) }
-        registerMessage(userID, sessionID: targetSessionID)
+        withSessionMessages(targetSessionID) { msgs in
+            msgs.append(userMessage)
+        }
+        registerMessage(userId, sessionID: targetSessionID)
 
         let conversation = buildConversationEntries(for: targetSessionID)
 
@@ -3414,7 +3419,6 @@ class OracleViewModel: ObservableObject {
         if !promptViewModel.isModelAvailable(model) {
             // Show error in chat instead of silently falling back
             let errorMessage = AIChatMessage(
-                id: UUID(),
                 content: "Error: The model '\(model.displayName)' is not available. Please check that the \(model.providerType.displayName) API key is configured in Settings.",
                 isUser: false,
                 isFinalized: true

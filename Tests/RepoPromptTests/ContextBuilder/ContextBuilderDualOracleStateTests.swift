@@ -917,6 +917,7 @@ private func pairedResult(
         payload: .paired(.init(
             pairID: UUID(),
             mode: "plan",
+            primarySessionID: primaryID,
             primaryChatID: primaryID.uuidString,
             secondaryChatID: secondaryID.uuidString,
             primaryModel: primaryModel,

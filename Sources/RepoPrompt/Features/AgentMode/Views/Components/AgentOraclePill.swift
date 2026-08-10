@@ -210,10 +210,7 @@ enum AgentOraclePillLogic {
         {
             return currentSessionID
         }
-        return latestSession(
-            in: sameWorkspaceEligibleSessions,
-            streamingSessionIDs: streamingSessionIDs
-        )?.id
+        return latestSession(in: sameWorkspaceEligibleSessions, streamingSessionIDs: streamingSessionIDs)?.id
     }
 
     static func session(matchingChatID raw: String, in sessions: [ChatSession]) -> ChatSession? {
@@ -341,14 +338,11 @@ struct AgentOraclePill: View {
                     }
                     .padding(.horizontal, AgentPillMetrics.horizontalPadding())
                     .frame(height: AgentPillMetrics.height())
-                    .background(.ultraThinMaterial)
+                    .background(isStreaming ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(.ultraThinMaterial))
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .stroke(
-                                isStreaming ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.15),
-                                lineWidth: isStreaming ? 1 : 0.5
-                            )
+                            .stroke(isStreaming ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isStreaming ? 1 : 0.5)
                     )
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
@@ -508,13 +502,14 @@ struct AgentOraclePill: View {
         workspaceID: UUID? = nil,
         presentation: AgentOraclePopoverPresentation = .standard
     ) {
+        guard let tabID = currentTabID else { return }
         openRequestGeneration &+= 1
         let generation = openRequestGeneration
 
         guard let chatID else {
-            guard let latestTabSession else { return }
+            guard let target = latestTabSession else { return }
             present(
-                sessionID: latestTabSession.id,
+                sessionID: target.id,
                 isExplicit: false,
                 actionPolicy: .standard,
                 generation: generation
@@ -522,7 +517,6 @@ struct AgentOraclePill: View {
             return
         }
 
-        guard let tabID = currentTabID else { return }
         presentedPopover = nil
         guard let workspaceID,
               let request = AgentOraclePillLogic.explicitOpenRequest(

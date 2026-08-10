@@ -86,7 +86,7 @@ enum OraclePairCoordinator {
         _ operation: @escaping Operation<Success>
     ) async throws -> LaneExecution<Success> {
         do {
-            return try await .success(operation())
+            return .success(try await operation())
         } catch is CancellationError {
             throw CancellationError()
         } catch let failure as OracleLaneFailure {

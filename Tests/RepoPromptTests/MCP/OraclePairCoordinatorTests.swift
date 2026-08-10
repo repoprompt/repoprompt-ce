@@ -36,6 +36,7 @@ final class OraclePairCoordinatorTests: XCTestCase {
         let object = OraclePairSendReply(
             pairID: UUID(),
             mode: "chat",
+            primarySessionID: UUID(),
             primaryChatID: "primary-chat",
             secondaryChatID: "secondary-chat",
             primaryModel: .gpt54Pro,
@@ -63,6 +64,7 @@ final class OraclePairCoordinatorTests: XCTestCase {
         let pair = OraclePairSendReply(
             pairID: UUID(),
             mode: "chat",
+            primarySessionID: UUID(),
             primaryChatID: "primary-chat",
             secondaryChatID: "secondary-chat",
             primaryModel: .gpt54Pro,
@@ -84,6 +86,7 @@ final class OraclePairCoordinatorTests: XCTestCase {
         let pair = OraclePairSendReply(
             pairID: UUID(),
             mode: "chat",
+            primarySessionID: UUID(),
             primaryChatID: "primary-chat",
             secondaryChatID: "secondary-chat",
             primaryModel: .gpt54Pro,
@@ -106,11 +109,12 @@ final class OraclePairCoordinatorTests: XCTestCase {
         )
     }
 
-    func testPrimaryReplyUsesFallbackForFailedPrimary() {
-        let fallback = UUID()
+    func testPrimaryReplyUsesResolvedSessionForFailedPrimary() {
+        let primarySessionID = UUID()
         let pair = OraclePairSendReply(
             pairID: UUID(),
             mode: "plan",
+            primarySessionID: primarySessionID,
             primaryChatID: "primary-chat",
             secondaryChatID: "secondary-chat",
             primaryModel: .gpt54Pro,
@@ -123,8 +127,8 @@ final class OraclePairCoordinatorTests: XCTestCase {
             historyPersistenceError: nil
         )
 
-        let projected = pair.primaryReply(fallbackSessionID: fallback)
-        XCTAssertEqual(projected.chatId, fallback)
+        let projected = pair.primaryReply()
+        XCTAssertEqual(projected.chatId, primarySessionID)
         XCTAssertEqual(projected.shortId, "primary-chat")
         XCTAssertEqual(projected.mode, "plan")
         XCTAssertEqual(projected.response, "partial")
@@ -197,6 +201,7 @@ final class OraclePairCoordinatorTests: XCTestCase {
         let pairReply = OraclePairSendReply(
             pairID: pairID,
             mode: "chat",
+            primarySessionID: UUID(),
             primaryChatID: "primary-chat",
             secondaryChatID: "secondary-chat",
             primaryModel: .gpt54Pro,

@@ -22,10 +22,10 @@ struct OracleSendResult {
     let payload: Payload
     let route: OracleSendRoute
 
-    func primaryReply(fallbackSessionID: UUID? = nil) -> ChatSendReply {
+    func primaryReply() -> ChatSendReply {
         switch payload {
         case let .single(reply): reply
-        case let .paired(pair): pair.primaryReply(fallbackSessionID: fallbackSessionID)
+        case let .paired(pair): pair.primaryReply()
         }
     }
 
@@ -59,6 +59,7 @@ struct OracleSendFailure: LocalizedError {
 struct OraclePairSendReply {
     let pairID: UUID
     let mode: String
+    let primarySessionID: UUID
     let primaryChatID: String
     let secondaryChatID: String
     let primaryModel: AIModel
@@ -89,7 +90,7 @@ struct OraclePairSendReply {
         return warnings.isEmpty ? nil : warnings.joined(separator: "\n")
     }
 
-    func primaryReply(fallbackSessionID: UUID? = nil) -> ChatSendReply {
+    func primaryReply() -> ChatSendReply {
         switch result.primary {
         case let .success(primary):
             ChatSendReply(
@@ -101,8 +102,7 @@ struct OraclePairSendReply {
             )
         case let .failure(failure):
             ChatSendReply(
-                // Prefer the resolved Primary session id; shortId alone is not a UUID.
-                chatId: fallbackSessionID ?? UUID(uuidString: primaryChatID) ?? UUID(),
+                chatId: primarySessionID,
                 shortId: primaryChatID,
                 mode: mode,
                 response: failure.partialResponse,

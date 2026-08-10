@@ -275,7 +275,13 @@ public enum ChatHistoryLimit: Int, CaseIterable {
 /// An actor that reads/writes ChatSessions from each workspace's "Chats" folder.
 /// (Refactored to remove Task.detached usage but keep method signatures & behavior identical.)
 actor ChatDataService {
+    /// The JSON decoder we'll use
     private let decoder = JSONDecoder()
+
+    init() {
+        // Customize encoder/decoder if desired (dates, etc.)
+    }
+
     private static let fileSaveQueue = DispatchQueue(label: "com.repoprompt.chatDataServiceFileSaveQueue")
     private var pairMutationPending = false
     private var pairMutationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -454,6 +460,7 @@ actor ChatDataService {
                 case let .success(index, _), let .failure(index, _, _):
                     outcomes[index] = outcome
                 }
+
                 if nextIndexToSchedule < files.count {
                     schedule(nextIndexToSchedule)
                     nextIndexToSchedule += 1

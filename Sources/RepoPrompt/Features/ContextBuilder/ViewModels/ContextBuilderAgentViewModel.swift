@@ -4872,12 +4872,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 freshArgs["new_chat"] = .bool(true)
                 result = try await dispatch(freshArgs)
             }
-            guard let primarySessionID = session.followUpPrimarySessionID else {
+            guard session.followUpPrimarySessionID != nil else {
                 throw ChatToolError.internalError("Oracle runtime did not publish a Primary session")
             }
             let reply: ChatSendReply = switch result.payload {
             case let .single(reply): reply
-            case let .paired(pair): pair.primaryReply(fallbackSessionID: primarySessionID)
+            case let .paired(pair): pair.primaryReply()
             }
             await laneActivityTail?.value
             await progressReporter?(.messageFinalization)
@@ -5294,10 +5294,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         return switch result.payload {
         case let .single(reply): reply
-        case let .paired(pair):
-            pair.primaryReply(fallbackSessionID: oracleViewModel.sessions.first(where: {
-                $0.shortID == pair.primaryChatID
-            })?.id)
+        case let .paired(pair): pair.primaryReply()
         }
     }
 
