@@ -48,6 +48,10 @@ final class OraclePairCoordinatorTests: XCTestCase {
         XCTAssertEqual(object["status"]?.stringValue, "partial_failure")
         XCTAssertEqual(object["response"]?.stringValue, "primary response")
         XCTAssertEqual(
+            object["errors"]?.arrayValue?.compactMap(\.stringValue),
+            ["Secondary Oracle failed: secondary failed"]
+        )
+        XCTAssertEqual(
             object["oracle_results"]?.objectValue?["secondary"]?.objectValue?["partial_response"]?.stringValue,
             "partial"
         )

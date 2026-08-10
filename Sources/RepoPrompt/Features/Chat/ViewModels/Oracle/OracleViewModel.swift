@@ -614,6 +614,8 @@ class OracleViewModel: ObservableObject {
     private var sessionSwitchGeneration: Int = 0
     private var workspaceChatSessionLoadGeneration: UInt64 = 0
     private let workspaceSwitchChatStubLoadConcurrency = 4
+    /// Tracks the latest workspace-switch chat restore so callers can await settlement.
+    private var workspaceChatRestoreTask: Task<Void, Never>?
 
     /// Session management
     @Published var sessions: [ChatSession] = [] {
@@ -1312,8 +1314,12 @@ class OracleViewModel: ObservableObject {
         // New code using multi-listener approach:
         self.workspaceManager.addWorkspaceDidSwitchListener(label: "chat") { [weak self] newWS in
             guard let self else { return }
-            Task { [weak self] in
-                await self?.handleWorkspaceSwitched(to: newWS)
+            // Keep a single awaitable restore task. Workspace switch only yields once after
+            // notifying listeners, so tests and MCP callers must be able to wait until chat
+            // sessions finish reloading (sessions.removeAll + stub load + ensureActive).
+            self.workspaceChatRestoreTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.handleWorkspaceSwitched(to: newWS)
             }
         }
 
@@ -1977,6 +1983,13 @@ class OracleViewModel: ObservableObject {
         guard !isSwitchingTabsForSession else { return }
         guard tabID != nil else { return }
         _ = await ensureActiveSessionForCurrentTab(createIfMissing: true)
+    }
+
+    /// Waits for the most recent workspace-switch chat restore to finish.
+    /// Call after `WorkspaceManager.switchWorkspace` before asserting Oracle session state.
+    @MainActor
+    func awaitWorkspaceChatSessionsRestored() async {
+        await workspaceChatRestoreTask?.value
     }
 
     @MainActor

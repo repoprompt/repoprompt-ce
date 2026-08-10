@@ -748,6 +748,10 @@ final class ContextBuilderDualOracleStateTests: XCTestCase {
             ephemeral: true
         )
         await composition.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: #function)
+        // Chat restore runs in a listener Task that switchWorkspace does not await.
+        // Settle it before dual-Oracle assertions about current/active chat IDs.
+        await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
+        _ = await composition.oracleViewModel.ensureActiveSessionForCurrentTab(createIfMissing: true)
         let active = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(active.activeComposeTabID ?? active.composeTabs.first?.id)
         return Fixture(composition: composition, tabID: tabID, root: root)

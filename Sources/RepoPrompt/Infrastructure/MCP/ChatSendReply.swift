@@ -101,6 +101,7 @@ struct OraclePairSendReply {
             )
         case let .failure(failure):
             ChatSendReply(
+                // Prefer the resolved Primary session id; shortId alone is not a UUID.
                 chatId: fallbackSessionID ?? UUID(uuidString: primaryChatID) ?? UUID(),
                 shortId: primaryChatID,
                 mode: mode,
@@ -111,15 +112,20 @@ struct OraclePairSendReply {
     }
 
     func toMCPObject() -> [String: Value] {
-        var object: [String: Value] = switch result.primary {
+        var object: [String: Value]
+        switch result.primary {
         case let .success(primary):
-            primary.toMCPObject()
+            object = primary.toMCPObject()
         case let .failure(failure):
-            [
+            object = [
                 "chat_id": .string(primaryChatID),
                 "mode": .string(mode),
-                "errors": .array([.string(failure.message)])
+                "errors": .array([.string(failureSummary ?? failure.message)])
             ]
+            if let partialResponse = failure.partialResponse {
+                object["partial_response"] = .string(partialResponse)
+                object["response"] = .string(partialResponse)
+            }
         }
         object["status"] = .string(status.rawValue)
         object["oracle_pair_id"] = .string(pairID.uuidString)
@@ -128,6 +134,11 @@ struct OraclePairSendReply {
         object["oracle_history_diverged"] = .bool(historyDiverged)
         if let historyPersistenceError {
             object["oracle_pair_history_persistence_error"] = .string(historyPersistenceError)
+        }
+        // Surface Secondary-only / history failures at the top level so single-lane
+        // MCP consumers do not treat partial_failure as a clean success.
+        if status != .completed, let failureSummary, object["errors"] == nil {
+            object["errors"] = .array([.string(failureSummary)])
         }
         object["oracle_results"] = .object([
             "primary": laneValue(

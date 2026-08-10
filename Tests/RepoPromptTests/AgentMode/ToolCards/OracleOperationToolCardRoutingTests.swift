@@ -502,7 +502,17 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
     func testAuthoritativeChatIDPolicyPreservesFailClosedRootRulesAcrossEntryPoints() {
         let acceptedPayloads: [([String: Any], String)] = [
             (["chat_id": "  exact-chat  "], "exact-chat"),
-            (["chat_id": "exact-with-unrelated-data", "diffs": [["path": 42]]], "exact-with-unrelated-data")
+            (["chat_id": "exact-with-unrelated-data", "diffs": [["path": 42]]], "exact-with-unrelated-data"),
+            // Dual-Oracle nests lane chat_ids; root/primary remains authoritative.
+            ([
+                "chat_id": "primary-short",
+                "primary_chat_id": "primary-short",
+                "oracle_pair_id": "pair-1",
+                "oracle_results": [
+                    "primary": ["chat_id": "primary-short"],
+                    "secondary": ["chat_id": "secondary-short"]
+                ]
+            ], "primary-short")
         ]
         for (payload, expected) in acceptedPayloads {
             XCTAssertEqual(

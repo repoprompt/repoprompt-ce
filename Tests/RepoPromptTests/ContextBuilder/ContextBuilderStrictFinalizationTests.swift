@@ -7,6 +7,11 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     @MainActor
     func testActiveContextBuilderIncompleteTerminationFailsAndPreservesOracleChat() async throws {
         #if DEBUG
+            let settings = GlobalSettingsStore.shared
+            let previousSecondaryModel = settings.secondaryOracleModelRaw()
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
+            defer { settings.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false) }
+
             let composition = makeComposition(
                 windowID: -177,
                 terminalOutcome: .incomplete(reason: "max_tokens")
@@ -26,6 +31,8 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 saveState: false,
                 reason: "ContextBuilderStrictFinalizationTests.active"
             )
+            await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
+            _ = await composition.oracleViewModel.ensureActiveSessionForCurrentTab(createIfMissing: true)
             let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
@@ -81,6 +88,11 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     @MainActor
     func testInteractiveIncompleteTerminationPreservesPartialResponseAndShowsReason() async throws {
         #if DEBUG
+            let settings = GlobalSettingsStore.shared
+            let previousSecondaryModel = settings.secondaryOracleModelRaw()
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
+            defer { settings.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false) }
+
             let composition = makeComposition(
                 windowID: -180,
                 terminalOutcome: .incomplete(reason: "max_tokens")
@@ -100,6 +112,7 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 saveState: false,
                 reason: "ContextBuilderStrictFinalizationTests.interactive-incomplete"
             )
+            await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
 
             let sentQueryID = await composition.oracleViewModel.sendMessage(
                 "Produce a response.",
@@ -147,18 +160,22 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 saveState: false,
                 reason: "ContextBuilderStrictFinalizationTests.ask-oracle-incomplete"
             )
+            await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
 
             let settings = GlobalSettingsStore.shared
+            let previousSecondaryModel = settings.secondaryOracleModelRaw()
             let previousShowPresets = settings.mcpShowModelPresets()
             let previousDisablePresets = settings.mcpTemporarilyDisablePresets()
             let previousPlanningModel = composition.promptManager.planningModelName
             let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
             defer {
+                settings.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false)
                 settings.setMCPShowModelPresets(previousShowPresets, commit: false)
                 settings.setMCPTemporarilyDisablePresets(previousDisablePresets, commit: false)
                 composition.promptManager.planningModelName = previousPlanningModel
                 composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity
             }
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
             settings.setMCPShowModelPresets(false, commit: false)
             settings.setMCPTemporarilyDisablePresets(false, commit: false)
             composition.apiSettingsViewModel.isCustomProviderValid = true
@@ -217,18 +234,22 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 saveState: false,
                 reason: "ContextBuilderStrictFinalizationTests.ask-oracle-completed"
             )
+            await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
 
             let settings = GlobalSettingsStore.shared
+            let previousSecondaryModel = settings.secondaryOracleModelRaw()
             let previousShowPresets = settings.mcpShowModelPresets()
             let previousDisablePresets = settings.mcpTemporarilyDisablePresets()
             let previousPlanningModel = composition.promptManager.planningModelName
             let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
             defer {
+                settings.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false)
                 settings.setMCPShowModelPresets(previousShowPresets, commit: false)
                 settings.setMCPTemporarilyDisablePresets(previousDisablePresets, commit: false)
                 composition.promptManager.planningModelName = previousPlanningModel
                 composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity
             }
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
             settings.setMCPShowModelPresets(false, commit: false)
             settings.setMCPTemporarilyDisablePresets(false, commit: false)
             composition.apiSettingsViewModel.isCustomProviderValid = true
@@ -254,6 +275,11 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     @MainActor
     func testInactiveContextBuilderCleanEOFFailsBeforePersistence() async throws {
         #if DEBUG
+            let settings = GlobalSettingsStore.shared
+            let previousSecondaryModel = settings.secondaryOracleModelRaw()
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
+            defer { settings.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false) }
+
             let composition = makeComposition(windowID: -178)
             await composition.workspaceManager.awaitInitialized()
 
@@ -274,6 +300,7 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 saveState: false,
                 reason: "ContextBuilderStrictFinalizationTests.headless-active"
             )
+            await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
             let inactiveWorkspace = composition.workspaceManager.createWorkspace(
                 name: "Context Builder strict headless target workspace",
                 repoPaths: [inactiveRoot.path],
@@ -334,6 +361,11 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     @MainActor
     func testInactiveContextBuilderProviderCompletionPersistsReply() async throws {
         #if DEBUG
+            let settings = GlobalSettingsStore.shared
+            let previousSecondaryModel = settings.secondaryOracleModelRaw()
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
+            defer { settings.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false) }
+
             let composition = makeComposition(windowID: -179, terminalOutcome: .completed)
             await composition.workspaceManager.awaitInitialized()
 
@@ -354,6 +386,7 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 saveState: false,
                 reason: "ContextBuilderStrictFinalizationTests.headless-success-active"
             )
+            await composition.oracleViewModel.awaitWorkspaceChatSessionsRestored()
             let inactiveWorkspace = composition.workspaceManager.createWorkspace(
                 name: "Context Builder strict headless success target workspace",
                 repoPaths: [inactiveRoot.path],
