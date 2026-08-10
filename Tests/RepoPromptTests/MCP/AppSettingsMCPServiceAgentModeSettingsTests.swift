@@ -215,6 +215,51 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertEqual(persisted.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
     }
 
+    func testSecondaryOracleModelSettingPersistsIdempotentlyAndClears() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let service = AppSettingsMCPService(store: store)
+        let key = "models.secondary_oracle_model"
+        let model = AIModel.gpt54Pro.rawValue
+
+        do {
+            _ = try await service.handleForTesting([
+                "op": .string("set"), "key": .string(key), "value": .string("not-a-real-model")
+            ])
+            XCTFail("Expected an unknown Secondary Oracle model to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("not a recognized Oracle model ID"))
+        }
+        XCTAssertNil(store.secondaryOracleModelRaw())
+
+        let set = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(key), "value": .string(model)
+        ])
+        XCTAssertEqual(set.objectValue?["new_value"]?.stringValue, model)
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.modelSelection?.secondaryOracleModel, model)
+        XCTAssertEqual(try fileStore.load().schemaVersion, GlobalSettingsDocument.secondaryOracleSchemaVersion)
+
+        let unchanged = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(key), "value": .string(model)
+        ])
+        XCTAssertEqual(unchanged.objectValue?["changed"]?.boolValue, false)
+
+        let cleared = try await service.handleForTesting([
+            "op": .string("set"), "key": .string(key), "value": .null
+        ])
+        XCTAssertNil(cleared.objectValue?["new_value"]?.stringValue)
+        XCTAssertNil(store.secondaryOracleModelRaw())
+        XCTAssertNil(try fileStore.load().scalarPreferences?.modelSelection?.secondaryOracleModel)
+    }
+
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

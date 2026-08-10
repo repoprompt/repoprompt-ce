@@ -67,6 +67,427 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertFalse(encodedString.contains("delegateResults"), encodedString)
     }
 
+    func testPairSaveReplacesBothMembers() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Save")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairID = UUID()
+        var primary = pairSession(.primary, pairID: pairID, workspace: fixture.workspace, name: "Original Primary")
+        var secondary = pairSession(.secondary, pairID: pairID, workspace: fixture.workspace, name: "Original Secondary")
+        let urls = try await service.saveOraclePairSessions([primary, secondary], for: fixture.workspace)
+
+        primary.name = "Updated Primary"
+        secondary.name = "Updated Secondary"
+        _ = try await service.saveOraclePairSessions([primary, secondary], for: fixture.workspace)
+
+        let updatedPrimary = try await service.loadChatSession(from: XCTUnwrap(urls[primary.id]))
+        let updatedSecondary = try await service.loadChatSession(from: XCTUnwrap(urls[secondary.id]))
+        XCTAssertEqual(updatedPrimary.name, "Updated Primary")
+        XCTAssertEqual(updatedSecondary.name, "Updated Secondary")
+    }
+
+    func testConcurrentPairAndLegacySavesQueueWithoutLosingHistory() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Concurrent Saves")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairs = (0 ..< 8).map { index in
+            let pairID = UUID()
+            return OracleLane.allCases.map {
+                pairSession($0, pairID: pairID, workspace: fixture.workspace, name: "Pair \(index) \($0.rawValue)")
+            }
+        }
+        let singles = (0 ..< 8).map {
+            ChatSession(workspaceID: fixture.workspace.id, name: "Single \($0)")
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for pair in pairs {
+                group.addTask {
+                    _ = try await service.saveOraclePairSessions(pair, for: fixture.workspace)
+                }
+            }
+            for single in singles {
+                group.addTask {
+                    _ = try await service.saveChatSession(single, for: fixture.workspace)
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let files = try await service.listChatSessions(for: fixture.workspace, applyRetention: false)
+        let expectedIDs = Set(pairs.flatMap(\.self).map(\.id) + singles.map(\.id))
+        let savedIDs = Set(files.compactMap { UUID(uuidString: String($0.deletingPathExtension().lastPathComponent.dropFirst("ChatSession-".count))) })
+        XCTAssertEqual(savedIDs, expectedIDs)
+    }
+
+    func testPairedSessionCannotUseLegacySingleSave() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Single Save Guard")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pair = pairSession(.primary, pairID: UUID(), workspace: fixture.workspace, name: "Primary")
+
+        do {
+            _ = try await service.saveChatSession(pair, for: fixture.workspace)
+            XCTFail("Expected a paired session to require the pair save path")
+        } catch is ChatDataError {}
+    }
+
+    func testCurrentPairTransactionRecoversInterruptedAndCommittedInstalls() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Recovery")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairID = UUID()
+        var primary = pairSession(.primary, pairID: pairID, workspace: fixture.workspace, name: "Primary")
+        var secondary = pairSession(.secondary, pairID: pairID, workspace: fixture.workspace, name: "Secondary")
+        let urls = try await service.saveOraclePairSessions(
+            [primary, secondary],
+            for: fixture.workspace
+        )
+        let pairURLs = try [XCTUnwrap(urls[primary.id]), XCTUnwrap(urls[secondary.id])]
+        let chatsFolder = pairURLs[0].deletingLastPathComponent()
+
+        let uncommitted = try makeCurrentPairTransaction(files: pairURLs, in: chatsFolder)
+        primary.name = "Interrupted Primary"
+        try FileManager.default.removeItem(at: pairURLs[0])
+        try FileManager.default.removeItem(at: pairURLs[1])
+        try JSONEncoder().encode(primary).write(to: pairURLs[0], options: .atomic)
+
+        _ = try await service.listChatSessions(for: fixture.workspace)
+        let restoredPrimary = try await service.loadChatSession(from: pairURLs[0])
+        let restoredSecondary = try await service.loadChatSession(from: pairURLs[1])
+        XCTAssertEqual(restoredPrimary.name, "Primary")
+        XCTAssertEqual(restoredSecondary.name, "Secondary")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: uncommitted.path))
+
+        let committed = try makeCurrentPairTransaction(files: pairURLs, in: chatsFolder)
+        primary.name = "Committed Primary"
+        secondary.name = "Committed Secondary"
+        try JSONEncoder().encode(primary).write(to: pairURLs[0], options: .atomic)
+        try JSONEncoder().encode(secondary).write(to: pairURLs[1], options: .atomic)
+        try Data().write(to: committed.appendingPathComponent("committed"))
+
+        _ = try await service.listChatSessions(for: fixture.workspace)
+        let committedPrimary = try await service.loadChatSession(from: pairURLs[0])
+        let committedSecondary = try await service.loadChatSession(from: pairURLs[1])
+        XCTAssertEqual(committedPrimary.name, "Committed Primary")
+        XCTAssertEqual(committedSecondary.name, "Committed Secondary")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: committed.path))
+    }
+
+    func testMalformedPairTransactionDebrisIsQuarantinedWithoutBlockingSaves() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Malformed Pair Debris")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let existing = ChatSession(workspaceID: fixture.workspace.id, name: "Existing")
+        _ = try await service.saveChatSession(existing, for: fixture.workspace)
+        let chatsFolder = fixture.root.appendingPathComponent("Chats", isDirectory: true)
+
+        let stray = chatsFolder.appendingPathComponent(".oracle-pair-save-\(UUID().uuidString) conflicted copy")
+        try Data("debris".utf8).write(to: stray)
+        let malformed = chatsFolder.appendingPathComponent(".oracle-pair-save-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: malformed, withIntermediateDirectories: false)
+        try Data("not json".utf8).write(to: malformed.appendingPathComponent("manifest.json"))
+
+        let newSession = ChatSession(workspaceID: fixture.workspace.id, name: "After debris")
+        let newURL = try await service.saveChatSession(newSession, for: fixture.workspace)
+        let files = try await service.listChatSessions(for: fixture.workspace, applyRetention: false)
+        let folderEntries = try FileManager.default.contentsOfDirectory(atPath: chatsFolder.path)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: newURL.path))
+        XCTAssertEqual(files.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stray.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: malformed.path))
+        XCTAssertEqual(folderEntries.count(where: { $0.hasPrefix(".oracle-pair-quarantine-") }), 2)
+    }
+
+    func testReadOnlyHistoryQueriesDoNotApplyRetention() async throws {
+        let previousLimit = UserDefaults.standard.object(forKey: "chatHistoryLimit")
+        UserDefaults.standard.set(ChatHistoryLimit.fifty.rawValue, forKey: "chatHistoryLimit")
+        defer {
+            if let previousLimit {
+                UserDefaults.standard.set(previousLimit, forKey: "chatHistoryLimit")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "chatHistoryLimit")
+            }
+        }
+
+        let fixture = try makeTemporaryWorkspace(named: "Read Only History")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        var sessions: [ChatSession] = []
+        for index in 0 ..< 51 {
+            let session = ChatSession(workspaceID: fixture.workspace.id, name: "Session \(index)")
+            sessions.append(session)
+            _ = try await service.saveChatSession(session, for: fixture.workspace)
+        }
+
+        _ = try await service.recentSessions(for: fixture.workspace, limit: 1)
+        _ = try await service.findSessionResult(for: fixture.workspace, id: sessions[0].id.uuidString)
+        _ = try await service.mostRecentSession(for: fixture.workspace)
+
+        let chatsFolder = fixture.root.appendingPathComponent("Chats", isDirectory: true)
+        let fileCount = try FileManager.default.contentsOfDirectory(atPath: chatsFolder.path)
+            .count(where: { $0.hasPrefix("ChatSession-") && $0.hasSuffix(".json") })
+
+        XCTAssertEqual(fileCount, 51)
+    }
+
+    func testRetentionKeepsPairsWholeAndHandlesCorruptFiles() async throws {
+        let previousLimit = UserDefaults.standard.object(forKey: "chatHistoryLimit")
+        UserDefaults.standard.set(ChatHistoryLimit.fifty.rawValue, forKey: "chatHistoryLimit")
+        defer {
+            if let previousLimit {
+                UserDefaults.standard.set(previousLimit, forKey: "chatHistoryLimit")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "chatHistoryLimit")
+            }
+        }
+
+        let fixture = try makeTemporaryWorkspace(named: "Pair Retention")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let chatsFolder = fixture.root.appendingPathComponent("Chats", isDirectory: true)
+        try FileManager.default.createDirectory(at: chatsFolder, withIntermediateDirectories: false)
+        let now = Date()
+        let pairID = UUID()
+        let pair = OracleLane.allCases.map {
+            pairSession($0, pairID: pairID, workspace: fixture.workspace, name: $0.rawValue)
+        }
+        let sessions = pair + (0 ..< 49).map {
+            ChatSession(workspaceID: fixture.workspace.id, name: "Single \($0)")
+        }
+        for (index, session) in sessions.enumerated() {
+            let fileURL = chatsFolder.appendingPathComponent("ChatSession-\(session.id.uuidString).json")
+            try JSONEncoder().encode(session).write(to: fileURL)
+            try FileManager.default.setAttributes(
+                [.modificationDate: now.addingTimeInterval(TimeInterval(-index))],
+                ofItemAtPath: fileURL.path
+            )
+        }
+        let corruptID = UUID()
+        let corruptURL = chatsFolder.appendingPathComponent("ChatSession-\(corruptID.uuidString).json")
+        try Data("not json".utf8).write(to: corruptURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-10000)],
+            ofItemAtPath: corruptURL.path
+        )
+
+        let service = ChatDataService()
+        let retained = try await service.listChatSessions(for: fixture.workspace)
+        XCTAssertEqual(retained.count, 50)
+        XCTAssertTrue(pair.allSatisfy { session in
+            retained.contains { $0.lastPathComponent == "ChatSession-\(session.id.uuidString).json" }
+        })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: corruptURL.path))
+
+        try Data("still corrupt".utf8).write(to: corruptURL)
+        let protected = try await service.listChatSessions(
+            for: fixture.workspace,
+            protectedSessionIDs: [corruptID]
+        )
+        XCTAssertTrue(protected.contains { $0.lastPathComponent == corruptURL.lastPathComponent })
+    }
+
+    func testRetentionDoesNotKeepOlderUnprotectedSingleAfterNewerPairOverflows() async throws {
+        let previousLimit = UserDefaults.standard.object(forKey: "chatHistoryLimit")
+        UserDefaults.standard.set(ChatHistoryLimit.fifty.rawValue, forKey: "chatHistoryLimit")
+        defer {
+            if let previousLimit {
+                UserDefaults.standard.set(previousLimit, forKey: "chatHistoryLimit")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "chatHistoryLimit")
+            }
+        }
+
+        let fixture = try makeTemporaryWorkspace(named: "Pair Retention Ordering")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let chatsFolder = fixture.root.appendingPathComponent("Chats", isDirectory: true)
+        try FileManager.default.createDirectory(at: chatsFolder, withIntermediateDirectories: false)
+        let now = Date()
+        let newerSingles = (0 ..< 49).map {
+            ChatSession(workspaceID: fixture.workspace.id, name: "Newer \($0)")
+        }
+        let pairID = UUID()
+        let pair = OracleLane.allCases.map {
+            pairSession($0, pairID: pairID, workspace: fixture.workspace, name: $0.rawValue)
+        }
+        let olderSingle = ChatSession(workspaceID: fixture.workspace.id, name: "Older unprotected")
+        let protectedOldest = ChatSession(workspaceID: fixture.workspace.id, name: "Oldest protected")
+        let orderedSessions = newerSingles + pair + [olderSingle, protectedOldest]
+        for (index, session) in orderedSessions.enumerated() {
+            let url = chatsFolder.appendingPathComponent("ChatSession-\(session.id.uuidString).json")
+            try JSONEncoder().encode(session).write(to: url)
+            try FileManager.default.setAttributes(
+                [.modificationDate: now.addingTimeInterval(TimeInterval(-index * 10))],
+                ofItemAtPath: url.path
+            )
+        }
+
+        let service = ChatDataService()
+        let retained = try await service.listChatSessions(
+            for: fixture.workspace,
+            protectedSessionIDs: [protectedOldest.id]
+        )
+        let retainedNames = Set(retained.map(\.lastPathComponent))
+
+        XCTAssertEqual(retained.count, 50)
+        XCTAssertTrue(retainedNames.contains("ChatSession-\(protectedOldest.id.uuidString).json"))
+        XCTAssertFalse(retainedNames.contains("ChatSession-\(olderSingle.id.uuidString).json"))
+        XCTAssertTrue(pair.allSatisfy { session in
+            !FileManager.default.fileExists(
+                atPath: chatsFolder.appendingPathComponent("ChatSession-\(session.id.uuidString).json").path
+            )
+        })
+    }
+
+    func testProtectingOnePairMemberRetainsBothMembers() async throws {
+        let previousLimit = UserDefaults.standard.object(forKey: "chatHistoryLimit")
+        UserDefaults.standard.set(ChatHistoryLimit.fifty.rawValue, forKey: "chatHistoryLimit")
+        defer {
+            if let previousLimit {
+                UserDefaults.standard.set(previousLimit, forKey: "chatHistoryLimit")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "chatHistoryLimit")
+            }
+        }
+
+        let fixture = try makeTemporaryWorkspace(named: "Protected Pair Retention")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairID = UUID()
+        let pair = OracleLane.allCases.map {
+            pairSession($0, pairID: pairID, workspace: fixture.workspace, name: $0.rawValue)
+        }
+        let urls = try await service.saveOraclePairSessions(pair, for: fixture.workspace)
+        for url in urls.values {
+            try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: url.path)
+        }
+        for index in 0 ..< 49 {
+            _ = try await service.saveChatSession(
+                ChatSession(workspaceID: fixture.workspace.id, name: "Single \(index)"),
+                for: fixture.workspace
+            )
+        }
+
+        let retained = try await service.listChatSessions(
+            for: fixture.workspace,
+            protectedSessionIDs: [pair[0].id]
+        )
+
+        XCTAssertEqual(retained.count, 51)
+        let retainedNames = Set(retained.map(\.lastPathComponent))
+        XCTAssertTrue(pair.allSatisfy { session in
+            guard let url = urls[session.id] else { return false }
+            return retainedNames.contains(url.lastPathComponent)
+        })
+    }
+
+    func testRetentionIgnoresNonRegularPathsAndDeletedIDCanBeSavedAgain() async throws {
+        let previousLimit = UserDefaults.standard.object(forKey: "chatHistoryLimit")
+        UserDefaults.standard.set(ChatHistoryLimit.fifty.rawValue, forKey: "chatHistoryLimit")
+        defer {
+            if let previousLimit {
+                UserDefaults.standard.set(previousLimit, forKey: "chatHistoryLimit")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "chatHistoryLimit")
+            }
+        }
+
+        let fixture = try makeTemporaryWorkspace(named: "Retention Best Effort")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let chatsFolder = fixture.root.appendingPathComponent("Chats", isDirectory: true)
+        try FileManager.default.createDirectory(at: chatsFolder, withIntermediateDirectories: false)
+        let now = Date()
+        for index in 0 ..< 50 {
+            let session = ChatSession(workspaceID: fixture.workspace.id, name: "Kept \(index)")
+            let url = chatsFolder.appendingPathComponent("ChatSession-\(session.id.uuidString).json")
+            try JSONEncoder().encode(session).write(to: url)
+            try FileManager.default.setAttributes(
+                [.modificationDate: now.addingTimeInterval(TimeInterval(-index))],
+                ofItemAtPath: url.path
+            )
+        }
+
+        let failed = ChatSession(workspaceID: fixture.workspace.id, name: "Failed retention delete")
+        let failedURL = chatsFolder.appendingPathComponent("ChatSession-\(failed.id.uuidString).json")
+        try FileManager.default.createDirectory(at: failedURL, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-1000)],
+            ofItemAtPath: failedURL.path
+        )
+
+        let deleted = ChatSession(workspaceID: fixture.workspace.id, name: "Successful retention delete")
+        let deletedURL = chatsFolder.appendingPathComponent("ChatSession-\(deleted.id.uuidString).json")
+        try JSONEncoder().encode(deleted).write(to: deletedURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-2000)],
+            ofItemAtPath: deletedURL.path
+        )
+
+        let service = ChatDataService()
+        let retained = try await service.listChatSessions(for: fixture.workspace)
+        XCTAssertEqual(retained.count, 50)
+        XCTAssertFalse(retained.contains { $0.lastPathComponent == failedURL.lastPathComponent })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: failedURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deletedURL.path))
+
+        try FileManager.default.removeItem(at: failedURL)
+        let savedURL = try await service.saveChatSession(failed, for: fixture.workspace)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: savedURL.path))
+    }
+
+    func testDeletedLegacySessionIDCanBeSavedAgain() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Legacy Resave")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let session = ChatSession(workspaceID: fixture.workspace.id, name: "Legacy")
+        let firstURL = try await service.saveChatSession(session, for: fixture.workspace)
+        try await service.deleteChatSessionFile(firstURL)
+
+        let secondURL = try await service.saveChatSession(session, for: fixture.workspace)
+        XCTAssertEqual(secondURL, firstURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondURL.path))
+    }
+
+    func testUnmergedLegacyJournalIsIgnored() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Legacy Journal")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        _ = try await service.saveChatSession(
+            ChatSession(workspaceID: fixture.workspace.id, name: "Existing"),
+            for: fixture.workspace
+        )
+        let chatsFolder = fixture.root.appendingPathComponent("Chats", isDirectory: true)
+        let transaction = chatsFolder.appendingPathComponent(".chat-transaction-future", isDirectory: true)
+        try FileManager.default.createDirectory(at: transaction, withIntermediateDirectories: false)
+        try JSONSerialization.data(withJSONObject: ["version": 2, "entries": []])
+            .write(to: transaction.appendingPathComponent("manifest.json"))
+
+        let saved = try await service.saveChatSession(
+            ChatSession(workspaceID: fixture.workspace.id, name: "After legacy journal"),
+            for: fixture.workspace
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: saved.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: transaction.path))
+    }
+
+    func testPairDeletionUsesCanonicalWorkspaceFiles() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Pair Delete")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let pairID = UUID()
+        let primary = pairSession(.primary, pairID: pairID, workspace: fixture.workspace, name: "Primary")
+        let secondary = pairSession(.secondary, pairID: pairID, workspace: fixture.workspace, name: "Secondary")
+        let urls = try await service.saveOraclePairSessions([primary, secondary], for: fixture.workspace)
+        let primaryURL = try XCTUnwrap(urls[primary.id])
+        let secondaryURL = try XCTUnwrap(urls[secondary.id])
+
+        try await service.deleteOraclePairSessionFiles([primary.id, secondary.id], for: fixture.workspace)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: primaryURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: secondaryURL.path))
+    }
+
     func testLegacyChatSessionEditPayloadsAreIgnoredOnDecodeAndOmittedOnEncode() throws {
         let sessionID = UUID()
         let messageID = UUID()
@@ -100,5 +521,53 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         let encodedString = String(data: encoded, encoding: .utf8) ?? ""
         XCTAssertFalse(encodedString.contains("changedFilesByMessage"), encodedString)
         XCTAssertFalse(encodedString.contains("delegateEditItemsByMessage"), encodedString)
+    }
+
+    private func pairSession(
+        _ lane: OracleLane,
+        pairID: UUID,
+        workspace: WorkspaceModel,
+        name: String
+    ) -> ChatSession {
+        ChatSession(
+            workspaceID: workspace.id,
+            oraclePairID: pairID,
+            oracleLane: lane,
+            name: name
+        )
+    }
+
+    private func makeCurrentPairTransaction(files: [URL], in chatsFolder: URL) throws -> URL {
+        let transaction = chatsFolder.appendingPathComponent(".oracle-pair-save-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: transaction, withIntermediateDirectories: false)
+        for fileURL in files {
+            try Data(contentsOf: fileURL).write(
+                to: transaction.appendingPathComponent("original-\(fileURL.lastPathComponent)")
+            )
+        }
+        let entries = try files.map { fileURL -> [String: Any] in
+            let rawID = fileURL.deletingPathExtension().lastPathComponent.dropFirst("ChatSession-".count)
+            return try [
+                "sessionID": XCTUnwrap(UUID(uuidString: String(rawID))).uuidString,
+                "originallyExisted": true
+            ]
+        }
+        try JSONSerialization.data(withJSONObject: ["entries": entries])
+            .write(to: transaction.appendingPathComponent("manifest.json"))
+        return transaction
+    }
+
+    private func makeTemporaryWorkspace(named name: String) throws -> (root: URL, workspace: WorkspaceModel) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChatHistoryJSONOnlyTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return (
+            root,
+            WorkspaceModel(
+                name: name,
+                repoPaths: [root.path],
+                customStoragePath: root
+            )
+        )
     }
 }

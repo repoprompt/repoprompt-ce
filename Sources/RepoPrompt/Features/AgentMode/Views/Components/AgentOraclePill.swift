@@ -2,7 +2,55 @@ import SwiftUI
 
 // MARK: - Oracle Pill
 
+enum AgentOraclePillPresentation: Equatable {
+    case legacySingle
+    case pairedLane(OracleLane)
+
+    var id: String {
+        switch self {
+        case .legacySingle: "legacy"
+        case let .pairedLane(lane): lane.rawValue
+        }
+    }
+
+    var lane: OracleLane {
+        switch self {
+        case .legacySingle: .primary
+        case let .pairedLane(lane): lane
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .legacySingle: "Oracle"
+        case .pairedLane(.primary): "Primary Oracle"
+        case .pairedLane(.secondary): "Secondary Oracle"
+        }
+    }
+}
+
 enum AgentOraclePillLogic {
+    static func presentations(
+        secondaryModelRaw: String?,
+        hasSecondarySession: Bool = false
+    ) -> [AgentOraclePillPresentation] {
+        let secondaryConfigured = (try? OraclePairModelSelectionPolicy.canonicalSecondaryRaw(secondaryModelRaw)) != nil
+        guard secondaryConfigured || hasSecondarySession else { return [.legacySingle] }
+        return [.pairedLane(.primary), .pairedLane(.secondary)]
+    }
+
+    static func resolvedLane(for session: ChatSession) -> OracleLane? {
+        switch (session.oraclePairID, session.oracleLane) {
+        case (nil, nil): .primary
+        case let (.some, lane?): lane
+        default: nil
+        }
+    }
+
+    static func sessions(_ sessions: [ChatSession], resolvedTo lane: OracleLane) -> [ChatSession] {
+        sessions.filter { resolvedLane(for: $0) == lane }
+    }
+
     struct ExplicitOpenRequest: Equatable {
         let generation: UInt64
         let workspaceID: UUID
@@ -45,13 +93,15 @@ enum AgentOraclePillLogic {
         for request: ExplicitOpenRequest,
         currentGeneration: UInt64,
         currentWorkspaceID: UUID?,
-        currentTabID: UUID?
+        currentTabID: UUID?,
+        expectedLane: OracleLane = .primary
     ) -> Bool {
         guard request.generation == currentGeneration,
               request.workspaceID == currentWorkspaceID,
               request.tabID == currentTabID,
               session.workspaceID == request.workspaceID,
-              session.composeTabID == request.tabID else { return false }
+              session.composeTabID == request.tabID,
+              resolvedLane(for: session) == expectedLane else { return false }
         return Self.session(matchingChatID: request.chatID, in: [session]) != nil
     }
 
@@ -160,7 +210,10 @@ enum AgentOraclePillLogic {
         {
             return currentSessionID
         }
-        return latestSession(in: sameWorkspaceEligibleSessions, streamingSessionIDs: streamingSessionIDs)?.id
+        return latestSession(
+            in: sameWorkspaceEligibleSessions,
+            streamingSessionIDs: streamingSessionIDs
+        )?.id
     }
 
     static func session(matchingChatID raw: String, in sessions: [ChatSession]) -> ChatSession? {
@@ -186,6 +239,7 @@ struct AgentOraclePill: View {
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
+    let presentation: AgentOraclePillPresentation
 
     private struct PopoverPresentation: Identifiable {
         /// Identifies the open request; bump the generation whenever the session or policy changes
@@ -203,10 +257,21 @@ struct AgentOraclePill: View {
         fontScale.preset
     }
 
-    private var eligibleTabSessions: [ChatSession] {
+    private var lane: OracleLane {
+        presentation.lane
+    }
+
+    private var sameTabLaneSessions: [ChatSession] {
         guard let tabID = currentTabID else { return [] }
-        return AgentOraclePillLogic.eligibleSessions(
-            sessions: oracleViewModel.sessions(forTabID: tabID),
+        return AgentOraclePillLogic.sessions(
+            oracleViewModel.sessions(forTabID: tabID),
+            resolvedTo: lane
+        )
+    }
+
+    private var eligibleTabSessions: [ChatSession] {
+        AgentOraclePillLogic.eligibleSessions(
+            sessions: sameTabLaneSessions,
             streamingSessionIDs: oracleViewModel.streamingSessions,
             liveMessageCount: { oracleViewModel.liveMessageCount(for: $0) },
             activeAgentSessionID: activeAgentSessionID,
@@ -228,7 +293,9 @@ struct AgentOraclePill: View {
 
     private func presentedSession(for presentation: PopoverPresentation) -> ChatSession? {
         guard let tabID = currentTabID else { return nil }
-        return oracleViewModel.sessions(forTabID: tabID).first { $0.id == presentation.sessionID }
+        return oracleViewModel.sessions(forTabID: tabID).first {
+            $0.id == presentation.sessionID && AgentOraclePillLogic.resolvedLane(for: $0) == lane
+        }
     }
 
     private func isPresentedSessionStreaming(_ presentation: PopoverPresentation) -> Bool {
@@ -236,9 +303,10 @@ struct AgentOraclePill: View {
     }
 
     private func popoverSubtitle(_ presentation: PopoverPresentation) -> String {
-        guard let session = presentedSession(for: presentation) else { return "Latest tab chat" }
+        let latestLabel = self.presentation == .legacySingle ? "Latest tab chat" : "Latest \(lane.rawValue) chat"
+        guard let session = presentedSession(for: presentation) else { return latestLabel }
         if session.id == latestTabSession?.id {
-            return "Latest tab chat"
+            return latestLabel
         }
         return session.name
     }
@@ -267,22 +335,30 @@ struct AgentOraclePill: View {
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                 .foregroundStyle(.secondary)
                         }
-                        Text("Oracle")
+                        Text(presentation.label)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
                             .foregroundStyle(isStreaming ? .primary : .secondary)
                     }
                     .padding(.horizontal, AgentPillMetrics.horizontalPadding())
                     .frame(height: AgentPillMetrics.height())
-                    .background(isStreaming ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(.ultraThinMaterial))
+                    .background(.ultraThinMaterial)
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .stroke(isStreaming ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isStreaming ? 1 : 0.5)
+                            .stroke(
+                                isStreaming ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.15),
+                                lineWidth: isStreaming ? 1 : 0.5
+                            )
                     )
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
                 .buttonStyle(.plain)
-                .hoverTooltip(isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab", .top)
+                .hoverTooltip(
+                    isStreaming
+                        ? "\(presentation.label) is thinking — click to view the live chat"
+                        : "Open the latest \(presentation.label) chat for this tab",
+                    .top
+                )
                 .animation(.easeInOut(duration: 0.2), value: isStreaming)
             } else {
                 Color.clear.frame(width: 0, height: 0)
@@ -301,7 +377,8 @@ struct AgentOraclePill: View {
                 )
                 return
             }
-            guard let route = AgentOracleLatestPopoverRoute(notificationUserInfo: note.userInfo),
+            guard presentation != .pairedLane(.secondary),
+                  let route = AgentOracleLatestPopoverRoute(notificationUserInfo: note.userInfo),
                   route.windowID == windowID,
                   route.tabID == currentTabID,
                   route.workspaceID == oracleViewModel.workspaceManager.activeWorkspaceID
@@ -343,7 +420,7 @@ struct AgentOraclePill: View {
         let transcriptMaxHeight = fontPreset.scaledClamped(600, max: 780)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Text("Oracle")
+                Text(self.presentation.label)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
                 if isPresentedSessionStreaming(presentation) {
                     ProgressView()
@@ -375,7 +452,7 @@ struct AgentOraclePill: View {
 
     private func reconcilePresentedSession() {
         guard let presentation = presentedPopover else { return }
-        let sameTabSessions = currentTabID.map { oracleViewModel.sessions(forTabID: $0) } ?? []
+        let sameTabSessions = sameTabLaneSessions
         let resolvedID = AgentOraclePillLogic.reconciledPresentedSessionID(
             currentSessionID: presentation.sessionID,
             isExplicit: presentation.isExplicit,
@@ -431,14 +508,13 @@ struct AgentOraclePill: View {
         workspaceID: UUID? = nil,
         presentation: AgentOraclePopoverPresentation = .standard
     ) {
-        guard let tabID = currentTabID else { return }
         openRequestGeneration &+= 1
         let generation = openRequestGeneration
 
         guard let chatID else {
-            guard let target = latestTabSession else { return }
+            guard let latestTabSession else { return }
             present(
-                sessionID: target.id,
+                sessionID: latestTabSession.id,
                 isExplicit: false,
                 actionPolicy: .standard,
                 generation: generation
@@ -446,6 +522,7 @@ struct AgentOraclePill: View {
             return
         }
 
+        guard let tabID = currentTabID else { return }
         presentedPopover = nil
         guard let workspaceID,
               let request = AgentOraclePillLogic.explicitOpenRequest(
@@ -467,7 +544,8 @@ struct AgentOraclePill: View {
                     for: request,
                     currentGeneration: openRequestGeneration,
                     currentWorkspaceID: oracleViewModel.workspaceManager.activeWorkspaceID,
-                    currentTabID: currentTabID
+                    currentTabID: currentTabID,
+                    expectedLane: lane
                 )
             else { return }
 

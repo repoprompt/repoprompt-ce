@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import enum MCP.Value
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift
@@ -97,6 +98,19 @@ enum ContextBuilderFollowUpType: String, CaseIterable, Codable {
         case .review: "Review"
         case .question: "Answer"
         }
+    }
+}
+
+struct ContextBuilderSupersededFollowUpDrain {
+    let task: Task<Void, Never>
+    let completion: AsyncStream<Void>
+}
+
+private struct ContextBuilderSupersededFollowUpDrainTimeout: LocalizedError {
+    let timeout: TimeInterval
+
+    var errorDescription: String? {
+        "Previous Oracle follow-up did not stop within \(timeout.formatted(.number.precision(.fractionLength(1))))s; no replacement was started."
     }
 }
 
@@ -309,11 +323,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         // MARK: - Background Plan Generation (per-tab tracking)
 
-        /// Task handle for this tab's background plan generation
+        /// Task handle for this tab's background plan generation.
         var backgroundPlanTask: Task<Void, Never>?
+        /// Retained cancellation/join work that must finish before a replacement starts.
+        var supersededFollowUpDrain: ContextBuilderSupersededFollowUpDrain?
+        /// Monotonic owner for runtime callbacks and completion publication.
+        var backgroundPlanGeneration: UInt64 = 0
 
-        /// Live Oracle chat session used by MCP follow-up streaming.
-        var followUpOracleSessionID: UUID?
+        /// The two live Oracle lanes used by follow-up streaming.
+        var followUpPrimarySessionID: UUID?
+        var followUpSecondarySessionID: UUID?
 
         /// Per-tab auto-generate plan setting (loaded from tab config)
         var autoGeneratePlan: Bool = false
@@ -395,7 +414,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpControlToken = nil
             mcpWorkspaceID = nil
             mcpPlanningModelRaw = nil
-            followUpOracleSessionID = nil
+            supersededFollowUpDrain = nil
+            backgroundPlanGeneration = 0
+            followUpPrimarySessionID = nil
+            followUpSecondarySessionID = nil
             pendingAskUser = nil
             askUserContinuation = nil
             pendingAskUserRunID = nil
@@ -442,7 +464,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 _ mode: HeadlessMode,
                 _ prompt: String,
                 _ selection: StoredSelection
-            ) async throws -> ChatSendReply
+            ) async throws -> OracleSendResult
+            typealias ToolChatSend = @MainActor @Sendable (
+                _ args: [String: Value],
+                _ promptVM: PromptViewModel,
+                _ tabContext: OracleViewModel.OracleSendTabContext,
+                _ primaryModelSelection: OracleViewModel.ModelSelectionResult,
+                _ liveCallbacks: OracleViewModel.OracleSendLiveCallbacks
+            ) async throws -> OracleSendResult
 
             let beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?
             let providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?
@@ -460,6 +489,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 _ runID: UUID,
                 _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
             ) async -> Void)?
+            let cancelFollowUpOracleSession: (@MainActor @Sendable (UUID) async -> Void)?
+            let toolChatSend: ToolChatSend?
+            let supersededDrainTimeout: TimeInterval?
 
             init(
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
@@ -475,7 +507,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 afterCommittedTabSnapshotCaptured: (@MainActor @Sendable (
                     _ runID: UUID,
                     _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
-                ) async -> Void)? = nil
+                ) async -> Void)? = nil,
+                cancelFollowUpOracleSession: (@MainActor @Sendable (UUID) async -> Void)? = nil,
+                toolChatSend: ToolChatSend? = nil,
+                supersededDrainTimeout: TimeInterval? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
                 self.providerEventDisposition = providerEventDisposition
@@ -486,6 +521,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.validateContextBuilderProviders = validateContextBuilderProviders
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
                 self.afterCommittedTabSnapshotCaptured = afterCommittedTabSnapshotCaptured
+                self.cancelFollowUpOracleSession = cancelFollowUpOracleSession
+                self.toolChatSend = toolChatSend
+                self.supersededDrainTimeout = supersededDrainTimeout
             }
         }
 
@@ -1502,16 +1540,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         for session in sessions.values where !session.isMCPControlledRun {
             cancelPendingQuestion(for: session)
-            session.backgroundPlanTask?.cancel()
-            session.backgroundPlanTask = nil
-            if let oracleVM = oracleViewModel,
-               let followUpSessionID = session.followUpOracleSessionID
-            {
-                Task { @MainActor in
-                    await oracleVM.cancelStreaming(in: followUpSessionID)
-                }
-            }
-            session.followUpOracleSessionID = nil
+            _ = supersedeBackgroundPlanGeneration(for: session, using: oracleViewModel)
         }
         sessions = sessions.filter(\.value.isMCPControlledRun)
         lastProcessedTabID = nil
@@ -1561,16 +1590,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             // 1. Cancel any pending clarifying question
             cancelPendingQuestion(for: session)
 
-            // 2. Cancel background plan generation for this tab
-            if session.isBackgroundPlanGenerating {
+            // 2. Cancel background plan generation for this tab.
+            if session.isBackgroundPlanGenerating || session.backgroundPlanTask != nil || session.supersededFollowUpDrain != nil {
                 debugLog("handleComposeTabsWillClose: cancelling background plan for tab \(tabID)")
-                session.backgroundPlanTask?.cancel()
-                session.backgroundPlanTask = nil
+                _ = supersedeBackgroundPlanGeneration(for: session, using: oracleViewModel)
                 session.isBackgroundPlanGenerating = false
-                if let followUpSessionID = session.followUpOracleSessionID {
-                    await oracleViewModel?.cancelStreaming(in: followUpSessionID)
-                }
-                session.followUpOracleSessionID = nil
             }
 
             // 3. Logically cancel every registered run for the tab without waiting for teardown.
@@ -3072,13 +3096,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let session = sessions[tabID] else { continue }
 
             if session.isBackgroundPlanGenerating {
-                session.backgroundPlanTask?.cancel()
-                session.backgroundPlanTask = nil
+                _ = supersedeBackgroundPlanGeneration(for: session, using: oracleViewModel)
                 session.isBackgroundPlanGenerating = false
-                if let followUpSessionID = session.followUpOracleSessionID {
-                    await oracleViewModel?.cancelStreaming(in: followUpSessionID)
-                }
-                session.followUpOracleSessionID = nil
                 updateRuntimeBindings(from: session)
             }
 
@@ -4217,9 +4236,211 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func chatNameForTab(_ tabID: UUID) -> String {
         let tabName = workspaceManager?.composeTab(with: tabID)?.name
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let workspaceName = workspaceManager?.activeWorkspace?.name ?? "Workspace"
+        let routedWorkspaceID = workspaceManager?.bindingCandidate(forContextID: tabID)?.workspaceID
+        let workspaceName = workspaceManager?.workspaces.first(where: { $0.id == routedWorkspaceID })?.name ?? "Workspace"
         let defaultName = "Plan – \(workspaceName)"
         return (tabName?.isEmpty == false) ? tabName! : defaultName
+    }
+
+    @MainActor
+    private func takeFollowUpOracleSessionIDs(from session: TabSession) -> [UUID] {
+        let ids = [session.followUpPrimarySessionID, session.followUpSecondarySessionID]
+            .compactMap(\.self)
+            .reduce(into: [UUID]()) { result, id in
+                if !result.contains(id) { result.append(id) }
+            }
+        session.followUpPrimarySessionID = nil
+        session.followUpSecondarySessionID = nil
+        return ids
+    }
+
+    @MainActor
+    private func cancelFollowUpOracleSessions(
+        _ sessionIDs: [UUID],
+        using oracleViewModel: OracleViewModel?
+    ) async {
+        for sessionID in sessionIDs {
+            #if DEBUG
+                if let cancel = runTestHooks?.cancelFollowUpOracleSession {
+                    await cancel(sessionID)
+                    continue
+                }
+            #endif
+            await oracleViewModel?.cancelStreaming(in: sessionID)
+        }
+    }
+
+    @MainActor
+    private func scheduleSupersededFollowUpDrain(
+        for session: TabSession,
+        supersededTask: Task<Void, Never>?,
+        sessionIDs: [UUID],
+        using oracleViewModel: OracleViewModel?
+    ) -> ContextBuilderSupersededFollowUpDrain? {
+        let previous = session.supersededFollowUpDrain
+        guard supersededTask != nil || !sessionIDs.isEmpty else { return previous }
+
+        let tabID = session.tabID
+        let generation = session.backgroundPlanGeneration
+        let (completion, continuation) = AsyncStream<Void>.makeStream()
+        let task = Task { @MainActor [weak self, weak session, oracleViewModel] in
+            defer { continuation.finish() }
+            _ = await previous?.task.value
+            if let self {
+                await cancelFollowUpOracleSessions(sessionIDs, using: oracleViewModel)
+            } else {
+                for sessionID in sessionIDs {
+                    await oracleViewModel?.cancelStreaming(in: sessionID)
+                }
+            }
+            _ = await supersededTask?.value
+            if let self, let session,
+               sessions[tabID] === session,
+               session.backgroundPlanGeneration == generation
+            {
+                session.supersededFollowUpDrain = nil
+            }
+        }
+        let drain = ContextBuilderSupersededFollowUpDrain(task: task, completion: completion)
+        session.supersededFollowUpDrain = drain
+        return drain
+    }
+
+    @MainActor
+    private func awaitSupersededFollowUpDrain(
+        _ drain: ContextBuilderSupersededFollowUpDrain?
+    ) async throws {
+        guard let drain else { return }
+        let timeout: TimeInterval = {
+            #if DEBUG
+                if let override = runTestHooks?.supersededDrainTimeout { return override }
+            #endif
+            return 30
+        }()
+        let finished = try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in drain.completion {}
+                try Task.checkCancellation()
+                return true
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeout))
+                return false
+            }
+            let first = try await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        guard finished else {
+            throw ContextBuilderSupersededFollowUpDrainTimeout(timeout: timeout)
+        }
+    }
+
+    @MainActor
+    private func supersedeBackgroundPlanGeneration(
+        for session: TabSession,
+        using oracleViewModel: OracleViewModel?
+    ) -> ContextBuilderSupersededFollowUpDrain? {
+        session.backgroundPlanGeneration &+= 1
+        let sessionIDs = takeFollowUpOracleSessionIDs(from: session)
+        let supersededTask = session.backgroundPlanTask
+        session.backgroundPlanTask = nil
+        supersededTask?.cancel()
+        return scheduleSupersededFollowUpDrain(
+            for: session,
+            supersededTask: supersededTask,
+            sessionIDs: sessionIDs,
+            using: oracleViewModel
+        )
+    }
+
+    @MainActor
+    private func beginBackgroundPlanGeneration(
+        for session: TabSession,
+        using oracleViewModel: OracleViewModel?
+    ) -> (generation: UInt64, drain: ContextBuilderSupersededFollowUpDrain?) {
+        let drain = supersedeBackgroundPlanGeneration(for: session, using: oracleViewModel)
+        session.generatedAnswerRoute = nil
+        session.isBackgroundPlanGenerating = true
+        session.backgroundPlanError = nil
+        session.backgroundPlanResponseText = nil
+        session.backgroundPlanReasoningText = nil
+        clearPendingBackgroundPlanUIRefresh(for: session.tabID)
+        applyPlanPreview(to: session)
+        updateRuntimeBindings(from: session)
+        return (session.backgroundPlanGeneration, drain)
+    }
+
+    @MainActor
+    private func publishFollowUpOracleSessions(
+        primary: UUID,
+        secondary: UUID?,
+        workspaceID: UUID,
+        oracleViewModel: OracleViewModel,
+        session: TabSession,
+        generation: UInt64
+    ) throws {
+        guard session.backgroundPlanGeneration == generation else { throw CancellationError() }
+        session.followUpPrimarySessionID = primary
+        session.followUpSecondarySessionID = secondary
+        let primaryChatID = oracleViewModel.sessions.first(where: { $0.id == primary })?.shortID
+            ?? primary.uuidString
+        session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: workspaceID,
+            tabID: session.tabID,
+            chatID: primaryChatID
+        )
+        updateRuntimeBindings(from: session)
+    }
+
+    @MainActor
+    private func publishPrimaryProgress(
+        text: String,
+        reasoning: String?,
+        session: TabSession,
+        generation: UInt64
+    ) {
+        guard session.backgroundPlanGeneration == generation,
+              session.isBackgroundPlanGenerating else { return }
+        session.backgroundPlanResponseText = text
+        session.backgroundPlanReasoningText = reasoning
+        applyPlanPreview(to: session)
+        requestBackgroundPlanUIRefresh(for: session.tabID)
+    }
+
+    @MainActor
+    private func publishFollowUpCompletion(
+        _ reply: ChatSendReply,
+        workspaceID: UUID,
+        session: TabSession,
+        generation: UInt64
+    ) throws {
+        guard session.backgroundPlanGeneration == generation else { throw CancellationError() }
+        session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: workspaceID,
+            tabID: session.tabID,
+            chatID: reply.shortId
+        )
+        session.backgroundPlanResponseText = reply.response
+        session.backgroundPlanError = nil
+        session.isBackgroundPlanGenerating = false
+        session.followUpPrimarySessionID = nil
+        session.followUpSecondarySessionID = nil
+        clearPendingBackgroundPlanUIRefresh(for: session.tabID)
+        applyPlanPreview(to: session)
+        updateRuntimeBindings(from: session)
+    }
+
+    @MainActor
+    private func resetBackgroundPlanPresentation(for session: TabSession) {
+        session.isBackgroundPlanGenerating = false
+        session.backgroundPlanError = nil
+        session.backgroundPlanResponseText = nil
+        session.backgroundPlanReasoningText = nil
+        session.generatedAnswerRoute = nil
+        clearPendingBackgroundPlanUIRefresh(for: session.tabID)
+        applyPlanPreview(to: session)
+        updateRuntimeBindings(from: session)
     }
 
     /// Called when a tab's discovery run completes successfully.
@@ -4288,63 +4509,45 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         chatName: String = "Plan",
         mode: HeadlessMode = .plan
     ) {
-        // Session must exist - caller ensures tab is valid
         let session = session(for: tabID)
-        guard let originWorkspaceID = workspaceID(containing: tabID) else {
+        guard let workspaceID = workspaceID(containing: tabID) else {
             session.backgroundPlanError = ContextBuilderGenerationError.missingWorkspace.errorDescription
             updateRuntimeBindings(from: session)
             return
         }
-
-        // Cancel any existing background plan task for THIS tab only
-        session.backgroundPlanTask?.cancel()
-
-        session.generatedAnswerRoute = nil
-        session.isBackgroundPlanGenerating = true
-        session.backgroundPlanError = nil
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        clearPendingBackgroundPlanUIRefresh(for: tabID)
-        applyPlanPreview(to: session)
-        updateRuntimeBindings(from: session)
+        let continuationChatID = session.generatedAnswerRoute.flatMap { route in
+            route.workspaceID == workspaceID && route.tabID == tabID ? route.chatID : nil
+        }
+        let start = beginBackgroundPlanGeneration(for: session, using: oracleViewModel)
 
         session.backgroundPlanTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            guard let session = sessions[tabID] else { return }
-
             do {
-                let reply = try await generatePlanFromDiscovery(
+                try await awaitSupersededFollowUpDrain(start.drain)
+                try Task.checkCancellation()
+                guard let session = sessions[tabID],
+                      session.backgroundPlanGeneration == start.generation else { return }
+                _ = try await generatePlanFromDiscovery(
                     tabID: tabID,
-                    originWorkspaceID: originWorkspaceID,
+                    originWorkspaceID: workspaceID,
                     oracleViewModel: oracleViewModel,
                     chatName: chatName,
-                    mode: mode
+                    mode: mode,
+                    continuationChatID: continuationChatID,
+                    generation: start.generation
                 )
-                // generatedAnswerRoute is set inside generatePlanFromDiscovery
-                session.isBackgroundPlanGenerating = false
-                if let response = reply.response, !response.isEmpty {
-                    session.backgroundPlanResponseText = response
-                }
-                clearPendingBackgroundPlanUIRefresh(for: tabID)
-                applyPlanPreview(to: session)
-                updateRuntimeBindings(from: session)
             } catch {
-                // Treat both outer Task cancellation and stream CancellationError as "user cancelled".
-                if Task.isCancelled || (error is CancellationError) {
-                    session.backgroundPlanResponseText = nil
-                    session.backgroundPlanReasoningText = nil
-                    session.backgroundPlanError = nil
-                } else {
-                    session.backgroundPlanError = error.asFriendlyString()
-                }
+                guard let session = sessions[tabID],
+                      session.backgroundPlanGeneration == start.generation else { return }
                 session.isBackgroundPlanGenerating = false
+                session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
                 clearPendingBackgroundPlanUIRefresh(for: tabID)
                 applyPlanPreview(to: session)
                 updateRuntimeBindings(from: session)
             }
-
-            // Clear task reference when this run ends for any reason
-            session.backgroundPlanTask = nil
+            if let session = sessions[tabID], session.backgroundPlanGeneration == start.generation {
+                session.backgroundPlanTask = nil
+            }
         }
     }
 
@@ -4354,30 +4557,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func cancelBackgroundPlanGeneration(forTabID tabID: UUID? = nil) {
         let targetTabID = tabID ?? currentTabID
         guard let targetTabID, let session = sessions[targetTabID] else { return }
-
-        // 1) Cancel the underlying follow-up stream in OracleViewModel
-        if let oracleVM = oracleViewModel {
-            if let followUpSessionID = session.followUpOracleSessionID {
-                Task { @MainActor in
-                    await oracleVM.cancelStreaming(in: followUpSessionID)
-                }
-            }
-        }
-
-        // 2) Cancel the wrapper task (so outer await stack unwinds)
-        session.backgroundPlanTask?.cancel()
-        session.backgroundPlanTask = nil
-
-        // 3) Reset UI state on the tab
-        session.isBackgroundPlanGenerating = false
-        session.backgroundPlanError = nil
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        session.generatedAnswerRoute = nil
-        session.followUpOracleSessionID = nil
-        clearPendingBackgroundPlanUIRefresh(for: targetTabID)
-        applyPlanPreview(to: session)
-        updateRuntimeBindings(from: session)
+        _ = supersedeBackgroundPlanGeneration(for: session, using: oracleViewModel)
+        resetBackgroundPlanPresentation(for: session)
     }
 
     /// Clear background plan state for a specific tab (e.g., when starting a new discovery run).
@@ -4485,241 +4666,247 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     // MARK: - MCP Plan/Question Generation
 
-    private func promptMode(for mode: HeadlessMode) -> PromptViewModel.PlanActMode {
-        switch mode {
-        case .plan:
-            .plan
-        case .review:
-            .review
-        case .chat:
-            .chat
-        }
-    }
-
-    private func waitForFollowUpFinalization(
-        in oracleViewModel: OracleViewModel,
-        queryID: UUID,
-        sessionID: UUID,
-        progressReporter: ContextBuilderMCPProgressReporter?,
-        activityReporter: ContextBuilderMCPActivityReporter?
-    ) async throws -> String {
-        let (activityEvents, activityContinuation) = AsyncStream<OracleMessageLifecycleActivityEvent>.makeStream(
-            bufferingPolicy: .bufferingNewest(32)
-        )
-        let observerID = oracleViewModel.addMessageLifecycleActivityObserver(for: queryID) { event in
-            activityContinuation.yield(event)
-        }
-        defer {
-            oracleViewModel.removeMessageLifecycleActivityObserver(for: queryID, observerID: observerID)
-            activityContinuation.finish()
-        }
-
-        return try await ContextBuilderFollowUpFinalizationMonitor.wait(
-            activityEvents: activityEvents,
-            waitForFinalization: {
-                try await oracleViewModel.waitForContextBuilderCompletion(queryID)
-            },
-            cancelStreaming: {
-                await oracleViewModel.cancelStreaming(in: sessionID)
-            },
-            reportPhase: { phase in
-                await progressReporter?(phase)
-            },
-            reportActivity: { phase, message in
-                await activityReporter?(phase, message)
-            }
-        )
-    }
-
-    /// Unified follow-up generator that always streams in a real chat session.
-    /// Used by both MCP-triggered follow-ups and UI auto-generate follow-ups.
+    /// Streams ordinary follow-ups through the single-or-paired Oracle runtime without activating chat UI.
     @MainActor
     private func runFollowUpOracleStream(
         for tabID: UUID,
-        originWorkspaceID: UUID,
+        workspaceID: UUID,
         oracleViewModel: OracleViewModel,
         mode: HeadlessMode,
         prompt: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
         reviewGitContext: FrozenPromptGitReviewContext,
-        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         chatName: String,
-        model: AIModel,
-        chatPresetID: UUID?,
-        mcpSessionUIState: OracleViewModel.MCPSessionUIState? = nil,
-        gitScopeOverride: GitInclusion? = nil,
+        primaryModelSelection: OracleViewModel.ModelSelectionResult,
+        secondaryModelOverride: AIModel? = nil,
+        prebuiltAIMessage: AIMessage? = nil,
+        continuationChatID: String? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
-        activityReporter: ContextBuilderMCPActivityReporter? = nil
-    ) async throws -> ChatSendReply {
+        activityReporter: ContextBuilderMCPActivityReporter? = nil,
+        generation: UInt64
+    ) async throws -> OracleSendResult {
         let session = session(for: tabID)
+        guard session.backgroundPlanGeneration == generation,
+              session.isBackgroundPlanGenerating else { throw CancellationError() }
 
-        // Set initial UI state
-        session.generatedAnswerRoute = nil
-        session.isBackgroundPlanGenerating = true
-        session.backgroundPlanError = nil
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        session.followUpOracleSessionID = nil
-        updateRuntimeBindings(from: session)
-
-        let modeName = mode.mcpModeName
-        let promptMode = promptMode(for: mode)
-
-        let isFocusedTab = (promptManager.activeComposeTabID == tabID)
-        let activeSessionID = oracleViewModel.workspaceManager.activeChatSessionID(forTabID: tabID) ?? oracleViewModel.currentSessionID
-        let isUserStreaming = oracleViewModel.isSessionStreaming(activeSessionID)
-        let shouldActivate = isFocusedTab && !isUserStreaming
-
-        var createdSessionID: UUID?
-        do {
-            try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
-                throw CancellationError()
+        var pinnedSessionIDs: Set<UUID> = []
+        defer {
+            for sessionID in pinnedSessionIDs {
+                oracleViewModel.unpinSession(sessionID)
             }
+        }
 
-            await progressReporter?(.payloadPackaging)
-            let aiMessage = try await promptManager.buildHeadlessAIMessage(
-                from: HeadlessContextSnapshot(
-                    tabID: tabID,
-                    promptText: prompt,
-                    selection: selection,
-                    lookupContext: lookupContext,
-                    reviewGitContext: reviewGitContext,
-                    finalReviewAuthorization: finalReviewAuthorization
-                ),
-                model: model,
-                mode: mode,
-                gitScopeOverride: mode == .review ? gitScopeOverride : nil
-            )
-
-            try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
-                throw CancellationError()
+        func pin(_ sessionID: UUID) {
+            if pinnedSessionIDs.insert(sessionID).inserted {
+                oracleViewModel.pinSession(sessionID)
             }
+        }
 
+        var isPaired = false
+        var terminalLanes: Set<OracleLane> = []
+        var laneActivityTail: Task<Void, Never>?
+        let reportStreamingPhases: @MainActor @Sendable () async -> Void = {
             await progressReporter?(.sessionCreationAndPersist)
-            let createdSession = try await oracleViewModel.createSession(
-                named: chatName,
-                tabID: tabID,
-                activateInUI: shouldActivate,
-                setActiveForTab: true,
-                agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
-            )
-            createdSessionID = createdSession.id
-            oracleViewModel.pinSession(createdSession.id)
-            defer { oracleViewModel.unpinSession(createdSession.id) }
-            session.followUpOracleSessionID = createdSession.id
-            session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-                workspaceID: originWorkspaceID,
-                tabID: tabID,
-                chatID: createdSession.shortID
-            )
-            updateRuntimeBindings(from: session)
-
-            try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
-                throw CancellationError()
-            }
-
-            if let mcpSessionUIState {
-                oracleViewModel.setMCPSessionUIState(mcpSessionUIState, for: createdSession.id)
-            } else {
-                oracleViewModel.clearMCPSessionUIState(for: createdSession.id)
-            }
-
-            try Task.checkCancellation()
-            guard session.isBackgroundPlanGenerating else {
-                throw CancellationError()
-            }
-
             await progressReporter?(.messageSend)
-            guard let queryId = await oracleViewModel.sendMessage(
-                prompt,
-                sessionID: createdSession.id,
-                overrideModel: model,
-                overrideChatPresetID: chatPresetID,
-                overrideMode: promptMode,
-                gitInclusionOverride: mode == .review ? gitScopeOverride : nil,
-                selectionOverride: selection,
-                lookupContextOverride: lookupContext,
-                overrideAIMessage: aiMessage,
-                completionPolicy: .contextBuilderStrict,
-                onProgress: { [weak self] text, reasoning in
-                    guard let self,
-                          let session = sessions[tabID],
-                          session.isBackgroundPlanGenerating else { return }
-                    session.backgroundPlanResponseText = text
-                    session.backgroundPlanReasoningText = reasoning
-                    applyPlanPreview(to: session)
-                    requestBackgroundPlanUIRefresh(for: tabID)
-                    onProgress?(text, reasoning)
-                }
-            ) else {
-                throw ChatToolError.internalError("Failed to start follow-up stream")
-            }
-
-            guard session.isBackgroundPlanGenerating else {
-                throw CancellationError()
-            }
             await progressReporter?(.activeQueryAcquisition)
             await progressReporter?(.streaming)
-            let responseText = try await waitForFollowUpFinalization(
-                in: oracleViewModel,
-                queryID: queryId,
-                sessionID: createdSession.id,
-                progressReporter: progressReporter,
-                activityReporter: activityReporter
-            )
-            guard session.isBackgroundPlanGenerating else {
-                throw CancellationError()
+        }
+        let reportLaneLifecycle: @MainActor @Sendable (
+            OracleLane,
+            OracleMessageLifecycleActivityEvent
+        ) -> Void = { lane, event in
+            guard isPaired else { return }
+            let label = lane == .primary ? "Primary Oracle" : "Secondary Oracle"
+            let phase: ContextBuilderMCPProgressPhase
+            let message: String
+            switch event.kind {
+            case .streamActivity:
+                guard !terminalLanes.contains(lane) else { return }
+                phase = .streaming
+                message = "Still in \(label) response streaming"
+            case .finalizationCompleted:
+                guard terminalLanes.insert(lane).inserted else { return }
+                phase = .messageFinalization
+                message = "\(label) message finalization completed"
+            case .streamFailed:
+                guard terminalLanes.insert(lane).inserted else { return }
+                phase = .streaming
+                message = "\(label) stream failed"
+            case .streamCancelled:
+                guard terminalLanes.insert(lane).inserted else { return }
+                phase = .streaming
+                message = "\(label) stream cancelled"
+            case .streamInactivityWatchdogFired:
+                guard terminalLanes.insert(lane).inserted else { return }
+                phase = .streaming
+                message = "\(label) stream inactivity watchdog fired"
+            default:
+                return
             }
-
-            let reply = ChatSendReply(
-                chatId: createdSession.id,
-                shortId: createdSession.shortID,
-                mode: modeName,
-                response: responseText,
-                errors: nil
-            )
-
-            session.isBackgroundPlanGenerating = false
-            session.followUpOracleSessionID = nil
-            session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-                workspaceID: originWorkspaceID,
-                tabID: tabID,
-                chatID: reply.shortId
-            )
-            if let response = reply.response, !response.isEmpty {
-                session.backgroundPlanResponseText = response
+            let previous = laneActivityTail
+            laneActivityTail = Task { @MainActor in
+                await previous?.value
+                await activityReporter?(.report(phase: phase, message: message))
             }
-            clearPendingBackgroundPlanUIRefresh(for: tabID)
-            applyPlanPreview(to: session)
-            updateRuntimeBindings(from: session)
-            workspaceManager?.setActiveChatSessionID(reply.chatId, forTabID: tabID)
+        }
+        let callbacks = OracleViewModel.OracleSendLiveCallbacks(
+            modelsResolved: { [weak self] primary, secondary in
+                guard let self,
+                      let session = sessions[tabID],
+                      session.backgroundPlanGeneration == generation
+                else { return }
+                session.mcpPlanModel = if let secondary {
+                    "\(primary.displayName) + \(secondary.displayName)"
+                } else {
+                    primary.displayName
+                }
+                updateRuntimeBindings(from: session)
+            },
+            pairSessionsResolved: { [weak self] primary, secondary in
+                guard let self, let session = sessions[tabID] else { throw CancellationError() }
+                isPaired = true
+                pin(primary)
+                pin(secondary)
+                try publishFollowUpOracleSessions(
+                    primary: primary,
+                    secondary: secondary,
+                    workspaceID: workspaceID,
+                    oracleViewModel: oracleViewModel,
+                    session: session,
+                    generation: generation
+                )
+                await activityReporter?(.suppressHeartbeat(phase: .streaming))
+                await reportStreamingPhases()
+            },
+            primarySessionResolved: { [weak self] primary in
+                guard let self, let session = sessions[tabID] else { throw CancellationError() }
+                pin(primary)
+                try publishFollowUpOracleSessions(
+                    primary: primary,
+                    secondary: nil,
+                    workspaceID: workspaceID,
+                    oracleViewModel: oracleViewModel,
+                    session: session,
+                    generation: generation
+                )
+                await reportStreamingPhases()
+                await activityReporter?(.report(
+                    phase: .streaming,
+                    message: "Oracle response streaming"
+                ))
+            },
+            primaryProgress: { [weak self] text, reasoning in
+                guard let self, let session = sessions[tabID] else { return }
+                publishPrimaryProgress(text: text, reasoning: reasoning, session: session, generation: generation)
+                onProgress?(text, reasoning)
+            },
+            laneLifecycle: reportLaneLifecycle
+        )
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: tabID,
+            sourceWorkspaceID: workspaceID,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: agentModeSessionID,
+            sourceAgentRunID: agentModeRunID,
+            promptText: prompt,
+            selection: selection,
+            lookupContext: lookupContext,
+            reviewGitContext: reviewGitContext,
+            prebuiltAIMessage: prebuiltAIMessage,
+            provenance: .direct
+        )
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            origin: .compatibility,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            activationPolicy: .background,
+            completionPolicy: .contextBuilderStrict,
+            packaging: packaging
+        )
+        var args: [String: Value] = [
+            "message": .string(prompt),
+            "mode": .string(mode.mcpModeName),
+            "chat_name": .string(chatName)
+        ]
+        if let continuationChatID {
+            args["chat_id"] = .string(continuationChatID)
+            args["new_chat"] = .bool(false)
+        } else {
+            args["new_chat"] = .bool(true)
+        }
 
-            return reply
+        func dispatch(_ args: [String: Value]) async throws -> OracleSendResult {
+            #if DEBUG
+                if let send = runTestHooks?.toolChatSend {
+                    return try await send(args, promptManager, tabContext, primaryModelSelection, callbacks)
+                }
+            #endif
+            return try await oracleViewModel.sendOracle(
+                args: args,
+                promptVM: promptManager,
+                tabContext: tabContext,
+                primaryModelSelection: primaryModelSelection,
+                secondaryModelOverride: secondaryModelOverride,
+                liveCallbacks: callbacks
+            )
+        }
+
+        do {
+            let result: OracleSendResult
+            do {
+                result = try await dispatch(args)
+            } catch let error as ChatToolError where continuationChatID != nil &&
+                session.followUpPrimarySessionID == nil &&
+                session.backgroundPlanGeneration == generation &&
+                [.notFound, .invalidParams, .conflict].contains(error.code)
+            {
+                session.generatedAnswerRoute = nil
+                var freshArgs = args
+                freshArgs.removeValue(forKey: "chat_id")
+                freshArgs["new_chat"] = .bool(true)
+                result = try await dispatch(freshArgs)
+            }
+            guard let primarySessionID = session.followUpPrimarySessionID else {
+                throw ChatToolError.internalError("Oracle runtime did not publish a Primary session")
+            }
+            let reply: ChatSendReply = switch result.payload {
+            case let .single(reply): reply
+            case let .paired(pair): pair.primaryReply(fallbackSessionID: primarySessionID)
+            }
+            await laneActivityTail?.value
+            await progressReporter?(.messageFinalization)
+            if !isPaired {
+                await activityReporter?(.report(
+                    phase: .messageFinalization,
+                    message: "Oracle message finalization completed"
+                ))
+            }
+            try publishFollowUpCompletion(reply, workspaceID: workspaceID, session: session, generation: generation)
+            return result
         } catch {
-            if let createdSessionID {
-                await oracleViewModel.cancelStreaming(in: createdSessionID)
-            }
-
+            await laneActivityTail?.value
+            guard session.backgroundPlanGeneration == generation else { throw error }
+            let sessionIDs = takeFollowUpOracleSessionIDs(from: session)
+            _ = scheduleSupersededFollowUpDrain(
+                for: session,
+                supersededTask: nil,
+                sessionIDs: sessionIDs,
+                using: oracleViewModel
+            )
+            session.isBackgroundPlanGenerating = false
+            session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+            session.backgroundPlanResponseText = nil
+            session.backgroundPlanReasoningText = nil
             if error is CancellationError {
-                session.backgroundPlanResponseText = nil
-                session.backgroundPlanReasoningText = nil
                 session.generatedAnswerRoute = nil
                 session.backgroundPlanError = nil
-            } else {
-                session.backgroundPlanResponseText = nil
-                session.backgroundPlanReasoningText = nil
-                session.backgroundPlanError = error.asFriendlyString()
             }
-            session.isBackgroundPlanGenerating = false
-            session.followUpOracleSessionID = nil
             clearPendingBackgroundPlanUIRefresh(for: tabID)
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
@@ -4728,16 +4915,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     /// Run plan or question generation for MCP context_builder.
-    /// This method encapsulates all UI state management for MCP-triggered plan/question generation,
-    /// including cancellation wiring, progress updates, and cleanup.
-    ///
-    /// - Parameters:
-    ///   - tabID: The tab to generate for
-    ///   - oracleViewModel: The OracleViewModel to use for follow-up generation
-    ///   - mode: `.plan`, `.chat` (question), or `.review`
-    ///   - prompt: The effective prompt text (already computed by caller)
-    ///   - selection: The file selection (already computed by caller)
-    /// - Returns: The chat reply with chat_id for follow-up
     @MainActor
     func runMCPPlanOrQuestion(
         for identity: WorkspaceSelectionIdentity,
@@ -4753,124 +4930,223 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         gitScopeOverride: GitInclusion? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         activityReporter: ContextBuilderMCPActivityReporter? = nil
-    ) async throws -> ChatSendReply {
-        let tabID = identity.tabID
+    ) async throws -> OracleSendResult {
         #if DEBUG
             if let runner = runTestHooks?.runMCPFollowUp {
                 return try await runner(mode, prompt, selection)
             }
         #endif
 
-        guard let originWorkspaceID = workspaceID(containing: tabID) else {
-            throw ContextBuilderGenerationError.missingWorkspace
+        let state = session(for: identity.tabID)
+        let continuationChatID = state.generatedAnswerRoute.flatMap { route in
+            route.workspaceID == identity.workspaceID && route.tabID == identity.tabID ? route.chatID : nil
         }
+        let start = beginBackgroundPlanGeneration(for: state, using: oracleViewModel)
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await performMCPPlanOrQuestion(
+                identity: identity,
+                oracleViewModel: oracleViewModel,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
+                mode: mode,
+                prompt: prompt,
+                selection: selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
+                finalReviewAuthorization: finalReviewAuthorization,
+                gitScopeOverride: gitScopeOverride,
+                progressReporter: progressReporter,
+                activityReporter: activityReporter,
+                continuationChatID: continuationChatID,
+                generation: start.generation,
+                drain: start.drain
+            )
+        }
+        let wrapper = Task {
+            await withTaskCancellationHandler {
+                _ = await operation.result
+            } onCancel: {
+                operation.cancel()
+            }
+        }
+        state.backgroundPlanTask = wrapper
 
-        let modeName = mode.mcpModeName
+        do {
+            let reply = try await withTaskCancellationHandler {
+                try await operation.value
+            } onCancel: {
+                operation.cancel()
+                wrapper.cancel()
+            }
+            if state.backgroundPlanGeneration == start.generation {
+                state.backgroundPlanTask = nil
+            }
+            return reply
+        } catch {
+            guard state.backgroundPlanGeneration == start.generation else { throw error }
+            state.backgroundPlanTask = nil
+            state.isBackgroundPlanGenerating = false
+            state.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+            updateRuntimeBindings(from: state)
+            throw error
+        }
+    }
+
+    @MainActor
+    private func performMCPPlanOrQuestion(
+        identity: WorkspaceSelectionIdentity,
+        oracleViewModel: OracleViewModel,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        mode: HeadlessMode,
+        prompt: String,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext?,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?,
+        gitScopeOverride: GitInclusion?,
+        progressReporter: ContextBuilderMCPProgressReporter?,
+        activityReporter: ContextBuilderMCPActivityReporter?,
+        continuationChatID: String?,
+        generation: UInt64,
+        drain: ContextBuilderSupersededFollowUpDrain?
+    ) async throws -> OracleSendResult {
+        let state = session(for: identity.tabID)
+        try await awaitSupersededFollowUpDrain(drain)
+        try Task.checkCancellation()
+        guard state.backgroundPlanGeneration == generation else { throw CancellationError() }
+
         await progressReporter?(.modelResolution)
-        let modelSelection: (
-            model: AIModel,
-            chatPresetID: UUID?,
-            mcpControlInfo: String?
-        )
+        let modelSelection: OracleViewModel.ModelSelectionResult
         #if DEBUG
             if let resolver = runTestHooks?.resolveMCPFollowUpModel {
-                modelSelection = try await resolver(modeName)
+                let selection = try await resolver(mode.mcpModeName)
+                modelSelection = .init(
+                    model: selection.model,
+                    mcpControlInfo: selection.mcpControlInfo,
+                    isAutoSelected: false,
+                    chatPresetID: selection.chatPresetID
+                )
             } else {
                 modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
-                    mode: modeName,
+                    mode: mode.mcpModeName,
                     workspaceID: identity.workspaceID,
-                    planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
+                    planningModelRawOverride: state.mcpPlanningModelRaw
                 )
             }
         #else
             modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
-                mode: modeName,
+                mode: mode.mcpModeName,
                 workspaceID: identity.workspaceID,
-                planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
+                planningModelRawOverride: state.mcpPlanningModelRaw
             )
         #endif
-        let mcpSessionUIState: OracleViewModel.MCPSessionUIState? = {
-            guard let mcpModelInfo = modelSelection.mcpControlInfo else { return nil }
-            let overrideChatPresetName = modelSelection.chatPresetID
-                .flatMap { ChatPresetManager.shared.preset(with: $0)?.name }
-            return OracleViewModel.MCPSessionUIState(
-                modelInfo: mcpModelInfo,
-                overrideModelName: modelSelection.model.displayName,
-                overrideChatPresetName: overrideChatPresetName
-            )
-        }()
+        try Task.checkCancellation()
+        guard state.backgroundPlanGeneration == generation else { throw CancellationError() }
+        await progressReporter?(.payloadPackaging)
 
-        if workspaceManager?.activeWorkspaceID != identity.workspaceID {
-            let session = session(for: tabID)
-            session.generatedAnswerRoute = nil
-            session.isBackgroundPlanGenerating = true
-            session.backgroundPlanError = nil
-            session.backgroundPlanResponseText = nil
-            session.backgroundPlanReasoningText = nil
-            updateRuntimeBindings(from: session)
-            do {
-                let reply = try await oracleViewModel.runHeadless(
-                    prompt: prompt,
-                    modelParam: nil,
-                    chatName: chatNameForTab(tabID),
-                    tabID: tabID,
-                    selection: selection,
-                    mode: mode,
-                    gitScopeOverride: gitScopeOverride,
-                    reviewGitContext: reviewGitContext,
+        let requiresHeadlessPackaging = finalReviewAuthorization != nil || gitScopeOverride != nil
+        let targetsInactiveWorkspace = workspaceManager?.activeWorkspaceID != identity.workspaceID
+        if requiresHeadlessPackaging || targetsInactiveWorkspace {
+            let secondaryModel = try oracleViewModel.resolveOracleSecondaryModel(workspaceID: identity.workspaceID)
+            try Task.checkCancellation()
+            guard state.backgroundPlanGeneration == generation else { throw CancellationError() }
+
+            if let secondaryModel {
+                let aiMessage: AIMessage? = if requiresHeadlessPackaging {
+                    try await promptManager.buildHeadlessAIMessage(
+                        from: HeadlessContextSnapshot(
+                            workspaceID: identity.workspaceID,
+                            tabID: identity.tabID,
+                            promptText: prompt,
+                            selection: selection,
+                            lookupContext: lookupContext,
+                            reviewGitContext: reviewGitContext,
+                            finalReviewAuthorization: finalReviewAuthorization
+                        ),
+                        model: modelSelection.model,
+                        mode: mode,
+                        gitScopeOverride: gitScopeOverride
+                    )
+                } else {
+                    nil
+                }
+                try Task.checkCancellation()
+                guard state.backgroundPlanGeneration == generation else { throw CancellationError() }
+                return try await runFollowUpOracleStream(
+                    for: identity.tabID,
                     workspaceID: identity.workspaceID,
+                    oracleViewModel: oracleViewModel,
+                    mode: mode,
+                    prompt: prompt,
+                    selection: selection,
                     lookupContext: lookupContext,
-                    resolvedModel: modelSelection.model,
-                    finalReviewAuthorization: finalReviewAuthorization,
+                    reviewGitContext: reviewGitContext,
                     agentModeSessionID: agentModeSessionID,
                     agentModeRunID: agentModeRunID,
-                    completionPolicy: .contextBuilderStrict,
-                    onProgress: { [weak self] text, reasoning in
-                        guard let self, let session = sessions[tabID], session.isBackgroundPlanGenerating else { return }
-                        session.backgroundPlanResponseText = text
-                        session.backgroundPlanReasoningText = reasoning
-                    }
+                    chatName: chatNameForTab(identity.tabID),
+                    primaryModelSelection: modelSelection,
+                    secondaryModelOverride: secondaryModel,
+                    prebuiltAIMessage: aiMessage,
+                    continuationChatID: nil,
+                    progressReporter: progressReporter,
+                    activityReporter: activityReporter,
+                    generation: generation
                 )
-                session.isBackgroundPlanGenerating = false
-                session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-                    workspaceID: identity.workspaceID,
-                    tabID: tabID,
-                    chatID: reply.shortId
-                )
-                session.backgroundPlanResponseText = reply.response
-                workspaceManager?.setActiveChatSessionID(reply.chatId, for: identity)
-                updateRuntimeBindings(from: session)
-                return reply
-            } catch {
-                session.isBackgroundPlanGenerating = false
-                session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
-                session.backgroundPlanResponseText = nil
-                session.backgroundPlanReasoningText = nil
-                session.generatedAnswerRoute = nil
-                updateRuntimeBindings(from: session)
-                throw error
             }
+
+            state.mcpPlanModel = modelSelection.model.displayName
+            updateRuntimeBindings(from: state)
+            let reply = try await oracleViewModel.runHeadless(
+                prompt: prompt,
+                modelParam: nil,
+                chatName: chatNameForTab(identity.tabID),
+                tabID: identity.tabID,
+                selection: selection,
+                mode: mode,
+                gitScopeOverride: gitScopeOverride,
+                reviewGitContext: reviewGitContext,
+                workspaceID: identity.workspaceID,
+                lookupContext: lookupContext,
+                resolvedModel: modelSelection.model,
+                finalReviewAuthorization: finalReviewAuthorization,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
+                completionPolicy: .contextBuilderStrict,
+                onProgress: { [weak self] text, reasoning in
+                    guard let self, let session = sessions[identity.tabID] else { return }
+                    publishPrimaryProgress(text: text, reasoning: reasoning, session: session, generation: generation)
+                }
+            )
+            try publishFollowUpCompletion(reply, workspaceID: identity.workspaceID, session: state, generation: generation)
+            return OracleSendResult(
+                payload: .single(reply),
+                route: .init(
+                    contextID: identity.tabID,
+                    agentSessionID: agentModeSessionID,
+                    agentRunID: agentModeRunID
+                )
+            )
         }
 
         return try await runFollowUpOracleStream(
-            for: tabID,
-            originWorkspaceID: originWorkspaceID,
+            for: identity.tabID,
+            workspaceID: identity.workspaceID,
             oracleViewModel: oracleViewModel,
             mode: mode,
             prompt: prompt,
             selection: selection,
             lookupContext: lookupContext,
             reviewGitContext: reviewGitContext,
-            finalReviewAuthorization: finalReviewAuthorization,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
-            chatName: chatNameForTab(tabID),
-            model: modelSelection.model,
-            chatPresetID: modelSelection.chatPresetID,
-            mcpSessionUIState: mcpSessionUIState,
-            gitScopeOverride: gitScopeOverride,
+            chatName: chatNameForTab(identity.tabID),
+            primaryModelSelection: modelSelection,
+            continuationChatID: continuationChatID,
             progressReporter: progressReporter,
-            activityReporter: activityReporter
+            activityReporter: activityReporter,
+            generation: generation
         )
     }
 
@@ -4890,7 +5166,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             gitScopeOverride: GitInclusion? = nil,
             progressReporter: ContextBuilderMCPProgressReporter? = nil,
             activityReporter: ContextBuilderMCPActivityReporter? = nil
-        ) async throws -> ChatSendReply {
+        ) async throws -> OracleSendResult {
             guard let workspaceID = workspaceManager?.activeWorkspaceID else {
                 throw ContextBuilderWorkspaceContextError.missingWorkspace
             }
@@ -4966,6 +5242,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         oracleViewModel: OracleViewModel,
         chatName: String? = nil,
         mode: HeadlessMode = .plan,
+        continuationChatID: String? = nil,
+        generation: UInt64,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> ChatSendReply {
         // Get the tab's current state after Context Builder completed
@@ -4995,19 +5273,32 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             ? await promptManager.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
             : .automaticOnly()
 
-        return try await runFollowUpOracleStream(
+        let result = try await runFollowUpOracleStream(
             for: tabID,
-            originWorkspaceID: originWorkspaceID,
+            workspaceID: originWorkspaceID,
             oracleViewModel: oracleViewModel,
             mode: mode,
             prompt: prompt,
             selection: selection,
             reviewGitContext: reviewGitContext,
             chatName: chatName ?? defaultChatName,
-            model: promptManager.preferredAIModel,
-            chatPresetID: nil,
-            onProgress: onProgress
+            primaryModelSelection: OracleViewModel.ModelSelectionResult(
+                model: promptManager.preferredAIModel,
+                mcpControlInfo: nil,
+                isAutoSelected: false,
+                chatPresetID: nil
+            ),
+            continuationChatID: continuationChatID,
+            onProgress: onProgress,
+            generation: generation
         )
+        return switch result.payload {
+        case let .single(reply): reply
+        case let .paired(pair):
+            pair.primaryReply(fallbackSessionID: oracleViewModel.sessions.first(where: {
+                $0.shortID == pair.primaryChatID
+            })?.id)
+        }
     }
 
     // MARK: - Clarifying Questions

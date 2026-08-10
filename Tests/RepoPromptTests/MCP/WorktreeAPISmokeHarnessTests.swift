@@ -583,12 +583,15 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                     allowSyntheticRoutingWithoutFinalContext: true,
                     runMCPFollowUp: { mode, _, _ in
                         let chatID = UUID()
-                        return ChatSendReply(
-                            chatId: chatID,
-                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
-                            mode: mode.mcpModeName,
-                            response: "deterministic worktree export response",
-                            errors: nil
+                        return OracleSendResult(
+                            payload: .single(ChatSendReply(
+                                chatId: chatID,
+                                shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                                mode: mode.mcpModeName,
+                                response: "deterministic worktree export response",
+                                errors: nil
+                            )),
+                            route: .init(contextID: nil, agentSessionID: nil, agentRunID: nil)
                         )
                     }
                 )

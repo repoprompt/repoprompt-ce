@@ -25,11 +25,40 @@ extension OracleViewModel {
     // MARK: - Model Selection
 
     /// Encapsulates the result of model selection
-    private struct ModelSelectionResult {
+    struct ModelSelectionResult {
         let model: AIModel
         let mcpControlInfo: String?
         let isAutoSelected: Bool
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
+    }
+
+    enum OracleSendActivationPolicy: Equatable {
+        case legacyAutomatic
+        case background
+
+        static let publicMCP: Self = .legacyAutomatic
+    }
+
+    struct OracleSendLiveCallbacks {
+        var modelsResolved: (@MainActor @Sendable (AIModel, AIModel?) -> Void)?
+        var pairSessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)?
+        var primarySessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)?
+        var primaryProgress: (@MainActor @Sendable (String, String?) -> Void)?
+        var laneLifecycle: (@MainActor @Sendable (OracleLane, OracleMessageLifecycleActivityEvent) -> Void)?
+
+        init(
+            modelsResolved: (@MainActor @Sendable (AIModel, AIModel?) -> Void)? = nil,
+            pairSessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)? = nil,
+            primarySessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)? = nil,
+            primaryProgress: (@MainActor @Sendable (String, String?) -> Void)? = nil,
+            laneLifecycle: (@MainActor @Sendable (OracleLane, OracleMessageLifecycleActivityEvent) -> Void)? = nil
+        ) {
+            self.modelsResolved = modelsResolved
+            self.pairSessionsResolved = pairSessionsResolved
+            self.primarySessionResolved = primarySessionResolved
+            self.primaryProgress = primaryProgress
+            self.laneLifecycle = laneLifecycle
+        }
     }
 
     enum OracleSendPackagingProvenance: Equatable {
@@ -49,6 +78,7 @@ extension OracleViewModel {
         let selection: StoredSelection
         let lookupContext: WorkspaceLookupContext?
         let reviewGitContext: FrozenPromptGitReviewContext
+        let prebuiltAIMessage: AIMessage?
         let provenance: OracleSendPackagingProvenance
 
         init(
@@ -61,6 +91,7 @@ extension OracleViewModel {
             selection: StoredSelection,
             lookupContext: WorkspaceLookupContext?,
             reviewGitContext: FrozenPromptGitReviewContext,
+            prebuiltAIMessage: AIMessage? = nil,
             provenance: OracleSendPackagingProvenance
         ) {
             self.sourceTabID = sourceTabID
@@ -72,6 +103,7 @@ extension OracleViewModel {
             self.selection = selection
             self.lookupContext = lookupContext
             self.reviewGitContext = reviewGitContext
+            self.prebuiltAIMessage = prebuiltAIMessage
             self.provenance = provenance
         }
 
@@ -131,6 +163,8 @@ extension OracleViewModel {
         let origin: OracleSendOrigin
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
+        let activationPolicy: OracleSendActivationPolicy
+        let completionPolicy: OracleResponseCompletionPolicy
         let packaging: OracleSendPackagingContext
 
         init(
@@ -139,6 +173,8 @@ extension OracleViewModel {
             origin: OracleSendOrigin = .compatibility,
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
+            activationPolicy: OracleSendActivationPolicy = .legacyAutomatic,
+            completionPolicy: OracleResponseCompletionPolicy = .interactive,
             packaging: OracleSendPackagingContext
         ) {
             self.tabID = tabID
@@ -146,6 +182,8 @@ extension OracleViewModel {
             self.origin = origin
             self.agentModeSessionID = agentModeSessionID
             self.agentModeRunID = agentModeRunID
+            self.activationPolicy = activationPolicy
+            self.completionPolicy = completionPolicy
             self.packaging = packaging
         }
     }
@@ -384,10 +422,10 @@ extension OracleViewModel {
         modelParam: String? = nil,
         workspaceID: UUID? = nil,
         planningModelRawOverride: String? = nil
-    ) async throws -> (model: AIModel, chatPresetID: UUID?, mcpControlInfo: String?) {
+    ) async throws -> ModelSelectionResult {
         let presetsManager = ModelPresetsManager.shared
         let allPresets = presetsManager.allPresets()
-        let selection = try await selectModel(
+        return try await selectModel(
             modelParam: modelParam,
             mode: mode,
             allPresets: allPresets,
@@ -396,7 +434,6 @@ extension OracleViewModel {
                 GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: $0).planningModelRaw
             }
         )
-        return (selection.model, selection.chatPresetID, selection.mcpControlInfo)
     }
 
     /// Finds a built-in chat preset for the given mode
@@ -737,20 +774,24 @@ extension OracleViewModel {
     @MainActor
     func createSession(
         named name: String?,
+        workspaceID: UUID? = nil,
         tabID: UUID? = nil,
         activateInUI: Bool = true,
         setActiveForTab: Bool = true,
         agentModeSessionID: UUID? = nil,
-        agentModeRunID: UUID? = nil
+        agentModeRunID: UUID? = nil,
+        reuseBlankSession: Bool = true
     ) async throws -> ChatSession {
         let safeName = ChatSession.validatedName(name ?? "")
         let createdID = await startNewChatSession(
             name: safeName,
+            workspaceID: workspaceID,
             tabID: tabID,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             activateInUI: activateInUI,
-            setActiveForTab: setActiveForTab
+            setActiveForTab: setActiveForTab,
+            reuseBlankSession: reuseBlankSession
         )
 
         guard let id = createdID ?? currentSessionID,
@@ -904,14 +945,16 @@ extension OracleViewModel {
     private func activateResolvedChatSession(
         _ session: ChatSession,
         resolvedTabID: UUID?,
-        activateInUI: Bool
+        activateInUI: Bool,
+        setActiveForTab: Bool
     ) async {
         if activateInUI {
-            await switchToSession(session.id)
+            await switchToSession(session.id, setActiveForTab: setActiveForTab)
             return
         }
 
         _ = await ensureSessionLoadedForBackground(session)
+        guard setActiveForTab else { return }
         let targetTabID = await resolveBackgroundTabID(
             for: session,
             fallbackTabID: resolvedTabID
@@ -929,19 +972,23 @@ extension OracleViewModel {
         _ idString: String?,
         desiredName: String? = nil,
         forceNew: Bool = false,
+        workspaceID: UUID? = nil,
         tabID: UUID? = nil,
         activateInUI: Bool = true,
+        setActiveForTab: Bool = true,
         agentModeSessionID: UUID? = nil,
-        agentModeRunID: UUID? = nil
+        agentModeRunID: UUID? = nil,
+        allowPairedSessions: Bool = true
     ) async throws -> UUID {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         if forceNew {
             let new = try await createSession(
                 named: desiredName,
+                workspaceID: workspaceID,
                 tabID: resolvedTabID,
                 activateInUI: activateInUI,
-                setActiveForTab: true,
+                setActiveForTab: setActiveForTab,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
@@ -965,6 +1012,11 @@ extension OracleViewModel {
             ) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different Agent Mode owner")
             }
+            guard allowPairedSessions || existing.oraclePairID == nil else {
+                throw ChatToolError.invalidParams(
+                    "Paired Oracle histories cannot be continued while Secondary Oracle is disabled. Start a new chat."
+                )
+            }
 
             await applyOracleOwnerIfNeeded(
                 sessionID: existing.id,
@@ -972,7 +1024,12 @@ extension OracleViewModel {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
-            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
+            await activateResolvedChatSession(
+                existing,
+                resolvedTabID: resolvedTabID,
+                activateInUI: activateInUI,
+                setActiveForTab: setActiveForTab
+            )
 
             if let newName = desiredName,
                !newName.isEmpty,
@@ -984,7 +1041,8 @@ extension OracleViewModel {
         }
 
         func eligible(_ session: ChatSession, allowUnownedLegacy: Bool = true) -> Bool {
-            Self.sessionBelongsToResolvedTab(session, tabID: resolvedTabID) &&
+            (allowPairedSessions || session.oraclePairID == nil) &&
+                Self.sessionBelongsToResolvedTab(session, tabID: resolvedTabID) &&
                 Self.sessionMatchesOracleOwner(
                     session,
                     agentModeSessionID: agentModeSessionID,
@@ -1041,7 +1099,12 @@ extension OracleViewModel {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
-            await activateResolvedChatSession(candidate, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
+            await activateResolvedChatSession(
+                candidate,
+                resolvedTabID: resolvedTabID,
+                activateInUI: activateInUI,
+                setActiveForTab: setActiveForTab
+            )
             if let newName = desiredName,
                !newName.isEmpty,
                newName != candidate.name
@@ -1053,118 +1116,880 @@ extension OracleViewModel {
 
         let new = try await createSession(
             named: desiredName ?? "New Chat",
+            workspaceID: workspaceID,
             tabID: resolvedTabID,
             activateInUI: activateInUI,
-            setActiveForTab: true,
+            setActiveForTab: setActiveForTab,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID
         )
         return new.id
     }
 
-    /// Full implementation of the shared oracle send backend.
-    @MainActor
-    func tool_chatSend(
-        args: [String: Value],
-        promptVM: PromptViewModel,
-        tabContext: OracleSendTabContext? = nil
-    ) async throws
-        -> [String: Value]
-    {
-        // ────────── 1. Validate & extract parameters ──────────
+    private struct OraclePairSessionResolution {
+        let pairID: UUID
+        let primary: ChatSession
+        let secondary: ChatSession
+    }
+
+    private func validateRemovedOracleSendArguments(_ args: [String: Value]) throws {
         let removedArgs = ["selected_paths", "git_scope", "git_base"].filter { args[$0] != nil }
         if !removedArgs.isEmpty {
             throw ChatToolError.invalidParams(
                 "ask_oracle no longer accepts \(removedArgs.joined(separator: ", ")). Use manage_selection for selection and git tools for git context."
             )
         }
+    }
 
-        let useTabPrompt = args["use_tab_prompt"]?.boolValue ?? false
-        let rawMessage = args["message"]?.stringValue ?? ""
-
-        // Resolve message: either from tab prompt or explicit message parameter
-        let message: String
-        if useTabPrompt {
-            let base = tabContext?.packaging.promptText ?? promptVM.promptText
-            message = base.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !message.isEmpty else {
-                throw ChatToolError.invalidParams("Active tab prompt is empty (use_tab_prompt=true)")
-            }
-        } else {
-            message = rawMessage
-            guard !message.isEmpty else {
-                throw ChatToolError.invalidParams("message cannot be empty")
-            }
-        }
-
+    private func validatedOracleSendMode(_ args: [String: Value]) throws -> String {
         let mode = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         guard ["chat", "plan", "review"].contains(mode) else {
             throw ChatToolError.invalidParams("Invalid mode: \(mode). Valid modes: chat, plan, review")
         }
+        return mode
+    }
+
+    @MainActor
+    func resolveOracleSecondaryModel(workspaceID: UUID?) throws -> AIModel? {
+        try resolveOracleSecondaryModel(
+            workspaceID: workspaceID,
+            effectiveProfile: GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID:)
+        )
+    }
+
+    @MainActor
+    func resolveOracleSecondaryModel(
+        workspaceID: UUID?,
+        effectiveProfile: (UUID?) -> AgentModelsSettingsProfile
+    ) throws -> AIModel? {
+        try OraclePairModelSelectionPolicy.resolveSecondary(
+            raw: effectiveProfile(workspaceID).secondaryOracleModelRaw
+        )
+    }
+
+    @MainActor
+    private func resolvedOracleMessage(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?
+    ) throws -> String {
+        if args["use_tab_prompt"]?.boolValue ?? false {
+            let message = (tabContext?.packaging.promptText ?? promptVM.promptText)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !message.isEmpty else {
+                throw ChatToolError.invalidParams("Active tab prompt is empty (use_tab_prompt=true)")
+            }
+            return message
+        }
+        guard let message = args["message"]?.stringValue, !message.isEmpty else {
+            throw ChatToolError.invalidParams("message cannot be empty")
+        }
+        return message
+    }
+
+    private nonisolated static func sessionMatchesExactOracleRoute(
+        _ session: ChatSession,
+        workspaceID: UUID,
+        tabID: UUID,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) -> Bool {
+        session.workspaceID == workspaceID &&
+            session.composeTabID == tabID &&
+            session.agentModeSessionID == agentModeSessionID &&
+            session.agentModeRunID == agentModeRunID
+    }
+
+    @MainActor
+    private func resolveOraclePairSource(
+        requestedChatID: String?,
+        forceNew: Bool,
+        workspaceID: UUID,
+        tabID: UUID,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) async throws -> ChatSession? {
+        guard !forceNew else { return nil }
+        if let requestedChatID = requestedChatID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !requestedChatID.isEmpty
+        {
+            guard let source = try await resolveSessionForExplicitContinuation(id: requestedChatID, tabID: tabID) else {
+                throw ChatToolError.notFound("Chat with ID '\(requestedChatID)' not found")
+            }
+            guard Self.sessionMatchesExactOracleRoute(
+                source,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
+            ) else {
+                throw ChatToolError.invalidParams("The requested Oracle chat belongs to a different workspace, tab, Agent session, or run.")
+            }
+            return source
+        }
+
+        let candidates = sessions.filter {
+            Self.sessionMatchesExactOracleRoute(
+                $0,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
+            ) && $0.oraclePairID != nil && $0.oracleLane == .primary
+        }.sorted { $0.savedAt > $1.savedAt }
+        if let activeID = workspaceManager.activeChatSessionID(forTabID: tabID),
+           let active = candidates.first(where: { $0.id == activeID })
+        {
+            return active
+        }
+        if let currentSessionID,
+           let current = candidates.first(where: { $0.id == currentSessionID })
+        {
+            return current
+        }
+        return candidates.first
+    }
+
+    @MainActor
+    private func loadPersistedOraclePair(
+        pairID: UUID,
+        workspaceID: UUID,
+        tabID: UUID,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) async throws -> (primary: ChatSession, secondary: ChatSession, inserted: Set<UUID>) {
+        guard let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }) else {
+            throw ChatToolError.invalidParams("The Oracle pair workspace is unavailable.")
+        }
+        let stubs = try await chatData.oraclePairSessionStubs(for: workspace, pairID: pairID)
+        guard stubs.count == 2, Set(stubs.map(\.id)).count == 2 else {
+            throw ChatToolError(code: .conflict, message: "Oracle pair \(pairID.uuidString) is incomplete; start a new Oracle chat instead of continuing it.", details: nil)
+        }
+
+        var loaded: [ChatSession] = []
+        for stub in stubs {
+            let member = sessions.first(where: { $0.id == stub.id }) ?? stub
+            let full: ChatSession = if member.isListStub, let fileURL = member.fileURL {
+                try await chatData.loadChatSession(from: fileURL)
+            } else {
+                member
+            }
+            loaded.append(full)
+        }
+        guard loaded.count == 2,
+              loaded.allSatisfy({ member in
+                  member.oraclePairID == pairID &&
+                      Self.sessionMatchesExactOracleRoute(
+                          member,
+                          workspaceID: workspaceID,
+                          tabID: tabID,
+                          agentModeSessionID: agentModeSessionID,
+                          agentModeRunID: agentModeRunID
+                      ) && !isSessionStreaming(member.id)
+              }),
+              let primary = loaded.first(where: { $0.oracleLane == .primary }),
+              let secondary = loaded.first(where: { $0.oracleLane == .secondary })
+        else {
+            throw ChatToolError(code: .conflict, message: "Oracle pair metadata is unavailable, corrupt, or already streaming.", details: nil)
+        }
+
+        var inserted = Set<UUID>()
+        for member in loaded {
+            if let index = sessions.firstIndex(where: { $0.id == member.id }) {
+                sessions[index] = member
+            } else {
+                sessions.append(member)
+                inserted.insert(member.id)
+            }
+        }
+        for member in loaded {
+            await reloadSessionFromMemory(member)
+        }
+        return (primary, secondary, inserted)
+    }
+
+    @MainActor
+    func persistOraclePairRename(sessionID: UUID, newName: String) async throws {
+        guard let target = sessions.first(where: { $0.id == sessionID }),
+              let pairID = target.oraclePairID,
+              target.oracleLane != nil,
+              let workspaceID = target.workspaceID,
+              let tabID = target.composeTabID
+        else {
+            throw ChatToolError.internalError("Failed to resolve the Oracle pair for renaming.")
+        }
+        let claim = OracleSendClaimKey.oracleSend(
+            workspaceID: workspaceID,
+            tabID: tabID,
+            agentModeSessionID: target.agentModeSessionID,
+            agentModeRunID: target.agentModeRunID
+        )
+
+        do {
+            try await oracleSendClaims.withClaim([claim]) {
+                let pair = try await self.loadPersistedOraclePair(
+                    pairID: pairID,
+                    workspaceID: workspaceID,
+                    tabID: tabID,
+                    agentModeSessionID: target.agentModeSessionID,
+                    agentModeRunID: target.agentModeRunID
+                )
+                guard pair.primary.id == sessionID || pair.secondary.id == sessionID,
+                      let index = self.sessions.firstIndex(where: { $0.id == sessionID })
+                else {
+                    throw ChatToolError.internalError("Failed to resolve the renamed Oracle pair member.")
+                }
+
+                let originalName = self.sessions[index].name
+                self.sessions[index].name = newName
+                do {
+                    _ = try await self.persistOraclePairHistories(
+                        pairID: pairID,
+                        primarySessionID: pair.primary.id,
+                        secondarySessionID: pair.secondary.id
+                    )
+                } catch let error as ChatToolError where error.details?["durable_commit"] == "true" {
+                    throw error
+                } catch {
+                    if let currentIndex = self.sessions.firstIndex(where: { $0.id == sessionID }),
+                       self.sessions[currentIndex].oraclePairID == pairID,
+                       self.sessions[currentIndex].name == newName
+                    {
+                        self.sessions[currentIndex].name = originalName
+                    }
+                    if !pair.inserted.isEmpty {
+                        self.removeOraclePairSessionState(pair.inserted)
+                    }
+                    throw error
+                }
+            }
+        } catch OracleSendClaimError.conflict {
+            throw ChatToolError(
+                code: .conflict,
+                message: "This Oracle pair is busy and could not be renamed.",
+                details: nil
+            )
+        }
+    }
+
+    @MainActor
+    func resolveInMemoryOraclePairMembers(
+        pairID: UUID,
+        workspaceID: UUID,
+        tabID: UUID,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) async throws -> (primary: ChatSession, secondary: ChatSession)? {
+        let members = sessions.filter { $0.oraclePairID == pairID }
+        guard !members.isEmpty else { return nil }
+        guard members.count <= 2 else {
+            throw ChatToolError(
+                code: .conflict,
+                message: "Oracle pair \(pairID.uuidString) has duplicate members.",
+                details: nil
+            )
+        }
+        let laneGroups = Dictionary(grouping: members.compactMap(\.oracleLane), by: { $0 })
+        guard !laneGroups.values.contains(where: { $0.count > 1 }) else {
+            throw ChatToolError(
+                code: .conflict,
+                message: "Oracle pair \(pairID.uuidString) has duplicate lanes.",
+                details: nil
+            )
+        }
+        guard members.count == 2,
+              let primary = members.first(where: { $0.oracleLane == .primary }),
+              let secondary = members.first(where: { $0.oracleLane == .secondary }),
+              Self.sessionMatchesExactOracleRoute(
+                  primary,
+                  workspaceID: workspaceID,
+                  tabID: tabID,
+                  agentModeSessionID: agentModeSessionID,
+                  agentModeRunID: agentModeRunID
+              ),
+              Self.sessionMatchesExactOracleRoute(
+                  secondary,
+                  workspaceID: workspaceID,
+                  tabID: tabID,
+                  agentModeSessionID: agentModeSessionID,
+                  agentModeRunID: agentModeRunID
+              ),
+              !isSessionStreaming(primary.id),
+              !isSessionStreaming(secondary.id),
+              let loadedPrimary = await ensureSessionLoadedForBackground(primary),
+              let loadedSecondary = await ensureSessionLoadedForBackground(secondary)
+        else {
+            return nil
+        }
+        return (loadedPrimary, loadedSecondary)
+    }
+
+    private struct OraclePairPreparationRollbackState {
+        let workspaceID: UUID
+        let tabID: UUID
+        let priorCurrentSessionID: UUID?
+        let priorTabActiveSessionID: UUID?
+        var originalSessions: [UUID: ChatSession] = [:]
+        var createdSessionIDs: Set<UUID> = []
+        var insertedSessionIDs: Set<UUID> = []
+        var assignedSessions: [UUID: ChatSession] = [:]
+    }
+
+    @MainActor
+    private func rollbackOraclePairPreparation(
+        _ state: OraclePairPreparationRollbackState
+    ) async -> [String] {
+        var failures: [String] = []
+        let operationSessionIDs = state.createdSessionIDs.union(state.originalSessions.keys)
+
+        for sessionID in operationSessionIDs where isSessionStreaming(sessionID) {
+            await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+        }
+
+        if !state.createdSessionIDs.isEmpty {
+            if let workspace = workspaceManager.workspaces.first(where: { $0.id == state.workspaceID }) {
+                do {
+                    try await chatData.deleteOraclePairSessionFiles(
+                        state.createdSessionIDs,
+                        for: workspace
+                    )
+                } catch {
+                    failures.append("created sessions: \(error.localizedDescription)")
+                }
+            } else {
+                failures.append("created sessions: workspace is unavailable")
+            }
+        }
+
+        for (sessionID, original) in state.originalSessions {
+            guard let index = sessions.firstIndex(where: { $0.id == sessionID }),
+                  let assigned = state.assignedSessions[sessionID]
+            else { continue }
+            var current = sessions[index]
+            if current.workspaceID == assigned.workspaceID { current.workspaceID = original.workspaceID }
+            if current.composeTabID == assigned.composeTabID { current.composeTabID = original.composeTabID }
+            if current.agentModeSessionID == assigned.agentModeSessionID { current.agentModeSessionID = original.agentModeSessionID }
+            if current.agentModeRunID == assigned.agentModeRunID { current.agentModeRunID = original.agentModeRunID }
+            if current.oraclePairID == assigned.oraclePairID { current.oraclePairID = original.oraclePairID }
+            if current.oracleLane == assigned.oracleLane { current.oracleLane = original.oracleLane }
+            if current.oracleHistoryDiverged == assigned.oracleHistoryDiverged {
+                current.oracleHistoryDiverged = original.oracleHistoryDiverged
+            }
+            if current.fileURL == assigned.fileURL { current.fileURL = original.fileURL }
+            if current.savedAt == assigned.savedAt { current.savedAt = original.savedAt }
+            sessions[index] = current
+        }
+
+        let insertedSessionIDs = state.createdSessionIDs.union(state.insertedSessionIDs)
+        if !insertedSessionIDs.isEmpty {
+            removeOraclePairSessionState(insertedSessionIDs)
+        }
+        if let activeID = workspaceManager.activeChatSessionID(forTabID: state.tabID),
+           state.createdSessionIDs.contains(activeID)
+        {
+            workspaceManager.setActiveChatSessionID(state.priorTabActiveSessionID, forTabID: state.tabID)
+        }
+        if let currentSessionID, state.createdSessionIDs.contains(currentSessionID) {
+            self.currentSessionID = state.priorCurrentSessionID
+        }
+        return failures
+    }
+
+    @MainActor
+    private func resolveOrCreateOraclePairSessions(
+        requestedChatID: String?,
+        forceNew: Bool,
+        desiredName: String?,
+        workspaceID: UUID,
+        tabID: UUID,
+        activatePrimaryInUI: Bool,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        sessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)?
+    ) async throws -> OraclePairSessionResolution {
+        guard Set(sessions.map(\.id)).count == sessions.count,
+              workspaceManager.workspaces.contains(where: { $0.id == workspaceID })
+        else {
+            throw ChatToolError(code: .conflict, message: "Oracle pair session identities are invalid.", details: nil)
+        }
+        let initialSessionIDs = Set(sessions.map(\.id))
+        let source = try await resolveOraclePairSource(
+            requestedChatID: requestedChatID,
+            forceNew: forceNew,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        )
+        let pairID = source?.oraclePairID ?? UUID()
+        var rollback = OraclePairPreparationRollbackState(
+            workspaceID: workspaceID,
+            tabID: tabID,
+            priorCurrentSessionID: currentSessionID,
+            priorTabActiveSessionID: workspaceManager.activeChatSessionID(forTabID: tabID)
+        )
+        rollback.insertedSessionIDs = Set(sessions.map(\.id)).subtracting(initialSessionIDs)
+
+        do {
+            var primary: ChatSession?
+            var secondary: ChatSession?
+            if source?.oraclePairID != nil {
+                if let pair = try await resolveInMemoryOraclePairMembers(
+                    pairID: pairID,
+                    workspaceID: workspaceID,
+                    tabID: tabID,
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID
+                ) {
+                    primary = pair.primary
+                    secondary = pair.secondary
+                } else {
+                    let pair = try await loadPersistedOraclePair(
+                        pairID: pairID,
+                        workspaceID: workspaceID,
+                        tabID: tabID,
+                        agentModeSessionID: agentModeSessionID,
+                        agentModeRunID: agentModeRunID
+                    )
+                    primary = pair.primary
+                    secondary = pair.secondary
+                    rollback.insertedSessionIDs.formUnion(pair.inserted)
+                }
+            } else if let source {
+                guard source.oracleLane != .secondary,
+                      !isSessionStreaming(source.id),
+                      let loaded = await ensureSessionLoadedForBackground(source)
+                else {
+                    throw ChatToolError(code: .conflict, message: "The Oracle session is unavailable or already streaming.", details: nil)
+                }
+                primary = loaded
+            }
+
+            for member in [primary, secondary].compactMap(\.self) {
+                rollback.originalSessions[member.id] = member
+            }
+            let primaryName = desiredName ?? primary?.name ?? "Oracle"
+            if primary == nil {
+                primary = try await createSession(
+                    named: primaryName,
+                    workspaceID: workspaceID,
+                    tabID: tabID,
+                    activateInUI: false,
+                    setActiveForTab: false,
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID,
+                    reuseBlankSession: false
+                )
+                rollback.createdSessionIDs.insert(primary!.id)
+            }
+            if secondary == nil {
+                secondary = try await createSession(
+                    named: "\(primaryName) — Secondary",
+                    workspaceID: workspaceID,
+                    tabID: tabID,
+                    activateInUI: false,
+                    setActiveForTab: false,
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID,
+                    reuseBlankSession: false
+                )
+                rollback.createdSessionIDs.insert(secondary!.id)
+            }
+            guard var primary, var secondary, primary.id != secondary.id else {
+                throw ChatToolError(code: .conflict, message: "Failed to create a distinct Oracle pair.", details: nil)
+            }
+            rollback.insertedSessionIDs.formUnion(rollback.createdSessionIDs)
+
+            let diverged = primary.oracleHistoryDiverged || secondary.oracleHistoryDiverged ||
+                Self.oracleHistoriesDiverged(
+                    primary: primary.messages.filter(\.isUser).map(\.rawText),
+                    secondary: secondary.messages.filter(\.isUser).map(\.rawText)
+                )
+            let savedAt = Date()
+            func prepare(_ session: inout ChatSession, lane: OracleLane) {
+                session.workspaceID = workspaceID
+                session.composeTabID = tabID
+                session.agentModeSessionID = agentModeSessionID
+                session.agentModeRunID = agentModeRunID
+                session.oraclePairID = pairID
+                session.oracleLane = lane
+                session.oracleHistoryDiverged = diverged
+                session.savedAt = savedAt
+            }
+            prepare(&primary, lane: .primary)
+            prepare(&secondary, lane: .secondary)
+            guard let primaryIndex = sessions.firstIndex(where: { $0.id == primary.id }),
+                  let secondaryIndex = sessions.firstIndex(where: { $0.id == secondary.id })
+            else {
+                throw ChatToolError(code: .conflict, message: "Oracle pair preparation changed before lane dispatch.", details: nil)
+            }
+            sessions[primaryIndex] = primary
+            sessions[secondaryIndex] = secondary
+            rollback.assignedSessions = [primary.id: primary, secondary.id: secondary]
+            try await sessionsResolved?(primary.id, secondary.id)
+
+            if activatePrimaryInUI {
+                await activateResolvedChatSession(
+                    primary,
+                    resolvedTabID: tabID,
+                    activateInUI: true,
+                    setActiveForTab: true
+                )
+            }
+            return OraclePairSessionResolution(pairID: pairID, primary: primary, secondary: secondary)
+        } catch {
+            let preparationError = error
+            let rollbackFailures = await rollbackOraclePairPreparation(rollback)
+            guard rollbackFailures.isEmpty else {
+                throw ChatToolError.internalError(
+                    "Oracle pair preparation failed (\(preparationError.localizedDescription)); rollback also failed: \(rollbackFailures.joined(separator: "; "))"
+                )
+            }
+            throw preparationError
+        }
+    }
+
+    nonisolated static func oracleHistoriesDiverged(
+        primary: [String],
+        secondary: [String]
+    ) -> Bool {
+        primary != secondary
+    }
+
+    @MainActor
+    func recordLaneEffectiveModel(sessionID: UUID, model: AIModel) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        sessions[index].preferredAIModel = model.rawValue
+    }
+
+    /// MCP transport boundary for Oracle sends.
+    @MainActor
+    func tool_chatSend(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext? = nil,
+        liveCallbacks: OracleSendLiveCallbacks = OracleSendLiveCallbacks()
+    ) async throws -> [String: Value] {
+        do {
+            return try await sendOracle(
+                args: args,
+                promptVM: promptVM,
+                tabContext: tabContext,
+                liveCallbacks: liveCallbacks
+            ).toMCPObject()
+        } catch let failure as OracleSendFailure {
+            throw ChatToolError(
+                code: .internalError,
+                message: failure.message,
+                details: [
+                    "oracle_pair_payload": ToolOutputFormatter.rawJSONString(.object(failure.result.toMCPObject()))
+                ]
+            )
+        }
+    }
+
+    /// Typed Oracle runtime entry point for in-app callers.
+    @MainActor
+    func sendOracle(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext? = nil,
+        primaryModelSelection: ModelSelectionResult? = nil,
+        secondaryModelOverride: AIModel? = nil,
+        liveCallbacks: OracleSendLiveCallbacks = OracleSendLiveCallbacks()
+    ) async throws -> OracleSendResult {
+        let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
+        let route = OracleSendRoute(
+            contextID: tabContext?.tabID ?? promptVM.activeComposeTabID,
+            agentSessionID: tabContext?.agentModeSessionID,
+            agentRunID: tabContext?.agentModeRunID
+        )
+        let secondaryModel = try secondaryModelOverride ?? resolveOracleSecondaryModel(workspaceID: workspaceID)
+
+        let operation: @MainActor () async throws -> OracleSendResult = {
+            try self.validateRemovedOracleSendArguments(args)
+            guard let secondaryModel else {
+                if let primaryModelSelection {
+                    liveCallbacks.modelsResolved?(primaryModelSelection.model, nil)
+                }
+                let reply = try await self.tool_singleChatSendClaimed(
+                    args: args,
+                    promptVM: promptVM,
+                    tabContext: tabContext,
+                    modelSelectionOverride: primaryModelSelection,
+                    sessionResolved: liveCallbacks.primarySessionResolved,
+                    onProgress: liveCallbacks.primaryProgress
+                )
+                return OracleSendResult(payload: .single(reply), route: route)
+            }
+
+            let message = try self.resolvedOracleMessage(args: args, promptVM: promptVM, tabContext: tabContext)
+            let mode = try self.validatedOracleSendMode(args)
+            guard let workspaceID,
+                  let tabID = route.contextID,
+                  self.workspaceManager.bindingCandidate(forContextID: tabID)?.workspaceID == workspaceID
+            else {
+                throw ChatToolError.invalidParams("Paired Oracle requires an exact workspace and tab route.")
+            }
+            let pair = try await self.tool_pairedChatSend(
+                args: args,
+                promptVM: promptVM,
+                tabContext: tabContext,
+                mode: mode,
+                message: message,
+                secondaryModel: secondaryModel,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                primaryModelSelectionOverride: primaryModelSelection,
+                liveCallbacks: liveCallbacks
+            )
+            let result = OracleSendResult(payload: .paired(pair), route: route)
+            if pair.status == .failed, let failureSummary = pair.failureSummary {
+                throw OracleSendFailure(result: result, message: failureSummary)
+            }
+            return result
+        }
+
+        guard secondaryModel != nil, let workspaceID else { return try await operation() }
+        let claim = OracleSendClaimKey.oracleSend(
+            workspaceID: workspaceID,
+            tabID: route.contextID,
+            agentModeSessionID: route.agentSessionID,
+            agentModeRunID: route.agentRunID
+        )
+        do {
+            return try await oracleSendClaims.withClaim([claim], operation: operation)
+        } catch OracleSendClaimError.conflict {
+            throw ChatToolError(
+                code: .conflict,
+                message: "This Oracle route already has an in-flight request.",
+                details: nil
+            )
+        }
+    }
+
+    @MainActor
+    private func tool_pairedChatSend(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?,
+        mode: String,
+        message: String,
+        secondaryModel: AIModel,
+        workspaceID: UUID,
+        tabID: UUID,
+        primaryModelSelectionOverride: ModelSelectionResult?,
+        liveCallbacks: OracleSendLiveCallbacks
+    ) async throws -> OraclePairSendReply {
+        let primarySelection = if let primaryModelSelectionOverride {
+            primaryModelSelectionOverride
+        } else {
+            try await selectModel(
+                modelParam: args["model"]?.stringValue,
+                mode: mode,
+                allPresets: ModelPresetsManager.shared.allPresets(),
+                promptVM: promptVM
+            )
+        }
+        liveCallbacks.modelsResolved?(primarySelection.model, secondaryModel)
+        let shouldActivatePrimary: Bool = if tabContext?.activationPolicy == .background {
+            false
+        } else if let tabContext {
+            promptVM.activeComposeTabID == tabContext.tabID &&
+                !isSessionStreaming(workspaceManager.activeChatSessionID(forTabID: tabContext.tabID))
+        } else {
+            true
+        }
+        let pair = try await resolveOrCreateOraclePairSessions(
+            requestedChatID: args["chat_id"]?.stringValue,
+            forceNew: args["new_chat"]?.boolValue ?? false,
+            desiredName: args["chat_name"]?.stringValue,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            activatePrimaryInUI: shouldActivatePrimary,
+            agentModeSessionID: tabContext?.agentModeSessionID,
+            agentModeRunID: tabContext?.agentModeRunID,
+            sessionsResolved: { primary, secondary in
+                try await liveCallbacks.pairSessionsResolved?(primary, secondary)
+            }
+        )
+        pinSession(pair.primary.id)
+        pinSession(pair.secondary.id)
+        defer {
+            unpinSession(pair.secondary.id)
+            unpinSession(pair.primary.id)
+        }
+        var primaryArgs = args
+        primaryArgs["chat_id"] = .string(pair.primary.shortID)
+        primaryArgs["new_chat"] = .bool(false)
+        primaryArgs.removeValue(forKey: "chat_name")
+        var secondaryArgs = args
+        secondaryArgs["chat_id"] = .string(pair.secondary.shortID)
+        secondaryArgs["new_chat"] = .bool(false)
+        secondaryArgs.removeValue(forKey: "chat_name")
+        let secondarySelection = ModelSelectionResult(
+            model: secondaryModel,
+            mcpControlInfo: "Secondary Oracle (\(secondaryModel.displayName))",
+            isAutoSelected: false,
+            chatPresetID: primarySelection.chatPresetID
+        )
+        let execution: OraclePairCoordinator.Result<ChatSendReply>
+        do {
+            execution = try await OraclePairCoordinator.run(
+                primary: {
+                    let result = try await self.tool_singleChatSendClaimed(
+                        args: primaryArgs,
+                        promptVM: promptVM,
+                        tabContext: tabContext,
+                        modelSelectionOverride: primarySelection,
+                        resolvedMessageOverride: message,
+                        activateInUI: false,
+                        lane: .primary,
+                        laneLifecycle: liveCallbacks.laneLifecycle,
+                        onProgress: liveCallbacks.primaryProgress
+                    )
+                    _ = try OraclePairCoordinator.validatedResponse(result.response, lane: .primary)
+                    return result
+                },
+                secondary: {
+                    let result = try await self.tool_singleChatSendClaimed(
+                        args: secondaryArgs,
+                        promptVM: promptVM,
+                        tabContext: tabContext,
+                        modelSelectionOverride: secondarySelection,
+                        resolvedMessageOverride: message,
+                        activateInUI: false,
+                        lane: .secondary,
+                        laneLifecycle: liveCallbacks.laneLifecycle
+                    )
+                    _ = try OraclePairCoordinator.validatedResponse(result.response, lane: .secondary)
+                    return result
+                }
+            )
+        } catch is CancellationError {
+            do {
+                _ = try await persistOraclePairHistories(
+                    pairID: pair.pairID,
+                    primarySessionID: pair.primary.id,
+                    secondarySessionID: pair.secondary.id
+                )
+            } catch {
+                let message = "Cancelled Oracle pair history persistence failed: \(error.localizedDescription)"
+                print(message)
+            }
+            throw CancellationError()
+        }
+
+        let historyDiverged: Bool
+        var historyPersistenceError: String?
+        do {
+            historyDiverged = try await persistOraclePairHistories(
+                pairID: pair.pairID,
+                primarySessionID: pair.primary.id,
+                secondarySessionID: pair.secondary.id
+            )
+        } catch {
+            historyPersistenceError = error.localizedDescription
+            historyDiverged = Self.oracleHistoriesDiverged(
+                primary: oracleUserHistory(in: pair.primary.id) ?? [],
+                secondary: oracleUserHistory(in: pair.secondary.id) ?? []
+            )
+            for index in sessions.indices where sessions[index].oraclePairID == pair.pairID {
+                sessions[index].oracleHistoryDiverged = historyDiverged
+            }
+        }
+        return OraclePairSendReply(
+            pairID: pair.pairID,
+            mode: mode,
+            primaryChatID: pair.primary.shortID,
+            secondaryChatID: pair.secondary.shortID,
+            primaryModel: primarySelection.model,
+            secondaryModel: secondaryModel,
+            result: execution,
+            historyDiverged: historyDiverged,
+            historyPersistenceError: historyPersistenceError
+        )
+    }
+
+    @MainActor
+    private func tool_singleChatSendClaimed(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext? = nil,
+        modelSelectionOverride: ModelSelectionResult? = nil,
+        resolvedMessageOverride: String? = nil,
+        activateInUI: Bool? = nil,
+        lane: OracleLane? = nil,
+        laneLifecycle: (@MainActor @Sendable (OracleLane, OracleMessageLifecycleActivityEvent) -> Void)? = nil,
+        sessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)? = nil,
+        onProgress: (@MainActor @Sendable (String, String?) -> Void)? = nil
+    ) async throws -> ChatSendReply {
+        // ────────── 1. Validate & extract parameters ──────────
+        let message = try resolvedMessageOverride ??
+            resolvedOracleMessage(args: args, promptVM: promptVM, tabContext: tabContext)
+        let mode = try validatedOracleSendMode(args)
         let chatName = args["chat_name"]?.stringValue
         let chatIdIn = args["chat_id"]?.stringValue
         let newChat = args["new_chat"]?.boolValue ?? false
-        let modelParam = args["model"]?.stringValue
-        // Deprecated compatibility parameter: Oracle replies are text-only and no longer emit diffs.
         _ = args["include_diffs"]?.boolValue
         let selectionOverride = tabContext?.packaging.selection
         let lookupContextOverride = tabContext?.packaging.lookupContext
         let reviewGitContextOverride = tabContext?.packaging.reviewGitContext
+        let prebuiltAIMessage = tabContext?.packaging.prebuiltAIMessage
 
-        // ────────── 2. Handle model selection ──────────
-        let presetsManager = ModelPresetsManager.shared
-        let allPresets = presetsManager.allPresets()
-
-        let modelSelection = try await selectModel(
-            modelParam: modelParam,
-            mode: mode,
-            allPresets: allPresets,
-            promptVM: promptVM
-        )
-
+        let modelSelection = if let modelSelectionOverride {
+            modelSelectionOverride
+        } else {
+            try await selectModel(
+                modelParam: args["model"]?.stringValue,
+                mode: mode,
+                allPresets: ModelPresetsManager.shared.allPresets(),
+                promptVM: promptVM
+            )
+        }
         let selectedModel = modelSelection.model
         let mcpControlledModel = modelSelection.mcpControlInfo
         let overrideModelName = selectedModel.displayName
         let overrideChatPresetName: String? = {
             if let presetID = modelSelection.chatPresetID,
-               let chatPreset = ChatPresetManager.shared.preset(with: presetID)
-            {
-                return chatPreset.name
-            }
-            // Fallback: map the requested mode to a built-in chat preset so the orange chip matches the active mode
-            if let builtIn = findBuiltInPreset(for: mode) {
-                return builtIn.name
-            }
-            return nil
+               let chatPreset = ChatPresetManager.shared.preset(with: presetID) { return chatPreset.name }
+            return findBuiltInPreset(for: mode)?.name
         }()
 
-        // ────────── 3. Resolve chat session ──────────
         let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
         let shouldActivate: Bool
-        if let tabContext {
-            let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID)
+        if tabContext?.activationPolicy == .background {
+            shouldActivate = false
+        } else if let activateInUI {
+            shouldActivate = activateInUI
+        } else if let tabContext {
             let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabContext.tabID)
                 ?? currentSessionID.flatMap { currentID in
                     sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
                 }
-            let isUserStreaming = isSessionStreaming(activeSessionID)
-            shouldActivate = isFocusedTab && !isUserStreaming
+            shouldActivate = promptVM.activeComposeTabID == tabContext.tabID &&
+                !isSessionStreaming(activeSessionID)
         } else {
             shouldActivate = true
         }
+        let allowPairedSessions = lane != nil
+        let shouldSetActiveForTab = tabContext?.activationPolicy == .background ? false : !allowPairedSessions
         let chatID = try await locateOrCreateChat(
             chatIdIn,
             desiredName: chatName,
             forceNew: newChat,
+            workspaceID: tabContext?.workspaceID,
             tabID: tabID,
             activateInUI: shouldActivate,
+            setActiveForTab: shouldSetActiveForTab,
             agentModeSessionID: tabContext?.agentModeSessionID,
-            agentModeRunID: tabContext?.agentModeRunID
+            agentModeRunID: tabContext?.agentModeRunID,
+            allowPairedSessions: allowPairedSessions
         )
+        try await sessionResolved?(chatID)
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
-        // Set MCP control info for the MCP-triggered session only
         if let mcpControlledModel {
             setMCPSessionUIState(
                 MCPSessionUIState(
@@ -1178,11 +2003,7 @@ extension OracleViewModel {
             clearMCPSessionUIState(for: chatID)
         }
 
-        // ────────── 4. Determine mode ──────────
         let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
-
-        // ────────── 5. Send user message & wait for completion ──────────
-        // Pass the selected model, chat preset, and mode to sendMessage without affecting global state.
         let send = {
             await self.sendMessage(
                 message,
@@ -1194,47 +2015,80 @@ extension OracleViewModel {
                 gitBaseOverride: nil,
                 selectionOverride: selectionOverride,
                 lookupContextOverride: lookupContextOverride,
-                reviewGitContextOverride: reviewGitContextOverride
+                reviewGitContextOverride: reviewGitContextOverride,
+                overrideAIMessage: prebuiltAIMessage,
+                completionPolicy: tabContext?.completionPolicy ?? .interactive,
+                onProgress: onProgress
             )
         }
-        let queryId: UUID?
+        let dispatchedMessageID: UUID?
         #if DEBUG
             let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
                 tabContext: tabContext,
                 observer: oracleReviewPackagingTraceObserverForTesting
             )
-            queryId = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
+            dispatchedMessageID = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
         #else
-            queryId = await send()
+            dispatchedMessageID = await send()
         #endif
-        guard let queryId else {
+        guard let queryID = dispatchedMessageID else {
+            if let lane {
+                throw OracleLaneFailure(message: "Oracle \(lane.rawValue) lane did not start.")
+            }
             throw OracleContextBuilderCompletionError.missingExactQuery
         }
-        let response = try await waitForContextBuilderCompletion(queryId)
 
-        // ────────── 6. Build typed reply ──────────
-        let replyObj = ChatSendReply(
+        let response: String
+        if let lane {
+            let lifecycleObserverID = laneLifecycle.map { callback in
+                addMessageLifecycleActivityObserver(for: queryID) { event in
+                    callback(lane, event)
+                }
+            }
+            defer {
+                if let lifecycleObserverID {
+                    removeMessageLifecycleActivityObserver(for: queryID, observerID: lifecycleObserverID)
+                }
+            }
+            do {
+                switch try await waitForMessageFinalisationOutcome(queryID) {
+                case .completed:
+                    recordLaneEffectiveModel(sessionID: chatID, model: selectedModel)
+                case let .providerTerminatedIncomplete(reason, partialResponse):
+                    let error = OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
+                    throw OracleLaneFailure(message: error.localizedDescription, partialResponse: partialResponse)
+                case let .streamEndedWithoutProviderCompletion(partialResponse):
+                    let error = OracleContextBuilderCompletionError.streamEndedWithoutProviderCompletion
+                    throw OracleLaneFailure(message: error.localizedDescription, partialResponse: partialResponse)
+                case let .interactiveWatchdog(partialResponse):
+                    let error = OracleContextBuilderCompletionError.interactiveWatchdogFinalization
+                    throw OracleLaneFailure(message: error.localizedDescription, partialResponse: partialResponse)
+                case let .failed(message, partialResponse):
+                    throw OracleLaneFailure(message: message, partialResponse: partialResponse)
+                case let .cancelled(message, partialResponse):
+                    if Task.isCancelled { throw CancellationError() }
+                    throw OracleLaneFailure(
+                        message: message,
+                        partialResponse: partialResponse,
+                        code: .cancelled
+                    )
+                }
+            } catch is CancellationError {
+                await cancelAIResponse(in: chatID, skipPartialParseAndSave: false)
+                throw CancellationError()
+            }
+            response = try await waitForContextBuilderCompletion(queryID)
+        } else {
+            response = try await waitForContextBuilderCompletion(queryID)
+        }
+
+        return ChatSendReply(
             chatId: chatID,
             shortId: sessions.first(where: { $0.id == chatID })?.shortID ?? "",
             mode: mode,
             response: response,
             errors: nil
         )
-
-        // Serialise to MCP Value → dictionary
-        guard case var .object(dict) = replyObj.toMCPValue() else {
-            throw ChatToolError.internalError("failed to encode reply")
-        }
-        if let tabID {
-            dict["context_id"] = .string(tabID.uuidString)
-        }
-        if let agentModeSessionID = tabContext?.agentModeSessionID {
-            dict["agent_session_id"] = .string(agentModeSessionID.uuidString)
-        }
-        if let agentModeRunID = tabContext?.agentModeRunID {
-            dict["agent_run_id"] = .string(agentModeRunID.uuidString)
-        }
-        return dict
     }
 
     /// Legacy entry point kept for compatibility with `MCPServerViewModel`.
@@ -1280,6 +2134,11 @@ extension OracleViewModel {
         ]
         if let resolvedTabID = tabID ?? resolvedSession.composeTabID {
             result["context_id"] = .string(resolvedTabID.uuidString)
+        }
+        if let pairID = resolvedSession.oraclePairID {
+            result["oracle_pair_id"] = .string(pairID.uuidString)
+            result["oracle_lane"] = .string(resolvedSession.oracleLane?.rawValue ?? "unknown")
+            result["oracle_history_diverged"] = .bool(resolvedSession.oracleHistoryDiverged)
         }
 
         return result

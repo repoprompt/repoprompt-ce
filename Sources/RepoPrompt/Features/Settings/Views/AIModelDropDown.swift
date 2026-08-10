@@ -124,8 +124,19 @@ struct AIModelDropdown: View {
 
     private func aiModelMenuItems() -> [StableMenuItem] {
         let allModels = menuModelSnapshot ?? promptViewModel.availableModels
+        var items: [StableMenuItem] = []
+        if destination.allowsEmptySelection {
+            items.append(.action(
+                "Disabled",
+                isSelected: destination.currentRawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ) {
+                destination.apply("")
+            })
+            items.append(.separator)
+        }
         guard !allModels.isEmpty else {
-            return [.action("Configure API Settings", handleConfigureAction)]
+            items.append(.action("Configure API Settings", handleConfigureAction))
+            return items
         }
 
         let groupedModels = Dictionary(grouping: allModels, by: { $0.providerType })
@@ -133,7 +144,7 @@ struct AIModelDropdown: View {
             AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
         }
 
-        return sortedProviders.flatMap { provider -> [StableMenuItem] in
+        items.append(contentsOf: sortedProviders.flatMap { provider -> [StableMenuItem] in
             let models = AIModel.sortedForPicker(groupedModels[provider] ?? [])
             if provider == .claudeCode {
                 return aiModelClaudeCodeTopLevelMenuItems(for: models)
@@ -156,7 +167,8 @@ struct AIModelDropdown: View {
                 models.map(aiModelMenuItem)
             }
             return [.submenu(AIProviderType.displayName(for: provider), items: providerItems)]
-        }
+        })
+        return items
     }
 
     private func aiModelClaudeCodeTopLevelMenuItems(for models: [AIModel]) -> [StableMenuItem] {
@@ -318,6 +330,7 @@ struct AIModelDropdown: View {
         Self.displayName(
             forRawValue: destination.currentRawValue,
             destinationID: destination.id,
+            allowsEmptySelection: destination.allowsEmptySelection,
             availableModels: promptViewModel.availableModels,
             customOpenRouterModels: promptViewModel.apiSettingsViewModel?.customOpenRouterModels ?? [],
             compatibleClaudeBackendDisplayName: { model in
@@ -331,12 +344,17 @@ struct AIModelDropdown: View {
     static func displayName(
         forRawValue currentModel: String,
         destinationID: String,
+        allowsEmptySelection: Bool = false,
         availableModels: [AIModel],
         customOpenRouterModels: [String],
         compatibleClaudeBackendDisplayName: (AIModel) -> String? = { _ in nil }
     ) -> String {
+        let trimmedRawValue = currentModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if allowsEmptySelection, trimmedRawValue.isEmpty {
+            return "Disabled"
+        }
         if availableModels.isEmpty {
-            return "No models available"
+            return allowsEmptySelection ? trimmedRawValue : "No models available"
         }
 
         // Check custom OpenRouter models
@@ -355,8 +373,10 @@ struct AIModelDropdown: View {
         }
 
         if destinationID == "planningModel" {
-            let trimmedRawValue = currentModel.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmedRawValue.isEmpty ? "Select an Oracle model" : "Invalid Oracle model"
+        }
+        if allowsEmptySelection {
+            return trimmedRawValue
         }
 
         // Fallback to first available for non-Oracle destinations.
