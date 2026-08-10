@@ -1317,9 +1317,9 @@ class OracleViewModel: ObservableObject {
             // Keep a single awaitable restore task. Workspace switch only yields once after
             // notifying listeners, so tests and MCP callers must be able to wait until chat
             // sessions finish reloading (sessions.removeAll + stub load + ensureActive).
-            self.workspaceChatRestoreTask = Task { @MainActor [weak self] in
+            workspaceChatRestoreTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                await self.handleWorkspaceSwitched(to: newWS)
+                await handleWorkspaceSwitched(to: newWS)
             }
         }
 
