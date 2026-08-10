@@ -326,12 +326,10 @@ import XCTest
                             selection: selection,
                             lookupContext: lookupContext
                         )
-                        return ChatSendReply(
-                            chatId: UUID(),
-                            shortId: "cb-\(mode.mcpModeName)",
+                        return singleOracleResult(
+                            shortID: "cb-\(mode.mcpModeName)",
                             mode: mode.mcpModeName,
-                            response: "generated \(mode.mcpModeName)",
-                            errors: nil
+                            response: "generated \(mode.mcpModeName)"
                         )
                     }
                     defer {
@@ -680,12 +678,10 @@ import XCTest
                             selection: selection,
                             lookupContext: lookupContext
                         )
-                        return ChatSendReply(
-                            chatId: UUID(),
-                            shortId: "cb-deferred-review",
+                        return singleOracleResult(
+                            shortID: "cb-deferred-review",
                             mode: mode.mcpModeName,
-                            response: "generated deferred review",
-                            errors: nil
+                            response: "generated deferred review"
                         )
                     }
                     defer {
@@ -1138,12 +1134,10 @@ import XCTest
                             selection: selection,
                             lookupContext: lookupContext
                         )
-                        return ChatSendReply(
-                            chatId: UUID(),
-                            shortId: "two-root-review",
+                        return singleOracleResult(
+                            shortID: "two-root-review",
                             mode: mode.mcpModeName,
-                            response: "generated review",
-                            errors: nil
+                            response: "generated review"
                         )
                     }
 
@@ -1414,12 +1408,10 @@ import XCTest
                             selection: selection,
                             lookupContext: lookupContext
                         )
-                        return ChatSendReply(
-                            chatId: UUID(),
-                            shortId: "canonical-review",
+                        return singleOracleResult(
+                            shortID: "canonical-review",
                             mode: mode.mcpModeName,
-                            response: "generated review",
-                            errors: nil
+                            response: "generated review"
                         )
                     }
                     let response = try await endpoint.callTool(
@@ -2025,12 +2017,10 @@ import XCTest
                             contextBuilderViewModel.sessions[identity.tabID]?.mcpPlanningModelRaw,
                             AIModel.gpt54Pro.rawValue
                         )
-                        return ChatSendReply(
-                            chatId: UUID(),
-                            shortId: "inactive-b-plan",
+                        return singleOracleResult(
+                            shortID: "inactive-b-plan",
                             mode: mode.mcpModeName,
-                            response: "B-scoped plan",
-                            errors: nil
+                            response: "B-scoped plan"
                         )
                     }
                     defer { window.mcpServer.setContextBuilderFollowUpOverrideForTesting(nil) }
@@ -2964,6 +2954,23 @@ import XCTest
         func snapshot() -> [Entry] {
             entries
         }
+    }
+
+    private func singleOracleResult(
+        shortID: String,
+        mode: String,
+        response: String
+    ) -> OracleSendResult {
+        OracleSendResult(
+            payload: .single(ChatSendReply(
+                chatId: UUID(),
+                shortId: shortID,
+                mode: mode,
+                response: response,
+                errors: nil
+            )),
+            route: .init(contextID: nil, agentSessionID: nil, agentRunID: nil)
+        )
     }
 
     private actor ContextBuilderProbeGate {

@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
 package enum CodeMapCanonicalIdentityError: Error, Equatable, Sendable {

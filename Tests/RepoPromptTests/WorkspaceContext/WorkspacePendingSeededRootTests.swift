@@ -72,7 +72,8 @@ import XCTest
             let syntheticEventID: FSEventStreamEventId = 9_000_000_000_000_000_000
             let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
                 rootID: physicalRoot.id,
-                events: [(postCommitURL.path, createdFileFlags, syntheticEventID)]
+                events: [(postCommitURL.path, createdFileFlags, syntheticEventID)],
+                scheduleDrain: false
             )
             let acceptedWatcherWatermark = try XCTUnwrap(acceptedPayload)
             let ingressSamples = await store.awaitAppliedIngress(rootRefs: [physicalRoot])

@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2025-02-08.
 //
 
+import CoreFoundation
 import Foundation
 #if CODEMAP_PERF_SIGNPOSTS
     import os

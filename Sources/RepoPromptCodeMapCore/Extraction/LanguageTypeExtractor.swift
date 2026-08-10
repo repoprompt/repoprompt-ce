@@ -15,6 +15,7 @@
 //  on return types and param types to avoid trailing spaces.
 //
 
+import CoreFoundation
 import Foundation
 
 /// A single struct holding all enhanced regex patterns and static helper methods

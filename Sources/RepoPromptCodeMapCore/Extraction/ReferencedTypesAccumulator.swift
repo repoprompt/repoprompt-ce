@@ -5,6 +5,7 @@
 //  Centralized referenced type collection and cleaning.
 //
 
+import CoreFoundation
 import Foundation
 
 struct ReferencedTypesAccumulator {

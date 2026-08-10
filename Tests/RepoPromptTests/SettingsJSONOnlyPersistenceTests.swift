@@ -596,7 +596,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
 
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 4)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 5)
         XCTAssertTrue(store.worktreeVisualIdentitiesByRepositoryID().isEmpty)
     }
 
@@ -1165,6 +1165,20 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         try fileStore.save(GlobalSettingsDocument(scalarPreferences: seededScalarPreferences()))
         XCTAssertEqual(try fileStore.load().schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: seededScalarPreferences(
+                modelSelection: .init(secondaryOracleModel: " \n\t ")
+            )
+        ))
+        XCTAssertEqual(try fileStore.load().schemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: seededScalarPreferences(
+                modelSelection: .init(secondaryOracleModel: AIModel.gpt54Pro.rawValue)
+            )
+        ))
+        XCTAssertEqual(try fileStore.load().schemaVersion, GlobalSettingsDocument.secondaryOracleSchemaVersion)
     }
 
     func testCompatibleLineagedSchemaV2LoadDoesNotRewriteBytes() throws {
@@ -1182,12 +1196,26 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
     }
 
     func testWorkspaceAgentModelsUsesFixedFeatureSchemaV4() {
+        let workspaceID = UUID()
         let document = GlobalSettingsDocument(
-            agentModelsSettings: [UUID(): WorkspaceAgentModelsSettings(inheritanceMode: .useWorkspaceOverrides)]
+            agentModelsSettings: [workspaceID: WorkspaceAgentModelsSettings(inheritanceMode: .useWorkspaceOverrides)]
+        )
+        let secondaryOracleDocument = GlobalSettingsDocument(
+            agentModelsSettings: [
+                workspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(secondaryOracleModelRaw: AIModel.gpt54Pro.rawValue)
+                )
+            ]
         )
 
         XCTAssertEqual(GlobalSettingsDocument.workspaceAgentModelsSchemaVersion, 4)
+        XCTAssertEqual(GlobalSettingsDocument.secondaryOracleSchemaVersion, 5)
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+        XCTAssertEqual(
+            secondaryOracleDocument.requiredSchemaVersion,
+            GlobalSettingsDocument.secondaryOracleSchemaVersion
+        )
     }
 
     func testFalseV4BacksUpExactBytesNormalizesOnlyHeaderAndIsIdempotent() throws {
@@ -1294,6 +1322,8 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let document = try GlobalSettingsFileStore(fileURL: fileURL).load()
 
         XCTAssertEqual(document.schemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+        XCTAssertNil(document.scalarPreferences?.modelSelection?.secondaryOracleModel)
+        XCTAssertNil(document.agentModelsSettings[workspaceID]?.profile?.secondaryOracleModelRaw)
         XCTAssertEqual(try Data(contentsOf: fileURL), original)
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: fileURL.deletingLastPathComponent().appendingPathComponent("Backups").path
@@ -1803,7 +1833,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         defer { recorder.invalidate() }
 
         store.setGlobalAgentModelsProfile(
-            AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue),
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                secondaryOracleModelRaw: AIModel.claude4Sonnet.rawValue
+            ),
             contextBuilderWriteIntent: .preserveExistingOwnership
         )
         await drainMainQueue()
@@ -1821,6 +1854,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             originalChatFileTreeOption
         )
         XCTAssertEqual(prompt.planningModelName, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(prompt.secondaryOracleModelRaw, AIModel.claude4Sonnet.rawValue)
     }
 
     func testAgentModelsViewModelDoesNotFallbackUnsyncedBuiltinChatToOracle() async throws {
@@ -2236,6 +2270,31 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         )
     }
 
+    func testSecondaryOracleProfilesResolveGlobalAndWorkspaceInheritance() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let workspaceID = UUID()
+        let globalProfile = AgentModelsSettingsProfile(
+            secondaryOracleModelRaw: AIModel.claude4Sonnet.rawValue
+        )
+        let workspaceProfile = AgentModelsSettingsProfile(
+            secondaryOracleModelRaw: AIModel.gpt54Pro.rawValue
+        )
+
+        store.setGlobalAgentModelsProfile(globalProfile, contextBuilderWriteIntent: .preserveExistingOwnership)
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID), workspaceProfile)
+
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useGlobalSettings)
+        XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID), globalProfile)
+
+        let reloaded = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        XCTAssertEqual(reloaded.effectiveAgentModelsProfile(workspaceID: workspaceID), globalProfile)
+    }
+
     func testAgentModelsCopyWorkspaceToGlobalOverwritesContextBuilderModelMap() throws {
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
@@ -2616,6 +2675,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                     inheritanceMode: .useWorkspaceOverrides,
                     profile: AgentModelsSettingsProfile(
                         planningModelRaw: tierRaw,
+                        secondaryOracleModelRaw: tierRaw,
                         preferredComposeModelRaw: tierRaw,
                         mcpAgentRoleOverrides: [
                             "explore": tierSelectionRaw,
@@ -2633,7 +2693,11 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                 ]
             ),
             scalarPreferences: GlobalScalarPreferences(
-                modelSelection: .init(preferredComposeModel: tierRaw, planningModel: tierRaw)
+                modelSelection: .init(
+                    preferredComposeModel: tierRaw,
+                    planningModel: tierRaw,
+                    secondaryOracleModel: tierRaw
+                )
             )
         ))
         let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
@@ -2645,6 +2709,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertEqual(fileStore.saveCount, 1)
         XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(store.globalAgentModelsProfile().secondaryOracleModelRaw, AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(store.globalAgentModelsProfile().preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(
             store.globalAgentModelsProfile().contextBuilderModelsByAgent?[AgentProviderKind.codexExec.rawValue],
@@ -2657,6 +2722,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             "Parse-invalid overrides must survive byte-identical"
         )
         XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.secondaryOracleModelRaw,
+            AIModel.gpt54Pro.rawValue
+        )
         XCTAssertEqual(
             store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["explore"],
             normalizedSelectionRaw

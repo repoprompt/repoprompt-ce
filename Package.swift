@@ -2,6 +2,203 @@
 import Foundation
 import PackageDescription
 
+#if os(Linux)
+    // Linux ships only the upstream direct headless backend. The macOS app,
+    // proxy transport, interactive client, and bundled UI dependencies stay
+    // out of this graph so `repoprompt-mcp --backend headless` remains the
+    // single runtime implementation on both platforms.
+    let linuxSwift6: [SwiftSetting] = [.swiftLanguageMode(.v6)]
+
+    let package = Package(
+        name: "RepoPromptCE",
+        products: [
+            .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"])
+        ],
+        dependencies: [
+            .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.0"),
+            .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
+            .package(
+                url: "https://github.com/repoprompt/swift-sdk.git",
+                revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"
+            ),
+            .package(
+                url: "https://github.com/repoprompt/swift-tree-sitter.git",
+                revision: "a778ef4fb7f0d3ad00185f42ce83c688373c4361"
+            ),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-c", exact: "0.24.2"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-go", exact: "0.25.0"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-java", exact: "0.23.5"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-javascript", exact: "0.25.0"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-python", exact: "0.25.0"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-rust", exact: "0.24.2"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-typescript", exact: "0.23.2"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-ruby", exact: "0.23.1"),
+            .package(url: "https://github.com/alex-pinkus/tree-sitter-swift", exact: "0.7.3-with-generated-files"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-c-sharp.git", exact: "0.23.5"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-cpp", exact: "0.23.4"),
+            .package(url: "https://github.com/tree-sitter/tree-sitter-php.git", exact: "0.24.2")
+        ],
+        targets: [
+            .target(
+                name: "RepoPromptShared",
+                dependencies: [.product(name: "Crypto", package: "swift-crypto")],
+                path: "Sources/RepoPromptShared",
+                swiftSettings: linuxSwift6
+            ),
+            .target(
+                name: "RepoPromptRegexCore",
+                dependencies: ["CSwiftPCRE2"],
+                path: "Sources/RepoPromptRegexCore",
+                swiftSettings: linuxSwift6
+            ),
+            .target(
+                name: "RepoPromptWorkspaceCore",
+                path: "Sources/RepoPromptWorkspaceCore"
+            ),
+            .target(
+                name: "RepoPromptCodeMapCore",
+                dependencies: [
+                    "RepoPromptRegexCore",
+                    "TreeSitterScannerSupport",
+                    .product(name: "Crypto", package: "swift-crypto"),
+                    .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
+                    .product(name: "TreeSitterC", package: "tree-sitter-c"),
+                    .product(name: "TreeSitterGo", package: "tree-sitter-go"),
+                    .product(name: "TreeSitterJava", package: "tree-sitter-java"),
+                    .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
+                    .product(name: "TreeSitterPython", package: "tree-sitter-python"),
+                    .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
+                    .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
+                    .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
+                    .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
+                    .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
+                    .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
+                    .product(name: "TreeSitterPHP", package: "tree-sitter-php")
+                ],
+                path: "Sources/RepoPromptCodeMapCore",
+                swiftSettings: linuxSwift6
+            ),
+            .target(
+                name: "RepoPromptDomainRuntime",
+                dependencies: [
+                    "RepoPromptShared",
+                    "RepoPromptC",
+                    "RepoPromptCodeMapCore",
+                    .product(name: "Crypto", package: "swift-crypto"),
+                    .product(name: "Logging", package: "swift-log"),
+                    .product(name: "MCP", package: "swift-sdk")
+                ],
+                path: "Sources/RepoPromptDomainRuntime",
+                swiftSettings: linuxSwift6
+            ),
+            .executableTarget(
+                name: "RepoPromptMCP",
+                dependencies: [
+                    "RepoPromptShared",
+                    "RepoPromptDomainRuntime",
+                    .product(name: "Crypto", package: "swift-crypto"),
+                    .product(name: "Logging", package: "swift-log"),
+                    .product(name: "MCP", package: "swift-sdk")
+                ],
+                path: "Sources/RepoPromptMCP",
+                exclude: [
+                    "CommandRunner",
+                    "DeviceIdentity.swift",
+                    "Exec",
+                    "Interactive",
+                    "MCPBackendSelection.swift",
+                    "MCPReplayState.swift",
+                    "Shared",
+                    "Transports/BootstrapSocketMCPTransport.swift",
+                    "Transports/OrderedMCPTransport.swift",
+                    "main.swift"
+                ],
+                sources: [
+                    "DirectHeadlessCapabilityBackends.swift",
+                    "DirectHeadlessClientIdentity.swift",
+                    "DirectHeadlessChildBridge.swift",
+                    "DirectHeadlessChildEndpoint.swift",
+                    "DirectHeadlessDomainContext.swift",
+                    "DirectHeadlessMCPService.swift",
+                    "DirectHeadlessOracleCoordinator.swift",
+                    "DirectHeadlessProviderCoordinator.swift",
+                    "DirectHeadlessRuntimeConfiguration.swift",
+                    "DirectHeadlessWorkspaceBackends.swift",
+                    "CLIProductVersion.swift",
+                    "LinuxHeadlessMain.swift",
+                    "MCPStdioServerTransport.swift",
+                    "POSIXSocketCompatibility.swift",
+                    "Transports/NonBlockingFDWriter.swift"
+                ],
+                swiftSettings: linuxSwift6
+            ),
+            .target(
+                name: "CSwiftPCRE2",
+                path: "Sources/CSwiftPCRE2",
+                exclude: [
+                    "deps/sljit/sljit_src/sljitNativeARM_64.c",
+                    "deps/sljit/sljit_src/sljitSerialize.c",
+                    "deps/sljit/sljit_src/sljitUtils.c",
+                    "deps/sljit/sljit_src/sljitNativeX86_common.c",
+                    "deps/sljit/sljit_src/sljitNativeX86_64.c",
+                    "deps/sljit/sljit_src/sljitNativeX86_32.c",
+                    "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c",
+                    "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c",
+                    "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c",
+                    "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c",
+                    "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"
+                ],
+                publicHeadersPath: "include",
+                cSettings: [
+                    .headerSearchPath("include"),
+                    .headerSearchPath("src"),
+                    .define("PCRE2_CODE_UNIT_WIDTH", to: "8"),
+                    .define("HAVE_CONFIG_H")
+                ]
+            ),
+            .target(
+                name: "RepoPromptC",
+                path: "Sources/RepoPromptC",
+                publicHeadersPath: "include",
+                cSettings: [.headerSearchPath("include")]
+            ),
+            .target(
+                name: "TreeSitterScannerSupport",
+                path: "Sources/TreeSitterScannerSupport",
+                sources: ["src/javascript/scanner.c", "src/python/scanner.c"],
+                publicHeadersPath: "include"
+            ),
+            .testTarget(
+                name: "RepoPromptDomainRuntimeTests",
+                dependencies: [
+                    "RepoPromptDomainRuntime",
+                    .product(name: "MCP", package: "swift-sdk")
+                ],
+                path: "Tests/RepoPromptDomainRuntimeTests",
+                swiftSettings: linuxSwift6
+            ),
+            .testTarget(
+                name: "RepoPromptWorkspaceCoreTests",
+                dependencies: ["RepoPromptWorkspaceCore"],
+                path: "Tests/RepoPromptWorkspaceCoreTests"
+            ),
+            .testTarget(
+                name: "RepoPromptCodeMapCoreTests",
+                dependencies: [
+                    "RepoPromptCodeMapCore",
+                    .product(name: "Crypto", package: "swift-crypto")
+                ],
+                path: "Tests/RepoPromptCodeMapCoreTests",
+                resources: [
+                    .copy("Fixtures"),
+                    .copy("Goldens")
+                ],
+                swiftSettings: linuxSwift6
+            )
+        ],
+        swiftLanguageModes: [.v5]
+    )
+#else
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 
 // Telemetry (Sentry) is resolved deterministically but linked only when explicitly
@@ -237,3 +434,4 @@ let package = Package(
     ],
     swiftLanguageModes: [.v5]
 )
+#endif

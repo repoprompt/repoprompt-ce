@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 
 package struct DomainMutationPathIdentity: Codable, Hashable, Sendable {
@@ -6,6 +10,8 @@ package struct DomainMutationPathIdentity: Codable, Hashable, Sendable {
     package let resolvedPath: String
     package let device: UInt64
     package let inode: UInt64
+    package let statusChangeSeconds: Int64
+    package let statusChangeNanoseconds: Int64
 }
 
 package struct DomainMutationPathFenceEntry: Codable, Hashable, Sendable {
@@ -91,7 +97,7 @@ package enum DomainMutationPathFence {
     package static func revalidateBlocking(_ snapshot: DomainMutationPathFenceSnapshot) throws {
         for root in snapshot.authorizedRoots {
             let currentRoot = try identity(root.originalPath)
-            guard currentRoot == root else {
+            guard sameFilesystemObject(currentRoot, root) else {
                 throw DomainMutationPathFenceError.rootIdentityChanged(root.originalPath)
             }
         }
@@ -149,11 +155,20 @@ package enum DomainMutationPathFence {
         guard lstat(standardized, &info) == 0 else {
             throw DomainMutationPathFenceError.rootUnavailable(path)
         }
+        #if canImport(Darwin)
+            let statusChangeSeconds = Int64(info.st_ctimespec.tv_sec)
+            let statusChangeNanoseconds = Int64(info.st_ctimespec.tv_nsec)
+        #else
+            let statusChangeSeconds = Int64(info.st_ctim.tv_sec)
+            let statusChangeNanoseconds = Int64(info.st_ctim.tv_nsec)
+        #endif
         return DomainMutationPathIdentity(
             originalPath: standardized,
             resolvedPath: URL(fileURLWithPath: standardized).resolvingSymlinksInPath().standardizedFileURL.path,
             device: UInt64(info.st_dev),
-            inode: UInt64(info.st_ino)
+            inode: UInt64(info.st_ino),
+            statusChangeSeconds: statusChangeSeconds,
+            statusChangeNanoseconds: statusChangeNanoseconds
         )
     }
 
@@ -184,5 +199,15 @@ package enum DomainMutationPathFence {
 
     private static func isContained(_ path: String, by root: String) -> Bool {
         path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    private static func sameFilesystemObject(
+        _ lhs: DomainMutationPathIdentity,
+        _ rhs: DomainMutationPathIdentity
+    ) -> Bool {
+        lhs.originalPath == rhs.originalPath
+            && lhs.resolvedPath == rhs.resolvedPath
+            && lhs.device == rhs.device
+            && lhs.inode == rhs.inode
     }
 }

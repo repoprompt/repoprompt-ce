@@ -1,6 +1,14 @@
 #if RPCE_BENCHMARK_TESTS
-    import CryptoKit
-    import Darwin
+    #if canImport(CryptoKit)
+        import CryptoKit
+    #else
+        import Crypto
+    #endif
+    #if canImport(Darwin)
+        import Darwin
+    #else
+        import Glibc
+    #endif
     import Foundation
     @testable import RepoPromptCodeMapCore
 
@@ -363,7 +371,7 @@
                 }
                 var total = 0
                 while total < buffer.count {
-                    let result = Darwin.write(descriptor, base.advanced(by: total), buffer.count - total)
+                    let result = write(descriptor, base.advanced(by: total), buffer.count - total)
                     if result < 0 {
                         if errno == EINTR { continue }
                         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)

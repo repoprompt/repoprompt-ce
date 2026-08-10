@@ -115,6 +115,7 @@ if ! tree_sitter_dependency_manifest_output="$(python3 <<'PY'
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 expected_packages = {
@@ -137,6 +138,7 @@ resolved = json.loads(Path("Package.resolved").read_text())
 resolved_pins = {pin["identity"]: pin for pin in resolved["pins"]}
 package = json.loads(subprocess.check_output(["swift", "package", "dump-package"], text=True))
 targets = {target["name"]: target for target in package["targets"]}
+is_linux = sys.platform.startswith("linux")
 repo_prompt = targets.get("RepoPrompt", {})
 repo_prompt_app = targets.get("RepoPromptApp", {})
 repo_prompt_dependencies = repo_prompt.get("dependencies", [])
@@ -154,16 +156,16 @@ repo_prompt_code_map_core_products = {
     if "product" in dependency
 }
 
-if repo_prompt.get("type") != "executable":
+if not is_linux and repo_prompt.get("type") != "executable":
     errors.append("RepoPrompt target must remain executable")
-if repo_prompt.get("path") != "Sources/RepoPromptExecutable":
+if not is_linux and repo_prompt.get("path") != "Sources/RepoPromptExecutable":
     errors.append("RepoPrompt target must remain the thin Sources/RepoPromptExecutable entry target")
 repo_prompt_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_dependencies if dependency.get("byName")]
-if len(repo_prompt_dependencies) != 1 or repo_prompt_by_name_dependencies != ["RepoPromptApp"]:
+if not is_linux and (len(repo_prompt_dependencies) != 1 or repo_prompt_by_name_dependencies != ["RepoPromptApp"]):
     errors.append("RepoPrompt executable target must depend only on RepoPromptApp")
-if repo_prompt_app.get("type") != "regular":
+if not is_linux and repo_prompt_app.get("type") != "regular":
     errors.append("RepoPromptApp target must remain an internal library target")
-if repo_prompt_app.get("path") != "Sources/RepoPrompt":
+if not is_linux and repo_prompt_app.get("path") != "Sources/RepoPrompt":
     errors.append("RepoPromptApp target must retain the Sources/RepoPrompt implementation path")
 
 workspace_core = targets.get("RepoPromptWorkspaceCore")
@@ -186,7 +188,7 @@ else:
         errors.append("RepoPromptWorkspaceCoreTests must depend only on RepoPromptWorkspaceCore")
 
 app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
-if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
+if not is_linux and app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
 for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "RepoPromptTests"):
     dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
@@ -218,7 +220,7 @@ if wrapper_manifest_pattern.search(manifest_text) is None:
     errors.append("Package.swift must use the unnamed URL/revision declaration for the approved RepoPrompt SwiftTreeSitter fork")
 if wrapper.get("location") != wrapper_url or wrapper.get("state", {}) != {"revision": wrapper_revision}:
     errors.append("SwiftTreeSitter fork location/revision drifted")
-if ("SwiftTreeSitter", "swift-tree-sitter") in repo_prompt_app_products:
+if not is_linux and ("SwiftTreeSitter", "swift-tree-sitter") in repo_prompt_app_products:
     errors.append("RepoPromptApp must not directly depend on SwiftTreeSitter")
 if ("SwiftTreeSitter", "swift-tree-sitter") not in repo_prompt_code_map_core_products:
     errors.append("RepoPromptCodeMapCore missing direct SwiftTreeSitter product dependency")
@@ -246,9 +248,9 @@ core_by_name_dependencies = [
 ]
 if core_by_name_dependencies.count("TreeSitterScannerSupport") != 1:
     errors.append("RepoPromptCodeMapCore must directly depend exactly once on TreeSitterScannerSupport")
-if app_by_name_dependencies.count("TreeSitterScannerSupport") != 0:
+if not is_linux and app_by_name_dependencies.count("TreeSitterScannerSupport") != 0:
     errors.append("RepoPromptApp must not directly depend on TreeSitterScannerSupport")
-if app_by_name_dependencies.count("RepoPromptCodeMapCore") != 1:
+if not is_linux and app_by_name_dependencies.count("RepoPromptCodeMapCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptCodeMapCore")
 
 # M1 headless domain runtime is an internal AppKit-free owner boundary. During the
@@ -271,7 +273,12 @@ else:
         for dependency in domain_runtime.get("dependencies", [])
         if "product" in dependency
     }
-    if runtime_by_name != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 5:
+    expected_runtime_products = {("Logging", "swift-log"), ("MCP", "swift-sdk")}
+    expected_runtime_count = 5
+    if is_linux:
+        expected_runtime_products.add(("Crypto", "swift-crypto"))
+        expected_runtime_count = 6
+    if runtime_by_name != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != expected_runtime_products or len(domain_runtime.get("dependencies", [])) != expected_runtime_count:
         errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
 if domain_runtime_tests is None:
     errors.append("RepoPromptDomainRuntimeTests target missing")
@@ -311,10 +318,10 @@ if domain_runtime is not None and domain_runtime_tests is not None:
             errors.append("Swift 5 domain runtime and owner tests must retain complete StrictConcurrency checking")
     elif runtime_modes != ["6"]:
         errors.append("RepoPromptDomainRuntime and owner tests must be either Swift 5 + StrictConcurrency or Swift 6")
-if app_by_name_dependencies.count("RepoPromptDomainRuntime") != 1:
+if not is_linux and app_by_name_dependencies.count("RepoPromptDomainRuntime") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 repo_prompt_tests_dependencies = [dependency["byName"][0] for dependency in targets.get("RepoPromptTests", {}).get("dependencies", []) if dependency.get("byName")]
-if repo_prompt_tests_dependencies.count("RepoPromptDomainRuntime") != 1:
+if not is_linux and repo_prompt_tests_dependencies.count("RepoPromptDomainRuntime") != 1:
     errors.append("RepoPromptTests must directly consume RepoPromptDomainRuntime for adapter evidence")
 
 code_map_core_tests = targets.get("RepoPromptCodeMapCoreTests", {})

@@ -438,17 +438,23 @@ package struct DomainChildLaunchCarrier: Sendable {
 
     package let runID: UUID
     package let launchTokenID: UUID
+    package let context: DomainContextIdentity?
+    package let expectedContextRevision: UInt64?
     package let credentialEnvelope: DomainCredentialEnvelopeDescriptor?
     package let environment: [String: String]
 
     package init(
         runID: UUID,
         launchTokenID: UUID,
+        context: DomainContextIdentity? = nil,
+        expectedContextRevision: UInt64? = nil,
         credentialEnvelope: DomainCredentialEnvelopeDescriptor?,
         environment: [String: String]
     ) {
         self.runID = runID
         self.launchTokenID = launchTokenID
+        self.context = context
+        self.expectedContextRevision = expectedContextRevision
         self.credentialEnvelope = credentialEnvelope
         self.environment = environment
     }
@@ -498,6 +504,8 @@ package struct DomainPrivateChildLaunchHarness: Sendable {
         return DomainChildLaunchCarrier(
             runID: request.runID,
             launchTokenID: token.tokenID,
+            context: request.context,
+            expectedContextRevision: request.expectedContextRevision,
             credentialEnvelope: descriptor,
             environment: environment
         )

@@ -62,6 +62,8 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 })
             )
             XCTAssertEqual(viewModel.currentFollowUpOracleChatID(for: tabID), oracleSession.shortID)
+            let didReloadSession = await composition.oracleViewModel.ensureSessionMessagesLoaded(oracleSession.id)
+            XCTAssertTrue(didReloadSession)
             let retainedResponse = try XCTUnwrap(
                 composition.oracleViewModel.messagesSnapshot(for: oracleSession.id)
                     .first(where: { !$0.isUser })
@@ -368,7 +370,7 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
             installModelHook(on: viewModel)
             defer { viewModel.installRunTestHooks(nil) }
 
-            let reply = try await viewModel.runMCPPlanOrQuestion(
+            let result = try await viewModel.runMCPPlanOrQuestion(
                 for: identity,
                 oracleViewModel: composition.oracleViewModel,
                 mode: .plan,
@@ -376,6 +378,7 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 selection: StoredSelection(),
                 reviewGitContext: .automaticOnly()
             )
+            let reply = result.primaryReply()
 
             XCTAssertEqual(reply.response, "partial response")
             XCTAssertEqual(viewModel.currentFollowUpOracleChatID(for: tabID), reply.shortId)

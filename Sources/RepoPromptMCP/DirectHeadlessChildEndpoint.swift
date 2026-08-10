@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import Logging
 import MCP
@@ -65,15 +69,14 @@ actor DirectHeadlessChildEndpoint {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         directoryIdentity = Self.identity(at: directory.path)
 
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = rpMakeUnixStreamSocket()
         guard fd >= 0 else { throw EndpointError.socket(errno: errno) }
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        rpConfigureNoSIGPIPE(fd)
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = socketURL.path.utf8CString
         guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
-            Darwin.close(fd)
+            close(fd)
             throw EndpointError.pathTooLong
         }
         withUnsafeMutablePointer(to: &address.sun_path) { pointer in
@@ -85,23 +88,23 @@ actor DirectHeadlessChildEndpoint {
         }
         let bindResult = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         guard bindResult == 0 else {
             let code = errno
-            Darwin.close(fd)
+            close(fd)
             throw EndpointError.bind(errno: code)
         }
         guard chmod(socketURL.path, 0o600) == 0 else {
             let code = errno
-            Darwin.close(fd)
+            close(fd)
             unlink(socketURL.path)
             throw EndpointError.bind(errno: code)
         }
-        guard Darwin.listen(fd, 8) == 0 else {
+        guard listen(fd, 8) == 0 else {
             let code = errno
-            Darwin.close(fd)
+            close(fd)
             unlink(socketURL.path)
             throw EndpointError.listen(errno: code)
         }
@@ -117,8 +120,8 @@ actor DirectHeadlessChildEndpoint {
         let listener = listenFD
         listenFD = -1
         if listener >= 0 {
-            Darwin.shutdown(listener, SHUT_RDWR)
-            Darwin.close(listener)
+            rpShutdownReadWrite(listener)
+            close(listener)
         }
         acceptTask?.cancel()
         let accept = acceptTask
@@ -126,7 +129,7 @@ actor DirectHeadlessChildEndpoint {
         let clients = Array(clientTasks.values)
         clientTasks.removeAll()
         for client in clients {
-            Darwin.shutdown(client.fd, SHUT_RDWR)
+            rpShutdownReadWrite(client.fd)
             client.task.cancel()
         }
         await accept?.value
@@ -152,7 +155,7 @@ actor DirectHeadlessChildEndpoint {
     ) async {
         while !Task.isCancelled {
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLERR | POLLHUP), revents: 0)
-            let polled = Darwin.poll(&descriptor, 1, 100)
+            let polled = poll(&descriptor, 1, 100)
             if polled == 0 { continue }
             if polled < 0 {
                 if errno == EINTR { continue }
@@ -162,15 +165,14 @@ actor DirectHeadlessChildEndpoint {
             var length = socklen_t(MemoryLayout<sockaddr_un>.size)
             let clientFD = withUnsafeMutablePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.accept(fd, $0, &length)
+                    accept(fd, $0, &length)
                 }
             }
             if clientFD < 0 {
                 if errno == EINTR || errno == EAGAIN { continue }
                 return
             }
-            var noSigPipe: Int32 = 1
-            setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            rpConfigureNoSIGPIPE(clientFD)
             await endpoint.acceptClient(fd: clientFD, handler: handler)
         }
     }
@@ -179,7 +181,7 @@ actor DirectHeadlessChildEndpoint {
         let id = UUID()
         let logger = logger
         let task = Task.detached(priority: .userInitiated) { [weak self] in
-            defer { Darwin.close(fd) }
+            defer { close(fd) }
             do {
                 let handshake = try Self.readHandshake(fd: fd)
                 let peerPID = Self.peerPID(fd: fd)
@@ -202,13 +204,13 @@ actor DirectHeadlessChildEndpoint {
         var byte: UInt8 = 0
         while ContinuousClock().now < deadline {
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLERR | POLLHUP), revents: 0)
-            let polled = Darwin.poll(&descriptor, 1, 100)
+            let polled = poll(&descriptor, 1, 100)
             if polled == 0 { continue }
             if polled < 0 {
                 if errno == EINTR { continue }
                 throw EndpointError.handshakeRead(errno: errno)
             }
-            let count = Darwin.read(fd, &byte, 1)
+            let count = read(fd, &byte, 1)
             if count == 0 { throw EndpointError.invalidHandshake }
             if count < 0 {
                 if errno == EINTR || errno == EAGAIN { continue }
@@ -227,10 +229,7 @@ actor DirectHeadlessChildEndpoint {
     }
 
     private nonisolated static func peerPID(fd: Int32) -> Int32? {
-        var pid: pid_t = 0
-        var size = socklen_t(MemoryLayout<pid_t>.size)
-        guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0, pid > 0 else { return nil }
-        return pid
+        rpPeerProcessID(fd)
     }
 
     private nonisolated static func identity(at path: String) -> SocketIdentity? {
@@ -266,18 +265,25 @@ actor DirectHeadlessChildLaunchCoordinator {
         securityContext: DomainToolInvocationSecurityContext
     ) async throws -> DomainChildLaunchCarrier? {
         guard let runtime, let harness else { throw CoordinatorError.unavailable }
-        let registration = try await runtime.routingCoordinator.currentRegistration(
-            connectionID: securityContext.connectionID
-        )
-        let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
-        let provider = arguments["provider"]?.stringValue
-            ?? arguments["model_id"]?.stringValue
-            ?? "headless"
+        let context: DomainContextIdentity
+        let expectedContextRevision: UInt64
+        if let anchor = DomainChildLaunchReservationContext.current {
+            context = anchor.context
+            expectedContextRevision = anchor.expectedContextRevision
+        } else {
+            let registration = try await runtime.routingCoordinator.currentRegistration(
+                connectionID: securityContext.connectionID
+            )
+            let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+            context = handle.context
+            expectedContextRevision = handle.contextRevision
+        }
+        let provider = Self.providerIdentifier(arguments: arguments)
         let runID = arguments["run_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? UUID()
         let request = DomainRunLaunchReservationRequest(
             runID: runID,
-            context: handle.context,
-            expectedContextRevision: handle.contextRevision,
+            context: context,
+            expectedContextRevision: expectedContextRevision,
             windowID: nil,
             clientPrincipal: securityContext.principal.stableKey ?? securityContext.principal.displayName,
             providerIdentifier: provider,
@@ -287,5 +293,23 @@ actor DirectHeadlessChildLaunchCoordinator {
             lifetime: .seconds(60)
         )
         return try await harness.prepare(request: request)
+    }
+
+    nonisolated static func providerIdentifier(arguments: [String: MCP.Value]) -> String {
+        let requested = arguments["provider"]?.stringValue
+            ?? arguments["model_id"]?.stringValue
+        let normalized = requested?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let codexRoleAliases: Set<String> = [
+            "pair", "explore", "engineer", "design", "default", "headless"
+        ]
+        if let normalized, !normalized.isEmpty, !codexRoleAliases.contains(normalized) {
+            return requested?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "codexExec"
+        }
+        // The direct backend currently has one physical provider. Preserve its
+        // identity in the launch token so the private child receives the Codex
+        // engineer policy rather than a generic role profile.
+        return "codexExec"
     }
 }

@@ -3477,7 +3477,7 @@ label_generated_tip_appcast""",
 
     def test_mcp_cli_version_sync_updates_source_and_check_detects_drift(self) -> None:
         root = self.make_metadata_root()
-        source = root / "Sources" / "RepoPromptMCP" / "main.swift"
+        source = root / "Sources" / "RepoPromptMCP" / "CLIProductVersion.swift"
         source.parent.mkdir(parents=True)
         source.write_text('let CLI_VERSION = "9.9.9"\n', encoding="utf-8")
         env = os.environ.copy()

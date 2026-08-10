@@ -50,9 +50,25 @@ enum DirectHeadlessRuntimeLocationResolver {
             eventDirectory = root.appendingPathComponent("Events", isDirectory: true)
             runtimeTemporaryDirectory = root.appendingPathComponent("Temporary", isDirectory: true)
         } else {
-            let root = homeDirectory
+            let root: URL
+#if os(Linux)
+            if let xdgDataHome = environment["XDG_DATA_HOME"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !xdgDataHome.isEmpty
+            {
+                root = URL(fileURLWithPath: xdgDataHome, isDirectory: true)
+                    .appendingPathComponent("repoprompt-ce", isDirectory: true)
+                    .standardizedFileURL
+            } else {
+                root = homeDirectory
+                    .appendingPathComponent(".local/share/repoprompt-ce", isDirectory: true)
+                    .standardizedFileURL
+            }
+#else
+            root = homeDirectory
                 .appendingPathComponent("Library/Application Support/RepoPrompt CE", isDirectory: true)
                 .standardizedFileURL
+#endif
             storageDirectory = root
             workspaceStorageDirectory = customWorkspaceStoragePath.flatMap { path -> URL? in
                 let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)

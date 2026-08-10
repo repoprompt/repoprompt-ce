@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -65,8 +70,7 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             try manager.moveItem(at: source, to: destination)
         case "delete":
             guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
-            var resultingURL: NSURL?
-            try manager.trashItem(at: source, resultingItemURL: &resultingURL)
+            try moveToTrash(source, using: manager)
         default:
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }
@@ -144,6 +148,56 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             DomainMutationPhysicalRootMapping(canonicalRoot: $0.path, physicalRoot: $0.path)
         }
         try await MCPDomainMutationCommitContext.admitPhysicalTargets(paths, rootMappings: mappings)
+    }
+
+    private func moveToTrash(_ source: URL, using manager: FileManager) throws {
+        #if canImport(Darwin)
+            var resultingURL: NSURL?
+            try manager.trashItem(at: source, resultingItemURL: &resultingURL)
+        #else
+            let environment = ProcessInfo.processInfo.environment
+            let dataHome = environment["XDG_DATA_HOME"].flatMap { value in
+                value.isEmpty ? nil : URL(fileURLWithPath: value, isDirectory: true)
+            } ?? manager.homeDirectoryForCurrentUser
+                .appendingPathComponent(".local/share", isDirectory: true)
+            let trashRoot = dataHome.appendingPathComponent("Trash", isDirectory: true)
+            let filesDirectory = trashRoot.appendingPathComponent("files", isDirectory: true)
+            let infoDirectory = trashRoot.appendingPathComponent("info", isDirectory: true)
+            try manager.createDirectory(at: filesDirectory, withIntermediateDirectories: true)
+            try manager.createDirectory(at: infoDirectory, withIntermediateDirectories: true)
+
+            let baseName = source.lastPathComponent.isEmpty ? "item" : source.lastPathComponent
+            var trashName = baseName
+            while manager.fileExists(atPath: filesDirectory.appendingPathComponent(trashName).path)
+                || manager.fileExists(atPath: infoDirectory.appendingPathComponent("\(trashName).trashinfo").path)
+            {
+                trashName = "\(baseName).\(UUID().uuidString.lowercased())"
+            }
+            let destination = filesDirectory.appendingPathComponent(trashName)
+            let infoURL = infoDirectory.appendingPathComponent("\(trashName).trashinfo")
+            let encodedPath = source.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? source.path
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            let info = "[Trash Info]\nPath=\(encodedPath)\nDeletionDate=\(formatter.string(from: Date()))\n"
+            try info.write(to: infoURL, atomically: true, encoding: .utf8)
+            do {
+                do {
+                    try manager.moveItem(at: source, to: destination)
+                } catch {
+                    try manager.copyItem(at: source, to: destination)
+                    do {
+                        try manager.removeItem(at: source)
+                    } catch {
+                        try? manager.removeItem(at: destination)
+                        throw error
+                    }
+                }
+            } catch {
+                try? manager.removeItem(at: infoURL)
+                throw error
+            }
+        #endif
     }
 }
 
@@ -673,22 +727,20 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 }
 
 actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
-    private let coordinator: DirectHeadlessProviderCoordinator
+    private let coordinator: DirectHeadlessOracleCoordinator
 
-    init(coordinator: DirectHeadlessProviderCoordinator) {
+    init(coordinator: DirectHeadlessOracleCoordinator) {
         self.coordinator = coordinator
     }
 
     func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         let op = args["op"]?.stringValue ?? "models"
-        let providers = await coordinator.providerCatalog().map(\.value)
-        return try .object([
-            "op": .string(op),
-            "models": .array(providers),
-            "providers": .array(providers),
-            "backend": .string("headless")
-        ])
+        return try await .mcp(coordinator.utilityResult(
+            operation: op,
+            limit: args["limit"]?.intValue ?? 50,
+            request: request
+        ))
     }
 
     func startOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -696,47 +748,56 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         guard let message = args["message"]?.stringValue, !message.isEmpty else {
             throw MCPError.invalidParams("ask_oracle requires message")
         }
-        let (id, response) = try await coordinator.createConversation(
+        return try await .mcp(coordinator.start(
             providerID: args["provider"]?.stringValue,
             message: message,
             model: args["model"]?.stringValue,
+            mode: args["mode"]?.stringValue ?? "chat",
             request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        ))
     }
 
     func continueOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
-        guard let rawID = args["chat_id"]?.stringValue,
-              let id = UUID(uuidString: rawID),
-              let message = args["message"]?.stringValue,
-              !message.isEmpty
-        else {
-            throw MCPError.invalidParams("oracle_send requires chat_id and message")
+        guard let message = args["message"]?.stringValue, !message.isEmpty else {
+            throw MCPError.invalidParams("oracle_send requires message")
         }
-        let response = try await coordinator.continueConversation(
-            id: id,
+        let forceNew = args["new_chat"]?.boolValue ?? false
+        let id: UUID?
+        if !forceNew, let rawID = args["chat_id"]?.stringValue {
+            guard let parsed = UUID(uuidString: rawID) else {
+                throw MCPError.invalidParams("chat_id must be a UUID")
+            }
+            id = parsed
+        } else {
+            id = nil
+        }
+        return try await .mcp(coordinator.send(
+            providerID: args["provider"]?.stringValue,
+            requestedID: id,
+            forceNew: forceNew,
             message: message,
             model: args["model"]?.stringValue,
+            mode: args["mode"]?.stringValue ?? "chat",
             request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        ))
     }
 
     func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
-        let id = args["chat_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+        let id: UUID?
+        if let rawID = args["chat_id"]?.stringValue {
+            guard let parsed = UUID(uuidString: rawID) else {
+                throw MCPError.invalidParams("chat_id must be a UUID")
+            }
+            id = parsed
+        } else {
+            id = nil
+        }
         return try await .mcp(coordinator.conversationLog(
             id: id,
-            limit: args["limit"]?.intValue ?? 8
+            limit: args["limit"]?.intValue ?? 8,
+            request: request
         ))
     }
 
@@ -745,17 +806,13 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         guard let instructions = args["instructions"]?.stringValue, !instructions.isEmpty else {
             throw MCPError.invalidParams("context_builder requires instructions")
         }
-        let (id, response) = try await coordinator.createConversation(
+        return try await .mcp(coordinator.buildContext(
             providerID: args["provider"]?.stringValue,
-            message: instructions,
+            instructions: instructions,
             model: args["model"]?.stringValue,
+            responseType: args["response_type"]?.stringValue,
             request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        ))
     }
 
     func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -1010,6 +1067,13 @@ enum DirectProcess {
         "XDG_DATA_HOME"
     ]
 
+    /// Credentials are accepted only when a caller deliberately supplies them for a
+    /// specific child invocation. Ambient credentials must not leak into unrelated git
+    /// subprocesses that also use `DirectProcess`.
+    private static let explicitEnvironmentKeys: Set<String> = [
+        "CODEX_API_KEY"
+    ]
+
     private static let childLaunchEnvironmentKeys: Set<String> = [
         DomainChildLaunchCarrier.endpointEnvironmentKey,
         DomainChildLaunchCarrier.launchTokenEnvironmentKey,
@@ -1033,6 +1097,7 @@ enum DirectProcess {
             inheritedEnvironmentKeys.contains(key) || key.hasPrefix("LC_")
         }
         for (key, value) in overrides where inheritedEnvironmentKeys.contains(key)
+            || explicitEnvironmentKeys.contains(key)
             || childLaunchEnvironmentKeys.contains(key)
             || key.hasPrefix("LC_")
         {
@@ -1062,15 +1127,26 @@ enum DirectProcess {
 
 private final class DirectProcessInvocation: @unchecked Sendable {
     private static let outputLimit = 8 * 1024 * 1024
+    private static let cancellationGraceInterval: TimeInterval = 1
+    private static let cancellationPollInterval: TimeInterval = 0.01
 
     private let lock = NSLock()
-    private let process = Process()
-    private let pipe = Pipe()
-    private let inputPipe: Pipe?
+    private let executable: String
+    private let arguments: [String]
     private let input: Data?
+    private let environment: [String: String]
+    private let currentDirectory: URL?
     private var output = Data()
     private var truncated = false
     private var cancellationRequested = false
+    private var cancellationStarted = false
+    private var cancellationCleanupFinished = false
+    private var processID: pid_t = 0
+    private var waitOutcome: Result<Int32, Error>?
+    private var outputFinished = false
+    private var continuation: CheckedContinuation<String, Error>?
+    private var inputHandle: FileHandle?
+    private var completed = false
 
     init(
         executable: String,
@@ -1079,57 +1155,20 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         environment overrides: [String: String],
         currentDirectory: URL?
     ) {
+        self.executable = executable
+        self.arguments = arguments
         self.input = input
-        inputPipe = input == nil ? nil : Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = DirectProcess.childEnvironment(overrides: overrides)
-        process.currentDirectoryURL = currentDirectory
-        process.standardOutput = pipe
-        process.standardError = pipe
-        if let inputPipe {
-            process.standardInput = inputPipe
-        }
+        environment = DirectProcess.childEnvironment(overrides: overrides)
+        self.currentDirectory = currentDirectory
     }
 
     func run() async throws -> String {
         try Task.checkCancellation()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    self?.append(handle.availableData)
-                }
-                process.terminationHandler = { [weak self] process in
-                    guard let self else {
-                        continuation.resume(throwing: CancellationError())
-                        return
-                    }
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    append(pipe.fileHandleForReading.readDataToEndOfFile())
-                    let snapshot = takeSnapshot()
-                    if snapshot.cancelled {
-                        continuation.resume(throwing: CancellationError())
-                    } else {
-                        var text = String(decoding: snapshot.data, as: UTF8.self)
-                        if snapshot.truncated { text += "\n[output truncated at \(Self.outputLimit) bytes]" }
-                        if process.terminationStatus == 0 {
-                            continuation.resume(returning: text)
-                        } else {
-                            continuation.resume(throwing: MCPError.internalError(
-                                text.trimmingCharacters(in: .whitespacesAndNewlines)
-                            ))
-                        }
-                    }
-                }
                 do {
-                    try process.run()
-                    if let inputPipe, let input {
-                        inputPipe.fileHandleForWriting.write(input)
-                        try? inputPipe.fileHandleForWriting.close()
-                    }
-                    if isCancellationRequested() { cancelProcess() }
+                    try start(continuation: continuation)
                 } catch {
-                    pipe.fileHandleForReading.readabilityHandler = nil
                     continuation.resume(throwing: error)
                 }
             }
@@ -1138,11 +1177,83 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         }
     }
 
+    private func start(continuation: CheckedContinuation<String, Error>) throws {
+        let spawned = try Self.spawn(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            currentDirectory: currentDirectory,
+            hasInput: input != nil
+        )
+
+        lock.lock()
+        self.continuation = continuation
+        processID = spawned.pid
+        inputHandle = spawned.input
+        let shouldCancel = cancellationRequested && !cancellationStarted
+        if shouldCancel { cancellationStarted = true }
+        lock.unlock()
+
+        readOutput(from: spawned.output)
+        waitForExit(pid: spawned.pid)
+        writeInput(to: spawned.input)
+        if shouldCancel { cancelProcessGroup(spawned.pid) }
+    }
+
+    private func readOutput(from handle: FileHandle) {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            while true {
+                do {
+                    guard let data = try handle.read(upToCount: 64 * 1024), !data.isEmpty else { break }
+                    append(data)
+                } catch {
+                    break
+                }
+            }
+            try? handle.close()
+            lock.lock()
+            outputFinished = true
+            lock.unlock()
+            finishIfReady()
+        }
+    }
+
+    private func waitForExit(pid: pid_t) {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            var status: Int32 = 0
+            var result: pid_t
+            repeat {
+                result = waitpid(pid, &status, 0)
+            } while result < 0 && errno == EINTR
+
+            let outcome: Result<Int32, Error>
+            if result == pid {
+                outcome = .success(status)
+            } else {
+                outcome = .failure(Self.posixError(operation: "waitpid", code: errno))
+            }
+            lock.lock()
+            waitOutcome = outcome
+            lock.unlock()
+            finishIfReady()
+        }
+    }
+
+    private func writeInput(to handle: FileHandle?) {
+        guard let handle else { return }
+        let input = input ?? Data()
+        DispatchQueue.global(qos: .utility).async {
+            try? handle.write(contentsOf: input)
+            try? handle.close()
+        }
+    }
+
     private func append(_ data: Data) {
         guard !data.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard output.count < Self.outputLimit else { truncated = true
+        guard output.count < Self.outputLimit else {
+            truncated = true
             return
         }
         let remaining = Self.outputLimit - output.count
@@ -1150,35 +1261,371 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         if data.count > remaining { truncated = true }
     }
 
-    private func takeSnapshot() -> (data: Data, truncated: Bool, cancelled: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        return (output, truncated, cancellationRequested)
-    }
-
-    private func isCancellationRequested() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cancellationRequested
-    }
-
     private func requestCancellation() {
         lock.lock()
         cancellationRequested = true
-        let isRunning = process.isRunning
-        let pid = process.processIdentifier
+        let handle = inputHandle
+        let pid = processID
+        let shouldCancel = pid > 0 && !cancellationStarted && !completed
+        if shouldCancel { cancellationStarted = true }
         lock.unlock()
-        guard isRunning else { return }
-        cancelProcess()
-        if pid > 0 {
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak process] in
-                guard let process, process.isRunning, process.processIdentifier == pid else { return }
-                _ = kill(pid, SIGKILL)
+        if shouldCancel { cancelProcessGroup(pid) }
+        try? handle?.close()
+    }
+
+    private func cancelProcessGroup(_ pid: pid_t) {
+        // The provider root is the process-group leader, so this also reaches
+        // reparented descendants that still carry the private MCP launch token.
+        Self.signalProcessGroup(pid, signal: SIGTERM)
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let deadline = ProcessInfo.processInfo.systemUptime + Self.cancellationGraceInterval
+            while Self.processGroupExists(pid), ProcessInfo.processInfo.systemUptime < deadline {
+                Thread.sleep(forTimeInterval: Self.cancellationPollInterval)
             }
+            if Self.processGroupExists(pid) {
+                Self.signalProcessGroup(pid, signal: SIGKILL)
+            }
+            lock.lock()
+            cancellationCleanupFinished = true
+            lock.unlock()
+            finishIfReady()
         }
     }
 
-    private func cancelProcess() {
-        if process.isRunning { process.terminate() }
+    private func finishIfReady() {
+        let completion: (CheckedContinuation<String, Error>, Result<String, Error>)? = lock.withLock {
+            guard !completed,
+                  let continuation,
+                  outputFinished,
+                  let waitOutcome
+            else { return nil }
+            if cancellationRequested, !cancellationCleanupFinished { return nil }
+
+            completed = true
+            self.continuation = nil
+            processID = 0
+            inputHandle = nil
+
+            if cancellationRequested {
+                return (continuation, .failure(CancellationError()))
+            }
+            switch waitOutcome {
+            case let .failure(error):
+                return (continuation, .failure(error))
+            case let .success(status):
+                var text = String(decoding: output, as: UTF8.self)
+                if truncated { text += "\n[output truncated at \(Self.outputLimit) bytes]" }
+                if Self.exitedSuccessfully(status) {
+                    return (continuation, .success(text))
+                }
+                return (continuation, .failure(MCPError.internalError(
+                    text.trimmingCharacters(in: .whitespacesAndNewlines)
+                )))
+            }
+        }
+        guard let (continuation, result) = completion else { return }
+        continuation.resume(with: result)
+    }
+
+    private static func exitedSuccessfully(_ status: Int32) -> Bool {
+        let signal = status & 0x7F
+        return signal == 0 && ((status >> 8) & 0xFF) == 0
+    }
+
+    private static func processGroupExists(_ processGroupID: pid_t) -> Bool {
+        guard isSafeProcessGroup(processGroupID) else { return false }
+        if systemKill(-processGroupID, signal: 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private static func signalProcessGroup(_ processGroupID: pid_t, signal: Int32) {
+        guard isSafeProcessGroup(processGroupID) else { return }
+        _ = systemKill(-processGroupID, signal: signal)
+    }
+
+    private static func isSafeProcessGroup(_ processGroupID: pid_t) -> Bool {
+        processGroupID > 1 && processGroupID != getpgrp()
+    }
+
+    @discardableResult
+    private static func systemKill(_ pid: pid_t, signal: Int32) -> Int32 {
+        #if canImport(Darwin)
+            Darwin.kill(pid, signal)
+        #else
+            Glibc.kill(pid, signal)
+        #endif
+    }
+
+    private struct SpawnedProcess {
+        let pid: pid_t
+        let output: FileHandle
+        let input: FileHandle?
+    }
+
+    private static func spawn(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        currentDirectory: URL?,
+        hasInput: Bool
+    ) throws -> SpawnedProcess {
+        var outputPipe: [Int32] = [-1, -1]
+        var inputPipe: [Int32] = [-1, -1]
+
+        guard systemPipe(&outputPipe) == 0 else {
+            throw posixError(operation: "pipe(stdout)", code: errno)
+        }
+        do {
+            try relocatePipeDescriptors(&outputPipe)
+            try setCloseOnExec(outputPipe[0])
+            try setCloseOnExec(outputPipe[1])
+            if hasInput {
+                guard systemPipe(&inputPipe) == 0 else {
+                    throw posixError(operation: "pipe(stdin)", code: errno)
+                }
+                try relocatePipeDescriptors(&inputPipe)
+                try setCloseOnExec(inputPipe[0])
+                try setCloseOnExec(inputPipe[1])
+            }
+        } catch {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw error
+        }
+
+        #if canImport(Darwin)
+            var fileActions: posix_spawn_file_actions_t? = nil
+        #else
+            var fileActions = posix_spawn_file_actions_t()
+        #endif
+        var result = posix_spawn_file_actions_init(&fileActions)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawn_file_actions_init", code: result)
+        }
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+        func addFileAction(_ operation: String, _ body: () -> Int32) throws {
+            let actionResult = body()
+            guard actionResult == 0 else {
+                closePipe(&outputPipe)
+                closePipe(&inputPipe)
+                throw posixError(operation: operation, code: actionResult)
+            }
+        }
+
+        if hasInput {
+            try addFileAction("dup2(stdin)") {
+                posix_spawn_file_actions_adddup2(&fileActions, inputPipe[0], STDIN_FILENO)
+            }
+            try addFileAction("close(stdin read)") {
+                posix_spawn_file_actions_addclose(&fileActions, inputPipe[0])
+            }
+            try addFileAction("close(stdin write)") {
+                posix_spawn_file_actions_addclose(&fileActions, inputPipe[1])
+            }
+        } else {
+            // Match Foundation.Process: without an explicit input pipe, the
+            // child inherits the headless process's standard input.
+            try addFileAction("inherit(stdin)") {
+                posix_spawn_file_actions_adddup2(&fileActions, STDIN_FILENO, STDIN_FILENO)
+            }
+        }
+        try addFileAction("dup2(stdout)") {
+            posix_spawn_file_actions_adddup2(&fileActions, outputPipe[1], STDOUT_FILENO)
+        }
+        try addFileAction("dup2(stderr)") {
+            posix_spawn_file_actions_adddup2(&fileActions, outputPipe[1], STDERR_FILENO)
+        }
+        try addFileAction("close(output read)") {
+            posix_spawn_file_actions_addclose(&fileActions, outputPipe[0])
+        }
+        try addFileAction("close(output write)") {
+            posix_spawn_file_actions_addclose(&fileActions, outputPipe[1])
+        }
+        if let currentDirectory {
+            result = currentDirectory.path.withCString { path in
+                posix_spawn_file_actions_addchdir_np(&fileActions, path)
+            }
+            guard result == 0 else {
+                closePipe(&outputPipe)
+                closePipe(&inputPipe)
+                throw posixError(operation: "chdir(\(currentDirectory.path))", code: result)
+            }
+        }
+        #if canImport(Glibc)
+            // Foundation.Process closes unrelated descriptors on Linux. Preserve
+            // that boundary so private endpoint/listener FDs cannot reach Codex.
+            try addFileAction("closefrom") {
+                posix_spawn_file_actions_addclosefrom_np(&fileActions, 3)
+            }
+        #endif
+
+        #if canImport(Darwin)
+            var attributes: posix_spawnattr_t? = nil
+        #else
+            var attributes = posix_spawnattr_t()
+        #endif
+        result = posix_spawnattr_init(&attributes)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawnattr_init", code: result)
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        sigaddset(&defaultSignals, SIGPIPE)
+        result = posix_spawnattr_setsigdefault(&attributes, &defaultSignals)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawnattr_setsigdefault", code: result)
+        }
+        var childSignalMask = sigset_t()
+        sigemptyset(&childSignalMask)
+        result = posix_spawnattr_setsigmask(&attributes, &childSignalMask)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawnattr_setsigmask", code: result)
+        }
+        result = posix_spawnattr_setpgroup(&attributes, 0)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawnattr_setpgroup", code: result)
+        }
+
+        // Establish a distinct group atomically as part of spawn. A parent-side
+        // setpgid after launch races the child exec and cannot secure cancellation.
+        var spawnFlags = Int16(POSIX_SPAWN_SETPGROUP)
+            | Int16(POSIX_SPAWN_SETSIGDEF)
+            | Int16(POSIX_SPAWN_SETSIGMASK)
+        #if canImport(Darwin)
+            spawnFlags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        #endif
+        result = posix_spawnattr_setflags(&attributes, spawnFlags)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawnattr_setflags", code: result)
+        }
+
+        var argv: [UnsafeMutablePointer<CChar>?] = [strdup(executable)]
+        for argument in arguments {
+            argv.append(strdup(argument))
+        }
+        argv.append(nil)
+        defer {
+            for pointer in argv where pointer != nil {
+                free(pointer)
+            }
+        }
+
+        var envp: [UnsafeMutablePointer<CChar>?] = []
+        envp.reserveCapacity(environment.count + 1)
+        for (key, value) in environment {
+            envp.append(strdup("\(key)=\(value)"))
+        }
+        envp.append(nil)
+        defer {
+            for pointer in envp where pointer != nil {
+                free(pointer)
+            }
+        }
+
+        var pid: pid_t = 0
+        result = posix_spawn(&pid, executable, &fileActions, &attributes, argv, envp)
+        guard result == 0 else {
+            closePipe(&outputPipe)
+            closePipe(&inputPipe)
+            throw posixError(operation: "posix_spawn(\(executable))", code: result)
+        }
+
+        systemClose(outputPipe[1])
+        outputPipe[1] = -1
+        if hasInput {
+            systemClose(inputPipe[0])
+            inputPipe[0] = -1
+        }
+        let outputHandle = FileHandle(fileDescriptor: outputPipe[0], closeOnDealloc: true)
+        outputPipe[0] = -1
+        let inputHandle: FileHandle?
+        if hasInput {
+            inputHandle = FileHandle(fileDescriptor: inputPipe[1], closeOnDealloc: true)
+            inputPipe[1] = -1
+        } else {
+            inputHandle = nil
+        }
+        return SpawnedProcess(pid: pid, output: outputHandle, input: inputHandle)
+    }
+
+    private static func setCloseOnExec(_ descriptor: Int32) throws {
+        let flags: Int32
+        #if canImport(Darwin)
+            flags = Darwin.fcntl(descriptor, F_GETFD)
+        #else
+            flags = Glibc.fcntl(descriptor, F_GETFD)
+        #endif
+        guard flags >= 0 else { throw posixError(operation: "fcntl(F_GETFD)", code: errno) }
+        let result: Int32
+        #if canImport(Darwin)
+            result = Darwin.fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC)
+        #else
+            result = Glibc.fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC)
+        #endif
+        guard result == 0 else { throw posixError(operation: "fcntl(F_SETFD)", code: errno) }
+    }
+
+    private static func relocatePipeDescriptors(_ descriptors: inout [Int32]) throws {
+        for index in descriptors.indices where descriptors[index] <= STDERR_FILENO {
+            let original = descriptors[index]
+            let relocated: Int32
+            #if canImport(Darwin)
+                relocated = Darwin.fcntl(original, F_DUPFD_CLOEXEC, STDERR_FILENO + 1)
+            #else
+                relocated = Glibc.fcntl(original, F_DUPFD_CLOEXEC, STDERR_FILENO + 1)
+            #endif
+            guard relocated >= 0 else {
+                throw posixError(operation: "fcntl(F_DUPFD_CLOEXEC)", code: errno)
+            }
+            systemClose(original)
+            descriptors[index] = relocated
+        }
+    }
+
+    private static func closePipe(_ descriptors: inout [Int32]) {
+        for index in descriptors.indices where descriptors[index] >= 0 {
+            systemClose(descriptors[index])
+            descriptors[index] = -1
+        }
+    }
+
+    @discardableResult
+    private static func systemPipe(_ descriptors: inout [Int32]) -> Int32 {
+        #if canImport(Darwin)
+            Darwin.pipe(&descriptors)
+        #else
+            Glibc.pipe(&descriptors)
+        #endif
+    }
+
+    private static func systemClose(_ descriptor: Int32) {
+        #if canImport(Darwin)
+            _ = Darwin.close(descriptor)
+        #else
+            _ = Glibc.close(descriptor)
+        #endif
+    }
+
+    private static func posixError(operation: String, code: Int32) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: "\(operation): \(String(cString: strerror(code)))"]
+        )
     }
 }

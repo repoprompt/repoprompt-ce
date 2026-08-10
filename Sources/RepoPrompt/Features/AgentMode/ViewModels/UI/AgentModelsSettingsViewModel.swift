@@ -180,6 +180,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         displayName(forChatModelRaw: profileSnapshot.planningModelRaw, fallback: "Select an Oracle model")
     }
 
+    var currentSecondaryOracleModelName: String {
+        displayName(forChatModelRaw: profileSnapshot.secondaryOracleModelRaw, fallback: "Disabled")
+    }
+
     var currentBuiltinChatModelName: String {
         let raw = profileSnapshot.syncChatModelWithOracle
             ? profileSnapshot.planningModelRaw
@@ -309,6 +313,19 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         )
     }
 
+    var secondaryOracleModelDestination: ModelDestination {
+        ModelDestination(
+            id: "agentModels.secondaryOracle",
+            allowsEmptySelection: true,
+            getter: { [weak self] in
+                self?.profileSnapshot.secondaryOracleModelRaw ?? ""
+            },
+            applier: { [weak self] rawValue in
+                self?.setSecondaryOracleModel(raw: rawValue)
+            }
+        )
+    }
+
     /// Destination for the Built-in Chat model. Writes `preferredComposeModel`
     /// and, when the sync toggle is on, mirrors to `planningModel` in the
     /// selected global/workspace Agent Models profile.
@@ -335,6 +352,18 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             } else {
                 profile.preferredComposeModelRaw = raw
             }
+        }
+    }
+
+    func setSecondaryOracleModel(raw: String) {
+        let canonicalRaw: String?
+        do {
+            canonicalRaw = try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(raw)
+        } catch {
+            return
+        }
+        updateSelectedProfile(reason: "agent_models.secondary_oracle_model") { profile in
+            profile.secondaryOracleModelRaw = canonicalRaw
         }
     }
 

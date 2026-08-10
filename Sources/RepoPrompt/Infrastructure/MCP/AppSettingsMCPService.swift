@@ -178,13 +178,14 @@ final class AppSettingsMCPService: Service {
 
         let definition = try AppSettingsMCPRegistry.definition(forKey: key)
         let normalizedValue = try definition.validate(rawValue)
+        let validatedValue = try Self.validatedSecondaryOracleValue(key: definition.key, value: normalizedValue)
 
         let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool, persistenceBlockReason: GlobalSettingsPersistenceBlockReason?) in
             let oldValue = definition.read(store)
-            let changed = !Self.valuesEqual(oldValue, normalizedValue)
+            let changed = !Self.valuesEqual(oldValue, validatedValue)
             if changed {
-                try definition.write(store, normalizedValue)
-                definition.afterWrite?(store, normalizedValue, notificationCenter)
+                try definition.write(store, validatedValue)
+                definition.afterWrite?(store, validatedValue, notificationCenter)
             }
             let newValue = definition.read(store)
             definition.afterSet?(store, newValue, changed, notificationCenter)
@@ -206,6 +207,18 @@ final class AppSettingsMCPService: Service {
             response["persistence_warning"] = .string(Self.persistenceBlockWarning(reason))
         }
         return .object(response)
+    }
+
+    private static func validatedSecondaryOracleValue(key: String, value: Value) throws -> Value {
+        guard key == "models.secondary_oracle_model", let raw = value.stringValue else { return value }
+        do {
+            guard let canonicalRaw = try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(raw) else {
+                return .null
+            }
+            return .string(canonicalRaw)
+        } catch let error as ChatToolError {
+            throw MCPError.invalidParams(error.message)
+        }
     }
 
     private func options(_ args: [String: Value]) async throws -> Value {
@@ -702,6 +715,21 @@ private enum AppSettingsMCPRegistry {
                 honorSync: true
             ) },
             afterWrite: postRecommendationsDidApply,
+            candidateProvider: aiModelRawCandidates
+        ),
+        optionalModelRawSetting(
+            key: "models.secondary_oracle_model",
+            group: "models",
+            label: "Secondary Oracle Model",
+            description: "Optional independent Secondary Oracle model. Null disables the second lane.",
+            read: { stringOrNull($0.secondaryOracleModelRaw()) },
+            write: { store, value in
+                try store.setSecondaryOracleModelRaw(
+                    optionalString(from: value),
+                    reason: "app_settings.models.secondary_oracle_model"
+                )
+            },
+            afterWrite: nil,
             candidateProvider: aiModelRawCandidates
         ),
         boolSetting(

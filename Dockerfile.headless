@@ -1,0 +1,75 @@
+FROM node:22-bookworm-slim AS codex
+
+ARG CODEX_CLI_VERSION=0.147.0
+RUN test "$CODEX_CLI_VERSION" = "0.147.0" \
+    && npm install --global --omit=dev --ignore-scripts --no-audit --no-fund \
+        "@openai/codex@${CODEX_CLI_VERSION}" \
+    && CODEX_VENDOR_DIR="$(find /usr/local/lib/node_modules/@openai/codex/node_modules/@openai \
+        -type d -path '*/vendor/*-unknown-linux-musl' -print -quit)" \
+    && test -n "$CODEX_VENDOR_DIR" \
+    && install -d /out/opt/codex /tmp/codex-home \
+    && cp -a "$CODEX_VENDOR_DIR"/. /out/opt/codex/ \
+    && CODEX_HOME=/tmp/codex-home /out/opt/codex/bin/codex --version \
+        | grep -Fx "codex-cli ${CODEX_CLI_VERSION}" \
+    && npm cache clean --force
+
+FROM swift:6.2.1-noble AS build
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        g++ \
+        git \
+        libstdc++-14-dev \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+ARG SWIFT_JOBS=4
+RUN swift test --jobs "$SWIFT_JOBS" \
+    && swift build \
+        --configuration release \
+        --jobs "$SWIFT_JOBS" \
+        --product repoprompt-mcp \
+        --static-swift-stdlib \
+    && BINARY="$(swift build --configuration release --show-bin-path)/repoprompt-mcp" \
+    && "$BINARY" --version \
+    && python3 Scripts/test_linux_headless_mcp.py binary "$BINARY" \
+    && install -D -m 0755 "$BINARY" /out/repoprompt-mcp
+
+FROM ubuntu:24.04 AS runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git libcurl4t64 tini \
+    && groupadd --gid 65532 repoprompt \
+    && useradd --uid 65532 --gid 65532 --home-dir /home/repoprompt --create-home --shell /bin/bash repoprompt \
+    && install -d -m 0700 -o 65532 -g 65532 /home/repoprompt/.codex \
+    && install -d -o 65532 -g 65532 /data /workspace \
+    && git config --system --add safe.directory /workspace \
+    && git config --system --add safe.directory '/workspace/*' \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=codex /out/opt/codex /opt/codex
+COPY --from=build /out/repoprompt-mcp /usr/local/bin/repoprompt-mcp
+COPY ThirdPartyLicenses/codex/ /usr/share/doc/repoprompt-ce/codex/
+
+RUN ! ldd /usr/local/bin/repoprompt-mcp | grep -q "not found"
+
+ENV CODEX_HOME=/home/repoprompt/.codex \
+    HOME=/home/repoprompt \
+    PATH=/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    REPOPROMPT_CODEX_COMMAND=/opt/codex/bin/codex \
+    REPOPROMPT_CODEX_EXTERNALLY_SANDBOXED=1 \
+    REPOPROMPT_MCP_HEADLESS_PROFILE_DIR=/data \
+    REPOPROMPT_MCP_WORKING_DIRS=/workspace \
+    SHELL=/bin/bash
+
+WORKDIR /workspace
+USER 65532:65532
+RUN test -w "$CODEX_HOME" \
+    && test -x /opt/codex/bin/codex
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/repoprompt-mcp"]
+CMD ["--backend", "headless"]

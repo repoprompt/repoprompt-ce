@@ -1081,6 +1081,36 @@ enum ToolResultDTOs {
 
     // MARK: - Chat Send
 
+    struct OracleLaneDTO: Codable, Equatable {
+        let status: String?
+        let chatID: String?
+        let mode: String?
+        let response: String?
+        let partialResponse: String?
+        let error: String?
+        let errorCode: String?
+        let errors: [String]?
+        let oracleLane: String?
+        let oraclePairID: String?
+        let modelRawID: String?
+        let modelDisplayName: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case status
+            case chatID = "chat_id"
+            case mode
+            case response
+            case partialResponse = "partial_response"
+            case error
+            case errorCode = "error_code"
+            case errors
+            case oracleLane = "oracle_lane"
+            case oraclePairID = "oracle_pair_id"
+            case modelRawID = "model_raw_id"
+            case modelDisplayName = "model_display_name"
+        }
+    }
+
     struct ChatSendDTO: Codable, Equatable {
         struct Diff: Codable, Equatable {
             let path: String
@@ -1089,47 +1119,128 @@ enum ToolResultDTOs {
 
         let chatID: String?
         let mode: String?
+        let status: String?
         let response: String?
         let diffs: [Diff]?
         let errors: [String]?
+        let oracleResults: [String: OracleLaneDTO]?
+        let oraclePairID: String?
+        let primaryChatID: String?
+        let secondaryChatID: String?
+        let oracleHistoryDiverged: Bool?
+        let oraclePairHistoryPersistenceError: String?
+        let contextID: String?
+        let agentSessionID: String?
+        let agentRunID: String?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
             case mode
+            case status
             case response
             case diffs
             case patches
             case errors
+            case oracleResults = "oracle_results"
+            case oraclePairID = "oracle_pair_id"
+            case primaryChatID = "primary_chat_id"
+            case secondaryChatID = "secondary_chat_id"
+            case oracleHistoryDiverged = "oracle_history_diverged"
+            case oraclePairHistoryPersistenceError = "oracle_pair_history_persistence_error"
+            case contextID = "context_id"
+            case agentSessionID = "agent_session_id"
+            case agentRunID = "agent_run_id"
+            case error
         }
 
-        init(chatID: String?, mode: String?, response: String?, diffs: [Diff]?, errors: [String]?) {
+        init(
+            chatID: String?,
+            mode: String?,
+            response: String?,
+            diffs: [Diff]?,
+            errors: [String]?,
+            oracleResults: [String: OracleLaneDTO]? = nil,
+            status: String? = nil,
+            oraclePairID: String? = nil,
+            primaryChatID: String? = nil,
+            secondaryChatID: String? = nil,
+            oracleHistoryDiverged: Bool? = nil,
+            oraclePairHistoryPersistenceError: String? = nil,
+            contextID: String? = nil,
+            agentSessionID: String? = nil,
+            agentRunID: String? = nil
+        ) {
             self.chatID = chatID
             self.mode = mode
+            self.status = status
             self.response = response
             self.diffs = diffs
             self.errors = errors
+            self.oracleResults = oracleResults
+            self.oraclePairID = oraclePairID
+            self.primaryChatID = primaryChatID
+            self.secondaryChatID = secondaryChatID
+            self.oracleHistoryDiverged = oracleHistoryDiverged
+            self.oraclePairHistoryPersistenceError = oraclePairHistoryPersistenceError
+            self.contextID = contextID
+            self.agentSessionID = agentSessionID
+            self.agentRunID = agentRunID
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            chatID = try container.decodeIfPresent(String.self, forKey: .chatID)
-            mode = try container.decodeIfPresent(String.self, forKey: .mode)
-            response = try container.decodeIfPresent(String.self, forKey: .response)
-            if let decodedDiffs = try container.decodeIfPresent([Diff].self, forKey: .diffs) {
-                diffs = decodedDiffs
+            let embedded: Self? = if let rawError = try? container.decode(String.self, forKey: .error),
+                                     let raw = OraclePairFailureTransportEnvelope.decodePayload(in: rawError)
+            {
+                try? JSONDecoder().decode(Self.self, from: Data(raw.utf8))
             } else {
-                diffs = try container.decodeIfPresent([Diff].self, forKey: .patches)
+                nil
             }
-            errors = try container.decodeIfPresent([String].self, forKey: .errors)
+
+            chatID = try container.decodeIfPresent(String.self, forKey: .chatID) ?? embedded?.chatID
+            mode = try container.decodeIfPresent(String.self, forKey: .mode) ?? embedded?.mode
+            status = try container.decodeIfPresent(String.self, forKey: .status) ?? embedded?.status
+            response = try container.decodeIfPresent(String.self, forKey: .response) ?? embedded?.response
+            diffs = try container.decodeIfPresent([Diff].self, forKey: .diffs)
+                ?? container.decodeIfPresent([Diff].self, forKey: .patches)
+                ?? embedded?.diffs
+            errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? embedded?.errors
+            oracleResults = try container.decodeIfPresent([String: OracleLaneDTO].self, forKey: .oracleResults)
+                ?? embedded?.oracleResults
+            oraclePairID = try container.decodeIfPresent(String.self, forKey: .oraclePairID) ?? embedded?.oraclePairID
+            primaryChatID = try container.decodeIfPresent(String.self, forKey: .primaryChatID) ?? embedded?.primaryChatID
+            secondaryChatID = try container.decodeIfPresent(String.self, forKey: .secondaryChatID) ?? embedded?.secondaryChatID
+            oracleHistoryDiverged = try container.decodeIfPresent(Bool.self, forKey: .oracleHistoryDiverged)
+                ?? embedded?.oracleHistoryDiverged
+            oraclePairHistoryPersistenceError = try container.decodeIfPresent(
+                String.self,
+                forKey: .oraclePairHistoryPersistenceError
+            ) ?? embedded?.oraclePairHistoryPersistenceError
+            contextID = try container.decodeIfPresent(String.self, forKey: .contextID) ?? embedded?.contextID
+            agentSessionID = try container.decodeIfPresent(String.self, forKey: .agentSessionID) ?? embedded?.agentSessionID
+            agentRunID = try container.decodeIfPresent(String.self, forKey: .agentRunID) ?? embedded?.agentRunID
         }
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encodeIfPresent(chatID, forKey: .chatID)
             try container.encodeIfPresent(mode, forKey: .mode)
+            try container.encodeIfPresent(status, forKey: .status)
             try container.encodeIfPresent(response, forKey: .response)
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
+            try container.encodeIfPresent(oracleResults, forKey: .oracleResults)
+            try container.encodeIfPresent(oraclePairID, forKey: .oraclePairID)
+            try container.encodeIfPresent(primaryChatID, forKey: .primaryChatID)
+            try container.encodeIfPresent(secondaryChatID, forKey: .secondaryChatID)
+            try container.encodeIfPresent(oracleHistoryDiverged, forKey: .oracleHistoryDiverged)
+            try container.encodeIfPresent(
+                oraclePairHistoryPersistenceError,
+                forKey: .oraclePairHistoryPersistenceError
+            )
+            try container.encodeIfPresent(contextID, forKey: .contextID)
+            try container.encodeIfPresent(agentSessionID, forKey: .agentSessionID)
+            try container.encodeIfPresent(agentRunID, forKey: .agentRunID)
         }
     }
 

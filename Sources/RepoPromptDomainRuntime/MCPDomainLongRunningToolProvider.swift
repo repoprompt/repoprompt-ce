@@ -5,6 +5,92 @@ package enum DomainChildLaunchContext {
     @TaskLocal package static var current: DomainChildLaunchCarrier?
 }
 
+package struct DomainChildLaunchReservationAnchor: Sendable {
+    package let context: DomainContextIdentity
+    package let expectedContextRevision: UInt64
+
+    package init(context: DomainContextIdentity, expectedContextRevision: UInt64) {
+        self.context = context
+        self.expectedContextRevision = expectedContextRevision
+    }
+}
+
+package enum DomainChildLaunchReservationContext {
+    @TaskLocal package static var current: DomainChildLaunchReservationAnchor?
+}
+
+package enum DomainAdditionalChildLaunchContext {
+    package typealias PrepareFreshCarrier = @Sendable () async throws -> DomainChildLaunchCarrier?
+
+    @TaskLocal package static var prepareFreshCarrier: PrepareFreshCarrier?
+}
+
+package enum DomainAdditionalChildLaunchError: String, Error, LocalizedError, Sendable {
+    case alreadyRequested = "additional_child_launch_already_requested"
+    case invocationClosed = "additional_child_launch_invocation_closed"
+
+    package var errorDescription: String? { rawValue }
+}
+
+private final class DomainAdditionalChildLaunchGate: @unchecked Sendable {
+    private enum State: Equatable {
+        case available
+        case requested
+        case closed
+    }
+
+    private let lock = NSLock()
+    private var state = State.available
+    private var prepareFreshCarrier: DomainAdditionalChildLaunchContext.PrepareFreshCarrier?
+
+    init(prepareFreshCarrier: @escaping DomainAdditionalChildLaunchContext.PrepareFreshCarrier) {
+        self.prepareFreshCarrier = prepareFreshCarrier
+    }
+
+    func requestFreshCarrier() async throws -> DomainChildLaunchCarrier? {
+        let operation = try lock.withLock {
+            switch state {
+            case .available:
+                break
+            case .requested:
+                throw DomainAdditionalChildLaunchError.alreadyRequested
+            case .closed:
+                throw DomainAdditionalChildLaunchError.invocationClosed
+            }
+
+            state = .requested
+            guard let prepareFreshCarrier = self.prepareFreshCarrier else {
+                throw DomainAdditionalChildLaunchError.invocationClosed
+            }
+            self.prepareFreshCarrier = nil
+            return prepareFreshCarrier
+        }
+        do {
+            try Task.checkCancellation()
+            let carrier = try await operation()
+            try lock.withLock {
+                guard state != .closed else {
+                    throw DomainAdditionalChildLaunchError.invocationClosed
+                }
+            }
+            return carrier
+        } catch {
+            let isClosed = lock.withLock { state == .closed }
+            guard !isClosed else {
+                throw DomainAdditionalChildLaunchError.invocationClosed
+            }
+            throw error
+        }
+    }
+
+    func close() {
+        lock.withLock {
+            state = .closed
+            prepareFreshCarrier = nil
+        }
+    }
+}
+
 package enum DomainInteractionPresentationContext {
     @TaskLocal package static var requestID: UUID?
 }
@@ -115,6 +201,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                 )
                 try Task.checkCancellation()
                 let carrier: DomainChildLaunchCarrier?
+                let additionalChildLaunchGate: DomainAdditionalChildLaunchGate?
+                let prepareFreshCarrier: DomainAdditionalChildLaunchContext.PrepareFreshCarrier?
                 if requiresChildLaunch(toolName: toolName, arguments: arguments) {
                     guard let securityContext else {
                         throw MCPError.invalidParams(
@@ -122,16 +210,47 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                         )
                     }
                     carrier = try await prepareChildLaunch(toolName, arguments, securityContext)
+                    let reservationAnchor = carrier.flatMap { carrier -> DomainChildLaunchReservationAnchor? in
+                        guard let context = carrier.context,
+                              let expectedContextRevision = carrier.expectedContextRevision
+                        else { return nil }
+                        return DomainChildLaunchReservationAnchor(
+                            context: context,
+                            expectedContextRevision: expectedContextRevision
+                        )
+                    }
+                    let gate = DomainAdditionalChildLaunchGate {
+                        let freshCarrier = try await DomainChildLaunchReservationContext.$current.withValue(
+                            reservationAnchor
+                        ) {
+                            try await prepareChildLaunch(toolName, arguments, securityContext)
+                        }
+                        for authorization in authorizations {
+                            try await policyStore.revalidate(authorization)
+                        }
+                        try Task.checkCancellation()
+                        return freshCarrier
+                    }
+                    additionalChildLaunchGate = gate
+                    prepareFreshCarrier = {
+                        try await gate.requestFreshCarrier()
+                    }
                 } else {
                     carrier = nil
+                    additionalChildLaunchGate = nil
+                    prepareFreshCarrier = nil
                 }
                 for authorization in authorizations {
                     try await policyStore.revalidate(authorization)
                 }
                 try Task.checkCancellation()
-                value = try await DomainChildLaunchContext.$current.withValue(carrier) {
-                    try await binding(arguments)
-                }
+                value = try await executeBinding(
+                    binding,
+                    arguments: arguments,
+                    carrier: carrier,
+                    prepareFreshCarrier: prepareFreshCarrier,
+                    additionalChildLaunchGate: additionalChildLaunchGate
+                )
             }
             _ = await activityCenter.finish(
                 activity,
@@ -155,6 +274,21 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                 statusText: Self.safeErrorText(error)
             )
             throw error
+        }
+    }
+
+    private func executeBinding(
+        _ binding: MCPDomainToolBinding,
+        arguments: [String: Value],
+        carrier: DomainChildLaunchCarrier?,
+        prepareFreshCarrier: DomainAdditionalChildLaunchContext.PrepareFreshCarrier?,
+        additionalChildLaunchGate: DomainAdditionalChildLaunchGate?
+    ) async throws -> Value {
+        defer { additionalChildLaunchGate?.close() }
+        return try await DomainChildLaunchContext.$current.withValue(carrier) {
+            try await DomainAdditionalChildLaunchContext.$prepareFreshCarrier.withValue(
+                prepareFreshCarrier
+            ) { try await binding(arguments) }
         }
     }
 

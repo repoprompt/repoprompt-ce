@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -36,7 +40,7 @@ enum DirectHeadlessChildBridge {
         }
         try validatePrivateEndpoint(path: endpoint)
         let fd = try connect(path: endpoint)
-        defer { Darwin.close(fd) }
+        defer { close(fd) }
         let handshake = DirectHeadlessChildEndpoint.Handshake(
             launchToken: launchToken,
             clientPrincipal: principal,
@@ -61,9 +65,9 @@ enum DirectHeadlessChildBridge {
                 case .upstream:
                     // EOF from the nested client's stdin only closes the request half. Keep the
                     // response pump alive until the private endpoint reaches its terminal boundary.
-                    Darwin.shutdown(fd, SHUT_WR)
+                    rpShutdownWrite(fd)
                 case .downstream:
-                    Darwin.shutdown(fd, SHUT_RDWR)
+                    rpShutdownReadWrite(fd)
                     group.cancelAll()
                     return
                 }
@@ -92,15 +96,14 @@ enum DirectHeadlessChildBridge {
     }
 
     private static func connect(path: String) throws -> Int32 {
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = rpMakeUnixStreamSocket()
         guard fd >= 0 else { throw BridgeError.socket(errno: errno) }
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        rpConfigureNoSIGPIPE(fd)
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = path.utf8CString
         guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
-            Darwin.close(fd)
+            close(fd)
             throw BridgeError.pathTooLong
         }
         withUnsafeMutablePointer(to: &address.sun_path) { pointer in
@@ -112,12 +115,12 @@ enum DirectHeadlessChildBridge {
         }
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                rpConnect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         guard result == 0 else {
             let code = errno
-            Darwin.close(fd)
+            close(fd)
             throw BridgeError.connect(errno: code)
         }
         return fd
@@ -127,13 +130,13 @@ enum DirectHeadlessChildBridge {
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
         while !Task.isCancelled {
             var descriptor = pollfd(fd: source, events: Int16(POLLIN | POLLERR | POLLHUP), revents: 0)
-            let polled = Darwin.poll(&descriptor, 1, 100)
+            let polled = poll(&descriptor, 1, 100)
             if polled == 0 { continue }
             if polled < 0 {
                 if errno == EINTR { continue }
                 throw BridgeError.read(errno: errno)
             }
-            let count = Darwin.read(source, &buffer, buffer.count)
+            let count = read(source, &buffer, buffer.count)
             if count == 0 { return }
             if count < 0 {
                 if errno == EINTR || errno == EAGAIN { continue }
@@ -151,7 +154,7 @@ enum DirectHeadlessChildBridge {
         while written < data.count {
             let count = data.withUnsafeBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return 0 }
-                return Darwin.write(fd, base.advanced(by: written), data.count - written)
+                return write(fd, base.advanced(by: written), data.count - written)
             }
             if count > 0 {
                 written += count

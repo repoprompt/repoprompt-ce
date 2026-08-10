@@ -1,5 +1,10 @@
 import Foundation
 
+enum OracleLane: String, Codable, CaseIterable, Hashable {
+    case primary
+    case secondary
+}
+
 enum ChatSessionError: Error {
     case emptySession
     case invalidFilename(String)
@@ -26,6 +31,9 @@ struct ChatSession: Codable, Identifiable {
     var composeTabID: UUID?
     var agentModeSessionID: UUID?
     var agentModeRunID: UUID?
+    var oraclePairID: UUID?
+    var oracleLane: OracleLane?
+    var oracleHistoryDiverged: Bool
     var name: String
     var savedAt: Date
     var fileURL: URL?
@@ -58,6 +66,9 @@ struct ChatSession: Codable, Identifiable {
         composeTabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        oraclePairID: UUID? = nil,
+        oracleLane: OracleLane? = nil,
+        oracleHistoryDiverged: Bool = false,
         name: String = "Untitled",
         savedAt: Date = Date(),
         fileURL: URL? = nil,
@@ -75,6 +86,9 @@ struct ChatSession: Codable, Identifiable {
         self.composeTabID = composeTabID
         self.agentModeSessionID = agentModeSessionID
         self.agentModeRunID = agentModeRunID
+        self.oraclePairID = oraclePairID
+        self.oracleLane = oracleLane
+        self.oracleHistoryDiverged = oracleHistoryDiverged
         self.name = name
         self.savedAt = savedAt
         self.fileURL = fileURL
@@ -93,6 +107,9 @@ struct ChatSession: Codable, Identifiable {
         case composeTabID
         case agentModeSessionID
         case agentModeRunID
+        case oraclePairID
+        case oracleLane
+        case oracleHistoryDiverged
         case name
         case savedAt
         case fileURL
@@ -113,6 +130,9 @@ struct ChatSession: Codable, Identifiable {
         composeTabID = try container.decodeIfPresent(UUID.self, forKey: .composeTabID)
         agentModeSessionID = try container.decodeIfPresent(UUID.self, forKey: .agentModeSessionID)
         agentModeRunID = try container.decodeIfPresent(UUID.self, forKey: .agentModeRunID)
+        oraclePairID = try container.decodeIfPresent(UUID.self, forKey: .oraclePairID)
+        oracleLane = try container.decodeIfPresent(OracleLane.self, forKey: .oracleLane)
+        oracleHistoryDiverged = try container.decodeIfPresent(Bool.self, forKey: .oracleHistoryDiverged) ?? false
         name = try container.decode(String.self, forKey: .name)
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         fileURL = try container.decodeIfPresent(URL.self, forKey: .fileURL)

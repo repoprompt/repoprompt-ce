@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 @testable import RepoPromptMCP
 import XCTest
@@ -9,6 +14,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "HOME": "/tmp/home",
             "TMPDIR": "/tmp/",
             "LANG": "en_US.UTF-8",
+            "CODEX_API_KEY": "secret-codex",
             "LC_CTYPE": "en_US.UTF-8",
             "OPENAI_API_KEY": "secret-openai",
             "AWS_SECRET_ACCESS_KEY": "secret-aws",
@@ -24,20 +30,32 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "REPOPROMPT_MCP_PROVIDER_IDENTIFIER": "codex",
             "REPOPROMPT_MCP_RUN_ID": UUID().uuidString
         ]
-        let overrides = inherited.merging(carrier) { _, supplied in supplied }
+        var overrides = carrier
+        overrides["CODEX_API_KEY"] = inherited["CODEX_API_KEY"]
         let child = DirectProcess.childEnvironment(inherited: inherited, overrides: overrides)
 
         XCTAssertEqual(child["PATH"], inherited["PATH"])
         XCTAssertEqual(child["HOME"], inherited["HOME"])
+        XCTAssertEqual(child["CODEX_API_KEY"], inherited["CODEX_API_KEY"])
         XCTAssertEqual(child["LC_CTYPE"], inherited["LC_CTYPE"])
         XCTAssertEqual(child["GIT_TERMINAL_PROMPT"], "0")
         XCTAssertEqual(child["LC_ALL"], "C")
         for (key, value) in carrier {
             XCTAssertEqual(child[key], value, "carrier key=\(key)")
         }
-        for key in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "DYLD_INSERT_LIBRARIES", "REPOPROMPT_CODEX_COMMAND"] {
+        let rejectedKeys = [
+            "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK",
+            "DYLD_INSERT_LIBRARIES", "REPOPROMPT_CODEX_COMMAND"
+        ]
+        for key in rejectedKeys {
             XCTAssertNil(child[key], "unexpected inherited key=\(key)")
         }
+
+        let ambientOnly = DirectProcess.childEnvironment(inherited: inherited)
+        XCTAssertNil(
+            ambientOnly["CODEX_API_KEY"],
+            "ambient provider credentials must require an explicit invocation override"
+        )
     }
 
     func testDirectProcessStripsStalePrivateCarrierBeforeCurrentCarrierMerge() {
@@ -66,6 +84,105 @@ final class DirectHeadlessProcessTests: XCTestCase {
         for (key, value) in staleCarrier where currentCarrier[key] == nil {
             XCTAssertNil(child[key], "stale carrier key=\(key) value=\(value)")
         }
+    }
+
+    func testDirectProcessLaunchesRootInOwnProcessGroup() async throws {
+        let output = try await DirectProcess.run(
+            "/bin/sh",
+            arguments: ["-c", "printf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\""]
+        )
+        let identifiers = output.split(whereSeparator: { $0.isWhitespace }).compactMap { Int32(String($0)) }
+
+        XCTAssertEqual(identifiers.count, 2, output)
+        XCTAssertEqual(identifiers.first, identifiers.last, output)
+    }
+
+    func testDirectProcessPreservesInputWorkingDirectoryAndMergedOutput() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("direct-process-io-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let output = try await DirectProcess.run(
+            "/bin/sh",
+            arguments: [
+                "-c",
+                "printf 'stdout:%s\\n' \"$PWD\"; IFS= read -r line; printf 'stderr:%s\\n' \"$line\" >&2"
+            ],
+            input: Data("carrier-input\n".utf8),
+            currentDirectory: directory
+        )
+
+        XCTAssertTrue(output.contains("stdout:\(directory.path)\n"), output)
+        XCTAssertTrue(output.contains("stderr:carrier-input\n"), output)
+    }
+
+    func testDirectProcessCancellationTerminatesReparentedProcessGroupDescendant() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("direct-process-descendant-\(UUID().uuidString).pid")
+        let rootMarker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("direct-process-root-\(UUID().uuidString).pid")
+        defer {
+            try? FileManager.default.removeItem(at: marker)
+            try? FileManager.default.removeItem(at: rootMarker)
+        }
+        let descendantScript = "printf \"%s\\n\" \"$$\" > \"$2\"; "
+            + "( /bin/sh -c 'test \"$REPOPROMPT_MCP_LAUNCH_TOKEN\" = test-launch-token || exit 91; "
+            + "trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"$1\"; "
+            + "while :; do sleep 1; done' child \"$1\" & ); while :; do sleep 1; done"
+
+        let task = Task {
+            try await DirectProcess.run(
+                "/bin/sh",
+                arguments: [
+                    "-c",
+                    descendantScript,
+                    "root",
+                    marker.path,
+                    rootMarker.path
+                ],
+                environment: ["REPOPROMPT_MCP_LAUNCH_TOKEN": "test-launch-token"]
+            )
+        }
+        defer { task.cancel() }
+
+        let rootPID = try await Self.waitForPIDFile(rootMarker)
+        let descendantPID = try await Self.waitForPIDFile(marker)
+        defer {
+            if Self.processExists(rootPID) {
+                Self.signalProcessGroup(rootPID, SIGKILL)
+                Self.signal(rootPID, SIGKILL)
+            }
+            if Self.processExists(descendantPID) {
+                Self.signal(descendantPID, SIGKILL)
+            }
+        }
+        XCTAssertTrue(Self.processExists(descendantPID))
+
+        task.cancel()
+        let completion = expectation(description: "DirectProcess cancellation completed")
+        let resultBox = DirectProcessTaskResultBox()
+        Task {
+            resultBox.store(await task.result)
+            completion.fulfill()
+        }
+        await fulfillment(of: [completion], timeout: 4)
+        guard let result = resultBox.result else {
+            XCTFail("DirectProcess cancellation did not finish within the bounded grace period")
+            return
+        }
+        switch result {
+        case .success:
+            XCTFail("Expected DirectProcess cancellation")
+        case let .failure(error):
+            XCTAssertTrue(error is CancellationError, "Unexpected cancellation error: \(error)")
+        }
+
+        let descendantGone = await Self.waitUntilProcessGone(descendantPID)
+        XCTAssertTrue(
+            descendantGone,
+            "Reparented same-process-group descendant should not survive DirectProcess cancellation"
+        )
     }
 
     func testNoAppHeadlessProcessListsCanonicalPolicySurfaceAndDrainsOnEOF() throws {
@@ -281,5 +398,65 @@ final class DirectHeadlessProcessTests: XCTestCase {
             guard data.count <= 2 * 1024 * 1024 else { throw CocoaError(.fileReadTooLarge) }
         }
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private static func waitForPIDFile(_ url: URL, timeout: TimeInterval = 3) async throws -> pid_t {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            {
+                return pid
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        throw DirectHeadlessProcessTestError.pidFileTimedOut
+    }
+
+    private static func waitUntilProcessGone(_ pid: pid_t, timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !processExists(pid) { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return !processExists(pid)
+    }
+
+    private static func processExists(_ pid: pid_t) -> Bool {
+        if systemKill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private static func signal(_ pid: pid_t, _ signal: Int32) {
+        _ = systemKill(pid, signal)
+    }
+
+    private static func signalProcessGroup(_ processGroupID: pid_t, _ signal: Int32) {
+        _ = systemKill(-processGroupID, signal)
+    }
+
+    private static func systemKill(_ pid: pid_t, _ signal: Int32) -> Int32 {
+        #if canImport(Darwin)
+            Darwin.kill(pid, signal)
+        #else
+            Glibc.kill(pid, signal)
+        #endif
+    }
+}
+
+private enum DirectHeadlessProcessTestError: Error {
+    case pidFileTimedOut
+}
+
+private final class DirectProcessTaskResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Result<String, Error>?
+
+    var result: Result<String, Error>? {
+        lock.withLock { storage }
+    }
+
+    func store(_ result: Result<String, Error>) {
+        lock.withLock { storage = result }
     }
 }

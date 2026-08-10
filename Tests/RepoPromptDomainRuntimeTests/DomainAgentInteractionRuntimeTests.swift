@@ -1313,6 +1313,226 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
         XCTAssertEqual(activities.recentTerminal.map(\.state), [.completed, .failed, .failed])
     }
 
+    func testLongRunningProviderOffersFreshAdditionalChildLaunchCarriers() async throws {
+        let runtime = makeRuntime(mode: .app)
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = InvocationRecorder()
+        let reservationAnchorRecorder = InvocationRecorder()
+        let lateAttemptRecorder = InvocationRecorder()
+        let lateAttemptRelease = BoundedAsyncSignal()
+        let lateAttemptFinished = BoundedAsyncSignal()
+        let reservationContext = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
+        let reservationRevision: UInt64 = 41
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: runtime.identity,
+            policyStore: runtime.mutationPolicyStore,
+            interactionBroker: runtime.interactionBroker,
+            activityCenter: runtime.activityCenter,
+            prepareChildLaunch: { toolName, arguments, securityContext in
+                if let anchor = DomainChildLaunchReservationContext.current {
+                    await reservationAnchorRecorder.record(
+                        "\(anchor.context.contextID.uuidString)|\(anchor.expectedContextRevision)"
+                    )
+                } else {
+                    await reservationAnchorRecorder.record("none")
+                }
+                await recorder.record(
+                    "\(toolName)|\(arguments["message"]?.stringValue ?? "missing")|\(securityContext.invocationID)"
+                )
+                return DomainChildLaunchCarrier(
+                    runID: securityContext.principal.runID ?? UUID(),
+                    launchTokenID: UUID(),
+                    context: reservationContext,
+                    expectedContextRevision: reservationRevision,
+                    credentialEnvelope: nil,
+                    environment: [
+                        DomainChildLaunchCarrier.endpointEnvironmentKey: "injected://child",
+                        DomainChildLaunchCarrier.launchTokenEnvironmentKey: UUID().uuidString
+                    ]
+                )
+            }
+        )
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "oracle_send",
+                description: "additional child-launch fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            guard let current = DomainChildLaunchContext.current else {
+                throw MCPError.internalError("missing current child launch")
+            }
+            guard let prepareFreshCarrier = DomainAdditionalChildLaunchContext.prepareFreshCarrier else {
+                throw MCPError.internalError("missing additional child-launch factory")
+            }
+            Task {
+                _ = await lateAttemptRelease.wait(timeout: .seconds(2))
+                let outcome: String
+                guard let inheritedFactory = DomainAdditionalChildLaunchContext.prepareFreshCarrier else {
+                    await lateAttemptRecorder.record("missing_inherited_factory")
+                    await lateAttemptFinished.signal()
+                    return
+                }
+                do {
+                    _ = try await inheritedFactory()
+                    outcome = "unexpected_success"
+                } catch let error as DomainAdditionalChildLaunchError {
+                    outcome = error.rawValue
+                } catch {
+                    outcome = "unexpected_error:\(error)"
+                }
+                await lateAttemptRecorder.record(outcome)
+                await lateAttemptFinished.signal()
+            }
+            guard let fresh = try await prepareFreshCarrier() else {
+                throw MCPError.internalError("missing fresh child launch")
+            }
+            let secondRequestResult: String
+            do {
+                _ = try await prepareFreshCarrier()
+                secondRequestResult = "unexpected_success"
+            } catch let error as DomainAdditionalChildLaunchError {
+                secondRequestResult = error.rawValue
+            } catch {
+                secondRequestResult = "unexpected_error:\(error)"
+            }
+            return .object([
+                "current_token_id": .string(current.launchTokenID.uuidString),
+                "current_token_material": .string(
+                    current.environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey] ?? "missing"
+                ),
+                "current_token_id_after_fresh_preparation": .string(
+                    DomainChildLaunchContext.current?.launchTokenID.uuidString ?? "missing"
+                ),
+                "fresh_token_id": .string(fresh.launchTokenID.uuidString),
+                "fresh_token_material": .string(
+                    fresh.environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey] ?? "missing"
+                ),
+                "second_request_result": .string(secondRequestResult)
+            ])
+        }
+        let wrapped = provider.wrapping(binding)
+        let securityContext = makeRunSecurityContext(
+            identity: runtime.identity,
+            grantedTools: ["oracle_send"],
+            hasAuthoritativeRoutingContext: true
+        )
+
+        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+            try await wrapped(["message": .string("hello")])
+        }
+        await lateAttemptRelease.signal()
+        let lateAttemptDidFinish = await lateAttemptFinished.wait(timeout: .seconds(2))
+
+        XCTAssertNil(DomainChildLaunchContext.current)
+        XCTAssertNil(DomainAdditionalChildLaunchContext.prepareFreshCarrier)
+        XCTAssertTrue(lateAttemptDidFinish)
+        let lateAttemptResults = await lateAttemptRecorder.values()
+        XCTAssertEqual(lateAttemptResults, [DomainAdditionalChildLaunchError.invocationClosed.rawValue])
+        let preparationCalls = await recorder.values()
+        XCTAssertEqual(
+            preparationCalls,
+            Array(repeating: "oracle_send|hello|\(securityContext.invocationID)", count: 2)
+        )
+        let reservationAnchors = await reservationAnchorRecorder.values()
+        XCTAssertEqual(
+            reservationAnchors,
+            ["none", "\(reservationContext.contextID.uuidString)|\(reservationRevision)"]
+        )
+        let result = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(
+            result["second_request_result"]?.stringValue,
+            DomainAdditionalChildLaunchError.alreadyRequested.rawValue
+        )
+        XCTAssertEqual(
+            result["current_token_id"]?.stringValue,
+            result["current_token_id_after_fresh_preparation"]?.stringValue
+        )
+        XCTAssertNotEqual(
+            result["current_token_id"]?.stringValue,
+            result["fresh_token_id"]?.stringValue
+        )
+        XCTAssertNotEqual(
+            result["current_token_material"]?.stringValue,
+            result["fresh_token_material"]?.stringValue
+        )
+    }
+
+    func testLongRunningProviderClosesAdditionalChildLaunchFactoryAfterThrowAndCancellation() async throws {
+        let runtime = makeRuntime(mode: .app)
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: runtime.identity,
+            policyStore: runtime.mutationPolicyStore,
+            interactionBroker: runtime.interactionBroker,
+            activityCenter: runtime.activityCenter,
+            prepareChildLaunch: { _, _, securityContext in
+                DomainChildLaunchCarrier(
+                    runID: securityContext.principal.runID ?? UUID(),
+                    launchTokenID: UUID(),
+                    credentialEnvelope: nil,
+                    environment: [
+                        DomainChildLaunchCarrier.endpointEnvironmentKey: "injected://child",
+                        DomainChildLaunchCarrier.launchTokenEnvironmentKey: UUID().uuidString
+                    ]
+                )
+            }
+        )
+
+        for expectsCancellation in [false, true] {
+            let shouldCancel = expectsCancellation
+            let factoryCapture = AdditionalChildLaunchFactoryCapture()
+            let binding = MCPDomainToolBinding(
+                definition: .init(
+                    name: "oracle_send",
+                    description: "additional child-launch settlement fixture",
+                    inputSchema: .object(["type": .string("object")])
+                )
+            ) { _ in
+                guard let prepareFreshCarrier = DomainAdditionalChildLaunchContext.prepareFreshCarrier else {
+                    throw MCPError.internalError("missing additional child-launch factory")
+                }
+                await factoryCapture.store(prepareFreshCarrier)
+                if shouldCancel {
+                    throw CancellationError()
+                }
+                throw TestError.expectedAcceptedEpoch
+            }
+            let wrapped = provider.wrapping(binding)
+            let securityContext = makeRunSecurityContext(
+                identity: runtime.identity,
+                grantedTools: ["oracle_send"],
+                hasAuthoritativeRoutingContext: true
+            )
+
+            do {
+                _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+                    try await wrapped(["message": .string("hello")])
+                }
+                XCTFail("The settlement fixture must throw")
+            } catch is CancellationError {
+                XCTAssertTrue(shouldCancel)
+            } catch TestError.expectedAcceptedEpoch {
+                XCTAssertFalse(shouldCancel)
+            } catch {
+                XCTFail("Unexpected settlement error: \(error)")
+            }
+
+            let capturedFactory = await factoryCapture.value()
+            let prepareFreshCarrier = try XCTUnwrap(capturedFactory)
+            do {
+                _ = try await prepareFreshCarrier()
+                XCTFail("A captured factory must close when its invocation settles")
+            } catch let error as DomainAdditionalChildLaunchError {
+                XCTAssertEqual(error, .invocationClosed)
+            } catch {
+                XCTFail("Unexpected captured-factory error: \(error)")
+            }
+        }
+    }
+
     func testLongRunningProviderNormalizesOperationBeforeApprovalAndChildLaunch() async throws {
         let runtime = makeRuntime(mode: .app)
         try await runtime.start()
@@ -1668,6 +1888,18 @@ private actor InvocationRecorder {
 
     func values() -> [String] {
         recorded
+    }
+}
+
+private actor AdditionalChildLaunchFactoryCapture {
+    private var factory: DomainAdditionalChildLaunchContext.PrepareFreshCarrier?
+
+    func store(_ factory: @escaping DomainAdditionalChildLaunchContext.PrepareFreshCarrier) {
+        self.factory = factory
+    }
+
+    func value() -> DomainAdditionalChildLaunchContext.PrepareFreshCarrier? {
+        factory
     }
 }
 
