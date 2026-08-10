@@ -51,7 +51,8 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
             }
             environment[LaunchContract.configContentEnvironmentKey] = try OpenCodeIntegrationConfiguration.ephemeralACPConfigJSON(
                 includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
-                repoPromptMCPConfiguration: repoPromptMCPConfiguration
+                repoPromptMCPConfiguration: repoPromptMCPConfiguration,
+                workingDirectory: workingDirectory
             )
         }
 
@@ -128,10 +129,28 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         if error is OpenCodeACPLaunchResolutionError || error is ExecutableFileIdentityError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
+        if let guidance = Self.openCodeACPStartupTimeoutGuidance(for: error) {
+            return AIProviderError.invalidConfiguration(detail: guidance)
+        }
         if (error as NSError).domain == NSCocoaErrorDomain {
             return AIProviderError.invalidConfiguration(detail: "Unable to prepare OpenCode ACP config: \(error.localizedDescription)")
         }
         return AIProviderError.apiError(source: error)
+    }
+
+    private static func openCodeACPStartupTimeoutGuidance(for error: Error) -> String? {
+        let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = message.lowercased()
+        let isStartupTimeout = lower.contains("acp request")
+            && lower.contains("timed out")
+            && (lower.contains("session/new")
+                || lower.contains("session/load")
+                || lower.contains("initialize")
+                || lower.contains("authenticate"))
+        guard isStartupTimeout else { return nil }
+        return """
+        OpenCode ACP did not finish session startup. OpenCode merges global/project MCP servers into ACP `session/new` and waits for them to connect; a slow or hanging MCP entry (including a recursive RepoPrompt CE CLI) can exceed the bootstrap timeout. RepoPrompt disables discovered inherited MCP names in its process-ephemeral overlay—update OpenCode (`opencode upgrade`) and remove or disable hanging entries under `mcp` in `~/.config/opencode/opencode.json` if this persists. Original error: \(message)
+        """
     }
 
     private func standardizedWorkingDirectory(from workspacePath: String?) -> String {

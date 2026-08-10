@@ -10,21 +10,41 @@ enum OpenCodeIntegrationConfiguration {
     private static let mcpTimeoutMilliseconds = 14_400_000
     private static let disabledMCPCommand = "/usr/bin/false"
     private static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
+    /// Bound reads of inherited OpenCode config used only to discover MCP server names.
+    private static let maximumInheritedConfigBytes: UInt64 = 2 * 1024 * 1024
 
     struct PersistentMCPConfigResult {
         let configURL: URL
         let wasMCPServerAlreadyPresent: Bool
     }
 
-    static func configDirectoryURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
+    static func configDirectoryURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> URL {
+        if let xdgConfigHome = environment["XDG_CONFIG_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !xdgConfigHome.isEmpty
+        {
+            return URL(fileURLWithPath: xdgConfigHome, isDirectory: true)
+                .appendingPathComponent("opencode", isDirectory: true)
+        }
+        let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let homeURL = if let home, !home.isEmpty {
+            URL(fileURLWithPath: home, isDirectory: true)
+        } else {
+            fileManager.homeDirectoryForCurrentUser
+        }
+        return homeURL
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent("opencode", isDirectory: true)
     }
 
-    static func configURL() -> URL {
-        configDirectoryURL().appendingPathComponent("opencode.json")
+    static func configURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> URL {
+        configDirectoryURL(environment: environment, fileManager: fileManager)
+            .appendingPathComponent("opencode.json")
     }
 
     /// MCP config dictionary for OpenCode format.
@@ -111,31 +131,60 @@ enum OpenCodeIntegrationConfiguration {
 
     /// Process-ephemeral OpenCode config overlay for RepoPrompt-launched ACP runs.
     ///
-    /// Intended for `OPENCODE_CONFIG_CONTENT`; it always provides RepoPrompt-managed modes and
-    /// either an active current-build RepoPrompt MCP entry or a disabled same-name override.
+    /// Intended for `OPENCODE_CONFIG_CONTENT`. OpenCode merges this overlay with global/project
+    /// config by MCP server name. `session/new` waits for those MCP servers to connect, so a
+    /// hanging non-RepoPrompt entry (or a recursive RepoPrompt CE CLI entry) can exceed the ACP
+    /// bootstrap timeout. This overlay therefore:
+    /// - disables every inherited global/project MCP server name it can discover
+    /// - sets the current-build RepoPrompt MCP entry active or disabled
+    /// - always provides RepoPrompt-managed agent modes
     static func ephemeralACPConfigDict(
         includeRepoPromptMCPServer: Bool,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
+        workingDirectory: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default,
+        inheritedMCPServerNamesOverride: [String]? = nil
     ) -> [String: Any] {
-        [
+        var mcp: [String: Any] = [:]
+        let inheritedNames = inheritedMCPServerNamesOverride ?? discoverInheritedMCPServerNames(
+            workingDirectory: workingDirectory,
+            environment: environment,
+            fileManager: fileManager
+        )
+        for name in inheritedNames {
+            if name.compare(repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame {
+                continue
+            }
+            mcp[name] = disabledMCPConfigDict()
+        }
+        mcp[repoPromptMCPServerName] = includeRepoPromptMCPServer
+            ? mcpConfigDict(for: repoPromptMCPConfiguration)
+            : disabledMCPConfigDict()
+
+        return [
             "$schema": configSchemaURL,
             "agent": managedAgentConfigDicts,
-            "mcp": [
-                repoPromptMCPServerName: includeRepoPromptMCPServer
-                    ? mcpConfigDict(for: repoPromptMCPConfiguration)
-                    : disabledMCPConfigDict()
-            ]
+            "mcp": mcp
         ]
     }
 
     /// Serializes the process-ephemeral OpenCode config overlay for `OPENCODE_CONFIG_CONTENT`.
     static func ephemeralACPConfigJSON(
         includeRepoPromptMCPServer: Bool,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
+        workingDirectory: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default,
+        inheritedMCPServerNamesOverride: [String]? = nil
     ) throws -> String {
         let dict = ephemeralACPConfigDict(
             includeRepoPromptMCPServer: includeRepoPromptMCPServer,
-            repoPromptMCPConfiguration: repoPromptMCPConfiguration
+            repoPromptMCPConfiguration: repoPromptMCPConfiguration,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            fileManager: fileManager,
+            inheritedMCPServerNamesOverride: inheritedMCPServerNamesOverride
         )
         let data = try JSONSerialization.data(
             withJSONObject: dict,
@@ -149,6 +198,67 @@ enum OpenCodeIntegrationConfiguration {
             )
         }
         return string
+    }
+
+    /// Discovers MCP server names that OpenCode may inherit from global/project config.
+    /// Used only to neutralize those names in the process-ephemeral overlay.
+    static func discoverInheritedMCPServerNames(
+        workingDirectory: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> [String] {
+        var names = Set<String>()
+        for path in inheritedConfigPaths(workingDirectory: workingDirectory, environment: environment, fileManager: fileManager) {
+            guard let object = readBoundedJSONObject(atPath: path, fileManager: fileManager),
+                  let mcp = object["mcp"] as? [String: Any]
+            else {
+                continue
+            }
+            for key in mcp.keys where !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                names.insert(key)
+            }
+        }
+        return names.sorted()
+    }
+
+    static func inheritedConfigPaths(
+        workingDirectory: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> [String] {
+        var paths: [String] = []
+        paths.append(configURL(environment: environment, fileManager: fileManager).path)
+        if let workingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !workingDirectory.isEmpty
+        {
+            let root = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            paths.append(root.appendingPathComponent("opencode.json").path)
+            paths.append(root.appendingPathComponent(".opencode/opencode.json").path)
+        }
+        var seen = Set<String>()
+        return paths.filter { seen.insert($0).inserted }
+    }
+
+    private static func readBoundedJSONObject(
+        atPath path: String,
+        fileManager: FileManager
+    ) -> [String: Any]? {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: path),
+              attributes[.type] as? FileAttributeType == .typeRegular
+        else {
+            return nil
+        }
+        let size = (attributes[.size] as? NSNumber)?.uint64Value
+            ?? attributes[.size] as? UInt64
+        guard let size, size > 0, size <= maximumInheritedConfigBytes else {
+            return nil
+        }
+        guard let data = fileManager.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return object
     }
 
     /// Ensures the persistent OpenCode config contains the RepoPrompt MCP server.
