@@ -1718,8 +1718,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             let slicePaths = Array(slices.keys)
             let candidateFileIDs = Set(modifiedFilesByID.compactMap { fileID, file -> UUID? in
                 let relativePath = file.standardizedRelativePath
+                let suffixPath = "/\(relativePath)"
                 guard slicePaths.contains(where: {
-                    $0 == relativePath || $0.hasSuffix("/\(relativePath)")
+                    $0 == relativePath || $0.hasSuffix(suffixPath)
                 }) else { return nil }
                 return fileID
             })
