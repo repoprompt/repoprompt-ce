@@ -89,16 +89,16 @@ struct AgentToolTrackingHooks {
     // MARK: - Hook Closures
 
     /// Flush any pending assistant text delta before a tool event.
-    let flushPendingAssistantDelta: @MainActor @Sendable (_ session: AgentModeViewModel.TabSession) -> Void
+    let flushPendingAssistantDelta: @MainActor @Sendable (_ session: AgentTabSession) -> Void
 
     /// End the active streaming assistant segment.
-    let endActiveAssistantSegment: @MainActor @Sendable (_ session: AgentModeViewModel.TabSession) -> Void
+    let endActiveAssistantSegment: @MainActor @Sendable (_ session: AgentTabSession) -> Void
 
     /// End the active reasoning segment.
-    let endActiveReasoningSegment: @MainActor @Sendable (_ session: AgentModeViewModel.TabSession) -> Void
+    let endActiveReasoningSegment: @MainActor @Sendable (_ session: AgentTabSession) -> Void
 
     /// Seal the assistant boundary so subsequent content starts a new bubble.
-    let sealAssistantBoundary: @MainActor @Sendable (_ session: AgentModeViewModel.TabSession) -> Void
+    let sealAssistantBoundary: @MainActor @Sendable (_ session: AgentTabSession) -> Void
 
     /// Request a UI refresh for the given tab.
     let requestUIRefresh: @MainActor @Sendable (_ tabID: UUID, _ urgent: Bool) -> Void
@@ -107,10 +107,10 @@ struct AgentToolTrackingHooks {
     let scheduleSave: @MainActor @Sendable (_ tabID: UUID) -> Void
 
     /// Account for tool input tokens from args payload.
-    let addToolInputTokens: @MainActor @Sendable (_ payload: String?, _ session: AgentModeViewModel.TabSession) -> Void
+    let addToolInputTokens: @MainActor @Sendable (_ payload: String?, _ session: AgentTabSession) -> Void
 
     /// Account for tool output tokens from result payload.
-    let addToolOutputTokens: @MainActor @Sendable (_ payload: String?, _ session: AgentModeViewModel.TabSession) -> Void
+    let addToolOutputTokens: @MainActor @Sendable (_ payload: String?, _ session: AgentTabSession) -> Void
 }
 
 // MARK: - Tool Tracking Support Utilities
@@ -150,7 +150,7 @@ enum AgentToolTrackingSupport {
 
     /// Whether a provider tool_call should be auto-completed with a synthetic result.
     static func shouldAutoCompleteProviderToolCall(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         toolName: String,
         invocationID: UUID?
     ) -> Bool {

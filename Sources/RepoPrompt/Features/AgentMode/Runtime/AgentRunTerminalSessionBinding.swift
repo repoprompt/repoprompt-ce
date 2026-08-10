@@ -3,7 +3,7 @@ import RepoPromptDomainRuntime
 
 /// Exact-object-bound capabilities used by the terminal settlement spine.
 ///
-/// This value carries no concrete `TabSession` and performs no lookup by
+/// This value carries no concrete app session class and performs no lookup by
 /// `tabID`. The app host partially applies its exact session at the
 /// run/settlement edge, while the terminal barrier operates only on this
 /// capability surface and `AgentRunAttemptLifecycle`. Attachment finalization

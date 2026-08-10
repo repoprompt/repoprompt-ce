@@ -44,7 +44,7 @@ final class ClaudeIntegratedAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
@@ -210,7 +210,7 @@ final class ClaudeIntegratedAgentModeRunner {
 
     private func consumeEvents(
         _ events: AsyncStream<NativeAgentRuntimeEvent>,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
@@ -351,7 +351,7 @@ final class ClaudeIntegratedAgentModeRunner {
 
     private func handleAcquireFailure(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
@@ -373,7 +373,7 @@ final class ClaudeIntegratedAgentModeRunner {
 
     @discardableResult
     private func finalize(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?,

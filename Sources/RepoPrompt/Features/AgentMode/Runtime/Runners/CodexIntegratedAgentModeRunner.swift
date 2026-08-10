@@ -18,10 +18,10 @@ final class CodexIntegratedAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        fallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?
+        fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
         let createdOwnership: Bool

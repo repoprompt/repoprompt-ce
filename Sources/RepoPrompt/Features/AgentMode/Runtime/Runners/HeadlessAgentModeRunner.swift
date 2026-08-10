@@ -18,7 +18,7 @@ final class HeadlessAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
@@ -130,7 +130,7 @@ final class HeadlessAgentModeRunner {
     }
 
     private func handleAcquireFailure(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
@@ -156,7 +156,7 @@ final class HeadlessAgentModeRunner {
     }
 
     private func executeHeadlessRun(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         provider: HeadlessAgentProvider,
         initialMessage: AgentMessage,
         runID: UUID,

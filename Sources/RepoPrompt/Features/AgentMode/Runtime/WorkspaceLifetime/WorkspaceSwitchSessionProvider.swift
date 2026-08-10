@@ -6,7 +6,7 @@ import Foundation
 /// still needs the live session's provider state.
 struct WorkspaceSwitchSessionDiscardContext {
     let tabID: UUID
-    let session: AgentModeViewModel.TabSession
+    let session: AgentTabSession
     let boundSessionID: UUID?
     /// Run identity observed when the discard decision was made.
     let preparedRunID: UUID?
@@ -20,7 +20,7 @@ struct WorkspaceSwitchSessionDiscardContext {
 /// coordinator state after a suspension point.
 struct WorkspaceSwitchSessionCleanupTarget {
     let tabID: UUID
-    let session: AgentModeViewModel.TabSession
+    let session: AgentTabSession
     let boundSessionID: UUID?
     /// Distinct run IDs needing MCP run-routing cleanup: the run captured at
     /// prepare time plus any successor run present at finalize time.
@@ -49,7 +49,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// clears mcpControlContext, etc.). The session is already detached
     /// from the active workspace.
     func teardownMCPControlForDiscardedSession(
-        _ session: AgentModeViewModel.TabSession,
+        _ session: AgentTabSession,
         cleanupSessionStore: Bool,
         publishChanges: Bool,
         deactivateLiveControlContext: Bool
@@ -58,7 +58,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// Cleanup MCP run routing for a discarded session.
     func cleanupMCPRunRoutingForDiscardedSession(
         boundSessionID: UUID?,
-        liveSession: AgentModeViewModel.TabSession,
+        liveSession: AgentTabSession,
         explicitRunID: UUID?,
         reason: String
     ) async
@@ -157,7 +157,7 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     }
 
     /// Handle-only disposal: every provider/controller reference was captured by
-    /// the synchronous finalize phase. The discarded `TabSession`'s provider,
+    /// the synchronous finalize phase. The discarded `AgentTabSession`'s provider,
     /// controller, run, and presentation state must not be read or mutated here
     /// — a same-tab successor may already be live by the time this runs.
     private static func disposeDetachedTarget(
@@ -249,7 +249,7 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     }
 }
 
-extension AgentModeViewModel.TabSession {
+extension AgentTabSession {
     func disposeProviderIfPresent() async {
         let provider = provider
         self.provider = nil

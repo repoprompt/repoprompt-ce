@@ -6,7 +6,7 @@ import Foundation
 /// terminal-settlement bookkeeping.
 ///
 /// This type consolidates what used to be a stored field cluster on
-/// `AgentModeViewModel.TabSession` (run identity, the attempt tracker, provider
+/// `AgentTabSession` (run identity, the attempt tracker, provider
 /// drain generation, the terminal-commit phase flag, the settled terminal
 /// revision/publication result, and exactly-once terminal resources) behind
 /// named single-writer operations.
@@ -20,7 +20,7 @@ import Foundation
 ///   ordering (revision staged before publication resolves; the in-progress
 ///   flag cleared only after publication and teardown registration) stays
 ///   representable across its suspension points.
-/// - Live tab/session binding remains owned by `TabSession`; binding currency
+/// - Live tab/session binding remains owned by `AgentTabSession`; binding currency
 ///   validation composes this facade's attempt check with the session's own
 ///   binding comparison.
 ///

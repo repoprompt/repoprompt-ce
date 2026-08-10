@@ -84,7 +84,7 @@ final class ACPIntegratedAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
@@ -280,7 +280,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     func submitActivePrompt(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         messageForRun: String,
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
@@ -370,7 +370,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func isStartupStillCurrent(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID? = nil,
         runAttemptID: UUID
     ) -> Bool {
@@ -387,7 +387,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func failBeforeProviderSend(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?,
@@ -419,7 +419,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func cancelBeforeProviderSend(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?
@@ -450,7 +450,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func startFreshRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -586,7 +586,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func continueRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -678,7 +678,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func runPromptTurn(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -777,7 +777,7 @@ final class ACPIntegratedAgentModeRunner {
     private func applyProviderSessionIdentity(
         _ identity: ACPProviderSessionIdentity,
         invalidatedResumeSessionID: String? = nil,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         let providerSessionID = identity.loadSessionID ?? identity.runtimeSessionID
         var changed = false
@@ -857,7 +857,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func consumeEvents(
         _ events: AsyncStream<NormalizedAgentRuntimeEvent>,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
@@ -912,7 +912,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func handleAcquireFailure(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
@@ -945,7 +945,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func finalize(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController?,
@@ -998,7 +998,7 @@ final class ACPIntegratedAgentModeRunner {
     // MARK: - Tool Tracking (per-tab, using shared AgentToolTrackingController)
 
     private func startToolTracking(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         runID: UUID,
         clientNameHint: String
     ) async {
@@ -1028,7 +1028,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func prepareToolTrackingTeardown(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         matchingRunID: UUID? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
         if let matchingRunID, toolTrackingRunIDByTabID[session.tabID] != matchingRunID {
@@ -1042,8 +1042,8 @@ final class ACPIntegratedAgentModeRunner {
 
     private func setRunningStatus(
         _ text: String?,
-        source: AgentModeViewModel.TabSession.RunningStatusSource?,
-        session: AgentModeViewModel.TabSession,
+        source: AgentTabSession.RunningStatusSource?,
+        session: AgentTabSession,
         urgent: Bool = false
     ) {
         let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1076,7 +1076,7 @@ final class ACPIntegratedAgentModeRunner {
         invocationID: UUID,
         toolName: String,
         args: [String: Value]?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -1161,7 +1161,7 @@ final class ACPIntegratedAgentModeRunner {
         args: [String: Value]?,
         resultJSON: String,
         isError: Bool,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -1222,7 +1222,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func indexedThenActiveTurnToolCandidates(
         indexedIndices: [Int],
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         where predicate: (AgentChatItem) -> Bool
     ) -> (indices: [Int], inspectedItemCount: Int, usedFallbackScan: Bool) {
         let indexedMatches = indexedIndices.filter { predicate(session.items[$0]) }
@@ -1238,7 +1238,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func correlatedToolCallItemIndex(
-        in session: AgentModeViewModel.TabSession,
+        in session: AgentTabSession,
         storedToolName: String,
         invocationID: UUID?,
         argsJSON: String?,
@@ -1294,12 +1294,12 @@ final class ACPIntegratedAgentModeRunner {
         if let argsJSON,
            hasAccountableToolPayload(argsJSON)
         {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let placeholderCandidates = session.activeTurnToolItemIndices(where: { item in
                 item.kind == .toolCall
                     && self.isProviderPlaceholderInvocation(item.toolInvocationID, tabID: session.tabID)
                     && self.isPlaceholderToolArgs(item.toolArgsJSON)
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
             })
             inspectedItemCount += placeholderCandidates.scannedItemCount
             if placeholderCandidates.indices.count == 1 {
@@ -1311,10 +1311,10 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         if allowNameOnlyFallback {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             MCPToolObserverAttributionContext.record(
@@ -1331,7 +1331,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func correlatedToolResultItemIndex(
-        in session: AgentModeViewModel.TabSession,
+        in session: AgentTabSession,
         storedToolName: String,
         invocationID: UUID?,
         argsJSON: String?,
@@ -1429,10 +1429,10 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         if allowNameOnlyFallback {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             MCPToolObserverAttributionContext.record(
@@ -1537,7 +1537,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
-        AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+        AgentTabSession.canonicalToolInvocationSignature(
             toolName: toolName,
             argsJSON: argsJSON
         )
@@ -1580,7 +1580,7 @@ final class ACPIntegratedAgentModeRunner {
             invocationID: UUID,
             toolName: String,
             args: [String: Value]?,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             handleTrackerToolCall(invocationID: invocationID, toolName: toolName, args: args, session: session)
         }
@@ -1591,7 +1591,7 @@ final class ACPIntegratedAgentModeRunner {
             args: [String: Value]?,
             resultJSON: String,
             isError: Bool,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             handleTrackerToolResult(
                 invocationID: invocationID,
@@ -1605,7 +1605,7 @@ final class ACPIntegratedAgentModeRunner {
 
         func testSyncACPSelectedModelFromRegistryIfNeeded(
             agentKind: AgentProviderKind,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) -> Bool {
             syncACPSelectedModelFromRegistryIfNeeded(agentKind: agentKind, session: session)
         }
@@ -1615,7 +1615,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func syncACPSelectedModelFromRegistryIfNeeded(
         agentKind: AgentProviderKind,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         guard let providerID = agentKind.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
@@ -1644,7 +1644,7 @@ final class ACPIntegratedAgentModeRunner {
     @discardableResult
     func handleToolStreamEvent(
         _ event: AgentToolStreamEvent,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         // ACP provider events carry the provider's tool invocation IDs, while the
         // MCP tracker sees RepoPrompt's internal invocation IDs. Render explicit

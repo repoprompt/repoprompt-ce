@@ -14,10 +14,10 @@ import RepoPromptDomainRuntime
 // - Presentation, binding-observation, queued-work recovery, and persistence
 //   hooks are host projections. They must never become backend authority: a
 //   headless host may implement them as no-ops without changing run semantics.
-// - `AgentModeViewModel.TabSession` remains at broader app-host orchestration
+// - `AgentTabSession` remains at broader app-host orchestration
 //   hooks because the app is the only adopter today. Terminal settlement does
 //   not receive that type: `bindTerminalSession(_:)` partially applies the
-//   exact originating object into a `TabSession`-neutral capability value.
+//   exact originating object into an `AgentTabSession`-neutral capability value.
 
 extension AgentModeRunService {
     /// Token/usage accounting projection for non-Codex turns.
@@ -25,29 +25,29 @@ extension AgentModeRunService {
     /// Authority: usage accounting (host-side projection of provider activity).
     struct UsageAccountingHooks {
         let estimateRuntimeTokens: (String) -> Int
-        let addUserInputTokensToActiveNonCodexTurn: (Int, AgentModeViewModel.TabSession) -> Void
-        let startNonCodexTurnAccountingIfNeeded: (AgentModeViewModel.TabSession, String) -> Void
-        let finalizeNonCodexTurnUsage: (AgentModeViewModel.TabSession, Int?, Int?, Int?) -> Void
+        let addUserInputTokensToActiveNonCodexTurn: (Int, AgentTabSession) -> Void
+        let startNonCodexTurnAccountingIfNeeded: (AgentTabSession, String) -> Void
+        let finalizeNonCodexTurnUsage: (AgentTabSession, Int?, Int?, Int?) -> Void
     }
 
     /// Attachment file lifecycle for one turn (reserve → consume → finalize).
     ///
     /// Authority: persistence/durable turn resources.
     struct AttachmentLifecycleHooks {
-        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> UUID?
-        let markAttachmentsConsumed: (AgentModeViewModel.TabSession, UUID?) -> Void
-        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> Void
-        let consumeDeferredAttachmentCleanup: (AgentModeViewModel.TabSession, Bool) -> Void
-        let finalizeAttachmentsForTurn: (AgentModeViewModel.TabSession, UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void
+        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentTabSession) -> UUID?
+        let markAttachmentsConsumed: (AgentTabSession, UUID?) -> Void
+        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentTabSession) -> Void
+        let consumeDeferredAttachmentCleanup: (AgentTabSession, Bool) -> Void
+        let finalizeAttachmentsForTurn: (AgentTabSession, UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void
     }
 
     /// UI-only callbacks. Never authoritative for run lifecycle decisions.
     ///
     /// Authority: presentation projection.
     struct RunPresentationHooks {
-        let setAgentRunActive: (AgentModeViewModel.TabSession, Bool) -> Void
+        let setAgentRunActive: (AgentTabSession, Bool) -> Void
         let requestUIRefresh: (UUID, Bool) -> Void
-        let notifyAgentTurnComplete: (AgentModeViewModel.TabSession) -> Void
+        let notifyAgentTurnComplete: (AgentTabSession) -> Void
     }
 
     /// Session binding/run-state observation invoked from the central run
@@ -59,7 +59,7 @@ extension AgentModeRunService {
     /// Authority: host binding/state observation projection. Never
     /// authoritative for run lifecycle decisions.
     struct RunBindingObservationHooks {
-        let updateBindings: (AgentModeViewModel.TabSession) -> Void
+        let updateBindings: (AgentTabSession) -> Void
     }
 
     /// Recovery of queued, undelivered user work when a run settles before
@@ -74,49 +74,49 @@ extension AgentModeRunService {
     ///
     /// Authority: persistence projection.
     struct RunPersistenceHooks {
-        let scheduleSave: (AgentModeViewModel.TabSession) -> Void
+        let scheduleSave: (AgentTabSession) -> Void
     }
 
     /// Transcript projection of provider stream events and terminal finalization.
     ///
     /// Authority: transcript projection.
     struct TranscriptProjectionHooks {
-        let handleHeadlessStreamResult: (AIStreamResult, AgentModeViewModel.TabSession, UUID, UUID) async -> Void
-        let finalizeStreamingItems: (AgentModeViewModel.TabSession) -> Void
-        let finalizePendingToolCalls: (AgentModeViewModel.TabSession, AgentSessionRunState) -> Void
-        let finalizePendingToolCallsWithUpperBound: (AgentModeViewModel.TabSession, AgentSessionRunState, Int?) -> Void
-        let flushPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
-        let clearPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
+        let handleHeadlessStreamResult: (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void
+        let finalizeStreamingItems: (AgentTabSession) -> Void
+        let finalizePendingToolCalls: (AgentTabSession, AgentSessionRunState) -> Void
+        let finalizePendingToolCallsWithUpperBound: (AgentTabSession, AgentSessionRunState, Int?) -> Void
+        let flushPendingAssistantDelta: (AgentTabSession) -> Void
+        let clearPendingAssistantDelta: (AgentTabSession) -> Void
     }
 
     /// Provider-facing input assembly (messages, handoff payloads).
     ///
     /// Authority: provider capability inputs.
     struct ProviderInputAssemblyHooks {
-        let buildHeadlessAgentMessage: (AgentModeViewModel.TabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
+        let buildHeadlessAgentMessage: (AgentTabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
         /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
         let augmentUserMessageForProviderSend: (
             _ text: String,
             _ attachments: [AgentImageAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentModeViewModel.TabSession?
+            _ session: AgentTabSession?
         ) async -> String
         /// Stages a transcript handoff for fresh-session resume recovery.
-        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentModeViewModel.TabSession) async -> Void
+        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
         /// Prepends a staged handoff payload to provider-facing text.
-        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentModeViewModel.TabSession) -> String
+        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> String
         /// Records whether a staged handoff payload was accepted by the provider send attempt.
-        let recordPendingHandoffSendOutcome: (_ session: AgentModeViewModel.TabSession, _ didSend: Bool) -> Void
+        let recordPendingHandoffSendOutcome: (_ session: AgentTabSession, _ didSend: Bool) -> Void
     }
 
     /// Cancellation of pending approvals/questions/reviews when a run settles.
     ///
     /// Authority: approval/interaction brokerage.
     struct RunInteractionHooks {
-        let cancelPendingQuestion: (AgentModeViewModel.TabSession) -> Void
-        let cancelPendingApproval: (AgentModeViewModel.TabSession) -> Void
-        let cancelPendingApplyEditsReview: (AgentModeViewModel.TabSession, String) -> Void
-        let cancelPendingWorktreeMergeReview: (AgentModeViewModel.TabSession, String) -> Void
+        let cancelPendingQuestion: (AgentTabSession) -> Void
+        let cancelPendingApproval: (AgentTabSession) -> Void
+        let cancelPendingApplyEditsReview: (AgentTabSession, String) -> Void
+        let cancelPendingWorktreeMergeReview: (AgentTabSession, String) -> Void
     }
 
     /// Adapter into the canonical durable terminal settlement authority
@@ -125,16 +125,16 @@ extension AgentModeRunService {
     /// Authority: canonical lifecycle command/event adaptation. The terminal
     /// commit barrier drives these exactly once per settled run attempt.
     struct TerminalSettlementHooks {
-        let prepareTerminalPublication: (AgentModeViewModel.TabSession) -> Void
+        let prepareTerminalPublication: (AgentTabSession) -> Void
         let makeTerminalPublicationEnvelope: (
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             AgentRunOwnership,
             AgentSessionRunState,
             UUID?,
             DomainAgentRunSnapshot.FailureReason?
         ) -> AgentRunTerminalPublicationEnvelope?
         let publishTerminalCommit: (
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
@@ -144,9 +144,9 @@ extension AgentModeRunService {
     ///
     /// Authority: lifecycle command issuance back into the host.
     struct RunContinuationHooks {
-        let startFollowUpRun: (AgentModeViewModel.TabSession, String) -> Void
+        let startFollowUpRun: (AgentTabSession, String) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
-        let signalMCPInstructionDelivered: (_ session: AgentModeViewModel.TabSession) async -> Void
+        let signalMCPInstructionDelivered: (_ session: AgentTabSession) async -> Void
     }
 
     /// Composite host callback surface for run execution, grouped by authority.
@@ -174,7 +174,7 @@ extension AgentModeRunService.Hooks {
     /// object directly and never re-resolves it through the tab dictionary.
     @MainActor
     func bindTerminalSession(
-        _ session: AgentModeViewModel.TabSession
+        _ session: AgentTabSession
     ) -> AgentRunTerminalSessionBinding {
         let tabID = session.tabID
         return AgentRunTerminalSessionBinding(
