@@ -96,16 +96,11 @@ struct MCPServerToggleView: View {
 
     var body: some View {
         Button(action: { showPopover.toggle() }) {
-            HStack(spacing: 6) {
-                Image(systemName: "server.rack")
-                    .imageScale(.medium)
-                    .foregroundColor(buttonIconColor)
-                Text("MCP Server")
-            }
+            Label("MCP Server", systemImage: "server.rack")
+                .labelStyle(.iconOnly)
+                .imageScale(.medium)
+                .foregroundColor(buttonIconColor)
         }
-        .buttonStyle(CustomButtonStyle())
-        .padding(.leading, 8)
-        .padding(.trailing, 8)
         .hoverTooltip(toolbarStateObserver.visualState.helpText, .bottom)
         .accessibilityHint(toolbarStateObserver.visualState.helpText)
         .popover(isPresented: $showPopover, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {

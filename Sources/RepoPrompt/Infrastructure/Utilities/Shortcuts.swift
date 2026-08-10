@@ -39,8 +39,9 @@ extension KeyboardShortcuts.Name {
     static let agentNewChat = Self("agentNewChat", default: .init(.n, modifiers: [.command, .option]))
     /// Toggle the Agent session sidebar.
     static let toggleNavigationSidebar = Self("toggleNavigationSidebar", default: .init(.b, modifiers: [.command, .option]))
-    /// Toggle the Compose inspector.
-    static let toggleComposeInspector = Self("toggleComposeInspector", default: .init(.p, modifiers: [.command]))
+    /// Toggle Context Composer.
+    /// The raw key remains stable so existing custom bindings continue to resolve.
+    static let toggleContextComposer = Self("toggleComposeInspector", default: .init(.p, modifiers: [.command]))
     /// Show the current-window Agent navigation HUD.
     static let showCurrentWindowAgentNavigationHUD = Self("showCurrentWindowAgentNavigationHUD", default: .init(.k, modifiers: [.command]))
     /// Show the all-active/recent Agents navigation HUD.
