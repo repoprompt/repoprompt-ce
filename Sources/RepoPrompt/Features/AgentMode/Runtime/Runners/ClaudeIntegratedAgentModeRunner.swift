@@ -2,11 +2,18 @@ import Foundation
 
 @MainActor
 final class ClaudeIntegratedAgentModeRunner {
-    private struct ConsumeEventsOutcome {
-        let terminalState: AgentSessionRunState
-        let errorText: String?
-        let shouldShutdownSession: Bool
+    private enum ConsumeEventsOutcome {
+        case completed
+        case cancelled
+        case failed(errorText: String?, shouldShutdownSession: Bool)
     }
+
+    /// Claude's native stream reports terminal cancellation and failure as values,
+    /// while the shared transient execution core accepts those classifications as
+    /// thrown errors. This marker is intentionally runner-local: the coordinator
+    /// and native controller remain the authorities for the underlying terminal
+    /// event and its provider-specific metadata.
+    private struct NativeTerminalFailure: Error {}
 
     private let claudeCoordinator: ClaudeAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
@@ -111,40 +118,72 @@ final class ClaudeIntegratedAgentModeRunner {
                 )
 
                 let providerName = session.selectedAgent.rawValue
-                await lease.providerInitializationStarted(provider: providerName)
-                let sendOutcome = await self.claudeCoordinator.sendClaudeNativeMessage(
-                    session: session,
-                    text: initialMessageForRun,
-                    attachments: attachments,
-                    intent: .runAttempt(ownership: ownership, runID: runID)
-                )
-                let providerInitializationOutcome = switch sendOutcome {
-                case .sent:
-                    "ready"
-                case .failed:
-                    Task.isCancelled ? "cancelled" : "failed"
-                case .superseded:
-                    "superseded"
-                }
-                await lease.providerInitializationCompleted(
-                    provider: providerName,
-                    outcome: providerInitializationOutcome
-                )
-                switch sendOutcome {
-                case .sent:
-                    self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
-                case .failed:
-                    self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-                    await self.finalize(
+                var didSendToProvider = false
+                var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
+                let report = await DomainAgentRunExecutionCore.execute(
+                    failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
+                ) {
+                    await lease.providerInitializationStarted(provider: providerName)
+                    let sendOutcome = await self.claudeCoordinator.sendClaudeNativeMessage(
+                        session: session,
+                        text: initialMessageForRun,
+                        attachments: attachments,
+                        intent: .runAttempt(ownership: ownership, runID: runID)
+                    )
+                    let providerInitializationOutcome = switch sendOutcome {
+                    case .sent:
+                        "ready"
+                    case .failed:
+                        Task.isCancelled ? "cancelled" : "failed"
+                    case .superseded:
+                        "superseded"
+                    }
+                    await lease.providerInitializationCompleted(
+                        provider: providerName,
+                        outcome: providerInitializationOutcome
+                    )
+
+                    switch sendOutcome {
+                    case .sent:
+                        didSendToProvider = true
+                        self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+                    case .failed:
+                        nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
+                        throw NativeTerminalFailure()
+                    case .superseded:
+                        return .superseded
+                    }
+
+                    self.hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+                    self.hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
+                    _ = await lease.releaseWhenRouted()
+
+                    guard let events = await self.claudeCoordinator.events(for: session) else {
+                        nativeFailureMetadata = (
+                            errorText: "Claude native events stream not available.",
+                            shouldShutdownSession: false
+                        )
+                        throw NativeTerminalFailure()
+                    }
+
+                    session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+                    switch await self.consumeEvents(
+                        events,
                         session: session,
                         runID: runID,
-                        ownership: ownership,
-                        attachmentReservationID: attachmentReservationID,
-                        terminalState: .failed,
-                        errorText: nil,
-                        notifyTurnComplete: false
-                    )
-                    return
+                        runAttemptID: runAttemptID
+                    ) {
+                    case .completed:
+                        return .completed(assistantText: nil)
+                    case .cancelled:
+                        throw CancellationError()
+                    case let .failed(errorText, shouldShutdownSession):
+                        nativeFailureMetadata = (errorText, shouldShutdownSession)
+                        throw NativeTerminalFailure()
+                    }
+                }
+
+                switch report.result {
                 case .superseded:
                     if self.claudeCoordinator.runAttemptIsCurrent(
                         ownership,
@@ -167,43 +206,27 @@ final class ClaudeIntegratedAgentModeRunner {
                     } else {
                         await lease.cancelAndCleanup()
                     }
-                    return
-                }
-
-                self.hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-                self.hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
-                _ = await lease.releaseWhenRouted()
-
-                guard let events = await self.claudeCoordinator.events(for: session) else {
+                case let .terminal(outcome):
+                    let terminalState: AgentSessionRunState = switch outcome.kind {
+                    case .completed: .completed
+                    case .cancelled: .cancelled
+                    case .failed: .failed
+                    }
+                    if !didSendToProvider {
+                        self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+                    }
                     await self.finalize(
                         session: session,
                         runID: runID,
                         ownership: ownership,
                         attachmentReservationID: attachmentReservationID,
-                        terminalState: .failed,
-                        errorText: "Claude native events stream not available.",
-                        notifyTurnComplete: false
+                        terminalState: terminalState,
+                        errorText: outcome.kind == .failed ? nativeFailureMetadata?.errorText : nil,
+                        notifyTurnComplete: outcome.kind == .completed,
+                        shouldShutdownSession: outcome.kind == .failed
+                            && nativeFailureMetadata?.shouldShutdownSession == true
                     )
-                    return
                 }
-
-                session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
-                let outcome = await self.consumeEvents(
-                    events,
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID
-                )
-                await self.finalize(
-                    session: session,
-                    runID: runID,
-                    ownership: ownership,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: outcome.terminalState,
-                    errorText: outcome.errorText,
-                    notifyTurnComplete: outcome.terminalState == .completed,
-                    shouldShutdownSession: outcome.shouldShutdownSession
-                )
             } onCancel: {}
         }
     }
@@ -256,8 +279,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     hooks.persistence.scheduleSave(session)
                 }
                 if status.isRepoPromptServerFailed {
-                    return ConsumeEventsOutcome(
-                        terminalState: .failed,
+                    return .failed(
                         errorText: "RepoPrompt MCP failed to initialize for Claude (session \(status.sessionID ?? "unknown")).",
                         shouldShutdownSession: true
                     )
@@ -309,11 +331,11 @@ final class ClaudeIntegratedAgentModeRunner {
                 session.claudeSupersedingProtectedTurnIDs.removeAll()
                 switch turnStatus {
                 case .completed:
-                    return ConsumeEventsOutcome(terminalState: .completed, errorText: nil, shouldShutdownSession: false)
+                    return .completed
                 case .cancelled:
-                    return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil, shouldShutdownSession: false)
+                    return .cancelled
                 case .failed:
-                    return ConsumeEventsOutcome(terminalState: .failed, errorText: nil, shouldShutdownSession: false)
+                    return .failed(errorText: nil, shouldShutdownSession: false)
                 }
             case let .error(message):
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -336,14 +358,13 @@ final class ClaudeIntegratedAgentModeRunner {
         // If we exited because the attempt changed (cancel / new attempt)
         // or the task was cancelled, this is expected — not a stream failure.
         if exitedDueToAttemptMismatch || Task.isCancelled {
-            return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil, shouldShutdownSession: false)
+            return .cancelled
         }
 
         // The events stream ended without a terminal turnCompleted event while this
         // attempt was still active.  This means the stream was finished or the Claude
         // process exited unexpectedly.
-        return ConsumeEventsOutcome(
-            terminalState: .failed,
+        return .failed(
             errorText: "Claude events stream ended unexpectedly. The run may need to be restarted.",
             shouldShutdownSession: false
         )
