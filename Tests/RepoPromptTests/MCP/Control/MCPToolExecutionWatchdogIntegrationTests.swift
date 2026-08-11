@@ -2060,6 +2060,8 @@ import XCTest
                     await operationGate.enterAndWait()
                     return .null
                 }
+                let laneFillerGate = MCPExecutionIgnoringCancellationGate()
+                var laneFillerTasks: [Task<Void, Error>] = []
                 do {
                     let endpoint = try fixture.endpointA()
                     let arguments: [String: Any] = [
@@ -2085,6 +2087,21 @@ import XCTest
                     try await clock.waitForSleeperCount(2)
                     try await operationGate.waitUntilEntered(count: 2)
 
+                    let competingWatchdogCallCount = 2
+                    let smallReadCapacity = MCPToolAdmissionPolicy.smallReadConnectionLimit
+                    let laneFillerCount = smallReadCapacity - competingWatchdogCallCount
+                    laneFillerTasks = (0 ..< laneFillerCount).map { _ in
+                        Task {
+                            try await manager.withConnectionCallPermitForTesting(
+                                connectionID: endpoint.connectionID,
+                                lane: .smallRead
+                            ) {
+                                await laneFillerGate.enterAndWait()
+                            }
+                        }
+                    }
+                    try await laneFillerGate.waitUntilEntered(count: laneFillerCount)
+
                     let queuedBeyondCapacity = Task {
                         try await endpoint.callTool(
                             name: MCPWindowToolName.readFile,
@@ -2096,7 +2113,7 @@ import XCTest
                             connectionID: endpoint.connectionID,
                             lane: .smallRead
                         )
-                        return snapshot?.activePermitCount == MCPToolAdmissionPolicy.smallReadPerWindowLimit
+                        return snapshot?.activePermitCount == smallReadCapacity
                             && snapshot?.waiterCount == 1
                     }
                     XCTAssertTrue(capacityWaiterRegistered)
@@ -2104,7 +2121,7 @@ import XCTest
                         connectionID: endpoint.connectionID,
                         lane: .smallRead
                     )
-                    XCTAssertEqual(queuedLimiter?.activePermitCount, MCPToolAdmissionPolicy.smallReadPerWindowLimit)
+                    XCTAssertEqual(queuedLimiter?.activePermitCount, smallReadCapacity)
                     XCTAssertEqual(queuedLimiter?.waiterCount, 1)
 
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
@@ -2123,9 +2140,14 @@ import XCTest
                     XCTAssertEqual(queuedPayload["busy_reason"] as? String, "detached_settlement_in_progress")
                     XCTAssertEqual(queuedPayload["retryable"] as? Bool, true)
 
+                    await laneFillerGate.release()
+                    for task in laneFillerTasks {
+                        try await task.value
+                    }
+
                     let enteredCount = await operationGate.enteredCount()
                     let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
-                    XCTAssertEqual(enteredCount, MCPToolAdmissionPolicy.smallReadPerWindowLimit)
+                    XCTAssertEqual(enteredCount, competingWatchdogCallCount)
                     XCTAssertFalse(isTerminal)
 
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
@@ -2162,6 +2184,10 @@ import XCTest
                     await manager.debugResetToolExecutionWatchdogEnvironment()
                     await fixture.cleanup()
                 } catch {
+                    await laneFillerGate.release()
+                    for task in laneFillerTasks {
+                        _ = try? await task.value
+                    }
                     await operationGate.release()
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)

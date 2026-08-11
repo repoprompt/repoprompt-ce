@@ -1,5 +1,6 @@
 import CoreServices
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
@@ -489,6 +490,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingLimiter")
         let service = try await makeService(root: root)
         let limit = FileSystemService.contentReadWorkerLimitForTesting
+        XCTAssertEqual(limit, ContentReadConcurrencyCapacity.maximumConcurrentReads)
         let readCount = limit + 2
         for index in 0 ..< readCount {
             try FileSystemTestSupport.write("file-\(index)", to: root.appendingPathComponent("File-\(index).txt"))

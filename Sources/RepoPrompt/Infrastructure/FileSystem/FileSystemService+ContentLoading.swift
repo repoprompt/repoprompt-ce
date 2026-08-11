@@ -1,5 +1,6 @@
 import Cuchardet
 import Foundation
+import RepoPromptDomainRuntime
 import UniversalCharsetDetection
 
 private extension String.Encoding {
@@ -779,16 +780,17 @@ actor ContentReadAsyncLimiter {
 extension FileSystemService {
     private static let defaultContentReadChunkSize = 1_048_576
     private static let defaultContentReadFileSizeLimit: Int64 = 10_000_000
-    private static let contentReadWorkerLimit = max(2, min(4, ProcessInfo.processInfo.activeProcessorCount))
     private static let contentReadWorkerLimiter = ContentReadAsyncLimiter(
-        capacity: contentReadWorkerLimit,
+        capacity: ContentReadConcurrencyCapacity.maximumConcurrentReads,
         maxQueuedWaiterCount: 512
     )
 
     /// Maximum CodeMap bulk permits when no foreground activity is registered.
     /// Foreground activity temporarily suppresses all CodeMap permit grants.
     nonisolated static var codeMapArtifactBuildBulkPermitLimit: Int {
-        ContentReadAsyncLimiter.bulkPermitLimit(forCapacity: contentReadWorkerLimit)
+        ContentReadAsyncLimiter.bulkPermitLimit(
+            forCapacity: ContentReadConcurrencyCapacity.maximumConcurrentReads
+        )
     }
 
     nonisolated static func withContentReadForegroundActivity<T>(
@@ -848,7 +850,7 @@ extension FileSystemService {
 
     #if DEBUG
         nonisolated static var contentReadWorkerLimitForTesting: Int {
-            contentReadWorkerLimit
+            ContentReadConcurrencyCapacity.maximumConcurrentReads
         }
 
         nonisolated static func contentReadWorkerLimiterSnapshotForTesting() async -> ContentReadAsyncLimiter.Snapshot {

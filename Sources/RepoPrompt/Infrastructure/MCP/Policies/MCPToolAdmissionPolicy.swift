@@ -23,7 +23,7 @@ extension MCPToolAdmissionClass {
 }
 
 enum MCPToolAdmissionPolicy {
-    /// Preserve the measured app-host lane limits; M1 moves classification authority only.
+    /// Keep app-host admission aligned with the package-level domain limits.
     static let exclusiveConnectionLimit = MCPDomainToolAdmissionLimits.exclusiveConnection
     static let controlConnectionLimit = MCPDomainToolAdmissionLimits.controlConnection
     static let smallReadConnectionLimit = MCPDomainToolAdmissionLimits.smallReadConnection
