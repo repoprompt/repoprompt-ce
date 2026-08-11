@@ -39,8 +39,8 @@ private struct ContextBuilderToolResult: Codable {
     let selection: String
 
     let responseType: String?
-    let plan: ChatSendReply?
-    let review: ChatSendReply?
+    let plan: Value?
+    let review: Value?
     let followUpHint: String?
     let oracleExportPath: String?
     let oracleExportInstruction: String?
@@ -100,10 +100,10 @@ private struct ContextBuilderToolResult: Codable {
             obj["response_type"] = .string(responseType)
         }
         if let plan {
-            obj["plan"] = plan.toMCPValue()
+            obj["plan"] = plan
         }
         if let review {
-            obj["review"] = review.toMCPValue()
+            obj["review"] = review
         }
         if let hint = followUpHint {
             obj["follow_up_hint"] = .string(hint)
@@ -261,6 +261,17 @@ enum ContextBuilderTypedPromptResolver {
 @MainActor
 final class MCPContextBuilderToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .contextBuilder
+
+    nonisolated static func followUpValue(
+        for result: OracleSendResult
+    ) -> (value: Value, primary: ChatSendReply) {
+        switch result.payload {
+        case let .single(reply):
+            (.object(reply.toMCPObject()), reply)
+        case let .paired(pair):
+            (.object(pair.toMCPObject()), pair.primaryReply())
+        }
+    }
 
     private let runtime: MCPAppToolBinder
     private typealias Dependencies = (
@@ -509,8 +520,13 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             let progressReporter: ContextBuilderMCPProgressReporter = { phase in
                 await progressTimeline.transition(to: phase)
             }
-            let activityReporter: ContextBuilderMCPActivityReporter = { phase, message in
-                await progressTimeline.reportActivity(phase: phase, message: message)
+            let activityReporter: ContextBuilderMCPActivityReporter = { activity in
+                switch activity {
+                case let .report(phase, message):
+                    await progressTimeline.reportActivity(phase: phase, message: message)
+                case let .suppressHeartbeat(phase):
+                    await progressTimeline.suppressHeartbeat(for: phase)
+                }
             }
 
             func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
@@ -674,8 +690,9 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 let selectionReply = renderedSelection.reply
                 let formattedSelection = renderedSelection.formatted
 
-                var planReply: ChatSendReply? = nil
-                var reviewReply: ChatSendReply? = nil
+                var planValue: Value? = nil
+                var reviewValue: Value? = nil
+                var followUpPrimaryReply: ChatSendReply? = nil
                 var followUpHint: String? = nil
                 var oracleExportFile: OracleExportFile? = nil
 
@@ -791,7 +808,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         "Generating \(modeLabel)..."
                     )
 
-                    let reply = try await withTimelinePhaseCompletion(progressTimeline) {
+                    let result = try await withTimelinePhaseCompletion(progressTimeline) {
                         try await withHeartbeat(
                             connectionID: connectionID,
                             tool: MCPWindowToolName.contextBuilder,
@@ -816,12 +833,14 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         }
                     }
 
+                    let followUp = Self.followUpValue(for: result)
+                    followUpPrimaryReply = followUp.primary
                     if mode == .review {
-                        reviewReply = reply
+                        reviewValue = followUp.value
                     } else {
-                        planReply = reply
+                        planValue = followUp.value
                     }
-                    followUpHint = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(reply.shortId)\", new_chat: false)"
+                    followUpHint = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(followUp.primary.shortId)\", new_chat: false)"
                 }
 
                 await dependencies.execution.sendStageProgress(
@@ -860,8 +879,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         planningModel: planModelName,
                         selection: formattedSelection,
                         responseType: responseType?.rawValue,
-                        plan: planReply,
-                        review: reviewReply,
+                        plan: planValue,
+                        review: reviewValue,
                         followUpHint: followUpHint,
                         oracleExportPath: oracleExportPath,
                         oracleExportInstruction: oracleExportInstruction
@@ -869,7 +888,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 }
 
                 if exportResponse,
-                   planReply != nil || reviewReply != nil
+                   planValue != nil || reviewValue != nil
                 {
                     let resultForExport = makeResult(oracleExportPath: nil)
                     let markdown = ToolOutputFormatter.formatDiscoverContext(value: resultForExport.toMCPValue())
@@ -882,8 +901,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                             }
                         }
                         .joined(separator: "\n")
-                    let exportMode = responseType?.rawValue ?? planReply?.mode ?? reviewReply?.mode ?? "response"
-                    let chatID = planReply?.shortId ?? reviewReply?.shortId
+                    let exportMode = responseType?.rawValue ?? followUpPrimaryReply?.mode ?? "response"
+                    let chatID = followUpPrimaryReply?.shortId
                     guard let capturedOracleExportDestination else {
                         throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
                     }
@@ -992,7 +1011,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 while !Task.isCancelled {
                     try await Task.sleep(for: interval)
                     try Task.checkCancellation()
-                    let heartbeat: (stage: String, message: String) = if let timeline {
+                    let heartbeat: (stage: String, message: String)? = if let timeline {
                         await timeline.heartbeat(
                             fallbackStage: stage,
                             fallbackMessage: message
@@ -1000,13 +1019,15 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                     } else {
                         (stage, message)
                     }
-                    await ServerNetworkManager.shared.sendProgress(
-                        for: connectionID,
-                        tool: tool,
-                        kind: .heartbeat,
-                        stage: heartbeat.stage,
-                        message: heartbeat.message
-                    )
+                    if let heartbeat {
+                        await ServerNetworkManager.shared.sendProgress(
+                            for: connectionID,
+                            tool: tool,
+                            kind: .heartbeat,
+                            stage: heartbeat.stage,
+                            message: heartbeat.message
+                        )
+                    }
                 }
             } catch {
                 // Cancellation is the expected completion path.

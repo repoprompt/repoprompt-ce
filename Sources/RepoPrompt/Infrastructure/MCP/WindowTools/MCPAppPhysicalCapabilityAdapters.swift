@@ -118,7 +118,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?,
         _ progressReporter: ContextBuilderMCPProgressReporter?,
         _ activityReporter: ContextBuilderMCPActivityReporter?
-    ) async throws -> ChatSendReply
+    ) async throws -> OracleSendResult
     typealias CaptureRequestMetadata = @MainActor @Sendable () async -> MCPServerViewModel.RequestMetadata
     typealias ResolveImplicitContextBuilderGitTarget = @MainActor @Sendable (
         _ metadata: MCPServerViewModel.RequestMetadata

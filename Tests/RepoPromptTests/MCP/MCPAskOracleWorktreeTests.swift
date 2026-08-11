@@ -16,6 +16,130 @@ import XCTest
             try await super.tearDown()
         }
 
+        func testDisabledSecondaryPreservesSingleSendValidationError() async {
+            let settings = GlobalSettingsStore.shared
+            let priorSecondaryModel = settings.secondaryOracleModelRaw()
+            settings.setSecondaryOracleModelRaw(nil, commit: false)
+            defer {
+                settings.setSecondaryOracleModelRaw(priorSecondaryModel, commit: false)
+            }
+
+            let oracle = makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder())
+            let args: [String: Value] = ["message": .string("")]
+            let routedError: ChatToolError?
+            do {
+                _ = try await oracle.tool_chatSend(args: args, promptVM: oracle.promptViewModel)
+                routedError = nil
+            } catch {
+                routedError = error as? ChatToolError
+            }
+            XCTAssertEqual(routedError?.message, "message cannot be empty")
+        }
+
+        func testAskOracleMapsOnlyStructuredPairFailuresToMCPServerError() {
+            let pairFailure = ChatToolError(
+                code: .internalError,
+                message: "Both Oracle lanes failed.",
+                details: ["oracle_pair_payload": "{\"status\":\"failed\"}"]
+            )
+            XCTAssertNotNil(MCPOracleToolService.structuredOracleSendMCPError(pairFailure))
+            XCTAssertNil(MCPOracleToolService.structuredOracleSendMCPError(.internalError("ordinary failure")))
+        }
+
+        func testOracleSecondaryModelUsesRoutedWorkspaceProfile() {
+            let oracle = makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder())
+            let workspaceID = UUID()
+            var resolvedWorkspaceID: UUID?
+
+            XCTAssertThrowsError(try oracle.resolveOracleSecondaryModel(
+                workspaceID: workspaceID,
+                effectiveProfile: { requestedWorkspaceID in
+                    resolvedWorkspaceID = requestedWorkspaceID
+                    return AgentModelsSettingsProfile(
+                        secondaryOracleModelRaw: "workspace-secondary-invalid"
+                    )
+                }
+            )) { error in
+                guard let toolError = error as? ChatToolError else {
+                    return XCTFail("Expected ChatToolError, got \(error)")
+                }
+                XCTAssertEqual(toolError.code, .invalidParams)
+                XCTAssertTrue(toolError.message.contains("workspace-secondary-invalid"))
+            }
+            XCTAssertEqual(resolvedWorkspaceID, workspaceID)
+        }
+
+        func testRecognizedSecondaryModelDefersAvailabilityFailureToItsLane() throws {
+            XCTAssertEqual(
+                try OraclePairModelSelectionPolicy.resolveSecondary(raw: AIModel.gpt54Pro.rawValue),
+                .gpt54Pro
+            )
+        }
+
+        func testBackgroundRoutedSessionCreationDoesNotChangeCurrentOrActiveChat() async throws {
+            let oracle = makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder())
+            let workspaceID = UUID()
+            let tabID = UUID()
+            XCTAssertNil(oracle.currentSessionID)
+            XCTAssertNil(oracle.workspaceManager.activeChatSessionID(forTabID: tabID))
+
+            let createdID = try await oracle.locateOrCreateChat(
+                nil,
+                desiredName: "Background Oracle",
+                forceNew: true,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                activateInUI: false,
+                setActiveForTab: false
+            )
+
+            XCTAssertEqual(oracle.sessions.first(where: { $0.id == createdID })?.workspaceID, workspaceID)
+            XCTAssertNil(oracle.currentSessionID)
+            XCTAssertNil(oracle.workspaceManager.activeChatSessionID(forTabID: tabID))
+        }
+
+        func testPublicOracleToolsPreserveLegacyAutomaticActivationPolicy() {
+            XCTAssertEqual(
+                OracleViewModel.OracleSendActivationPolicy.publicMCP,
+                .legacyAutomatic
+            )
+        }
+
+        func testLegacyAndUnknownWorkspaceDeletionPreservesBaselineAndClearsMCPState() async throws {
+            for workspaceID in [UUID?.none, UUID()] {
+                let oracle = makeOracleViewModel(cleanupRecorder: OracleCleanupRecorder())
+                let root = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("LegacyOracleDeletion-\(UUID().uuidString)", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: root) }
+                let fileURL = root.appendingPathComponent("ChatSession-\(UUID().uuidString).json")
+                try Data().write(to: fileURL)
+                let session = ChatSession(
+                    workspaceID: workspaceID,
+                    name: "Legacy session",
+                    fileURL: fileURL
+                )
+                oracle.sessions.append(session)
+                oracle.currentSessionID = session.id
+                oracle.setMCPSessionUIState(
+                    .init(
+                        modelInfo: "MCP",
+                        overrideModelName: "Override",
+                        overrideChatPresetName: "Preset"
+                    ),
+                    for: session.id
+                )
+
+                let deleted = await oracle.deleteSession(session)
+                XCTAssertTrue(deleted)
+                XCTAssertFalse(oracle.sessions.contains { $0.id == session.id })
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+                XCTAssertNil(oracle.mcpModelInfo)
+                XCTAssertNil(oracle.mcpOverrideModelName)
+                XCTAssertNil(oracle.mcpOverrideChatPresetName)
+            }
+        }
+
         func testOracleCleanupHelperInvokesAIQueriesServiceDelete() async {
             let recorder = OracleCleanupRecorder()
             let oracle = makeOracleViewModel(cleanupRecorder: recorder)

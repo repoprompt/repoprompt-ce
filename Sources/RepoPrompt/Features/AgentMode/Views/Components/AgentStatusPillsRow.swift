@@ -14,6 +14,24 @@ struct AgentStatusPillsRow: View {
         statusPillsUI.snapshot
     }
 
+    private var oraclePresentations: [AgentOraclePillPresentation] {
+        let groupSessionLanes: Set<OracleLane> = snapshot.currentTabID.map { tabID in
+            let groupedSessions = oracleViewModel.sessions(forTabID: tabID).filter { $0.oraclePairID != nil }
+            let eligible = AgentOraclePillLogic.eligibleSessions(
+                sessions: groupedSessions,
+                streamingSessionIDs: oracleViewModel.streamingSessions,
+                liveMessageCount: { oracleViewModel.liveMessageCount(for: $0) },
+                activeAgentSessionID: snapshot.activeAgentSessionID,
+                activeRunID: snapshot.activeRunID
+            )
+            return Set(eligible.compactMap(\.oracleLane))
+        } ?? []
+        return AgentOraclePillLogic.presentations(
+            additionalModelRaws: promptManager.additionalOracleModelRaws,
+            groupSessionLanes: groupSessionLanes
+        )
+    }
+
     var body: some View {
         #if DEBUG
             let _ = AgentModePerfDiagnostics.increment("ui.body.statusPillsRow")
@@ -65,13 +83,16 @@ struct AgentStatusPillsRow: View {
             Spacer(minLength: 0)
 
             HStack(spacing: 6) {
-                AgentOraclePill(
-                    oracleViewModel: oracleViewModel,
-                    windowID: windowID,
-                    currentTabID: snapshot.currentTabID,
-                    activeAgentSessionID: snapshot.activeAgentSessionID,
-                    activeRunID: snapshot.activeRunID
-                )
+                ForEach(oraclePresentations, id: \.id) { presentation in
+                    AgentOraclePill(
+                        oracleViewModel: oracleViewModel,
+                        windowID: windowID,
+                        currentTabID: snapshot.currentTabID,
+                        activeAgentSessionID: snapshot.activeAgentSessionID,
+                        activeRunID: snapshot.activeRunID,
+                        presentation: presentation
+                    )
+                }
 
                 AgentContextPill(
                     promptManager: promptManager,

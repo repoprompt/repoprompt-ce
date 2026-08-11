@@ -180,6 +180,48 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         displayName(forChatModelRaw: profileSnapshot.planningModelRaw, fallback: "Select an Oracle model")
     }
 
+    var additionalOracleModelRaws: [String] {
+        profileSnapshot.additionalOracleModelRaws
+    }
+
+    var maximumOracleCount: Int {
+        OraclePairModelSelectionPolicy.maximumOracleCount
+    }
+
+    var totalOracleCount: Int {
+        additionalOracleModelRaws.count + 1
+    }
+
+    var canAddAdditionalOracle: Bool {
+        guard additionalOracleModelRaws.count < OraclePairModelSelectionPolicy.maximumAdditionalOracleCount else {
+            return false
+        }
+        do {
+            return try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(profileSnapshot.planningModelRaw) != nil
+        } catch {
+            return false
+        }
+    }
+
+    var addOracleHelpText: String {
+        if additionalOracleModelRaws.count >= OraclePairModelSelectionPolicy.maximumAdditionalOracleCount {
+            return "Maximum of \(maximumOracleCount) Oracles configured"
+        }
+        if !canAddAdditionalOracle {
+            return "Select the primary Oracle model first"
+        }
+        return "Add another Oracle using the primary model"
+    }
+
+    var currentSecondaryOracleModelName: String {
+        additionalOracleModelName(at: 0, fallback: "Disabled")
+    }
+
+    func additionalOracleModelName(at index: Int, fallback: String = "Select an Oracle model") -> String {
+        guard additionalOracleModelRaws.indices.contains(index) else { return fallback }
+        return displayName(forChatModelRaw: additionalOracleModelRaws[index], fallback: fallback)
+    }
+
     var currentBuiltinChatModelName: String {
         let raw = profileSnapshot.syncChatModelWithOracle
             ? profileSnapshot.planningModelRaw
@@ -309,6 +351,32 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         )
     }
 
+    var secondaryOracleModelDestination: ModelDestination {
+        ModelDestination(
+            id: "agentModels.secondaryOracle",
+            allowsEmptySelection: true,
+            getter: { [weak self] in
+                self?.profileSnapshot.secondaryOracleModelRaw ?? ""
+            },
+            applier: { [weak self] rawValue in
+                self?.setSecondaryOracleModel(raw: rawValue)
+            }
+        )
+    }
+
+    func additionalOracleModelDestination(at index: Int) -> ModelDestination {
+        ModelDestination(
+            id: "agentModels.additionalOracle.\(index)",
+            getter: { [weak self] in
+                guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
+                return additionalOracleModelRaws[index]
+            },
+            applier: { [weak self] rawValue in
+                self?.setAdditionalOracleModel(raw: rawValue, at: index)
+            }
+        )
+    }
+
     /// Destination for the Built-in Chat model. Writes `preferredComposeModel`
     /// and, when the sync toggle is on, mirrors to `planningModel` in the
     /// selected global/workspace Agent Models profile.
@@ -335,6 +403,62 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             } else {
                 profile.preferredComposeModelRaw = raw
             }
+        }
+    }
+
+    func setSecondaryOracleModel(raw: String) {
+        let canonicalRaw: String?
+        do {
+            canonicalRaw = try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(raw)
+        } catch {
+            return
+        }
+        updateSelectedProfile(reason: "agent_models.secondary_oracle_model") { profile in
+            profile.secondaryOracleModelRaw = canonicalRaw
+        }
+    }
+
+    func addAdditionalOracle() {
+        guard additionalOracleModelRaws.count < OraclePairModelSelectionPolicy.maximumAdditionalOracleCount else {
+            return
+        }
+        let primaryRaw: String
+        do {
+            guard let canonicalRaw = try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(
+                profileSnapshot.planningModelRaw
+            ) else { return }
+            primaryRaw = canonicalRaw
+        } catch {
+            return
+        }
+        updateSelectedProfile(reason: "agent_models.additional_oracle.add") { profile in
+            guard profile.additionalOracleModelRaws.count
+                < OraclePairModelSelectionPolicy.maximumAdditionalOracleCount
+            else { return }
+            profile.additionalOracleModelRaws.append(primaryRaw)
+        }
+    }
+
+    func removeAdditionalOracle(at index: Int) {
+        guard additionalOracleModelRaws.indices.contains(index) else { return }
+        updateSelectedProfile(reason: "agent_models.additional_oracle.remove") { profile in
+            guard profile.additionalOracleModelRaws.indices.contains(index) else { return }
+            profile.additionalOracleModelRaws.remove(at: index)
+        }
+    }
+
+    func setAdditionalOracleModel(raw: String, at index: Int) {
+        guard additionalOracleModelRaws.indices.contains(index) else { return }
+        let canonicalRaw: String
+        do {
+            guard let resolvedRaw = try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(raw) else { return }
+            canonicalRaw = resolvedRaw
+        } catch {
+            return
+        }
+        updateSelectedProfile(reason: "agent_models.additional_oracle.model") { profile in
+            guard profile.additionalOracleModelRaws.indices.contains(index) else { return }
+            profile.additionalOracleModelRaws[index] = canonicalRaw
         }
     }
 

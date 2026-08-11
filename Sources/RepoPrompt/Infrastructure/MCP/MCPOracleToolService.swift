@@ -1,6 +1,23 @@
 import Foundation
 import MCP
 
+enum OraclePairFailureTransportEnvelope {
+    private static let prefix = "[[RPCE_ORACLE_PAIR_FAILURE_V1:"
+    private static let suffix = "]]"
+
+    static func encode(payload: String) -> String {
+        prefix + Data(payload.utf8).base64EncodedString() + suffix
+    }
+
+    static func decodePayload(in text: String) -> String? {
+        guard let prefixRange = text.range(of: prefix),
+              let suffixRange = text.range(of: suffix, range: prefixRange.upperBound ..< text.endIndex),
+              let data = Data(base64Encoded: String(text[prefixRange.upperBound ..< suffixRange.lowerBound]))
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 @MainActor
 struct MCPOracleToolService {
     typealias RequestMetadata = MCPServerViewModel.RequestMetadata
@@ -41,6 +58,60 @@ struct MCPOracleToolService {
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping ChatSendOperation) async throws -> [String: Value]
     let sendChat: SendChat
     let exportOracleResponse: ExportOracleResponse
+
+    static func structuredOracleSendMCPError(_ error: ChatToolError) -> MCPError? {
+        // MCPError.serverError has no structured data field, so this boundary uses one exact versioned envelope.
+        guard let payload = error.details?["oracle_group_payload"] ?? error.details?["oracle_pair_payload"] else {
+            return nil
+        }
+        return .serverError(
+            code: -32000,
+            message: "\(error.message)\n\(OraclePairFailureTransportEnvelope.encode(payload: payload))"
+        )
+    }
+
+    private static func oracleExportResponse(from result: [String: Value]) -> String? {
+        guard let lanes = result["oracle_results"]?.objectValue else {
+            return result["response"]?.stringValue
+        }
+        func text(for lane: String) -> String {
+            guard let value = lanes[lane]?.objectValue else { return "(No response)" }
+            return value["response"]?.stringValue
+                ?? value["partial_response"]?.stringValue
+                ?? value["error"]?.stringValue.map { "Failed: \($0)" }
+                ?? "(No response)"
+        }
+        let requestedOrder = result["oracle_result_order"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let orderedKeys = requestedOrder.isEmpty
+            ? OracleLane.allCases.map(\.rawValue).filter { lanes[$0] != nil }
+            : requestedOrder.filter { lanes[$0] != nil }
+        guard !orderedKeys.isEmpty else { return result["response"]?.stringValue }
+        return orderedKeys.map { key in
+            let label = OracleLane(rawValue: key)?.displayLabel ?? key
+            return "# \(label)\n\n\(text(for: key))"
+        }.joined(separator: "\n\n")
+    }
+
+    private func performOracleSend(
+        args: [String: Value],
+        tabContext: OracleViewModel.OracleSendTabContext?,
+        connectionID: UUID?,
+        toolName: String
+    ) async throws -> [String: Value] {
+        do {
+            return try await withHeartbeat(
+                connectionID,
+                toolName,
+                "waiting",
+                "Waiting for Oracle response..."
+            ) {
+                try await sendChat(args, promptVM, tabContext)
+            }
+        } catch let error as ChatToolError {
+            if let mapped = Self.structuredOracleSendMCPError(error) { throw mapped }
+            throw error
+        }
+    }
 
     func executeOracleUtils(args: [String: Value]) async throws -> Value {
         let op = (args["op"]?.stringValue ?? "")
@@ -211,6 +282,7 @@ struct MCPOracleToolService {
                 origin: .askOracle,
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID,
+                activationPolicy: .publicMCP,
                 packaging: packaging
             )
         }
@@ -237,15 +309,12 @@ struct MCPOracleToolService {
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
 
-        let capturedChatArgs = chatArgs
-        var result = try await withHeartbeat(
-            connectionID,
-            askOracleToolName,
-            "waiting",
-            "Waiting for Oracle response..."
-        ) {
-            try await sendChat(capturedChatArgs, promptVM, tabContext)
-        }
+        var result = try await performOracleSend(
+            args: chatArgs,
+            tabContext: tabContext,
+            connectionID: connectionID,
+            toolName: askOracleToolName
+        )
 
         if exportResponse {
             let export = try await exportOracleResponse(OracleExportRequest(
@@ -253,7 +322,7 @@ struct MCPOracleToolService {
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? normalizedChatID,
-                response: result["response"]?.stringValue,
+                response: Self.oracleExportResponse(from: result),
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -337,16 +406,12 @@ struct MCPOracleToolService {
         var chatArgs = args
         chatArgs.removeValue(forKey: "export_response")
 
-        let capturedTabContext = tabContext
-        let capturedChatArgs = chatArgs
-        var result = try await withHeartbeat(
-            connectionID,
-            oracleSendToolName,
-            "waiting",
-            "Waiting for Oracle response..."
-        ) {
-            try await sendChat(capturedChatArgs, promptVM, capturedTabContext)
-        }
+        var result = try await performOracleSend(
+            args: chatArgs,
+            tabContext: tabContext,
+            connectionID: connectionID,
+            toolName: oracleSendToolName
+        )
 
         if exportResponse {
             let normalizedChatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -355,7 +420,7 @@ struct MCPOracleToolService {
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? ((normalizedChatID?.isEmpty == false) ? normalizedChatID : nil),
-                response: result["response"]?.stringValue,
+                response: Self.oracleExportResponse(from: result),
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -637,6 +702,7 @@ struct MCPOracleToolService {
             origin: origin,
             agentModeSessionID: owner.agentSessionID,
             agentModeRunID: owner.runID,
+            activationPolicy: .publicMCP,
             packaging: packaging
         )
     }

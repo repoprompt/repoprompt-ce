@@ -49,10 +49,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         await timeline.transition(to: .selectionReplyRendering)
         clock.advance(by: 1.25)
 
-        let renderingHeartbeat = await timeline.heartbeat(
+        guard let renderingHeartbeat = await timeline.heartbeat(
             fallbackStage: "processing",
             fallbackMessage: "Still rendering selection..."
-        )
+        ) else { return XCTFail("Expected rendering heartbeat") }
         XCTAssertEqual(renderingHeartbeat.stage, "processing")
         XCTAssertTrue(
             renderingHeartbeat.message.contains("selection reply rendering"),
@@ -62,10 +62,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
 
         await timeline.transition(to: .reviewSelectionAuthorization)
         clock.advance(by: 0.5)
-        let authorizationHeartbeat = await timeline.heartbeat(
+        guard let authorizationHeartbeat = await timeline.heartbeat(
             fallbackStage: "generating",
             fallbackMessage: "Still authorizing review..."
-        )
+        ) else { return XCTFail("Expected authorization heartbeat") }
         XCTAssertEqual(authorizationHeartbeat.stage, "generating")
         XCTAssertTrue(
             authorizationHeartbeat.message.contains("review selection authorization"),
@@ -86,6 +86,91 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         XCTAssertEqual(events[3].phaseElapsed, 0.5, accuracy: 0.000_1)
         XCTAssertTrue(events[1].message.contains("completed in 1.250s"), events[1].message)
         XCTAssertTrue(events[3].message.contains("total 1.750s"), events[3].message)
+    }
+
+    func testLegacySingleOracleStreamingMessagesRemainByteExact() async {
+        let clock = ContextBuilderProgressTestClock()
+        let recorder = ContextBuilderProgressEventRecorder()
+        let timeline = ContextBuilderMCPProgressTimeline(
+            clock: { clock.now() },
+            sink: { event in await recorder.record(event) }
+        )
+
+        await timeline.transition(to: .streaming)
+        clock.advance(by: 0.5)
+        await timeline.reportActivity(phase: .streaming, message: "Oracle response streaming")
+        clock.advance(by: 0.75)
+        guard let heartbeat = await timeline.heartbeat(
+            fallbackStage: "generating",
+            fallbackMessage: "fallback"
+        ) else { return XCTFail("Expected legacy streaming heartbeat") }
+        await timeline.finishCurrentPhase()
+
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events.map(\.message), [
+            "Oracle response streaming started (total 0.000s)",
+            "Oracle response streaming (total 0.500s)",
+            "Oracle response streaming completed in 1.250s (total 1.250s)"
+        ])
+        XCTAssertEqual(heartbeat.stage, "generating")
+        XCTAssertEqual(
+            heartbeat.message,
+            "Still in Oracle response streaming (phase 1.250s, total 1.250s)"
+        )
+    }
+
+    func testPairedOracleStreamingActivitiesRemainDistinctAndRecurringInTimelineOutput() async {
+        let clock = ContextBuilderProgressTestClock()
+        let recorder = ContextBuilderProgressEventRecorder()
+        let timeline = ContextBuilderMCPProgressTimeline(
+            clock: { clock.now() },
+            sink: { event in await recorder.record(event) }
+        )
+
+        await timeline.suppressHeartbeat(for: .streaming)
+        await timeline.transition(to: .streaming)
+        let genericHeartbeat = await timeline.heartbeat(
+            fallbackStage: "generating",
+            fallbackMessage: "fallback"
+        )
+        XCTAssertNil(genericHeartbeat)
+        for message in [
+            "Still in Primary Oracle response streaming",
+            "Still in Secondary Oracle response streaming",
+            "Still in Primary Oracle response streaming",
+            "Still in Secondary Oracle response streaming"
+        ] {
+            clock.advance(by: 0.25)
+            await timeline.reportActivity(phase: .streaming, message: message)
+        }
+        await timeline.reportActivity(
+            phase: .messageFinalization,
+            message: "Primary Oracle message finalization completed"
+        )
+        await timeline.finishCurrentPhase()
+        await timeline.transition(to: .messageFinalization)
+        let finalizationHeartbeat = await timeline.heartbeat(
+            fallbackStage: "generating",
+            fallbackMessage: "fallback"
+        )
+        XCTAssertNotNil(finalizationHeartbeat)
+        await timeline.finishCurrentPhase()
+
+        let activities = await recorder.snapshot().filter { $0.kind == .activity }
+        XCTAssertEqual(activities.map(\.phase), [
+            .streaming,
+            .streaming,
+            .streaming,
+            .streaming,
+            .messageFinalization
+        ])
+        XCTAssertEqual(activities.map(\.message), [
+            "Still in Primary Oracle response streaming (total 0.250s)",
+            "Still in Secondary Oracle response streaming (total 0.500s)",
+            "Still in Primary Oracle response streaming (total 0.750s)",
+            "Still in Secondary Oracle response streaming (total 1.000s)",
+            "Primary Oracle message finalization completed (total 1.000s)"
+        ])
     }
 
     func testSuspendingSinkPreservesEveryTimedTransitionWhenItReentersTimeline() async {
@@ -113,10 +198,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         }
         await sink.waitUntilSuspended()
 
-        let heartbeat = await timeline.heartbeat(
+        guard let heartbeat = await timeline.heartbeat(
             fallbackStage: "generating",
             fallbackMessage: "fallback"
-        )
+        ) else { return XCTFail("Expected reentrant phase heartbeat") }
         XCTAssertTrue(
             heartbeat.message.contains(ContextBuilderMCPProgressPhase.sessionCreationAndPersist.displayName),
             heartbeat.message
@@ -192,10 +277,15 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
     }
 
     @MainActor
-    func testRunMCPPlanOrQuestionReportsProductionPhaseSequenceThroughFinalization() async throws {
+    func testRunMCPPlanOrQuestionReportsSingleAndPairedProductionProgressThroughFinalization() async throws {
         #if DEBUG
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            let previousAdditionalModels = GlobalSettingsStore.shared.additionalOracleModelRaws()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+            defer {
+                GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalModels, commit: false)
+            }
             let composition = WindowStateCompositionFactory.make(
                 windowID: -76,
                 deferredInitialAgentSystemWorkspaceRefresh: true,
@@ -265,8 +355,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             defer { viewModel.installRunTestHooks(nil) }
 
             let recorder = ContextBuilderProgressPhaseRecorder()
+            let activityRecorder = ContextBuilderActivityMessageRecorder()
             let sessionRetentionRecorder = ContextBuilderSessionRetentionRecorder()
-            let reply = try await viewModel.runMCPPlanOrQuestion(
+            let result = try await viewModel.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: composition.oracleViewModel,
                 agentModeSessionID: agentModeSessionID,
@@ -278,7 +369,11 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 progressReporter: { phase in
                     await recorder.record(phase)
                 },
-                activityReporter: { phase, _ in
+                activityReporter: { activity in
+                    guard case let .report(phase, message) = activity else {
+                        return XCTFail("Single Oracle mode must not suppress timeline heartbeats")
+                    }
+                    await activityRecorder.record(message)
                     guard phase == .streaming || phase == .messageFinalization else { return }
                     let isPinned: Bool? = await MainActor.run {
                         guard let session = composition.oracleViewModel.sessions.first(where: {
@@ -295,6 +390,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 }
             )
 
+            let reply = MCPContextBuilderToolProvider.followUpValue(for: result).primary
             XCTAssertEqual(reply.mode, "plan")
             XCTAssertEqual(reply.response, "deterministic follow-up")
             let createdSession = try XCTUnwrap(
@@ -306,8 +402,80 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             XCTAssertFalse(retentionObservations.isEmpty)
             XCTAssertTrue(retentionObservations.allSatisfy(\.self))
             XCTAssertFalse(composition.oracleViewModel.isSessionPinnedForTesting(reply.chatId))
+            let activities = await activityRecorder.snapshot()
+            XCTAssertEqual(activities, [
+                "Oracle response streaming",
+                "Oracle message finalization completed"
+            ])
+            XCTAssertFalse(activities.contains { $0.contains("Primary Oracle") || $0.contains("Secondary Oracle") })
             let phases = await recorder.snapshot()
             XCTAssertEqual(phases, [
+                .modelResolution,
+                .payloadPackaging,
+                .sessionCreationAndPersist,
+                .messageSend,
+                .activeQueryAcquisition,
+                .streaming,
+                .messageFinalization
+            ])
+
+            let secondaryModel = AIModel.customProvider(
+                name: "Secondary test provider",
+                provider: "custom",
+                model: "secondary-test-model"
+            )
+            GlobalSettingsStore.shared.setAdditionalOracleModelRaws([secondaryModel.rawValue], commit: false)
+            let pairedActivityRecorder = ContextBuilderActivityMessageRecorder()
+            let pairedPhaseRecorder = ContextBuilderProgressPhaseRecorder()
+            let pairedHeartbeatSuppressionRecorder = ContextBuilderProgressPhaseRecorder()
+            let pairedResult = try await viewModel.runMCPPlanOrQuestion(
+                for: tabID,
+                oracleViewModel: composition.oracleViewModel,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
+                mode: .plan,
+                prompt: "Refine the selected context.",
+                selection: StoredSelection(),
+                reviewGitContext: .automaticOnly(),
+                progressReporter: { phase in
+                    await pairedPhaseRecorder.record(phase)
+                },
+                activityReporter: { activity in
+                    switch activity {
+                    case let .report(_, message):
+                        await pairedActivityRecorder.record(message)
+                    case let .suppressHeartbeat(phase):
+                        await pairedHeartbeatSuppressionRecorder.record(phase)
+                    }
+                }
+            )
+            guard case let .paired(pair) = pairedResult.payload else {
+                return XCTFail("Expected paired production follow-up")
+            }
+            XCTAssertEqual(pair.status, .completed)
+            let pairedActivities = await pairedActivityRecorder.snapshot()
+            XCTAssertEqual(pairedActivities.count, 4)
+            XCTAssertEqual(Set(pairedActivities), Set([
+                "Still in Primary Oracle response streaming",
+                "Still in Secondary Oracle response streaming",
+                "Primary Oracle message finalization completed",
+                "Secondary Oracle message finalization completed"
+            ]))
+            let pairedHeartbeatSuppressions = await pairedHeartbeatSuppressionRecorder.snapshot()
+            XCTAssertEqual(pairedHeartbeatSuppressions, [.streaming])
+            XCTAssertFalse(pairedActivities.contains("Oracle response streaming"))
+            XCTAssertFalse(pairedActivities.contains("Oracle message finalization completed"))
+            for lane in ["Primary Oracle", "Secondary Oracle"] {
+                let streamingIndex = try XCTUnwrap(
+                    pairedActivities.firstIndex(of: "Still in \(lane) response streaming")
+                )
+                let finalizationIndex = try XCTUnwrap(
+                    pairedActivities.firstIndex(of: "\(lane) message finalization completed")
+                )
+                XCTAssertLessThan(streamingIndex, finalizationIndex)
+            }
+            let pairedPhases = await pairedPhaseRecorder.snapshot()
+            XCTAssertEqual(pairedPhases, [
                 .modelResolution,
                 .payloadPackaging,
                 .sessionCreationAndPersist,
@@ -407,12 +575,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                             selection: selection
                         )
                         let chatID = UUID()
-                        return ChatSendReply(
-                            chatId: chatID,
-                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                        return contextBuilderSingleResult(
+                            chatID: chatID,
                             mode: mode.mcpModeName,
-                            response: "deterministic provider follow-up",
-                            errors: nil
+                            response: "deterministic provider follow-up"
                         )
                     },
                     afterCommittedTabSnapshotCaptured: { runID, _ in
@@ -630,12 +796,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                             selection: selection
                         )
                         let chatID = UUID()
-                        return ChatSendReply(
-                            chatId: chatID,
-                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                        return contextBuilderSingleResult(
+                            chatID: chatID,
                             mode: mode.mcpModeName,
-                            response: "deterministic provider follow-up",
-                            errors: nil
+                            response: "deterministic provider follow-up"
                         )
                     },
                     committedTabSnapshotCaptured: { runID, snapshot in
@@ -800,12 +964,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                     runMCPFollowUp: { mode, prompt, selection in
                         await followUpRecorder.record(mode: mode, prompt: prompt, selection: selection)
                         let chatID = UUID()
-                        return ChatSendReply(
-                            chatId: chatID,
-                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                        return contextBuilderSingleResult(
+                            chatID: chatID,
                             mode: mode.mcpModeName,
-                            response: "must not be generated",
-                            errors: nil
+                            response: "must not be generated"
                         )
                     },
                     committedTabSnapshotCaptured: { runID, snapshot in
@@ -1859,6 +2021,23 @@ private actor ContextBuilderProgressEventRecorder {
     }
 }
 
+private func contextBuilderSingleResult(
+    chatID: UUID,
+    mode: String,
+    response: String
+) -> OracleSendResult {
+    OracleSendResult(
+        payload: .single(ChatSendReply(
+            chatId: chatID,
+            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+            mode: mode,
+            response: response,
+            errors: nil
+        )),
+        route: .init(contextID: nil, agentSessionID: nil, agentRunID: nil)
+    )
+}
+
 private actor ContextBuilderProgressPhaseRecorder {
     private var phases: [ContextBuilderMCPProgressPhase] = []
 
@@ -1868,6 +2047,18 @@ private actor ContextBuilderProgressPhaseRecorder {
 
     func snapshot() -> [ContextBuilderMCPProgressPhase] {
         phases
+    }
+}
+
+private actor ContextBuilderActivityMessageRecorder {
+    private var messages: [String] = []
+
+    func record(_ message: String) {
+        messages.append(message)
+    }
+
+    func snapshot() -> [String] {
+        messages
     }
 }
 

@@ -36,6 +36,26 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
         )
 
         XCTAssertEqual(displayName, availableModels[0].displayName)
+        XCTAssertEqual(
+            AIModelDropdown.displayName(
+                forRawValue: "   ",
+                destinationID: "secondaryOracle",
+                allowsEmptySelection: true,
+                availableModels: availableModels,
+                customOpenRouterModels: []
+            ),
+            "Disabled"
+        )
+        XCTAssertEqual(
+            AIModelDropdown.displayName(
+                forRawValue: "  custom-secondary-model  ",
+                destinationID: "secondaryOracle",
+                allowsEmptySelection: true,
+                availableModels: [],
+                customOpenRouterModels: []
+            ),
+            "custom-secondary-model"
+        )
     }
 
     @MainActor

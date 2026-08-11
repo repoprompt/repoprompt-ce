@@ -159,9 +159,13 @@ typealias ContextBuilderMCPProgressReporter = @MainActor @Sendable (
     _ phase: ContextBuilderMCPProgressPhase
 ) async -> Void
 
+enum ContextBuilderMCPActivity {
+    case report(phase: ContextBuilderMCPProgressPhase, message: String)
+    case suppressHeartbeat(phase: ContextBuilderMCPProgressPhase)
+}
+
 typealias ContextBuilderMCPActivityReporter = @MainActor @Sendable (
-    _ phase: ContextBuilderMCPProgressPhase,
-    _ message: String
+    _ activity: ContextBuilderMCPActivity
 ) async -> Void
 
 struct ContextBuilderMCPProgressEvent: Equatable {
@@ -194,6 +198,8 @@ actor ContextBuilderMCPProgressTimeline {
     private var currentPhase: ContextBuilderMCPProgressPhase?
     private var currentPhaseStartedAt: TimeInterval?
     private var phaseGeneration = 0
+    private var heartbeatSuppressedGeneration: Int?
+    private var pendingHeartbeatSuppressionPhase: ContextBuilderMCPProgressPhase?
     private var didReportSoftBound = false
     private var softBoundTask: Task<Void, Never>?
     private var pendingEvents: [ContextBuilderMCPProgressEvent] = []
@@ -224,6 +230,10 @@ actor ContextBuilderMCPProgressTimeline {
         let generation = phaseGeneration
         currentPhase = phase
         currentPhaseStartedAt = now
+        if pendingHeartbeatSuppressionPhase == phase {
+            heartbeatSuppressedGeneration = generation
+            pendingHeartbeatSuppressionPhase = nil
+        }
         didReportSoftBound = false
         let started = event(
             kind: .started,
@@ -283,15 +293,24 @@ actor ContextBuilderMCPProgressTimeline {
         }
     }
 
+    func suppressHeartbeat(for phase: ContextBuilderMCPProgressPhase) {
+        if currentPhase == phase {
+            heartbeatSuppressedGeneration = phaseGeneration
+        } else {
+            pendingHeartbeatSuppressionPhase = phase
+        }
+    }
+
     func heartbeat(
         fallbackStage: String,
         fallbackMessage: String
-    ) -> (stage: String, message: String) {
+    ) -> (stage: String, message: String)? {
         guard let phase = currentPhase,
               let phaseStartedAt = currentPhaseStartedAt
         else {
             return (fallbackStage, fallbackMessage)
         }
+        guard heartbeatSuppressedGeneration != phaseGeneration else { return nil }
 
         let now = clock()
         return (

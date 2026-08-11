@@ -52,6 +52,7 @@ final class AppSettingsMCPService: Service {
                 - `{"op":"get","keys":["ui.appearance_mode","ui.show_tooltips"]}`
                 - `{"op":"get","group":"file_system"}`
                 - `{"op":"set","key":"models.planning_model","value":null}`
+                - `{"op":"set","key":"models.additional_oracle_models","value":["gpt-5.4-pro","claude-sonnet-4-5-20250929"]}`
                 - `{"op":"set","key":"file_system.global_ignore_defaults","value":"**/node_modules/\\n"}`
                 - `{"op":"options","key":"models.planning_model","agent":"codexExec"}`
 
@@ -63,7 +64,7 @@ final class AppSettingsMCPService: Service {
                         "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]),
                         "key": .string(description: "Allowlisted setting key (required for set/options)."),
                         "keys": .array(description: "Multiple keys (get only).", items: .string()),
-                        "value": .anyOf([.boolean(), .integer(), .number(), .string(), .null]),
+                        "value": .anyOf([.boolean(), .integer(), .number(), .string(), .array(items: .string()), .null]),
                         "agent": .string(description: "Filter options by CLI backend."),
                         "limit": .integer(description: "Maximum options returned (1–200)."),
                         "detailed": .boolean(description: "Include descriptions and model metadata.")
@@ -178,13 +179,14 @@ final class AppSettingsMCPService: Service {
 
         let definition = try AppSettingsMCPRegistry.definition(forKey: key)
         let normalizedValue = try definition.validate(rawValue)
+        let validatedValue = try Self.validatedOracleModelValue(key: definition.key, value: normalizedValue)
 
         let result = try await MainActor.run { () throws -> (oldValue: Value, newValue: Value, changed: Bool, applied: Bool, persistenceBlockReason: GlobalSettingsPersistenceBlockReason?) in
             let oldValue = definition.read(store)
-            let changed = !Self.valuesEqual(oldValue, normalizedValue)
+            let changed = !Self.valuesEqual(oldValue, validatedValue)
             if changed {
-                try definition.write(store, normalizedValue)
-                definition.afterWrite?(store, normalizedValue, notificationCenter)
+                try definition.write(store, validatedValue)
+                definition.afterWrite?(store, validatedValue, notificationCenter)
             }
             let newValue = definition.read(store)
             definition.afterSet?(store, newValue, changed, notificationCenter)
@@ -206,6 +208,28 @@ final class AppSettingsMCPService: Service {
             response["persistence_warning"] = .string(Self.persistenceBlockWarning(reason))
         }
         return .object(response)
+    }
+
+    private static func validatedOracleModelValue(key: String, value: Value) throws -> Value {
+        do {
+            switch key {
+            case "models.secondary_oracle_model":
+                guard let raw = value.stringValue else { return value }
+                guard let canonicalRaw = try OraclePairModelSelectionPolicy.canonicalSecondaryRaw(raw) else {
+                    return .null
+                }
+                return .string(canonicalRaw)
+            case "models.additional_oracle_models":
+                guard let values = value.arrayValue else { return value }
+                let raws = values.compactMap(\.stringValue)
+                let canonical = try OraclePairModelSelectionPolicy.canonicalAdditionalRaws(raws)
+                return .array(canonical.map(Value.string))
+            default:
+                return value
+            }
+        } catch let error as ChatToolError {
+            throw MCPError.invalidParams(error.message)
+        }
     }
 
     private func options(_ args: [String: Value]) async throws -> Value {
@@ -420,6 +444,7 @@ private enum AppSettingValueType: String {
     case boolean
     case string
     case optionalString = "string|null"
+    case stringArray = "string[]"
     case number
 }
 
@@ -702,6 +727,49 @@ private enum AppSettingsMCPRegistry {
                 honorSync: true
             ) },
             afterWrite: postRecommendationsDidApply,
+            candidateProvider: aiModelRawCandidates
+        ),
+        optionalModelRawSetting(
+            key: "models.secondary_oracle_model",
+            group: "models",
+            label: "Secondary Oracle Model",
+            description: "Compatibility alias for the first additional Oracle model. Null removes that lane and shifts later additional Oracles forward.",
+            read: { stringOrNull($0.secondaryOracleModelRaw()) },
+            write: { store, value in
+                try store.setSecondaryOracleModelRaw(
+                    optionalString(from: value),
+                    reason: "app_settings.models.secondary_oracle_model"
+                )
+            },
+            afterWrite: nil,
+            candidateProvider: aiModelRawCandidates
+        ),
+        AppSettingDefinition(
+            key: "models.additional_oracle_models",
+            group: "models",
+            valueType: .stringArray,
+            label: "Additional Oracle Models",
+            description: "Ordered independent Oracle model raw identifiers after the permanent Primary Oracle (zero to four).",
+            allowedValues: nil,
+            read: { .array($0.additionalOracleModelRaws().map(Value.string)) },
+            validate: { value in
+                guard let values = value.arrayValue,
+                      values.count <= OraclePairModelSelectionPolicy.maximumAdditionalOracleCount,
+                      values.allSatisfy({ $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false })
+                else {
+                    throw MCPError.invalidParams(
+                        "Setting 'models.additional_oracle_models' requires an array of zero to four non-empty model ID strings."
+                    )
+                }
+                return .array(values)
+            },
+            write: { store, value in
+                store.setAdditionalOracleModelRaws(
+                    value.arrayValue?.compactMap(\.stringValue) ?? [],
+                    reason: "app_settings.models.additional_oracle_models"
+                )
+            },
+            afterWrite: nil,
             candidateProvider: aiModelRawCandidates
         ),
         boolSetting(

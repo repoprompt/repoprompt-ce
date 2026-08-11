@@ -301,6 +301,8 @@ class PromptViewModel: ObservableObject {
     private var sessionPreferredModelOverrideRaw: String?
     @Published private var _contextBuilderModel: String = "" // workspace-scoped (synced from ChatGlobalSettings)
     @Published private var _planningModel: String = ""
+    @Published private(set) var additionalOracleModelRaws: [String] = []
+    @Published private(set) var secondaryOracleModelRaw: String?
 
     /// Returns the chosen planning model as an `AIModel` (falls back to preferredAIModel).
     var planningModel: AIModel {
@@ -855,6 +857,8 @@ class PromptViewModel: ObservableObject {
             currentRaw: _planningModel,
             persistedRaw: profile.planningModelRaw
         )
+        additionalOracleModelRaws = profile.additionalOracleModelRaws
+        secondaryOracleModelRaw = additionalOracleModelRaws.first
         if sessionPreferredModelOverrideRaw == nil {
             _preferredModel = Self.modelRawAfterSettingsSync(
                 currentRaw: _preferredModel,

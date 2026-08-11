@@ -282,15 +282,15 @@ final class ContextBuilderRunRecord {
             switch item {
             case let .firstEvent(type):
                 await reportProgress(.providerStreamActive)
-                await activityReporter?(
-                    .providerStreamActive,
-                    "First discovery provider event received: \(type)"
-                )
+                await activityReporter?(.report(
+                    phase: .providerStreamActive,
+                    message: "First discovery provider event received: \(type)"
+                ))
             case let .firstRepoPromptTool(name):
-                await activityReporter?(
-                    .providerStreamActive,
-                    "First nested RepoPrompt MCP tool request observed: \(name)"
-                )
+                await activityReporter?(.report(
+                    phase: .providerStreamActive,
+                    message: "First nested RepoPrompt MCP tool request observed: \(name)"
+                ))
             }
         }
     }
