@@ -252,7 +252,7 @@ struct ManageWorkspacesView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Leaked Test Workspaces Detected")
                         .font(fontPreset.headlineFont)
-                    Text("\(leakCleanupPreview.records.count) runtime-catalog \(leakCleanupPreview.records.count == 1 ? "record matches" : "records match") narrow persisted test-fixture evidence. Files are not removed until you review and confirm.")
+                    Text("\(leakCleanupPreview.records.count) runtime-catalog \(leakCleanupPreview.records.count == 1 ? "record matches" : "records match") narrow persisted test-fixture evidence. No catalog records are removed until you review and confirm.")
                         .font(fontPreset.subheadlineFont)
                         .foregroundColor(.secondary)
                     if deletableCount != leakCleanupPreview.records.count {
@@ -636,7 +636,7 @@ struct ManageWorkspacesView: View {
         let selectedMatchingCount = managementSelection.selectedCount(in: matchingIDs)
         return HStack(spacing: 10) {
             Button("Select All Results") {
-                managementSelection.selectAllResults(deletableMatchingIDs)
+                handleSelectionMutation(managementSelection.selectAllResults(deletableMatchingIDs))
             }
             .disabled(deletableMatchingIDs.isEmpty)
             Text("\(managementSelection.selectedWorkspaceIDs.count) selected (\(selectedMatchingCount) of \(filteredItems.count) matching)")
@@ -648,7 +648,11 @@ struct ManageWorkspacesView: View {
             Button("Cancel") { managementSelection.cancel() }
                 .keyboardShortcut(.cancelAction)
             Button("Delete…") { showBulkDeleteConfirmation = true }
-                .disabled(managementSelection.selectedWorkspaceIDs.isEmpty || isRunningBulkDelete)
+                .disabled(
+                    managementSelection.selectedWorkspaceIDs.isEmpty
+                        || managementSelection.selectedWorkspaceIDs.count > WorkspaceBulkDeletePolicy.maximumWorkspaceCount
+                        || isRunningBulkDelete
+                )
                 .foregroundColor(.red)
         }
         .padding(8)
@@ -659,7 +663,9 @@ struct ManageWorkspacesView: View {
     private func selectionWorkspaceRow(_ item: WorkspaceManagementItem) -> some View {
         let selected = managementSelection.selectedWorkspaceIDs.contains(item.id)
         return Button {
-            managementSelection.toggle(item.id, isDeletable: item.isDeletable)
+            handleSelectionMutation(
+                managementSelection.toggle(item.id, isDeletable: item.isDeletable)
+            )
         } label: {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: selected ? "checkmark.square.fill" : "square")
@@ -710,12 +716,12 @@ struct ManageWorkspacesView: View {
             userWorkspaces: workspaceManager.workspaces.filter { !$0.isSystemWorkspace }
         )
         let selectedItems = allItems.filter {
-            managementSelection.selectedWorkspaceIDs.contains($0.id) && $0.isDeletable
+            managementSelection.selectedWorkspaceIDs.contains($0.id)
         }
         return VStack(alignment: .leading, spacing: 14) {
             Text("Delete \(selectedItems.count) \(selectedItems.count == 1 ? "Workspace" : "Workspaces")?")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 21, weight: .semibold))
-            Text("This removes the approved records from the authoritative runtime catalog and deletes their saved workspace artifacts. This cannot be undone.")
+            Text("This removes the approved records from the authoritative runtime catalog. Saved workspace artifacts are then cleaned up on a best-effort basis; any files that could not be removed will be reported. Catalog removal cannot be undone.")
                 .font(fontPreset.subheadlineFont)
                 .foregroundColor(.secondary)
             ScrollView {
@@ -742,7 +748,11 @@ struct ManageWorkspacesView: View {
                     runBulkDelete(approvedItems: selectedItems)
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(selectedItems.isEmpty || isRunningBulkDelete)
+                .disabled(
+                    selectedItems.isEmpty
+                        || selectedItems.count > WorkspaceBulkDeletePolicy.maximumWorkspaceCount
+                        || isRunningBulkDelete
+                )
             }
         }
         .padding(20)
@@ -752,11 +762,17 @@ struct ManageWorkspacesView: View {
 
     private func runBulkDelete(approvedItems: [WorkspaceManagementItem]) {
         guard !approvedItems.isEmpty, !isRunningBulkDelete else { return }
+        guard approvedItems.count <= WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
+            bulkDeleteResultMessage = bulkDeleteLimitMessage(attemptedCount: approvedItems.count)
+            return
+        }
         isRunningBulkDelete = true
+        let namesByWorkspaceID = Dictionary(uniqueKeysWithValues: approvedItems.map {
+            ($0.id, $0.workspace.name)
+        })
         Task {
             let result = await workspaceManager.deleteWorkspacesAsync(
                 workspaceIDs: Set(approvedItems.map(\.id)),
-                protectedWorkspaceIDs: activeWorkspaceIDs,
                 leakedTestFixtureWorkspaceIDs: Set(
                     approvedItems.filter(\.isLeakCleanupCandidate).map(\.id)
                 )
@@ -764,11 +780,73 @@ struct ManageWorkspacesView: View {
             await refreshLeakCleanupPreview()
             isRunningBulkDelete = false
             showBulkDeleteConfirmation = false
-            managementSelection.cancel()
-            let deletedCount = result.deletedWorkspaceIDs.count
-            let unchangedCount = result.alreadyAbsentWorkspaceIDs.count
-            let issueCount = result.skippedReasonsByWorkspaceID.count + result.failedReasonsByWorkspaceID.count
-            bulkDeleteResultMessage = "Deleted \(deletedCount) workspace \(deletedCount == 1 ? "record" : "records"). \(unchangedCount) were already absent. \(issueCount) were protected or failed."
+            if result.requestFailureReason == nil, result.retryableWorkspaceIDs.isEmpty {
+                managementSelection.cancel()
+            } else if result.requestFailureReason == nil {
+                managementSelection.retainWorkspaceIDs(result.retryableWorkspaceIDs)
+            }
+            bulkDeleteResultMessage = makeBulkDeleteResultMessage(
+                result,
+                namesByWorkspaceID: namesByWorkspaceID
+            )
+        }
+    }
+
+    private func handleSelectionMutation(_ result: WorkspaceSelectionMutationResult) {
+        guard case let .limitExceeded(maximum, attemptedCount) = result else { return }
+        bulkDeleteResultMessage = "You tried to select \(attemptedCount) workspaces. Bulk deletion is limited to \(maximum) per request; the existing selection was kept. Narrow the search or clear the selection and try again."
+    }
+
+    private func bulkDeleteLimitMessage(attemptedCount: Int) -> String {
+        "Bulk deletion is limited to \(WorkspaceBulkDeletePolicy.maximumWorkspaceCount) workspaces per request. The \(attemptedCount)-workspace request was not submitted and no records were changed."
+    }
+
+    private func makeBulkDeleteResultMessage(
+        _ result: WorkspaceBulkDeleteResult,
+        namesByWorkspaceID: [UUID: String]
+    ) -> String {
+        if let requestFailureReason = result.requestFailureReason {
+            return requestFailureReason
+        }
+        var sections = [
+            "Removed \(result.deletedWorkspaceIDs.count) \(result.deletedWorkspaceIDs.count == 1 ? "record" : "records") from the authoritative runtime catalog. \(result.alreadyAbsentWorkspaceIDs.count) were already absent."
+        ]
+        sections.append(contentsOf: formattedReasonGroups(
+            title: "Protected or skipped",
+            reasonsByWorkspaceID: result.skippedReasonsByWorkspaceID,
+            namesByWorkspaceID: namesByWorkspaceID
+        ))
+        sections.append(contentsOf: formattedReasonGroups(
+            title: "Failed; still selected for retry",
+            reasonsByWorkspaceID: result.failedReasonsByWorkspaceID,
+            namesByWorkspaceID: namesByWorkspaceID
+        ))
+        sections.append(contentsOf: formattedReasonGroups(
+            title: "Catalog removal succeeded, but saved artifact cleanup was incomplete",
+            reasonsByWorkspaceID: result.artifactCleanupWarningsByWorkspaceID,
+            namesByWorkspaceID: namesByWorkspaceID
+        ))
+        if !result.retryableWorkspaceIDs.isEmpty {
+            sections.append("\(result.retryableWorkspaceIDs.count) unresolved \(result.retryableWorkspaceIDs.count == 1 ? "workspace remains" : "workspaces remain") selected for targeted retry.")
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func formattedReasonGroups(
+        title: String,
+        reasonsByWorkspaceID: [UUID: String],
+        namesByWorkspaceID: [UUID: String]
+    ) -> [String] {
+        let grouped = Dictionary(grouping: reasonsByWorkspaceID.keys) {
+            reasonsByWorkspaceID[$0] ?? "Unknown reason."
+        }
+        return grouped.keys.sorted().map { reason in
+            let ids = grouped[reason, default: []]
+            let names = ids.map { namesByWorkspaceID[$0] ?? $0.uuidString }
+                .sorted()
+            let shownNames = names.prefix(8).joined(separator: ", ")
+            let remainder = names.count > 8 ? " and \(names.count - 8) more" : ""
+            return "\(title) (\(names.count)): \(shownNames)\(remainder) — \(reason)"
         }
     }
 

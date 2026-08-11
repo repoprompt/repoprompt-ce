@@ -39,6 +39,46 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
     }
 
+    func testPersistedEphemeralWorkspaceRejectsSaveAndConflictResolutionCommands() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        try FileManager.default.createDirectory(
+            at: fixture.workspaceFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let document = try fixture.document(prompt: "legacy ephemeral", ephemeral: true)
+        try document.documentBytes.write(to: fixture.workspaceFile)
+        try fixture.writeLegacyIndex()
+
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let loaded = await runtime.workspaceStore.snapshot()
+        XCTAssertEqual(loaded.workspaces.first?.document.metadata.isEphemeral, true)
+
+        let save = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+        ))
+        XCTAssertEqual(save.disposition, .invalid)
+        XCTAssertEqual(save.errorCode, .invalidDocument)
+        XCTAssertEqual(save.diagnostic, "ephemeral_workspace_not_persistable")
+
+        let resolve = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: true,
+                protectedAgentIdentities: []
+            )
+        ))
+        XCTAssertEqual(resolve.disposition, .invalid)
+        XCTAssertEqual(resolve.errorCode, .invalidDocument)
+        XCTAssertEqual(resolve.diagnostic, "ephemeral_workspace_not_persistable")
+        XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), document.documentBytes)
+    }
+
     func testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence() async throws {
         let fixture = try Fixture.make(includeWorkspace: false)
         defer { fixture.remove() }
@@ -247,6 +287,67 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         let finalSnapshot = await finalRuntime.workspaceStore.snapshot()
         XCTAssertTrue(finalSnapshot.workspaces.isEmpty)
         XCTAssertEqual(finalSnapshot.health, .writable)
+    }
+
+    func testDeleteKeepsAuthoritativeTombstoneWhenArtifactCleanupFails() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let snapshot = await runtime.workspaceStore.snapshot()
+        let workspace = try XCTUnwrap(snapshot.workspaces.first)
+        let workspaceDirectory = fixture.workspaceFile.deletingLastPathComponent()
+        let workspaceRoot = workspaceDirectory.deletingLastPathComponent()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: workspaceDirectory.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: workspaceRoot.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: workspaceRoot.path
+            )
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: workspaceDirectory.path
+            )
+        }
+
+        let envelope = DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            expectedCatalogRevision: snapshot.catalogRevision,
+            expectedWorkspaceRevision: workspace.revisions.workingRevision,
+            origin: .standalone,
+            command: .deleteWorkspace(workspaceID: fixture.workspaceID)
+        )
+        let deleted = await runtime.workspaceStore.execute(envelope)
+
+        XCTAssertEqual(deleted.disposition, .applied)
+        XCTAssertNil(deleted.errorCode)
+        XCTAssertTrue(deleted.diagnostic?.hasPrefix("artifact_cleanup_incomplete:") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspaceDirectory.path))
+        let authoritativeAfter = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(authoritativeAfter.workspaces.isEmpty)
+
+        let replayed = await runtime.workspaceStore.execute(envelope)
+        XCTAssertEqual(replayed.disposition, .deduplicated)
+        XCTAssertEqual(replayed.diagnostic, deleted.diagnostic)
+        let authoritativeAfterReplay = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(authoritativeAfterReplay.workspaces.isEmpty)
+
+        _ = await runtime.shutdown()
+        let restartedRuntime = fixture.runtime()
+        try await restartedRuntime.start()
+        defer { Task { _ = await restartedRuntime.shutdown() } }
+        let replayedAfterRestart = await restartedRuntime.workspaceStore.execute(envelope)
+        XCTAssertEqual(replayedAfterRestart.disposition, .deduplicated)
+        XCTAssertEqual(replayedAfterRestart.diagnostic, deleted.diagnostic)
+        let authoritativeAfterRestart = await restartedRuntime.workspaceStore.snapshot()
+        XCTAssertTrue(authoritativeAfterRestart.workspaces.isEmpty)
     }
 
     func testRecreateSameWorkspaceIDClearsDeletionSidecarAcrossRestart() async throws {

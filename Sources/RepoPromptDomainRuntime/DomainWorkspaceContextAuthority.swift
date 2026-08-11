@@ -1369,16 +1369,22 @@ actor DomainWorkspaceContextAuthority {
                 now: operation.recordedAt
             )
             records.removeValue(forKey: workspaceID)
-            globalOperations.insert(operation)
             catalogRevision = deleted.catalogRevision
+            let cleanupDiagnostic = deleted.tombstone.operation.diagnostic
             let outcome = DomainCommandOutcome(
                 operationID: envelope.operationID,
                 disposition: .applied,
                 before: record.revisions,
                 after: nil,
                 catalogRevision: catalogRevision,
-                resultingDigest: nil
+                resultingDigest: nil,
+                diagnostic: cleanupDiagnostic
             )
+            globalOperations.insert(DomainRecordedOperation(
+                fingerprint: fingerprint,
+                recordedAt: operation.recordedAt,
+                outcome: outcome
+            ))
             publish(
                 kind: .workspaceDeleted,
                 workspaceID: workspaceID,
@@ -1386,7 +1392,7 @@ actor DomainWorkspaceContextAuthority {
                 operationID: envelope.operationID,
                 origin: envelope.origin,
                 revisions: nil,
-                diagnostic: nil
+                diagnostic: cleanupDiagnostic
             )
             recordMetric(envelope: envelope, outcome: outcome, byteCount: 0)
             return outcome

@@ -97,6 +97,47 @@ import XCTest
             XCTAssertTrue(FileManager.default.fileExists(atPath: indexURL.path))
         }
 
+        func testLeakedFixtureIdentityMatchesProductionShapeAndRejectsNearMatches() {
+            let fixtureUUID = UUID().uuidString
+            let validPath = "/private/var/folders/fixture/AgentModeChatSwitchActivationTests-\(fixtureUUID)/repo"
+
+            XCTAssertTrue(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Agent Mode Chat Switch 1A2B3C4D",
+                repoPaths: [validPath]
+            ))
+
+            let invalidNames = [
+                "Agent Mode Chat Switch 1A2B3C4",
+                "Agent Mode Chat Switch 1A2B3C4D5",
+                "Agent Mode Chat Switch 1A2B3C4G",
+                "Agent Mode Chat Switch 1a2B3C4D",
+                "Agent Mode Chat Switch \(UUID().uuidString)"
+            ]
+            for name in invalidNames {
+                XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                    isEphemeral: true,
+                    name: name,
+                    repoPaths: [validPath]
+                ), name)
+            }
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: false,
+                name: "Agent Mode Chat Switch 1A2B3C4D",
+                repoPaths: [validPath]
+            ))
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Agent Mode Chat Switch 1A2B3C4D",
+                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID + "-extra")]
+            ))
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Agent Mode Chat Switch 1A2B3C4D",
+                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID.lowercased())]
+            ))
+        }
+
         func testRuntimeCatalogCleanupFindsLegacyInventoryOmissionsAndAppliesIdempotently() async throws {
             let normal = WorkspaceModel(name: "User Workspace", repoPaths: ["/Users/example/project"])
             let removableLeak = leakedFixtureWorkspace()
@@ -151,6 +192,22 @@ import XCTest
             XCTAssertFalse(manager.workspaces.contains { $0.id == removableLeak.id })
             XCTAssertTrue(manager.workspaces.contains { $0.id == normal.id })
 
+            let oversized = await manager.deleteWorkspacesAsync(
+                workspaceIDs: Set((0 ... WorkspaceBulkDeletePolicy.maximumWorkspaceCount).map { _ in UUID() })
+            )
+            XCTAssertNotNil(oversized.requestFailureReason)
+            XCTAssertTrue(oversized.failedReasonsByWorkspaceID.isEmpty)
+            XCTAssertTrue(oversized.deletedWorkspaceIDs.isEmpty)
+
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: protectedLeak.repoPaths[0]),
+                withIntermediateDirectories: true
+            )
+            let protector = makeManager(windowID: -764)
+            await protector.awaitInitialized()
+            let protectedSwitch = await protector.switchWorkspace(to: protectedLeak, saveState: false)
+            XCTAssertTrue(protectedSwitch.didSwitch)
+
             let protectedIDs: Set<UUID> = [normal.id, protectedLeak.id]
             let preview = await manager.previewLeakedTestWorkspaces(protectedWorkspaceIDs: protectedIDs)
             XCTAssertEqual(Set(preview.records.map(\.id)), [removableLeak.id, protectedLeak.id])
@@ -162,12 +219,11 @@ import XCTest
             XCTAssertFalse(preview.records.contains { $0.id == unrelatedEphemeral.id })
 
             let firstApply = await manager.deleteWorkspacesAsync(
-                workspaceIDs: [removableLeak.id, protectedLeak.id, normal.id],
-                protectedWorkspaceIDs: protectedIDs,
+                workspaceIDs: [removableLeak.id, protectedLeak.id],
                 leakedTestFixtureWorkspaceIDs: [removableLeak.id, protectedLeak.id]
             )
             XCTAssertEqual(firstApply.deletedWorkspaceIDs, [removableLeak.id])
-            XCTAssertEqual(Set(firstApply.skippedReasonsByWorkspaceID.keys), protectedIDs)
+            XCTAssertEqual(Set(firstApply.skippedReasonsByWorkspaceID.keys), [protectedLeak.id])
             XCTAssertTrue(firstApply.failedReasonsByWorkspaceID.isEmpty)
             XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFileURL(for: removableLeak).path))
 
@@ -178,7 +234,6 @@ import XCTest
 
             let repeatedApply = await manager.deleteWorkspacesAsync(
                 workspaceIDs: [removableLeak.id],
-                protectedWorkspaceIDs: protectedIDs,
                 leakedTestFixtureWorkspaceIDs: [removableLeak.id]
             )
             XCTAssertEqual(repeatedApply.alreadyAbsentWorkspaceIDs, [removableLeak.id])
@@ -186,12 +241,203 @@ import XCTest
             XCTAssertTrue(repeatedApply.failedReasonsByWorkspaceID.isEmpty)
         }
 
-        private func leakedFixtureWorkspace() -> WorkspaceModel {
-            let suffix = UUID()
-            return WorkspaceModel(
-                name: "Agent Mode Chat Switch \(suffix.uuidString)",
+        func testSingleDeleteRejectsCanonicalPinnedAgentClaim() async throws {
+            let pinnedWorkspace = WorkspaceModel(
+                name: "Pinned Agent Workspace",
+                repoPaths: [storageRoot.appendingPathComponent("pinned-repo").path],
+                stashedTabs: [
+                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true))
+                ]
+            )
+            try writeWorkspace(pinnedWorkspace)
+            try writeLegacyIndex([pinnedWorkspace])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-single-delete-protection-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -767,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -767
+                )
+            )
+            await manager.awaitInitialized()
+
+            let didDelete = await manager.deleteWorkspaceAsync(pinnedWorkspace)
+            XCTAssertFalse(didDelete)
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == pinnedWorkspace.id
+            })
+        }
+
+        func testActivationLeaseBlocksDeletionClaimUntilSwitchCompletes() async throws {
+            let workspace = leakedFixtureWorkspace()
+            try writeWorkspace(workspace)
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: workspace.repoPaths[0]),
+                withIntermediateDirectories: true
+            )
+            try writeLegacyIndex([workspace])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-activation-lease-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator()
+            let activationManager = makeManager(
+                windowID: -768,
+                workspaceActivityCoordinator: coordinator
+            )
+            let deletionManager = makeManager(
+                windowID: -769,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -769
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await activationManager.awaitInitialized()
+            await deletionManager.awaitInitialized()
+
+            let activationLeaseAcquired = expectation(description: "activation lease acquired")
+            let gate = WorkspaceDeleteSuspensionGate()
+            var didSuspend = false
+            activationManager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting { workspaceID in
+                guard workspaceID == workspace.id, !didSuspend else { return }
+                didSuspend = true
+                activationLeaseAcquired.fulfill()
+                await gate.wait()
+            }
+
+            let activationTask = Task {
+                await activationManager.switchWorkspace(to: workspace, saveState: false)
+            }
+            await fulfillment(of: [activationLeaseAcquired], timeout: 2)
+
+            let deletion = await deletionManager.deleteWorkspacesAsync(
+                workspaceIDs: [workspace.id],
+                leakedTestFixtureWorkspaceIDs: [workspace.id]
+            )
+            XCTAssertEqual(
+                deletion.skippedReasonsByWorkspaceID[workspace.id],
+                "Workspace is being activated in another window."
+            )
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty)
+            let authoritativeDuringActivation = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeDuringActivation.workspaces.contains {
+                $0.document.workspaceID == workspace.id
+            })
+
+            await gate.open()
+            let activation = await activationTask.value
+            activationManager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting(nil)
+            XCTAssertTrue(activation.didSwitch)
+        }
+
+        func testDeletionLeaseRejectsActivationOfLaterBatchWorkspaceWhileFirstDeleteIsSuspended() async throws {
+            let firstID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+            let laterID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+            let first = leakedFixtureWorkspace(id: firstID)
+            let later = leakedFixtureWorkspace(id: laterID)
+            for workspace in [first, later] {
+                try writeWorkspace(workspace)
+                try FileManager.default.createDirectory(
+                    at: URL(fileURLWithPath: workspace.repoPaths[0]),
+                    withIntermediateDirectories: true
+                )
+            }
+            try writeLegacyIndex([first, later])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-delete-lease-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator()
+            let deletionManager = makeManager(
+                windowID: -765,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -765
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            let activationManager = makeManager(
+                windowID: -766,
+                workspaceActivityCoordinator: coordinator
+            )
+            await deletionManager.awaitInitialized()
+            await activationManager.awaitInitialized()
+
+            let firstDeleteStarted = expectation(description: "first deletion suspended")
+            let gate = WorkspaceDeleteSuspensionGate()
+            deletionManager.setWorkspaceDeleteWillExecuteHandlerForTesting { workspaceID in
+                guard workspaceID == firstID else { return }
+                firstDeleteStarted.fulfill()
+                await gate.wait()
+            }
+
+            let deletionTask = Task {
+                await deletionManager.deleteWorkspacesAsync(
+                    workspaceIDs: [firstID, laterID],
+                    leakedTestFixtureWorkspaceIDs: [firstID, laterID]
+                )
+            }
+            await fulfillment(of: [firstDeleteStarted], timeout: 2)
+
+            let activation = await activationManager.switchWorkspace(to: later, saveState: false)
+            XCTAssertFalse(activation.didSwitch)
+            if case let .blocked(message) = activation {
+                XCTAssertTrue(message.contains("being deleted"), message)
+            } else {
+                XCTFail("Expected deletion lease to reject activation, got \(activation)")
+            }
+
+            await gate.open()
+            let result = await deletionTask.value
+            deletionManager.setWorkspaceDeleteWillExecuteHandlerForTesting(nil)
+
+            XCTAssertEqual(Set(result.deletedWorkspaceIDs), [firstID, laterID])
+            XCTAssertTrue(result.skippedReasonsByWorkspaceID.isEmpty)
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains { $0.document.workspaceID == laterID })
+        }
+
+        private func leakedFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
+            WorkspaceModel(
+                id: id,
+                name: "Agent Mode Chat Switch \(UUID().uuidString.prefix(8))",
                 repoPaths: [
-                    "/private/var/folders/fixture/AgentModeChatSwitchActivationTests-\(UUID().uuidString)/repo"
+                    storageRoot
+                        .appendingPathComponent("AgentModeChatSwitchActivationTests-\(UUID().uuidString)", isDirectory: true)
+                        .appendingPathComponent("repo", isDirectory: true)
+                        .path
                 ],
                 ephemeralFlag: true
             )
@@ -231,7 +477,11 @@ import XCTest
             )
         }
 
-        private func makeManager(windowID: Int) -> WorkspaceManagerViewModel {
+        private func makeManager(
+            windowID: Int,
+            domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
+            workspaceActivityCoordinator: WorkspaceActivityCoordinator? = nil
+        ) -> WorkspaceManagerViewModel {
             let keyManager = KeyManager(
                 secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
             )
@@ -251,10 +501,32 @@ import XCTest
             let manager = WorkspaceManagerViewModel(
                 fileManager: fileManager,
                 promptViewModel: prompt,
+                domainWorkspaceAuthorityClient: domainWorkspaceAuthorityClient,
+                workspaceActivityCoordinator: workspaceActivityCoordinator
+                    ?? WindowStatesManager.shared.workspaceActivityCoordinator,
                 performInitialWorkspaceActivation: false
             )
             managers.append(manager)
             return manager
+        }
+    }
+
+    private actor WorkspaceDeleteSuspensionGate {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            guard !isOpen else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func open() {
+            isOpen = true
+            let pending = waiters
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
         }
     }
 #endif
