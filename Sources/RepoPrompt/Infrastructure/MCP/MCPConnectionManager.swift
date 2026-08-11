@@ -2955,7 +2955,8 @@ actor ServerNetworkManager {
     private func mapConnectionToRunIDForPendingPolicy(
         _ connectionID: UUID,
         runID: UUID,
-        windowID: Int
+        windowID: Int,
+        clientName: String
     ) async -> MCPServerViewModel.PendingPolicyRunIDMappingToken? {
         let token = await MainActor.run { () -> MCPServerViewModel.PendingPolicyRunIDMappingToken? in
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
@@ -2965,7 +2966,8 @@ actor ServerNetworkManager {
             return window.mcpServer.registerPendingPolicyRunIDMapping(
                 connectionID: connectionID,
                 runID: runID,
-                windowID: windowID
+                windowID: windowID,
+                clientName: clientName
             )
         }
         guard let token else {
@@ -10215,7 +10217,8 @@ actor ServerNetworkManager {
                 pendingPolicyRunIDMappingToken = await mapConnectionToRunIDForPendingPolicy(
                     connectionID,
                     runID: runID,
-                    windowID: policy.windowID
+                    windowID: policy.windowID,
+                    clientName: clientName
                 )
                 routed = pendingPolicyRunIDMappingToken != nil
             }

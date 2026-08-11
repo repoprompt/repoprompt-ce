@@ -80,7 +80,7 @@ BUILD_CACHE_ENV_KEYS = (
     "SWIFT_EXEC",
     "SWIFTFLAGS",
 )
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
 SUMMARY_MAX_CHARS = 16000
@@ -229,6 +229,8 @@ Operation commands:
   ./conductor diagnostics build-cache [--limit <n>]
   ./conductor cache status [--limit <n>] [--json]  # read-only; performs no repair or cleanup
   ./conductor cache drop <compatibility-key> [--json]
+  ./conductor diagnostics focused-build [--product <name>] [--test] [--filter <filter>]
+  ./conductor diagnostics high-output [--lines <n>] [--warnings <n>] [--exit-code <n>] [--linger <s>]
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
@@ -2528,7 +2530,7 @@ class OutputSummarizer:
         re.IGNORECASE,
     )
     SWIFT_ERROR_RE = re.compile(r"(: error:|error: emit-module command failed|Command SwiftCompile failed|Command CompileSwift failed|fatal error:)")
-    WARNING_RE = re.compile(r"(: warning:|^WARNING:)")
+    WARNING_RE = re.compile(r"(: warning:|^WARNING:)", re.IGNORECASE)
     TEST_FAILURE_RE = re.compile(
         r"(Test Case '.*' failed|XCTAssert|: error: .*Test|Executed .* tests?, with .* failures?|Failing tests:|error: Exited with unexpected signal|error: terminated)"
     )
@@ -2589,6 +2591,7 @@ class OutputSummarizer:
         lines_iterable: Any,
     ) -> Dict[str, Any]:
         del args
+        summary_start = now()
         failure = state in {"failed", "canceled"} or bool(timed_out) or (exit_code not in (None, 0))
         launch_lifecycle = {
             "transitionStarted": False,
@@ -2645,7 +2648,7 @@ class OutputSummarizer:
 
             if cls.WARNING_RE.search(line):
                 warning_count += 1
-                if failure or line.startswith("WARNING:"):
+                if failure or cls.WARNING_RE.match(line):
                     sections["Warnings"].add(line)
             if cls.SWIFT_ERROR_RE.search(line) or cls.FAILURE_RE.search(line):
                 error_count += 1
@@ -2770,6 +2773,7 @@ class OutputSummarizer:
             "omittedLineCount": omitted_line_count,
             "errorCount": error_count,
             "warningCount": warning_count,
+            "summaryDurationSeconds": round(now() - summary_start, 6),
             "launchLifecycle": launch_lifecycle,
             "sections": payload_sections,
             "truncated": truncated or input_truncated,
@@ -2799,6 +2803,7 @@ class OutputSummarizer:
             "omittedLineCount": 0,
             "errorCount": 0,
             "warningCount": 0,
+            "summaryDurationSeconds": 0.0,
             "sections": [
                 {
                     "title": "Summary notes",
@@ -2841,6 +2846,8 @@ def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
     if operation == "release" and args.get("subcommand") in {"artifact", "package", "local-install"}:
+        return True
+    if operation == "diagnostics" and args.get("subcommand") == "focused-build":
         return True
     return False
 
@@ -3280,6 +3287,10 @@ class OperationRegistry:
                 return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
             if subcommand == "build-cache":
                 return self._internal_argv("diagnostics_build_cache", dict(args)), lanes, cwd, env, effective_timeout
+            if subcommand == "focused-build":
+                return self._internal_argv("diagnostics_focused_build", dict(args)), ["build"], cwd, env, effective_timeout
+            if subcommand == "high-output":
+                return self._internal_argv("diagnostics_high_output", dict(args)), lanes, cwd, env, effective_timeout
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
@@ -8106,6 +8117,10 @@ def run_operation_runner(payload_json: str) -> int:
         return operation_diagnostics_agent_mode_on(repo_root, args)
     if kind == "diagnostics_build_cache":
         return operation_diagnostics_build_cache(repo_root, args)
+    if kind == "diagnostics_focused_build" or kind == "diagnostics_high_output":
+        import conductor_diagnostics
+
+        return conductor_diagnostics.run_diagnostic(kind, repo_root, args)
     if kind == "release_preflight_missing":
         return operation_release_preflight_missing(repo_root)
     print(f"unknown internal operation runner kind: {kind}", file=sys.stderr)
@@ -8273,6 +8288,17 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         build_cache = subparsers.add_parser("build-cache")
         build_cache.add_argument("--limit", type=int, default=BUILD_CACHE_DIAGNOSTIC_MAX_ROWS)
 
+        focused_build = subparsers.add_parser("focused-build")
+        focused_build.add_argument("--product", default="RepoPrompt")
+        focused_build.add_argument("--test", action="store_true")
+        focused_build.add_argument("--filter")
+
+        high_output = subparsers.add_parser("high-output")
+        high_output.add_argument("--lines", type=int, default=1000)
+        high_output.add_argument("--warnings", type=int, default=0)
+        high_output.add_argument("--exit-code", type=int, default=0)
+        high_output.add_argument("--linger", type=float, default=0.0)
+
         ns = parser.parse_args(rest)
         args["subcommand"] = ns.subcommand
         if ns.subcommand == "agent-mode-on":
@@ -8281,6 +8307,27 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             if ns.limit <= 0:
                 raise ConductorError("diagnostics build-cache --limit must be greater than zero")
             args["limit"] = ns.limit
+        elif ns.subcommand == "focused-build":
+            args.update({
+                "product": ns.product,
+                "runTests": ns.test or bool(ns.filter),
+                "testFilter": ns.filter,
+            })
+        elif ns.subcommand == "high-output":
+            if ns.lines < 0:
+                raise ConductorError("diagnostics high-output --lines must be non-negative")
+            if ns.warnings < 0:
+                raise ConductorError("diagnostics high-output --warnings must be non-negative")
+            if ns.exit_code < 0 or ns.exit_code > 255:
+                raise ConductorError("diagnostics high-output --exit-code must be 0-255")
+            if ns.linger < 0:
+                raise ConductorError("diagnostics high-output --linger must be non-negative")
+            args.update({
+                "lines": ns.lines,
+                "warnings": ns.warnings,
+                "exitCode": ns.exit_code,
+                "linger": ns.linger,
+            })
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
         parser.add_argument("subcommand", choices=["preflight", "artifact", "package", "local-install"])
