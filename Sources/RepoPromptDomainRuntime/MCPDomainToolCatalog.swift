@@ -83,6 +83,7 @@ package enum MCPToolAdmissionClass: String, CaseIterable, Sendable {
     case exclusive
     case control
     case smallRead = "small_read"
+    case fileRead = "file_read"
     case gitRead = "git_read"
     case fileSearch = "file_search"
 }
@@ -251,7 +252,7 @@ package enum MCPDomainToolCatalog {
         )),
         .init(name: MCPWindowToolName.getCodeStructure, scope: .window, capability: .structuralExplore, admissionClass: .smallRead),
         .init(name: MCPWindowToolName.getFileTree, scope: .window, capability: .structuralExplore, admissionClass: .smallRead),
-        .init(name: MCPWindowToolName.readFile, scope: .window, capability: .fileRead, admissionClass: .smallRead),
+        .init(name: MCPWindowToolName.readFile, scope: .window, capability: .fileRead, admissionClass: .fileRead),
         .init(name: MCPWindowToolName.search, scope: .window, capability: .fileSearch, admissionClass: .fileSearch),
         .init(name: MCPWindowToolName.workspaceContext, scope: .window, capability: .workspaceRead, admissionClass: .exclusive, operationPolicy: .init(
             operations: ["snapshot", "export", "list_presets", "select_preset"],
@@ -354,6 +355,8 @@ package enum MCPDomainToolCatalog {
             MCPDomainToolAdmissionLimits.controlConnection
         case .smallRead:
             MCPDomainToolAdmissionLimits.smallReadConnection
+        case .fileRead:
+            MCPDomainToolAdmissionLimits.fileReadConnection
         case .gitRead:
             MCPDomainToolAdmissionLimits.gitReadConnection
         case .fileSearch:
@@ -367,6 +370,8 @@ package enum MCPDomainToolCatalog {
             )
         case .smallRead:
             (MCPDomainToolAdmissionLimits.smallReadPerWindow, .window)
+        case .fileRead:
+            (MCPDomainToolAdmissionLimits.fileReadPerWindow, .window)
         case .gitRead:
             (MCPDomainToolAdmissionLimits.gitReadPerRepository, .repository)
         case .control, .fileSearch:

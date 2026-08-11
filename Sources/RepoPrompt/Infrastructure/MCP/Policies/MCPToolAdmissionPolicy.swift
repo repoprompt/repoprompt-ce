@@ -14,6 +14,8 @@ extension MCPToolAdmissionClass {
             .control
         case .smallRead:
             .smallRead
+        case .fileRead:
+            .fileRead
         case .gitRead:
             .gitRead
         case .fileSearch:
@@ -28,6 +30,8 @@ enum MCPToolAdmissionPolicy {
     static let controlConnectionLimit = MCPDomainToolAdmissionLimits.controlConnection
     static let smallReadConnectionLimit = MCPDomainToolAdmissionLimits.smallReadConnection
     static let smallReadPerWindowLimit = MCPDomainToolAdmissionLimits.smallReadPerWindow
+    static let fileReadConnectionLimit = MCPDomainToolAdmissionLimits.fileReadConnection
+    static let fileReadPerWindowLimit = MCPDomainToolAdmissionLimits.fileReadPerWindow
     static let gitReadConnectionLimit = MCPDomainToolAdmissionLimits.gitReadConnection
     static let fileSearchConnectionLimit = MCPDomainToolAdmissionLimits.fileSearchConnection
     static let gitReadPerRepositoryLimit = MCPDomainToolAdmissionLimits.gitReadPerRepository

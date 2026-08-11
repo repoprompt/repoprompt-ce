@@ -1,15 +1,12 @@
 import Foundation
 
-package enum ContentReadConcurrencyCapacity {
-    /// Scale content reads with the machine while retaining a useful minimum on constrained hosts.
-    package static let maximumConcurrentReads = max(2, ProcessInfo.processInfo.activeProcessorCount)
-}
-
 package enum MCPDomainToolAdmissionLimits {
     package static let exclusiveConnection = 1
     package static let controlConnection = 8
-    package static let smallReadConnection = ContentReadConcurrencyCapacity.maximumConcurrentReads
-    package static let smallReadPerWindow = ContentReadConcurrencyCapacity.maximumConcurrentReads
+    package static let smallReadConnection = 2
+    package static let smallReadPerWindow = 2
+    package static let fileReadConnection = ContentReadConcurrencyCapacity.maximumConcurrentReads
+    package static let fileReadPerWindow = ContentReadConcurrencyCapacity.maximumConcurrentReads
     package static let gitReadConnection = 2
     package static let fileSearchConnection = 4
     package static let gitReadPerRepository = 1

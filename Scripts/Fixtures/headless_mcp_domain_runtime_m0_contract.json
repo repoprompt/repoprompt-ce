@@ -241,7 +241,8 @@
     "admission": {
       "exclusive": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "workspace_context", "prompt", "apply_edits", "manage_worktree"],
       "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
-      "small_read": ["get_code_structure", "get_file_tree", "read_file", "oracle_chat_log"],
+      "small_read": ["get_code_structure", "get_file_tree", "oracle_chat_log"],
+      "file_read": ["read_file"],
       "git_read": ["git"],
       "file_search": ["file_search"]
     },

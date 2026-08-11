@@ -14,16 +14,16 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
         XCTAssertNil(ServerNetworkManager.callLane(forCanonicalToolName: "future_unreviewed_tool"))
 
-        // Cheap read-only tools sharing the machine-scaled content-read capacity. history is excluded:
+        // Cheap read-only tools retain the conservative shared small-read lane. history is excluded:
         // `search`/calendar `time` can decode up to maxSessionsScanned transcripts on the
         // shared scanner actor — heavier than these per-file reads, so history rides the
         // .control lane to avoid starving read_file/get_code_structure under content-read load.
         assertClass(.smallRead, tools: [
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.getFileTree,
-            MCPWindowToolName.readFile,
             MCPWindowToolName.oracleChatLog
         ])
+        assertClass(.fileRead, tools: [MCPWindowToolName.readFile])
         assertClass(.gitRead, tools: [MCPWindowToolName.git])
         assertClass(.fileSearch, tools: [MCPWindowToolName.search])
         assertClass(.control, tools: [
@@ -60,10 +60,14 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
     func testAdmissionCapacitiesUseMachineDerivedContentReadAuthorityAndPreserveOtherLimits() {
         let contentReadCapacity = ContentReadConcurrencyCapacity.maximumConcurrentReads
         XCTAssertEqual(contentReadCapacity, max(2, ProcessInfo.processInfo.activeProcessorCount))
-        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, contentReadCapacity)
-        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, contentReadCapacity)
-        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, contentReadCapacity)
+        XCTAssertEqual(MCPToolAdmissionPolicy.fileReadConnectionLimit, contentReadCapacity)
+        XCTAssertEqual(MCPToolAdmissionPolicy.fileReadPerWindowLimit, contentReadCapacity)
+        XCTAssertEqual(ServerNetworkManager.fileReadCallLaneLimit, contentReadCapacity)
         XCTAssertEqual(FileSystemService.contentReadWorkerLimitForTesting, contentReadCapacity)
+        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 2)
+        XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 2)
+        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 2)
+        XCTAssertEqual(FileSystemService.contentReadBulkPermitLimitForTesting, min(3, contentReadCapacity - 1))
 
         XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
         XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)
@@ -106,7 +110,44 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         )
     }
 
-    func testSameConnectionSmallReadsFillMachineCapacityAndQueueOneAdditionalRead() async throws {
+    func testReadFileUsesMachineScaledLaneWhileOtherSmallReadsRemainAtTwo() async throws {
+        let fileReadLimits = try XCTUnwrap(
+            MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.readFile)
+        )
+        XCTAssertEqual(ServerNetworkManager.callLane(forCanonicalToolName: MCPWindowToolName.readFile), .fileRead)
+        XCTAssertEqual(fileReadLimits.connectionLane, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(fileReadLimits.resourceLease, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+
+        for toolName in [
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.oracleChatLog
+        ] {
+            let limits = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: toolName))
+            XCTAssertEqual(ServerNetworkManager.callLane(forCanonicalToolName: toolName), .smallRead, toolName)
+            XCTAssertEqual(limits.connectionLane, 2, toolName)
+            XCTAssertEqual(limits.resourceLease, 2, toolName)
+        }
+
+        let manager = ServerNetworkManager()
+        let connectionID = UUID()
+        _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
+        let smallReadSnapshot = await manager.connectionLimiterSnapshotForTesting(
+            connectionID: connectionID,
+            lane: .smallRead
+        )
+        let fileReadSnapshot = await manager.connectionLimiterSnapshotForTesting(
+            connectionID: connectionID,
+            lane: .fileRead
+        )
+        let smallRead = try XCTUnwrap(smallReadSnapshot)
+        let fileRead = try XCTUnwrap(fileReadSnapshot)
+        XCTAssertEqual(smallRead.limit, 2)
+        XCTAssertEqual(fileRead.limit, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        await manager.debugRemoveConnection(connectionID)
+    }
+
+    func testSameConnectionSmallReadsFillFixedCapacityAndQueueOneAdditionalRead() async throws {
         let manager = ServerNetworkManager()
         let connectionID = UUID()
         _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
@@ -273,7 +314,7 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(controller.activeCount(for: .window(20)), 0)
     }
 
-    func testSmallReadResourceAdmissionFillsMachineCapacityPerWindowAndQueuesOneAdditionalRead() async throws {
+    func testSmallReadResourceAdmissionFillsFixedCapacityPerWindowAndQueuesOneAdditionalRead() async throws {
         let capacity = MCPToolAdmissionPolicy.smallReadPerWindowLimit
         let controller = MCPToolResourceAdmissionController(limit: capacity)
         let gate = AdmissionTestGate()

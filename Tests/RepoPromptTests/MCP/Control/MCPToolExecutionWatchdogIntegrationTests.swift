@@ -311,7 +311,7 @@ import XCTest
             }
         }
 
-        func testSameWindowSmallReadResourcesReleaseBeforeFormattingTail() async throws {
+        func testSameWindowFileReadResourcesReleaseBeforeFormattingTail() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let manager = fixture.networkManager
@@ -359,7 +359,7 @@ import XCTest
                     for endpoint in [firstEndpoint, secondEndpoint] {
                         let limiter = await manager.connectionLimiterSnapshotForTesting(
                             connectionID: endpoint.connectionID,
-                            lane: .smallRead
+                            lane: .fileRead
                         )
                         XCTAssertEqual(limiter?.activePermitCount, 1)
                     }
@@ -2047,7 +2047,7 @@ import XCTest
             XCTAssertEqual(explicit["window_id"], .int(explicitWindowID))
         }
 
-        func testUncooperativeSmallReadsDetachFirstThenForceDisconnectCompetingExpiryAndFenceQueuedCall() async throws {
+        func testUncooperativeFileReadsDetachFirstThenForceDisconnectCompetingExpiryAndFenceQueuedCall() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
@@ -2060,10 +2060,12 @@ import XCTest
                     await operationGate.enterAndWait()
                     return .null
                 }
-                let laneFillerGate = MCPExecutionIgnoringCancellationGate()
-                var laneFillerTasks: [Task<Void, Error>] = []
                 do {
                     let endpoint = try fixture.endpointA()
+                    _ = await manager.debugInstallConnectionLimiterForTesting(
+                        connectionID: endpoint.connectionID,
+                        fileReadLimit: 2
+                    )
                     let arguments: [String: Any] = [
                         "path": fixture.contextA.fileURL.path,
                         "context_id": fixture.contextA.tabID.uuidString,
@@ -2088,19 +2090,6 @@ import XCTest
                     try await operationGate.waitUntilEntered(count: 2)
 
                     let competingWatchdogCallCount = 2
-                    let smallReadCapacity = MCPToolAdmissionPolicy.smallReadConnectionLimit
-                    let laneFillerCount = smallReadCapacity - competingWatchdogCallCount
-                    laneFillerTasks = (0 ..< laneFillerCount).map { _ in
-                        Task {
-                            try await manager.withConnectionCallPermitForTesting(
-                                connectionID: endpoint.connectionID,
-                                lane: .smallRead
-                            ) {
-                                await laneFillerGate.enterAndWait()
-                            }
-                        }
-                    }
-                    try await laneFillerGate.waitUntilEntered(count: laneFillerCount)
 
                     let queuedBeyondCapacity = Task {
                         try await endpoint.callTool(
@@ -2111,17 +2100,17 @@ import XCTest
                     let capacityWaiterRegistered = await Self.waitUntil {
                         let snapshot = await manager.connectionLimiterSnapshotForTesting(
                             connectionID: endpoint.connectionID,
-                            lane: .smallRead
+                            lane: .fileRead
                         )
-                        return snapshot?.activePermitCount == smallReadCapacity
+                        return snapshot?.activePermitCount == competingWatchdogCallCount
                             && snapshot?.waiterCount == 1
                     }
                     XCTAssertTrue(capacityWaiterRegistered)
                     let queuedLimiter = await manager.connectionLimiterSnapshotForTesting(
                         connectionID: endpoint.connectionID,
-                        lane: .smallRead
+                        lane: .fileRead
                     )
-                    XCTAssertEqual(queuedLimiter?.activePermitCount, smallReadCapacity)
+                    XCTAssertEqual(queuedLimiter?.activePermitCount, competingWatchdogCallCount)
                     XCTAssertEqual(queuedLimiter?.waiterCount, 1)
 
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
@@ -2139,11 +2128,6 @@ import XCTest
                     XCTAssertEqual(queuedPayload["code"] as? String, "tool_execution_structure_settlement_busy")
                     XCTAssertEqual(queuedPayload["busy_reason"] as? String, "detached_settlement_in_progress")
                     XCTAssertEqual(queuedPayload["retryable"] as? Bool, true)
-
-                    await laneFillerGate.release()
-                    for task in laneFillerTasks {
-                        try await task.value
-                    }
 
                     let enteredCount = await operationGate.enteredCount()
                     let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
@@ -2184,10 +2168,6 @@ import XCTest
                     await manager.debugResetToolExecutionWatchdogEnvironment()
                     await fixture.cleanup()
                 } catch {
-                    await laneFillerGate.release()
-                    for task in laneFillerTasks {
-                        _ = try? await task.value
-                    }
                     await operationGate.release()
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
