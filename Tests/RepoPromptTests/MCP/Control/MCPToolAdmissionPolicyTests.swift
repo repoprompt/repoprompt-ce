@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -67,6 +68,37 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 8)
         XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 2)
         XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 4)
+    }
+
+    func testOperationIdentityUsesNormalizedArgumentsWithoutRetainingMalformedValues() {
+        XCTAssertEqual(
+            MCPToolAdmissionPolicy.operationIdentity(
+                forCanonicalToolName: MCPWindowToolName.manageSelection,
+                arguments: [:]
+            ).normalizedOperation,
+            "get"
+        )
+        XCTAssertEqual(
+            MCPToolAdmissionPolicy.operationIdentity(
+                forCanonicalToolName: MCPGlobalToolName.manageWorkspaces,
+                arguments: ["action": .string("SWITCH")]
+            ).normalizedOperation,
+            "switch"
+        )
+        XCTAssertEqual(
+            MCPToolAdmissionPolicy.operationIdentity(
+                forCanonicalToolName: MCPWindowToolName.manageSelection,
+                arguments: ["op": .int(42)]
+            ).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+        XCTAssertEqual(
+            MCPToolAdmissionPolicy.operationIdentity(
+                forCanonicalToolName: MCPWindowToolName.applyEdits,
+                arguments: ["op": .string("private/path/id/prompt")]
+            ).normalizedOperation,
+            MCPDomainToolOperationIdentity.callOperation
+        )
     }
 
     func testSameConnectionSmallReadsOverlapAtBoundedCapacity() async throws {

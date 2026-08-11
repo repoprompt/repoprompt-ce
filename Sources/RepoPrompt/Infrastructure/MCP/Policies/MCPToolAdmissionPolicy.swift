@@ -1,7 +1,9 @@
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 
 typealias MCPToolAdmissionClass = RepoPromptDomainRuntime.MCPToolAdmissionClass
+typealias MCPToolOperationIdentity = RepoPromptDomainRuntime.MCPDomainToolOperationIdentity
 
 extension MCPToolAdmissionClass {
     var connectionLane: MCPConnectionCallLane {
@@ -34,5 +36,19 @@ enum MCPToolAdmissionPolicy {
 
     static func classification(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
         MCPDomainToolCatalog.admissionClass(for: toolName)
+    }
+
+    static func operationIdentity(
+        forCanonicalToolName toolName: String,
+        arguments: [String: Value]
+    ) -> MCPToolOperationIdentity {
+        let input: MCPDomainToolOperationInput = if let argumentKey = MCPDomainToolCatalog.operationArgumentKey(for: toolName),
+                                                    let value = arguments[argumentKey]
+        {
+            value.stringValue.map(MCPDomainToolOperationInput.value) ?? .malformed
+        } else {
+            .missing
+        }
+        return MCPDomainToolCatalog.operationIdentity(for: toolName, input: input)
     }
 }
