@@ -15,22 +15,20 @@ struct AgentStatusPillsRow: View {
     }
 
     private var oraclePresentations: [AgentOraclePillPresentation] {
-        let hasSecondarySession = snapshot.currentTabID.map { tabID in
-            let secondarySessions = AgentOraclePillLogic.sessions(
-                oracleViewModel.sessions(forTabID: tabID),
-                resolvedTo: .secondary
-            )
-            return !AgentOraclePillLogic.eligibleSessions(
-                sessions: secondarySessions,
+        let groupSessionLanes: Set<OracleLane> = snapshot.currentTabID.map { tabID in
+            let groupedSessions = oracleViewModel.sessions(forTabID: tabID).filter { $0.oraclePairID != nil }
+            let eligible = AgentOraclePillLogic.eligibleSessions(
+                sessions: groupedSessions,
                 streamingSessionIDs: oracleViewModel.streamingSessions,
                 liveMessageCount: { oracleViewModel.liveMessageCount(for: $0) },
                 activeAgentSessionID: snapshot.activeAgentSessionID,
                 activeRunID: snapshot.activeRunID
-            ).isEmpty
-        } ?? false
+            )
+            return Set(eligible.compactMap(\.oracleLane))
+        } ?? []
         return AgentOraclePillLogic.presentations(
-            secondaryModelRaw: promptManager.secondaryOracleModelRaw,
-            hasSecondarySession: hasSecondarySession
+            additionalModelRaws: promptManager.additionalOracleModelRaws,
+            groupSessionLanes: groupSessionLanes
         )
     }
 

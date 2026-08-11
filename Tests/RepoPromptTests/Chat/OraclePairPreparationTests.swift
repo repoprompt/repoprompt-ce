@@ -123,6 +123,282 @@ final class OraclePairPreparationTests: XCTestCase {
         )
     }
 
+    func testFiveLaneHistoryPersistenceIsAtomicAndDivergesFromAnyNonPrimaryHistory() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let groupID = UUID()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        var members = lanes.map { lane in
+            makeSession(
+                fixture: fixture,
+                pairID: groupID,
+                lane: lane,
+                groupSize: lanes.count
+            )
+        }
+        for index in members.indices {
+            members[index].messages = [
+                StoredMessage(
+                    isUser: true,
+                    rawText: lanes[index] == .oracle4 ? "different user turn" : "shared user turn",
+                    sequenceIndex: 0
+                )
+            ]
+        }
+        fixture.oracleViewModel.sessions = members
+        for member in members {
+            let loaded = await fixture.oracleViewModel.ensureSessionMessagesLoaded(member.id)
+            XCTAssertTrue(loaded)
+        }
+
+        let diverged = try await fixture.oracleViewModel.persistOracleGroupHistories(
+            groupID: groupID,
+            sessionIDsByLane: Dictionary(uniqueKeysWithValues: zip(lanes, members.map(\.id)))
+        )
+
+        XCTAssertTrue(diverged)
+        let stubs = try await fixture.oracleViewModel.chatData.oraclePairSessionStubs(
+            for: fixture.workspace,
+            pairID: groupID
+        )
+        XCTAssertEqual(stubs.compactMap(\.oracleLane), lanes)
+        XCTAssertTrue(stubs.allSatisfy { $0.oracleGroupSize == 5 && $0.oracleHistoryDiverged })
+        for stub in stubs {
+            let persisted = try await fixture.oracleViewModel.chatData.loadChatSession(
+                from: XCTUnwrap(stub.fileURL)
+            )
+            XCTAssertEqual(persisted.messages.count, 1)
+            XCTAssertTrue(persisted.oracleHistoryDiverged)
+        }
+    }
+
+    func testFiveLaneRenamePersistsTheWholeGroup() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let groupID = UUID()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let members = lanes.map { lane in
+            makeSession(
+                fixture: fixture,
+                pairID: groupID,
+                lane: lane,
+                groupSize: lanes.count
+            )
+        }
+        fixture.oracleViewModel.sessions = members
+        _ = try await fixture.oracleViewModel.chatData.saveOraclePairSessions(
+            members,
+            for: fixture.workspace
+        )
+        let renamed = try XCTUnwrap(members.first(where: { $0.oracleLane == .oracle4 }))
+
+        try await fixture.oracleViewModel.persistOraclePairRename(
+            sessionID: renamed.id,
+            newName: "Renamed Oracle 4"
+        )
+
+        let stubs = try await fixture.oracleViewModel.chatData.oraclePairSessionStubs(
+            for: fixture.workspace,
+            pairID: groupID
+        )
+        XCTAssertEqual(stubs.compactMap(\.oracleLane), lanes)
+        for stub in stubs {
+            let persisted = try await fixture.oracleViewModel.chatData.loadChatSession(
+                from: XCTUnwrap(stub.fileURL)
+            )
+            let original = try XCTUnwrap(members.first(where: { $0.id == persisted.id }))
+            let expectedName = persisted.id == renamed.id ? "Renamed Oracle 4" : original.name
+            XCTAssertEqual(persisted.name, expectedName)
+        }
+    }
+
+    func testDeletingOneFiveLaneMemberDeletesTheWholeGroup() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let groupID = UUID()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let members = lanes.map { lane in
+            makeSession(
+                fixture: fixture,
+                pairID: groupID,
+                lane: lane,
+                groupSize: lanes.count
+            )
+        }
+        fixture.oracleViewModel.sessions = members
+        let fileURLs = try await fixture.oracleViewModel.chatData.saveOraclePairSessions(
+            members,
+            for: fixture.workspace
+        )
+
+        let deleted = await fixture.oracleViewModel.deleteClaimedSession(
+            members[2],
+            workspace: fixture.workspace
+        )
+
+        XCTAssertTrue(deleted)
+        XCTAssertFalse(fixture.oracleViewModel.sessions.contains { $0.oraclePairID == groupID })
+        XCTAssertTrue(fileURLs.values.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testExplicitContinuationLoadsTheCompletePersistedFiveLaneGroupFromOneColdMember() async throws {
+        let fixture = try await makeFixture(sendPromptOverride: { _, model in
+            (UUID(), completedOracleStream("\(model.rawValue) continued"))
+        })
+        defer { fixture.cleanup() }
+        let groupID = UUID()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let members = lanes.map { lane in
+            makeSession(
+                fixture: fixture,
+                pairID: groupID,
+                lane: lane,
+                groupSize: lanes.count
+            )
+        }
+        _ = try await fixture.oracleViewModel.chatData.saveOraclePairSessions(
+            members,
+            for: fixture.workspace
+        )
+        let focusedTabID = UUID()
+        var workspace = try XCTUnwrap(fixture.composition.workspaceManager.activeWorkspace)
+        workspace.composeTabs.append(ComposeTabState(id: focusedTabID))
+        workspace.activeComposeTabID = focusedTabID
+        if let index = fixture.composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
+            fixture.composition.workspaceManager.workspaces[index] = workspace
+        }
+        fixture.composition.workspaceManager.activeWorkspace = workspace
+        fixture.composition.promptManager.loadComposeTabsFromWorkspace(workspace)
+        let focused = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: focusedTabID,
+            name: "Focused unrelated chat"
+        )
+        fixture.oracleViewModel.sessions = [focused]
+        fixture.oracleViewModel.currentSessionID = focused.id
+        fixture.composition.workspaceManager.setActiveChatSessionID(focused.id, forTabID: focusedTabID)
+        fixture.composition.workspaceManager.setActiveChatSessionID(nil, forTabID: fixture.tabID)
+
+        let prompt = "Continue the persisted Oracle group."
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: fixture.workspace.id,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            promptText: prompt,
+            selection: StoredSelection(),
+            lookupContext: nil,
+            reviewGitContext: .automaticOnly(),
+            provenance: .direct
+        )
+        let context = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            activationPolicy: .background,
+            completionPolicy: .contextBuilderStrict,
+            packaging: packaging
+        )
+        let primarySelection = OracleViewModel.ModelSelectionResult(
+            model: .gpt54Pro,
+            mcpControlInfo: nil,
+            isAutoSelected: false,
+            chatPresetID: nil
+        )
+        let additionalModels: [AIModel] = [
+            .claude4Sonnet,
+            .gpt54Pro,
+            .claude4Sonnet,
+            .gpt54Pro
+        ]
+
+        let result = try await fixture.oracleViewModel.sendOracle(
+            args: [
+                "message": .string(prompt),
+                "chat_id": .string(members[4].shortID),
+                "new_chat": .bool(false)
+            ],
+            promptVM: fixture.oracleViewModel.promptViewModel,
+            tabContext: context,
+            primaryModelSelection: primarySelection,
+            additionalModelOverrides: additionalModels
+        )
+
+        guard case let .paired(group) = result.payload else {
+            return XCTFail("Expected the persisted Oracle group to continue")
+        }
+        XCTAssertEqual(group.groupID, groupID)
+        XCTAssertEqual(group.oracleCount, lanes.count)
+        XCTAssertEqual(
+            group.sessionIDsByLane,
+            Dictionary(uniqueKeysWithValues: zip(lanes, members.map(\.id)))
+        )
+        XCTAssertEqual(
+            Set(fixture.oracleViewModel.sessions.filter { $0.oraclePairID == groupID }.map(\.id)),
+            Set(members.map(\.id))
+        )
+        XCTAssertEqual(fixture.oracleViewModel.currentSessionID, focused.id)
+        XCTAssertEqual(
+            fixture.composition.workspaceManager.activeChatSessionID(forTabID: focusedTabID),
+            focused.id
+        )
+        XCTAssertNil(fixture.composition.workspaceManager.activeChatSessionID(forTabID: fixture.tabID))
+    }
+
+    func testGroupedDeletionFailsClosedWhenOwningWorkspaceIsUnavailable() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let pairID = UUID()
+        var primary = makeSession(fixture: fixture, pairID: pairID, lane: .primary)
+        var secondary = makeSession(fixture: fixture, pairID: pairID, lane: .secondary)
+        let fileURLs = try await fixture.oracleViewModel.chatData.saveOraclePairSessions(
+            [primary, secondary],
+            for: fixture.workspace
+        )
+        primary.fileURL = fileURLs[primary.id]
+        secondary.fileURL = fileURLs[secondary.id]
+        primary.workspaceID = UUID()
+        fixture.oracleViewModel.sessions = [primary, secondary]
+
+        let deleted = await fixture.oracleViewModel.deleteSession(primary)
+
+        XCTAssertFalse(deleted)
+        XCTAssertEqual(Set(fixture.oracleViewModel.sessions.map(\.id)), Set([primary.id, secondary.id]))
+        XCTAssertTrue(fileURLs.values.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testGroupedDeletionRejectsMixedGroupedAndLegacySeedsWithoutDeletingEither() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let pairID = UUID()
+        let primary = makeSession(fixture: fixture, pairID: pairID, lane: .primary)
+        let secondary = makeSession(fixture: fixture, pairID: pairID, lane: .secondary)
+        let groupURLs = try await fixture.oracleViewModel.chatData.saveOraclePairSessions(
+            [primary, secondary],
+            for: fixture.workspace
+        )
+        let legacy = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Unrelated legacy chat"
+        )
+        let legacyURL = try await fixture.oracleViewModel.chatData.saveChatSession(
+            legacy,
+            for: fixture.workspace
+        )
+
+        do {
+            try await fixture.oracleViewModel.chatData.deleteOraclePairSessionFiles(
+                [primary.id, legacy.id],
+                for: fixture.workspace
+            )
+            XCTFail("Expected mixed grouped and legacy deletion seeds to be rejected")
+        } catch is ChatDataError {}
+
+        XCTAssertTrue(groupURLs.values.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacyURL.path))
+    }
+
     func testPairedRenamePersistsBothMembersOrLeavesTheVisibleNameUnchanged() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
@@ -470,12 +746,70 @@ final class OraclePairPreparationTests: XCTestCase {
             for: fixture.workspace,
             pairID: pair.pairID
         )
-        XCTAssertEqual(Set(stubs.compactMap(\.oracleLane)), Set(OracleLane.allCases))
+        XCTAssertEqual(Set(stubs.compactMap(\.oracleLane)), Set([.primary, .secondary]))
         XCTAssertEqual(stubs.count, 2)
         let snapshots = await recorder.snapshot()
         XCTAssertEqual(Set(snapshots.map(\.modelRaw)), Set([primaryModel.rawValue, secondaryModel.rawValue]))
         XCTAssertTrue(snapshots.allSatisfy { $0.prompt?.contains(prompt) == true })
         XCTAssertTrue(snapshots.allSatisfy { $0.fileBlocks.joined(separator: "\n").contains(sentinel) })
+    }
+
+    func testFiveOracleContextBuilderRuntimeDispatchesAndPersistsEveryLane() async throws {
+        let recorder = OracleRuntimeMessageRecorder()
+        let fixture = try await makeFixture(sendPromptOverride: { message, model in
+            await recorder.record(
+                modelRaw: model.rawValue,
+                prompt: message.conversationMessages.last?.content,
+                fileBlocks: message.fileBlocks
+            )
+            return (UUID(), completedOracleStream("\(model.rawValue) response"))
+        })
+        defer { fixture.cleanup() }
+        let primaryModel = AIModel.customProvider(name: "Primary", provider: "custom", model: "oracle-primary")
+        let additionalModels = (2 ... 5).map { ordinal in
+            AIModel.customProvider(
+                name: "Oracle \(ordinal)",
+                provider: "custom",
+                model: "oracle-\(ordinal)"
+            )
+        }
+        let settings = GlobalSettingsStore.shared
+        let priorAdditionalModels = settings.additionalOracleModelRaws()
+        settings.setAdditionalOracleModelRaws(additionalModels.map(\.rawValue), commit: false)
+        defer { settings.setAdditionalOracleModelRaws(priorAdditionalModels, commit: false) }
+        installFollowUpModel(primaryModel, in: fixture)
+        defer { fixture.composition.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+
+        let prompt = "Plan with five independent Oracles."
+        let result = try await fixture.composition.contextBuilderAgentViewModel.runMCPPlanOrQuestion(
+            for: fixture.tabID,
+            oracleViewModel: fixture.oracleViewModel,
+            mode: .plan,
+            prompt: prompt,
+            selection: StoredSelection(),
+            reviewGitContext: .automaticOnly()
+        )
+
+        guard case let .paired(group) = result.payload else {
+            return XCTFail("Expected grouped Oracle result")
+        }
+        XCTAssertEqual(group.status, .completed)
+        XCTAssertEqual(group.oracleCount, 5)
+        XCTAssertEqual(group.orderedLanes, OracleLane.allCases)
+        let stubs = try await fixture.oracleViewModel.chatData.oraclePairSessionStubs(
+            for: fixture.workspace,
+            pairID: group.groupID
+        )
+        XCTAssertEqual(stubs.compactMap(\.oracleLane), OracleLane.allCases)
+        XCTAssertTrue(stubs.allSatisfy { $0.oracleGroupSize == 5 })
+
+        let snapshots = await recorder.snapshot()
+        XCTAssertEqual(snapshots.count, 5)
+        XCTAssertEqual(
+            Set(snapshots.map(\.modelRaw)),
+            Set([primaryModel.rawValue] + additionalModels.map(\.rawValue))
+        )
+        XCTAssertTrue(snapshots.allSatisfy { $0.prompt?.contains(prompt) == true })
     }
 
     func testPairedContextBuilderRuntimePersistsPartialSecondaryFailure() async throws {
@@ -573,17 +907,28 @@ final class OraclePairPreparationTests: XCTestCase {
         fixture: Fixture,
         pairID: UUID,
         lane: OracleLane,
+        groupSize: Int = 2,
         ownerSessionID: UUID? = nil,
         ownerRunID: UUID? = nil
     ) -> ChatSession {
-        ChatSession(
+        let name: String
+        switch lane {
+        case .primary:
+            name = "Primary"
+        case .secondary:
+            name = "Secondary"
+        case .oracle3, .oracle4, .oracle5:
+            name = "Oracle \(lane.ordinal)"
+        }
+        return ChatSession(
             workspaceID: fixture.workspace.id,
             composeTabID: fixture.tabID,
             agentModeSessionID: ownerSessionID,
             agentModeRunID: ownerRunID,
             oraclePairID: pairID,
             oracleLane: lane,
-            name: lane == .primary ? "Primary" : "Secondary"
+            oracleGroupSize: groupSize,
+            name: name
         )
     }
 

@@ -41,20 +41,26 @@ extension OracleViewModel {
 
     struct OracleSendLiveCallbacks {
         var modelsResolved: (@MainActor @Sendable (AIModel, AIModel?) -> Void)?
+        var groupModelsResolved: (@MainActor @Sendable ([OracleLane: AIModel]) -> Void)?
         var pairSessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)?
+        var groupSessionsResolved: (@MainActor @Sendable ([OracleLane: UUID]) async throws -> Void)?
         var primarySessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)?
         var primaryProgress: (@MainActor @Sendable (String, String?) -> Void)?
         var laneLifecycle: (@MainActor @Sendable (OracleLane, OracleMessageLifecycleActivityEvent) -> Void)?
 
         init(
             modelsResolved: (@MainActor @Sendable (AIModel, AIModel?) -> Void)? = nil,
+            groupModelsResolved: (@MainActor @Sendable ([OracleLane: AIModel]) -> Void)? = nil,
             pairSessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)? = nil,
+            groupSessionsResolved: (@MainActor @Sendable ([OracleLane: UUID]) async throws -> Void)? = nil,
             primarySessionResolved: (@MainActor @Sendable (UUID) async throws -> Void)? = nil,
             primaryProgress: (@MainActor @Sendable (String, String?) -> Void)? = nil,
             laneLifecycle: (@MainActor @Sendable (OracleLane, OracleMessageLifecycleActivityEvent) -> Void)? = nil
         ) {
             self.modelsResolved = modelsResolved
+            self.groupModelsResolved = groupModelsResolved
             self.pairSessionsResolved = pairSessionsResolved
+            self.groupSessionsResolved = groupSessionsResolved
             self.primarySessionResolved = primarySessionResolved
             self.primaryProgress = primaryProgress
             self.laneLifecycle = laneLifecycle
@@ -1014,7 +1020,7 @@ extension OracleViewModel {
             }
             guard allowPairedSessions || existing.oraclePairID == nil else {
                 throw ChatToolError.invalidParams(
-                    "Paired Oracle histories cannot be continued while Secondary Oracle is disabled. Start a new chat."
+                    "Grouped Oracle histories cannot be continued while only one Oracle is configured. Start a new chat."
                 )
             }
 
@@ -1126,10 +1132,16 @@ extension OracleViewModel {
         return new.id
     }
 
-    private struct OraclePairSessionResolution {
-        let pairID: UUID
-        let primary: ChatSession
-        let secondary: ChatSession
+    private struct OracleGroupSessionResolution {
+        let groupID: UUID
+        let members: [OracleLane: ChatSession]
+
+        var primary: ChatSession {
+            guard let primary = members[.primary] else {
+                preconditionFailure("A validated Oracle group must contain Primary")
+            }
+            return primary
+        }
     }
 
     private func validateRemovedOracleSendArguments(_ args: [String: Value]) throws {
@@ -1151,10 +1163,10 @@ extension OracleViewModel {
 
     @MainActor
     func resolveOracleSecondaryModel(workspaceID: UUID?) throws -> AIModel? {
-        try resolveOracleSecondaryModel(
+        try resolveAdditionalOracleModels(
             workspaceID: workspaceID,
             effectiveProfile: GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID:)
-        )
+        ).first
     }
 
     @MainActor
@@ -1162,8 +1174,24 @@ extension OracleViewModel {
         workspaceID: UUID?,
         effectiveProfile: (UUID?) -> AgentModelsSettingsProfile
     ) throws -> AIModel? {
-        try OraclePairModelSelectionPolicy.resolveSecondary(
-            raw: effectiveProfile(workspaceID).secondaryOracleModelRaw
+        try resolveAdditionalOracleModels(workspaceID: workspaceID, effectiveProfile: effectiveProfile).first
+    }
+
+    @MainActor
+    func resolveAdditionalOracleModels(workspaceID: UUID?) throws -> [AIModel] {
+        try resolveAdditionalOracleModels(
+            workspaceID: workspaceID,
+            effectiveProfile: GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID:)
+        )
+    }
+
+    @MainActor
+    func resolveAdditionalOracleModels(
+        workspaceID: UUID?,
+        effectiveProfile: (UUID?) -> AgentModelsSettingsProfile
+    ) throws -> [AIModel] {
+        try OraclePairModelSelectionPolicy.resolveAdditional(
+            raws: effectiveProfile(workspaceID).additionalOracleModelRaws
         )
     }
 
@@ -1201,9 +1229,10 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func resolveOraclePairSource(
+    private func resolveOracleGroupSource(
         requestedChatID: String?,
         forceNew: Bool,
+        expectedLanes: [OracleLane],
         workspaceID: UUID,
         tabID: UUID,
         agentModeSessionID: UUID?,
@@ -1225,17 +1254,41 @@ extension OracleViewModel {
             ) else {
                 throw ChatToolError.invalidParams("The requested Oracle chat belongs to a different workspace, tab, Agent session, or run.")
             }
+            if source.oraclePairID != nil {
+                // Explicit inactive-tab resolution intentionally loads only the requested
+                // member. Validate that member's durable cardinality here; the complete
+                // in-memory or persisted group is validated and loaded by preparation.
+                guard source.oracleGroupSize == expectedLanes.count,
+                      source.oracleLane.map { expectedLanes.contains($0) } == true
+                else {
+                    throw ChatToolError(
+                        code: .conflict,
+                        message: "This Oracle history was created with a different number of Oracles. Start a new chat with new_chat=true.",
+                        details: nil
+                    )
+                }
+            }
             return source
         }
 
-        let candidates = sessions.filter {
-            Self.sessionMatchesExactOracleRoute(
-                $0,
-                workspaceID: workspaceID,
-                tabID: tabID,
-                agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
-            ) && $0.oraclePairID != nil && $0.oracleLane == .primary
+        var membersByGroup: [UUID: [ChatSession]] = [:]
+        for session in sessions where Self.sessionMatchesExactOracleRoute(
+            session,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        ) {
+            guard let groupID = session.oraclePairID else { continue }
+            membersByGroup[groupID, default: []].append(session)
+        }
+        let expectedLaneSet = Set(expectedLanes)
+        let candidates = membersByGroup.values.compactMap { members -> ChatSession? in
+            guard members.count == expectedLanes.count,
+                  Set(members.compactMap(\.oracleLane)) == expectedLaneSet,
+                  members.allSatisfy({ $0.oracleGroupSize == expectedLanes.count })
+            else { return nil }
+            return members.first(where: { $0.oracleLane == .primary })
         }.sorted { $0.savedAt > $1.savedAt }
         if let activeID = workspaceManager.activeChatSessionID(forTabID: tabID),
            let active = candidates.first(where: { $0.id == activeID })
@@ -1251,19 +1304,31 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func loadPersistedOraclePair(
-        pairID: UUID,
+    private func loadPersistedOracleGroup(
+        groupID: UUID,
+        expectedLanes: [OracleLane]? = nil,
         workspaceID: UUID,
         tabID: UUID,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?
-    ) async throws -> (primary: ChatSession, secondary: ChatSession, inserted: Set<UUID>) {
+    ) async throws -> (members: [OracleLane: ChatSession], inserted: Set<UUID>) {
         guard let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }) else {
-            throw ChatToolError.invalidParams("The Oracle pair workspace is unavailable.")
+            throw ChatToolError.invalidParams("The Oracle group workspace is unavailable.")
         }
-        let stubs = try await chatData.oraclePairSessionStubs(for: workspace, pairID: pairID)
-        guard stubs.count == 2, Set(stubs.map(\.id)).count == 2 else {
-            throw ChatToolError(code: .conflict, message: "Oracle pair \(pairID.uuidString) is incomplete; start a new Oracle chat instead of continuing it.", details: nil)
+        let stubs = try await chatData.oraclePairSessionStubs(for: workspace, pairID: groupID)
+        guard let groupSize = stubs.first?.oracleGroupSize,
+              (2 ... OracleLane.allCases.count).contains(groupSize),
+              stubs.count == groupSize,
+              Set(stubs.map(\.id)).count == groupSize,
+              stubs.allSatisfy({ $0.oracleGroupSize == groupSize })
+        else {
+            throw ChatToolError(code: .conflict, message: "Oracle group \(groupID.uuidString) is incomplete; start a new Oracle chat instead of continuing it.", details: nil)
+        }
+        let persistedLanes = Array(OracleLane.allCases.prefix(groupSize))
+        guard Set(stubs.compactMap(\.oracleLane)) == Set(persistedLanes),
+              expectedLanes == nil || expectedLanes == persistedLanes
+        else {
+            throw ChatToolError(code: .conflict, message: "Oracle group \(groupID.uuidString) has incompatible lane metadata; start a new Oracle chat instead of continuing it.", details: nil)
         }
 
         var loaded: [ChatSession] = []
@@ -1276,9 +1341,10 @@ extension OracleViewModel {
             }
             loaded.append(full)
         }
-        guard loaded.count == 2,
+        guard loaded.count == groupSize,
               loaded.allSatisfy({ member in
-                  member.oraclePairID == pairID &&
+                  member.oraclePairID == groupID &&
+                      member.oracleGroupSize == groupSize &&
                       Self.sessionMatchesExactOracleRoute(
                           member,
                           workspaceID: workspaceID,
@@ -1287,10 +1353,9 @@ extension OracleViewModel {
                           agentModeRunID: agentModeRunID
                       ) && !isSessionStreaming(member.id)
               }),
-              let primary = loaded.first(where: { $0.oracleLane == .primary }),
-              let secondary = loaded.first(where: { $0.oracleLane == .secondary })
+              Set(loaded.compactMap(\.oracleLane)) == Set(persistedLanes)
         else {
-            throw ChatToolError(code: .conflict, message: "Oracle pair metadata is unavailable, corrupt, or already streaming.", details: nil)
+            throw ChatToolError(code: .conflict, message: "Oracle group metadata is unavailable, corrupt, or already streaming.", details: nil)
         }
 
         var inserted = Set<UUID>()
@@ -1305,7 +1370,12 @@ extension OracleViewModel {
         for member in loaded {
             await reloadSessionFromMemory(member)
         }
-        return (primary, secondary, inserted)
+        return (
+            Dictionary(uniqueKeysWithValues: loaded.compactMap { member in
+                member.oracleLane.map { ($0, member) }
+            }),
+            inserted
+        )
     }
 
     @MainActor
@@ -1327,26 +1397,25 @@ extension OracleViewModel {
 
         do {
             try await oracleSendClaims.withClaim([claim]) {
-                let pair = try await self.loadPersistedOraclePair(
-                    pairID: pairID,
+                let group = try await self.loadPersistedOracleGroup(
+                    groupID: pairID,
                     workspaceID: workspaceID,
                     tabID: tabID,
                     agentModeSessionID: target.agentModeSessionID,
                     agentModeRunID: target.agentModeRunID
                 )
-                guard pair.primary.id == sessionID || pair.secondary.id == sessionID,
+                guard group.members.values.contains(where: { $0.id == sessionID }),
                       let index = self.sessions.firstIndex(where: { $0.id == sessionID })
                 else {
-                    throw ChatToolError.internalError("Failed to resolve the renamed Oracle pair member.")
+                    throw ChatToolError.internalError("Failed to resolve the renamed Oracle group member.")
                 }
 
                 let originalName = self.sessions[index].name
                 self.sessions[index].name = newName
                 do {
-                    _ = try await self.persistOraclePairHistories(
-                        pairID: pairID,
-                        primarySessionID: pair.primary.id,
-                        secondarySessionID: pair.secondary.id
+                    _ = try await self.persistOracleGroupHistories(
+                        groupID: pairID,
+                        sessionIDsByLane: group.members.mapValues(\.id)
                     )
                 } catch let error as ChatToolError where error.details?["durable_commit"] == "true" {
                     throw error
@@ -1357,8 +1426,8 @@ extension OracleViewModel {
                     {
                         self.sessions[currentIndex].name = originalName
                     }
-                    if !pair.inserted.isEmpty {
-                        self.removeOraclePairSessionState(pair.inserted)
+                    if !group.inserted.isEmpty {
+                        self.removeOraclePairSessionState(group.inserted)
                     }
                     throw error
                 }
@@ -1366,7 +1435,7 @@ extension OracleViewModel {
         } catch OracleSendClaimError.conflict {
             throw ChatToolError(
                 code: .conflict,
-                message: "This Oracle pair is busy and could not be renamed.",
+                message: "This Oracle group is busy and could not be renamed.",
                 details: nil
             )
         }
@@ -1380,12 +1449,33 @@ extension OracleViewModel {
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?
     ) async throws -> (primary: ChatSession, secondary: ChatSession)? {
-        let members = sessions.filter { $0.oraclePairID == pairID }
+        guard let members = try await resolveInMemoryOracleGroupMembers(
+            groupID: pairID,
+            expectedLanes: [.primary, .secondary],
+            workspaceID: workspaceID,
+            tabID: tabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        ), let primary = members[.primary], let secondary = members[.secondary]
+        else { return nil }
+        return (primary, secondary)
+    }
+
+    @MainActor
+    private func resolveInMemoryOracleGroupMembers(
+        groupID: UUID,
+        expectedLanes: [OracleLane],
+        workspaceID: UUID,
+        tabID: UUID,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) async throws -> [OracleLane: ChatSession]? {
+        let members = sessions.filter { $0.oraclePairID == groupID }
         guard !members.isEmpty else { return nil }
-        guard members.count <= 2 else {
+        guard members.count <= OracleLane.allCases.count else {
             throw ChatToolError(
                 code: .conflict,
-                message: "Oracle pair \(pairID.uuidString) has duplicate members.",
+                message: "Oracle group \(groupID.uuidString) has too many members.",
                 details: nil
             )
         }
@@ -1393,35 +1483,32 @@ extension OracleViewModel {
         guard !laneGroups.values.contains(where: { $0.count > 1 }) else {
             throw ChatToolError(
                 code: .conflict,
-                message: "Oracle pair \(pairID.uuidString) has duplicate lanes.",
+                message: "Oracle group \(groupID.uuidString) has duplicate lanes.",
                 details: nil
             )
         }
-        guard members.count == 2,
-              let primary = members.first(where: { $0.oracleLane == .primary }),
-              let secondary = members.first(where: { $0.oracleLane == .secondary }),
-              Self.sessionMatchesExactOracleRoute(
-                  primary,
-                  workspaceID: workspaceID,
-                  tabID: tabID,
-                  agentModeSessionID: agentModeSessionID,
-                  agentModeRunID: agentModeRunID
-              ),
-              Self.sessionMatchesExactOracleRoute(
-                  secondary,
-                  workspaceID: workspaceID,
-                  tabID: tabID,
-                  agentModeSessionID: agentModeSessionID,
-                  agentModeRunID: agentModeRunID
-              ),
-              !isSessionStreaming(primary.id),
-              !isSessionStreaming(secondary.id),
-              let loadedPrimary = await ensureSessionLoadedForBackground(primary),
-              let loadedSecondary = await ensureSessionLoadedForBackground(secondary)
-        else {
-            return nil
+        guard members.count == expectedLanes.count,
+              Set(members.compactMap(\.oracleLane)) == Set(expectedLanes),
+              members.allSatisfy({ member in
+                  member.oracleGroupSize == expectedLanes.count &&
+                      Self.sessionMatchesExactOracleRoute(
+                          member,
+                          workspaceID: workspaceID,
+                          tabID: tabID,
+                          agentModeSessionID: agentModeSessionID,
+                          agentModeRunID: agentModeRunID
+                      ) && !isSessionStreaming(member.id)
+              })
+        else { return nil }
+
+        var loaded: [OracleLane: ChatSession] = [:]
+        for lane in expectedLanes {
+            guard let member = members.first(where: { $0.oracleLane == lane }),
+                  let full = await ensureSessionLoadedForBackground(member)
+            else { return nil }
+            loaded[lane] = full
         }
-        return (loadedPrimary, loadedSecondary)
+        return loaded
     }
 
     private struct OraclePairPreparationRollbackState {
@@ -1471,6 +1558,7 @@ extension OracleViewModel {
             if current.agentModeSessionID == assigned.agentModeSessionID { current.agentModeSessionID = original.agentModeSessionID }
             if current.agentModeRunID == assigned.agentModeRunID { current.agentModeRunID = original.agentModeRunID }
             if current.oraclePairID == assigned.oraclePairID { current.oraclePairID = original.oraclePairID }
+            if current.oracleGroupSize == assigned.oracleGroupSize { current.oracleGroupSize = original.oracleGroupSize }
             if current.oracleLane == assigned.oracleLane { current.oracleLane = original.oracleLane }
             if current.oracleHistoryDiverged == assigned.oracleHistoryDiverged {
                 current.oracleHistoryDiverged = original.oracleHistoryDiverged
@@ -1496,32 +1584,36 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func resolveOrCreateOraclePairSessions(
+    private func resolveOrCreateOracleGroupSessions(
         requestedChatID: String?,
         forceNew: Bool,
         desiredName: String?,
+        expectedLanes: [OracleLane],
         workspaceID: UUID,
         tabID: UUID,
         activatePrimaryInUI: Bool,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
-        sessionsResolved: (@MainActor @Sendable (UUID, UUID) async throws -> Void)?
-    ) async throws -> OraclePairSessionResolution {
-        guard Set(sessions.map(\.id)).count == sessions.count,
+        sessionsResolved: (@MainActor @Sendable ([OracleLane: UUID]) async throws -> Void)?
+    ) async throws -> OracleGroupSessionResolution {
+        guard (2 ... OracleLane.allCases.count).contains(expectedLanes.count),
+              expectedLanes == Array(OracleLane.allCases.prefix(expectedLanes.count)),
+              Set(sessions.map(\.id)).count == sessions.count,
               workspaceManager.workspaces.contains(where: { $0.id == workspaceID })
         else {
-            throw ChatToolError(code: .conflict, message: "Oracle pair session identities are invalid.", details: nil)
+            throw ChatToolError(code: .conflict, message: "Oracle group session identities are invalid.", details: nil)
         }
         let initialSessionIDs = Set(sessions.map(\.id))
-        let source = try await resolveOraclePairSource(
+        let source = try await resolveOracleGroupSource(
             requestedChatID: requestedChatID,
             forceNew: forceNew,
+            expectedLanes: expectedLanes,
             workspaceID: workspaceID,
             tabID: tabID,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID
         )
-        let pairID = source?.oraclePairID ?? UUID()
+        let groupID = source?.oraclePairID ?? UUID()
         var rollback = OraclePairPreparationRollbackState(
             workspaceID: workspaceID,
             tabID: tabID,
@@ -1531,47 +1623,47 @@ extension OracleViewModel {
         rollback.insertedSessionIDs = Set(sessions.map(\.id)).subtracting(initialSessionIDs)
 
         do {
-            var primary: ChatSession?
-            var secondary: ChatSession?
+            var members: [OracleLane: ChatSession] = [:]
             if source?.oraclePairID != nil {
-                if let pair = try await resolveInMemoryOraclePairMembers(
-                    pairID: pairID,
+                if let inMemory = try await resolveInMemoryOracleGroupMembers(
+                    groupID: groupID,
+                    expectedLanes: expectedLanes,
                     workspaceID: workspaceID,
                     tabID: tabID,
                     agentModeSessionID: agentModeSessionID,
                     agentModeRunID: agentModeRunID
                 ) {
-                    primary = pair.primary
-                    secondary = pair.secondary
+                    members = inMemory
                 } else {
-                    let pair = try await loadPersistedOraclePair(
-                        pairID: pairID,
+                    let persisted = try await loadPersistedOracleGroup(
+                        groupID: groupID,
+                        expectedLanes: expectedLanes,
                         workspaceID: workspaceID,
                         tabID: tabID,
                         agentModeSessionID: agentModeSessionID,
                         agentModeRunID: agentModeRunID
                     )
-                    primary = pair.primary
-                    secondary = pair.secondary
-                    rollback.insertedSessionIDs.formUnion(pair.inserted)
+                    members = persisted.members
+                    rollback.insertedSessionIDs.formUnion(persisted.inserted)
                 }
             } else if let source {
-                guard source.oracleLane != .secondary,
+                guard source.oracleLane == nil,
                       !isSessionStreaming(source.id),
                       let loaded = await ensureSessionLoadedForBackground(source)
                 else {
                     throw ChatToolError(code: .conflict, message: "The Oracle session is unavailable or already streaming.", details: nil)
                 }
-                primary = loaded
+                members[.primary] = loaded
             }
 
-            for member in [primary, secondary].compactMap(\.self) {
+            for member in members.values {
                 rollback.originalSessions[member.id] = member
             }
-            let primaryName = desiredName ?? primary?.name ?? "Oracle"
-            if primary == nil {
-                primary = try await createSession(
-                    named: primaryName,
+            let primaryName = desiredName ?? members[.primary]?.name ?? "Oracle"
+            for lane in expectedLanes where members[lane] == nil {
+                let name = lane == .primary ? primaryName : "\(primaryName) — Oracle \(lane.ordinal)"
+                let created = try await createSession(
+                    named: name,
                     workspaceID: workspaceID,
                     tabID: tabID,
                     activateInUI: false,
@@ -1580,69 +1672,64 @@ extension OracleViewModel {
                     agentModeRunID: agentModeRunID,
                     reuseBlankSession: false
                 )
-                rollback.createdSessionIDs.insert(primary!.id)
+                members[lane] = created
+                rollback.createdSessionIDs.insert(created.id)
             }
-            if secondary == nil {
-                secondary = try await createSession(
-                    named: "\(primaryName) — Secondary",
-                    workspaceID: workspaceID,
-                    tabID: tabID,
-                    activateInUI: false,
-                    setActiveForTab: false,
-                    agentModeSessionID: agentModeSessionID,
-                    agentModeRunID: agentModeRunID,
-                    reuseBlankSession: false
-                )
-                rollback.createdSessionIDs.insert(secondary!.id)
-            }
-            guard var primary, var secondary, primary.id != secondary.id else {
-                throw ChatToolError(code: .conflict, message: "Failed to create a distinct Oracle pair.", details: nil)
+            guard members.count == expectedLanes.count,
+                  Set(members.values.map(\.id)).count == expectedLanes.count,
+                  let primary = members[.primary]
+            else {
+                throw ChatToolError(code: .conflict, message: "Failed to create a distinct Oracle group.", details: nil)
             }
             rollback.insertedSessionIDs.formUnion(rollback.createdSessionIDs)
 
-            let diverged = primary.oracleHistoryDiverged || secondary.oracleHistoryDiverged ||
-                Self.oracleHistoriesDiverged(
-                    primary: primary.messages.filter(\.isUser).map(\.rawText),
-                    secondary: secondary.messages.filter(\.isUser).map(\.rawText)
-                )
+            let primaryHistory = primary.messages.filter(\.isUser).map(\.rawText)
+            let diverged = members.values.contains(where: \.oracleHistoryDiverged) || expectedLanes.dropFirst().contains { lane in
+                members[lane]?.messages.filter(\.isUser).map(\.rawText) != primaryHistory
+            }
             let savedAt = Date()
             func prepare(_ session: inout ChatSession, lane: OracleLane) {
                 session.workspaceID = workspaceID
                 session.composeTabID = tabID
                 session.agentModeSessionID = agentModeSessionID
                 session.agentModeRunID = agentModeRunID
-                session.oraclePairID = pairID
+                session.oraclePairID = groupID
+                session.oracleGroupSize = expectedLanes.count
                 session.oracleLane = lane
                 session.oracleHistoryDiverged = diverged
                 session.savedAt = savedAt
             }
-            prepare(&primary, lane: .primary)
-            prepare(&secondary, lane: .secondary)
-            guard let primaryIndex = sessions.firstIndex(where: { $0.id == primary.id }),
-                  let secondaryIndex = sessions.firstIndex(where: { $0.id == secondary.id })
-            else {
-                throw ChatToolError(code: .conflict, message: "Oracle pair preparation changed before lane dispatch.", details: nil)
+            for lane in expectedLanes {
+                guard var member = members[lane],
+                      let index = sessions.firstIndex(where: { $0.id == member.id })
+                else {
+                    throw ChatToolError(code: .conflict, message: "Oracle group preparation changed before lane dispatch.", details: nil)
+                }
+                prepare(&member, lane: lane)
+                sessions[index] = member
+                members[lane] = member
+                rollback.assignedSessions[member.id] = member
             }
-            sessions[primaryIndex] = primary
-            sessions[secondaryIndex] = secondary
-            rollback.assignedSessions = [primary.id: primary, secondary.id: secondary]
-            try await sessionsResolved?(primary.id, secondary.id)
+            try await sessionsResolved?(members.mapValues(\.id))
 
             if activatePrimaryInUI {
+                guard let preparedPrimary = members[.primary] else {
+                    throw ChatToolError.internalError("Oracle group lost its Primary session during activation.")
+                }
                 await activateResolvedChatSession(
-                    primary,
+                    preparedPrimary,
                     resolvedTabID: tabID,
                     activateInUI: true,
                     setActiveForTab: true
                 )
             }
-            return OraclePairSessionResolution(pairID: pairID, primary: primary, secondary: secondary)
+            return OracleGroupSessionResolution(groupID: groupID, members: members)
         } catch {
             let preparationError = error
             let rollbackFailures = await rollbackOraclePairPreparation(rollback)
             guard rollbackFailures.isEmpty else {
                 throw ChatToolError.internalError(
-                    "Oracle pair preparation failed (\(preparationError.localizedDescription)); rollback also failed: \(rollbackFailures.joined(separator: "; "))"
+                    "Oracle group preparation failed (\(preparationError.localizedDescription)); rollback also failed: \(rollbackFailures.joined(separator: "; "))"
                 )
             }
             throw preparationError
@@ -1678,11 +1765,13 @@ extension OracleViewModel {
                 liveCallbacks: liveCallbacks
             ).toMCPObject()
         } catch let failure as OracleSendFailure {
+            let payload = ToolOutputFormatter.rawJSONString(.object(failure.result.toMCPObject()))
             throw ChatToolError(
                 code: .internalError,
                 message: failure.message,
                 details: [
-                    "oracle_pair_payload": ToolOutputFormatter.rawJSONString(.object(failure.result.toMCPObject()))
+                    "oracle_group_payload": payload,
+                    "oracle_pair_payload": payload
                 ]
             )
         }
@@ -1695,6 +1784,7 @@ extension OracleViewModel {
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext? = nil,
         primaryModelSelection: ModelSelectionResult? = nil,
+        additionalModelOverrides: [AIModel]? = nil,
         secondaryModelOverride: AIModel? = nil,
         liveCallbacks: OracleSendLiveCallbacks = OracleSendLiveCallbacks()
     ) async throws -> OracleSendResult {
@@ -1704,11 +1794,21 @@ extension OracleViewModel {
             agentSessionID: tabContext?.agentModeSessionID,
             agentRunID: tabContext?.agentModeRunID
         )
-        let secondaryModel = try secondaryModelOverride ?? resolveOracleSecondaryModel(workspaceID: workspaceID)
+        let additionalModels: [AIModel]
+        if let additionalModelOverrides {
+            additionalModels = additionalModelOverrides
+        } else if let secondaryModelOverride {
+            additionalModels = [secondaryModelOverride]
+        } else {
+            additionalModels = try resolveAdditionalOracleModels(workspaceID: workspaceID)
+        }
+        guard additionalModels.count <= OracleLane.allCases.count - 1 else {
+            throw ChatToolError.invalidParams("Oracle supports at most five concurrent models.")
+        }
 
         let operation: @MainActor () async throws -> OracleSendResult = {
             try self.validateRemovedOracleSendArguments(args)
-            guard let secondaryModel else {
+            guard !additionalModels.isEmpty else {
                 if let primaryModelSelection {
                     liveCallbacks.modelsResolved?(primaryModelSelection.model, nil)
                 }
@@ -1729,33 +1829,33 @@ extension OracleViewModel {
                   let tabID = route.contextID,
                   self.workspaceManager.bindingCandidate(forContextID: tabID)?.workspaceID == workspaceID
             else {
-                throw ChatToolError.invalidParams("Paired Oracle requires an exact workspace and tab route.")
+                throw ChatToolError.invalidParams("Multiple Oracles require an exact workspace and tab route.")
             }
-            let pair = try await self.tool_pairedChatSend(
+            let group = try await self.tool_groupedChatSend(
                 args: args,
                 promptVM: promptVM,
                 tabContext: tabContext,
                 mode: mode,
                 message: message,
-                secondaryModel: secondaryModel,
+                additionalModels: additionalModels,
                 workspaceID: workspaceID,
                 tabID: tabID,
                 primaryModelSelectionOverride: primaryModelSelection,
                 liveCallbacks: liveCallbacks
             )
-            let result = OracleSendResult(payload: .paired(pair), route: route)
-            // Fail closed whenever Primary fails (including incomplete). Secondary-only
-            // failure stays a returned partial_failure so callers can keep Primary text.
-            if case let .failure(failure) = pair.result.primary {
+            let result = OracleSendResult(payload: .paired(group), route: route)
+            // Fail closed whenever Primary fails (including incomplete). Additional-lane
+            // failures stay a returned partial_failure so callers can keep Primary text.
+            if case let .failure(failure) = group.result.primary {
                 throw OracleSendFailure(
                     result: result,
-                    message: pair.failureSummary ?? failure.message
+                    message: group.failureSummary ?? failure.message
                 )
             }
             return result
         }
 
-        guard secondaryModel != nil, let workspaceID else { return try await operation() }
+        guard !additionalModels.isEmpty, let workspaceID else { return try await operation() }
         let claim = OracleSendClaimKey.oracleSend(
             workspaceID: workspaceID,
             tabID: route.contextID,
@@ -1774,13 +1874,13 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func tool_pairedChatSend(
+    private func tool_groupedChatSend(
         args: [String: Value],
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext?,
         mode: String,
         message: String,
-        secondaryModel: AIModel,
+        additionalModels: [AIModel],
         workspaceID: UUID,
         tabID: UUID,
         primaryModelSelectionOverride: ModelSelectionResult?,
@@ -1796,7 +1896,16 @@ extension OracleViewModel {
                 promptVM: promptVM
             )
         }
-        liveCallbacks.modelsResolved?(primarySelection.model, secondaryModel)
+        let lanes = Array(OracleLane.allCases.prefix(additionalModels.count + 1))
+        var modelsByLane: [OracleLane: AIModel] = [.primary: primarySelection.model]
+        for (lane, model) in zip(lanes.dropFirst(), additionalModels) {
+            modelsByLane[lane] = model
+        }
+        if let groupModelsResolved = liveCallbacks.groupModelsResolved {
+            groupModelsResolved(modelsByLane)
+        } else {
+            liveCallbacks.modelsResolved?(primarySelection.model, additionalModels.first)
+        }
         let shouldActivatePrimary: Bool = if tabContext?.activationPolicy == .background {
             false
         } else if let tabContext {
@@ -1805,81 +1914,82 @@ extension OracleViewModel {
         } else {
             true
         }
-        let pair = try await resolveOrCreateOraclePairSessions(
+        let group = try await resolveOrCreateOracleGroupSessions(
             requestedChatID: args["chat_id"]?.stringValue,
             forceNew: args["new_chat"]?.boolValue ?? false,
             desiredName: args["chat_name"]?.stringValue,
+            expectedLanes: lanes,
             workspaceID: workspaceID,
             tabID: tabID,
             activatePrimaryInUI: shouldActivatePrimary,
             agentModeSessionID: tabContext?.agentModeSessionID,
             agentModeRunID: tabContext?.agentModeRunID,
-            sessionsResolved: { primary, secondary in
-                try await liveCallbacks.pairSessionsResolved?(primary, secondary)
+            sessionsResolved: { sessionIDsByLane in
+                if let groupSessionsResolved = liveCallbacks.groupSessionsResolved {
+                    try await groupSessionsResolved(sessionIDsByLane)
+                } else if let primary = sessionIDsByLane[.primary], let secondary = sessionIDsByLane[.secondary] {
+                    try await liveCallbacks.pairSessionsResolved?(primary, secondary)
+                }
             }
         )
-        pinSession(pair.primary.id)
-        pinSession(pair.secondary.id)
-        defer {
-            unpinSession(pair.secondary.id)
-            unpinSession(pair.primary.id)
+        for member in group.members.values {
+            pinSession(member.id)
         }
-        var primaryArgs = args
-        primaryArgs["chat_id"] = .string(pair.primary.shortID)
-        primaryArgs["new_chat"] = .bool(false)
-        primaryArgs.removeValue(forKey: "chat_name")
-        var secondaryArgs = args
-        secondaryArgs["chat_id"] = .string(pair.secondary.shortID)
-        secondaryArgs["new_chat"] = .bool(false)
-        secondaryArgs.removeValue(forKey: "chat_name")
-        let secondarySelection = ModelSelectionResult(
-            model: secondaryModel,
-            mcpControlInfo: "Secondary Oracle (\(secondaryModel.displayName))",
-            isAutoSelected: false,
-            chatPresetID: primarySelection.chatPresetID
-        )
+        defer {
+            for member in group.members.values {
+                unpinSession(member.id)
+            }
+        }
+        var selectionsByLane: [OracleLane: ModelSelectionResult] = [.primary: primarySelection]
+        for lane in lanes.dropFirst() {
+            guard let model = modelsByLane[lane] else {
+                throw ChatToolError.internalError("Oracle group lost a configured model before dispatch.")
+            }
+            selectionsByLane[lane] = ModelSelectionResult(
+                model: model,
+                mcpControlInfo: "Oracle \(lane.ordinal) (\(model.displayName))",
+                isAutoSelected: false,
+                chatPresetID: primarySelection.chatPresetID
+            )
+        }
+        var operationsByLane: [OracleLane: OraclePairCoordinator.Operation<ChatSendReply>] = [:]
+        for lane in lanes {
+            guard let member = group.members[lane], let selection = selectionsByLane[lane] else {
+                throw ChatToolError.internalError("Oracle group lost a prepared lane before dispatch.")
+            }
+            var laneArgs = args
+            laneArgs["chat_id"] = .string(member.shortID)
+            laneArgs["new_chat"] = .bool(false)
+            laneArgs.removeValue(forKey: "chat_name")
+            let sendArgs = laneArgs
+            let onProgress = lane == .primary ? liveCallbacks.primaryProgress : nil
+            operationsByLane[lane] = {
+                let result = try await self.tool_singleChatSendClaimed(
+                    args: sendArgs,
+                    promptVM: promptVM,
+                    tabContext: tabContext,
+                    modelSelectionOverride: selection,
+                    resolvedMessageOverride: message,
+                    activateInUI: false,
+                    lane: lane,
+                    laneLifecycle: liveCallbacks.laneLifecycle,
+                    onProgress: onProgress
+                )
+                _ = try OraclePairCoordinator.validatedResponse(result.response, lane: lane)
+                return result
+            }
+        }
         let execution: OraclePairCoordinator.Result<ChatSendReply>
         do {
-            execution = try await OraclePairCoordinator.run(
-                primary: {
-                    let result = try await self.tool_singleChatSendClaimed(
-                        args: primaryArgs,
-                        promptVM: promptVM,
-                        tabContext: tabContext,
-                        modelSelectionOverride: primarySelection,
-                        resolvedMessageOverride: message,
-                        activateInUI: false,
-                        lane: .primary,
-                        laneLifecycle: liveCallbacks.laneLifecycle,
-                        onProgress: liveCallbacks.primaryProgress
-                    )
-                    _ = try OraclePairCoordinator.validatedResponse(result.response, lane: .primary)
-                    return result
-                },
-                secondary: {
-                    let result = try await self.tool_singleChatSendClaimed(
-                        args: secondaryArgs,
-                        promptVM: promptVM,
-                        tabContext: tabContext,
-                        modelSelectionOverride: secondarySelection,
-                        resolvedMessageOverride: message,
-                        activateInUI: false,
-                        lane: .secondary,
-                        laneLifecycle: liveCallbacks.laneLifecycle
-                    )
-                    _ = try OraclePairCoordinator.validatedResponse(result.response, lane: .secondary)
-                    return result
-                }
-            )
+            execution = try await OraclePairCoordinator.run(operationsByLane: operationsByLane)
         } catch is CancellationError {
             do {
-                _ = try await persistOraclePairHistories(
-                    pairID: pair.pairID,
-                    primarySessionID: pair.primary.id,
-                    secondarySessionID: pair.secondary.id
+                _ = try await persistOracleGroupHistories(
+                    groupID: group.groupID,
+                    sessionIDsByLane: group.members.mapValues(\.id)
                 )
             } catch {
-                let message = "Cancelled Oracle pair history persistence failed: \(error.localizedDescription)"
+                let message = "Cancelled Oracle group history persistence failed: \(error.localizedDescription)"
                 print(message)
             }
             throw CancellationError()
@@ -1888,29 +1998,27 @@ extension OracleViewModel {
         let historyDiverged: Bool
         var historyPersistenceError: String?
         do {
-            historyDiverged = try await persistOraclePairHistories(
-                pairID: pair.pairID,
-                primarySessionID: pair.primary.id,
-                secondarySessionID: pair.secondary.id
+            historyDiverged = try await persistOracleGroupHistories(
+                groupID: group.groupID,
+                sessionIDsByLane: group.members.mapValues(\.id)
             )
         } catch {
             historyPersistenceError = error.localizedDescription
-            historyDiverged = Self.oracleHistoriesDiverged(
-                primary: oracleUserHistory(in: pair.primary.id) ?? [],
-                secondary: oracleUserHistory(in: pair.secondary.id) ?? []
-            )
-            for index in sessions.indices where sessions[index].oraclePairID == pair.pairID {
+            let primaryHistory = oracleUserHistory(in: group.primary.id) ?? []
+            historyDiverged = lanes.dropFirst().contains { lane in
+                guard let sessionID = group.members[lane]?.id else { return true }
+                return oracleUserHistory(in: sessionID) != primaryHistory
+            }
+            for index in sessions.indices where sessions[index].oraclePairID == group.groupID {
                 sessions[index].oracleHistoryDiverged = historyDiverged
             }
         }
-        return OraclePairSendReply(
-            pairID: pair.pairID,
+        return try OraclePairSendReply(
+            groupID: group.groupID,
             mode: mode,
-            primarySessionID: pair.primary.id,
-            primaryChatID: pair.primary.shortID,
-            secondaryChatID: pair.secondary.shortID,
-            primaryModel: primarySelection.model,
-            secondaryModel: secondaryModel,
+            sessionIDsByLane: group.members.mapValues(\.id),
+            chatIDsByLane: group.members.mapValues(\.shortID),
+            modelsByLane: modelsByLane,
             result: execution,
             historyDiverged: historyDiverged,
             historyPersistenceError: historyPersistenceError

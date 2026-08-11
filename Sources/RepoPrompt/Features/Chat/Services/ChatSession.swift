@@ -1,8 +1,66 @@
 import Foundation
 
-enum OracleLane: String, Codable, CaseIterable, Hashable {
+enum OracleLane: String, Codable, CaseIterable, Hashable, Sendable {
     case primary
     case secondary
+    case oracle3 = "oracle_3"
+    case oracle4 = "oracle_4"
+    case oracle5 = "oracle_5"
+
+    /// Stable one-based position used by persistence, transport, and UI ordering.
+    var ordinal: Int {
+        switch self {
+        case .primary: 1
+        case .secondary: 2
+        case .oracle3: 3
+        case .oracle4: 4
+        case .oracle5: 5
+        }
+    }
+
+    var isPrimary: Bool {
+        self == .primary
+    }
+
+    var displayLabel: String {
+        switch self {
+        case .primary: "Primary Oracle"
+        case .secondary: "Secondary Oracle"
+        case .oracle3: "Oracle 3"
+        case .oracle4: "Oracle 4"
+        case .oracle5: "Oracle 5"
+        }
+    }
+
+    /// Returns the only valid ordered lane prefix for a configured Oracle count.
+    static func orderedPrefix(count: Int) throws -> [OracleLane] {
+        guard (1 ... allCases.count).contains(count) else {
+            throw OracleLaneValidationError.invalidCount(count)
+        }
+        return Array(allCases.prefix(count))
+    }
+
+    /// Ensures lanes are unique, contiguous, and ordered from Primary.
+    static func validateOrderedPrefix(_ lanes: [OracleLane]) throws {
+        let expected = try orderedPrefix(count: lanes.count)
+        guard lanes == expected else {
+            throw OracleLaneValidationError.invalidPrefix(expected: expected, actual: lanes)
+        }
+    }
+}
+
+enum OracleLaneValidationError: LocalizedError, Equatable, Sendable {
+    case invalidCount(Int)
+    case invalidPrefix(expected: [OracleLane], actual: [OracleLane])
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidCount(count):
+            "Oracle lane count must be between 1 and \(OracleLane.allCases.count); received \(count)."
+        case let .invalidPrefix(expected, actual):
+            "Oracle lanes must be the ordered prefix [\(expected.map(\.rawValue).joined(separator: ", "))]; received [\(actual.map(\.rawValue).joined(separator: ", "))]."
+        }
+    }
 }
 
 enum ChatSessionError: Error {
@@ -33,6 +91,9 @@ struct ChatSession: Codable, Identifiable {
     var agentModeRunID: UUID?
     var oraclePairID: UUID?
     var oracleLane: OracleLane?
+    /// Expected member count for the logical Oracle group containing this session.
+    /// Legacy Primary/Secondary pairs decode as a two-member group.
+    var oracleGroupSize: Int?
     var oracleHistoryDiverged: Bool
     var name: String
     var savedAt: Date
@@ -68,6 +129,7 @@ struct ChatSession: Codable, Identifiable {
         agentModeRunID: UUID? = nil,
         oraclePairID: UUID? = nil,
         oracleLane: OracleLane? = nil,
+        oracleGroupSize: Int? = nil,
         oracleHistoryDiverged: Bool = false,
         name: String = "Untitled",
         savedAt: Date = Date(),
@@ -88,6 +150,10 @@ struct ChatSession: Codable, Identifiable {
         self.agentModeRunID = agentModeRunID
         self.oraclePairID = oraclePairID
         self.oracleLane = oracleLane
+        self.oracleGroupSize = oracleGroupSize ?? Self.inferredLegacyOracleGroupSize(
+            pairID: oraclePairID,
+            lane: oracleLane
+        )
         self.oracleHistoryDiverged = oracleHistoryDiverged
         self.name = name
         self.savedAt = savedAt
@@ -109,6 +175,7 @@ struct ChatSession: Codable, Identifiable {
         case agentModeRunID
         case oraclePairID
         case oracleLane
+        case oracleGroupSize
         case oracleHistoryDiverged
         case name
         case savedAt
@@ -132,6 +199,8 @@ struct ChatSession: Codable, Identifiable {
         agentModeRunID = try container.decodeIfPresent(UUID.self, forKey: .agentModeRunID)
         oraclePairID = try container.decodeIfPresent(UUID.self, forKey: .oraclePairID)
         oracleLane = try container.decodeIfPresent(OracleLane.self, forKey: .oracleLane)
+        oracleGroupSize = try container.decodeIfPresent(Int.self, forKey: .oracleGroupSize)
+            ?? Self.inferredLegacyOracleGroupSize(pairID: oraclePairID, lane: oracleLane)
         oracleHistoryDiverged = try container.decodeIfPresent(Bool.self, forKey: .oracleHistoryDiverged) ?? false
         name = try container.decode(String.self, forKey: .name)
         savedAt = try container.decode(Date.self, forKey: .savedAt)
@@ -163,9 +232,21 @@ struct ChatSession: Codable, Identifiable {
             )
         return collapsed.isEmpty ? "Untitled Chat" : collapsed
     }
+
+    private static func inferredLegacyOracleGroupSize(pairID: UUID?, lane: OracleLane?) -> Int? {
+        guard pairID != nil, lane == .primary || lane == .secondary else { return nil }
+        return 2
+    }
 }
 
 extension ChatSession {
+    /// Generic terminology for new multi-Oracle code while preserving the durable
+    /// `oraclePairID` key and all existing pair call sites.
+    var oracleGroupID: UUID? {
+        get { oraclePairID }
+        set { oraclePairID = newValue }
+    }
+
     /// Message count for UI and sorting when `messages` may be unloaded.
     var effectiveMessageCount: Int {
         messageCount ?? messages.count

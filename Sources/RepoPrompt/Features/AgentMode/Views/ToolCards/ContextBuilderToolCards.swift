@@ -574,7 +574,7 @@ struct ContextBuilderOracleLaneSummary: Equatable {
     let chatID: String?
 
     var label: String {
-        lane == .primary ? "Primary Oracle" : "Secondary Oracle"
+        lane == .primary ? "Primary Oracle" : "Oracle \(lane.ordinal)"
     }
 
     var statusLabel: String {
@@ -601,7 +601,7 @@ func contextBuilderOracleLaneSummaries(
     case .plan: dto.plan
     }
     guard let results = followUp?.oracleResults else { return [] }
-    return [OracleLane.primary, .secondary].compactMap { lane in
+    return OracleLane.allCases.compactMap { lane in
         guard let result = results[lane.rawValue] else { return nil }
         return ContextBuilderOracleLaneSummary(
             lane: lane,

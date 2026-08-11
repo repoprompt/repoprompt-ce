@@ -1091,6 +1091,10 @@ enum ToolResultDTOs {
         let errorCode: String?
         let errors: [String]?
         let oracleLane: String?
+        let oracleOrdinal: Int?
+        let oracleLabel: String?
+        let oracleGroupID: String?
+        let oracleCount: Int?
         let oraclePairID: String?
         let modelRawID: String?
         let modelDisplayName: String?
@@ -1105,6 +1109,10 @@ enum ToolResultDTOs {
             case errorCode = "error_code"
             case errors
             case oracleLane = "oracle_lane"
+            case oracleOrdinal = "oracle_ordinal"
+            case oracleLabel = "oracle_label"
+            case oracleGroupID = "oracle_group_id"
+            case oracleCount = "oracle_count"
             case oraclePairID = "oracle_pair_id"
             case modelRawID = "model_raw_id"
             case modelDisplayName = "model_display_name"
@@ -1124,10 +1132,16 @@ enum ToolResultDTOs {
         let diffs: [Diff]?
         let errors: [String]?
         let oracleResults: [String: OracleLaneDTO]?
+        let oracleGroupResults: [OracleLaneDTO]?
+        let oracleResultOrder: [String]?
+        let oracleGroupID: String?
+        let oracleCount: Int?
+        let oracleChatIDs: [String: String]?
         let oraclePairID: String?
         let primaryChatID: String?
         let secondaryChatID: String?
         let oracleHistoryDiverged: Bool?
+        let oracleGroupHistoryPersistenceError: String?
         let oraclePairHistoryPersistenceError: String?
         let contextID: String?
         let agentSessionID: String?
@@ -1142,10 +1156,16 @@ enum ToolResultDTOs {
             case patches
             case errors
             case oracleResults = "oracle_results"
+            case oracleGroupResults = "oracle_group_results"
+            case oracleResultOrder = "oracle_result_order"
+            case oracleGroupID = "oracle_group_id"
+            case oracleCount = "oracle_count"
+            case oracleChatIDs = "oracle_chat_ids"
             case oraclePairID = "oracle_pair_id"
             case primaryChatID = "primary_chat_id"
             case secondaryChatID = "secondary_chat_id"
             case oracleHistoryDiverged = "oracle_history_diverged"
+            case oracleGroupHistoryPersistenceError = "oracle_group_history_persistence_error"
             case oraclePairHistoryPersistenceError = "oracle_pair_history_persistence_error"
             case contextID = "context_id"
             case agentSessionID = "agent_session_id"
@@ -1160,11 +1180,17 @@ enum ToolResultDTOs {
             diffs: [Diff]?,
             errors: [String]?,
             oracleResults: [String: OracleLaneDTO]? = nil,
+            oracleGroupResults: [OracleLaneDTO]? = nil,
+            oracleResultOrder: [String]? = nil,
+            oracleGroupID: String? = nil,
+            oracleCount: Int? = nil,
+            oracleChatIDs: [String: String]? = nil,
             status: String? = nil,
             oraclePairID: String? = nil,
             primaryChatID: String? = nil,
             secondaryChatID: String? = nil,
             oracleHistoryDiverged: Bool? = nil,
+            oracleGroupHistoryPersistenceError: String? = nil,
             oraclePairHistoryPersistenceError: String? = nil,
             contextID: String? = nil,
             agentSessionID: String? = nil,
@@ -1177,10 +1203,16 @@ enum ToolResultDTOs {
             self.diffs = diffs
             self.errors = errors
             self.oracleResults = oracleResults
+            self.oracleGroupResults = oracleGroupResults
+            self.oracleResultOrder = oracleResultOrder
+            self.oracleGroupID = oracleGroupID
+            self.oracleCount = oracleCount
+            self.oracleChatIDs = oracleChatIDs
             self.oraclePairID = oraclePairID
             self.primaryChatID = primaryChatID
             self.secondaryChatID = secondaryChatID
             self.oracleHistoryDiverged = oracleHistoryDiverged
+            self.oracleGroupHistoryPersistenceError = oracleGroupHistoryPersistenceError
             self.oraclePairHistoryPersistenceError = oraclePairHistoryPersistenceError
             self.contextID = contextID
             self.agentSessionID = agentSessionID
@@ -1207,11 +1239,23 @@ enum ToolResultDTOs {
             errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? embedded?.errors
             oracleResults = try container.decodeIfPresent([String: OracleLaneDTO].self, forKey: .oracleResults)
                 ?? embedded?.oracleResults
+            oracleGroupResults = try container.decodeIfPresent([OracleLaneDTO].self, forKey: .oracleGroupResults)
+                ?? embedded?.oracleGroupResults
+            oracleResultOrder = try container.decodeIfPresent([String].self, forKey: .oracleResultOrder)
+                ?? embedded?.oracleResultOrder
+            oracleGroupID = try container.decodeIfPresent(String.self, forKey: .oracleGroupID) ?? embedded?.oracleGroupID
+            oracleCount = try container.decodeIfPresent(Int.self, forKey: .oracleCount) ?? embedded?.oracleCount
+            oracleChatIDs = try container.decodeIfPresent([String: String].self, forKey: .oracleChatIDs)
+                ?? embedded?.oracleChatIDs
             oraclePairID = try container.decodeIfPresent(String.self, forKey: .oraclePairID) ?? embedded?.oraclePairID
             primaryChatID = try container.decodeIfPresent(String.self, forKey: .primaryChatID) ?? embedded?.primaryChatID
             secondaryChatID = try container.decodeIfPresent(String.self, forKey: .secondaryChatID) ?? embedded?.secondaryChatID
             oracleHistoryDiverged = try container.decodeIfPresent(Bool.self, forKey: .oracleHistoryDiverged)
                 ?? embedded?.oracleHistoryDiverged
+            oracleGroupHistoryPersistenceError = try container.decodeIfPresent(
+                String.self,
+                forKey: .oracleGroupHistoryPersistenceError
+            ) ?? embedded?.oracleGroupHistoryPersistenceError
             oraclePairHistoryPersistenceError = try container.decodeIfPresent(
                 String.self,
                 forKey: .oraclePairHistoryPersistenceError
@@ -1230,10 +1274,19 @@ enum ToolResultDTOs {
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
             try container.encodeIfPresent(oracleResults, forKey: .oracleResults)
+            try container.encodeIfPresent(oracleGroupResults, forKey: .oracleGroupResults)
+            try container.encodeIfPresent(oracleResultOrder, forKey: .oracleResultOrder)
+            try container.encodeIfPresent(oracleGroupID, forKey: .oracleGroupID)
+            try container.encodeIfPresent(oracleCount, forKey: .oracleCount)
+            try container.encodeIfPresent(oracleChatIDs, forKey: .oracleChatIDs)
             try container.encodeIfPresent(oraclePairID, forKey: .oraclePairID)
             try container.encodeIfPresent(primaryChatID, forKey: .primaryChatID)
             try container.encodeIfPresent(secondaryChatID, forKey: .secondaryChatID)
             try container.encodeIfPresent(oracleHistoryDiverged, forKey: .oracleHistoryDiverged)
+            try container.encodeIfPresent(
+                oracleGroupHistoryPersistenceError,
+                forKey: .oracleGroupHistoryPersistenceError
+            )
             try container.encodeIfPresent(
                 oraclePairHistoryPersistenceError,
                 forKey: .oraclePairHistoryPersistenceError

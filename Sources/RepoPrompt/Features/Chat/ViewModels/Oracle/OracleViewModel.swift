@@ -1808,7 +1808,7 @@ class OracleViewModel: ObservableObject {
         }
     }
 
-    /// Deletes one logical chat. Paired Oracle sessions are one lifecycle unit:
+    /// Deletes one logical chat. Grouped Oracle sessions are one lifecycle unit:
     /// every known member is cancelled, deleted, and removed from memory together.
     @MainActor
     @discardableResult
@@ -1819,7 +1819,11 @@ class OracleViewModel: ObservableObject {
         guard let workspaceID = session.workspaceID,
               let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID })
         else {
-            return await deleteLegacySession(session)
+            // Group membership is a lifecycle invariant. Without the owning workspace we
+            // cannot discover or atomically delete the other lanes, so fail closed instead
+            // of silently deleting only the selected member through the legacy path.
+            print("Refusing to delete grouped Oracle session without its owning workspace.")
+            return false
         }
         let claim = OracleSendClaimKey.oracleSend(
             workspaceID: workspaceID,
@@ -1876,21 +1880,41 @@ class OracleViewModel: ObservableObject {
     @MainActor
     func deleteClaimedSession(_ session: ChatSession, workspace: WorkspaceModel) async -> Bool {
         sessionSwitchGeneration += 1
-        guard let pairID = session.oraclePairID else {
+        guard let groupID = session.oraclePairID else {
             return await deleteLegacySession(session)
         }
         let persistedMembers: [ChatSession]
         do {
-            persistedMembers = try await chatData.oraclePairSessionStubs(for: workspace, pairID: pairID)
+            persistedMembers = try await chatData.oraclePairSessionStubs(
+                for: workspace,
+                pairID: groupID,
+                requireCompleteGroup: false
+            )
         } catch {
-            print("Error resolving Oracle pair for deletion: \(error)")
+            print("Error resolving Oracle group for deletion: \(error)")
             return false
         }
         let memberIDs = Set([session.id]).union(persistedMembers.map(\.id)).union(
-            sessions.lazy.filter { $0.oraclePairID == pairID }.map(\.id)
+            sessions.lazy.filter { $0.oraclePairID == groupID }.map(\.id)
         )
-        guard memberIDs.count <= 2 else {
-            print("Refusing to delete malformed Oracle pair \(pairID).")
+        let knownMembersByID = Dictionary(
+            ([session] + persistedMembers + sessions.filter { $0.oraclePairID == groupID }).map { ($0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        let knownMembers = Array(knownMembersByID.values)
+        let declaredSizes = Set(knownMembers.compactMap(\.oracleGroupSize))
+        guard knownMembers.compactMap(\.oracleGroupSize).count == knownMembers.count,
+              declaredSizes.count == 1,
+              let groupSize = declaredSizes.first,
+              (2 ... OracleLane.allCases.count).contains(groupSize),
+              let expectedLanes = try? OracleLane.orderedPrefix(count: groupSize),
+              memberIDs.count <= groupSize,
+              knownMembers.allSatisfy({ $0.workspaceID == workspace.id && $0.oraclePairID == groupID }),
+              knownMembers.compactMap(\.oracleLane).count == knownMembers.count,
+              Set(knownMembers.compactMap(\.oracleLane)).count == knownMembers.count,
+              Set(knownMembers.compactMap(\.oracleLane)).isSubset(of: Set(expectedLanes))
+        else {
+            print("Refusing to delete malformed Oracle group \(groupID).")
             return false
         }
         let inMemoryMembers = sessions.filter { memberIDs.contains($0.id) }
@@ -1920,8 +1944,8 @@ class OracleViewModel: ObservableObject {
                     .filter { $0.composeTabID == tabID }
                     .sorted { lhs, rhs in
                         if lhs.savedAt != rhs.savedAt { return lhs.savedAt > rhs.savedAt }
-                        let leftLane = lhs.oracleLane == .primary ? 0 : lhs.oracleLane == .secondary ? 1 : 2
-                        let rightLane = rhs.oracleLane == .primary ? 0 : rhs.oracleLane == .secondary ? 1 : 2
+                        let leftLane = lhs.oracleLane?.ordinal ?? .max
+                        let rightLane = rhs.oracleLane?.ordinal ?? .max
                         if leftLane != rightLane { return leftLane < rightLane }
                         return lhs.id.uuidString < rhs.id.uuidString
                     }
@@ -2902,6 +2926,7 @@ class OracleViewModel: ObservableObject {
                 sessionToSave.agentModeRunID = session.agentModeRunID
                 sessionToSave.oraclePairID = session.oraclePairID
                 sessionToSave.oracleLane = session.oracleLane
+                sessionToSave.oracleGroupSize = session.oracleGroupSize
                 sessionToSave.oracleHistoryDiverged = session.oracleHistoryDiverged
                 sessionToSave.selectedFilePaths = session.selectedFilePaths
                 sessionToSave.selectedPromptIDs = session.selectedPromptIDs
@@ -2944,7 +2969,10 @@ class OracleViewModel: ObservableObject {
         // 0️⃣  Preconditions
         // ------------------------------------------------------------------
         guard let session = sessions.first(where: { $0.id == sessionID }) else { return nil }
-        guard session.oraclePairID == nil, session.oracleLane == nil else { return nil }
+        guard session.oraclePairID == nil,
+              session.oracleLane == nil,
+              session.oracleGroupSize == nil
+        else { return nil }
         guard let liveMessages = messageStore[sessionID] ?? (sessionID == currentSessionID ? messages : nil) else {
             return nil
         }
@@ -3257,46 +3285,68 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    func persistOraclePairHistories(
-        pairID: UUID,
-        primarySessionID: UUID,
-        secondarySessionID: UUID
+    func persistOracleGroupHistories(
+        groupID: UUID,
+        sessionIDsByLane: [OracleLane: UUID]
     ) async throws -> Bool {
-        guard primarySessionID != secondarySessionID,
-              let primaryIndex = sessions.firstIndex(where: { $0.id == primarySessionID }),
-              let secondaryIndex = sessions.firstIndex(where: { $0.id == secondarySessionID }),
-              sessions[primaryIndex].oraclePairID == pairID,
-              sessions[primaryIndex].oracleLane == .primary,
-              sessions[secondaryIndex].oraclePairID == pairID,
-              sessions[secondaryIndex].oracleLane == .secondary,
-              let workspaceID = sessions[primaryIndex].workspaceID,
-              sessions[secondaryIndex].workspaceID == workspaceID,
-              let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
-              let primaryMessages = messageStore[primarySessionID],
-              let secondaryMessages = messageStore[secondarySessionID]
+        let groupSize = sessionIDsByLane.count
+        guard (2 ... OracleLane.allCases.count).contains(groupSize),
+              Set(sessionIDsByLane.values).count == groupSize,
+              let orderedLanes = try? OracleLane.orderedPrefix(count: groupSize),
+              Set(sessionIDsByLane.keys) == Set(orderedLanes)
         else {
-            throw ChatToolError.internalError("Failed to persist a complete Oracle pair history.")
+            throw ChatToolError.internalError("Failed to persist a complete Oracle group history.")
+        }
+
+        var members: [ChatSession] = []
+        var liveMessagesByLane: [OracleLane: [AIChatMessage]] = [:]
+        for lane in orderedLanes {
+            guard let sessionID = sessionIDsByLane[lane],
+                  let member = sessions.first(where: { $0.id == sessionID }),
+                  member.oraclePairID == groupID,
+                  member.oracleLane == lane,
+                  member.oracleGroupSize == groupSize,
+                  let liveMessages = messageStore[sessionID]
+            else {
+                throw ChatToolError.internalError("Failed to persist a complete Oracle group history.")
+            }
+            members.append(member)
+            liveMessagesByLane[lane] = liveMessages
+        }
+        guard let workspaceID = members.first?.workspaceID,
+              members.allSatisfy({ $0.workspaceID == workspaceID }),
+              let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+              let primaryMessages = liveMessagesByLane[.primary]
+        else {
+            throw ChatToolError.internalError("Failed to persist a complete Oracle group history.")
         }
 
         let projectionWorkspaceLoadGeneration = workspaceChatSessionLoadGeneration
         let projectionActiveWorkspaceID = workspaceManager.activeWorkspace?.id
-        let diverged = Self.oracleHistoriesDiverged(
-            primary: primaryMessages.filter(\.isUser).map(\.content),
-            secondary: secondaryMessages.filter(\.isUser).map(\.content)
-        )
+        let primaryUserHistory = primaryMessages.filter(\.isUser).map(\.content)
+        let diverged = orderedLanes.dropFirst().contains { lane in
+            guard let laneMessages = liveMessagesByLane[lane] else { return true }
+            return laneMessages.filter(\.isUser).map(\.content) != primaryUserHistory
+        }
         let savedAt = Date()
-        var primary = sessions[primaryIndex]
-        var secondary = sessions[secondaryIndex]
-        primary.messages = try Self.storedOracleMessages(primaryMessages, preserving: primary.messages)
-        secondary.messages = try Self.storedOracleMessages(secondaryMessages, preserving: secondary.messages)
-        primary.savedAt = savedAt
-        secondary.savedAt = savedAt
-        primary.oracleHistoryDiverged = diverged
-        secondary.oracleHistoryDiverged = diverged
+        for index in members.indices {
+            let lane = orderedLanes[index]
+            guard let liveMessages = liveMessagesByLane[lane] else {
+                throw ChatToolError.internalError("Failed to persist a complete Oracle group history.")
+            }
+            members[index].messages = try Self.storedOracleMessages(
+                liveMessages,
+                preserving: members[index].messages
+            )
+            members[index].savedAt = savedAt
+            members[index].oracleGroupSize = groupSize
+            members[index].oracleHistoryDiverged = diverged
+        }
 
-        let fileURLs = try await chatData.saveOraclePairSessions([primary, secondary], for: workspace)
-        primary.fileURL = fileURLs[primarySessionID]
-        secondary.fileURL = fileURLs[secondarySessionID]
+        let fileURLs = try await chatData.saveOraclePairSessions(members, for: workspace)
+        for index in members.indices {
+            members[index].fileURL = fileURLs[members[index].id]
+        }
 
         #if DEBUG
             await oraclePairDidCommitTestHook?()
@@ -3307,23 +3357,22 @@ class OracleViewModel: ObservableObject {
         else {
             throw ChatToolError(
                 code: .conflict,
-                message: "Oracle pair histories were committed, but the workspace changed before projection; durable state was not projected into the new workspace.",
+                message: "Oracle group histories were committed, but the workspace changed before projection; durable state was not projected into the new workspace.",
                 details: ["durable_commit": "true"]
             )
         }
 
-        let projectionRouteIsCurrent = sessions.contains {
-            $0.id == primarySessionID &&
-                $0.oraclePairID == pairID &&
-                $0.oracleLane == .primary &&
-                $0.workspaceID == workspaceID
-        } && sessions.contains {
-            $0.id == secondarySessionID &&
-                $0.oraclePairID == pairID &&
-                $0.oracleLane == .secondary &&
-                $0.workspaceID == workspaceID
+        let projectionRouteIsCurrent = orderedLanes.allSatisfy { lane in
+            guard let sessionID = sessionIDsByLane[lane] else { return false }
+            return sessions.contains {
+                $0.id == sessionID &&
+                    $0.oraclePairID == groupID &&
+                    $0.oracleLane == lane &&
+                    $0.oracleGroupSize == groupSize &&
+                    $0.workspaceID == workspaceID
+            }
         }
-        for member in [primary, secondary] {
+        for member in members {
             if let index = sessions.firstIndex(where: { $0.id == member.id }) {
                 sessions[index] = member
             } else {
@@ -3333,11 +3382,27 @@ class OracleViewModel: ObservableObject {
         if !projectionRouteIsCurrent {
             throw ChatToolError(
                 code: .conflict,
-                message: "Oracle pair histories were committed, but in-memory state changed during projection; durable state was restored.",
+                message: "Oracle group histories were committed, but in-memory state changed during projection; durable state was restored.",
                 details: ["durable_commit": "true"]
             )
         }
         return diverged
+    }
+
+    /// Compatibility wrapper for two-lane callers while group runtime migration lands.
+    @MainActor
+    func persistOraclePairHistories(
+        pairID: UUID,
+        primarySessionID: UUID,
+        secondarySessionID: UUID
+    ) async throws -> Bool {
+        try await persistOracleGroupHistories(
+            groupID: pairID,
+            sessionIDsByLane: [
+                .primary: primarySessionID,
+                .secondary: secondarySessionID
+            ]
+        )
     }
 
     @MainActor

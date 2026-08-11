@@ -7,6 +7,19 @@ enum OraclePairSendStatus: String {
     case failed
 }
 
+typealias OracleGroupSendStatus = OraclePairSendStatus
+
+enum OracleGroupReplyValidationError: LocalizedError, Equatable {
+    case laneMetadataMismatch(expected: [OracleLane])
+
+    var errorDescription: String? {
+        switch self {
+        case let .laneMetadataMismatch(expected):
+            "Oracle group metadata must contain exactly the lanes [\(expected.map(\.rawValue).joined(separator: ", "))]."
+        }
+    }
+}
+
 struct OracleSendRoute: Equatable {
     let contextID: UUID?
     let agentSessionID: UUID?
@@ -60,32 +73,103 @@ struct OraclePairSendReply {
     let pairID: UUID
     let mode: String
     let primarySessionID: UUID
-    let primaryChatID: String
-    let secondaryChatID: String
-    let primaryModel: AIModel
-    let secondaryModel: AIModel
+    let sessionIDsByLane: [OracleLane: UUID]
+    let chatIDsByLane: [OracleLane: String]
+    let modelsByLane: [OracleLane: AIModel]
     let result: OraclePairCoordinator.Result<ChatSendReply>
     let historyDiverged: Bool
     let historyPersistenceError: String?
 
-    var status: OraclePairSendStatus {
-        switch (result.primary, result.secondary) {
-        case (.success, .success):
-            historyPersistenceError == nil ? .completed : .partialFailure
-        case (.failure, .failure):
-            .failed
-        default:
-            .partialFailure
+    var groupID: UUID { pairID }
+    var oracleCount: Int { result.orderedResults.count }
+    var orderedLanes: [OracleLane] { result.orderedLanes }
+    var primaryChatID: String { requiredChatID(for: .primary) }
+    var secondaryChatID: String { requiredChatID(for: .secondary) }
+    var primaryModel: AIModel { requiredModel(for: .primary) }
+    var secondaryModel: AIModel { requiredModel(for: .secondary) }
+
+    /// Compatibility initializer for the original two-lane runtime.
+    init(
+        pairID: UUID,
+        mode: String,
+        primarySessionID: UUID,
+        primaryChatID: String,
+        secondaryChatID: String,
+        primaryModel: AIModel,
+        secondaryModel: AIModel,
+        result: OraclePairCoordinator.Result<ChatSendReply>,
+        historyDiverged: Bool,
+        historyPersistenceError: String?
+    ) {
+        self.pairID = pairID
+        self.mode = mode
+        self.primarySessionID = primarySessionID
+        var resolvedSessionIDs: [OracleLane: UUID] = [.primary: primarySessionID]
+        if let secondarySessionID = Self.sessionID(for: .secondary, in: result) {
+            resolvedSessionIDs[.secondary] = secondarySessionID
         }
+        sessionIDsByLane = resolvedSessionIDs
+        chatIDsByLane = [.primary: primaryChatID, .secondary: secondaryChatID]
+        modelsByLane = [.primary: primaryModel, .secondary: secondaryModel]
+        self.result = result
+        self.historyDiverged = historyDiverged
+        self.historyPersistenceError = historyPersistenceError
+    }
+
+    /// Generic ordered group initializer. All metadata maps must cover the same
+    /// complete 2...5 lane prefix represented by `result`.
+    init(
+        groupID: UUID,
+        mode: String,
+        sessionIDsByLane: [OracleLane: UUID],
+        chatIDsByLane: [OracleLane: String],
+        modelsByLane: [OracleLane: AIModel],
+        result: OraclePairCoordinator.Result<ChatSendReply>,
+        historyDiverged: Bool,
+        historyPersistenceError: String?
+    ) throws {
+        let lanes = result.orderedLanes
+        guard (2 ... OracleLane.allCases.count).contains(lanes.count) else {
+            throw OracleLaneValidationError.invalidCount(lanes.count)
+        }
+        try OracleLane.validateOrderedPrefix(lanes)
+        let expected = Set(lanes)
+        guard Set(sessionIDsByLane.keys) == expected,
+              Set(chatIDsByLane.keys) == expected,
+              Set(modelsByLane.keys) == expected,
+              let primarySessionID = sessionIDsByLane[.primary]
+        else {
+            throw OracleGroupReplyValidationError.laneMetadataMismatch(expected: lanes)
+        }
+
+        pairID = groupID
+        self.mode = mode
+        self.primarySessionID = primarySessionID
+        self.sessionIDsByLane = sessionIDsByLane
+        self.chatIDsByLane = chatIDsByLane
+        self.modelsByLane = modelsByLane
+        self.result = result
+        self.historyDiverged = historyDiverged
+        self.historyPersistenceError = historyPersistenceError
+    }
+
+    var status: OraclePairSendStatus {
+        let successCount = result.orderedResults.reduce(into: 0) { count, laneResult in
+            if case .success = laneResult.execution { count += 1 }
+        }
+        if successCount == result.orderedResults.count {
+            return historyPersistenceError == nil ? .completed : .partialFailure
+        }
+        return successCount == 0 ? .failed : .partialFailure
     }
 
     var failureSummary: String? {
-        var warnings = [
-            laneFailureSummary(.primary, result.primary),
-            laneFailureSummary(.secondary, result.secondary)
-        ].compactMap(\.self)
+        var warnings = result.orderedResults.compactMap { laneResult in
+            laneFailureSummary(laneResult.lane, laneResult.execution)
+        }
         if let historyPersistenceError {
-            warnings.append("Oracle pair history persistence failed: \(historyPersistenceError)")
+            let noun = oracleCount == 2 ? "pair" : "group"
+            warnings.append("Oracle \(noun) history persistence failed: \(historyPersistenceError)")
         }
         return warnings.isEmpty ? nil : warnings.joined(separator: "\n")
     }
@@ -128,11 +212,18 @@ struct OraclePairSendReply {
             }
         }
         object["status"] = .string(status.rawValue)
+        object["oracle_group_id"] = .string(groupID.uuidString)
+        object["oracle_count"] = .int(oracleCount)
+        object["oracle_chat_ids"] = .object(Dictionary(uniqueKeysWithValues: orderedLanes.map { lane in
+            (lane.rawValue, .string(requiredChatID(for: lane)))
+        }))
+        object["oracle_result_order"] = .array(orderedLanes.map { .string($0.rawValue) })
         object["oracle_pair_id"] = .string(pairID.uuidString)
         object["primary_chat_id"] = .string(primaryChatID)
         object["secondary_chat_id"] = .string(secondaryChatID)
         object["oracle_history_diverged"] = .bool(historyDiverged)
         if let historyPersistenceError {
+            object["oracle_group_history_persistence_error"] = .string(historyPersistenceError)
             object["oracle_pair_history_persistence_error"] = .string(historyPersistenceError)
         }
         // Surface Secondary-only / history failures at the top level so single-lane
@@ -140,20 +231,19 @@ struct OraclePairSendReply {
         if status != .completed, let failureSummary, object["errors"] == nil {
             object["errors"] = .array([.string(failureSummary)])
         }
-        object["oracle_results"] = .object([
-            "primary": laneValue(
-                lane: .primary,
-                execution: result.primary,
-                chatID: primaryChatID,
-                model: primaryModel
-            ),
-            "secondary": laneValue(
-                lane: .secondary,
-                execution: result.secondary,
-                chatID: secondaryChatID,
-                model: secondaryModel
+        let orderedValues = result.orderedResults.map { laneResult in
+            laneValue(
+                lane: laneResult.lane,
+                execution: laneResult.execution,
+                chatID: requiredChatID(for: laneResult.lane),
+                model: requiredModel(for: laneResult.lane)
             )
-        ])
+        }
+        object["oracle_results"] = .object(Dictionary(uniqueKeysWithValues: zip(
+            orderedLanes.map(\.rawValue),
+            orderedValues
+        )))
+        object["oracle_group_results"] = .array(orderedValues)
         return object
     }
 
@@ -162,8 +252,7 @@ struct OraclePairSendReply {
         _ execution: OraclePairCoordinator.LaneExecution<ChatSendReply>
     ) -> String? {
         guard case let .failure(failure) = execution else { return nil }
-        let label = lane == .primary ? "Primary" : "Secondary"
-        return "\(label) Oracle failed: \(failure.message)"
+        return "\(lane.displayLabel) failed: \(failure.message)"
     }
 
     private func laneValue(
@@ -188,13 +277,44 @@ struct OraclePairSendReply {
             }
         }
         object["oracle_lane"] = .string(lane.rawValue)
+        object["oracle_ordinal"] = .int(lane.ordinal)
+        object["oracle_label"] = .string(lane.displayLabel)
+        object["oracle_group_id"] = .string(groupID.uuidString)
+        object["oracle_count"] = .int(oracleCount)
         object["oracle_pair_id"] = .string(pairID.uuidString)
         object["chat_id"] = .string(chatID)
         object["model_raw_id"] = .string(model.rawValue)
         object["model_display_name"] = .string(model.displayName)
         return .object(object)
     }
+
+    private static func sessionID(
+        for lane: OracleLane,
+        in result: OraclePairCoordinator.Result<ChatSendReply>
+    ) -> UUID? {
+        guard let execution = result[lane] else { return nil }
+        switch execution {
+        case let .success(reply): reply.chatId
+        case .failure: nil
+        }
+    }
+
+    private func requiredChatID(for lane: OracleLane) -> String {
+        guard let chatID = chatIDsByLane[lane] else {
+            preconditionFailure("Validated Oracle group is missing \(lane.rawValue) chat identity")
+        }
+        return chatID
+    }
+
+    private func requiredModel(for lane: OracleLane) -> AIModel {
+        guard let model = modelsByLane[lane] else {
+            preconditionFailure("Validated Oracle group is missing \(lane.rawValue) model identity")
+        }
+        return model
+    }
 }
+
+typealias OracleGroupSendReply = OraclePairSendReply
 
 struct ChatSendReply: Codable {
     let chatId: UUID

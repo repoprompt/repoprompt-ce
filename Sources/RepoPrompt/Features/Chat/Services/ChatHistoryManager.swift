@@ -59,7 +59,74 @@ private enum ChatSessionFile {
     }
 }
 
-/// Current-format crash recovery for installing exactly one Oracle pair.
+private enum OracleGroupPersistencePolicy {
+    static let validSizeRange = 2 ... OracleLane.allCases.count
+
+    static func orderedLanes(count: Int) throws -> [OracleLane] {
+        guard validSizeRange.contains(count) else {
+            throw ChatDataError.invalidFilename("An Oracle group requires between two and five sessions.")
+        }
+        return try OracleLane.orderedPrefix(count: count)
+    }
+
+    static func effectiveGroupSize(for session: ChatSession) -> Int? {
+        if let groupSize = session.oracleGroupSize {
+            return groupSize
+        }
+        // Compatibility for histories written by the original two-lane draft.
+        guard session.oraclePairID != nil,
+              session.oracleLane == .primary || session.oracleLane == .secondary
+        else { return nil }
+        return 2
+    }
+
+    @discardableResult
+    static func validate(
+        _ sessions: [ChatSession],
+        workspaceID: UUID? = nil,
+        requireCompleteGroup: Bool
+    ) throws -> Int {
+        guard !sessions.isEmpty,
+              sessions.count <= validSizeRange.upperBound,
+              Set(sessions.map(\.id)).count == sessions.count,
+              let groupID = sessions.first?.oraclePairID,
+              sessions.allSatisfy({ $0.oraclePairID == groupID })
+        else {
+            throw ChatDataError.invalidFilename("Oracle group sessions must have distinct identities and one shared group ID.")
+        }
+        if let workspaceID, !sessions.allSatisfy({ $0.workspaceID == workspaceID }) {
+            throw ChatDataError.invalidFilename("Oracle group sessions must belong to the target workspace.")
+        }
+
+        let groupSizes = sessions.compactMap { effectiveGroupSize(for: $0) }
+        guard groupSizes.count == sessions.count,
+              let groupSize = groupSizes.first,
+              validSizeRange.contains(groupSize),
+              groupSizes.allSatisfy({ $0 == groupSize }),
+              sessions.count <= groupSize
+        else {
+            throw ChatDataError.invalidFilename("Oracle group sessions must declare the same valid group size.")
+        }
+        if requireCompleteGroup, sessions.count != groupSize {
+            throw ChatDataError.invalidFilename(
+                "Oracle group is incomplete: expected \(groupSize) sessions, found \(sessions.count)."
+            )
+        }
+
+        let expectedLanes = try orderedLanes(count: groupSize)
+        let lanes = sessions.compactMap(\.oracleLane)
+        guard lanes.count == sessions.count,
+              Set(lanes).count == sessions.count,
+              Set(lanes).isSubset(of: Set(expectedLanes)),
+              !requireCompleteGroup || Set(lanes) == Set(expectedLanes)
+        else {
+            throw ChatDataError.invalidFilename("Oracle group sessions must use distinct contiguous lanes starting at Primary.")
+        }
+        return groupSize
+    }
+}
+
+/// Current-format crash recovery for atomically installing one Oracle group.
 private enum OraclePairWriteTransaction {
     private struct Manifest: Codable {
         struct Entry: Codable {
@@ -77,8 +144,10 @@ private enum OraclePairWriteTransaction {
     private static let commitName = "committed"
 
     static func save(_ replacements: [(id: UUID, data: Data)], in folder: URL) throws {
-        guard replacements.count == 2, Set(replacements.map(\.id)).count == 2 else {
-            throw ChatDataError.invalidFilename("An Oracle pair save requires exactly two distinct sessions.")
+        guard OracleGroupPersistencePolicy.validSizeRange.contains(replacements.count),
+              Set(replacements.map(\.id)).count == replacements.count
+        else {
+            throw ChatDataError.invalidFilename("An Oracle group save requires between two and five distinct sessions.")
         }
         try recover(in: folder)
 
@@ -125,7 +194,7 @@ private enum OraclePairWriteTransaction {
             do {
                 try recover(transaction, in: folder)
             } catch {
-                throw saveError("Oracle pair save and recovery both failed.", underlying: error)
+                throw saveError("Oracle group save and recovery both failed.", underlying: error)
             }
             throw error
         }
@@ -175,8 +244,8 @@ private enum OraclePairWriteTransaction {
         }
 
         let manifest = try JSONDecoder().decode(Manifest.self, from: readRegular(manifestURL))
-        guard manifest.entries.count == 2,
-              Set(manifest.entries.map(\.sessionID)).count == 2
+        guard OracleGroupPersistencePolicy.validSizeRange.contains(manifest.entries.count),
+              Set(manifest.entries.map(\.sessionID)).count == manifest.entries.count
         else { throw ChatDataError.invalidFilename(transaction.lastPathComponent) }
         _ = try validatedArtifacts(in: transaction, entries: manifest.entries)
 
@@ -300,6 +369,7 @@ actor ChatDataService {
         let agentModeRunID: UUID?
         let oraclePairID: UUID?
         let oracleLane: OracleLane?
+        let oracleGroupSize: Int?
         let oracleHistoryDiverged: Bool?
         let name: String
         let savedAt: Date
@@ -326,11 +396,14 @@ actor ChatDataService {
         _ session: ChatSession,
         for workspace: WorkspaceModel
     ) async throws -> URL {
-        guard session.oraclePairID == nil, session.oracleLane == nil else {
+        guard session.oraclePairID == nil,
+              session.oracleLane == nil,
+              session.oracleGroupSize == nil
+        else {
             throw ChatDataError.saveFailed(NSError(
                 domain: "ChatDataService",
                 code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "Paired Oracle sessions must be saved together."]
+                userInfo: [NSLocalizedDescriptionKey: "Grouped Oracle sessions must be saved together."]
             ))
         }
         return try await withExclusivePairMutation {
@@ -360,23 +433,23 @@ actor ChatDataService {
         chatsFolder: URL,
         workspaceID: UUID
     ) throws -> [(id: UUID, fileURL: URL, data: Data)] {
-        guard sessions.count == 2,
-              Set(sessions.map(\.id)).count == 2,
-              let pairID = sessions.first?.oraclePairID,
-              sessions.allSatisfy({ $0.oraclePairID == pairID && $0.workspaceID == workspaceID }),
-              Set(sessions.compactMap(\.oracleLane)) == Set(OracleLane.allCases)
-        else {
-            throw ChatDataError.invalidFilename("An Oracle pair save requires one Primary and one Secondary session in the target workspace.")
-        }
-        return try sessions.sorted { ($0.oracleLane == .primary ? 0 : 1) < ($1.oracleLane == .primary ? 0 : 1) }.map { session in
+        let groupSize = try OracleGroupPersistencePolicy.validate(
+            sessions,
+            workspaceID: workspaceID,
+            requireCompleteGroup: true
+        )
+        return try sessions.sorted {
+            ($0.oracleLane?.ordinal ?? .max) < ($1.oracleLane?.ordinal ?? .max)
+        }.map { session in
             let fileURL = chatsFolder.appendingPathComponent(ChatSessionFile.filename(for: session.id))
             var copy = session
             copy.fileURL = fileURL
+            copy.oracleGroupSize = groupSize
             return try (session.id, fileURL, JSONEncoder().encode(copy))
         }
     }
 
-    /// Saves exactly one Primary/Secondary Oracle pair without exposing a half-written generation.
+    /// Saves one complete two-to-five-member Oracle group without exposing a partial generation.
     func saveOraclePairSessions(
         _ sessions: [ChatSession],
         for workspace: WorkspaceModel
@@ -513,6 +586,7 @@ actor ChatDataService {
                 agentModeRunID: header.agentModeRunID,
                 oraclePairID: header.oraclePairID,
                 oracleLane: header.oracleLane,
+                oracleGroupSize: header.oracleGroupSize,
                 oracleHistoryDiverged: header.oracleHistoryDiverged ?? false,
                 name: header.name,
                 savedAt: header.savedAt,
@@ -539,7 +613,20 @@ actor ChatDataService {
         let id: UUID
         let pairID: UUID?
         let lane: OracleLane?
+        let groupSize: Int?
+        let metadataReadable: Bool
         let modified: Date
+    }
+
+    private func retentionCost(for group: [HistoryFile]) -> Int {
+        let declaredSizes = Set(group.compactMap(\.groupSize))
+        guard declaredSizes.count == 1,
+              let declaredSize = declaredSizes.first,
+              OracleGroupPersistencePolicy.validSizeRange.contains(declaredSize)
+        else { return group.count }
+        // An incomplete durable group still consumes its declared number of slots. This
+        // prevents a missing file from making the group appear to be a smaller valid one.
+        return max(group.count, declaredSize)
     }
 
     private func chatFiles(in chatsFolder: URL) throws -> [URL] {
@@ -555,8 +642,9 @@ actor ChatDataService {
         }
     }
 
-    /// Returns newest-first chat files. Readable pairs are retained or deleted together;
-    /// unreadable exact chat files still consume one bounded-retention slot.
+    /// Returns newest-first chat files. Oracle groups are retained or deleted together.
+    /// If any canonical chat file is unreadable, retention fails closed because that file
+    /// may be a group member whose durable membership can no longer be recovered.
     func listChatSessions(
         for workspace: WorkspaceModel,
         protectedSessionIDs: Set<UUID> = [],
@@ -572,6 +660,8 @@ actor ChatDataService {
                 id: id,
                 pairID: stub?.oraclePairID,
                 lane: stub?.oracleLane,
+                groupSize: stub?.oracleGroupSize,
+                metadataReadable: stub != nil,
                 modified: modified
             )
         }
@@ -579,27 +669,31 @@ actor ChatDataService {
             file.pairID.map { "pair:\($0.uuidString)" } ?? "session:\(file.id.uuidString)"
         }.values.map { group in
             group.sorted {
-                let left = $0.lane == .primary ? 0 : $0.lane == .secondary ? 1 : 2
-                let right = $1.lane == .primary ? 0 : $1.lane == .secondary ? 1 : 2
+                let left = $0.lane?.ordinal ?? .max
+                let right = $1.lane?.ordinal ?? .max
                 return left == right ? $0.id.uuidString < $1.id.uuidString : left < right
             }
         }.sorted {
             ($0.map(\.modified).max() ?? .distantPast) > ($1.map(\.modified).max() ?? .distantPast)
         }
 
-        guard applyRetention, !pairMutationPending else { return groups.flatMap { $0.map(\.url) } }
+        guard applyRetention,
+              !pairMutationPending,
+              files.allSatisfy(\.metadataReadable)
+        else { return groups.flatMap { $0.map(\.url) } }
         let limit = chatHistoryLimit == .unlimited ? Int.max : chatHistoryLimit.rawValue
         var kept: [[HistoryFile]] = []
         var dropped: [[HistoryFile]] = []
         var used = 0
         var retentionFull = false
         for group in groups {
+            let cost = retentionCost(for: group)
             if group.contains(where: { protectedSessionIDs.contains($0.id) }) {
                 kept.append(group)
-                used += group.count
-            } else if !retentionFull, used + group.count <= limit {
+                used += cost
+            } else if !retentionFull, used + cost <= limit {
                 kept.append(group)
-                used += group.count
+                used += cost
             } else {
                 dropped.append(group)
                 retentionFull = true
@@ -611,17 +705,31 @@ actor ChatDataService {
         return kept.flatMap { $0.map(\.url) }
     }
 
-    /// Reads persisted pair metadata without applying retention.
+    /// Reads persisted Oracle group metadata without applying retention.
+    ///
+    /// Complete validation is the default so a missing file cannot be mistaken for a
+    /// smaller valid group. Cleanup callers may opt into an incomplete read to discover
+    /// and delete the durable members that remain.
     func oraclePairSessionStubs(
         for workspace: WorkspaceModel,
-        pairID: UUID
+        pairID: UUID,
+        requireCompleteGroup: Bool = true
     ) async throws -> [ChatSession] {
         let chatsFolder = try ensureChatsFolder(for: workspace)
-        return try chatFiles(in: chatsFolder).compactMap { url in
+        let stubs = try chatFiles(in: chatsFolder).compactMap { url in
             guard let stub = try? Self.loadChatSessionStubFromDisk(from: url), stub.oraclePairID == pairID else {
                 return nil
             }
             return stub
+        }
+        guard !stubs.isEmpty else { return [] }
+        _ = try OracleGroupPersistencePolicy.validate(
+            stubs,
+            workspaceID: workspace.id,
+            requireCompleteGroup: requireCompleteGroup
+        )
+        return stubs.sorted {
+            ($0.oracleLane?.ordinal ?? .max) < ($1.oracleLane?.ordinal ?? .max)
         }
     }
 
@@ -745,14 +853,19 @@ actor ChatDataService {
         try FileManager.default.removeItem(at: fileURL)
     }
 
-    /// Deletes the known durable members of one Oracle pair as a unit.
+    /// Deletes the known durable members of one Oracle group as a unit.
     func deleteOraclePairSessionFiles(
         _ sessionIDs: Set<UUID>,
         for workspace: WorkspaceModel
     ) async throws {
         try await withExclusivePairMutation {
             let chatsFolder = try ensureChatsFolder(for: workspace)
-            try deleteSessionFiles(sessionIDs, in: chatsFolder)
+            let expandedSessionIDs = try oracleGroupSessionIDsForDeletion(
+                seededBy: sessionIDs,
+                in: chatsFolder,
+                workspaceID: workspace.id
+            )
+            try deleteSessionFiles(expandedSessionIDs, in: chatsFolder)
         }
     }
 
@@ -787,9 +900,56 @@ actor ChatDataService {
         return try await operation()
     }
 
+    private func oracleGroupSessionIDsForDeletion(
+        seededBy sessionIDs: Set<UUID>,
+        in chatsFolder: URL,
+        workspaceID: UUID
+    ) throws -> Set<UUID> {
+        guard !sessionIDs.isEmpty, sessionIDs.count <= OracleGroupPersistencePolicy.validSizeRange.upperBound else {
+            throw ChatDataError.invalidFilename("Oracle group deletion requires between one and five session IDs.")
+        }
+        let files = try chatFiles(in: chatsFolder)
+        let readableStubs = files.compactMap { url in
+            try? Self.loadChatSessionStubFromDisk(from: url)
+        }
+        let readableSessionIDs = Set(readableStubs.map(\.id))
+        let unreadableSessionIDs = Set(files.compactMap { url in
+            ChatSessionFile.sessionID(from: url.lastPathComponent)
+        }).subtracting(readableSessionIDs)
+        guard sessionIDs.isDisjoint(with: unreadableSessionIDs) else {
+            throw ChatDataError.invalidFilename(
+                "Oracle group deletion cannot classify an unreadable seeded chat session."
+            )
+        }
+        let seededStubs = readableStubs.filter { sessionIDs.contains($0.id) }
+        let groupIDs = Set(seededStubs.compactMap(\.oraclePairID))
+        guard groupIDs.count <= 1 else {
+            throw ChatDataError.invalidFilename("Oracle group deletion cannot span multiple groups.")
+        }
+        guard let groupID = groupIDs.first else { return sessionIDs }
+        guard seededStubs.allSatisfy({ $0.oraclePairID == groupID }) else {
+            throw ChatDataError.invalidFilename(
+                "Oracle group deletion cannot include ungrouped chat sessions."
+            )
+        }
+        guard unreadableSessionIDs.isEmpty else {
+            throw ChatDataError.invalidFilename(
+                "Oracle group deletion cannot prove complete membership while a chat file is unreadable."
+            )
+        }
+
+        let members = readableStubs.filter { $0.oraclePairID == groupID }
+        _ = try OracleGroupPersistencePolicy.validate(
+            members,
+            workspaceID: workspaceID,
+            requireCompleteGroup: false
+        )
+        return sessionIDs.union(members.map(\.id))
+    }
+
     private func deleteSessionFiles(_ sessionIDs: Set<UUID>, in chatsFolder: URL) throws {
-        guard !sessionIDs.isEmpty, sessionIDs.count <= 2 else {
-            throw ChatDataError.invalidFilename("Oracle pair deletion requires one or two session IDs.")
+        guard !sessionIDs.isEmpty, sessionIDs.count <= OracleGroupPersistencePolicy.validSizeRange.upperBound else {
+            throw ChatDataError.invalidFilename("Oracle group deletion requires between one and five session IDs.")
         }
         let saved = try sessionIDs.sorted(by: { $0.uuidString < $1.uuidString }).compactMap { id -> (URL, Data, Date?)? in
             let url = chatsFolder.appendingPathComponent(ChatSessionFile.filename(for: id))

@@ -23,20 +23,45 @@ enum AgentOraclePillPresentation: Equatable {
     var label: String {
         switch self {
         case .legacySingle: "Oracle"
-        case .pairedLane(.primary): "Primary Oracle"
-        case .pairedLane(.secondary): "Secondary Oracle"
+        case let .pairedLane(lane):
+            lane == .primary ? "Primary Oracle" : "Oracle \(lane.ordinal)"
+        }
+    }
+
+    var compactLabel: String {
+        switch self {
+        case .legacySingle: "Oracle"
+        case .pairedLane(.primary): "Oracle 1"
+        case let .pairedLane(lane): "O\(lane.ordinal)"
         }
     }
 }
 
 enum AgentOraclePillLogic {
     static func presentations(
+        additionalModelRaws: [String],
+        groupSessionLanes: Set<OracleLane> = []
+    ) -> [AgentOraclePillPresentation] {
+        let configuredAdditional = (try? OraclePairModelSelectionPolicy.canonicalAdditionalRaws(
+            additionalModelRaws
+        )) ?? []
+        guard !configuredAdditional.isEmpty || !groupSessionLanes.isEmpty else {
+            return [.legacySingle]
+        }
+        let configuredLanes = Set(OracleLane.allCases.prefix(configuredAdditional.count + 1))
+        return configuredLanes.union(groupSessionLanes).sorted { $0.ordinal < $1.ordinal }.map {
+            .pairedLane($0)
+        }
+    }
+
+    static func presentations(
         secondaryModelRaw: String?,
         hasSecondarySession: Bool = false
     ) -> [AgentOraclePillPresentation] {
-        let secondaryConfigured = (try? OraclePairModelSelectionPolicy.canonicalSecondaryRaw(secondaryModelRaw)) != nil
-        guard secondaryConfigured || hasSecondarySession else { return [.legacySingle] }
-        return [.pairedLane(.primary), .pairedLane(.secondary)]
+        presentations(
+            additionalModelRaws: secondaryModelRaw.map { [$0] } ?? [],
+            groupSessionLanes: hasSecondarySession ? [.primary, .secondary] : []
+        )
     }
 
     static func resolvedLane(for session: ChatSession) -> OracleLane? {
@@ -228,8 +253,9 @@ enum AgentOraclePillLogic {
     }
 }
 
-/// Pill that appears when there are oracle chat sessions for the current tab.
-/// More prominent when streaming. Clicking opens a wide popover with chat transcript.
+/// Primary stays visible as a stable Agent Mode affordance. Additional lane pills
+/// appear when they have a live or historical session for the current tab.
+/// Active pills open a wide popover with the chat transcript.
 struct AgentOraclePill: View {
     @ObservedObject var oracleViewModel: OracleViewModel
     let windowID: Int
@@ -312,12 +338,16 @@ struct AgentOraclePill: View {
         latestTabSession != nil
     }
 
+    private var shouldRender: Bool {
+        hasAnySessions || lane.isPrimary
+    }
+
     var body: some View {
         #if DEBUG
             let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.oracle")
         #endif
         Group {
-            if hasAnySessions {
+            if shouldRender {
                 let cornerRadius = AgentPillMetrics.cornerRadius()
                 Button {
                     openPopover(chatID: nil)
@@ -332,7 +362,7 @@ struct AgentOraclePill: View {
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                 .foregroundStyle(.secondary)
                         }
-                        Text(presentation.label)
+                        Text(presentation.compactLabel)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
                             .foregroundStyle(isStreaming ? .primary : .secondary)
                     }
@@ -347,8 +377,11 @@ struct AgentOraclePill: View {
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
                 .buttonStyle(.plain)
+                .disabled(!hasAnySessions)
                 .hoverTooltip(
-                    isStreaming
+                    !hasAnySessions
+                        ? "Oracle is ready — its latest chat will appear here"
+                        : isStreaming
                         ? "\(presentation.label) is thinking — click to view the live chat"
                         : "Open the latest \(presentation.label) chat for this tab",
                     .top
@@ -371,7 +404,7 @@ struct AgentOraclePill: View {
                 )
                 return
             }
-            guard presentation != .pairedLane(.secondary),
+            guard presentation.lane == .primary,
                   let route = AgentOracleLatestPopoverRoute(notificationUserInfo: note.userInfo),
                   route.windowID == windowID,
                   route.tabID == currentTabID,

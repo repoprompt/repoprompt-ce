@@ -260,6 +260,59 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertNil(try fileStore.load().scalarPreferences?.modelSelection?.secondaryOracleModel)
     }
 
+    func testAdditionalOracleModelsSettingPersistsOrderedRosterAndRejectsOverMaximum() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let service = AppSettingsMCPService(store: store)
+        let key = "models.additional_oracle_models"
+        let models = [
+            AIModel.gpt54Pro.rawValue,
+            AIModel.claude4Sonnet.rawValue,
+            AIModel.gpt54Pro.rawValue,
+            AIModel.claude4Sonnet.rawValue
+        ]
+
+        let set = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string(key),
+            "value": .array(models.map(Value.string))
+        ])
+        XCTAssertEqual(set.objectValue?["new_value"]?.arrayValue?.compactMap(\.stringValue), models)
+        XCTAssertEqual(store.additionalOracleModelRaws(), models)
+        XCTAssertEqual(
+            try fileStore.load().scalarPreferences?.modelSelection?.additionalOracleModels,
+            models
+        )
+
+        do {
+            _ = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string(key),
+                "value": .array(Array(repeating: .string(models[0]), count: 5))
+            ])
+            XCTFail("Expected more than four additional Oracles to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("zero to four"))
+        }
+        XCTAssertEqual(store.additionalOracleModelRaws(), models)
+
+        let cleared = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string(key),
+            "value": .array([])
+        ])
+        XCTAssertEqual(cleared.objectValue?["new_value"]?.arrayValue?.count, 0)
+        XCTAssertTrue(store.additionalOracleModelRaws().isEmpty)
+    }
+
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

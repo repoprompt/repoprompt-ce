@@ -350,64 +350,113 @@ struct AgentModelsSettingsView: View {
 
     private var oracleSection: some View {
         settingsCard {
-            sectionHeader(title: "Primary Oracle Model", subtitle: "The compatibility/default response used by ask_oracle, oracle_send, plan/review, and Context Builder analysis.")
+            sectionHeader(
+                title: "Oracle Models",
+                subtitle: "Oracle 1 is permanent and remains the compatibility/default response. "
+                    + "Add up to four independent additional Oracles; responses are not automatically synthesized."
+            )
 
-            HStack(alignment: .center, spacing: 12) {
-                AIModelDropdown(
-                    promptViewModel: promptVM,
-                    showSettingsPopover: $showSettingsPopover,
-                    windowID: windowID,
-                    useBorderlessStyle: false,
-                    isInGeneralSettings: true,
-                    destination: viewModel.oracleModelDestination
-                )
-
-                Spacer(minLength: 0)
-
-                if viewModel.showsRecommendationActions,
-                   let recommendedName = viewModel.recommendedOracleModelName,
-                   !viewModel.isOracleRecommendationSatisfied
-                {
-                    Text("Recommended: \(recommendedName)")
-                        .font(.caption)
-                        .foregroundColor(.orange)
-
-                    Button("Apply") {
-                        viewModel.applyOracleRecommendation()
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Oracle 1")
+                            .font(.callout.weight(.semibold))
+                        Text("Primary · permanent")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+
+                    Spacer(minLength: 0)
+
+                    AIModelDropdown(
+                        promptViewModel: promptVM,
+                        showSettingsPopover: $showSettingsPopover,
+                        windowID: windowID,
+                        useBorderlessStyle: false,
+                        isInGeneralSettings: true,
+                        destination: viewModel.oracleModelDestination
+                    )
+
+                    if viewModel.showsRecommendationActions,
+                       let recommendedName = viewModel.recommendedOracleModelName,
+                       !viewModel.isOracleRecommendationSatisfied
+                    {
+                        Text("Recommended: \(recommendedName)")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+
+                        Button("Apply") {
+                            viewModel.applyOracleRecommendation()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "cpu")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                    Text("Using: \(viewModel.currentOracleModelName)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
 
-            HStack(spacing: 6) {
-                Image(systemName: "cpu")
+            ForEach(Array(viewModel.additionalOracleModelRaws.indices), id: \.self) { index in
+                Divider()
+
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Oracle \(index + 2)")
+                            .font(.callout.weight(.semibold))
+                        Text("Using: \(viewModel.additionalOracleModelName(at: index))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    AIModelDropdown(
+                        promptViewModel: promptVM,
+                        showSettingsPopover: $showSettingsPopover,
+                        windowID: windowID,
+                        useBorderlessStyle: false,
+                        isInGeneralSettings: true,
+                        destination: viewModel.additionalOracleModelDestination(at: index)
+                    )
+
+                    Button {
+                        viewModel.removeAdditionalOracle(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
                     .foregroundColor(.secondary)
-                    .font(.caption)
-                Text("Using: \(viewModel.currentOracleModelName)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                    .hoverTooltip("Remove Oracle \(index + 2)")
+                    .accessibilityLabel("Remove Oracle \(index + 2)")
+                }
             }
 
             Divider()
 
-            sectionHeader(
-                title: "Secondary Oracle Model",
-                subtitle: "Optional independent second opinion. Both responses are returned without automatic synthesis."
-            )
+            HStack(spacing: 8) {
+                Button {
+                    viewModel.addAdditionalOracle()
+                } label: {
+                    Label("Add Oracle", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!viewModel.canAddAdditionalOracle)
+                .hoverTooltip(viewModel.addOracleHelpText)
 
-            AIModelDropdown(
-                promptViewModel: promptVM,
-                showSettingsPopover: $showSettingsPopover,
-                windowID: windowID,
-                useBorderlessStyle: false,
-                isInGeneralSettings: true,
-                destination: viewModel.secondaryOracleModelDestination
-            )
+                Spacer(minLength: 0)
 
-            Text("Using: \(viewModel.currentSecondaryOracleModelName)")
-                .font(.caption)
-                .foregroundColor(.secondary)
+                Text("\(viewModel.totalOracleCount) of \(viewModel.maximumOracleCount) configured")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
     }
 

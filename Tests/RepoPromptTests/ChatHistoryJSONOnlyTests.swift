@@ -86,14 +86,156 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertEqual(updatedSecondary.name, "Updated Secondary")
     }
 
+    func testOracleGroupSaveAcceptsEverySupportedSizeInLaneOrder() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Oracle Group Sizes")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+
+        for groupSize in 2 ... 5 {
+            let groupID = UUID()
+            let lanes = try OracleLane.orderedPrefix(count: groupSize)
+            var members = lanes.map { lane in
+                pairSession(
+                    lane,
+                    pairID: groupID,
+                    groupSize: groupSize,
+                    workspace: fixture.workspace,
+                    name: "Group \(groupSize) \(lane.rawValue)"
+                )
+            }
+            let urls = try await service.saveOraclePairSessions(members, for: fixture.workspace)
+            let stubs = try await service.oraclePairSessionStubs(for: fixture.workspace, pairID: groupID)
+
+            XCTAssertEqual(stubs.compactMap(\.oracleLane), lanes)
+            XCTAssertTrue(stubs.allSatisfy { $0.oracleGroupSize == groupSize })
+            XCTAssertEqual(urls.count, groupSize)
+
+            if groupSize == 5 {
+                for index in members.indices {
+                    members[index].name = "Updated \(lanes[index].rawValue)"
+                }
+                _ = try await service.saveOraclePairSessions(members, for: fixture.workspace)
+                for member in members {
+                    let loaded = try await service.loadChatSession(from: XCTUnwrap(urls[member.id]))
+                    XCTAssertEqual(loaded.name, member.name)
+                    XCTAssertEqual(loaded.oracleGroupSize, 5)
+                }
+            }
+        }
+    }
+
+    func testOracleGroupSaveRejectsMismatchedMetadataAndNoncontiguousLanes() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Oracle Group Validation")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let groupID = UUID()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        var mismatchedSize = lanes.map { lane in
+            pairSession(
+                lane,
+                pairID: groupID,
+                groupSize: 5,
+                workspace: fixture.workspace,
+                name: lane.rawValue
+            )
+        }
+        mismatchedSize[mismatchedSize.count - 1].oracleGroupSize = 4
+
+        do {
+            _ = try await service.saveOraclePairSessions(mismatchedSize, for: fixture.workspace)
+            XCTFail("Expected mismatched group size to fail")
+        } catch is ChatDataError {}
+
+        let noncontiguousGroupID = UUID()
+        let noncontiguous = [OracleLane.primary, .secondary, .oracle4].map { lane in
+            pairSession(
+                lane,
+                pairID: noncontiguousGroupID,
+                groupSize: 3,
+                workspace: fixture.workspace,
+                name: lane.rawValue
+            )
+        }
+        do {
+            _ = try await service.saveOraclePairSessions(noncontiguous, for: fixture.workspace)
+            XCTFail("Expected noncontiguous lanes to fail")
+        } catch is ChatDataError {}
+
+        let validThreeLaneGroupID = UUID()
+        let validThreeLaneGroup = try OracleLane.orderedPrefix(count: 3).map { lane in
+            pairSession(
+                lane,
+                pairID: validThreeLaneGroupID,
+                groupSize: 3,
+                workspace: fixture.workspace,
+                name: lane.rawValue
+            )
+        }
+        var mismatchedGroupID = validThreeLaneGroup
+        mismatchedGroupID[2].oraclePairID = UUID()
+        do {
+            _ = try await service.saveOraclePairSessions(mismatchedGroupID, for: fixture.workspace)
+            XCTFail("Expected mismatched group IDs to fail")
+        } catch is ChatDataError {}
+
+        var mismatchedWorkspace = validThreeLaneGroup
+        mismatchedWorkspace[2].workspaceID = UUID()
+        do {
+            _ = try await service.saveOraclePairSessions(mismatchedWorkspace, for: fixture.workspace)
+            XCTFail("Expected mismatched workspaces to fail")
+        } catch is ChatDataError {}
+    }
+
+    func testMissingGroupFileCannotMasqueradeAsSmallerGroupAndCleanupDeletesRemainder() async throws {
+        let fixture = try makeTemporaryWorkspace(named: "Incomplete Oracle Group")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = ChatDataService()
+        let groupID = UUID()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let members = lanes.map { lane in
+            pairSession(
+                lane,
+                pairID: groupID,
+                groupSize: 5,
+                workspace: fixture.workspace,
+                name: lane.rawValue
+            )
+        }
+        let urls = try await service.saveOraclePairSessions(members, for: fixture.workspace)
+        try FileManager.default.removeItem(at: XCTUnwrap(urls[members[4].id]))
+
+        do {
+            _ = try await service.oraclePairSessionStubs(for: fixture.workspace, pairID: groupID)
+            XCTFail("Expected an incomplete five-member group to fail validation")
+        } catch is ChatDataError {}
+
+        let remaining = try await service.oraclePairSessionStubs(
+            for: fixture.workspace,
+            pairID: groupID,
+            requireCompleteGroup: false
+        )
+        XCTAssertEqual(remaining.count, 4)
+        XCTAssertTrue(remaining.allSatisfy { $0.oracleGroupSize == 5 })
+
+        try await service.deleteOraclePairSessionFiles([members[0].id], for: fixture.workspace)
+        XCTAssertTrue(urls.values.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
     func testConcurrentPairAndLegacySavesQueueWithoutLosingHistory() async throws {
         let fixture = try makeTemporaryWorkspace(named: "Concurrent Saves")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let service = ChatDataService()
+        let lanes = try OracleLane.orderedPrefix(count: 5)
         let pairs = (0 ..< 8).map { index in
             let pairID = UUID()
-            return OracleLane.allCases.map {
-                pairSession($0, pairID: pairID, workspace: fixture.workspace, name: "Pair \(index) \($0.rawValue)")
+            return lanes.map {
+                pairSession(
+                    $0,
+                    pairID: pairID,
+                    groupSize: lanes.count,
+                    workspace: fixture.workspace,
+                    name: "Pair \(index) \($0.rawValue)"
+                )
             }
         }
         let singles = (0 ..< 8).map {
@@ -232,7 +374,7 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertEqual(fileCount, 51)
     }
 
-    func testRetentionKeepsPairsWholeAndHandlesCorruptFiles() async throws {
+    func testRetentionAndGroupDeletionFailClosedForUnreadableChatFiles() async throws {
         let previousLimit = UserDefaults.standard.object(forKey: "chatHistoryLimit")
         UserDefaults.standard.set(ChatHistoryLimit.fifty.rawValue, forKey: "chatHistoryLimit")
         defer {
@@ -249,8 +391,9 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         try FileManager.default.createDirectory(at: chatsFolder, withIntermediateDirectories: false)
         let now = Date()
         let pairID = UUID()
-        let pair = OracleLane.allCases.map {
-            pairSession($0, pairID: pairID, workspace: fixture.workspace, name: $0.rawValue)
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let pair = lanes.map {
+            pairSession($0, pairID: pairID, groupSize: lanes.count, workspace: fixture.workspace, name: $0.rawValue)
         }
         let sessions = pair + (0 ..< 49).map {
             ChatSession(workspaceID: fixture.workspace.id, name: "Single \($0)")
@@ -273,11 +416,21 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
 
         let service = ChatDataService()
         let retained = try await service.listChatSessions(for: fixture.workspace)
-        XCTAssertEqual(retained.count, 50)
+        XCTAssertEqual(retained.count, sessions.count + 1)
         XCTAssertTrue(pair.allSatisfy { session in
             retained.contains { $0.lastPathComponent == "ChatSession-\(session.id.uuidString).json" }
         })
-        XCTAssertFalse(FileManager.default.fileExists(atPath: corruptURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corruptURL.path))
+
+        do {
+            try await service.deleteOraclePairSessionFiles([pair[0].id], for: fixture.workspace)
+            XCTFail("Expected grouped deletion to fail closed while a chat file is unreadable")
+        } catch is ChatDataError {}
+        XCTAssertTrue(pair.allSatisfy { session in
+            FileManager.default.fileExists(
+                atPath: chatsFolder.appendingPathComponent("ChatSession-\(session.id.uuidString).json").path
+            )
+        })
 
         try Data("still corrupt".utf8).write(to: corruptURL)
         let protected = try await service.listChatSessions(
@@ -307,8 +460,9 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
             ChatSession(workspaceID: fixture.workspace.id, name: "Newer \($0)")
         }
         let pairID = UUID()
-        let pair = OracleLane.allCases.map {
-            pairSession($0, pairID: pairID, workspace: fixture.workspace, name: $0.rawValue)
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let pair = lanes.map {
+            pairSession($0, pairID: pairID, groupSize: lanes.count, workspace: fixture.workspace, name: $0.rawValue)
         }
         let olderSingle = ChatSession(workspaceID: fixture.workspace.id, name: "Older unprotected")
         let protectedOldest = ChatSession(workspaceID: fixture.workspace.id, name: "Oldest protected")
@@ -354,8 +508,9 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let service = ChatDataService()
         let pairID = UUID()
-        let pair = OracleLane.allCases.map {
-            pairSession($0, pairID: pairID, workspace: fixture.workspace, name: $0.rawValue)
+        let lanes = try OracleLane.orderedPrefix(count: 5)
+        let pair = lanes.map {
+            pairSession($0, pairID: pairID, groupSize: lanes.count, workspace: fixture.workspace, name: $0.rawValue)
         }
         let urls = try await service.saveOraclePairSessions(pair, for: fixture.workspace)
         for url in urls.values {
@@ -373,7 +528,7 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
             protectedSessionIDs: [pair[0].id]
         )
 
-        XCTAssertEqual(retained.count, 51)
+        XCTAssertEqual(retained.count, 54)
         let retainedNames = Set(retained.map(\.lastPathComponent))
         XCTAssertTrue(pair.allSatisfy { session in
             guard let url = urls[session.id] else { return false }
@@ -526,6 +681,7 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
     private func pairSession(
         _ lane: OracleLane,
         pairID: UUID,
+        groupSize: Int = 2,
         workspace: WorkspaceModel,
         name: String
     ) -> ChatSession {
@@ -533,6 +689,7 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
             workspaceID: workspace.id,
             oraclePairID: pairID,
             oracleLane: lane,
+            oracleGroupSize: groupSize,
             name: name
         )
     }

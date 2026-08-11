@@ -330,7 +330,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Monotonic owner for runtime callbacks and completion publication.
         var backgroundPlanGeneration: UInt64 = 0
 
-        /// The two live Oracle lanes used by follow-up streaming.
+        /// Live Oracle lanes used by follow-up streaming. The first two fields
+        /// remain as compatibility projections for existing state/tests.
+        var followUpOracleSessionIDsByLane: [OracleLane: UUID] = [:]
         var followUpPrimarySessionID: UUID?
         var followUpSecondarySessionID: UUID?
 
@@ -416,6 +418,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpPlanningModelRaw = nil
             supersededFollowUpDrain = nil
             backgroundPlanGeneration = 0
+            followUpOracleSessionIDsByLane = [:]
             followUpPrimarySessionID = nil
             followUpSecondarySessionID = nil
             pendingAskUser = nil
@@ -4244,11 +4247,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     @MainActor
     private func takeFollowUpOracleSessionIDs(from session: TabSession) -> [UUID] {
-        let ids = [session.followUpPrimarySessionID, session.followUpSecondarySessionID]
-            .compactMap(\.self)
-            .reduce(into: [UUID]()) { result, id in
+        let candidateIDs = session.followUpOracleSessionIDsByLane
+            .sorted { $0.key.ordinal < $1.key.ordinal }
+            .map(\.value) +
+            [session.followUpPrimarySessionID, session.followUpSecondarySessionID].compactMap(\.self)
+        let ids = candidateIDs.reduce(into: [UUID]()) { result, id in
                 if !result.contains(id) { result.append(id) }
             }
+        session.followUpOracleSessionIDsByLane = [:]
         session.followUpPrimarySessionID = nil
         session.followUpSecondarySessionID = nil
         return ids
@@ -4373,16 +4379,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     @MainActor
     private func publishFollowUpOracleSessions(
-        primary: UUID,
-        secondary: UUID?,
+        sessionIDsByLane: [OracleLane: UUID],
         workspaceID: UUID,
         oracleViewModel: OracleViewModel,
         session: TabSession,
         generation: UInt64
     ) throws {
-        guard session.backgroundPlanGeneration == generation else { throw CancellationError() }
+        guard session.backgroundPlanGeneration == generation,
+              let primary = sessionIDsByLane[.primary]
+        else { throw CancellationError() }
+        session.followUpOracleSessionIDsByLane = sessionIDsByLane
         session.followUpPrimarySessionID = primary
-        session.followUpSecondarySessionID = secondary
+        session.followUpSecondarySessionID = sessionIDsByLane[.secondary]
         let primaryChatID = oracleViewModel.sessions.first(where: { $0.id == primary })?.shortID
             ?? primary.uuidString
         session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
@@ -4424,6 +4432,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.backgroundPlanResponseText = reply.response
         session.backgroundPlanError = nil
         session.isBackgroundPlanGenerating = false
+        session.followUpOracleSessionIDsByLane = [:]
         session.followUpPrimarySessionID = nil
         session.followUpSecondarySessionID = nil
         clearPendingBackgroundPlanUIRefresh(for: session.tabID)
@@ -4666,7 +4675,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     // MARK: - MCP Plan/Question Generation
 
-    /// Streams ordinary follow-ups through the single-or-paired Oracle runtime without activating chat UI.
+    /// Streams ordinary follow-ups through the single-or-grouped Oracle runtime without activating chat UI.
     @MainActor
     private func runFollowUpOracleStream(
         for tabID: UUID,
@@ -4681,6 +4690,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         agentModeRunID: UUID? = nil,
         chatName: String,
         primaryModelSelection: OracleViewModel.ModelSelectionResult,
+        additionalModelOverrides: [AIModel]? = nil,
         secondaryModelOverride: AIModel? = nil,
         prebuiltAIMessage: AIMessage? = nil,
         continuationChatID: String? = nil,
@@ -4706,7 +4716,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
         }
 
-        var isPaired = false
+        var isGrouped = false
         var terminalLanes: Set<OracleLane> = []
         var laneActivityTail: Task<Void, Never>?
         let reportStreamingPhases: @MainActor @Sendable () async -> Void = {
@@ -4719,8 +4729,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             OracleLane,
             OracleMessageLifecycleActivityEvent
         ) -> Void = { lane, event in
-            guard isPaired else { return }
-            let label = lane == .primary ? "Primary Oracle" : "Secondary Oracle"
+            guard isGrouped else { return }
+            let label = lane == .primary ? "Primary Oracle" : "Oracle \(lane.ordinal)"
             let phase: ContextBuilderMCPProgressPhase
             let message: String
             switch event.kind {
@@ -4753,6 +4763,22 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 await activityReporter?(.report(phase: phase, message: message))
             }
         }
+        let publishGroupSessions: @MainActor @Sendable ([OracleLane: UUID]) async throws -> Void = { [weak self] sessionIDsByLane in
+            guard let self, let session = sessions[tabID] else { throw CancellationError() }
+            isGrouped = true
+            for sessionID in sessionIDsByLane.values {
+                pin(sessionID)
+            }
+            try publishFollowUpOracleSessions(
+                sessionIDsByLane: sessionIDsByLane,
+                workspaceID: workspaceID,
+                oracleViewModel: oracleViewModel,
+                session: session,
+                generation: generation
+            )
+            await activityReporter?(.suppressHeartbeat(phase: .streaming))
+            await reportStreamingPhases()
+        }
         let callbacks = OracleViewModel.OracleSendLiveCallbacks(
             modelsResolved: { [weak self] primary, secondary in
                 guard let self,
@@ -4766,28 +4792,26 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 }
                 updateRuntimeBindings(from: session)
             },
-            pairSessionsResolved: { [weak self] primary, secondary in
-                guard let self, let session = sessions[tabID] else { throw CancellationError() }
-                isPaired = true
-                pin(primary)
-                pin(secondary)
-                try publishFollowUpOracleSessions(
-                    primary: primary,
-                    secondary: secondary,
-                    workspaceID: workspaceID,
-                    oracleViewModel: oracleViewModel,
-                    session: session,
-                    generation: generation
-                )
-                await activityReporter?(.suppressHeartbeat(phase: .streaming))
-                await reportStreamingPhases()
+            groupModelsResolved: { [weak self] modelsByLane in
+                guard let self,
+                      let session = sessions[tabID],
+                      session.backgroundPlanGeneration == generation
+                else { return }
+                session.mcpPlanModel = modelsByLane
+                    .sorted { $0.key.ordinal < $1.key.ordinal }
+                    .map { $0.value.displayName }
+                    .joined(separator: " + ")
+                updateRuntimeBindings(from: session)
             },
+            pairSessionsResolved: { primary, secondary in
+                try await publishGroupSessions([.primary: primary, .secondary: secondary])
+            },
+            groupSessionsResolved: publishGroupSessions,
             primarySessionResolved: { [weak self] primary in
                 guard let self, let session = sessions[tabID] else { throw CancellationError() }
                 pin(primary)
                 try publishFollowUpOracleSessions(
-                    primary: primary,
-                    secondary: nil,
+                    sessionIDsByLane: [.primary: primary],
                     workspaceID: workspaceID,
                     oracleViewModel: oracleViewModel,
                     session: session,
@@ -4852,6 +4876,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 promptVM: promptManager,
                 tabContext: tabContext,
                 primaryModelSelection: primaryModelSelection,
+                additionalModelOverrides: additionalModelOverrides,
                 secondaryModelOverride: secondaryModelOverride,
                 liveCallbacks: callbacks
             )
@@ -4881,7 +4906,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
             await laneActivityTail?.value
             await progressReporter?(.messageFinalization)
-            if !isPaired {
+            if !isGrouped {
                 await activityReporter?(.report(
                     phase: .messageFinalization,
                     message: "Oracle message finalization completed"
@@ -5049,11 +5074,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let requiresHeadlessPackaging = finalReviewAuthorization != nil || gitScopeOverride != nil
         let targetsInactiveWorkspace = workspaceManager?.activeWorkspaceID != identity.workspaceID
         if requiresHeadlessPackaging || targetsInactiveWorkspace {
-            let secondaryModel = try oracleViewModel.resolveOracleSecondaryModel(workspaceID: identity.workspaceID)
+            let additionalModels = try oracleViewModel.resolveAdditionalOracleModels(workspaceID: identity.workspaceID)
             try Task.checkCancellation()
             guard state.backgroundPlanGeneration == generation else { throw CancellationError() }
 
-            if let secondaryModel {
+            if !additionalModels.isEmpty {
                 let aiMessage: AIMessage? = if requiresHeadlessPackaging {
                     try await promptManager.buildHeadlessAIMessage(
                         from: HeadlessContextSnapshot(
@@ -5087,7 +5112,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     agentModeRunID: agentModeRunID,
                     chatName: chatNameForTab(identity.tabID),
                     primaryModelSelection: modelSelection,
-                    secondaryModelOverride: secondaryModel,
+                    additionalModelOverrides: additionalModels,
                     prebuiltAIMessage: aiMessage,
                     continuationChatID: nil,
                     progressReporter: progressReporter,

@@ -481,10 +481,14 @@ class GlobalSettingsStore: ObservableObject {
     // MARK: - Scoped Agent Models Settings
 
     func globalAgentModelsProfile() -> AgentModelsSettingsProfile {
-        AgentModelsSettingsProfile(
-            planningModelRaw: scalarPreferences.modelSelection?.planningModel,
-            secondaryOracleModelRaw: scalarPreferences.modelSelection?.secondaryOracleModel,
-            preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
+        let modelSelection = scalarPreferences.modelSelection
+        return AgentModelsSettingsProfile(
+            planningModelRaw: modelSelection?.planningModel,
+            additionalOracleModelRaws: Self.normalizedAdditionalOracleModelRaws(
+                modelSelection?.additionalOracleModels,
+                legacySecondary: modelSelection?.secondaryOracleModel
+            ),
+            preferredComposeModelRaw: modelSelection?.preferredComposeModel,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
             contextBuilderModelsByAgent: globalDefaults.discoverModelsByAgent,
@@ -501,6 +505,9 @@ class GlobalSettingsStore: ObservableObject {
         let normalized = normalizedAgentModelsProfile(profile)
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         modelSelection.planningModel = normalized.planningModelRaw
+        modelSelection.additionalOracleModels = normalized.additionalOracleModelRaws.isEmpty
+            ? nil
+            : normalized.additionalOracleModelRaws
         modelSelection.secondaryOracleModel = normalized.secondaryOracleModelRaw
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
@@ -628,13 +635,16 @@ class GlobalSettingsStore: ObservableObject {
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         let planning = normalized(modelSelection.planningModel)
         let secondaryOracle = normalized(modelSelection.secondaryOracleModel)
+        let additionalOracles = modelSelection.additionalOracleModels?.compactMap(normalized)
         let compose = normalized(modelSelection.preferredComposeModel)
         if planning != modelSelection.planningModel ||
             secondaryOracle != modelSelection.secondaryOracleModel ||
+            additionalOracles != modelSelection.additionalOracleModels ||
             compose != modelSelection.preferredComposeModel
         {
             modelSelection.planningModel = planning
             modelSelection.secondaryOracleModel = secondaryOracle
+            modelSelection.additionalOracleModels = additionalOracles?.isEmpty == true ? nil : additionalOracles
             modelSelection.preferredComposeModel = compose
             scalarPreferences.modelSelection = modelSelection
             globalChanged = true
@@ -657,7 +667,7 @@ class GlobalSettingsStore: ObservableObject {
             guard var settings = agentModelsSettingsByWorkspaceID[workspaceID], var profile = settings.profile else { continue }
             let old = profile
             profile.planningModelRaw = normalized(profile.planningModelRaw)
-            profile.secondaryOracleModelRaw = normalized(profile.secondaryOracleModelRaw)
+            profile.additionalOracleModelRaws = profile.additionalOracleModelRaws.compactMap(normalized)
             profile.preferredComposeModelRaw = normalized(profile.preferredComposeModelRaw)
             if let models = profile.contextBuilderModelsByAgent {
                 profile.contextBuilderModelsByAgent = models.mapValues { AIModel.rawValueWithoutOpenAIServiceTier($0) }
@@ -1031,7 +1041,41 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     func secondaryOracleModelRaw() -> String? {
-        scalarPreferences.modelSelection?.secondaryOracleModel
+        globalAgentModelsProfile().secondaryOracleModelRaw
+    }
+
+    func additionalOracleModelRaws() -> [String] {
+        globalAgentModelsProfile().additionalOracleModelRaws
+    }
+
+    func setAdditionalOracleModelRaws(
+        _ raws: [String],
+        commit: Bool = true,
+        reason: String? = nil,
+        fileID: StaticString = #fileID,
+        line: UInt = #line,
+        function: StaticString = #function
+    ) {
+        let oldAgentModelsProfile = globalAgentModelsProfile()
+        let oldValue = oldAgentModelsProfile.additionalOracleModelRaws
+        let normalized = Self.normalizedAdditionalOracleModelRaws(raws, legacySecondary: nil)
+        updateModelSelectionScalar(commit: commit) { settings in
+            settings.additionalOracleModels = normalized.isEmpty ? nil : normalized
+            settings.secondaryOracleModel = normalized.first
+        }
+        recordSettingsWriteDiagnostic(
+            key: "additionalOracleModelRaws",
+            oldValue: oldValue.joined(separator: ","),
+            newValue: normalized.joined(separator: ","),
+            commit: commit,
+            reason: reason,
+            fileID: fileID,
+            line: line,
+            function: function
+        )
+        if globalAgentModelsProfile() != oldAgentModelsProfile {
+            postAgentModelsSettingsDidChange(scope: .global)
+        }
     }
 
     func setSecondaryOracleModelRaw(
@@ -1043,9 +1087,27 @@ class GlobalSettingsStore: ObservableObject {
         function: StaticString = #function
     ) {
         let oldAgentModelsProfile = globalAgentModelsProfile()
-        let oldValue = scalarPreferences.modelSelection?.secondaryOracleModel
+        let oldValue = oldAgentModelsProfile.secondaryOracleModelRaw
         updateModelSelectionScalar(commit: commit) { settings in
-            settings.secondaryOracleModel = Self.trimmedNonEmptyModelRaw(raw)
+            guard settings.additionalOracleModels != nil else {
+                settings.secondaryOracleModel = Self.trimmedNonEmptyModelRaw(raw)
+                return
+            }
+            var additionalOracles = Self.normalizedAdditionalOracleModelRaws(
+                settings.additionalOracleModels,
+                legacySecondary: settings.secondaryOracleModel
+            )
+            if let normalizedRaw = Self.trimmedNonEmptyModelRaw(raw) {
+                if additionalOracles.isEmpty {
+                    additionalOracles.append(normalizedRaw)
+                } else {
+                    additionalOracles[0] = normalizedRaw
+                }
+            } else if !additionalOracles.isEmpty {
+                additionalOracles.removeFirst()
+            }
+            settings.additionalOracleModels = additionalOracles.isEmpty ? nil : additionalOracles
+            settings.secondaryOracleModel = additionalOracles.first
         }
         recordSettingsWriteDiagnostic(
             key: "secondaryOracleModelRaw",
@@ -2147,7 +2209,7 @@ class GlobalSettingsStore: ObservableObject {
     private func normalizedAgentModelsProfile(_ profile: AgentModelsSettingsProfile) -> AgentModelsSettingsProfile {
         var normalized = AgentModelsSettingsProfile(
             planningModelRaw: profile.planningModelRaw,
-            secondaryOracleModelRaw: profile.secondaryOracleModelRaw,
+            additionalOracleModelRaws: profile.additionalOracleModelRaws,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
@@ -2210,6 +2272,7 @@ class GlobalSettingsStore: ObservableObject {
         return [
             "planning=\(profile.planningModelRaw ?? "nil")",
             "secondaryOracle=\(profile.secondaryOracleModelRaw ?? "nil")",
+            "additionalOracles=\(profile.additionalOracleModelRaws.joined(separator: ","))",
             "compose=\(profile.preferredComposeModelRaw ?? "nil")",
             "sync=\(profile.syncChatModelWithOracle)",
             "contextBuilder=\(profile.contextBuilderAgentRaw ?? "nil"):\(contextBuilderModelRaw ?? "nil")",
@@ -2543,6 +2606,17 @@ class GlobalSettingsStore: ObservableObject {
             return nil
         }
         return trimmed
+    }
+
+    private static func normalizedAdditionalOracleModelRaws(
+        _ raws: [String]?,
+        legacySecondary: String?
+    ) -> [String] {
+        let source = raws ?? legacySecondary.map { [$0] } ?? []
+        return Array(
+            source.compactMap(trimmedNonEmptyModelRaw)
+                .prefix(AgentModelsSettingsProfile.maximumAdditionalOracleModels)
+        )
     }
 
     private func syncSiblingReason(from reason: String?) -> String? {

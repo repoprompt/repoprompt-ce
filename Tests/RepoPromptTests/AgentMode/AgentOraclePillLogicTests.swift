@@ -44,6 +44,28 @@ final class AgentOraclePillLogicTests: XCTestCase {
         )
     }
 
+    func testPresentationsScaleToFiveConfiguredOraclesInStableOrder() {
+        let model = AIModel.claude4Sonnet.rawValue
+        XCTAssertEqual(
+            AgentOraclePillLogic.presentations(
+                additionalModelRaws: Array(repeating: model, count: 4)
+            ),
+            OracleLane.allCases.map { .pairedLane($0) }
+        )
+        XCTAssertEqual(AgentOraclePillPresentation.pairedLane(.primary).label, "Primary Oracle")
+        XCTAssertEqual(AgentOraclePillPresentation.pairedLane(.oracle5).label, "Oracle 5")
+    }
+
+    func testHistoricalGroupLanesRemainVisibleAfterConfigurationRemoval() {
+        XCTAssertEqual(
+            AgentOraclePillLogic.presentations(
+                additionalModelRaws: [],
+                groupSessionLanes: Set(OracleLane.allCases)
+            ),
+            OracleLane.allCases.map { .pairedLane($0) }
+        )
+    }
+
     func testLaneResolutionPreservesLegacyPrimaryAndRejectsMalformedMetadata() {
         XCTAssertEqual(AgentOraclePillLogic.resolvedLane(for: makeSession()), .primary)
         XCTAssertEqual(AgentOraclePillLogic.resolvedLane(for: makeSession(pairID: UUID(), lane: .primary)), .primary)

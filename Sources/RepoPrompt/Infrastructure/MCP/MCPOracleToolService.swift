@@ -61,7 +61,9 @@ struct MCPOracleToolService {
 
     static func structuredOracleSendMCPError(_ error: ChatToolError) -> MCPError? {
         // MCPError.serverError has no structured data field, so this boundary uses one exact versioned envelope.
-        guard let payload = error.details?["oracle_pair_payload"] else { return nil }
+        guard let payload = error.details?["oracle_group_payload"] ?? error.details?["oracle_pair_payload"] else {
+            return nil
+        }
         return .serverError(
             code: -32000,
             message: "\(error.message)\n\(OraclePairFailureTransportEnvelope.encode(payload: payload))"
@@ -79,7 +81,15 @@ struct MCPOracleToolService {
                 ?? value["error"]?.stringValue.map { "Failed: \($0)" }
                 ?? "(No response)"
         }
-        return "# Primary Oracle\n\n\(text(for: "primary"))\n\n# Secondary Oracle\n\n\(text(for: "secondary"))"
+        let requestedOrder = result["oracle_result_order"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let orderedKeys = requestedOrder.isEmpty
+            ? OracleLane.allCases.map(\.rawValue).filter { lanes[$0] != nil }
+            : requestedOrder.filter { lanes[$0] != nil }
+        guard !orderedKeys.isEmpty else { return result["response"]?.stringValue }
+        return orderedKeys.map { key in
+            let label = OracleLane(rawValue: key)?.displayLabel ?? key
+            return "# \(label)\n\n\(text(for: key))"
+        }.joined(separator: "\n\n")
     }
 
     private func performOracleSend(

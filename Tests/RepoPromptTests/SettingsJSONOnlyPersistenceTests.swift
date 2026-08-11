@@ -596,7 +596,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
 
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 5)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 6)
         XCTAssertTrue(store.worktreeVisualIdentitiesByRepositoryID().isEmpty)
     }
 
@@ -1211,10 +1211,11 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertEqual(GlobalSettingsDocument.workspaceAgentModelsSchemaVersion, 4)
         XCTAssertEqual(GlobalSettingsDocument.secondaryOracleSchemaVersion, 5)
+        XCTAssertEqual(GlobalSettingsDocument.additionalOraclesSchemaVersion, 6)
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
         XCTAssertEqual(
             secondaryOracleDocument.requiredSchemaVersion,
-            GlobalSettingsDocument.secondaryOracleSchemaVersion
+            GlobalSettingsDocument.additionalOraclesSchemaVersion
         )
     }
 
@@ -1835,7 +1836,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         store.setGlobalAgentModelsProfile(
             AgentModelsSettingsProfile(
                 planningModelRaw: AIModel.gpt54Pro.rawValue,
-                secondaryOracleModelRaw: AIModel.claude4Sonnet.rawValue
+                additionalOracleModelRaws: [
+                    AIModel.claude4Sonnet.rawValue,
+                    AIModel.gpt54Pro.rawValue
+                ]
             ),
             contextBuilderWriteIntent: .preserveExistingOwnership
         )
@@ -1855,6 +1859,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         )
         XCTAssertEqual(prompt.planningModelName, AIModel.gpt54Pro.rawValue)
         XCTAssertEqual(prompt.secondaryOracleModelRaw, AIModel.claude4Sonnet.rawValue)
+        XCTAssertEqual(
+            prompt.additionalOracleModelRaws,
+            [AIModel.claude4Sonnet.rawValue, AIModel.gpt54Pro.rawValue]
+        )
     }
 
     func testAgentModelsViewModelDoesNotFallbackUnsyncedBuiltinChatToOracle() async throws {
@@ -2799,6 +2807,246 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(notifications.contains { $0.scope == "global" && $0.workspaceID == nil })
         XCTAssertTrue(notifications.contains { $0.workspaceID == changedWorkspaceID })
         XCTAssertTrue(notifications.contains { $0.workspaceID == removedWorkspaceID })
+    }
+
+    func testAdditionalOracleProfileDecodesLegacySecondaryAndPrefersOrderedCollection() throws {
+        let primaryAdditional = AIModel.gpt54Pro.rawValue
+        let secondAdditional = AIModel.claude4Sonnet.rawValue
+        let legacyJSON = #"{"secondaryOracleModelRaw":"\#(primaryAdditional)"}"#
+        let legacy = try JSONDecoder().decode(
+            AgentModelsSettingsProfile.self,
+            from: Data(legacyJSON.utf8)
+        )
+
+        XCTAssertEqual(legacy.additionalOracleModelRaws, [primaryAdditional])
+        XCTAssertEqual(legacy.secondaryOracleModelRaw, primaryAdditional)
+
+        let mixedJSON = #"""
+        {
+          "secondaryOracleModelRaw": "legacy",
+          "additionalOracleModelRaws": ["\#(primaryAdditional)", "\#(secondAdditional)", "\#(primaryAdditional)"]
+        }
+        """#
+        let mixed = try JSONDecoder().decode(
+            AgentModelsSettingsProfile.self,
+            from: Data(mixedJSON.utf8)
+        )
+        XCTAssertEqual(
+            mixed.additionalOracleModelRaws,
+            [primaryAdditional, secondAdditional, primaryAdditional],
+            "The ordered collection is authoritative when both new and legacy fields are present"
+        )
+        XCTAssertEqual(mixed.secondaryOracleModelRaw, primaryAdditional)
+
+        let reencoded = try JSONEncoder().encode(mixed)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: reencoded) as? [String: Any])
+        XCTAssertEqual(object["secondaryOracleModelRaw"] as? String, primaryAdditional)
+        XCTAssertEqual(
+            object["additionalOracleModelRaws"] as? [String],
+            [primaryAdditional, secondAdditional, primaryAdditional]
+        )
+    }
+
+    func testAdditionalOracleProfilesPersistOrderedDuplicatesForGlobalAndWorkspaceScopes() throws {
+        let workspaceID = UUID()
+        let globalAdditional = [
+            AIModel.gpt54Pro.rawValue,
+            AIModel.gpt54Pro.rawValue,
+            AIModel.claude4Sonnet.rawValue,
+            AIModel.gpt54Pro.rawValue
+        ]
+        let workspaceAdditional = [
+            AIModel.claude4Sonnet.rawValue,
+            AIModel.gpt54Pro.rawValue
+        ]
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                additionalOracleModelRaws: globalAdditional
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.claude4Sonnet.rawValue,
+                additionalOracleModelRaws: workspaceAdditional
+            )
+        )
+
+        XCTAssertEqual(store.globalAgentModelsProfile().additionalOracleModelRaws, globalAdditional)
+        XCTAssertEqual(store.secondaryOracleModelRaw(), globalAdditional.first)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.additionalOracleModelRaws,
+            workspaceAdditional
+        )
+        XCTAssertEqual(
+            fileStore.document.scalarPreferences?.modelSelection?.additionalOracleModels,
+            globalAdditional
+        )
+        XCTAssertEqual(
+            fileStore.document.scalarPreferences?.modelSelection?.secondaryOracleModel,
+            globalAdditional.first
+        )
+        XCTAssertEqual(fileStore.document.schemaVersion, GlobalSettingsDocument.additionalOraclesSchemaVersion)
+
+        fileStore.document = try JSONDecoder().decode(
+            GlobalSettingsDocument.self,
+            from: JSONEncoder().encode(fileStore.document)
+        )
+        let reloaded = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        XCTAssertEqual(reloaded.globalAgentModelsProfile().additionalOracleModelRaws, globalAdditional)
+        XCTAssertEqual(
+            reloaded.workspaceAgentModelsProfile(for: workspaceID)?.additionalOracleModelRaws,
+            workspaceAdditional
+        )
+    }
+
+    func testLegacyGlobalSecondaryProjectsIntoFirstAdditionalOracle() throws {
+        let legacySecondary = AIModel.claude4Sonnet.rawValue
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(secondaryOracleModel: legacySecondary)
+            )
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+        XCTAssertEqual(store.globalAgentModelsProfile().additionalOracleModelRaws, [legacySecondary])
+        XCTAssertEqual(store.secondaryOracleModelRaw(), legacySecondary)
+        XCTAssertNil(fileStore.document.scalarPreferences?.modelSelection?.additionalOracleModels)
+
+        let replacement = AIModel.gpt54Pro.rawValue
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: replacement,
+                additionalOracleModelRaws: [legacySecondary, replacement]
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setSecondaryOracleModelRaw(replacement)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().additionalOracleModelRaws,
+            [replacement, replacement]
+        )
+
+        store.setSecondaryOracleModelRaw(nil)
+        XCTAssertEqual(store.globalAgentModelsProfile().additionalOracleModelRaws, [replacement])
+        XCTAssertEqual(
+            fileStore.document.scalarPreferences?.modelSelection?.additionalOracleModels,
+            [replacement]
+        )
+        XCTAssertEqual(
+            fileStore.document.scalarPreferences?.modelSelection?.secondaryOracleModel,
+            replacement
+        )
+    }
+
+    func testAgentModelsViewModelAddsAtMostFourAdditionalOraclesAndRemovesInOrder() throws {
+        let primary = AIModel.gpt54Pro.rawValue
+        let replacement = AIModel.claude4Sonnet.rawValue
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(planningModelRaw: primary),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: WindowSettingsManager(windowID: -610, store: store),
+            settingsStore: store
+        )
+
+        XCTAssertEqual(viewModel.totalOracleCount, 1)
+        XCTAssertTrue(viewModel.canAddAdditionalOracle)
+        for _ in 0 ..< OraclePairModelSelectionPolicy.maximumAdditionalOracleCount {
+            viewModel.addAdditionalOracle()
+        }
+        viewModel.addAdditionalOracle()
+
+        XCTAssertEqual(viewModel.totalOracleCount, OraclePairModelSelectionPolicy.maximumOracleCount)
+        XCTAssertEqual(viewModel.additionalOracleModelRaws, Array(repeating: primary, count: 4))
+        XCTAssertFalse(viewModel.canAddAdditionalOracle)
+
+        viewModel.additionalOracleModelDestination(at: 2).apply(replacement)
+        XCTAssertEqual(viewModel.additionalOracleModelRaws, [primary, primary, replacement, primary])
+
+        viewModel.removeAdditionalOracle(at: 1)
+        XCTAssertEqual(viewModel.additionalOracleModelRaws, [primary, replacement, primary])
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().additionalOracleModelRaws,
+            [primary, replacement, primary]
+        )
+        XCTAssertTrue(viewModel.canAddAdditionalOracle)
+
+        viewModel.secondaryOracleModelDestination.apply("")
+        XCTAssertEqual(viewModel.additionalOracleModelRaws, [replacement, primary])
+        XCTAssertEqual(store.secondaryOracleModelRaw(), replacement)
+    }
+
+    func testAgentModelsViewModelAdditionalOracleEditsRespectWorkspaceScope() throws {
+        let workspaceID = UUID()
+        let globalPrimary = AIModel.gpt54Pro.rawValue
+        let workspacePrimary = AIModel.claude4Sonnet.rawValue
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(planningModelRaw: globalPrimary),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(planningModelRaw: workspacePrimary)
+        )
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            workspaceID: workspaceID,
+            workspaceName: "Additional Oracle scope",
+            settingsManager: WindowSettingsManager(windowID: -611, store: store),
+            settingsStore: store
+        )
+
+        viewModel.addAdditionalOracle()
+
+        XCTAssertTrue(store.globalAgentModelsProfile().additionalOracleModelRaws.isEmpty)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.additionalOracleModelRaws,
+            [workspacePrimary]
+        )
+    }
+
+    func testAdditionalOraclePolicyAllowsDuplicatesAndRejectsMoreThanFourAdditionalModels() throws {
+        let raw = AIModel.gpt54Pro.rawValue
+        XCTAssertEqual(
+            try OraclePairModelSelectionPolicy.canonicalAdditionalRaws([raw, raw]),
+            [raw, raw]
+        )
+        XCTAssertEqual(
+            try OraclePairModelSelectionPolicy.resolveAdditional(raws: [raw, raw]),
+            [.gpt54Pro, .gpt54Pro]
+        )
+        XCTAssertThrowsError(try OraclePairModelSelectionPolicy.canonicalAdditionalRaws(
+            Array(repeating: raw, count: 5)
+        ))
+        XCTAssertEqual(
+            AgentModelsSettingsProfile(
+                additionalOracleModelRaws: Array(repeating: raw, count: 5)
+            ).additionalOracleModelRaws.count,
+            AgentModelsSettingsProfile.maximumAdditionalOracleModels
+        )
     }
 
     private var obsoleteGitignorePreferenceKey: String {

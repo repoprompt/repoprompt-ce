@@ -12,9 +12,9 @@ enum AgentOracleAuthoritativeChatIDPolicy {
     }
 
     static func extract(fromRootObject object: [String: Any]) -> String? {
-        // Dual-Oracle payloads nest per-lane chat_id under oracle_results. Prefer the
+        // Multi-Oracle payloads nest per-lane chat_id under oracle_results. Prefer the
         // authoritative root/primary id and do not fail closed on those nested keys.
-        if object["oracle_pair_id"] != nil || object["oracle_results"] != nil {
+        if object["oracle_group_id"] != nil || object["oracle_pair_id"] != nil || object["oracle_results"] != nil {
             if let primary = (object["primary_chat_id"] as? String) ?? (object["chat_id"] as? String) {
                 let trimmed = primary.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? nil : trimmed
