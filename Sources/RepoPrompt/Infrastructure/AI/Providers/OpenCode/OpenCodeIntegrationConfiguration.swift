@@ -357,6 +357,7 @@ enum OpenCodeIntegrationConfiguration {
             .appendingPathComponent(path, isDirectory: isDirectory)
             .standardizedFileURL
     }
+
     private static func environmentFlagIsTruthy(_ value: String?) -> Bool {
         guard let value = value?.lowercased() else { return false }
         return value == "true" || value == "1"
@@ -536,6 +537,7 @@ enum OpenCodeIntegrationConfiguration {
         let dirURL = configDirectoryURL()
         let configURL = configURL()
         try fm.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
+
         let existingData = try? Data(contentsOf: configURL)
         var root: [String: Any] = [:]
         if let existingData,
