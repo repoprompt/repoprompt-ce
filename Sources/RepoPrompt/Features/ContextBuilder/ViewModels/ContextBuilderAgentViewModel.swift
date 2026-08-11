@@ -4730,7 +4730,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             OracleMessageLifecycleActivityEvent
         ) -> Void = { lane, event in
             guard isGrouped else { return }
-            let label = lane == .primary ? "Primary Oracle" : "Oracle \(lane.ordinal)"
+            let label = lane.displayLabel
             let phase: ContextBuilderMCPProgressPhase
             let message: String
             switch event.kind {

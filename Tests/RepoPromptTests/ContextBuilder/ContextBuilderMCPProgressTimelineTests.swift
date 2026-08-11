@@ -280,10 +280,12 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
     func testRunMCPPlanOrQuestionReportsSingleAndPairedProductionProgressThroughFinalization() async throws {
         #if DEBUG
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-            let previousSecondaryModel = GlobalSettingsStore.shared.secondaryOracleModelRaw()
+            let previousAdditionalModels = GlobalSettingsStore.shared.additionalOracleModelRaws()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            GlobalSettingsStore.shared.setSecondaryOracleModelRaw(nil, commit: false)
-            defer { GlobalSettingsStore.shared.setSecondaryOracleModelRaw(previousSecondaryModel, commit: false) }
+            GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+            defer {
+                GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalModels, commit: false)
+            }
             let composition = WindowStateCompositionFactory.make(
                 windowID: -76,
                 deferredInitialAgentSystemWorkspaceRefresh: true,
@@ -422,7 +424,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 provider: "custom",
                 model: "secondary-test-model"
             )
-            GlobalSettingsStore.shared.setSecondaryOracleModelRaw(secondaryModel.rawValue, commit: false)
+            GlobalSettingsStore.shared.setAdditionalOracleModelRaws([secondaryModel.rawValue], commit: false)
             let pairedActivityRecorder = ContextBuilderActivityMessageRecorder()
             let pairedPhaseRecorder = ContextBuilderProgressPhaseRecorder()
             let pairedHeartbeatSuppressionRecorder = ContextBuilderProgressPhaseRecorder()
