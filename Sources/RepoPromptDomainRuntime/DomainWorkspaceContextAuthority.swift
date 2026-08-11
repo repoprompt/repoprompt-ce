@@ -345,6 +345,14 @@ actor DomainWorkspaceContextAuthority {
                 diagnostic: diagnostic
             )
         }
+        if rejectsEphemeralPersistence(envelope.command) {
+            return recordTransientOutcome(
+                envelope: envelope,
+                disposition: .invalid,
+                errorCode: .invalidDocument,
+                diagnostic: "ephemeral_workspace_not_persistable"
+            )
+        }
         if let workspaceID, unavailableWorkspaces[workspaceID] != nil {
             return recordTransientOutcome(
                 envelope: envelope,
@@ -416,6 +424,18 @@ actor DomainWorkspaceContextAuthority {
             readRegistrations.removeValue(forKey: workspaceID)
         default:
             break
+        }
+    }
+
+    private func rejectsEphemeralPersistence(_ command: DomainWorkspaceCommand) -> Bool {
+        switch command {
+        case let .createWorkspace(document), let .replaceWorkingDocument(document):
+            document.metadata.isEphemeral
+        case let .saveWorkspaceDocument(workspaceID),
+             let .resolveExternalConflict(workspaceID, _, _):
+            records[workspaceID]?.document.metadata.isEphemeral == true
+        case .deleteWorkspace:
+            false
         }
     }
 
@@ -747,6 +767,22 @@ actor DomainWorkspaceContextAuthority {
                     )
                 }
             case let .changed(document, metadata):
+                if document.metadata.isEphemeral || record.document.metadata.isEphemeral {
+                    record.document = document
+                    record.fileMetadata = metadata
+                    records[workspaceID] = record
+                    readRegistrations.removeValue(forKey: workspaceID)
+                    publish(
+                        kind: .externalReloaded,
+                        workspaceID: workspaceID,
+                        contextID: nil,
+                        operationID: nil,
+                        revisions: record.revisions,
+                        diagnostic: "ephemeral_external_reload_not_persisted"
+                    )
+                    changed = true
+                    continue
+                }
                 #if DEBUG
                     if let testBeforeExternalReconciliation {
                         await testBeforeExternalReconciliation(workspaceID)

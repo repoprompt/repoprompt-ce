@@ -4,6 +4,41 @@ import Foundation
 import XCTest
 
 final class DomainWorkspaceContextAuthorityTests: XCTestCase {
+    func testEphemeralDocumentsCannotEnterDurableWorkspaceAuthority() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let document = try fixture.document(prompt: "temporary", ephemeral: true)
+
+        let registered = await runtime.workspaceStore.registerReadDocument(document)
+        XCTAssertTrue(registered.document.metadata.isEphemeral)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+
+        let created = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(document)
+        ))
+        XCTAssertEqual(created.disposition, .invalid)
+        XCTAssertEqual(created.errorCode, .invalidDocument)
+        XCTAssertEqual(created.diagnostic, "ephemeral_workspace_not_persistable")
+
+        let replaced = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .replaceWorkingDocument(document)
+        ))
+        XCTAssertEqual(replaced.disposition, .invalid)
+        XCTAssertEqual(replaced.errorCode, .invalidDocument)
+        XCTAssertEqual(replaced.diagnostic, "ephemeral_workspace_not_persistable")
+        let catalog = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(catalog.workspaces.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+    }
+
     func testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence() async throws {
         let fixture = try Fixture.make(includeWorkspace: false)
         defer { fixture.remove() }
@@ -1807,14 +1842,16 @@ private struct Fixture {
 
     func document(
         prompt: String,
-        name: String = "Fixture"
+        name: String = "Fixture",
+        ephemeral: Bool = false
     ) throws -> DomainWorkspaceDocument {
         try document(
             workspaceID: workspaceID,
             contextID: contextID,
             fileURL: workspaceFile,
             prompt: prompt,
-            name: name
+            name: name,
+            ephemeral: ephemeral
         )
     }
 
@@ -1847,7 +1884,8 @@ private struct Fixture {
         contextID: UUID,
         fileURL: URL,
         prompt: String,
-        name: String = "Fixture"
+        name: String = "Fixture",
+        ephemeral: Bool = false
     ) throws -> DomainWorkspaceDocument {
         let object: [String: Any] = [
             "id": workspaceID.uuidString,
@@ -1856,6 +1894,7 @@ private struct Fixture {
             "repoPaths": ["/tmp/repo"],
             "isSystemWorkspace": false,
             "isHiddenInMenus": false,
+            "ephemeralFlag": ephemeral,
             "activeComposeTabID": contextID.uuidString,
             "composeTabs": [[
                 "id": contextID.uuidString,
