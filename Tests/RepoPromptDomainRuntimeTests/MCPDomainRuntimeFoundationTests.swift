@@ -29,6 +29,111 @@ final class MCPDomainToolCatalogTests: XCTestCase {
         XCTAssertTrue(MCPDomainToolCatalog.capabilities(for: "unknown").isEmpty)
     }
 
+    func testOperationIdentityMirrorsCatalogSelectorsNormalizationAndHandlerDefaults() {
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .missing),
+            MCPDomainToolOperationIdentity(canonicalTool: MCPWindowToolName.manageSelection, normalizedOperation: "get")
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.workspaceContext, input: .missing).normalizedOperation,
+            "snapshot"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.prompt, input: .missing).normalizedOperation,
+            "get"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentRun, input: .missing).normalizedOperation,
+            "wait"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.git, input: .missing).normalizedOperation,
+            "status"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentManage, input: .missing).normalizedOperation,
+            "list_sessions"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.workspaceContext, input: .value("  EXPORT ")).normalizedOperation,
+            "export"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .value("SET")).normalizedOperation,
+            "set"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentManage, input: .value("handoff")).normalizedOperation,
+            "extract_handoff"
+        )
+        XCTAssertEqual(MCPDomainToolCatalog.operationArgumentKey(for: MCPGlobalToolName.manageWorkspaces), "action")
+        XCTAssertEqual(MCPDomainToolCatalog.operationArgumentKey(for: MCPWindowToolName.fileActions), "action")
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.fileActions, input: .value("CREATE")).normalizedOperation,
+            "create"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.fileActions, input: .value("rename")).normalizedOperation,
+            "move"
+        )
+        XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: MCPWindowToolName.readFile))
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.readFile, input: .malformed).normalizedOperation,
+            MCPDomainToolOperationIdentity.callOperation
+        )
+    }
+
+    func testOperationIdentityBoundsUnknownAndMalformedValuesWithoutRetainingInput() {
+        let privateValue = "private/path/session/prompt/" + String(repeating: "x", count: 10000)
+        let unknownOperation = MCPDomainToolCatalog.operationIdentity(
+            for: MCPWindowToolName.manageSelection,
+            input: .value(privateValue)
+        )
+        XCTAssertEqual(unknownOperation.canonicalTool, MCPWindowToolName.manageSelection)
+        XCTAssertEqual(unknownOperation.normalizedOperation, MCPDomainToolOperationIdentity.unknownOperation)
+        XCTAssertFalse(unknownOperation.normalizedOperation.contains("private"))
+
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .malformed).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPGlobalToolName.appSettings, input: .missing).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: "future_private_tool_\(privateValue)", input: .value(privateValue)),
+            .unknown
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.history, input: .value("SEARCH")).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+    }
+
+    func testConfiguredLimitsReportCurrentConnectionAndResourceScopes() throws {
+        let appMutation = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPGlobalToolName.appSettings))
+        XCTAssertEqual(appMutation.connectionLane, MCPDomainToolAdmissionLimits.exclusiveConnection)
+        XCTAssertEqual(appMutation.resourceLease, MCPDomainToolAdmissionLimits.exclusiveConnection)
+        XCTAssertEqual(appMutation.resourceScope, .application)
+
+        let smallRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.readFile))
+        XCTAssertEqual(smallRead.connectionLane, MCPDomainToolAdmissionLimits.smallReadConnection)
+        XCTAssertEqual(smallRead.resourceLease, MCPDomainToolAdmissionLimits.smallReadPerWindow)
+        XCTAssertEqual(smallRead.resourceScope, .window)
+
+        let gitRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.git))
+        XCTAssertEqual(gitRead.connectionLane, MCPDomainToolAdmissionLimits.gitReadConnection)
+        XCTAssertEqual(gitRead.resourceLease, MCPDomainToolAdmissionLimits.gitReadPerRepository)
+        XCTAssertEqual(gitRead.resourceScope, .repository)
+
+        let control = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.agentRun))
+        XCTAssertEqual(control.connectionLane, MCPDomainToolAdmissionLimits.controlConnection)
+        XCTAssertNil(control.resourceLease)
+        XCTAssertNil(control.resourceScope)
+        XCTAssertNil(MCPDomainToolCatalog.configuredLimits(for: "unknown"))
+    }
+
     func testEveryClientProfileHasExplicitPolicyAndPreservesFrozenVisibility() {
         XCTAssertEqual(
             Set(MCPClientToolPolicyCatalog.classifications.keys),

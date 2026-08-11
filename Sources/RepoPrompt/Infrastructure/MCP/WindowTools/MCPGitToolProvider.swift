@@ -451,6 +451,10 @@ final class MCPGitToolProvider {
         guard let op = GitOp(rawValue: opRaw) else {
             throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: status, diff, log, show, blame")
         }
+        let evidenceOperationIdentity = MCPToolAdmissionPolicy.operationIdentity(
+            forCanonicalToolName: MCPWindowToolName.git,
+            arguments: args
+        )
 
         guard let workspaceManager = dependencies.context.workspaceManager else {
             throw MCPError.invalidParams("Workspace manager unavailable for git tool.")
@@ -581,11 +585,13 @@ final class MCPGitToolProvider {
             )
             MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                 classKey: .gitRead,
+                operationIdentity: evidenceOperationIdentity,
                 milliseconds: gitLeaseWaitStart.duration(to: gitLeaseWaitClock.now).mcpMilliseconds
             )
         } catch {
             MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
                 classKey: .gitRead,
+                operationIdentity: evidenceOperationIdentity,
                 reason: .leaseWaitTermination(for: error)
             )
             throw error

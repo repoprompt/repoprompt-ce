@@ -8,11 +8,13 @@ import XCTest
 final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
     private func makeTraceEvent(
         toolName: String,
+        operationIdentity: MCPToolOperationIdentity? = nil,
         phase: MCPToolExecutionTraceEvent.Phase,
         elapsedMilliseconds: Double
     ) -> MCPToolExecutionTraceEvent {
         MCPToolExecutionTraceEvent(
             toolName: toolName,
+            operationIdentity: operationIdentity ?? MCPDomainToolCatalog.operationIdentity(for: toolName, input: .missing),
             connectionID: UUID(),
             invocationID: UUID(),
             runID: nil,
@@ -38,6 +40,16 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         _ classKey: MCPToolConcurrencyEvidenceClass
     ) -> MCPToolConcurrencyEvidenceSnapshot.ClassSnapshot? {
         snapshot.classes.first { $0.classKey == classKey.rawValue }
+    }
+
+    private func operationSnapshot(
+        _ snapshot: MCPToolConcurrencyEvidenceSnapshot,
+        _ identity: MCPToolOperationIdentity
+    ) -> MCPToolConcurrencyEvidenceSnapshot.OperationSnapshot? {
+        snapshot.operations.first {
+            $0.canonicalTool == identity.canonicalTool
+                && $0.normalizedOperation == identity.normalizedOperation
+        }
     }
 
     // MARK: Histogram
@@ -181,11 +193,19 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         recorder.recordCallCompleted(
             classKey: .smallRead,
             canonicalToolName: MCPWindowToolName.readFile,
+            operationIdentity: MCPDomainToolCatalog.operationIdentity(
+                for: MCPWindowToolName.readFile,
+                input: .missing
+            ),
             totalMilliseconds: 42
         )
         recorder.recordCallCompleted(
             classKey: .unclassified,
             canonicalToolName: "some_private_or_future_tool",
+            operationIdentity: MCPDomainToolCatalog.operationIdentity(
+                for: "some_private_or_future_tool",
+                input: .value("private/path/id/prompt")
+            ),
             totalMilliseconds: 9
         )
 
@@ -196,12 +216,141 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
             snapshot.completedCallCountsByTool[MCPToolConcurrencyEvidenceRecorder.unclassifiedToolKey],
             1
         )
+        XCTAssertEqual(snapshot.operations.map(\.canonicalTool).sorted(), [MCPWindowToolName.readFile, "unknown"])
+        XCTAssertFalse(snapshot.operations.description.contains("private/path/id/prompt"))
+        XCTAssertFalse(snapshot.operations.description.contains("some_private_or_future_tool"))
 
         let smallRead = try XCTUnwrap(classSnapshot(snapshot, .smallRead))
         let total = try XCTUnwrap(
             smallRead.stageHistograms[MCPToolConcurrencyEvidenceStage.total.rawValue]
         )
         XCTAssertEqual(total.count, 1)
+    }
+
+    func testOperationAggregationIncludesEveryStageTerminalCountClassAndLimits() throws {
+        let recorder = MCPToolConcurrencyEvidenceRecorder()
+        let identity = MCPDomainToolCatalog.operationIdentity(
+            for: MCPWindowToolName.manageSelection,
+            input: .missing
+        )
+
+        recorder.recordLaneWaitBegan(classKey: .exclusive)
+        recorder.recordLaneAdmitted(
+            classKey: .exclusive,
+            operationIdentity: identity,
+            waitMilliseconds: 4
+        )
+        recorder.recordLeaseWait(
+            classKey: .exclusive,
+            operationIdentity: identity,
+            milliseconds: 7
+        )
+        recorder.recordExecutionTraceEvent(makeTraceEvent(
+            toolName: MCPWindowToolName.manageSelection,
+            operationIdentity: identity,
+            phase: .handlerCompleted,
+            elapsedMilliseconds: 11
+        ))
+        recorder.recordCallCompleted(
+            classKey: .exclusive,
+            canonicalToolName: MCPWindowToolName.manageSelection,
+            operationIdentity: identity,
+            totalMilliseconds: 19
+        )
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(MCPToolConcurrencyEvidenceSnapshot.schemaVersion, 2)
+        let operation = try XCTUnwrap(operationSnapshot(snapshot, identity))
+        XCTAssertEqual(operation.completedCallCount, 1)
+        XCTAssertEqual(operation.admissionClass, MCPToolConcurrencyEvidenceClass.exclusive.rawValue)
+        XCTAssertEqual(operation.connectionLaneLimit, MCPToolAdmissionPolicy.exclusiveConnectionLimit)
+        XCTAssertEqual(operation.resourceLeaseLimit, MCPToolAdmissionPolicy.exclusiveConnectionLimit)
+        XCTAssertEqual(operation.resourceLeaseScope, MCPDomainToolResourceLimitScope.window.rawValue)
+        XCTAssertEqual(operation.stageHistograms[MCPToolConcurrencyEvidenceStage.laneWait.rawValue]?.sumMilliseconds, 4)
+        XCTAssertEqual(operation.stageHistograms[MCPToolConcurrencyEvidenceStage.leaseWait.rawValue]?.sumMilliseconds, 7)
+        XCTAssertEqual(operation.stageHistograms[MCPToolConcurrencyEvidenceStage.execution.rawValue]?.sumMilliseconds, 11)
+        XCTAssertEqual(operation.stageHistograms[MCPToolConcurrencyEvidenceStage.total.rawValue]?.sumMilliseconds, 19)
+        XCTAssertEqual(
+            operation.executionTracePhaseCounts[MCPToolExecutionTraceEvent.Phase.handlerCompleted.rawValue],
+            1
+        )
+    }
+
+    func testOperationTerminalAccountingIsExactlyOnceAcrossBoundedTerminalKinds() throws {
+        let recorder = MCPToolConcurrencyEvidenceRecorder()
+        let cases: [(MCPToolOperationIdentity, MCPToolConcurrencyEvidenceClass, String)] = [
+            (
+                MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .missing),
+                .exclusive,
+                MCPWindowToolName.manageSelection
+            ),
+            (
+                MCPDomainToolCatalog.operationIdentity(for: MCPGlobalToolName.appSettings, input: .missing),
+                .exclusive,
+                MCPGlobalToolName.appSettings
+            ),
+            (
+                MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentRun, input: .value("cancel")),
+                .control,
+                MCPWindowToolName.agentRun
+            ),
+            (
+                MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.git, input: .missing),
+                .gitRead,
+                MCPWindowToolName.git
+            )
+        ]
+
+        recorder.recordRejection(
+            classKey: cases[1].1,
+            operationIdentity: cases[1].0,
+            reason: .unclassifiedTool
+        )
+        recorder.recordRejection(
+            classKey: cases[2].1,
+            operationIdentity: cases[2].0,
+            reason: .laneWaitCancelled
+        )
+        recorder.recordExecutionTraceEvent(makeTraceEvent(
+            toolName: cases[3].2,
+            operationIdentity: cases[3].0,
+            phase: .deadlineExpired,
+            elapsedMilliseconds: 30000
+        ))
+        for (identity, classKey, toolName) in cases {
+            recorder.recordCallCompleted(
+                classKey: classKey,
+                canonicalToolName: toolName,
+                operationIdentity: identity,
+                totalMilliseconds: 1
+            )
+        }
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.operations.count, cases.count)
+        for (identity, _, _) in cases {
+            let operation = try XCTUnwrap(operationSnapshot(snapshot, identity))
+            XCTAssertEqual(operation.completedCallCount, 1)
+            XCTAssertEqual(operation.stageHistograms[MCPToolConcurrencyEvidenceStage.total.rawValue]?.count, 1)
+        }
+        XCTAssertEqual(
+            operationSnapshot(snapshot, cases[1].0)?.rejectionCounts[
+                MCPToolConcurrencyEvidenceRejectionReason.unclassifiedTool.rawValue
+            ],
+            1
+        )
+        XCTAssertEqual(
+            operationSnapshot(snapshot, cases[2].0)?.rejectionCounts[
+                MCPToolConcurrencyEvidenceRejectionReason.laneWaitCancelled.rawValue
+            ],
+            1
+        )
+        XCTAssertEqual(
+            operationSnapshot(snapshot, cases[3].0)?.executionTracePhaseCounts[
+                MCPToolExecutionTraceEvent.Phase.deadlineExpired.rawValue
+            ],
+            1
+        )
     }
 
     // MARK: Execution trace ingestion
@@ -296,25 +445,33 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         let cleared = recorder.snapshot()
         XCTAssertTrue(cleared.classes.isEmpty)
         XCTAssertTrue(cleared.completedCallCountsByTool.isEmpty)
+        XCTAssertTrue(cleared.operations.isEmpty)
     }
 
     func testSnapshotAndResetIsAtomicallyEquivalentToSnapshotThenReset() throws {
         let recorder = MCPToolConcurrencyEvidenceRecorder()
         recorder.recordLaneWaitBegan(classKey: .smallRead)
         recorder.recordLaneAdmitted(classKey: .smallRead, waitMilliseconds: 3)
+        let identity = MCPDomainToolCatalog.operationIdentity(
+            for: MCPWindowToolName.readFile,
+            input: .missing
+        )
         recorder.recordCallCompleted(
             classKey: .smallRead,
             canonicalToolName: MCPWindowToolName.readFile,
+            operationIdentity: identity,
             totalMilliseconds: 20
         )
 
         let expected = recorder.snapshot()
         let drained = recorder.snapshotAndReset()
         XCTAssertEqual(drained, expected)
+        XCTAssertEqual(operationSnapshot(drained, identity)?.completedCallCount, 1)
 
         let cleared = recorder.snapshot()
         XCTAssertTrue(cleared.classes.isEmpty)
         XCTAssertTrue(cleared.completedCallCountsByTool.isEmpty)
+        XCTAssertTrue(cleared.operations.isEmpty)
 
         // Recording continues normally after an atomic drain.
         recorder.recordLaneWaitBegan(classKey: .control)
