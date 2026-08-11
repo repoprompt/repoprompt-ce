@@ -83,28 +83,13 @@ private struct ActiveWorkspaceToolbarPicker: View {
         fontScale.preset
     }
 
-    private var workspaceTitle: String {
-        guard let workspace = workspaceManager.activeWorkspace,
-              !workspace.isSystemWorkspace
-        else {
-            return "No Workspace"
-        }
-
-        if let instanceNumber = windowState.workspaceInstanceNumber,
-           instanceNumber >= 2
-        {
-            return "\(workspace.name) (\(instanceNumber))"
-        }
-
-        return workspace.name
-    }
-
-    private var workspaceTooltip: String {
-        let workspaceCount = workspaceManager.workspacesForMenu().count
-        if workspaceCount == 0 {
-            return "No saved workspaces"
-        }
-        return "Switch workspace"
+    private var presentation: ActiveWorkspaceToolbarPresentation {
+        ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: workspaceManager.activeWorkspace,
+            workspaceCount: workspaceManager.workspacesForMenu().count,
+            instanceNumber: windowState.workspaceInstanceNumber,
+            chatTitle: title
+        )
     }
 
     init(title: String, windowState: WindowState, onCreateWorkspace: @escaping () -> Void) {
@@ -124,22 +109,36 @@ private struct ActiveWorkspaceToolbarPicker: View {
                 Image(systemName: "folder")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
 
-                Text(title)
+                Text(presentation.workspaceTitle)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(maxWidth: fontPreset.scaledClamped(520, max: 620), alignment: .leading)
-                    .accessibilityIdentifier("AgentChatTitle")
+                    .frame(maxWidth: fontPreset.scaledClamped(280, max: 340), alignment: .leading)
+                    .accessibilityIdentifier("ActiveWorkspaceTitle")
+
+                if presentation.showsDistinctChatTitle {
+                    Divider()
+                        .frame(height: fontPreset.scaledClamped(14, max: 18))
+
+                    Text(presentation.chatTitle)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: fontPreset.scaledClamped(280, max: 340), alignment: .leading)
+                        .accessibilityIdentifier("AgentChatTitle")
+                }
 
                 Image(systemName: "chevron.down")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Active workspace: \(workspaceTitle)")
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier("ActiveWorkspacePicker")
         }
         .buttonStyle(CustomButtonStyle(verticalPadding: 0, horizontalPadding: 10, height: 28))
-        .hoverTooltip(workspaceTooltip, .bottom)
+        .hoverTooltip(presentation.workspaceTooltip, .bottom)
     }
 
     private func openManageWorkspaces() {
@@ -148,5 +147,42 @@ private struct ActiveWorkspaceToolbarPicker: View {
             object: windowState,
             userInfo: ["windowID": windowState.windowID]
         )
+    }
+}
+
+struct ActiveWorkspaceToolbarPresentation: Equatable {
+    let workspaceTitle: String
+    let chatTitle: String
+    let workspaceTooltip: String
+
+    var showsDistinctChatTitle: Bool {
+        chatTitle != workspaceTitle
+    }
+
+    var accessibilityLabel: String {
+        if showsDistinctChatTitle {
+            return "Active workspace: \(workspaceTitle). Chat: \(chatTitle)"
+        }
+        return "Active workspace: \(workspaceTitle)"
+    }
+
+    init(
+        activeWorkspace: WorkspaceModel?,
+        workspaceCount: Int,
+        instanceNumber: Int?,
+        chatTitle: String
+    ) {
+        if let activeWorkspace, !activeWorkspace.isSystemWorkspace {
+            if let instanceNumber, instanceNumber >= 2 {
+                workspaceTitle = "\(activeWorkspace.name) (\(instanceNumber))"
+            } else {
+                workspaceTitle = activeWorkspace.name
+            }
+        } else {
+            workspaceTitle = "No Workspace"
+        }
+
+        self.chatTitle = chatTitle
+        workspaceTooltip = workspaceCount == 0 ? "No saved workspaces" : "Switch workspace"
     }
 }
