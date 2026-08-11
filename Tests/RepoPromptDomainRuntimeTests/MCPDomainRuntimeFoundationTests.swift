@@ -68,6 +68,14 @@ final class MCPDomainToolCatalogTests: XCTestCase {
         )
         XCTAssertEqual(MCPDomainToolCatalog.operationArgumentKey(for: MCPGlobalToolName.manageWorkspaces), "action")
         XCTAssertEqual(MCPDomainToolCatalog.operationArgumentKey(for: MCPWindowToolName.fileActions), "action")
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.fileActions, input: .value("CREATE")).normalizedOperation,
+            "create"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.fileActions, input: .value("rename")).normalizedOperation,
+            "move"
+        )
         XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: MCPWindowToolName.readFile))
         XCTAssertEqual(
             MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.readFile, input: .malformed).normalizedOperation,
