@@ -549,9 +549,11 @@ extension AgentModeRunServiceLifecycleTests {
             mcpServerStatuses: [MCPIntegrationHelper.repoPromptMCPServerName: "failed"],
             initializeResponse: nil
         )
+        let shutdownGate = LifecycleAsyncGate()
         let controller = LifecycleFakeNativeController(
             recorder: recorder,
             label: "runtime-init-failure",
+            shutdownGate: shutdownGate,
             runtimeInitStatusOnSend: runtimeInitFailure
         )
         let harness = makeHarness(recorder: recorder, claudeController: controller)
@@ -576,6 +578,8 @@ extension AgentModeRunServiceLifecycleTests {
             "RepoPrompt MCP failed to initialize for Claude (session runtime-init-failure)."
         )
         XCTAssertNil(session.claudeController)
+        await shutdownGate.waitUntilArrived()
+        await shutdownGate.release()
         await harness.host.claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
         XCTAssertTrue(recorder.contains("runtime-init-failure:shutdown"))
         XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
