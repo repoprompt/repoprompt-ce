@@ -592,10 +592,17 @@ class TokenCountingViewModel: ObservableObject {
         #endif
         let selectionAtStart = expectedSelectionForPublishedSnapshot(copySnapshot)
         #if DEBUG
-            var selectionFields = debugSelectionFields(selectionAtStart)
-            selectionFields["includeFiles"] = "\(includeFiles)"
-            selectionFields["duration"] = selectionSnapshotStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.selectionSnapshot", fields: selectionFields)
+            PromptTokenRecountDiagnostics.event(
+                "tokenRecount.calculate.selectionSnapshot",
+                fields: PromptTokenRecountDiagnostics.fieldsIfEnabled {
+                    var fields = debugSelectionFields(selectionAtStart)
+                    fields["includeFiles"] = "\(includeFiles)"
+                    fields["duration"] = selectionSnapshotStartMS.map {
+                        PromptTokenRecountDiagnostics.formatElapsedMS(since: $0)
+                    } ?? "notMeasured"
+                    return fields
+                }
+            )
         #endif
         let includeUserPrompt = copySnapshot.includeUserPrompt
         let includeMetaPrompts = copySnapshot.includeMetaPrompts
@@ -681,9 +688,12 @@ class TokenCountingViewModel: ObservableObject {
         )
         #if DEBUG
             let accountingStartMS = PromptTokenRecountDiagnostics.start()
-            var accountingCorrelationFields = debugSelectionFields(accountingSelection)
-            accountingCorrelationFields["schedulerGeneration"] = "\(tokenCountSchedulerGeneration)"
-            accountingCorrelationFields["codeMapUsage"] = "\(accountingCodeMapUsage)"
+            let accountingCorrelationFields = PromptTokenRecountDiagnostics.fieldsIfEnabled {
+                var fields = debugSelectionFields(accountingSelection)
+                fields["schedulerGeneration"] = "\(tokenCountSchedulerGeneration)"
+                fields["codeMapUsage"] = "\(accountingCodeMapUsage)"
+                return fields
+            }
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.calculate.accounting.begin",
                 fields: accountingCorrelationFields

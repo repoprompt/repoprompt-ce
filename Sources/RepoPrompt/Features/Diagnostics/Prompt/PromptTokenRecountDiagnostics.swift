@@ -4,13 +4,21 @@ import Foundation
     enum PromptTokenRecountDiagnostics {
         @TaskLocal static var correlationFields: [String: String] = [:]
 
+        static var isEnabled: Bool {
+            WorkspaceRestorePerfLog.isEnabled
+        }
+
         static func start() -> Double? {
             WorkspaceRestorePerfLog.timestampMSIfEnabled()
         }
 
-        static func event(_ name: String, fields: [String: String] = [:]) {
+        static func event(
+            _ name: String,
+            fields: @autoclosure () -> [String: String] = [:]
+        ) {
+            guard isEnabled else { return }
             var mergedFields = correlationFields
-            mergedFields.merge(fields) { _, new in new }
+            mergedFields.merge(fields()) { _, new in new }
             WorkspaceRestorePerfLog.event(name, fields: mergedFields)
         }
 
@@ -22,8 +30,24 @@ import Foundation
             startMS.map { formatElapsedMS(since: $0) } ?? "notMeasured"
         }
 
-        static func selectionFields(_ selection: StoredSelection) -> [String: String] {
-            WorkspaceSelectionDebugSignature.unprefixedFields(for: selection)
+        static func fieldsIfEnabled(
+            diagnosticsEnabled: Bool = isEnabled,
+            _ builder: () -> [String: String]
+        ) -> [String: String] {
+            guard diagnosticsEnabled else { return [:] }
+            return builder()
+        }
+
+        static func selectionFields(
+            _ selection: StoredSelection,
+            diagnosticsEnabled: Bool = isEnabled,
+            signatureBuilder: (StoredSelection) -> [String: String] = {
+                WorkspaceSelectionDebugSignature.unprefixedFields(for: $0)
+            }
+        ) -> [String: String] {
+            fieldsIfEnabled(diagnosticsEnabled: diagnosticsEnabled) {
+                signatureBuilder(selection)
+            }
         }
 
         final class SelectedPathsState: @unchecked Sendable {

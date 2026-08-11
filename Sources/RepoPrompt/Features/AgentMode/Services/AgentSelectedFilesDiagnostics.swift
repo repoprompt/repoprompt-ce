@@ -3,6 +3,14 @@ import Foundation
 enum AgentSelectedFilesDiagnostics {
     @TaskLocal static var correlationFields: [String: String] = [:]
 
+    static var isEnabled: Bool {
+        #if DEBUG
+            AgentModePerfDiagnostics.isEnabled
+        #else
+            false
+        #endif
+    }
+
     static func timestampMSIfEnabled() -> Double? {
         #if DEBUG
             AgentModePerfDiagnostics.timestampMSIfEnabled()
@@ -22,13 +30,13 @@ enum AgentSelectedFilesDiagnostics {
 
     static func event(
         _ name: String,
-        fields: [String: String] = [:],
+        fields: @autoclosure () -> [String: String] = [:],
         includeStack: Bool = false
     ) {
         #if DEBUG
-            guard AgentModePerfDiagnostics.isEnabled else { return }
+            guard isEnabled else { return }
             var mergedFields = correlationFields
-            mergedFields.merge(fields) { _, new in new }
+            mergedFields.merge(fields()) { _, new in new }
             if includeStack {
                 mergedFields["stack"] = compactCallStack()
             }
@@ -39,11 +47,12 @@ enum AgentSelectedFilesDiagnostics {
     static func durationEvent(
         _ name: String,
         startMS: Double?,
-        fields: [String: String] = [:]
+        fields: @autoclosure () -> [String: String] = [:]
     ) {
         #if DEBUG
+            guard isEnabled, startMS != nil else { return }
             var mergedFields = correlationFields
-            mergedFields.merge(fields) { _, new in new }
+            mergedFields.merge(fields()) { _, new in new }
             AgentModePerfDiagnostics.durationEvent("selectedFiles.\(name)", startMS: startMS, fields: mergedFields)
         #endif
     }
@@ -56,16 +65,26 @@ enum AgentSelectedFilesDiagnostics {
         #endif
     }
 
-    static func selectionFields(_ selection: StoredSelection) -> [String: String] {
-        #if DEBUG
-            WorkspaceSelectionDebugSignature.unprefixedFields(for: selection)
-        #else
+    #if DEBUG
+        static func selectionFields(
+            _ selection: StoredSelection,
+            diagnosticsEnabled: Bool = isEnabled,
+            signatureBuilder: (StoredSelection) -> [String: String] = {
+                WorkspaceSelectionDebugSignature.unprefixedFields(for: $0)
+            }
+        ) -> [String: String] {
+            guard diagnosticsEnabled else { return [:] }
+            return signatureBuilder(selection)
+        }
+    #else
+        static func selectionFields(_: StoredSelection) -> [String: String] {
             [:]
-        #endif
-    }
+        }
+    #endif
 
     static func sourceFields(_ source: AgentContextExportSource) -> [String: String] {
         #if DEBUG
+            guard isEnabled else { return [:] }
             var fields = selectionFields(source.selection)
             fields["tabID"] = shortID(source.tabID)
             fields["activeAgentSessionID"] = shortID(source.activeAgentSessionID)
@@ -80,6 +99,7 @@ enum AgentSelectedFilesDiagnostics {
 
     static func requestFields(_ request: AgentSelectedFilesModelRequest) -> [String: String] {
         #if DEBUG
+            guard isEnabled else { return [:] }
             var fields = sourceFields(request.source)
             fields["filePathDisplay"] = String(describing: request.filePathDisplay)
             fields["codeMapUsage"] = String(describing: request.codeMapUsage)
@@ -94,6 +114,7 @@ enum AgentSelectedFilesDiagnostics {
         to next: AgentSelectedFilesModelIdentity
     ) -> [String: String] {
         #if DEBUG
+            guard isEnabled else { return [:] }
             guard let previous else { return ["hasPreviousIdentity": "false"] }
             let previousExport = previous.exportContextIdentity
             let nextExport = next.exportContextIdentity
@@ -117,7 +138,8 @@ enum AgentSelectedFilesDiagnostics {
         _ metrics: WorkspaceCodemapPresentationPlanningMetrics
     ) -> [String: String] {
         #if DEBUG
-            [
+            guard isEnabled else { return [:] }
+            return [
                 "rootCount": String(metrics.rootCount),
                 "fileEnumerationRequests": String(metrics.fileEnumerationRequestCount),
                 "examinedFiles": String(metrics.examinedFileCount),
