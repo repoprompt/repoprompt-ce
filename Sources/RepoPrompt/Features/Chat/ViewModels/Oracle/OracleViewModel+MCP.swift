@@ -1259,7 +1259,8 @@ extension OracleViewModel {
                 // member. Validate that member's durable cardinality here; the complete
                 // in-memory or persisted group is validated and loaded by preparation.
                 guard source.oracleGroupSize == expectedLanes.count,
-                      source.oracleLane.map { expectedLanes.contains($0) } == true
+                      let sourceLane = source.oracleLane,
+                      expectedLanes.contains(sourceLane)
                 else {
                     throw ChatToolError(
                         code: .conflict,

@@ -314,8 +314,10 @@ struct OraclePairSendReply {
     ) -> UUID? {
         guard let execution = result[lane] else { return nil }
         switch execution {
-        case let .success(reply): reply.chatId
-        case .failure: nil
+        case let .success(reply):
+            return reply.chatId
+        case .failure:
+            return nil
         }
     }
 

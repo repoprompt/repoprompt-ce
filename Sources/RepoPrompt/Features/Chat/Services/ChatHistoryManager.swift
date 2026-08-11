@@ -716,11 +716,14 @@ actor ChatDataService {
         requireCompleteGroup: Bool = true
     ) async throws -> [ChatSession] {
         let chatsFolder = try ensureChatsFolder(for: workspace)
-        let stubs = try chatFiles(in: chatsFolder).compactMap { url in
-            guard let stub = try? Self.loadChatSessionStubFromDisk(from: url), stub.oraclePairID == pairID else {
-                return nil
-            }
-            return stub
+        let fileURLs = try chatFiles(in: chatsFolder)
+        var stubs: [ChatSession] = []
+        stubs.reserveCapacity(fileURLs.count)
+        for fileURL in fileURLs {
+            guard let stub: ChatSession = try? Self.loadChatSessionStubFromDisk(from: fileURL),
+                  stub.oraclePairID == pairID
+            else { continue }
+            stubs.append(stub)
         }
         guard !stubs.isEmpty else { return [] }
         _ = try OracleGroupPersistencePolicy.validate(
@@ -728,8 +731,10 @@ actor ChatDataService {
             workspaceID: workspace.id,
             requireCompleteGroup: requireCompleteGroup
         )
-        return stubs.sorted {
-            ($0.oracleLane?.ordinal ?? .max) < ($1.oracleLane?.ordinal ?? .max)
+        return stubs.sorted { lhs, rhs in
+            let lhsOrdinal: Int = lhs.oracleLane?.ordinal ?? Int.max
+            let rhsOrdinal: Int = rhs.oracleLane?.ordinal ?? Int.max
+            return lhsOrdinal < rhsOrdinal
         }
     }
 
