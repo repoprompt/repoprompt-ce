@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 @MainActor
 final class HeadlessAgentModeRunner {
@@ -18,20 +19,20 @@ final class HeadlessAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease
     ) async {
-        let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
+        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
            !session.pendingNonCodexUserInputTokenQueue.isEmpty
         {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.estimateRuntimeTokens(initialMessageForRun)
+            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
         }
-        hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
 
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
@@ -46,12 +47,12 @@ final class HeadlessAgentModeRunner {
         session.runningStatusText = nil
         session.runningStatusSource = nil
         session.runState = .running
-        hooks.setAgentRunActive(tabID, true)
-        hooks.updateBindings(session)
+        hooks.presentation.setAgentRunActive(session, true)
+        hooks.bindingObservation.updateBindings(session)
 
         guard session.selectedAgent != .codexExec else {
             await terminalCommitBarrier.commit(.init(
-                session: session,
+                binding: hooks.bindTerminalSession(session),
                 ownership: ownership,
                 expectedRunID: runID,
                 terminalState: .failed,
@@ -64,7 +65,7 @@ final class HeadlessAgentModeRunner {
                 notifyTurnComplete: false,
                 prepareProviderState: {
                     session.provider = nil
-                    session.runID = nil
+                    session.clearRunID(ifCurrent: runID)
                     return nil
                 }
             ))
@@ -80,9 +81,7 @@ final class HeadlessAgentModeRunner {
         session.provider = provider
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
             session.provider = nil
-            if session.runID == runID {
-                session.runID = nil
-            }
+            session.clearRunID(ifCurrent: runID)
             return {
                 switch terminalState {
                 case .failed:
@@ -110,7 +109,7 @@ final class HeadlessAgentModeRunner {
                     return
                 }
 
-                let agentMessage = self.hooks.buildHeadlessAgentMessage(
+                let agentMessage = self.hooks.providerInput.buildHeadlessAgentMessage(
                     session,
                     initialMessageForRun,
                     runID,
@@ -132,14 +131,14 @@ final class HeadlessAgentModeRunner {
     }
 
     private func handleAcquireFailure(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -151,14 +150,14 @@ final class HeadlessAgentModeRunner {
             notifyTurnComplete: false,
             prepareProviderState: {
                 session.provider = nil
-                session.runID = nil
+                session.clearRunID(ifCurrent: runID)
                 return nil
             }
         ))
     }
 
     private func executeHeadlessRun(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         provider: HeadlessAgentProvider,
         initialMessage: AgentMessage,
         runID: UUID,
@@ -169,14 +168,16 @@ final class HeadlessAgentModeRunner {
         lease: MCPBootstrapLease
     ) async {
         var providerInitializationCompleted = false
-        do {
+        let report = await DomainAgentRunExecutionCore.execute(
+            failureText: { "Agent failed: \($0.localizedDescription)" }
+        ) {
             await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
             let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
-            hooks.recordPendingHandoffSendOutcome(session, true)
-            hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-            hooks.markAttachmentsConsumed(session, attachmentReservationID)
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+            hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+            hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
             _ = await lease.releaseWhenRouted()
             if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
@@ -184,79 +185,69 @@ final class HeadlessAgentModeRunner {
 
             for try await result in stream {
                 guard !Task.isCancelled else { break }
-                guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { return }
+                guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
+                    return .superseded
+                }
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
-                await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+                await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             }
 
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
             else {
-                return
+                return .superseded
             }
+            return .completed(assistantText: nil)
+        }
 
-            await terminalCommitBarrier.commit(.init(
-                session: session,
-                ownership: ownership,
-                expectedRunID: runID,
-                terminalState: .completed,
-                source: "headless.completed",
-                attachmentReservationID: attachmentReservationID,
-                attachmentDisposition: .deleteFiles,
-                finalizeNonCodexUsage: true,
-                supportsFollowUp: false,
-                notifyTurnComplete: true,
-                prepareProviderState: {
-                    session.provider = nil
-                    session.runID = nil
-                    return nil
-                }
-            ))
-        } catch is CancellationError {
+        guard case let .terminal(outcome) = report.result else { return }
+        let terminalState: AgentSessionRunState
+        let source: String
+        let notifyTurnComplete: Bool
+        let errorText: String?
+        switch outcome.kind {
+        case .completed:
+            terminalState = .completed
+            source = "headless.completed"
+            notifyTurnComplete = true
+            errorText = nil
+        case .cancelled:
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
             }
-            hooks.recordPendingHandoffSendOutcome(session, false)
-            await terminalCommitBarrier.commit(.init(
-                session: session,
-                ownership: ownership,
-                expectedRunID: runID,
-                terminalState: .cancelled,
-                source: "headless.cancelled",
-                attachmentReservationID: attachmentReservationID,
-                attachmentDisposition: .deleteFiles,
-                finalizeNonCodexUsage: true,
-                supportsFollowUp: false,
-                notifyTurnComplete: false,
-                prepareProviderState: {
-                    session.provider = nil
-                    session.runID = nil
-                    return nil
-                }
-            ))
-        } catch {
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+            terminalState = .cancelled
+            source = "headless.cancelled"
+            notifyTurnComplete = false
+            errorText = nil
+        case .failed:
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
             }
-            hooks.recordPendingHandoffSendOutcome(session, false)
-            await terminalCommitBarrier.commit(.init(
-                session: session,
-                ownership: ownership,
-                expectedRunID: runID,
-                terminalState: .failed,
-                source: "headless.failed",
-                errorText: "Agent failed: \(error.localizedDescription)",
-                attachmentReservationID: attachmentReservationID,
-                attachmentDisposition: .deleteFiles,
-                finalizeNonCodexUsage: true,
-                supportsFollowUp: false,
-                notifyTurnComplete: false,
-                prepareProviderState: {
-                    session.provider = nil
-                    session.runID = nil
-                    return nil
-                }
-            ))
+            hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+            terminalState = .failed
+            source = "headless.failed"
+            notifyTurnComplete = false
+            errorText = outcome.assistantText
         }
+
+        await terminalCommitBarrier.commit(.init(
+            binding: hooks.bindTerminalSession(session),
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: terminalState,
+            source: source,
+            errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: notifyTurnComplete,
+            prepareProviderState: {
+                session.provider = nil
+                session.clearRunID(ifCurrent: runID)
+                return nil
+            }
+        ))
     }
 }

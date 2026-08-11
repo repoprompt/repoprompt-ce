@@ -754,7 +754,7 @@
         ) async throws -> WorkspaceCodeMapPhase5ScenarioResult {
             let root = try phase5SecureRoot(label: "foreground-\(ordinal)")
             defer { try? FileManager.default.removeItem(at: root) }
-            let limiter = ContentReadAsyncLimiter(capacity: 2, maxQueuedWaiterCount: 8)
+            let limiter = ContentReadAsyncLimiter(capacity: 2, bulkPermitLimit: 1, maxQueuedWaiterCount: 8)
             let builder = CodeMapArtifactBuilderClient(withPermit: { ownerID, priority, operation in
                 try await limiter.withCodeMapArtifactBuildPermit(
                     ownerID: ownerID,

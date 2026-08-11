@@ -253,7 +253,8 @@ final class AgentRuntimeProviderService {
         case .codexExec:
             let config = CodexExecAgentConfig(
                 modelString: modelString,
-                enableDebugLogging: Self.enableDebugLogging
+                enableDebugLogging: Self.enableDebugLogging,
+                fullAccess: CodexAgentToolPreferences.permissionLevel() == .fullAccess
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")

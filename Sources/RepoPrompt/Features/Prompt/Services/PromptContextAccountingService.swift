@@ -214,9 +214,10 @@ actor PromptContextAccountingService {
         filePathDisplay: FilePathDisplay,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) async -> PromptContextEntryMetricsSnapshot {
-        guard !entries.isEmpty else { return .empty }
+        let uniqueEntries = uniquePhysicalEntries(entries)
+        guard !uniqueEntries.isEmpty else { return .empty }
 
-        let loadedEntries = await entriesLoadingContentIfNeeded(entries, store: store)
+        let loadedEntries = await entriesLoadingContentIfNeeded(uniqueEntries, store: store)
         let snapshots = makePromptFileEntrySnapshots(
             from: loadedEntries,
             codemapPresentation: codemapPresentation,
@@ -238,11 +239,12 @@ actor PromptContextAccountingService {
         resolvedContentEntries: [PromptContextResolvedContentMetricsEntry]
     ) async throws -> PromptContextEntryMetricsSnapshot {
         try checkResolvedContentCancellation()
-        guard !resolvedContentEntries.isEmpty else { return .empty }
+        let uniqueResolvedContentEntries = uniquePhysicalEntries(resolvedContentEntries)
+        guard !uniqueResolvedContentEntries.isEmpty else { return .empty }
 
         var loadedEntries: [ResolvedPromptFileEntry] = []
-        loadedEntries.reserveCapacity(resolvedContentEntries.count)
-        for input in resolvedContentEntries {
+        loadedEntries.reserveCapacity(uniqueResolvedContentEntries.count)
+        for input in uniqueResolvedContentEntries {
             try checkResolvedContentCancellation()
             guard let content = try await resolvedContentReader(input.location, .promptAccounting) else {
                 throw PromptContextResolvedContentAccountingError.contentUnavailable(input.location)
@@ -266,7 +268,7 @@ actor PromptContextAccountingService {
         }
         try checkResolvedContentCancellation()
         let displayPathsByFileID = Dictionary(
-            uniqueKeysWithValues: resolvedContentEntries.map { ($0.fileID, $0.renderedDisplayPath) }
+            uniqueKeysWithValues: uniqueResolvedContentEntries.map { ($0.fileID, $0.renderedDisplayPath) }
         )
         let snapshots = makePromptFileEntrySnapshots(
             from: loadedEntries,
@@ -379,14 +381,9 @@ actor PromptContextAccountingService {
         var entries: [ResolvedPromptFileEntry] = []
         var missingPaths: [String] = []
         var invalidPaths: [String] = []
-        var seenIDs = Set<ResolvedPromptFileEntryID>()
+        var seenAccountingIdentities = PromptContextAccountingIdentitySet()
         var selectedFileIDs = Set<UUID>()
-        let orderedSlicePaths = selection.slices.keys.sorted {
-            let lhs = StoredSelectionPathNormalization.standardizedPath($0) ?? $0
-            let rhs = StoredSelectionPathNormalization.standardizedPath($1) ?? $1
-            if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
-            return $0.utf8.lexicographicallyPrecedes($1.utf8)
-        }
+        let orderedSlicePaths = StoredSelectionPathNormalization.orderedSlicePaths(selection.slices)
 
         #if DEBUG
             let selectedPathsStartMS = PromptTokenRecountDiagnostics.start()
@@ -455,6 +452,7 @@ actor PromptContextAccountingService {
             )
         #endif
         var selectedPathResultsByIndex: [Int: WorkspacePathLookupResult] = [:]
+        var selectedPathResultsByPath: [String: WorkspacePathLookupResult] = [:]
         var selectedPathFallbackLookups = 0
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
             guard !Task.isCancelled else {
@@ -462,8 +460,17 @@ actor PromptContextAccountingService {
             }
             if let result = selectedPathLookupResults[path] {
                 selectedPathResultsByIndex[selectedPathIndex] = result
+                selectedPathResultsByPath[path] = result
             } else if let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) {
                 selectedPathResultsByIndex[selectedPathIndex] = result
+                selectedPathResultsByPath[path] = result
+                selectedPathFallbackLookups += 1
+            } else if let result = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
+                path,
+                rootScope: rootScope
+            ) {
+                selectedPathResultsByIndex[selectedPathIndex] = result
+                selectedPathResultsByPath[path] = result
                 selectedPathFallbackLookups += 1
             }
         }
@@ -478,6 +485,36 @@ actor PromptContextAccountingService {
                 )
             }
         #endif
+
+        let directlySelectedFileIDs = Set(selectedPathResultsByIndex.values.compactMap { $0.file?.id })
+        let sliceLookupRequests = orderedSlicePaths.compactMap { path -> WorkspacePathLookupRequest? in
+            guard selection.slices[path]?.isEmpty == false, selectedPathResultsByPath[path] == nil else {
+                return nil
+            }
+            return WorkspacePathLookupRequest(userPath: path, profile: profile, rootScope: rootScope)
+        }
+        let sliceLookupResults = await store.lookupPaths(sliceLookupRequests)
+        var slicePathResults: [String: WorkspacePathLookupResult] = [:]
+        var sliceRangesByFileID: [UUID: [LineRange]] = [:]
+        for path in orderedSlicePaths {
+            guard let ranges = selection.slices[path], !ranges.isEmpty else { continue }
+            let result: WorkspacePathLookupResult? = if let cached = selectedPathResultsByPath[path]
+                ?? sliceLookupResults[path]
+            {
+                cached
+            } else {
+                await store.lookupPath(path, profile: profile, rootScope: rootScope)
+            }
+            guard let result else { continue }
+            slicePathResults[path] = result
+            if let file = result.file {
+                StoredSelectionPathNormalization.mergeSliceRanges(
+                    ranges,
+                    for: file.id,
+                    into: &sliceRangesByFileID
+                )
+            }
+        }
 
         var operationSourceFileIDs: [UUID] = []
         var seenOperationSourceFileIDs = Set<UUID>()
@@ -499,7 +536,7 @@ actor PromptContextAccountingService {
             }
         }
         for path in orderedSlicePaths {
-            if let file = await store.lookupPath(path, profile: profile, rootScope: rootScope)?.file {
+            if let file = slicePathResults[path]?.file {
                 appendOperationSource(file)
             }
         }
@@ -779,7 +816,7 @@ actor PromptContextAccountingService {
                     selectedPathsDebugState.beginAssembly(index: selectedPathIndex, path: path, resolvedKind: "file")
                 #endif
                 selectedFileIDs.insert(file.id)
-                let ranges = sliceRanges(for: path, file: file, location: result.location, in: selection.slices)
+                let ranges = sliceRangesByFileID[file.id]
                 let useSelectedCodemap = codeMapUsage == .selected && codemapPresentation.renderedEntriesByFileID[file.id] != nil
                 let content = useSelectedCodemap ? nil : selectedFileReadResults[selectedPathIndex]?.content
                 if codeMapUsage == .selected,
@@ -798,7 +835,7 @@ actor PromptContextAccountingService {
                     loadedContent: content ?? nil,
                     rootFolderPath: result.location.rootPath
                 )
-                append(entry, to: &entries, seenIDs: &seenIDs)
+                append(entry, to: &entries, seenAccountingIdentities: &seenAccountingIdentities)
                 #if DEBUG
                     PromptTokenRecountDiagnostics.event(
                         "tokenRecount.accounting.resolveEntries.selectedPath.end",
@@ -828,7 +865,9 @@ actor PromptContextAccountingService {
                     guard !Task.isCancelled else {
                         return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
                     }
+                    guard !directlySelectedFileIDs.contains(file.id) else { continue }
                     selectedFileIDs.insert(file.id)
+                    let ranges = sliceRangesByFileID[file.id]
                     let useSelectedCodemap = codeMapUsage == .selected && codemapPresentation.renderedEntriesByFileID[file.id] != nil
                     let content: String?
                     if useSelectedCodemap {
@@ -878,11 +917,12 @@ actor PromptContextAccountingService {
                     let entry = ResolvedPromptFileEntry(
                         file: file,
                         isCodemap: useSelectedCodemap,
-                        mode: useSelectedCodemap ? .codemap : .fullFile,
+                        lineRanges: useSelectedCodemap ? nil : ranges,
+                        mode: useSelectedCodemap ? .codemap : ((ranges?.isEmpty == false) ? .sliced : .fullFile),
                         loadedContent: content ?? nil,
                         rootFolderPath: result.location.rootPath
                     )
-                    append(entry, to: &entries, seenIDs: &seenIDs)
+                    append(entry, to: &entries, seenAccountingIdentities: &seenAccountingIdentities)
                 }
                 #if DEBUG
                     PromptTokenRecountDiagnostics.event(
@@ -927,11 +967,11 @@ actor PromptContextAccountingService {
             )
         #endif
         for path in orderedSlicePaths {
-            guard let ranges = selection.slices[path] else { continue }
+            guard selection.slices[path]?.isEmpty == false else { continue }
             guard !Task.isCancelled else {
                 return PromptContextEntryResolution(entries: entries, missingPaths: missingPaths, invalidPaths: invalidPaths, codemapPresentation: codemapPresentation)
             }
-            guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
+            guard let result = slicePathResults[path] else {
                 missingPaths.append(path)
                 continue
             }
@@ -939,7 +979,9 @@ actor PromptContextAccountingService {
                 invalidPaths.append(path)
                 continue
             }
-            guard !selectedFileIDs.contains(file.id) else { continue }
+            guard !selectedFileIDs.contains(file.id),
+                  let ranges = sliceRangesByFileID[file.id]
+            else { continue }
             selectedFileIDs.insert(file.id)
             let content: String? = switch contentPolicy {
             case .loadContent:
@@ -962,7 +1004,7 @@ actor PromptContextAccountingService {
                 continue
             }
             let entry = ResolvedPromptFileEntry(file: file, lineRanges: ranges, mode: .sliced, loadedContent: content ?? nil, rootFolderPath: result.location.rootPath)
-            append(entry, to: &entries, seenIDs: &seenIDs)
+            append(entry, to: &entries, seenAccountingIdentities: &seenAccountingIdentities)
         }
 
         #if DEBUG
@@ -1002,7 +1044,7 @@ actor PromptContextAccountingService {
                     loadedContent: nil,
                     rootFolderPath: rootsByID[file.rootID]?.fullPath
                 )
-                append(entry, to: &entries, seenIDs: &seenIDs)
+                append(entry, to: &entries, seenAccountingIdentities: &seenAccountingIdentities)
             }
         }
 
@@ -1168,24 +1210,31 @@ actor PromptContextAccountingService {
         return entry.file.fullPath
     }
 
-    private nonisolated func sliceRanges(for path: String, file: WorkspaceFileRecord, location: WorkspacePathLocation, in slices: [String: [LineRange]]) -> [LineRange]? {
-        let candidateKeys = [
-            path,
-            StandardizedPath.absolute(path),
-            file.relativePath,
-            file.standardizedRelativePath,
-            file.fullPath,
-            file.standardizedFullPath,
-            location.absolutePath
-        ]
-        for key in candidateKeys {
-            if let ranges = slices[key] { return ranges }
-        }
-        return nil
+    private nonisolated func uniquePhysicalEntries(
+        _ entries: [ResolvedPromptFileEntry]
+    ) -> [ResolvedPromptFileEntry] {
+        var identities = PromptContextAccountingIdentitySet()
+        return entries.filter { identities.insert($0) }
     }
 
-    private func append(_ entry: ResolvedPromptFileEntry, to entries: inout [ResolvedPromptFileEntry], seenIDs: inout Set<ResolvedPromptFileEntryID>) {
-        guard seenIDs.insert(entry.id).inserted else { return }
+    private nonisolated func uniquePhysicalEntries(
+        _ entries: [PromptContextResolvedContentMetricsEntry]
+    ) -> [PromptContextResolvedContentMetricsEntry] {
+        var identities = PromptContextAccountingIdentitySet()
+        return entries.filter { entry in
+            identities.insert(
+                fileID: entry.fileID,
+                standardizedFullPath: StandardizedPath.absolute(entry.location.resolvedFileURL.path)
+            )
+        }
+    }
+
+    private func append(
+        _ entry: ResolvedPromptFileEntry,
+        to entries: inout [ResolvedPromptFileEntry],
+        seenAccountingIdentities: inout PromptContextAccountingIdentitySet
+    ) {
+        guard seenAccountingIdentities.insert(entry) else { return }
         entries.append(entry)
     }
 }

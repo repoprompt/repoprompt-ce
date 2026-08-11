@@ -599,7 +599,11 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         )
         retainedHosts.append(host)
         let coordinator = host.test_codexCoordinator
-        coordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder)))
+        let hooks = makeHooks(recorder: recorder)
+        coordinator.installTerminalCommitBarrier(
+            AgentRunTerminalCommitBarrier(),
+            terminalSessionBinder: { hooks.bindTerminalSession($0) }
+        )
         return coordinator
     }
 
@@ -641,44 +645,66 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
 
     private func makeHooks(recorder: TerminalPublicationRecorder) -> AgentModeRunService.Hooks {
         AgentModeRunService.Hooks(
-            estimateRuntimeTokens: { $0.count },
-            addUserInputTokensToActiveNonCodexTurn: { _, _ in },
-            startNonCodexTurnAccountingIfNeeded: { _, _ in },
-            reserveAttachmentsForTurn: { _, _ in nil },
-            markAttachmentsConsumed: { _, _ in },
-            stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
-            consumeDeferredAttachmentCleanup: { _, _ in },
-            finalizeAttachmentsForTurn: { _, _, _ in },
-            setAgentRunActive: { _, _ in },
-            updateBindings: { _ in },
-            requestUIRefresh: { _, _ in },
-            scheduleSave: { _ in },
-            notifyAgentTurnComplete: { _ in },
-            handleHeadlessStreamResult: { _, _, _, _ in },
-            buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
-            finalizeStreamingItems: { _ in },
-            finalizePendingToolCalls: { _, _ in },
-            finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-            finalizeNonCodexTurnUsage: { _, _, _, _ in },
-            cancelPendingQuestion: { _ in },
-            cancelPendingApproval: { _ in },
-            cancelPendingApplyEditsReview: { _, _ in },
-            cancelPendingWorktreeMergeReview: { _, _ in },
-            flushPendingAssistantDelta: { _ in },
-            clearPendingAssistantDelta: { _ in },
-            prepareTerminalPublication: { _ in },
-            makeTerminalPublicationEnvelope: { _, _, _, _ in nil },
-            publishTerminalCommit: { _, revision, _ in
-                recorder.record(revision.terminalState)
-                return .accepted(successorEpoch: nil)
-            },
-            startFollowUpRun: { _, _ in },
-            restoreDraftText: { _, _, _, _ in },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
-            stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, _ in },
-            signalMCPInstructionDelivered: { _ in }
+            usage: .init(
+                estimateRuntimeTokens: { $0.count },
+                addUserInputTokensToActiveNonCodexTurn: { _, _ in },
+                startNonCodexTurnAccountingIfNeeded: { _, _ in },
+                finalizeNonCodexTurnUsage: { _, _, _, _ in }
+            ),
+            attachments: .init(
+                reserveAttachmentsForTurn: { _, _ in nil },
+                markAttachmentsConsumed: { _, _ in },
+                stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
+                consumeDeferredAttachmentCleanup: { _, _ in },
+                finalizeAttachmentsForTurn: { _, _, _ in }
+            ),
+            presentation: .init(
+                setAgentRunActive: { _, _ in },
+                requestUIRefresh: { _, _ in },
+                notifyAgentTurnComplete: { _ in }
+            ),
+            bindingObservation: .init(
+                updateBindings: { _ in }
+            ),
+            queuedWorkRecovery: .init(
+                restoreDraftText: { _, _, _, _ in }
+            ),
+            persistence: .init(
+                scheduleSave: { _ in }
+            ),
+            transcript: .init(
+                handleHeadlessStreamResult: { _, _, _, _ in },
+                finalizeStreamingItems: { _ in },
+                finalizePendingToolCalls: { _, _ in },
+                finalizePendingToolCallsWithUpperBound: { _, _, _ in },
+                flushPendingAssistantDelta: { _ in },
+                clearPendingAssistantDelta: { _ in }
+            ),
+            providerInput: .init(
+                buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
+                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                stageResumeRecoveryHandoffIfNeeded: { _ in },
+                prependPendingHandoffIfNeeded: { text, _ in text },
+                recordPendingHandoffSendOutcome: { _, _ in }
+            ),
+            interactions: .init(
+                cancelPendingQuestion: { _ in },
+                cancelPendingApproval: { _ in },
+                cancelPendingApplyEditsReview: { _, _ in },
+                cancelPendingWorktreeMergeReview: { _, _ in }
+            ),
+            terminalSettlement: .init(
+                prepareTerminalPublication: { _ in },
+                makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
+                publishTerminalCommit: { _, revision, _ in
+                    recorder.record(revision.terminalState)
+                    return .accepted(successorEpoch: nil)
+                }
+            ),
+            continuation: .init(
+                startFollowUpRun: { _, _ in },
+                signalMCPInstructionDelivered: { _ in }
+            )
         )
     }
 }

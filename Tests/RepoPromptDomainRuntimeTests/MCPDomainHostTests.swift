@@ -384,7 +384,11 @@ final class MCPDomainHostTests: XCTestCase {
     func testDrainClosesResourceAdmissionAndWaitsForActiveLease() async throws {
         let fixture = try await makeFixture()
         let host = fixture.runtime.domainHost
-        let lease = try await host.acquireMutationResourceAdmission(.appWide)
+        let mutationLease = try await host.acquireMutationResourceAdmission(.appWide)
+        let smallReadLease = try await host.acquireSmallReadResourceAdmission(windowID: 1)
+        let fileReadLease = try await host.acquireFileReadResourceAdmission(windowID: 1)
+        let activeLeaseSnapshot = await host.snapshot()
+        XCTAssertEqual(activeLeaseSnapshot.activeResourceAdmissionLeaseCount, 3)
         let waiter = Task { () -> Error? in
             do {
                 _ = try await host.acquireMutationResourceAdmission(.appWide)
@@ -406,7 +410,9 @@ final class MCPDomainHostTests: XCTestCase {
             waiterError as? MCPDomainToolResourceAdmissionController.AdmissionError,
             .closed
         )
-        XCTAssertTrue(lease.release())
+        XCTAssertTrue(mutationLease.release())
+        XCTAssertTrue(smallReadLease.release())
+        XCTAssertTrue(fileReadLease.release())
         let drain = await drainTask.value
         XCTAssertFalse(drain.deadlineExpired)
         XCTAssertEqual(drain.detachedInvocationCount, 0)
@@ -418,6 +424,12 @@ final class MCPDomainHostTests: XCTestCase {
         do {
             _ = try await host.acquireMutationResourceAdmission(.appWide)
             XCTFail("Drained host issued a new resource lease")
+        } catch let error as MCPDomainHostError {
+            XCTAssertEqual(error, .draining)
+        }
+        do {
+            _ = try await host.acquireFileReadResourceAdmission(windowID: 1)
+            XCTFail("Drained host issued a new file-read resource lease")
         } catch let error as MCPDomainHostError {
             XCTAssertEqual(error, .draining)
         }
@@ -508,7 +520,7 @@ final class MCPDomainHostTests: XCTestCase {
             toolName: MCPWindowToolName.readFile,
             policy: directPolicy
         )
-        XCTAssertEqual(readDecision.admissionClass, .smallRead)
+        XCTAssertEqual(readDecision.admissionClass, .fileRead)
 
         let disabled = await runtime.domainHost.advertisedCatalog(
             MCPDomainCatalogAdvertisementRequest(

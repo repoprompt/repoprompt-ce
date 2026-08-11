@@ -1380,8 +1380,8 @@ actor AgentSessionDataService {
             candidateFilesByPath[fileURL.path] = fileURL
         }
 
-        for fileURL in candidateFilesByPath.values {
-            try? await deleteSessionFileDurably(fileURL.standardizedFileURL)
+        for fileURL in candidateFilesByPath.values.sorted(by: { $0.path < $1.path }) {
+            try await deleteSessionFileDurably(fileURL.standardizedFileURL)
         }
         await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
     }

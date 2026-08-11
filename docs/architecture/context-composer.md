@@ -1,10 +1,10 @@
-# Compose Inspector
+# Context Composer
 
-This contributor guide covers the Agent Mode Compose inspector, including selected-context review, prompt packaging, Copy Prompt, Context Builder, and the services that support them.
+This contributor guide covers the Agent Mode Context Composer, including selected-context review, prompt packaging, Copy Prompt, Context Builder, and the services that support them.
 
 ## Scope and goals
 
-Compose lets a user review the context selected for the current agent chat, shape the prompt handed to another model, and run Context Builder without leaving the transcript.
+Context Composer lets a user review the context selected for the current agent chat, shape the prompt handed to another model, and run Context Builder without leaving the transcript.
 
 The inspector renders a resolved view of the current selection and sends user changes through the shared workspace selection services. Repository lookup, codemap resolution, and selection persistence stay outside the view layer; [`source-layout.md`](source-layout.md) defines the source-ownership boundary.
 
@@ -14,7 +14,7 @@ Inspector visibility and navigation are scoped to the current app window. Select
 
 ### Open and close
 
-Compose opens from the **Compose** button in the top-right Agent Mode toolbar, from the selected-context pill below the composer, or from `⌘P` (configurable under Settings → Keyboard Shortcuts → Toggle Compose). The toolbar and shortcut toggle the inspector. The selected-context pill opens **Selections**, switches to it from another Compose tab, or closes the inspector when **Selections** is already active. The header control closes the inspector directly.
+Context Composer opens from the selected-context pill below the message composer or from `⌘P` (configurable under Settings → Keyboard Shortcuts → Toggle Context Composer). The selected-context pill is the only visible entry point: it opens **Selections**, switches to it from another Context Composer tab, or closes Context Composer when **Selections** is already active. The shortcut toggles Context Composer, and the header close control closes it directly.
 
 The native macOS inspector column is resizable and adapts to preserve useful space for the chat.
 
@@ -34,13 +34,13 @@ Context Builder's **Preview**, **Open Oracle**, and **View in Chat** actions ope
 
 ### Loading behavior
 
-When the active chat changes, Compose waits for the new chat's selection before showing rows and totals. During updates to the current chat, matching rows remain visible while their data refreshes. File and codemap counts become available independently, and metrics remain hidden until their values are known.
+When the active chat changes, Context Composer waits for the new chat's selection before showing rows and totals. During updates to the current chat, matching rows remain visible while their data refreshes. File and codemap counts become available independently, and metrics remain hidden until their values are known.
 
 ## Layering
 
 ```mermaid
 flowchart LR
-    UI["Compose inspector"] --> STORE["AgentContextDrawerUIStore"]
+    UI["Context Composer"] --> STORE["AgentContextDrawerUIStore"]
     UI --> MODEL["AgentSelectedFilesModelCoordinator"]
     MODEL --> RESOLVER["AgentContextExportResolver"]
     RESOLVER --> CONTEXT["WorkspaceFileContextStore"]
@@ -54,7 +54,7 @@ flowchart LR
 
 ## Invariants and rationale
 
-**Observation isolation.** Compose detail state is observed within the inspector subtree. The chat surface receives only the presentation state and the action that opens Compose, keeping filter, sort, navigation, loading, and row updates from invalidating the transcript.
+**Observation isolation.** Context Composer detail state is observed within the inspector subtree. The chat surface receives only the presentation state and the action that opens Context Composer, keeping filter, sort, navigation, loading, and row updates from invalidating the transcript.
 
 **Context Builder Oracle presentation.** Context Builder routes each follow-up conversation by workspace, tab, and chat. `AgentOraclePill` presents the shared chat transcript with its non-mutating action policy, while the chat session remains the source of truth for live message updates.
 
@@ -72,7 +72,7 @@ flowchart LR
 | --- | --- |
 | Inspector visibility | `AgentContextDrawerPresentationStore` |
 | Active tab, filter, and sort | `AgentContextDrawerDetailStore` |
-| Open, close, and toggle behavior shared by Compose entry points | `AgentContextDrawerUIStore` |
+| Open, close, and toggle behavior shared by Context Composer entry points | `AgentContextDrawerUIStore` |
 | Selected files and active-tab mutations | `StoredSelection` and `WorkspaceSelectionCoordinator` |
 | Instructions, copy configuration, and token counting | `PromptViewModel` |
 | Context Builder execution and generated output | `ContextBuilderAgentViewModel` |
@@ -103,12 +103,12 @@ make dev-test FILTER=AgentSelectedFilesModelCoordinatorTests
 make dev-test FILTER=AgentContextInspectorColumnSizingTests
 ```
 
-Selection-card presentation, token accounting, Git actions, and chat-switch behavior have additional focused coverage in `AgentContextSelectedFileCardTests`, `TokenCountingViewModelTests`, `GitViewModelSelectionClearTests`, and `AgentModeChatSwitchActivationTests`. Use the contribution matrix in [`../../AGENTS.md`](../../AGENTS.md) for repository-wide lint, build, and PR-ready gates. Because Compose is running-app Agent Mode UI, also follow the live CE MCP smoke flow there when behavior changes.
+Selection-card presentation, token accounting, Git actions, and chat-switch behavior have additional focused coverage in `AgentContextSelectedFileCardTests`, `TokenCountingViewModelTests`, `GitViewModelSelectionClearTests`, and `AgentModeChatSwitchActivationTests`. Use the contribution matrix in [`../../AGENTS.md`](../../AGENTS.md) for repository-wide lint, build, and PR-ready gates. Because Context Composer is running-app Agent Mode UI, also follow the live CE MCP smoke flow there when behavior changes.
 
 ## References
 
 - `Sources/RepoPrompt/Features/AgentMode/Views/AgentModeDetailWithSidebarView.swift` — native inspector mounting, presenter, and detail-width column policy.
-- `Sources/RepoPrompt/Features/AgentMode/Views/ContextDrawer/` — Compose shell, tabs, selected-context rows, previews, and click-time export context.
+- `Sources/RepoPrompt/Features/AgentMode/Views/ContextDrawer/` — Context Composer shell, tabs, selected-context rows, previews, and click-time export context.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentContextDrawerUIStore.swift` — presentation and runtime detail state.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/UI/AgentSelectedFilesModelCoordinator.swift` — context-aware loading, caching, readiness, and mutation gating.
 - `Sources/RepoPrompt/Features/AgentMode/Services/AgentContextExportResolver.swift` — selection resolution, previews, metrics, and clipboard assembly.

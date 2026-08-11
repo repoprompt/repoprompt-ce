@@ -185,6 +185,9 @@ extension MCPServerViewModel {
         let previousRunPrimaryConnectionID: UUID?
         let previousPendingPolicyTokenID: UUID?
         let previousWindowID: Int?
+        var promotedContext: TabContextSnapshot?
+        var promotedContextClientName: String?
+        var promotedContextWindowID: Int?
     }
 
     /// Ordered, immutable coordinator lanes displaced by one pending-policy replacement.
@@ -379,6 +382,10 @@ extension MCPServerViewModel {
 
         func contains(clientName: String, windowID: Int, runID: UUID) -> Bool {
             storage[clientName]?[windowID]?[runID] != nil
+        }
+
+        func contains(clientName: String, runID: UUID) -> Bool {
+            storage[clientName]?.values.contains { $0[runID] != nil } == true
         }
 
         @discardableResult
@@ -1361,7 +1368,8 @@ extension MCPServerViewModel {
     private func bindPendingContextToConnection(
         clientName: String,
         windowID: Int,
-        connectionID: UUID
+        connectionID: UUID,
+        registerRunMapping: Bool = true
     ) -> TabContextSnapshot? {
         let queueBefore = pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
         let runHint = connectionIDToRunID[connectionID]
@@ -1389,7 +1397,9 @@ extension MCPServerViewModel {
                 activateReadFileAutoSelection(&rebound)
                 tabContextByConnectionID[connectionID] = rebound
                 presentationWindowByConnection[connectionID] = rebound.windowID
-                _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
+                if registerRunMapping {
+                    _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
+                }
                 recordLastContext(clientName: clientName, context: rebound)
                 beginMirroringForConnection(connectionID, context: rebound)
                 tabContextLog("bindPendingContextToConnection handover: runID=\(runID) tab=\(rebound.tabID) \(previousConnection) -> \(connectionID) queueBefore=\(queueBefore)")
@@ -1421,9 +1431,13 @@ extension MCPServerViewModel {
         publishDomainRoutingBinding(connectionID: connectionID, context: context)
         presentationWindowByConnection[connectionID] = context.windowID
         if let runID = context.runID {
-            let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: context.windowID)
-            // If we successfully registered the mapping, or if the initial runHint matched, count it as used
-            usedRunHint = usedRunHint || (runHint == runID) || mappingSucceeded
+            if registerRunMapping {
+                let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: context.windowID)
+                // If we successfully registered the mapping, or if the initial runHint matched, count it as used
+                usedRunHint = usedRunHint || (runHint == runID) || mappingSucceeded
+            } else {
+                usedRunHint = usedRunHint || runHint == runID
+            }
         }
         recordLastContext(clientName: clientName, context: context)
         beginMirroringForConnection(connectionID, context: context)
@@ -1432,6 +1446,31 @@ extension MCPServerViewModel {
             "bindPendingContextToConnection clientName=\(clientName) window=\(windowID) connectionID=\(connectionID) runID=\(context.runID?.uuidString ?? "nil") tab=\(context.tabID) queueBefore=\(queueBefore) remaining=\(result.remaining) usedRunHint=\(usedRunHint) fallback=false"
         )
         return context
+    }
+
+    @MainActor
+    @discardableResult
+    func promotePendingContextForRunMapping(
+        clientName: String,
+        windowID: Int,
+        connectionID: UUID
+    ) -> TabContextSnapshot? {
+        guard connectionIDToRunID[connectionID] != nil,
+              let runID = connectionIDToRunID[connectionID],
+              pendingRunScopedTabContexts.contains(
+                  clientName: clientName,
+                  windowID: windowID,
+                  runID: runID
+              )
+        else {
+            return nil
+        }
+        return bindPendingContextToConnection(
+            clientName: clientName,
+            windowID: windowID,
+            connectionID: connectionID,
+            registerRunMapping: false
+        )
     }
 
     struct RequestMetadata {
@@ -1862,7 +1901,8 @@ extension MCPServerViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey,
-        expectedBaseSelection: StoredSelection
+        expectedBaseSelection: StoredSelection,
+        automaticCodemapDisposition: MCPReadFileAutoSelectionCoordinator.AutomaticCodemapDisposition
     ) async -> ReadFileAutoSelectionAuthoritativeResult? {
         guard isReadFileAutoSelectionContextCurrent(contextKey) else { return nil }
 
@@ -1900,7 +1940,8 @@ extension MCPServerViewModel {
         )
         guard MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
             expectedBaseForPreservation,
-            isPreservedBy: persistedSelection
+            isPreservedBy: persistedSelection,
+            automaticCodemapDisposition: automaticCodemapDisposition
         ),
             let target = currentReadFileAutoSelectionTab(for: contextKey)
         else { return nil }
@@ -3582,7 +3623,8 @@ extension MCPServerViewModel {
     func registerPendingPolicyRunIDMapping(
         connectionID: UUID,
         runID: UUID,
-        windowID: Int
+        windowID: Int,
+        clientName: String? = nil
     ) -> PendingPolicyRunIDMappingToken? {
         if let bound = tabContextByConnectionID[connectionID],
            let boundRun = bound.runID,
@@ -3603,7 +3645,7 @@ extension MCPServerViewModel {
         }
 
         let previousRunID = connectionIDToRunID[connectionID]
-        let token = PendingPolicyRunIDMappingToken(
+        var token = PendingPolicyRunIDMappingToken(
             id: UUID(),
             connectionID: connectionID,
             runID: runID,
@@ -3613,10 +3655,11 @@ extension MCPServerViewModel {
             previousRunID: previousRunID,
             previousRunPrimaryConnectionID: previousRunID.flatMap { connectionIDByRunID[$0] },
             previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyRunIDMappingTokenIDByRunID[$0] },
-            previousWindowID: presentationWindowByConnection[connectionID]
+            previousWindowID: presentationWindowByConnection[connectionID],
+            promotedContext: nil,
+            promotedContextClientName: nil,
+            promotedContextWindowID: nil
         )
-        installReadFileAutoSelectionHandoverLineage(for: token)
-
         if let displacedConnectionID = token.displacedConnectionID,
            connectionIDToRunID[displacedConnectionID] == runID
         {
@@ -3632,6 +3675,18 @@ extension MCPServerViewModel {
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         pendingPolicyRunIDMappingTokenIDByRunID[runID] = token.id
+        if let clientName,
+           let promotedContext = promotePendingContextForRunMapping(
+               clientName: clientName,
+               windowID: windowID,
+               connectionID: connectionID
+           )
+        {
+            token.promotedContext = promotedContext
+            token.promotedContextClientName = clientName
+            token.promotedContextWindowID = windowID
+        }
+        installReadFileAutoSelectionHandoverLineage(for: token)
         tabContextLog("registerPendingPolicyRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
         return token
     }
@@ -3664,8 +3719,6 @@ extension MCPServerViewModel {
 
         readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
         guard token.displacedConnectionRunID == token.runID,
-              connectionIDByRunID[token.runID] == displacedConnectionID,
-              connectionIDToRunID[displacedConnectionID] == token.runID,
               let displacedContext = tabContextByConnectionID[displacedConnectionID],
               displacedContext.runID == token.runID,
               successorContext.windowID == displacedContext.windowID,
@@ -3726,6 +3779,25 @@ extension MCPServerViewModel {
         }
 
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: token.runID)
+        let promotedContextToRestore: (context: TabContextSnapshot, clientName: String, windowID: Int)? = {
+            guard let promotedContext = token.promotedContext,
+                  let promotedRunID = promotedContext.runID,
+                  let promotedContextClientName = token.promotedContextClientName,
+                  let promotedContextWindowID = token.promotedContextWindowID,
+                  let boundContext = tabContextByConnectionID[token.connectionID],
+                  boundContext.runID == promotedRunID,
+                  boundContext.tabID == promotedContext.tabID,
+                  boundContext.windowID == promotedContext.windowID,
+                  boundContext.workspaceID == promotedContext.workspaceID,
+                  !pendingRunScopedTabContexts.contains(
+                      clientName: promotedContextClientName,
+                      runID: promotedRunID
+                  )
+            else {
+                return nil
+            }
+            return (promotedContext, promotedContextClientName, promotedContextWindowID)
+        }()
         removeTabContext(
             forConnectionID: token.connectionID,
             clientName: clientName,
@@ -3733,6 +3805,13 @@ extension MCPServerViewModel {
             runID: token.runID,
             removeQueuedPendingContext: false
         )
+        if let promotedContextToRestore {
+            _ = pendingRunScopedTabContexts.enqueueReplacing(
+                promotedContextToRestore.context,
+                clientName: promotedContextToRestore.clientName,
+                windowID: promotedContextToRestore.windowID
+            )
+        }
         if connectionIDByRunID[token.runID] == token.connectionID {
             connectionIDByRunID.removeValue(forKey: token.runID)
         }

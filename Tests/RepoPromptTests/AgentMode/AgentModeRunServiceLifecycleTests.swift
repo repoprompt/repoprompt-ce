@@ -22,7 +22,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     func testTerminalCommitPreservesRebuiltToolCorrelationIndexes() async throws {
         let recorder = LifecycleRecorder()
-        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let hooks = makeHooks(recorder: recorder)
+        let barrier = AgentRunTerminalCommitBarrier()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let invocationID = UUID()
         session.setItemsSilently([
@@ -36,7 +37,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 sequenceIndex: 3
             )
         ], reason: .persistedSessionHydration)
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.correlationIndex")
 
@@ -46,7 +47,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         completed.text = completed.toolResultJSON ?? ""
         session.replaceItem(at: 3, with: completed)
         let revision = await barrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .completed,
@@ -159,7 +160,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.runState = .running
-            session.runID = UUID()
+            session.installRunID(UUID())
             let ownership = session.beginRunAttempt(source: "test.reusedCodexVariant")
 
             let outcome = await harness.service.startRun(
@@ -224,6 +225,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let harness = makeHarness(recorder: recorder, claudeController: claudeController)
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = .claudeCode
+            harness.host.test_installLiveSession(session)
 
             let outcome = await harness.service.startRun(
                 tabID: session.tabID,
@@ -243,6 +245,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertFalse(recorder.contains("factory:acp-provider"))
             XCTAssertFalse(recorder.contains("factory:headless"))
             await session.agentTask?.value
+            XCTAssertEqual(session.runState, .failed)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertNotNil(session.lastTerminalCommitRevision)
+            XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
+            XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "run-active:false" }), 1)
+            XCTAssertTrue(recorder.contains("attachments:deleteFiles"))
+            XCTAssertTrue(recorder.contains("save"))
         }
 
         do {
@@ -375,7 +385,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 idleWaiter: { _ in recorder.record("idle") },
                 claudeController: claudeController
             )
-            let session = makeRunningClaudeSession(controller: claudeController)
+            let session = makeRunningClaudeSession(controller: claudeController, host: harness.host)
             session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "steer successfully")]
 
             let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
@@ -401,7 +411,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 idleWaiter: { _ in recorder.record("idle") },
                 claudeController: claudeController
             )
-            let session = makeRunningClaudeSession(controller: claudeController)
+            let session = makeRunningClaudeSession(controller: claudeController, host: harness.host)
+            let ownership = session.activeRunOwnership
             session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "restore me")]
             session.pendingNonCodexUserInputTokenQueue = [7]
 
@@ -411,8 +422,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
             XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
             XCTAssertEqual(session.pendingNonCodexUserInputTokenQueue, [7])
+            XCTAssertEqual(session.runState, .running)
+            XCTAssertEqual(session.activeRunOwnership, ownership)
+            XCTAssertNil(session.lastTerminalCommitRevision)
+            XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
             XCTAssertTrue(recorder.contains("draft:restore me"))
             XCTAssertFalse(recorder.contains("delivered"))
+            XCTAssertFalse(recorder.contains(prefix: "commit:"))
             assertOrderedEvents(["idle", "claude:interrupt:interrupt", "claude:send", "draft:restore me"], in: recorder)
         }
     }
@@ -684,7 +700,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             fixture.host.test_installLiveSession(fixture.session)
             XCTAssertTrue(Self.processIsRunning(fixture.processID), name)
 
-            await fixture.host.handleComposeTabsWillClose([fixture.session.tabID], reason: reason)
+            await fixture.host.handleComposeTabsDidRemove([fixture.session.tabID], reason: reason)
 
             XCTAssertNil(fixture.session.acpController, name)
             XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)
@@ -701,16 +717,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     func testTerminalBarrierRejectsStaleOwnership() async {
         let recorder = LifecycleRecorder()
-        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let hooks = makeHooks(recorder: recorder)
+        let barrier = AgentRunTerminalCommitBarrier()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let staleOwnership = session.beginRunAttempt(source: "test.stale")
         session.endRunAttempt(ifCurrent: staleOwnership, source: "test.rotate")
         let currentOwnership = session.beginRunAttempt(source: "test.current")
 
         let staleRevision = await barrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: staleOwnership,
             expectedRunID: session.runID,
             terminalState: .completed,
@@ -728,18 +745,22 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     func testNewAttemptResetsProviderDrainGenerationAcrossProviderFamilies() async {
         let recorder = LifecycleRecorder()
-        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let hooks = makeHooks(recorder: recorder)
+        let barrier = AgentRunTerminalCommitBarrier()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let codexOwnership = session.beginRunAttempt(source: "test.codex")
-        session.providerTerminalDrainGeneration = 4
+        for _ in 0 ..< 4 {
+            session.bumpProviderTerminalDrainGeneration()
+        }
+        XCTAssertEqual(session.providerTerminalDrainGeneration, 4)
         _ = session.endRunAttempt(ifCurrent: codexOwnership, source: "test.rotate")
 
         let claudeOwnership = session.beginRunAttempt(source: "test.claude")
         XCTAssertEqual(session.providerTerminalDrainGeneration, 0)
         let revision = await barrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: claudeOwnership,
             expectedRunID: session.runID,
             terminalState: .completed,
@@ -777,7 +798,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("commit:\(revision.commitID.uuidString)")
             }
         )
-        let session = makeRunningClaudeSession(controller: controller)
+        let session = makeRunningClaudeSession(controller: controller, host: harness.host)
         session.pendingAssistantDelta = "buffered terminal tail"
 
         await harness.service.cancelRun(
@@ -822,7 +843,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.codexBufferedCancellation")
         let baselineDrainGeneration = session.providerTerminalDrainGeneration
         session.codexController = controller
@@ -894,13 +915,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     : .accepted(successorEpoch: nil)
             }
         )
-        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let barrier = AgentRunTerminalCommitBarrier()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.retryPublication")
         let request = AgentRunTerminalCommitBarrier.Request(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .completed,
@@ -921,6 +942,70 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(publicationAttempts, 2)
         XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
         XCTAssertEqual(recorder.events.count(where: { $0 == "assistant-flush" }), 1)
+    }
+
+    func testFailedTerminalCommitStampsFailureReasonAndDuplicateSettlementPreservesIt() async throws {
+        let recorder = LifecycleRecorder()
+        var envelopeFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+        var publishedFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+        var publicationAttempts = 0
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, revision, _ in
+                publicationAttempts += 1
+                publishedFailureReasons.append(revision.failureReason)
+                return publicationAttempts == 1
+                    ? .rejected(reason: "test_transient_rejection")
+                    : .accepted(successorEpoch: nil)
+            },
+            makeTerminalPublicationEnvelope: { _, _, _, _, failureReason in
+                envelopeFailureReasons.append(failureReason)
+                return nil
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.installRunID(UUID())
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.failureReasonStamp")
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("Provider request timed out after 60 seconds", sequenceIndex: 1)
+            ],
+            compact: false
+        )
+        let request = AgentRunTerminalCommitBarrier.Request(
+            binding: hooks.bindTerminalSession(session),
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .failed,
+            source: "test.failureReasonStamp",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        )
+
+        let firstResult = await barrier.commit(request)
+        let first = try XCTUnwrap(firstResult)
+        XCTAssertEqual(first.failureReason, .timeout)
+        XCTAssertEqual(envelopeFailureReasons, [.timeout])
+        XCTAssertEqual(publishedFailureReasons, [.timeout])
+
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("question", sequenceIndex: 0),
+                .error("transport closed unexpectedly", sequenceIndex: 1)
+            ],
+            compact: false
+        )
+        let duplicateResult = await barrier.commit(request)
+        let duplicate = try XCTUnwrap(duplicateResult)
+        XCTAssertEqual(duplicate, first)
+        XCTAssertEqual(duplicate.failureReason, .timeout)
+        XCTAssertEqual(envelopeFailureReasons, [.timeout])
+        XCTAssertEqual(publishedFailureReasons, [.timeout, .timeout])
     }
 
     func testQueuedFollowUpStartsOnlyAfterCanonicalSuccessorPublicationResolves() async {
@@ -955,19 +1040,19 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ? .rejected(reason: "test_transient_rejection")
                     : .accepted(successorEpoch: successor)
             },
-            makeTerminalPublicationEnvelope: { _, _, _, _ in
+            makeTerminalPublicationEnvelope: { _, _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
             startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
         )
-        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let barrier = AgentRunTerminalCommitBarrier()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         session.pendingInstructions = ["continue"]
         let ownership = session.beginRunAttempt(source: "test.followUpPublication")
         let request = AgentRunTerminalCommitBarrier.Request(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .completed,
@@ -1002,15 +1087,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     : .accepted(successorEpoch: nil)
             }
         )
-        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let barrier = AgentRunTerminalCommitBarrier()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .running
         session.pendingInstructions = ["unrelated generic instruction"]
         let ownership = session.beginRunAttempt(source: "test.providerSuccessor")
         let successorID = UUID()
         let request = AgentRunTerminalCommitBarrier.Request(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .completed,
@@ -1043,6 +1128,163 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.lastTerminalCommitRevision?.providerSuccessorID, successorID)
     }
 
+    func testTerminalBindingMutatesOnlyExactPredecessorWhenTabIDIsRecycled() async {
+        let recorder = LifecycleRecorder()
+        let recycledTabID = UUID()
+
+        let predecessor = AgentModeViewModel.TabSession(tabID: recycledTabID)
+        predecessor.installRunID(UUID())
+        predecessor.runState = .running
+        predecessor.activeAgentRunStartedAt = Date(timeIntervalSince1970: 1)
+        predecessor.pendingInstructions = ["continue predecessor"]
+        let predecessorOwnership = predecessor.beginRunAttempt(source: "test.predecessor")
+
+        let successor = AgentModeViewModel.TabSession(tabID: recycledTabID)
+        successor.installRunID(UUID())
+        successor.runState = .running
+        let successorStartedAt = Date(timeIntervalSince1970: 2)
+        successor.activeAgentRunStartedAt = successorStartedAt
+        successor.saveRequestGeneration = 41
+        let successorOwnership = successor.beginRunAttempt(source: "test.successor")
+
+        var inactiveSession: AgentModeViewModel.TabSession?
+        var savedSession: AgentModeViewModel.TabSession?
+        var followUpSession: AgentModeViewModel.TabSession?
+        var followUpText: String?
+        let hooks = makeHooks(
+            recorder: recorder,
+            setAgentRunActive: { session, isActive in
+                XCTAssertFalse(isActive)
+                inactiveSession = session
+                session.activeAgentRunStartedAt = nil
+            },
+            scheduleSave: { session in
+                savedSession = session
+                session.saveRequestGeneration &+= 1
+            },
+            startFollowUpRun: { session, text in
+                followUpSession = session
+                followUpText = text
+                session.mcpFollowUpRunPending = false
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier()
+
+        let revision = await barrier.commit(.init(
+            binding: hooks.bindTerminalSession(predecessor),
+            ownership: predecessorOwnership,
+            expectedRunID: predecessor.runID,
+            terminalState: .completed,
+            source: "test.predecessor",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: true,
+            notifyTurnComplete: false
+        ))
+
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(predecessor.runState, .completed)
+        XCTAssertNil(predecessor.activeRunOwnership)
+        XCTAssertEqual(predecessor.lastTerminalCommitRevision, revision)
+        XCTAssertTrue(inactiveSession === predecessor)
+        XCTAssertTrue(savedSession === predecessor)
+        XCTAssertTrue(followUpSession === predecessor)
+        XCTAssertEqual(followUpText, "continue predecessor")
+        XCTAssertNil(predecessor.activeAgentRunStartedAt)
+        XCTAssertEqual(predecessor.saveRequestGeneration, 1)
+        XCTAssertTrue(predecessor.pendingInstructions.isEmpty)
+        XCTAssertFalse(predecessor.mcpFollowUpRunPending)
+        XCTAssertEqual(successor.runState, .running)
+        XCTAssertEqual(successor.activeRunOwnership, successorOwnership)
+        XCTAssertNil(successor.lastTerminalCommitRevision)
+        XCTAssertEqual(successor.activeAgentRunStartedAt, successorStartedAt)
+        XCTAssertEqual(successor.saveRequestGeneration, 41)
+    }
+
+    func testSessionNeutralRequestPreservesDuplicateSettlementAndExplicitFailurePrecedence() async throws {
+        let barrier = AgentRunTerminalCommitBarrier()
+        let probe = NeutralTerminalBindingProbe()
+        let runID = UUID()
+        probe.lifecycle.installRunID(runID)
+        let ownership = probe.lifecycle.beginAttempt(
+            context: .init(tabID: probe.tabID, persistentSessionID: nil)
+        )
+        probe.latestFailureText = "Provider request timed out after 60 seconds"
+        let request = AgentRunTerminalCommitBarrier.Request(
+            binding: probe.makeBinding(),
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .failed,
+            source: "test.neutralRequest",
+            failureReason: .processCrash,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        )
+
+        let firstResult = await barrier.commit(request)
+        let first = try XCTUnwrap(firstResult)
+        XCTAssertEqual(first.failureReason, .processCrash)
+        XCTAssertEqual(probe.runState, .failed)
+        XCTAssertEqual(probe.envelopeFailureReasons, [.processCrash])
+        XCTAssertEqual(probe.publishedFailureReasons, [.processCrash])
+        XCTAssertEqual(probe.lifecycle.lastTerminalPublicationResult, .rejected(reason: "test_transient_rejection"))
+
+        probe.latestFailureText = "A later generic agent error"
+        let duplicateResult = await barrier.commit(request)
+        let duplicate = try XCTUnwrap(duplicateResult)
+
+        XCTAssertEqual(duplicate, first)
+        XCTAssertEqual(duplicate.failureReason, .processCrash)
+        XCTAssertEqual(probe.flushCount, 1)
+        XCTAssertEqual(probe.publicationAttempts, 2)
+        XCTAssertEqual(probe.envelopeFailureReasons, [.processCrash])
+        XCTAssertEqual(probe.publishedFailureReasons, [.processCrash, .processCrash])
+        XCTAssertEqual(probe.lifecycle.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
+    }
+
+    func testTerminalPublicationWaitDependsOnlyOnAttemptLifecycle() async {
+        let barrier = AgentRunTerminalCommitBarrier()
+        let lifecycle = AgentRunAttemptLifecycle()
+        let runID = UUID()
+        let tabID = UUID()
+        lifecycle.installRunID(runID)
+        let ownership = lifecycle.beginAttempt(
+            context: .init(tabID: tabID, persistentSessionID: nil)
+        )
+        XCTAssertTrue(lifecycle.beginTerminalCommit())
+
+        let waiterStarted = expectation(description: "lifecycle waiter started")
+        var waiterReturned = false
+        let waiter = Task { @MainActor in
+            waiterStarted.fulfill()
+            await barrier.awaitTerminalPublication(for: ownership, lifecycle: lifecycle)
+            waiterReturned = true
+        }
+        await fulfillment(of: [waiterStarted])
+        XCTAssertFalse(waiterReturned)
+
+        lifecycle.stageTerminalRevision(.init(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: .completed,
+            failureReason: nil,
+            expectedRunID: runID,
+            sourceItemsRevision: 0,
+            assistantDeltaFlushGeneration: 0,
+            providerDrainGeneration: 0,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        ))
+        lifecycle.completeTerminalCommit()
+        await waiter.value
+
+        XCTAssertTrue(waiterReturned)
+        await barrier.awaitTerminalTeardown(for: ownership, lifecycle: lifecycle)
+    }
+
     func testConcurrentPublicationOnlyCancellationWaitsForCanonicalPublication() async throws {
         let recorder = LifecycleRecorder()
         let publicationGate = LifecyclePublicationGate()
@@ -1057,7 +1299,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.blockedPublication")
 
         let firstCancelTask = Task {
@@ -1112,7 +1354,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.slowDisposal")
         session.provider = provider
 
@@ -1155,7 +1397,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.awaitTeardown")
         session.provider = provider
 
@@ -1198,7 +1440,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.lateAwaitTeardown")
         session.provider = provider
 
@@ -1242,7 +1484,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test.executionLocation")
         session.provider = provider
 
@@ -1284,7 +1526,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.runState = .running
-            session.runID = UUID()
+            session.installRunID(UUID())
             session.beginRunAttempt(source: "test")
 
             switch row {
@@ -1389,7 +1631,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .codexExec
-        session.runID = runID
+        session.installRunID(runID)
         session.runState = .running
         session.codexConversationID = "lifecycle"
         session.codexController = controller
@@ -1606,9 +1848,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
             AgentSessionRunState,
-            UUID?
+            UUID?,
+            AgentRunMCPSnapshot.FailureReason?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
-        startFollowUpRun: ((UUID, String) -> Void)? = nil
+        setAgentRunActive: ((AgentModeViewModel.TabSession, Bool) -> Void)? = nil,
+        scheduleSave: ((AgentModeViewModel.TabSession) -> Void)? = nil,
+        startFollowUpRun: ((AgentModeViewModel.TabSession, String) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
             recorder.record("assistant-flush")
@@ -1617,47 +1862,69 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("commit:\(revision.commitID.uuidString)")
         }
         return AgentModeRunService.Hooks(
-            estimateRuntimeTokens: { $0.count },
-            addUserInputTokensToActiveNonCodexTurn: { tokens, _ in recorder.record("tokens:\(tokens)") },
-            startNonCodexTurnAccountingIfNeeded: { _, _ in },
-            reserveAttachmentsForTurn: { _, _ in nil },
-            markAttachmentsConsumed: { _, _ in },
-            stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
-            consumeDeferredAttachmentCleanup: { _, _ in },
-            finalizeAttachmentsForTurn: { _, _, disposition in recorder.record("attachments:\(disposition)") },
-            setAgentRunActive: { _, isActive in recorder.record("run-active:\(isActive)") },
-            updateBindings: { _ in recorder.record("bindings") },
-            requestUIRefresh: { _, _ in },
-            scheduleSave: { _ in recorder.record("save") },
-            notifyAgentTurnComplete: { _ in },
-            handleHeadlessStreamResult: { _, _, _, _ in },
-            buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
-            finalizeStreamingItems: { _ in },
-            finalizePendingToolCalls: { _, _ in },
-            finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-            finalizeNonCodexTurnUsage: { _, _, _, _ in },
-            cancelPendingQuestion: { _ in },
-            cancelPendingApproval: { _ in },
-            cancelPendingApplyEditsReview: { _, _ in },
-            cancelPendingWorktreeMergeReview: { _, _ in },
-            flushPendingAssistantDelta: flushPendingAssistantDelta,
-            clearPendingAssistantDelta: { _ in },
-            prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
-            publishTerminalCommit: { session, revision, successorKind in
-                if let publishTerminalCommitResult {
-                    return await publishTerminalCommitResult(session, revision, successorKind)
+            usage: .init(
+                estimateRuntimeTokens: { $0.count },
+                addUserInputTokensToActiveNonCodexTurn: { tokens, _ in recorder.record("tokens:\(tokens)") },
+                startNonCodexTurnAccountingIfNeeded: { _, _ in },
+                finalizeNonCodexTurnUsage: { _, _, _, _ in }
+            ),
+            attachments: .init(
+                reserveAttachmentsForTurn: { _, _ in nil },
+                markAttachmentsConsumed: { _, _ in },
+                stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
+                consumeDeferredAttachmentCleanup: { _, _ in },
+                finalizeAttachmentsForTurn: { _, _, disposition in recorder.record("attachments:\(disposition)") }
+            ),
+            presentation: .init(
+                setAgentRunActive: setAgentRunActive ?? { _, isActive in recorder.record("run-active:\(isActive)") },
+                requestUIRefresh: { _, _ in },
+                notifyAgentTurnComplete: { _ in }
+            ),
+            bindingObservation: .init(
+                updateBindings: { _ in recorder.record("bindings") }
+            ),
+            queuedWorkRecovery: .init(
+                restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") }
+            ),
+            persistence: .init(
+                scheduleSave: scheduleSave ?? { _ in recorder.record("save") }
+            ),
+            transcript: .init(
+                handleHeadlessStreamResult: { _, _, _, _ in },
+                finalizeStreamingItems: { _ in },
+                finalizePendingToolCalls: { _, _ in },
+                finalizePendingToolCallsWithUpperBound: { _, _, _ in },
+                flushPendingAssistantDelta: flushPendingAssistantDelta,
+                clearPendingAssistantDelta: { _ in }
+            ),
+            providerInput: .init(
+                buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
+                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                stageResumeRecoveryHandoffIfNeeded: { _ in },
+                prependPendingHandoffIfNeeded: { text, _ in text },
+                recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") }
+            ),
+            interactions: .init(
+                cancelPendingQuestion: { _ in },
+                cancelPendingApproval: { _ in },
+                cancelPendingApplyEditsReview: { _, _ in },
+                cancelPendingWorktreeMergeReview: { _, _ in }
+            ),
+            terminalSettlement: .init(
+                prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
+                makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _, _ in nil },
+                publishTerminalCommit: { session, revision, successorKind in
+                    if let publishTerminalCommitResult {
+                        return await publishTerminalCommitResult(session, revision, successorKind)
+                    }
+                    await publishTerminalCommit(session, revision)
+                    return .accepted(successorEpoch: nil)
                 }
-                await publishTerminalCommit(session, revision)
-                return .accepted(successorEpoch: nil)
-            },
-            startFollowUpRun: startFollowUpRun ?? { _, _ in },
-            restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
-            stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
-            signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+            ),
+            continuation: .init(
+                startFollowUpRun: startFollowUpRun ?? { _, _ in },
+                signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+            )
         )
     }
 
@@ -1693,7 +1960,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .openCode
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.runState = .completed
         session.acpController = controller
         return RetainedACPFixture(
@@ -1704,13 +1971,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
-    func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
+    func makeRunningClaudeSession(
+        controller: LifecycleFakeNativeController,
+        host: AgentModeViewModel? = nil
+    ) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         session.claudeController = controller
+        host?.test_installLiveSession(session)
         return session
     }
 
@@ -1735,7 +2006,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .openCode
         session.runState = .running
-        session.runID = UUID()
+        session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         session.acpController = controller
         return session
@@ -2058,6 +2329,68 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             }
             cursor = index + 1
         }
+    }
+}
+
+@MainActor
+private final class NeutralTerminalBindingProbe {
+    let tabID = UUID()
+    let lifecycle = AgentRunAttemptLifecycle()
+
+    var runState: AgentSessionRunState = .running
+    var latestFailureText: String?
+    var flushCount = 0
+    var publicationAttempts = 0
+    var envelopeFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+    var publishedFailureReasons: [AgentRunMCPSnapshot.FailureReason?] = []
+
+    func makeBinding() -> AgentRunTerminalSessionBinding {
+        AgentRunTerminalSessionBinding(
+            tabID: tabID,
+            lifecycle: lifecycle,
+            hooks: .init(
+                flushPendingAssistantDelta: { self.flushCount += 1 },
+                finalizeStreamingItems: {},
+                finalizePendingToolCalls: { _ in },
+                finalizeNonCodexTurnUsage: {},
+                cancelPendingInteractions: { _ in },
+                finalizeAttachments: { _, _ in },
+                setAgentRunInactive: {},
+                prepareTerminalPublication: {},
+                makeTerminalPublicationEnvelope: { _, _, _, failureReason in
+                    self.envelopeFailureReasons.append(failureReason)
+                    return nil
+                },
+                updateBindings: {},
+                notifyAgentTurnComplete: {},
+                scheduleSave: {},
+                publishTerminalCommit: { revision, _ in
+                    self.publicationAttempts += 1
+                    self.publishedFailureReasons.append(revision.failureReason)
+                    return self.publicationAttempts == 1
+                        ? .rejected(reason: "test_transient_rejection")
+                        : .accepted(successorEpoch: nil)
+                },
+                startFollowUpRun: { _ in }
+            ),
+            validatesOwnership: { ownership, expectedRunID in
+                self.lifecycle.isCurrentAttempt(ownership, expectedRunID: expectedRunID)
+            },
+            providerDrainGeneration: { 0 },
+            terminalTurnID: { nil },
+            queuedFollowUp: { nil },
+            setFollowUpPending: { _ in },
+            removeFirstQueuedFollowUp: { nil },
+            appendError: { self.latestFailureText = $0 },
+            finishActiveState: { ownership, terminalState, _ in
+                self.runState = terminalState
+                _ = self.lifecycle.endAttempt(ifCurrent: ownership)
+            },
+            retainProcessRunIdentity: { _, _ in },
+            sourceItemsRevision: { 0 },
+            assistantDeltaFlushGeneration: { 0 },
+            latestFailureText: { self.latestFailureText }
+        )
     }
 }
 

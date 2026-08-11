@@ -1,5 +1,6 @@
 import CoreServices
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
@@ -489,6 +490,14 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingLimiter")
         let service = try await makeService(root: root)
         let limit = FileSystemService.contentReadWorkerLimitForTesting
+        XCTAssertEqual(limit, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        let initialSnapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
+        XCTAssertEqual(initialSnapshot.capacity, limit)
+        XCTAssertEqual(
+            initialSnapshot.backgroundPermitLimit,
+            ContentReadConcurrencyCapacity.maximumConcurrentBulkReads
+        )
+        guard limit <= 32 else { return }
         let readCount = limit + 2
         for index in 0 ..< readCount {
             try FileSystemTestSupport.write("file-\(index)", to: root.appendingPathComponent("File-\(index).txt"))
@@ -661,6 +670,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         func testContentReadSchedulerBoundsQueueCancelsWaitersAndReturnsIdle() async throws {
             let limiter = ContentReadAsyncLimiter(
                 capacity: 1,
+                bulkPermitLimit: 1,
                 maxQueuedWaiterCount: 1,
                 retryAfterMilliseconds: 777
             )
@@ -711,6 +721,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
 
             let reserveLimiter = ContentReadAsyncLimiter(
                 capacity: 1,
+                bulkPermitLimit: 1,
                 maxQueuedWaiterCount: 2,
                 retryAfterMilliseconds: 777
             )
@@ -758,7 +769,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         func testContentReadSchedulerPrioritizesInteractiveWaitersOverBulk() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 4)
+            let limiter = ContentReadAsyncLimiter(capacity: 1, bulkPermitLimit: 1, maxQueuedWaiterCount: 4)
             let gate = AsyncGate()
             let recorder = AsyncValueRecorder()
 
@@ -802,7 +813,11 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             ]
 
             for capacity in 2 ... 4 {
-                let limiter = ContentReadAsyncLimiter(capacity: capacity, maxQueuedWaiterCount: 12)
+                let limiter = ContentReadAsyncLimiter(
+                    capacity: capacity,
+                    bulkPermitLimit: capacity - 1,
+                    maxQueuedWaiterCount: 12
+                )
                 let backgroundGate = AsyncGate()
                 let backgroundStarted = AsyncCounter()
                 let searchGate = AsyncGate()
@@ -871,8 +886,41 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             }
         }
 
+        func testContentReadSchedulerUsesDistinctBoundedBulkLimitOnHighCapacityHost() async throws {
+            let limiter = ContentReadAsyncLimiter(
+                capacity: 8,
+                bulkPermitLimit: 3,
+                maxQueuedWaiterCount: 4
+            )
+            let gate = AsyncGate()
+            let started = AsyncCounter()
+            let tasks = (0 ..< 4).map { _ in
+                Task {
+                    try await limiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
+                        _ = await started.incrementAndValue()
+                        await gate.markStartedAndWaitForRelease()
+                    }
+                }
+            }
+
+            let capped = await waitForLimiterSnapshot(limiter) {
+                $0.activeBackgroundPermitCount == 3 && $0.queuedWaiterCount == 1
+            }
+            XCTAssertEqual(capped.capacity, 8)
+            XCTAssertEqual(capped.backgroundPermitLimit, 3)
+            let startedCount = await started.value()
+            XCTAssertEqual(startedCount, 3)
+
+            await gate.release()
+            for task in tasks {
+                _ = try await task.value
+            }
+            let idle = await limiter.snapshotForTesting()
+            XCTAssertTrue(idle.isIdle)
+        }
+
         func testCancelledActiveBackgroundReadRetainsPermitUntilBodyReturns() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 2, maxQueuedWaiterCount: 4)
+            let limiter = ContentReadAsyncLimiter(capacity: 2, bulkPermitLimit: 1, maxQueuedWaiterCount: 4)
             let firstGate = AsyncGate()
             let secondGate = AsyncGate()
             let sensitiveGate = AsyncGate()
@@ -928,6 +976,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
                 let clock = ContentReadTestClock()
                 let limiter = ContentReadAsyncLimiter(
                     capacity: 1,
+                    bulkPermitLimit: 1,
                     maxQueuedWaiterCount: 4,
                     agePromotionNanoseconds: 10_000_000,
                     nowUptimeNanoseconds: { clock.now() }
@@ -968,7 +1017,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         func testContentReadSchedulerForegroundTokensBlockCodemapReplacementUntilFinalEnd() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 8)
+            let limiter = ContentReadAsyncLimiter(capacity: 1, bulkPermitLimit: 1, maxQueuedWaiterCount: 8)
             let activeGate = AsyncGate()
             let recorder = AsyncValueRecorder()
             let active = Task {
@@ -1024,7 +1073,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         func testForegroundActivityTokensCleanUpOnSuccessErrorAndCancellation() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 2)
+            let limiter = ContentReadAsyncLimiter(capacity: 1, bulkPermitLimit: 1, maxQueuedWaiterCount: 2)
 
             let value = await limiter.withForegroundActivity(kind: .rootLoad) {
                 let active = await limiter.snapshotForTesting()
@@ -1071,7 +1120,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         func testContentReadSchedulerRoundRobinsOwnersWhilePreservingOwnerFIFO() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 8)
+            let limiter = ContentReadAsyncLimiter(capacity: 1, bulkPermitLimit: 1, maxQueuedWaiterCount: 8)
             let gate = AsyncGate()
             let recorder = AsyncValueRecorder()
             let ownerA = UUID()

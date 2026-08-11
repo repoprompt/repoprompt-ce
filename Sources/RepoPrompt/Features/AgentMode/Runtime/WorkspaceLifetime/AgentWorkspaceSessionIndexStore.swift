@@ -36,8 +36,7 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
 
     /// Called when `sessionIndex`, `sessionListSortDates`, or
     /// `sessionListCacheReady` changes. The delegate dispatches to
-    /// `syncSidebarUIState` and `scheduleSidebarAutoArchiveIfReady` as
-    /// appropriate for the reason.
+    /// `syncSidebarUIState` as appropriate for the reason.
     func sessionIndexStore(
         _ store: AgentWorkspaceSessionIndexStore,
         didChangeStateWithReason reason: SessionIndexStateChangeReason

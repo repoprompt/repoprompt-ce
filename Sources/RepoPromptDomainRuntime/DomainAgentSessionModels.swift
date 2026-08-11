@@ -400,6 +400,10 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         case agentError = "agent_error"
         case cancelled
 
+        /// Fallback heuristic for restored/legacy snapshots whose terminal
+        /// settlement did not stamp a canonical failure reason. Live terminal
+        /// classification is resolved exactly once by the terminal settlement
+        /// authority; this text inference must not become the primary path.
         package static func classify(status: Status, statusText: String?) -> FailureReason? {
             if status == .cancelled { return .cancelled }
             guard status == .failed else { return nil }

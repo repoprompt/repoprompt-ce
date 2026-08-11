@@ -546,6 +546,8 @@ struct WorkspaceCodemapBindingEngineHooks {
     ) async -> Void
     let afterManifestStoreWriteBeforeCompletion: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
     #if DEBUG
+        /// Deterministic async race seam immediately before manifest persistence.
+        let beforeManifestStoreWrite: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
         /// Deterministic race seam, structurally absent from non-DEBUG products.
         let afterPublishedArtifactLookupBeforeCurrentnessValidation: @Sendable (
             WorkspaceCodemapRootEpoch
@@ -565,6 +567,7 @@ struct WorkspaceCodemapBindingEngineHooks {
             afterManifestRevisionQueuedBeforeWaiterInstall
         self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
         #if DEBUG
+            beforeManifestStoreWrite = { _ in }
             afterPublishedArtifactLookupBeforeCurrentnessValidation = { _ in }
         #endif
     }
@@ -587,6 +590,32 @@ struct WorkspaceCodemapBindingEngineHooks {
             self.afterManifestRevisionQueuedBeforeWaiterInstall =
                 afterManifestRevisionQueuedBeforeWaiterInstall
             self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            beforeManifestStoreWrite = { _ in }
+            self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
+                afterPublishedArtifactLookupBeforeCurrentnessValidation
+        }
+
+        init(
+            debugBeforeManifestStoreWrite: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void,
+            event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+            afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch,
+                UInt64
+            ) async -> Void = { _, _ in },
+            afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in },
+            afterPublishedArtifactLookupBeforeCurrentnessValidation: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in }
+        ) {
+            self.event = event
+            self.afterManifestRevisionQueuedBeforeWaiterInstall =
+                afterManifestRevisionQueuedBeforeWaiterInstall
+            self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            beforeManifestStoreWrite = debugBeforeManifestStoreWrite
             self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
                 afterPublishedArtifactLookupBeforeCurrentnessValidation
         }

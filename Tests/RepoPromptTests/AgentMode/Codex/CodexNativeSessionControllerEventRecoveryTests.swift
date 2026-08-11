@@ -5,6 +5,16 @@ import XCTest
 final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
     private static let webSearchAliases = ["search", "web_search", "web_search_request", "google_web_search", "search_web"]
 
+    func testExternalToolNameNormalizationRejectsOversizedInputBeforeCanonicalization() {
+        let oversizedName = String(repeating: "x", count: AgentToolNamePolicy.maximumUTF8Length + 1)
+
+        XCTAssertNil(CodexNativeSessionController.test_normalizedExternalToolName(oversizedName))
+        XCTAssertEqual(
+            CodexNativeSessionController.test_normalizedExternalToolName(" functions.exec_command "),
+            "bash"
+        )
+    }
+
     func testRawExecCallIDAndSnapshotItemIDShareOnlyOpaqueProcessHandle() async throws {
         let controller = makeControllerWithThread(turnID: "turn-1")
         await controller.test_handleNotification(

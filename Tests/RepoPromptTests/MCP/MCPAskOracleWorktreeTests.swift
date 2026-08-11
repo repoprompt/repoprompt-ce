@@ -1298,7 +1298,7 @@ import XCTest
                         let runID = UUID()
                         targetRunID = runID
                         let session = viewModel.session(for: tabID)
-                        session.runID = runID
+                        session.installRunID(runID)
                         session.runState = .running
                         guard viewModel.mcpBindPendingAgentRunOracleReviewContext(
                             tabID: tabID,
@@ -1609,7 +1609,7 @@ import XCTest
                         let runID = UUID()
                         targetRunID = runID
                         let session = viewModel.session(for: tabID)
-                        session.runID = runID
+                        session.installRunID(runID)
                         session.runState = .running
                         guard viewModel.mcpBindPendingAgentRunOracleReviewContext(
                             tabID: tabID,
@@ -2024,7 +2024,7 @@ import XCTest
                                 sessionID: sourceSessionID
                             )
                             sourceSession.worktreeBindings = bindings
-                            sourceSession.runID = sourceRunID
+                            sourceSession.installRunID(sourceRunID)
                             try window.mcpServer.bindTabForConnection(
                                 connectionID: startConnectionID,
                                 clientName: sourceClientName,
@@ -2068,7 +2068,7 @@ import XCTest
                             let runID = UUID()
                             targetRunID = runID
                             let session = viewModel.session(for: tabID)
-                            session.runID = runID
+                            session.installRunID(runID)
                             session.runState = .running
                             guard viewModel.mcpBindPendingAgentRunOracleReviewContext(
                                 tabID: tabID,

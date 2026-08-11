@@ -545,6 +545,36 @@ actor WorkspaceFileContextStore {
             }
         }
 
+        func wait() async {
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else {
+                        continuation.resume()
+                        return
+                    }
+
+                    lock.lock()
+                    guard !didComplete else {
+                        lock.unlock()
+                        continuation.resume()
+                        return
+                    }
+                    waitersByID[waiterID] = Waiter(
+                        continuation: continuation,
+                        deadlineTask: nil
+                    )
+                    lock.unlock()
+
+                    if Task.isCancelled {
+                        resume(waiterID)
+                    }
+                }
+            } onCancel: {
+                self.resume(waiterID)
+            }
+        }
+
         func resolve() {
             lock.lock()
             guard !didComplete else {
@@ -13096,6 +13126,7 @@ actor WorkspaceFileContextStore {
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
         bundle?.close()
         if let engine = session.engine {
+            await codemapCancellationCleanupHook(ticket)
             _ = await engine.cancel(owner: record.owner)
         }
         guard !Task.isCancelled else { return .unavailable(.cancelled) }
@@ -14171,6 +14202,25 @@ actor WorkspaceFileContextStore {
                 codemapTicketsShareDemand(record.ticket, ticket)
             else { return 0 }
             return record.completion.waiterCount
+        }
+
+        func waitForCodemapArtifactDemandCompletionForTesting(
+            _ ticket: WorkspaceCodemapArtifactDemandTicket
+        ) async -> WorkspaceCodemapArtifactDemandResult {
+            guard codemapDemandIsCurrent(ticket),
+                  let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  record.retainIDs.contains(ticket.retainID)
+            else {
+                return .unavailable(.staleCurrentness)
+            }
+            let current = codemapDemandResult(record.result, for: ticket)
+            guard case .pending = current, record.task != nil else {
+                return current
+            }
+            await record.completion.wait()
+            return codemapArtifactDemandStatus(ticket)
         }
 
         func codemapArtifactDemandRetainCountForTesting(

@@ -463,6 +463,16 @@ final class MCPServerViewModel: ObservableObject {
             try await oracleToolService.executeAskOracle(args: args)
         }
 
+        func resolveAgentSessionLifecycleMutationTargetForTesting(
+            connectionID: UUID?
+        ) async throws -> AgentSessionLifecycleAuthority.MutationTarget {
+            try await resolveAgentSessionLifecycleMutationTarget(
+                args: [:],
+                connectionID: connectionID,
+                intent: .setStatus
+            )
+        }
+
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
         ) {
@@ -1117,9 +1127,13 @@ final class MCPServerViewModel: ObservableObject {
             }
             return connectionID
         },
-        resolveAgentModeTabID: { [weak self] args, connectionID in
+        resolveAgentModeTabID: { [weak self] args, connectionID, intent in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving agent mode tab") }
-            return try await resolveTabIDForAgentMode(args: args, connectionID: connectionID)
+            return try await resolveAgentSessionLifecycleMutationTarget(
+                args: args,
+                connectionID: connectionID,
+                intent: intent
+            )
         },
         resolveContextBuilderTab: { [weak self] args, targetWindow, connectionID in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving context_builder tab") }
@@ -1533,11 +1547,11 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while building file tree") }
             return try await buildStoreBackedFileTreeResult(mode: mode, maxDepth: maxDepth, startPath: startPath, lookupContext: lookupContext)
         },
-        readSelectedAuthorizedGitArtifact: { [weak self] requestedPath, resolvedPath, startLine1Based, lineCount, metadata, lookupContext in
+        readSelectedAuthorizedGitArtifact: { [weak self] requestedPath, translatedLookupPath, startLine1Based, lineCount, metadata, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while reading selected Git artifact") }
             return try await readSelectedAuthorizedGitArtifact(
                 requestedPath: requestedPath,
-                resolvedPath: resolvedPath,
+                translatedLookupPath: translatedLookupPath,
                 startLine1Based: startLine1Based,
                 lineCount: lineCount,
                 metadata: metadata,
@@ -1548,12 +1562,12 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while reading file") }
             return try await readFile(path: path, startLine1Based: startLine1Based, lineCount: lineCount, lookupRootScope: lookupRootScope)
         },
-        enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, resolvedPhysicalPath, metadata in
+        enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, absolutePhysicalPath, metadata in
             guard let self else { throw MCPError.internalError("Window deallocated while enqueuing read_file auto-selection") }
             try await enqueueReadFileAutoSelection(
                 reply: reply,
                 requestedPath: requestedPath,
-                resolvedPhysicalPath: resolvedPhysicalPath,
+                absolutePhysicalPath: absolutePhysicalPath,
                 metadata: metadata
             )
         },
@@ -3609,7 +3623,8 @@ final class MCPServerViewModel: ObservableObject {
         args: [String: Value],
         connectionID: UUID?
     ) async throws -> UUID {
-        // 1) Explicit _tabID override (hidden param), validated against real tabs.
+        // Oracle tools use this only to anchor context packaging to a compose tab;
+        // they do not mutate or start the tab's Agent session identity.
         let explicitRaw = rawExplicitTabID(args: args)
         let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
         let availableTabIDs = workspaceTabIDs.isEmpty
@@ -3622,7 +3637,6 @@ final class MCPServerViewModel: ObservableObject {
             return explicitUUID
         }
 
-        // 2) Try to get tab from MCP connection context (bound tab)
         let resolvedConnectionID: UUID? = if let connectionID {
             connectionID
         } else {
@@ -3635,14 +3649,12 @@ final class MCPServerViewModel: ObservableObject {
             return boundTab
         }
 
-        // 3) Fallback to active compose tab in the window
         if let activeTab = promptVM.activeComposeTabID,
            composeTabExists(activeTab)
         {
             return activeTab
         }
 
-        // 4) Create a blank tab as a last resort
         if let newTab = await promptVM.ensureActiveComposeTab(
             nil,
             creationStrategy: .blank,
@@ -3654,10 +3666,113 @@ final class MCPServerViewModel: ObservableObject {
         throw MCPError.invalidParams("No active compose tab available; open or create a tab first.")
     }
 
+    private func resolveAgentSessionLifecycleMutationTarget(
+        args: [String: Value],
+        connectionID: UUID?,
+        intent: AgentSessionLifecycleAuthority.Intent
+    ) async throws -> AgentSessionLifecycleAuthority.MutationTarget {
+        // 1) Explicit _tabID override (hidden param), validated against real tabs.
+        let explicitRaw = rawExplicitTabID(args: args)
+        let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
+        let availableTabIDs = workspaceTabIDs.isEmpty
+            ? Set(promptVM.currentComposeTabs.map(\.id))
+            : workspaceTabIDs
+        if let explicitUUID = try Self.resolveExplicitTabIDForAgentMode(
+            rawTabID: explicitRaw,
+            availableTabIDs: availableTabIDs
+        ) {
+            let expectedSessionID = workspaceManager?.composeTab(with: explicitUUID)?.activeAgentSessionID
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: explicitUUID,
+                    expectedSessionID: expectedSessionID,
+                    intent: intent
+                )
+        }
+
+        // 2) Try to get tab from MCP connection context (bound tab)
+        let resolvedConnectionID: UUID? = if let connectionID {
+            connectionID
+        } else {
+            await service.currentRequestConnectionID()
+        }
+        let requiresBoundAgentSessionContext = switch intent {
+        case .setStatus, .shareThoughts, .waitForInstruction, .askUser:
+            true
+        case .createOrContinue, .applyProjection, .providerStart:
+            false
+        }
+        if requiresBoundAgentSessionContext,
+           let resolvedConnectionID
+        {
+            guard let boundContext = tabContextByConnectionID[resolvedConnectionID],
+                  boundContext.windowID == windowID
+            else {
+                throw MCPError.invalidParams(
+                    "The Agent session connection no longer has its bound tab; the operation was not retargeted. Bind the current context again."
+                )
+            }
+            guard composeTabExists(boundContext.tabID) else {
+                throw MCPError.invalidParams(
+                    "The Agent session's bound tab no longer exists; the operation was not retargeted. Bind the current context again."
+                )
+            }
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: boundContext.tabID,
+                    expectedSessionID: boundContext.activeAgentSessionID,
+                    intent: intent
+                )
+        }
+        if let resolvedConnectionID,
+           let boundContext = tabContextByConnectionID[resolvedConnectionID],
+           boundContext.windowID == windowID
+        {
+            guard composeTabExists(boundContext.tabID) else {
+                throw MCPError.invalidParams(
+                    "The Agent session's bound tab no longer exists; the operation was not retargeted. Bind the current context again."
+                )
+            }
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: boundContext.tabID,
+                    expectedSessionID: boundContext.activeAgentSessionID,
+                    intent: intent
+                )
+        }
+
+        // 3) Fallback to active compose tab in the window
+        if let activeTab = promptVM.activeComposeTabID,
+           composeTabExists(activeTab)
+        {
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: activeTab,
+                    expectedSessionID: nil,
+                    intent: intent
+                )
+        }
+
+        // 4) Create a blank tab as a last resort
+        if let newTab = await promptVM.ensureActiveComposeTab(
+            nil,
+            creationStrategy: .blank,
+            name: nil
+        ) {
+            return try requireTargetWindow().agentModeViewModel
+                .resolveAgentSessionLifecycleMutationTarget(
+                    tabID: newTab.id,
+                    expectedSessionID: newTab.activeAgentSessionID,
+                    intent: intent
+                )
+        }
+
+        throw MCPError.invalidParams("No active compose tab available; open or create a tab first.")
+    }
+
     /// Resolves an explicit `_tabID` from the args, returning nil when not provided.
-    /// Unlike `resolveExistingTabIDForAgentControl`, this does NOT fall back to the
-    /// connection-bound tab or active tab. This ensures run-starting operations
-    /// (agent_run.start) creates a fresh session by default.
+    /// This does not fall back to the connection-bound or active tab. Run-starting
+    /// operations therefore create a fresh session by default.
     private func resolveRequestedTabIDForAgentControl(
         args: [String: Value]
     ) throws -> UUID? {
@@ -3669,34 +3784,6 @@ final class MCPServerViewModel: ObservableObject {
             rawTabID: rawExplicitTabID(args: args),
             availableTabIDs: availableTabIDs
         )
-    }
-
-    private func resolveExistingTabIDForAgentControl(
-        args: [String: Value],
-        metadata: RequestMetadata
-    ) async throws -> UUID? {
-        let workspaceTabIDs = Set(workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
-        let availableTabIDs = workspaceTabIDs.isEmpty
-            ? Set(promptVM.currentComposeTabs.map(\.id))
-            : workspaceTabIDs
-        if let explicitUUID = try Self.resolveExplicitTabIDForAgentMode(
-            rawTabID: rawExplicitTabID(args: args),
-            availableTabIDs: availableTabIDs
-        ) {
-            return explicitUUID
-        }
-        if let connectionID = metadata.connectionID,
-           let boundTabID = boundTabID(forConnection: connectionID),
-           composeTabExists(boundTabID)
-        {
-            return boundTabID
-        }
-        if let activeTabID = promptVM.activeComposeTabID,
-           composeTabExists(activeTabID)
-        {
-            return activeTabID
-        }
-        return nil
     }
 
     func bindCurrentRequestToTabIfPossible(
@@ -4212,7 +4299,7 @@ final class MCPServerViewModel: ObservableObject {
     private func enqueueReadFileAutoSelection(
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String,
-        resolvedPhysicalPath: String,
+        absolutePhysicalPath: String,
         metadata: RequestMetadata
     ) async throws {
         #if DEBUG || EDIT_FLOW_PERF
@@ -4270,9 +4357,15 @@ final class MCPServerViewModel: ObservableObject {
         }
         let intent: MCPReadFileAutoSelectionCoordinator.Intent = switch selection {
         case let .full(path):
-            .full(paths: [path])
+            .full(
+                paths: [path],
+                automaticCodemapDisposition: .disableAutomaticPreservingManual
+            )
         case let .slice(entry):
-            .slices(entries: [WorkspaceSelectionSliceInput(path: entry.path, ranges: entry.ranges)])
+            .slices(
+                entries: [WorkspaceSelectionSliceInput(path: entry.path, ranges: entry.ranges)],
+                automaticCodemapDisposition: .disableAutomaticPreservingManual
+            )
         }
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.AutoSelect.selectionProjection,
@@ -4286,7 +4379,7 @@ final class MCPServerViewModel: ObservableObject {
         )
         let coverageIdentity = MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
             intent: intent,
-            resolvedPaths: [resolvedPhysicalPath]
+            resolvedPaths: [absolutePhysicalPath]
         )
         let key = try readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
         let accepted = readFileAutoSelectionCoordinator.enqueue(
@@ -4794,12 +4887,12 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func authoritativeReadFileAutoSelectionResult(
-        mirrorKey: MCPReadFileAutoSelectionCoordinator.TabMirrorKey?,
         changed: Bool,
+        key: MCPReadFileAutoSelectionCoordinator.ContextKey,
         missReason: ReadFileAutoSelectionCoverageCertificateMissReason
     ) -> MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult {
         MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
-            mirrorKey: mirrorKey,
+            mirrorKey: changed ? key.mirrorKey : nil,
             disposition: changed ? .changed : .semanticNoOp,
             coverageCertificateOutcome: .authoritativeFallback(missReason)
         )
@@ -4814,7 +4907,17 @@ final class MCPServerViewModel: ObservableObject {
         // The bound tab context is a routable working snapshot, not canonical selection authority.
         // Handoffs and delayed mirrors can leave it behind the stored compose-tab selection, so
         // every additive read/search batch must rebase on the latest canonical value.
-        var selection = base
+        var selection = switch batch.automaticCodemapDisposition {
+        case .preserve:
+            base
+        case .disableAutomaticPreservingManual:
+            StoredSelection(
+                selectedPaths: base.selectedPaths,
+                manualCodemapPaths: base.manualCodemapPaths,
+                slices: base.slices,
+                codemapAutoEnabled: false
+            )
+        }
 
         if !batch.fullPaths.isEmpty {
             let addResult = await addStoredSelectionPaths(
@@ -4889,8 +4992,8 @@ final class MCPServerViewModel: ObservableObject {
         guard case let .miss(missReason) = certificateLookup else { return .unchanged }
         guard isReadFileAutoSelectionContextCurrent(key), readFileAutoSelectionContext(for: key) != nil else {
             return authoritativeReadFileAutoSelectionResult(
-                mirrorKey: nil,
                 changed: false,
+                key: key,
                 missReason: missReason
             )
         }
@@ -4920,7 +5023,7 @@ final class MCPServerViewModel: ObservableObject {
         } else {
             sliceRebaseCandidates = batch.sliceEntries.map(\.path)
         }
-        var observedCanonicalChange = false
+        var verifiedCanonicalChange = false
 
         // A file projection can register its slice-rebase task after the first wait. Each bounded
         // attempt revalidates path quiescence, the canonical base, and the full persisted result so
@@ -4947,7 +5050,8 @@ final class MCPServerViewModel: ObservableObject {
             )
             if !MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
                 initialSelection,
-                isPreservedBy: authoritativeLookupContext.logicalizeSelection(selection)
+                isPreservedBy: authoritativeLookupContext.logicalizeSelection(selection),
+                automaticCodemapDisposition: batch.automaticCodemapDisposition
             ) {
                 guard let batchIdentity,
                       batchIdentity.isCovered(
@@ -4967,10 +5071,11 @@ final class MCPServerViewModel: ObservableObject {
                 selection: selection,
                 lookupContext: authoritativeLookupContext,
                 contextKey: key,
-                expectedBaseSelection: initialSelection
+                expectedBaseSelection: initialSelection,
+                automaticCodemapDisposition: batch.automaticCodemapDisposition
             ) else { continue }
 
-            observedCanonicalChange = observedCanonicalChange || !authoritativeResult.canonicalUnchanged
+            verifiedCanonicalChange = verifiedCanonicalChange || !authoritativeResult.canonicalUnchanged
             let minted = await mintReadFileAutoSelectionCoverageCertificate(
                 batch: batch,
                 authoritativeResult: authoritativeResult,
@@ -4980,8 +5085,8 @@ final class MCPServerViewModel: ObservableObject {
             )
             if minted {
                 return authoritativeReadFileAutoSelectionResult(
-                    mirrorKey: observedCanonicalChange ? key.mirrorKey : nil,
-                    changed: observedCanonicalChange,
+                    changed: verifiedCanonicalChange,
+                    key: key,
                     missReason: missReason
                 )
             }
@@ -5005,10 +5110,10 @@ final class MCPServerViewModel: ObservableObject {
             if let batchIdentity,
                batchIdentity.isCovered(by: authoritativeLookupContext.physicalizeSelection(finalSelection))
             {
-                let changed = observedCanonicalChange || finalSelection != initialSelection
+                let changed = verifiedCanonicalChange || finalSelection != initialSelection
                 return authoritativeReadFileAutoSelectionResult(
-                    mirrorKey: changed ? key.mirrorKey : nil,
                     changed: changed,
+                    key: key,
                     missReason: missReason
                 )
             }
@@ -5016,8 +5121,8 @@ final class MCPServerViewModel: ObservableObject {
 
         evictReadFileAutoSelectionCoverageCertificate(for: key)
         return authoritativeReadFileAutoSelectionResult(
-            mirrorKey: nil,
-            changed: false,
+            changed: verifiedCanonicalChange,
+            key: key,
             missReason: missReason
         )
     }
@@ -5142,7 +5247,10 @@ final class MCPServerViewModel: ObservableObject {
             )
             return
         }
-        let intent = MCPReadFileAutoSelectionCoordinator.Intent.slices(entries: entries)
+        let intent = MCPReadFileAutoSelectionCoordinator.Intent.slices(
+            entries: entries,
+            automaticCodemapDisposition: .preserve
+        )
         let coverageIdentity = MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
             intent: intent,
             resolvedPaths: resolvedPhysicalPaths
@@ -5953,12 +6061,12 @@ final class MCPServerViewModel: ObservableObject {
     /// Returns both the content slice and metadata about the shown range.
     private func readSelectedAuthorizedGitArtifact(
         requestedPath: String,
-        resolvedPath: String,
+        translatedLookupPath: String,
         startLine1Based: Int?,
         lineCount: Int?,
         metadata: RequestMetadata,
         lookupContext: WorkspaceLookupContext
-    ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)? {
+    ) async throws -> ToolResultDTOs.ReadFileReply? {
         guard var resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: MCPWindowToolName.readFile
@@ -5975,7 +6083,7 @@ final class MCPServerViewModel: ObservableObject {
         )
         let targetsGitData = isGitDataArtifactRequest(
             requestedPath,
-            resolvedPath: resolvedPath,
+            resolvedPath: translatedLookupPath,
             capability: reviewGitContext.artifactCapability
         )
         guard let capability = reviewGitContext.artifactCapability else {
@@ -5995,7 +6103,7 @@ final class MCPServerViewModel: ObservableObject {
                 store: promptVM.workspaceFileContextStore
             )
         )
-        let requestedCandidates = Set([requestedPath, resolvedPath].map {
+        let requestedCandidates = Set([requestedPath, translatedLookupPath].map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         })
         guard let entry = authorization.entries.first(where: { entry in
@@ -6023,7 +6131,7 @@ final class MCPServerViewModel: ObservableObject {
                 lineCount: lineCount,
                 displayPath: displayPath
             )
-            return (preparedReply.reply, false)
+            return preparedReply.reply
         } catch WorkspaceInteractiveReadRangeError.limitWithNegativeStart {
             throw MCPError.invalidParams("limit parameter is not allowed with negative start_line. Use start_line=-N to read the last N lines.")
         } catch WorkspaceInteractiveReadRangeError.zeroStart {
@@ -6057,7 +6165,7 @@ final class MCPServerViewModel: ObservableObject {
         startLine1Based: Int? = nil,
         lineCount: Int? = nil,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
+    ) async throws -> MCPAppFileReadResult {
         try await MCPToolWorkCountDiagnostics.withReadFileInvocation { [self] in
             try await readFileBody(
                 path: path,
@@ -6073,7 +6181,7 @@ final class MCPServerViewModel: ObservableObject {
         startLine1Based: Int? = nil,
         lineCount: Int? = nil,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
+    ) async throws -> MCPAppFileReadResult {
         try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
@@ -6118,7 +6226,6 @@ final class MCPServerViewModel: ObservableObject {
 
         let preparedContent: WorkspaceInteractiveReadPreparedContent
         let displayPath: String
-        let shouldAutoSelect: Bool
         let cacheHit: Bool
         switch readableFile {
         case let .workspace(file):
@@ -6137,7 +6244,6 @@ final class MCPServerViewModel: ObservableObject {
                 fullPath: file.standardizedFullPath,
                 visibleRoots: roots
             )
-            shouldAutoSelect = true
         case let .external(externalFile):
             do {
                 let full = try await readableService.readAlwaysReadableExternalFile(externalFile)
@@ -6153,7 +6259,6 @@ final class MCPServerViewModel: ObservableObject {
             }
             cacheHit = false
             displayPath = externalFile.displayPath
-            shouldAutoSelect = false
         }
 
         let preparedReply: MCPReadFileToolProjection.PreparedReply
@@ -6178,7 +6283,15 @@ final class MCPServerViewModel: ObservableObject {
             returnedLines: preparedReply.returnedLineCount,
             cacheHit: cacheHit
         )
-        return (preparedReply.reply, shouldAutoSelect)
+        switch readableFile {
+        case let .workspace(file):
+            return .workspace(
+                reply: preparedReply.reply,
+                absolutePhysicalPath: file.standardizedFullPath
+            )
+        case .external:
+            return .nonSelecting(reply: preparedReply.reply)
+        }
     }
 
     /// Performs a file action (create, delete, or move/rename)

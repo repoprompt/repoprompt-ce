@@ -692,6 +692,61 @@ print_matches \
   "WorkspaceFilesViewModel references removed recursive eager loading seam" \
   grep -n -E 'loadContentsRecursively' Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift
 
+# Agent Mode terminal settlement stays free of the app's concrete session
+# class (AgentTabSession) and uses provider-neutral domain terminal command
+# vocabulary directly.
+terminal_session_neutral_files=(
+  "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalSessionBinding.swift"
+  "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift"
+)
+for path in "${terminal_session_neutral_files[@]}"; do
+  if [[ ! -f "$path" ]]; then
+      fail "required session-neutral terminal settlement source missing: $path"
+    continue
+  fi
+  print_matches \
+      "session-neutral terminal settlement source references the concrete agent session class: $path" \
+    grep -n -E 'AgentModeViewModel\.TabSession|AgentTabSession' "$path"
+  print_matches \
+      "domain-vocabulary terminal settlement source references app-nested terminal command type: $path" \
+    grep -n -E 'AgentModeViewModel\.AttachmentTurnDisposition|AgentModeRunService\.CancellationCompletion' "$path"
+done
+
+# Claude runtime coordination must use its closed host capability surface rather
+# than retaining or attaching the concrete AgentModeViewModel. The session type
+# is the extracted top-level AgentTabSession; AgentModeViewModel.TabSession is a
+# source-compatibility alias only.
+claude_coordinator_source="Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift"
+if [[ ! -f "$claude_coordinator_source" ]]; then
+  fail "required Claude agent-mode coordinator source missing: $claude_coordinator_source"
+else
+  print_matches \
+    "ClaudeAgentModeCoordinator stores concrete AgentModeViewModel authority" \
+    grep -n -E '(^|[[:space:]])(weak[[:space:]]+)?(var|let)[[:space:]]+[[:alnum:]_]+[[:space:]]*:[[:space:]]*AgentModeViewModel[?]?[[:space:]]*$' \
+      "$claude_coordinator_source"
+  print_matches \
+    "ClaudeAgentModeCoordinator reintroduced attach(viewModel:)" \
+    grep -n -E 'func[[:space:]]+attach\(viewModel:[[:space:]]*AgentModeViewModel[?]?\)' \
+      "$claude_coordinator_source"
+fi
+
+# The Agent Mode session type is the extracted top-level AgentTabSession.
+# `AgentModeViewModel.TabSession` must remain a source-compatibility typealias to
+# that exact class (no parallel session authority), and Agent Mode runtime code
+# must name AgentTabSession directly instead of the view-model-qualified alias.
+agent_tab_session_source="Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentTabSession.swift"
+if [[ ! -f "$agent_tab_session_source" ]]; then
+  fail "required extracted agent session source missing: $agent_tab_session_source"
+else
+  if ! grep -q -F 'typealias TabSession = AgentTabSession' "$agent_tab_session_source"; then
+    fail "AgentTabSession source lost the AgentModeViewModel.TabSession source-compatibility typealias"
+  fi
+fi
+print_matches \
+  "Agent Mode runtime source references the view-model-qualified session alias (use AgentTabSession)" \
+  grep -R -n -F 'AgentModeViewModel.TabSession' \
+    Sources/RepoPrompt/Features/AgentMode/Runtime
+
 # 7. Removed IDE-era Prompt selected-files panel and Prompt-owned preset bottom bar
 # artifacts must not return. The live compact selected-files surface is
 # SelectedFilesGrid/FilePreviewPopover, and Settings owns its chat preset picker.
@@ -715,7 +770,7 @@ print_matches \
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
-  "docs/architecture/compose.md"
+  "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"

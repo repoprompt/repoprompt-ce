@@ -55,6 +55,7 @@ package enum MCPDomainConnectionCallLane: String, CaseIterable, Sendable {
     case ordinary
     case control
     case smallRead = "small_read"
+    case fileRead = "file_read"
     case gitRead = "git_read"
     case fileSearch = "file_search"
 }
@@ -76,6 +77,7 @@ package actor MCPDomainConnectionCallLimiters {
     private let ordinary: MCPDomainAsyncLimiter
     private let control: MCPDomainAsyncLimiter
     private let smallRead: MCPDomainAsyncLimiter
+    private let fileRead: MCPDomainAsyncLimiter
     private let gitRead: MCPDomainAsyncLimiter
     private let fileSearch: MCPDomainAsyncLimiter
     private var admittedCallCount = 0
@@ -87,6 +89,7 @@ package actor MCPDomainConnectionCallLimiters {
             limit: Int,
             controlLimit: Int,
             smallReadLimit: Int,
+            fileReadLimit: Int,
             gitReadLimit: Int,
             fileSearchLimit: Int,
             idleWaitSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
@@ -96,14 +99,16 @@ package actor MCPDomainConnectionCallLimiters {
             ordinary = MCPDomainAsyncLimiter(limit: limit, idleWaitSleep: idleWaitSleep)
             control = MCPDomainAsyncLimiter(limit: controlLimit, idleWaitSleep: idleWaitSleep)
             smallRead = MCPDomainAsyncLimiter(limit: smallReadLimit, idleWaitSleep: idleWaitSleep)
+            fileRead = MCPDomainAsyncLimiter(limit: fileReadLimit, idleWaitSleep: idleWaitSleep)
             gitRead = MCPDomainAsyncLimiter(limit: gitReadLimit, idleWaitSleep: idleWaitSleep)
             fileSearch = MCPDomainAsyncLimiter(limit: fileSearchLimit, idleWaitSleep: idleWaitSleep)
         }
     #else
-        package init(limit: Int, controlLimit: Int, smallReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
+        package init(limit: Int, controlLimit: Int, smallReadLimit: Int, fileReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
             ordinary = MCPDomainAsyncLimiter(limit: limit)
             control = MCPDomainAsyncLimiter(limit: controlLimit)
             smallRead = MCPDomainAsyncLimiter(limit: smallReadLimit)
+            fileRead = MCPDomainAsyncLimiter(limit: fileReadLimit)
             gitRead = MCPDomainAsyncLimiter(limit: gitReadLimit)
             fileSearch = MCPDomainAsyncLimiter(limit: fileSearchLimit)
         }
@@ -221,12 +226,14 @@ package actor MCPDomainConnectionCallLimiters {
             async let ordinarySnapshot = ordinary.debugSnapshot()
             async let controlSnapshot = control.debugSnapshot()
             async let smallReadSnapshot = smallRead.debugSnapshot()
+            async let fileReadSnapshot = fileRead.debugSnapshot()
             async let gitReadSnapshot = gitRead.debugSnapshot()
             async let fileSearchSnapshot = fileSearch.debugSnapshot()
             return await MCPDomainConnectionCallLimiterDebugSnapshot(
                 ordinary: ordinarySnapshot,
                 control: controlSnapshot,
                 smallRead: smallReadSnapshot,
+                fileRead: fileReadSnapshot,
                 gitRead: gitReadSnapshot,
                 fileSearch: fileSearchSnapshot
             )
@@ -279,9 +286,10 @@ package actor MCPDomainConnectionCallLimiters {
         async let cancelOrdinary: Void = ordinary.cancelAll()
         async let cancelControl: Void = control.cancelAll()
         async let cancelSmallRead: Void = smallRead.cancelAll()
+        async let cancelFileRead: Void = fileRead.cancelAll()
         async let cancelGitRead: Void = gitRead.cancelAll()
         async let cancelFileSearch: Void = fileSearch.cancelAll()
-        _ = await (cancelOrdinary, cancelControl, cancelSmallRead, cancelGitRead, cancelFileSearch)
+        _ = await (cancelOrdinary, cancelControl, cancelSmallRead, cancelFileRead, cancelGitRead, cancelFileSearch)
     }
 
     private func limiter(for lane: MCPDomainConnectionCallLane) -> MCPDomainAsyncLimiter {
@@ -292,6 +300,8 @@ package actor MCPDomainConnectionCallLimiters {
             control
         case .smallRead:
             smallRead
+        case .fileRead:
+            fileRead
         case .gitRead:
             gitRead
         case .fileSearch:
@@ -304,6 +314,7 @@ package actor MCPDomainConnectionCallLimiters {
             (.ordinary, ordinary),
             (.control, control),
             (.smallRead, smallRead),
+            (.fileRead, fileRead),
             (.gitRead, gitRead),
             (.fileSearch, fileSearch)
         ]
@@ -316,6 +327,7 @@ package struct MCPDomainConnectionCallLimiterDebugSnapshot: Equatable, Sendable 
     package let ordinary: MCPDomainAsyncLimiter.DebugSnapshot
     package let control: MCPDomainAsyncLimiter.DebugSnapshot
     package let smallRead: MCPDomainAsyncLimiter.DebugSnapshot
+    package let fileRead: MCPDomainAsyncLimiter.DebugSnapshot
     package let gitRead: MCPDomainAsyncLimiter.DebugSnapshot
     package let fileSearch: MCPDomainAsyncLimiter.DebugSnapshot
 
@@ -324,23 +336,23 @@ package struct MCPDomainConnectionCallLimiterDebugSnapshot: Equatable, Sendable 
     }
 
     package var limit: Int {
-        ordinary.limit + control.limit + smallRead.limit + gitRead.limit + fileSearch.limit
+        ordinary.limit + control.limit + smallRead.limit + fileRead.limit + gitRead.limit + fileSearch.limit
     }
 
     package var permits: Int {
-        ordinary.permits + control.permits + smallRead.permits + gitRead.permits + fileSearch.permits
+        ordinary.permits + control.permits + smallRead.permits + fileRead.permits + gitRead.permits + fileSearch.permits
     }
 
     package var activePermitCount: Int {
-        ordinary.activePermitCount + control.activePermitCount + smallRead.activePermitCount + gitRead.activePermitCount + fileSearch.activePermitCount
+        ordinary.activePermitCount + control.activePermitCount + smallRead.activePermitCount + fileRead.activePermitCount + gitRead.activePermitCount + fileSearch.activePermitCount
     }
 
     package var waiterCount: Int {
-        ordinary.waiterCount + control.waiterCount + smallRead.waiterCount + gitRead.waiterCount + fileSearch.waiterCount
+        ordinary.waiterCount + control.waiterCount + smallRead.waiterCount + fileRead.waiterCount + gitRead.waiterCount + fileSearch.waiterCount
     }
 
     package var inFlight: Int {
-        ordinary.inFlight + control.inFlight + smallRead.inFlight + gitRead.inFlight + fileSearch.inFlight
+        ordinary.inFlight + control.inFlight + smallRead.inFlight + fileRead.inFlight + gitRead.inFlight + fileSearch.inFlight
     }
 
     package var oldestWaiterAgeMilliseconds: UInt64? {
@@ -348,6 +360,7 @@ package struct MCPDomainConnectionCallLimiterDebugSnapshot: Equatable, Sendable 
             ordinary.oldestWaiterAgeMilliseconds,
             control.oldestWaiterAgeMilliseconds,
             smallRead.oldestWaiterAgeMilliseconds,
+            fileRead.oldestWaiterAgeMilliseconds,
             gitRead.oldestWaiterAgeMilliseconds,
             fileSearch.oldestWaiterAgeMilliseconds
         ]
@@ -356,15 +369,15 @@ package struct MCPDomainConnectionCallLimiterDebugSnapshot: Equatable, Sendable 
     }
 
     package var cancelledWaiterCount: Int {
-        ordinary.cancelledWaiterCount + control.cancelledWaiterCount + smallRead.cancelledWaiterCount + gitRead.cancelledWaiterCount + fileSearch.cancelledWaiterCount
+        ordinary.cancelledWaiterCount + control.cancelledWaiterCount + smallRead.cancelledWaiterCount + fileRead.cancelledWaiterCount + gitRead.cancelledWaiterCount + fileSearch.cancelledWaiterCount
     }
 
     package var isClosed: Bool {
-        ordinary.isClosed && control.isClosed && smallRead.isClosed && gitRead.isClosed && fileSearch.isClosed
+        ordinary.isClosed && control.isClosed && smallRead.isClosed && fileRead.isClosed && gitRead.isClosed && fileSearch.isClosed
     }
 
     package var isIdle: Bool {
-        ordinary.isIdle && control.isIdle && smallRead.isIdle && gitRead.isIdle && fileSearch.isIdle
+        ordinary.isIdle && control.isIdle && smallRead.isIdle && fileRead.isIdle && gitRead.isIdle && fileSearch.isIdle
     }
 }
 #endif

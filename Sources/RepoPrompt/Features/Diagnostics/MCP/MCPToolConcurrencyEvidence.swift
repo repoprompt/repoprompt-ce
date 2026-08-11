@@ -35,6 +35,7 @@ enum MCPToolConcurrencyEvidenceClass: String, CaseIterable {
     case exclusive
     case control
     case smallRead = "small_read"
+    case fileRead = "file_read"
     case gitRead = "git_read"
     case fileSearch = "file_search"
     case unclassified
@@ -44,6 +45,7 @@ enum MCPToolConcurrencyEvidenceClass: String, CaseIterable {
         case .exclusive: self = .exclusive
         case .control: self = .control
         case .smallRead: self = .smallRead
+        case .fileRead: self = .fileRead
         case .gitRead: self = .gitRead
         case .fileSearch: self = .fileSearch
         case nil: self = .unclassified
@@ -56,7 +58,7 @@ enum MCPToolConcurrencyEvidenceStage: String, CaseIterable {
     /// Connection-lane (per-connection `AsyncLimiter`) admission wait.
     case laneWait = "lane_wait"
     /// Cross-connection resource lease wait (window/app mutation, per-window
-    /// small-read, per-repository git tool lease).
+    /// small-read/file-read, per-repository git tool lease).
     case leaseWait = "lease_wait"
     /// Provider execution from dispatch origin to handler completion, sourced from
     /// `MCPToolExecutionTraceEvent(.handlerCompleted)`.
@@ -145,12 +147,28 @@ struct MCPToolConcurrencyEvidenceSnapshot: Equatable {
         let executionTracePhaseCounts: [String: UInt64]
     }
 
-    static let schemaVersion = 1
+    struct OperationSnapshot: Equatable {
+        let canonicalTool: String
+        let normalizedOperation: String
+        let admissionClass: String
+        let connectionLaneLimit: Int?
+        let resourceLeaseLimit: Int?
+        let resourceLeaseScope: String?
+        let completedCallCount: UInt64
+        let stageHistograms: [String: MCPToolConcurrencyLatencyHistogram]
+        let rejectionCounts: [String: UInt64]
+        let executionTracePhaseCounts: [String: UInt64]
+    }
 
-    /// Sorted by `classKey` for deterministic iteration.
+    static let schemaVersion = 2
+
+    /// Sorted by `classKey` for deterministic iteration. Preserved from schema v1.
     let classes: [ClassSnapshot]
     /// Completed-call counts per canonical tool name (classified catalog only).
+    /// Preserved from schema v1.
     let completedCallCountsByTool: [String: UInt64]
+    /// Sorted by `(canonicalTool, normalizedOperation)` for deterministic iteration.
+    let operations: [OperationSnapshot]
 }
 
 /// Process-wide evidence recorder. `@unchecked Sendable` justified by the single
@@ -172,9 +190,17 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
         var executionTracePhaseCounts: [String: UInt64] = [:]
     }
 
+    private struct OperationState {
+        var completedCallCount: UInt64 = 0
+        var stageHistograms: [MCPToolConcurrencyEvidenceStage: MCPToolConcurrencyLatencyHistogram] = [:]
+        var rejectionCounts: [MCPToolConcurrencyEvidenceRejectionReason: UInt64] = [:]
+        var executionTracePhaseCounts: [String: UInt64] = [:]
+    }
+
     private let lock = NSLock()
     private var classStates: [MCPToolConcurrencyEvidenceClass: ClassState] = [:]
     private var completedCallCountsByTool: [String: UInt64] = [:]
+    private var operationStates: [MCPToolOperationIdentity: OperationState] = [:]
 
     // MARK: Lane (per-connection limiter) admission
 
@@ -187,15 +213,29 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
 
     func recordLaneAdmitted(
         classKey: MCPToolConcurrencyEvidenceClass,
+        operationIdentity: MCPToolOperationIdentity? = nil,
         waitMilliseconds: Double
     ) {
-        withClassState(classKey) { state in
-            state.laneWaiting = max(0, state.laneWaiting - 1)
-            state.laneAdmittedCount += 1
-            state.laneHeld += 1
-            state.laneHeldHighWater = max(state.laneHeldHighWater, state.laneHeld)
-            state.stageHistograms[.laneWait, default: .init()].record(milliseconds: waitMilliseconds)
+        lock.lock()
+        classStates[classKey, default: ClassState()].laneWaiting = max(
+            0,
+            classStates[classKey, default: ClassState()].laneWaiting - 1
+        )
+        classStates[classKey, default: ClassState()].laneAdmittedCount += 1
+        classStates[classKey, default: ClassState()].laneHeld += 1
+        classStates[classKey, default: ClassState()].laneHeldHighWater = max(
+            classStates[classKey, default: ClassState()].laneHeldHighWater,
+            classStates[classKey, default: ClassState()].laneHeld
+        )
+        classStates[classKey, default: ClassState()]
+            .stageHistograms[.laneWait, default: .init()]
+            .record(milliseconds: waitMilliseconds)
+        if let operationIdentity {
+            operationStates[operationIdentity, default: OperationState()]
+                .stageHistograms[.laneWait, default: .init()]
+                .record(milliseconds: waitMilliseconds)
         }
+        lock.unlock()
     }
 
     func recordLanePermitReleased(classKey: MCPToolConcurrencyEvidenceClass) {
@@ -215,22 +255,35 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
 
     func recordLeaseWait(
         classKey: MCPToolConcurrencyEvidenceClass,
+        operationIdentity: MCPToolOperationIdentity? = nil,
         milliseconds: Double
     ) {
-        withClassState(classKey) { state in
-            state.stageHistograms[.leaseWait, default: .init()].record(milliseconds: milliseconds)
+        lock.lock()
+        classStates[classKey, default: ClassState()]
+            .stageHistograms[.leaseWait, default: .init()]
+            .record(milliseconds: milliseconds)
+        if let operationIdentity {
+            operationStates[operationIdentity, default: OperationState()]
+                .stageHistograms[.leaseWait, default: .init()]
+                .record(milliseconds: milliseconds)
         }
+        lock.unlock()
     }
 
     // MARK: Rejections
 
     func recordRejection(
         classKey: MCPToolConcurrencyEvidenceClass,
+        operationIdentity: MCPToolOperationIdentity? = nil,
         reason: MCPToolConcurrencyEvidenceRejectionReason
     ) {
-        withClassState(classKey) { state in
-            state.rejectionCounts[reason, default: 0] += 1
+        lock.lock()
+        classStates[classKey, default: ClassState()].rejectionCounts[reason, default: 0] += 1
+        if let operationIdentity {
+            operationStates[operationIdentity, default: OperationState()]
+                .rejectionCounts[reason, default: 0] += 1
         }
+        lock.unlock()
     }
 
     // MARK: Completion
@@ -238,18 +291,26 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
     func recordCallCompleted(
         classKey: MCPToolConcurrencyEvidenceClass,
         canonicalToolName: String,
+        operationIdentity: MCPToolOperationIdentity? = nil,
         totalMilliseconds: Double
     ) {
         let countedToolName = MCPToolAdmissionPolicy.classification(
             forCanonicalToolName: canonicalToolName
         ) != nil ? canonicalToolName : Self.unclassifiedToolKey
-        // Single critical section: the total histogram and the per-tool completed
-        // count move together, so snapshots can never observe one without the other.
+        // Single critical section: class/tool compatibility aggregates and the v2
+        // operation terminal event move together. The tools/call caller invokes this
+        // once from one outer defer, including all early and watchdog return paths.
         lock.lock()
         classStates[classKey, default: ClassState()]
             .stageHistograms[.total, default: .init()]
             .record(milliseconds: totalMilliseconds)
         completedCallCountsByTool[countedToolName, default: 0] += 1
+        if let operationIdentity {
+            operationStates[operationIdentity, default: OperationState()].completedCallCount += 1
+            operationStates[operationIdentity, default: OperationState()]
+                .stageHistograms[.total, default: .init()]
+                .record(milliseconds: totalMilliseconds)
+        }
         lock.unlock()
     }
 
@@ -261,16 +322,23 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
     func recordExecutionTraceEvent(_ event: MCPToolExecutionTraceEvent) {
         let classKey = MCPToolConcurrencyEvidenceClass(
             admissionClass: MCPToolAdmissionPolicy.classification(
-                forCanonicalToolName: event.toolName
+                forCanonicalToolName: event.operationIdentity.canonicalTool
             )
         )
-        withClassState(classKey) { state in
-            state.executionTracePhaseCounts[event.phase.rawValue, default: 0] += 1
-            if event.phase == .handlerCompleted {
-                state.stageHistograms[.execution, default: .init()]
-                    .record(milliseconds: event.elapsedMilliseconds)
-            }
+        lock.lock()
+        classStates[classKey, default: ClassState()]
+            .executionTracePhaseCounts[event.phase.rawValue, default: 0] += 1
+        operationStates[event.operationIdentity, default: OperationState()]
+            .executionTracePhaseCounts[event.phase.rawValue, default: 0] += 1
+        if event.phase == .handlerCompleted {
+            classStates[classKey, default: ClassState()]
+                .stageHistograms[.execution, default: .init()]
+                .record(milliseconds: event.elapsedMilliseconds)
+            operationStates[event.operationIdentity, default: OperationState()]
+                .stageHistograms[.execution, default: .init()]
+                .record(milliseconds: event.elapsedMilliseconds)
         }
+        lock.unlock()
     }
 
     // MARK: Snapshot / reset
@@ -289,6 +357,7 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
         let snapshot = makeSnapshotLocked()
         classStates = [:]
         completedCallCountsByTool = [:]
+        operationStates = [:]
         return snapshot
     }
 
@@ -311,9 +380,39 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
                 )
             }
             .sorted { $0.classKey < $1.classKey }
+        let operations = operationStates
+            .map { identity, state in
+                let classKey = MCPToolConcurrencyEvidenceClass(
+                    admissionClass: MCPToolAdmissionPolicy.classification(
+                        forCanonicalToolName: identity.canonicalTool
+                    )
+                )
+                let limits = MCPDomainToolCatalog.configuredLimits(for: identity.canonicalTool)
+                return MCPToolConcurrencyEvidenceSnapshot.OperationSnapshot(
+                    canonicalTool: identity.canonicalTool,
+                    normalizedOperation: identity.normalizedOperation,
+                    admissionClass: classKey.rawValue,
+                    connectionLaneLimit: limits?.connectionLane,
+                    resourceLeaseLimit: limits?.resourceLease,
+                    resourceLeaseScope: limits?.resourceScope?.rawValue,
+                    completedCallCount: state.completedCallCount,
+                    stageHistograms: Dictionary(
+                        uniqueKeysWithValues: state.stageHistograms.map { ($0.key.rawValue, $0.value) }
+                    ),
+                    rejectionCounts: Dictionary(
+                        uniqueKeysWithValues: state.rejectionCounts.map { ($0.key.rawValue, $0.value) }
+                    ),
+                    executionTracePhaseCounts: state.executionTracePhaseCounts
+                )
+            }
+            .sorted {
+                ($0.canonicalTool, $0.normalizedOperation)
+                    < ($1.canonicalTool, $1.normalizedOperation)
+            }
         return MCPToolConcurrencyEvidenceSnapshot(
             classes: classes,
-            completedCallCountsByTool: completedCallCountsByTool
+            completedCallCountsByTool: completedCallCountsByTool,
+            operations: operations
         )
     }
 
@@ -321,6 +420,7 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
         lock.lock()
         classStates = [:]
         completedCallCountsByTool = [:]
+        operationStates = [:]
         lock.unlock()
     }
 
@@ -393,6 +493,45 @@ final class MCPToolConcurrencyEvidenceRecorder: @unchecked Sendable {
                         return stagePayload
                     }
                 return classPayload
+            }
+            payload["operations"] = snapshot.operations.map { operationSnapshot -> [String: Any] in
+                var operationPayload: [String: Any] = [
+                    "tool": operationSnapshot.canonicalTool,
+                    "operation": operationSnapshot.normalizedOperation,
+                    "admission_class": operationSnapshot.admissionClass,
+                    "completed_call_count": operationSnapshot.completedCallCount,
+                    "connection_lane_limit": operationSnapshot.connectionLaneLimit.map { $0 as Any } ?? NSNull(),
+                    "resource_lease_limit": operationSnapshot.resourceLeaseLimit.map { $0 as Any } ?? NSNull(),
+                    "resource_lease_scope": operationSnapshot.resourceLeaseScope.map { $0 as Any } ?? NSNull()
+                ]
+                operationPayload["rejections"] = operationSnapshot.rejectionCounts
+                    .sorted { $0.key < $1.key }
+                    .map { ["reason": $0.key, "count": $0.value] }
+                operationPayload["execution_trace_phases"] = operationSnapshot.executionTracePhaseCounts
+                    .sorted { $0.key < $1.key }
+                    .map { ["phase": $0.key, "count": $0.value] }
+                operationPayload["stages"] = operationSnapshot.stageHistograms
+                    .sorted { $0.key < $1.key }
+                    .map { stageKey, histogram -> [String: Any] in
+                        var stagePayload: [String: Any] = [
+                            "stage": stageKey,
+                            "count": histogram.count,
+                            "sum_ms": histogram.sumMilliseconds,
+                            "max_ms": histogram.maxMilliseconds,
+                            "bucket_counts": histogram.bucketCounts
+                        ]
+                        if let p50 = histogram.estimatedQuantileMilliseconds(0.5) {
+                            stagePayload["p50_ms_upper_bound"] = p50
+                        }
+                        if let p95 = histogram.estimatedQuantileMilliseconds(0.95) {
+                            stagePayload["p95_ms_upper_bound"] = p95
+                        }
+                        if let p99 = histogram.estimatedQuantileMilliseconds(0.99) {
+                            stagePayload["p99_ms_upper_bound"] = p99
+                        }
+                        return stagePayload
+                    }
+                return operationPayload
             }
             payload["completed_calls_by_tool"] = snapshot.completedCallCountsByTool
                 .sorted { $0.key < $1.key }

@@ -257,6 +257,8 @@ struct AgentModeSessionsListView: View {
     let currentTabID: UUID?
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
+    @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
+    private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -304,7 +306,8 @@ struct AgentModeSessionsListView: View {
             stashedTabs: promptManager.currentStashedTabs,
             currentTabID: currentTabID,
             sidebarSnapshot: sidebarSnapshot,
-            archivedSessionsExpanded: archivedSessionsExpanded
+            archivedSessionsExpanded: archivedSessionsExpanded,
+            showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
@@ -319,14 +322,32 @@ struct AgentModeSessionsListView: View {
 
                     ForEach(section.groups) { group in
                         ForEach(group.rows, id: \.id) { session in
+                            let hasAgentSession = session.sessionID != nil
+                            let runState: AgentSessionRunState = hasAgentSession
+                                ? agentModeVM.runState(for: session.tabID)
+                                : .idle
+                            let attentionRunState: AgentSessionRunState? = hasAgentSession
+                                ? sidebarUI.snapshot.attentionRunStateByTabID[session.tabID]
+                                : nil
+                            let toggleThreadAction: (() -> Void)? = session.hasThreadChildren
+                                ? { agentModeVM.requestSidebarThreadDisclosureToggle(for: session) }
+                                : nil
+                            // Archived Sessions excludes tabs without indexed conversation content,
+                            // so stashing a session-less tab would hide it from both sidebar lists.
+                            let stashAction: (() -> Void)? = hasAgentSession
+                                ? { Task { await promptManager.stashTab(session.tabID) } }
+                                : nil
+                            let dismissAttentionAction: (() -> Void)? = hasAgentSession
+                                ? { agentModeVM.dismissSidebarRunAttention(tabID: session.tabID) }
+                                : nil
+
                             AgentSessionRow(
                                 title: session.title,
                                 isActive: session.tabID == currentTabID,
                                 isPinned: session.isPinned,
                                 isMCPControlled: session.isMCPControlled,
-                                runState: agentModeVM.runState(for: session.tabID),
-                                isWaiting: agentModeVM.isTabWaiting(session.tabID),
-                                attentionRunState: sidebarUI.snapshot.attentionRunStateByTabID[session.tabID],
+                                runState: runState,
+                                attentionRunState: attentionRunState,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
                                 threadDepth: session.depth,
@@ -334,20 +355,14 @@ struct AgentModeSessionsListView: View {
                                 isThreadCollapsed: session.isThreadCollapsed,
                                 hiddenThreadDescendantCount: session.hiddenThreadDescendantCount,
                                 hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
-                                onToggleThreadCollapse: session.hasThreadChildren
-                                    ? {
-                                        agentModeVM.requestSidebarThreadDisclosureToggle(for: session)
-                                    }
-                                    : nil,
+                                onToggleThreadCollapse: toggleThreadAction,
                                 onSelect: {
                                     Task { await promptManager.switchComposeTab(session.tabID) }
                                 },
                                 onTogglePin: {
                                     promptManager.toggleComposeTabPinned(session.tabID)
                                 },
-                                onStash: {
-                                    Task { await promptManager.stashTab(session.tabID) }
-                                },
+                                onStash: stashAction,
                                 onDelete: {
                                     #if DEBUG
                                         agentModeVM.debugBeginSidebarDeleteRequest(
@@ -361,9 +376,7 @@ struct AgentModeSessionsListView: View {
                                 onRename: { newName in
                                     agentModeVM.renameSession(tabID: session.tabID, to: newName)
                                 },
-                                onDismissAttention: {
-                                    agentModeVM.dismissSidebarRunAttention(tabID: session.tabID)
-                                }
+                                onDismissAttention: dismissAttentionAction
                             )
                         }
                     }

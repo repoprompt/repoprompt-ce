@@ -728,7 +728,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         try await Task.sleep(nanoseconds: 250_000_000)
         await manager.pollAndSaveStateAsync()
         let workspaceURL = manager.workspaceFileURL(for: fixture.workspace)
-        let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL)
+        let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL, scheduleNormalizationWriteback: false)
         let savedTab = try XCTUnwrap(saved.composeTabs.first(where: { $0.id == fixture.tabID }))
         XCTAssertFalse(savedTab.selection.selectedPaths.isEmpty)
         XCTAssertEqual(savedTab.selection, fixture.selection)
@@ -755,7 +755,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             try await Task.sleep(nanoseconds: 250_000_000)
             await manager.pollAndSaveStateAsync()
             let workspaceURL = manager.workspaceFileURL(for: fixture.workspace)
-            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL)
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL, scheduleNormalizationWriteback: false)
             let savedTab = try XCTUnwrap(saved.composeTabs.first(where: { $0.id == fixture.tabID }))
             XCTAssertFalse(savedTab.selection.selectedPaths.isEmpty)
             XCTAssertEqual(savedTab.selection, fixture.selection)
@@ -852,7 +852,8 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         manager.markWorkspaceDirty()
         await manager.pollAndSaveStateAsync()
         let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
-            at: manager.workspaceFileURL(for: workspace)
+            at: manager.workspaceFileURL(for: workspace),
+            scheduleNormalizationWriteback: false
         )
         XCTAssertEqual(
             try Set(XCTUnwrap(saved.composeTabs.first(where: { $0.id == tabID })).selection.selectedPaths),

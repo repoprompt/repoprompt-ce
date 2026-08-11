@@ -1683,6 +1683,103 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertTrue(model.rows.allSatisfy { !$0.canRemove })
     }
 
+    func testRowsAndMetricsPreserveExplicitSliceRegardlessOfContainingFolderOrder() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportAccountingIdentity")
+        let sources = root.appendingPathComponent("Sources")
+        let targetURL = sources.appendingPathComponent("Target.swift")
+        let otherURL = sources.appendingPathComponent("Other.swift")
+        let targetContent = "skip\nselected line\nskip\n"
+        let otherContent = "let other = true\n"
+        try write(targetContent, to: targetURL)
+        try write(otherContent, to: otherURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let sliceRange = LineRange(start: 2, end: 2)
+
+        func resolve(selectedPaths: [String]) async throws -> AgentContextExportModel {
+            try await AgentContextExportResolver.resolveModel(
+                source: AgentContextExportSource(
+                    tabID: UUID(),
+                    promptText: "Review accounting identity",
+                    selection: StoredSelection(
+                        selectedPaths: selectedPaths,
+                        slices: [targetURL.path: [sliceRange]],
+                        codemapAutoEnabled: false
+                    ),
+                    selectedMetaPromptIDs: [],
+                    tabName: "Accounting Identity",
+                    activeAgentSessionID: nil,
+                    worktreeBindings: []
+                ),
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .none
+            )
+        }
+
+        let directFirst = try await resolve(selectedPaths: [targetURL.path, sources.path])
+        let folderFirst = try await resolve(selectedPaths: [sources.path, targetURL.path])
+
+        XCTAssertEqual(folderFirst.rows, directFirst.rows)
+        XCTAssertEqual(folderFirst.totalSelectedDisplayTokens, directFirst.totalSelectedDisplayTokens)
+        XCTAssertEqual(folderFirst.rows.count, 2)
+        XCTAssertEqual(Set(folderFirst.rows.map(\.id.fileID)).count, 2)
+        XCTAssertEqual(Set(folderFirst.rows.map(\.physicalPath)).count, 2)
+        let targetRow = try XCTUnwrap(folderFirst.rows.first {
+            $0.physicalPath == targetURL.standardizedFileURL.path
+        })
+        XCTAssertEqual(targetRow.kind, .slices)
+        XCTAssertEqual(targetRow.lineRanges, [sliceRange])
+        XCTAssertTrue(targetRow.canRemove)
+
+        let renderedSlice = SliceAssemblyBuilder.build(from: targetContent, ranges: [sliceRange]).combinedText
+        let expectedTotal = TokenCalculationService.estimateTokens(for: renderedSlice)
+            + TokenCalculationService.estimateTokens(for: otherContent)
+        XCTAssertEqual(folderFirst.totalSelectedDisplayTokens, expectedTotal)
+        XCTAssertEqual(targetRow.metrics.knownValues?.tokenCount, TokenCalculationService.estimateTokens(for: renderedSlice))
+    }
+
+    func testRowsMergeSliceRangesForAliasesOfSameFile() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportSliceAliases")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        try write("one\ntwo\nthree\nfour\n", to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let aliasPath = root.path + "/./Target.swift"
+        let ranges = [
+            LineRange(start: 1, end: 1),
+            LineRange(start: 4, end: 4)
+        ]
+        let model = try await AgentContextExportResolver.resolveModel(
+            source: AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review slice aliases",
+                selection: StoredSelection(
+                    slices: [
+                        targetURL.path: [ranges[0]],
+                        aliasPath: [ranges[1]]
+                    ],
+                    codemapAutoEnabled: false
+                ),
+                selectedMetaPromptIDs: [],
+                tabName: "Slice Aliases",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            ),
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertEqual(model.rows.count, 1)
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertEqual(row.kind, .slices)
+        XCTAssertEqual(row.lineRanges, ranges)
+        XCTAssertTrue(row.canRemove)
+    }
+
     @MainActor
     func testSourceBuilderUsesRequestedInactiveTabInsteadOfActiveSnapshot() {
         let requestedTabID = UUID()

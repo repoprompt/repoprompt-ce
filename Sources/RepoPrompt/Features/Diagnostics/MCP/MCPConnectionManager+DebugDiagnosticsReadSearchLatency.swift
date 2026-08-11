@@ -946,6 +946,7 @@ import RepoPromptShared
                     MCPConnectionCallLane.ordinary.rawValue: readSearchLimiterLanePayload(snapshot.ordinary),
                     MCPConnectionCallLane.control.rawValue: readSearchLimiterLanePayload(snapshot.control),
                     MCPConnectionCallLane.smallRead.rawValue: readSearchLimiterLanePayload(snapshot.smallRead),
+                    MCPConnectionCallLane.fileRead.rawValue: readSearchLimiterLanePayload(snapshot.fileRead),
                     MCPConnectionCallLane.gitRead.rawValue: readSearchLimiterLanePayload(snapshot.gitRead),
                     MCPConnectionCallLane.fileSearch.rawValue: readSearchLimiterLanePayload(snapshot.fileSearch)
                 ]

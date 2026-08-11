@@ -40,7 +40,6 @@ struct ContentView: View {
                     viewModel.workspaceManager.creationDraft = WorkspaceManagerViewModel.WorkspaceCreationDraft()
                     showWorkspaceSetup = true
                 },
-                isAgentModeActive: viewModel.rootRoute == .main,
                 showRecommendationsPopover: $showRecommendationsPopover,
                 showMCPServerPopover: $showMCPServerPopover
             )

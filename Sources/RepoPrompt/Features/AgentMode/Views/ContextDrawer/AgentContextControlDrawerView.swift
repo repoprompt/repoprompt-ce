@@ -354,9 +354,6 @@ struct AgentContextControlDrawerView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            Text("Compose")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 15, weight: .semibold))
-
             AgentContextDrawerTokenEstimatePill(
                 tokenCounter: promptManager.tokenCountingViewModel,
                 runtimeVM: runtimeVM,
@@ -374,7 +371,7 @@ struct AgentContextControlDrawerView: View {
                     .frame(width: 28, height: 28)
             }
             .buttonStyle(.plain)
-            .hoverTooltip("Close Compose")
+            .hoverTooltip("Close Context Composer")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)

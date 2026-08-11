@@ -65,7 +65,9 @@ enum AgentWebToolPayloadKeys {
 
 enum AgentWebToolCanonicalNames {
     static func canonicalWebActionType(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard let acceptedName = AgentToolNamePolicy.accepted(raw) else { return nil }
+        let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
         switch raw {
         case "search":
             return "search"
@@ -79,7 +81,7 @@ enum AgentWebToolCanonicalNames {
     }
 
     static func canonicalToolCardName(_ raw: String?) -> String? {
-        guard let raw else { return nil }
+        guard let raw = AgentToolNamePolicy.accepted(raw) else { return nil }
         let names = normalizedNameCandidates(raw)
         if names.contains(where: isWebSearchName) { return "search" }
         if names.contains(where: isWebReadName) { return "web_read" }
@@ -87,7 +89,8 @@ enum AgentWebToolCanonicalNames {
     }
 
     static func isWebSearchName(_ name: String) -> Bool {
-        switch normalizedName(name) {
+        guard let name = AgentToolNamePolicy.accepted(name) else { return false }
+        return switch normalizedName(name) {
         case "search", "web_search", "web_search_request", "google_web_search", "search_web", "websearch":
             true
         default:
@@ -96,7 +99,8 @@ enum AgentWebToolCanonicalNames {
     }
 
     static func isWebReadName(_ name: String) -> Bool {
-        switch normalizedName(name) {
+        guard let name = AgentToolNamePolicy.accepted(name) else { return false }
+        return switch normalizedName(name) {
         case "webfetch", "web_fetch", "web_read", "read_web", "browser.open", "browser_open", "open_url",
              "read_url", "fetch_url", "web_page", "webpage", "read_web_page":
             true
@@ -127,6 +131,7 @@ enum AgentWebToolCanonicalNames {
     }
 
     private static func normalizedNameCandidates(_ raw: String) -> [String] {
+        guard let raw = AgentToolNamePolicy.accepted(raw) else { return [] }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         let stripped = trimmed.replacingOccurrences(of: "mcp__RepoPrompt__", with: "")

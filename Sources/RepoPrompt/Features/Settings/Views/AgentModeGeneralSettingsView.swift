@@ -11,9 +11,10 @@ import SwiftUI
 /// the canonical pages, and surfaces at-a-glance CLI provider connection
 /// status so users can spot missing configuration without leaving Overview.
 ///
-/// SEARCH-HELPER: Agent Mode Overview, Agent Mode Behavior, Safe Managed summary,
-/// Oracle Model summary, Context Builder summary, Agent Role Defaults summary,
-/// CLI provider status, Direct-Agent Permissions deep link, Sub-Agent Permissions deep link
+/// SEARCH-HELPER: Agent Mode Overview, Agent Mode Behavior, Agent Chats,
+/// Show MCP-created chats, Compose tabs without Agent sessions, Safe Managed summary, Oracle Model summary,
+/// Context Builder summary, Agent Role Defaults summary, CLI provider status,
+/// Direct-Agent Permissions deep link, Sub-Agent Permissions deep link
 ///
 /// Related:
 /// - Agent Models:      /RepoPrompt/Views/Settings/AgentModelsSettingsView.swift
@@ -29,6 +30,8 @@ struct AgentModeGeneralSettingsView: View {
     /// Observe secure permission-store changes so the read-only summary rebuilds
     /// without relying on @AppStorage for sensitive policy keys.
     @State private var subagentPolicyRevision = 0
+    @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
+    private var showComposeTabsWithoutAgentSessions = false
 
     @State private var handoffInstructionsDraft = ""
     @State private var handoffInstructionsBaseline = ""
@@ -137,7 +140,36 @@ struct AgentModeGeneralSettingsView: View {
             )
 
             agentWorkflowsLinkRow
+
+            agentChatsCard
         }
+    }
+
+    // MARK: - Agent Chats
+
+    private var agentChatsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "bubble.left")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Agent Chats")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Toggle("Show chats created by MCP tools", isOn: $showComposeTabsWithoutAgentSessions)
+                    .toggleStyle(.switch)
+
+                Text("Lists chats created by MCP tools before an agent has run in them, so you can observe and iterate on their selections, prompts, and Context Builder runs in Compose.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
     }
 
     // MARK: - Provider cleanup

@@ -15,9 +15,22 @@ actor AsyncMutex {
         return try await body()
     }
 
+    /// Acquires the lock even when the current task is already cancelled.
+    ///
+    /// Use this only for state restoration that must finish before a cancelled
+    /// operation can return.
+    func withLockIgnoringCancellation<T: Sendable>(
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        await lockIgnoringCancellation()
+        defer { unlock() }
+        return try await body()
+    }
+
     /// Returns `true` if the lock was acquired, `false` if the waiter was
     /// removed due to task cancellation (caller must NOT enter the critical section).
     private func lock() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if !isLocked {
             isLocked = true
             return true
@@ -34,6 +47,16 @@ actor AsyncMutex {
             }
         } onCancel: { [weak self] in
             Task { await self?.removeCancelledWaiter(waiterID) }
+        }
+    }
+
+    private func lockIgnoringCancellation() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+        _ = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            waiters.append((id: UUID(), continuation: continuation))
         }
     }
 

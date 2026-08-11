@@ -299,7 +299,7 @@ extension AgentModeViewModel {
     }
 
     /// Remove observed-state entries and pending attention badges for tabs
-    /// that are going away. Called from `handleComposeTabsWillClose(...)`.
+    /// that were removed. Called from `handleComposeTabsDidRemove(...)`.
     func cleanupSidebarRunAttention(tabIDs: Set<UUID>) {
         guard !tabIDs.isEmpty else { return }
         for tabID in tabIDs {

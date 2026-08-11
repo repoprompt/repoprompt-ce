@@ -1395,7 +1395,7 @@ final class CodexNativeSessionController {
             try markStartOrResumeSucceeded()
             return sessionRef
         } catch {
-            try? await eventHandlingMutex.withLock {
+            try? await eventHandlingMutex.withLockIgnoringCancellation {
                 cancelBindingSession()
             }
             markStartOrResumeFailed()
@@ -3691,6 +3691,10 @@ final class CodexNativeSessionController {
             parseTokenUsagePayload(from: params)
         }
 
+        static func test_normalizedExternalToolName(_ raw: String?) -> String? {
+            normalizedExternalToolName(raw)
+        }
+
         static func test_parseErrorNotification(from params: [String: Any]) -> ErrorNotification? {
             parseErrorNotification(from: params)
         }
@@ -3817,6 +3821,12 @@ final class CodexNativeSessionController {
             }
             try? markStartOrResumeSucceeded()
             return sessionRef
+        }
+
+        func test_bindingBufferState() async throws -> (isBinding: Bool, bufferedCount: Int) {
+            try await eventHandlingMutex.withLock {
+                (isBindingSession, bufferedInbound.count)
+            }
         }
 
         func test_simulateTransportStreamEnded(source: String) async {
@@ -6503,8 +6513,8 @@ final class CodexNativeSessionController {
     }
 
     private static func normalizedExternalToolName(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let acceptedName = AgentToolNamePolicy.accepted(raw) else { return nil }
+        let trimmed = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let lowered = trimmed.lowercased()
         let suffix = lowered.split(separator: ".").last.map(String.init) ?? lowered

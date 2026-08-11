@@ -1136,7 +1136,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         import sys
 
         if sys.argv[1:] == ["--version"]:
-            print("codex 0.145.0")
+            print("codex 0.147.0")
             raise SystemExit(0)
 
         record_path = \(String(reflecting: recordURL.path))
