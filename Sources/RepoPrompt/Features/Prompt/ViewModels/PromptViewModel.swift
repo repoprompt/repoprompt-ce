@@ -89,35 +89,7 @@ class PromptViewModel: ObservableObject {
         case chat
     }
 
-    struct StoredPrompt: Identifiable, Codable, Equatable {
-        let id: UUID
-        var title: String
-        var content: String
-        /// Tracks whether the user has manually edited a built-in prompt.
-        /// When true, auto-upgrades of built-in content are skipped.
-        var isUserEdited: Bool
-
-        init(id: UUID, title: String, content: String, isUserEdited: Bool = false) {
-            self.id = id
-            self.title = title
-            self.content = content
-            self.isUserEdited = isUserEdited
-        }
-
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            id = try container.decode(UUID.self, forKey: .id)
-            title = try container.decode(String.self, forKey: .title)
-            content = try container.decode(String.self, forKey: .content)
-            isUserEdited = try container.decodeIfPresent(Bool.self, forKey: .isUserEdited) ?? false
-        }
-
-        static func == (lhs: StoredPrompt, rhs: StoredPrompt) -> Bool {
-            lhs.id == rhs.id &&
-                lhs.title == rhs.title &&
-                lhs.content == rhs.content
-        }
-    }
+    typealias StoredPrompt = StoredPromptRecord
 
     // MARK: - Core Properties
 
@@ -2117,13 +2089,15 @@ class PromptViewModel: ObservableObject {
     // MARK: - Initialization
 
     private let settingsManager: SettingsManaging
+    private let storedPromptPersistence: any StoredPromptPersistenceServing
 
     init(
         fileManager: WorkspaceFilesViewModel,
         aiQueriesService: AIQueriesService? = nil,
         apiSettingsViewModel: APISettingsViewModel,
         windowID: Int,
-        settingsManager: SettingsManaging
+        settingsManager: SettingsManaging,
+        storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2131,6 +2105,7 @@ class PromptViewModel: ObservableObject {
         self.apiSettingsViewModel = apiSettingsViewModel
         self.windowID = windowID
         self.settingsManager = settingsManager
+        self.storedPromptPersistence = storedPromptPersistence ?? StoredPromptPersistenceService()
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -4438,25 +4413,23 @@ class PromptViewModel: ObservableObject {
     }
 
     func saveStoredPrompts() {
-        PromptStorage.shared.savePrompts(storedPrompts)
+        storedPromptPersistence.savePrompts(storedPrompts)
     }
 
     func exportPrompts(to url: URL) throws {
-        try PromptStorage.shared.exportPrompts(to: url, prompts: storedPrompts)
+        try storedPromptPersistence.exportPrompts(to: url, prompts: storedPrompts)
     }
 
     func importPrompts(from url: URL) throws -> Int {
-        let external = try PromptStorage.shared.loadExternalPrompts(from: url)
-        let (merged, addedCount) = PromptStorage.shared.mergeExternalPrompts(
-            current: storedPrompts,
-            external: external
+        let result = try storedPromptPersistence.importPrompts(
+            from: url,
+            mergingInto: storedPrompts
         )
-        if addedCount > 0 {
-            storedPrompts = merged
-            saveStoredPrompts()
+        if result.addedCount > 0 {
+            storedPrompts = result.mergedPrompts
             updateSelectedInstructions() // refresh anything that depends on storedPrompts
         }
-        return addedCount
+        return result.addedCount
     }
 
     /// Checks if a persisted built-in prompt matches a known previous canonical version.
@@ -4531,7 +4504,7 @@ class PromptViewModel: ObservableObject {
     }
 
     func loadStoredPrompts() {
-        let loadResult = PromptStorage.shared.loadPrompts()
+        let loadResult = storedPromptPersistence.loadPrompts()
 
         // Handle the load result
         let loadedPrompts: [StoredPrompt]

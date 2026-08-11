@@ -1,18 +1,6 @@
 import Foundation
 import MCP // <- required for `Value`
 
-private actor OracleProviderCleanupHandleBox {
-    private var handle: ProviderConversationCleanupHandle?
-
-    func update(_ handle: ProviderConversationCleanupHandle) {
-        self.handle = handle
-    }
-
-    func current() -> ProviderConversationCleanupHandle? {
-        handle
-    }
-}
-
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
 extension OracleViewModel {
@@ -1640,101 +1628,29 @@ extension OracleViewModel {
 
         try Task.checkCancellation()
 
-        // 4) Stream via AIQueriesService WITHOUT touching OracleViewModel.messages
-        let (streamID, stream) = try await aiQueriesService.sendPrompt(aiMessage, model: model)
-        let cleanupHandleBox = OracleProviderCleanupHandleBox()
+        // 4) Execute provider streaming without touching OracleViewModel.messages.
+        let runtimeOutput = try await headlessRuntime.execute(
+            message: aiMessage,
+            model: model,
+            tabID: tabID,
+            completionPolicy: completionPolicy,
+            onProgress: onProgress
+        )
         var didScheduleProviderCleanup = false
         defer {
             if !didScheduleProviderCleanup {
                 Task {
-                    await self.cleanupOracleProviderConversation(cleanupHandleBox.current(), model: model)
+                    await self.headlessRuntime.cleanup(
+                        runtimeOutput.providerCleanupHandle,
+                        model: model
+                    )
                 }
             }
         }
 
-        // Register this headless stream by tab ID so Discover can cancel it.
-        headlessStreamsByTabID[tabID] = streamID
-        defer {
-            // Always clean up mapping when this headless run finishes or errors.
-            headlessStreamsByTabID.removeValue(forKey: tabID)
-        }
-
-        // Stream with 4-hour timeout using single task group
-        // (One Task.sleep for entire stream, not per-chunk - avoids CPU churn)
-        let timeout: Duration = .seconds(4 * 60 * 60)
-
-        let (finalText, _, finalTokenInfo, providerCleanupHandle, terminalOutcome) = try await withThrowingTaskGroup(
-            of: (String, String, ChatTokenInfo, ProviderConversationCleanupHandle?, ChatStreamTerminalOutcome?).self
-        ) { group in
-            // Timeout task - throws after 4 hours
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw ChatToolError.internalError("Stream timed out after 4 hours of inactivity.")
-            }
-
-            // Streaming task - accumulates locally, returns result
-            group.addTask { [stream, onProgress, cleanupHandleBox] in
-                var accText = ""
-                var accReasoning = ""
-                var tokens = ChatTokenInfo()
-                var cleanupHandle: ProviderConversationCleanupHandle?
-                var terminalOutcome: ChatStreamTerminalOutcome?
-                var iterator = stream.makeAsyncIterator()
-
-                while let chunk = try await iterator.next() {
-                    accText += chunk.text
-                    if let reasoning = chunk.reasoning, !reasoning.isEmpty {
-                        accReasoning += reasoning
-                        accReasoning = ReasoningTextFormatter.normalize(accReasoning)
-                    }
-                    if chunk.tokens.promptTokens != nil ||
-                        chunk.tokens.completionTokens != nil ||
-                        chunk.tokens.cost != nil
-                    {
-                        tokens = chunk.tokens
-                    }
-                    if let handle = chunk.cleanupHandle {
-                        cleanupHandle = handle
-                        await cleanupHandleBox.update(handle)
-                    }
-                    // Only hop to MainActor for progress callback
-                    if let onProgress {
-                        let text = accText
-                        let reasoning = accReasoning.isEmpty ? nil : accReasoning
-                        await MainActor.run { onProgress(text, reasoning) }
-                    }
-                    if let outcome = chunk.terminalOutcome {
-                        terminalOutcome = outcome
-                        break
-                    }
-                }
-                return (accText, accReasoning, tokens, cleanupHandle, terminalOutcome)
-            }
-
-            // Wait for stream to complete or timeout to fire
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
-        }
-
-        if completionPolicy == .contextBuilderStrict {
-            switch terminalOutcome {
-            case .completed:
-                break
-            case let .incomplete(reason):
-                throw OracleContextBuilderCompletionError.providerTerminatedIncomplete(reason: reason)
-            case nil:
-                throw OracleContextBuilderCompletionError.streamEndedWithoutProviderCompletion
-            }
-        }
-
-        let trimmedResponse = finalText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !trimmedResponse.isEmpty else {
-            if completionPolicy == .contextBuilderStrict {
-                throw OracleContextBuilderCompletionError.emptyProcessedContent
-            }
-            throw ChatToolError.internalError("Request produced no content.")
-        }
+        let trimmedResponse = runtimeOutput.text
+        let finalTokenInfo = runtimeOutput.tokenInfo
+        let providerCleanupHandle = runtimeOutput.providerCleanupHandle
 
         // 5) Create persisted ChatSession
         let (session, shortID) = try await createSessionFromHeadlessRun(
@@ -1752,7 +1668,7 @@ extension OracleViewModel {
         )
 
         didScheduleProviderCleanup = true
-        Task { await cleanupOracleProviderConversation(providerCleanupHandle, model: model) }
+        Task { await headlessRuntime.cleanup(providerCleanupHandle, model: model) }
 
         // 6) Return ChatSendReply
         return ChatSendReply(

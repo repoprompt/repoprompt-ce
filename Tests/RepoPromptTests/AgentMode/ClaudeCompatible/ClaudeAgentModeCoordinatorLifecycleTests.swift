@@ -458,6 +458,133 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertFalse(recorder.contains("runner-replacement:shutdown"))
     }
 
+    func testClaudeRunnerClassifiesNativeTerminalEventsThroughSharedExecutionCore() async throws {
+        let rows: [(
+            name: String,
+            nativeStatus: NativeAgentRuntimeTurnStatus,
+            expectedState: AgentSessionRunState
+        )] = [
+            ("completed", .completed, .completed),
+            ("cancelled", .cancelled, .cancelled),
+            ("failed", .failed, .failed)
+        ]
+
+        for row in rows {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleFakeNativeController(
+                recorder: recorder,
+                label: "terminal-\(row.name)",
+                turnStatusOnSend: row.nativeStatus
+            )
+            let harness = makeHarness(recorder: recorder, claudeController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .claudeCode
+            harness.host.test_installLiveSession(session)
+
+            _ = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: row.name,
+                initialMessageForRun: row.name,
+                attachments: []
+            )
+            let ownership = try XCTUnwrap(session.activeRunOwnership)
+            let agentTask = try XCTUnwrap(session.agentTask)
+            await agentTask.value
+
+            XCTAssertEqual(session.runState, row.expectedState, row.name)
+            XCTAssertNil(session.activeRunOwnership, row.name)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership, row.name)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, row.expectedState, row.name)
+            XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1, row.name)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "run-active:false" }), 1, row.name)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "handoff:true" }), 1, row.name)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "handoff:false" }), 0, row.name)
+            XCTAssertTrue(recorder.contains("attachments:deleteFiles"), row.name)
+            XCTAssertNotNil(session.claudeController, row.name)
+            XCTAssertFalse(recorder.contains("terminal-\(row.name):shutdown"), row.name)
+        }
+    }
+
+    func testClaudeRunnerPreservesUnexpectedStreamEndFailureEvidenceWithoutShutdown() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "stream-end",
+            finishEventsAfterSend: true
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "end stream",
+            initialMessageForRun: "end stream",
+            attachments: []
+        )
+        let agentTask = try XCTUnwrap(session.agentTask)
+        await agentTask.value
+
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed)
+        XCTAssertEqual(
+            session.items.last(where: { $0.kind == .error })?.text,
+            "Claude events stream ended unexpectedly. The run may need to be restarted."
+        )
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "handoff:true" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "handoff:false" }), 0)
+        XCTAssertNotNil(session.claudeController)
+        XCTAssertFalse(recorder.contains("stream-end:shutdown"))
+    }
+
+    func testClaudeRunnerPreservesRuntimeInitFailureShutdownPolicy() async throws {
+        let recorder = LifecycleRecorder()
+        let runtimeInitFailure = NativeAgentRuntimeRuntimeInitStatus(
+            sessionID: "runtime-init-failure",
+            tools: [],
+            mcpServerStatuses: [MCPIntegrationHelper.repoPromptMCPServerName: "failed"],
+            initializeResponse: nil
+        )
+        let shutdownGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "runtime-init-failure",
+            shutdownGate: shutdownGate,
+            runtimeInitStatusOnSend: runtimeInitFailure
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "fail runtime init",
+            initialMessageForRun: "fail runtime init",
+            attachments: []
+        )
+        let agentTask = try XCTUnwrap(session.agentTask)
+        await agentTask.value
+
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed)
+        XCTAssertEqual(
+            session.items.last(where: { $0.kind == .error })?.text,
+            "RepoPrompt MCP failed to initialize for Claude (session runtime-init-failure)."
+        )
+        XCTAssertNil(session.claudeController)
+        await shutdownGate.waitUntilArrived()
+        await shutdownGate.release()
+        await harness.host.claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+        XCTAssertTrue(recorder.contains("runtime-init-failure:shutdown"))
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+    }
+
     func testClaudeSendFailureReportsEvidenceWithoutTerminalizingSession() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(
@@ -1007,8 +1134,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let shutdownGate: LifecycleAsyncGate?
     private let repeatsStartOrResumeFailure: Bool
     private var pendingStartOrResumeFailure: Error?
+    private let turnStatusOnSend: NativeAgentRuntimeTurnStatus?
+    private let runtimeInitStatusOnSend: NativeAgentRuntimeRuntimeInitStatus?
+    private let finishEventsAfterSend: Bool
     private let sessionRef = NativeAgentRuntimeSessionRef(sessionID: "lifecycle-claude-session")
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
+    private let eventsContinuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation
 
     init(
         recorder: LifecycleRecorder,
@@ -1021,7 +1152,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sendUserMessageGate: LifecycleAsyncGate? = nil,
         shutdownGate: LifecycleAsyncGate? = nil,
         startOrResumeFailure: Error? = nil,
-        repeatsStartOrResumeFailure: Bool = false
+        repeatsStartOrResumeFailure: Bool = false,
+        turnStatusOnSend: NativeAgentRuntimeTurnStatus? = nil,
+        runtimeInitStatusOnSend: NativeAgentRuntimeRuntimeInitStatus? = nil,
+        finishEventsAfterSend: Bool = false
     ) {
         self.recorder = recorder
         self.label = label
@@ -1034,7 +1168,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.shutdownGate = shutdownGate
         self.repeatsStartOrResumeFailure = repeatsStartOrResumeFailure
         pendingStartOrResumeFailure = startOrResumeFailure
-        stream = AsyncStream { _ in }
+        self.turnStatusOnSend = turnStatusOnSend
+        self.runtimeInitStatusOnSend = runtimeInitStatusOnSend
+        self.finishEventsAfterSend = finishEventsAfterSend
+        let eventPipe = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
+        stream = eventPipe.stream
+        eventsContinuation = eventPipe.continuation
     }
 
     var hasActiveSession: Bool {
@@ -1097,7 +1236,17 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         if failSend {
             throw LifecycleTestError.expectedClaudeSendFailure
         }
-        return UUID()
+        let turnID = UUID()
+        if let runtimeInitStatusOnSend {
+            eventsContinuation.yield(.runtimeInit(runtimeInitStatusOnSend))
+        }
+        if let turnStatusOnSend {
+            eventsContinuation.yield(.turnCompleted(turnID: turnID, status: turnStatusOnSend))
+        }
+        if finishEventsAfterSend {
+            eventsContinuation.finish()
+        }
+        return turnID
     }
 
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {

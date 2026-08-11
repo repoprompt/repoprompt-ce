@@ -2761,7 +2761,7 @@ struct AgentModeChatDetailView: View {
                 cancelActiveToolsAction: cancelAction
             ),
             promptManager: promptManager,
-            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
+            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id, runInteraction: runInteraction) : nil,
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
             rawToolResultPayloadRenderRevision: transcript.presentation
                 .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
@@ -3239,12 +3239,12 @@ struct AgentModeChatDetailView: View {
 
     // MARK: - Handoff
 
-    private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig {
+    private func handoffConfig(for itemID: UUID, runInteraction: AgentRunInteractionUISnapshot) -> AgentHandoffConfig {
         AgentHandoffConfig(
             itemID: itemID,
-            defaultDestinationAgent: runInteractionSnapshot.selectedAgent,
-            defaultModelRaw: runInteractionSnapshot.selectedModelRaw,
-            defaultReasoningEffortRaw: runInteractionSnapshot.selectedReasoningEffortRaw,
+            defaultDestinationAgent: runInteraction.selectedAgent,
+            defaultModelRaw: runInteraction.selectedModelRaw,
+            defaultReasoningEffortRaw: runInteraction.selectedReasoningEffortRaw,
             availableAgentsProvider: { [weak agentModeVM] in
                 agentModeVM?.availableAgents ?? []
             },

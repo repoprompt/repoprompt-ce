@@ -468,11 +468,6 @@ class OracleViewModel: ObservableObject {
     /// Maps AI message/query IDs to the underlying AIQueriesService stream IDs for targeted cancellation.
     private var streamIDsByQueryId: [UUID: ChatStreamID] = [:]
 
-    /// Active headless (plan/question) streams keyed by tab ID.
-    /// Used by Discover to cancel background plan generation.
-    /// Note: Internal (not private) to allow access from OracleViewModel+MCP.swift extension.
-    var headlessStreamsByTabID: [UUID: ChatStreamID] = [:]
-
     /// Stores ephemeral message state that persists even when messages array is cleared
     let ephemeralState = EphemeralMessageState()
 
@@ -1071,6 +1066,7 @@ class OracleViewModel: ObservableObject {
 
     // Dependencies
     let aiQueriesService: AIQueriesService
+    let headlessRuntime: OracleHeadlessRuntime
     var promptViewModel: PromptViewModel
 
     #if DEBUG
@@ -1133,6 +1129,7 @@ class OracleViewModel: ObservableObject {
         chatData: ChatDataService
     ) {
         self.aiQueriesService = aiQueriesService
+        headlessRuntime = OracleHeadlessRuntime(aiQueriesService: aiQueriesService)
         self.promptViewModel = promptViewModel
         self.workspaceManager = workspaceManager
         self.chatData = chatData
@@ -1225,15 +1222,11 @@ class OracleViewModel: ObservableObject {
         activeRetryTask?.cancel()
 
         // Cancel any active headless and chat streams
-        let headlessStreamIDs = Array(headlessStreamsByTabID.values)
+        let headlessRuntime = headlessRuntime
         let chatStreamIDs = Array(streamIDsByQueryId.values)
         let queriesService = aiQueriesService
         Task {
-            // Cancel headless streams (plan/question generation)
-            for streamID in headlessStreamIDs {
-                await queriesService.cancelStream(id: streamID)
-            }
-            // Cancel any active chat streams
+            await headlessRuntime.cancelAllStreams()
             for streamID in chatStreamIDs {
                 await queriesService.cancelStream(id: streamID)
             }
@@ -3619,9 +3612,7 @@ class OracleViewModel: ObservableObject {
     /// Called by ContextBuilderAgentViewModel when user cancels background plan generation.
     @MainActor
     func cancelHeadlessStream(forTabID tabID: UUID) async {
-        guard let streamID = headlessStreamsByTabID[tabID] else { return }
-        headlessStreamsByTabID.removeValue(forKey: tabID)
-        await aiQueriesService.cancelStream(id: streamID)
+        await headlessRuntime.cancelStream(for: tabID)
     }
 
     @MainActor
@@ -3636,7 +3627,7 @@ class OracleViewModel: ObservableObject {
     private func handleComposeTabsWillClose(_ tabIDs: Set<UUID>) async {
         for tabID in tabIDs {
             // 1. Cancel headless stream (plan/question generation) for this tab
-            if headlessStreamsByTabID[tabID] != nil {
+            if headlessRuntime.hasActiveStream(for: tabID) {
                 await cancelHeadlessStream(forTabID: tabID)
             }
 

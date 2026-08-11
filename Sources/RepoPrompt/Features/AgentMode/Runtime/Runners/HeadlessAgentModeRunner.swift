@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 @MainActor
 final class HeadlessAgentModeRunner {
@@ -167,7 +168,9 @@ final class HeadlessAgentModeRunner {
         lease: MCPBootstrapLease
     ) async {
         var providerInitializationCompleted = false
-        do {
+        let report = await DomainAgentRunExecutionCore.execute(
+            failureText: { "Agent failed: \($0.localizedDescription)" }
+        ) {
             await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
             let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
             providerInitializationCompleted = true
@@ -182,7 +185,9 @@ final class HeadlessAgentModeRunner {
 
             for try await result in stream {
                 guard !Task.isCancelled else { break }
-                guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { return }
+                guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
+                    return .superseded
+                }
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             }
@@ -190,71 +195,59 @@ final class HeadlessAgentModeRunner {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
             else {
-                return
+                return .superseded
             }
+            return .completed(assistantText: nil)
+        }
 
-            await terminalCommitBarrier.commit(.init(
-                binding: hooks.bindTerminalSession(session),
-                ownership: ownership,
-                expectedRunID: runID,
-                terminalState: .completed,
-                source: "headless.completed",
-                attachmentReservationID: attachmentReservationID,
-                attachmentDisposition: .deleteFiles,
-                finalizeNonCodexUsage: true,
-                supportsFollowUp: false,
-                notifyTurnComplete: true,
-                prepareProviderState: {
-                    session.provider = nil
-                    session.clearRunID(ifCurrent: runID)
-                    return nil
-                }
-            ))
-        } catch is CancellationError {
+        guard case let .terminal(outcome) = report.result else { return }
+        let terminalState: AgentSessionRunState
+        let source: String
+        let notifyTurnComplete: Bool
+        let errorText: String?
+        switch outcome.kind {
+        case .completed:
+            terminalState = .completed
+            source = "headless.completed"
+            notifyTurnComplete = true
+            errorText = nil
+        case .cancelled:
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
             }
             hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-            await terminalCommitBarrier.commit(.init(
-                binding: hooks.bindTerminalSession(session),
-                ownership: ownership,
-                expectedRunID: runID,
-                terminalState: .cancelled,
-                source: "headless.cancelled",
-                attachmentReservationID: attachmentReservationID,
-                attachmentDisposition: .deleteFiles,
-                finalizeNonCodexUsage: true,
-                supportsFollowUp: false,
-                notifyTurnComplete: false,
-                prepareProviderState: {
-                    session.provider = nil
-                    session.clearRunID(ifCurrent: runID)
-                    return nil
-                }
-            ))
-        } catch {
+            terminalState = .cancelled
+            source = "headless.cancelled"
+            notifyTurnComplete = false
+            errorText = nil
+        case .failed:
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
             }
             hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-            await terminalCommitBarrier.commit(.init(
-                binding: hooks.bindTerminalSession(session),
-                ownership: ownership,
-                expectedRunID: runID,
-                terminalState: .failed,
-                source: "headless.failed",
-                errorText: "Agent failed: \(error.localizedDescription)",
-                attachmentReservationID: attachmentReservationID,
-                attachmentDisposition: .deleteFiles,
-                finalizeNonCodexUsage: true,
-                supportsFollowUp: false,
-                notifyTurnComplete: false,
-                prepareProviderState: {
-                    session.provider = nil
-                    session.clearRunID(ifCurrent: runID)
-                    return nil
-                }
-            ))
+            terminalState = .failed
+            source = "headless.failed"
+            notifyTurnComplete = false
+            errorText = outcome.assistantText
         }
+
+        await terminalCommitBarrier.commit(.init(
+            binding: hooks.bindTerminalSession(session),
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: terminalState,
+            source: source,
+            errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: notifyTurnComplete,
+            prepareProviderState: {
+                session.provider = nil
+                session.clearRunID(ifCurrent: runID)
+                return nil
+            }
+        ))
     }
 }

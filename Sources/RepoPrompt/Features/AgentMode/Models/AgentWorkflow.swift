@@ -1,75 +1,28 @@
+import RepoPromptShared
 import SwiftUI
 
 // MARK: - Agent Workflow
 
 /// Built-in workflow templates that wrap user input with structured prompts for agent mode.
 /// Each case maps to a corresponding provider-neutral RepoPrompt workflow prompt template.
-public enum AgentWorkflow: String, Codable, CaseIterable, Sendable, Identifiable {
-    case build, review, refactor, investigate, oracleExport, orchestrate, optimize, deepPlan
+public typealias AgentWorkflow = RepoPromptBuiltInAgentWorkflow
 
-    public var id: String {
-        rawValue
-    }
-
+extension AgentWorkflow {
     public var displayName: String {
-        switch self {
-        case .build: "Plan & Build"
-        case .review: "Review"
-        case .refactor: "Refactor"
-        case .investigate: "Investigate"
-        case .oracleExport: "ChatGPT Export"
-        case .orchestrate: "Orchestrate"
-        case .optimize: "Optimize"
-        case .deepPlan: "Deep Plan"
-        }
+        metadata.displayName
     }
 
     var iconName: String {
-        switch self {
-        case .build: "hammer.fill"
-        case .review: "eye.fill"
-        case .refactor: "arrow.triangle.2.circlepath"
-        case .investigate: "magnifyingglass"
-        case .oracleExport: "square.and.arrow.up"
-        case .orchestrate: "arrow.triangle.branch"
-        case .optimize: "speedometer"
-        case .deepPlan: "text.book.closed.fill"
-        }
+        metadata.iconName
     }
 
     var tooltipText: String {
-        switch self {
-        case .build: "Deep-research, plan, and implement complex tasks"
-        case .review: "Thorough code review across branches and diffs"
-        case .refactor: "Analyze and improve code organization"
-        case .investigate: "Hypothesis-driven research with evidence gathering"
-        case .oracleExport: "Export codebase context for ChatGPT analysis"
-        case .orchestrate: "Plan, decompose, and delegate tasks across multiple agents"
-        case .optimize: "Instrument, baseline, and iteratively optimize a target metric"
-        case .deepPlan: "Deeply research and shape a polished plan document"
-        }
+        metadata.tooltipText
     }
 
     /// Detailed description of what the workflow does, shown in the picker popover.
     var descriptionText: String {
-        switch self {
-        case .build:
-            "Researches the code, makes a plan, and implements the change step by step."
-        case .review:
-            "Deeply reviews the code for subtle bugs, regressions, risks, and missed edge cases."
-        case .refactor:
-            "Cleans up code structure while keeping behavior the same."
-        case .investigate:
-            "Digs into bugs, crashes, security concerns, or research questions and reports the evidence."
-        case .oracleExport:
-            "Packages the right code and context into a prompt you can send to ChatGPT."
-        case .orchestrate:
-            "Breaks a complex request into smaller tasks, sends agents to do the work, and checks each result."
-        case .optimize:
-            "Finds what to measure, adds metrics, tries improvements, and uses evidence to keep iterating."
-        case .deepPlan:
-            "Researches the code, asks how hands-on you want to be, and writes a clear implementation plan."
-        }
+        metadata.descriptionText
     }
 
     /// Compact guidance shown beside the workflow pill after the workflow is selected.
@@ -122,38 +75,6 @@ public enum AgentWorkflow: String, Codable, CaseIterable, Sendable, Identifiable
         }
     }
 
-    /// The full agent-variant workflow template string.
-    var template: String {
-        template(includeSessionCleanupGuidance: true)
-    }
-
-    var workflowPromptID: RepoPromptWorkflowID {
-        switch self {
-        case .build: .build
-        case .review: .review
-        case .refactor: .refactor
-        case .investigate: .investigate
-        case .oracleExport: .oracleExport
-        case .orchestrate: .orchestrate
-        case .optimize: .optimize
-        case .deepPlan: .deepPlan
-        }
-    }
-
-    func template(includeSessionCleanupGuidance: Bool) -> String {
-        RepoPromptWorkflowPrompts.render(
-            id: workflowPromptID,
-            variant: .agent,
-            includeSessionCleanupGuidance: includeSessionCleanupGuidance
-        )
-    }
-
-    /// Wraps user text by stripping YAML frontmatter from the template
-    /// and replacing `$ARGUMENTS` with the provided text.
-    func wrapUserText(_ text: String, includeSessionCleanupGuidance: Bool = true) -> String {
-        AgentWorkflowDefinition.wrap(template: template(includeSessionCleanupGuidance: includeSessionCleanupGuidance), userText: text)
-    }
-
     /// Creates an `AgentWorkflowDefinition` for this built-in workflow.
     ///
     /// Built-in definitions include the full workflow prompt template, which can be
@@ -163,8 +84,6 @@ public enum AgentWorkflow: String, Codable, CaseIterable, Sendable, Identifiable
     var definition: AgentWorkflowDefinition {
         Self.cachedDefinitionsByRawValue[rawValue] ?? AgentWorkflowDefinition(builtIn: self)
     }
-
-    static let displayOrder: [AgentWorkflow] = [.orchestrate, .deepPlan, .optimize, .build, .review, .refactor, .investigate, .oracleExport]
 
     private static let cachedDefinitionsByRawValue: [String: AgentWorkflowDefinition] = Dictionary(
         uniqueKeysWithValues: allCases.map { workflow in
@@ -225,7 +144,7 @@ public struct AgentWorkflowDefinition: Sendable, Identifiable, Equatable, Hashab
 
     public var id: String {
         switch source {
-        case let .builtIn(workflow): "builtin-\(workflow.rawValue)"
+        case let .builtIn(workflow): workflow.canonicalID
         case let .custom(uuid): "custom-\(uuid.uuidString)"
         }
     }

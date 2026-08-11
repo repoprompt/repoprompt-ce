@@ -1,7 +1,7 @@
 import Foundation
 
 /// Variant for tool invocation examples in prompts.
-enum WorkflowPromptVariant {
+public enum WorkflowPromptVariant: Sendable {
     case mcp // JSON-style MCP tool calls
     case cli // rpce-cli command line
     case agent // Agent mode – MCP syntax, auto-mapped workspace, uses ask_oracle
