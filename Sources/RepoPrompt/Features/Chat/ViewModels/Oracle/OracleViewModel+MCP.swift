@@ -1794,13 +1794,12 @@ extension OracleViewModel {
             agentSessionID: tabContext?.agentModeSessionID,
             agentRunID: tabContext?.agentModeRunID
         )
-        let additionalModels: [AIModel]
-        if let additionalModelOverrides {
-            additionalModels = additionalModelOverrides
+        let additionalModels: [AIModel] = if let additionalModelOverrides {
+            additionalModelOverrides
         } else if let secondaryModelOverride {
-            additionalModels = [secondaryModelOverride]
+            [secondaryModelOverride]
         } else {
-            additionalModels = try resolveAdditionalOracleModels(workspaceID: workspaceID)
+            try resolveAdditionalOracleModels(workspaceID: workspaceID)
         }
         guard additionalModels.count <= OracleLane.allCases.count - 1 else {
             throw ChatToolError.invalidParams("Oracle supports at most five concurrent models.")

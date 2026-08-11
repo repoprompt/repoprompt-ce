@@ -1,6 +1,6 @@
 import Foundation
 
-enum OracleLane: String, Codable, CaseIterable, Hashable, Sendable {
+enum OracleLane: String, Codable, CaseIterable, Hashable {
     case primary
     case secondary
     case oracle3 = "oracle_3"
@@ -49,7 +49,7 @@ enum OracleLane: String, Codable, CaseIterable, Hashable, Sendable {
     }
 }
 
-enum OracleLaneValidationError: LocalizedError, Equatable, Sendable {
+enum OracleLaneValidationError: LocalizedError, Equatable {
     case invalidCount(Int)
     case invalidPrefix(expected: [OracleLane], actual: [OracleLane])
 

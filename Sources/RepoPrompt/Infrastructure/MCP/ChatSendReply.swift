@@ -80,13 +80,33 @@ struct OraclePairSendReply {
     let historyDiverged: Bool
     let historyPersistenceError: String?
 
-    var groupID: UUID { pairID }
-    var oracleCount: Int { result.orderedResults.count }
-    var orderedLanes: [OracleLane] { result.orderedLanes }
-    var primaryChatID: String { requiredChatID(for: .primary) }
-    var secondaryChatID: String { requiredChatID(for: .secondary) }
-    var primaryModel: AIModel { requiredModel(for: .primary) }
-    var secondaryModel: AIModel { requiredModel(for: .secondary) }
+    var groupID: UUID {
+        pairID
+    }
+
+    var oracleCount: Int {
+        result.orderedResults.count
+    }
+
+    var orderedLanes: [OracleLane] {
+        result.orderedLanes
+    }
+
+    var primaryChatID: String {
+        requiredChatID(for: .primary)
+    }
+
+    var secondaryChatID: String {
+        requiredChatID(for: .secondary)
+    }
+
+    var primaryModel: AIModel {
+        requiredModel(for: .primary)
+    }
+
+    var secondaryModel: AIModel {
+        requiredModel(for: .secondary)
+    }
 
     /// Compatibility initializer for the original two-lane runtime.
     init(

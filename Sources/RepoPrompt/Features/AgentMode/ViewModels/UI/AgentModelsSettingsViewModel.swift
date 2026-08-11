@@ -368,8 +368,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         ModelDestination(
             id: "agentModels.additionalOracle.\(index)",
             getter: { [weak self] in
-                guard let self, self.additionalOracleModelRaws.indices.contains(index) else { return "" }
-                return self.additionalOracleModelRaws[index]
+                guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
+                return additionalOracleModelRaws[index]
             },
             applier: { [weak self] rawValue in
                 self?.setAdditionalOracleModel(raw: rawValue, at: index)

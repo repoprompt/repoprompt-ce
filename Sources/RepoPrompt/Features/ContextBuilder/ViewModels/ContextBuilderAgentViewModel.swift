@@ -4252,8 +4252,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             .map(\.value) +
             [session.followUpPrimarySessionID, session.followUpSecondarySessionID].compactMap(\.self)
         let ids = candidateIDs.reduce(into: [UUID]()) { result, id in
-                if !result.contains(id) { result.append(id) }
-            }
+            if !result.contains(id) { result.append(id) }
+        }
         session.followUpOracleSessionIDsByLane = [:]
         session.followUpPrimarySessionID = nil
         session.followUpSecondarySessionID = nil
@@ -4799,7 +4799,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 else { return }
                 session.mcpPlanModel = modelsByLane
                     .sorted { $0.key.ordinal < $1.key.ordinal }
-                    .map { $0.value.displayName }
+                    .map(\.value.displayName)
                     .joined(separator: " + ")
                 updateRuntimeBindings(from: session)
             },

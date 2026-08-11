@@ -91,9 +91,9 @@ final class OraclePairCoordinatorTests: XCTestCase {
         let modelsByLane = Dictionary(uniqueKeysWithValues: lanes.map { ($0, AIModel.gpt54Pro) })
         var executions: [OracleLane: OraclePairCoordinator.LaneExecution<ChatSendReply>] = [:]
         for lane in lanes {
-            executions[lane] = .success(ChatSendReply(
-                chatId: try XCTUnwrap(sessionIDsByLane[lane]),
-                shortId: try XCTUnwrap(chatIDsByLane[lane]),
+            executions[lane] = try .success(ChatSendReply(
+                chatId: XCTUnwrap(sessionIDsByLane[lane]),
+                shortId: XCTUnwrap(chatIDsByLane[lane]),
                 mode: "chat",
                 response: "\(lane.rawValue) response",
                 errors: nil

@@ -911,14 +911,13 @@ final class OraclePairPreparationTests: XCTestCase {
         ownerSessionID: UUID? = nil,
         ownerRunID: UUID? = nil
     ) -> ChatSession {
-        let name: String
-        switch lane {
+        let name = switch lane {
         case .primary:
-            name = "Primary"
+            "Primary"
         case .secondary:
-            name = "Secondary"
+            "Secondary"
         case .oracle3, .oracle4, .oracle5:
-            name = "Oracle \(lane.ordinal)"
+            "Oracle \(lane.ordinal)"
         }
         return ChatSession(
             workspaceID: fixture.workspace.id,

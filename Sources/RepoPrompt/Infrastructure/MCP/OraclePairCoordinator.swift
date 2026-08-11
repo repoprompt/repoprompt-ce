@@ -1,12 +1,12 @@
 import Foundation
 
-enum OracleLaneFailureCode: String, Equatable, Sendable {
+enum OracleLaneFailureCode: String, Equatable {
     case emptyResponse = "empty_response"
     case executionFailed = "execution_failed"
     case cancelled
 }
 
-struct OracleLaneFailure: LocalizedError, Equatable, Sendable {
+struct OracleLaneFailure: LocalizedError, Equatable {
     let message: String
     let partialResponse: String?
     let code: OracleLaneFailureCode
@@ -27,12 +27,12 @@ struct OracleLaneFailure: LocalizedError, Equatable, Sendable {
 }
 
 enum OraclePairCoordinator {
-    enum LaneExecution<Success: Sendable>: Sendable {
+    enum LaneExecution<Success: Sendable> {
         case success(Success)
         case failure(OracleLaneFailure)
     }
 
-    struct LaneOperation<Success: Sendable>: Sendable {
+    struct LaneOperation<Success: Sendable> {
         let lane: OracleLane
         let operation: Operation<Success>
 
@@ -42,12 +42,12 @@ enum OraclePairCoordinator {
         }
     }
 
-    struct LaneResult<Success: Sendable>: Sendable {
+    struct LaneResult<Success: Sendable> {
         let lane: OracleLane
         let execution: LaneExecution<Success>
     }
 
-    struct Result<Success: Sendable>: Sendable {
+    struct Result<Success: Sendable> {
         let orderedResults: [LaneResult<Success>]
 
         init(primary: LaneExecution<Success>, secondary: LaneExecution<Success>) {
