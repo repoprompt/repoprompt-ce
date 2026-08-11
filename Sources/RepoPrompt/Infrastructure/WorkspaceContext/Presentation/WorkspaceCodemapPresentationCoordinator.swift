@@ -131,6 +131,11 @@ struct WorkspaceCodemapPresentationAttempt<Context> {
     let requestedCodemapCount: Int?
 }
 
+enum WorkspaceCodemapPresentationRetrySource: Equatable {
+    case assembledPresentation
+    case publicationRevalidation
+}
+
 struct WorkspaceCodemapPresentationCoordinator {
     private struct AutomaticPreparation {
         let candidates: [WorkspaceCodemapOperationPresentationCandidate]
@@ -155,6 +160,11 @@ struct WorkspaceCodemapPresentationCoordinator {
         WorkspaceCodemapAutomaticSelectionReceipt
     ) async throws -> Void
     let structureAttemptDidBegin: @Sendable (Int) -> Void
+    let presentationRetryScheduled: @Sendable (
+        Int,
+        WorkspaceCodemapPresentationRetrySource,
+        WorkspaceCodemapOperationPublicationStaleReason
+    ) -> Void
     let structurePhaseDidChange: @Sendable (WorkspaceCodemapStructureExecutionPhase) async -> Void
 
     init(
@@ -168,6 +178,11 @@ struct WorkspaceCodemapPresentationCoordinator {
             WorkspaceCodemapAutomaticSelectionReceipt
         ) async throws -> Void = { _ in },
         structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in },
+        presentationRetryScheduled: @escaping @Sendable (
+            Int,
+            WorkspaceCodemapPresentationRetrySource,
+            WorkspaceCodemapOperationPublicationStaleReason
+        ) -> Void = { _, _, _ in },
         structurePhaseDidChange: @escaping @Sendable (
             WorkspaceCodemapStructureExecutionPhase
         ) async -> Void = { _ in }
@@ -178,6 +193,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         self.beforePublicationRevalidation = beforePublicationRevalidation
         self.afterAutomaticCandidateReconstruction = afterAutomaticCandidateReconstruction
         self.structureAttemptDidBegin = structureAttemptDidBegin
+        self.presentationRetryScheduled = presentationRetryScheduled
         self.structurePhaseDidChange = structurePhaseDidChange
     }
 
@@ -244,6 +260,7 @@ struct WorkspaceCodemapPresentationCoordinator {
 
         for attempt in 0 ... 1 {
             try Task.checkCancellation()
+            structureAttemptDidBegin(attempt)
             let prepared = try await prepareAttempt()
             lastAttempt = prepared
             if initialRequestedCodemapCount == nil {
@@ -271,6 +288,7 @@ struct WorkspaceCodemapPresentationCoordinator {
                 if let reason = retryableStaleReason(in: result.issues) {
                     lastStaleReason = reason
                     if attempt == 0, clock.now < deadline {
+                        presentationRetryScheduled(attempt, .assembledPresentation, reason)
                         await release(ownership)
                         continue
                     }
@@ -314,7 +332,10 @@ struct WorkspaceCodemapPresentationCoordinator {
                     case let .stale(reason):
                         lastStaleReason = reason
                         await release(ownership)
-                        if attempt == 0, clock.now < deadline { continue }
+                        if attempt == 0, clock.now < deadline {
+                            presentationRetryScheduled(attempt, .publicationRevalidation, reason)
+                            continue
+                        }
                         let fallbackValue = try await operation(
                             prepared.context,
                             incompletePublication(reason: reason)

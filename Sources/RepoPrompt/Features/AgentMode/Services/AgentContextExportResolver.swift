@@ -318,6 +318,7 @@ typealias AgentCodemapPresentationPlan = WorkspaceCodemapOperationPresentationPl
 
 enum AgentContextExportResolver {
     enum ResolutionPhase {
+        case preliminaryProjection
         case codemapFileRecords
         case metricsAssembly
         case finalModelAssembly
@@ -499,71 +500,113 @@ enum AgentContextExportResolver {
             return displayModel
         }
 
-        let lookupContext = await authoritativeLookupContext(
-            source: source,
-            store: store,
-            fallback: .visibleWorkspace
+        let publishesInterimFileRows = interimFileRowsHandler != nil
+            && shouldEmitInterimFileRows(for: source.selection, codeMapUsage: codeMapUsage)
+        let needsPreliminaryProjection = codeMapUsage == .none || publishesInterimFileRows
+        AgentSelectedFilesDiagnostics.event(
+            "resolver.preliminaryProjection",
+            fields: startFields.merging([
+                "disposition": codeMapUsage == .none
+                    ? "finalNone"
+                    : (publishesInterimFileRows ? "interim" : "skipped")
+            ]) { _, new in new }
         )
-        let physicalizeStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        let physicalSelection = lookupContext.physicalizeSelection(source.selection)
-        var physicalizeFields = AgentSelectedFilesDiagnostics.selectionFields(physicalSelection)
-        physicalizeFields["hasProjection"] = String(lookupContext.bindingProjection != nil)
-        AgentSelectedFilesDiagnostics.durationEvent("resolver.physicalizeSelection", startMS: physicalizeStartMS, fields: physicalizeFields)
-
-        let resolveRowsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
-        let resolution = await resolveRows(
-            selection: physicalSelection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted
-        )
-        AgentSelectedFilesDiagnostics.durationEvent(
-            "resolver.resolveRows",
-            startMS: resolveRowsStartMS,
-            fields: [
-                "rowEntries": String(resolution.rows.count),
-                "missingPaths": String(resolution.missingPaths.count),
-                "invalidPaths": String(resolution.invalidPaths.count)
-            ]
-        )
-
-        let roots = await store.rootRefs(scope: lookupContext.rootScope)
-        let logicalRootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        if shouldEmitInterimFileRows(for: physicalSelection, codeMapUsage: codeMapUsage), let interimFileRowsHandler {
-            let interimModel = try await makeModel(
+        if needsPreliminaryProjection {
+            phaseDidBeginForTesting?(.preliminaryProjection)
+            let lookupContext = await authoritativeLookupContext(
                 source: source,
-                lookupContext: lookupContext,
-                resolution: resolution,
-                roots: roots,
-                codemapFilesByID: [:],
                 store: store,
-                filePathDisplay: filePathDisplay,
-                codeMapUsage: .none,
-                codemapPresentation: .empty,
-                logicalRootDisplayNamesByRootID: logicalRootDisplayNames,
-                entryMetricsSnapshot: entryMetricsSnapshot ?? .empty,
-                phaseDidBeginForTesting: phaseDidBeginForTesting
+                fallback: .visibleWorkspace
             )
-            await interimFileRowsHandler(interimModel)
-            try checkCancellation()
-        }
-        if codeMapUsage == .none {
-            return try await makeModel(
-                source: source,
-                lookupContext: lookupContext,
-                resolution: resolution,
-                roots: roots,
-                codemapFilesByID: [:],
+            let physicalizeStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+            let physicalSelection = lookupContext.physicalizeSelection(source.selection)
+            var physicalizeFields = AgentSelectedFilesDiagnostics.selectionFields(physicalSelection)
+            physicalizeFields["hasProjection"] = String(lookupContext.bindingProjection != nil)
+            AgentSelectedFilesDiagnostics.durationEvent(
+                "resolver.physicalizeSelection",
+                startMS: physicalizeStartMS,
+                fields: physicalizeFields
+            )
+
+            let resolveRowsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+            let resolution = await resolveRows(
+                selection: physicalSelection,
                 store: store,
-                filePathDisplay: filePathDisplay,
-                codeMapUsage: codeMapUsage,
-                codemapPresentation: .empty,
-                logicalRootDisplayNamesByRootID: logicalRootDisplayNames,
-                entryMetricsSnapshot: entryMetricsSnapshot,
-                phaseDidBeginForTesting: phaseDidBeginForTesting
+                rootScope: lookupContext.rootScope,
+                profile: .uiAssisted
             )
+            AgentSelectedFilesDiagnostics.durationEvent(
+                "resolver.resolveRows",
+                startMS: resolveRowsStartMS,
+                fields: [
+                    "rowEntries": String(resolution.rows.count),
+                    "missingPaths": String(resolution.missingPaths.count),
+                    "invalidPaths": String(resolution.invalidPaths.count)
+                ]
+            )
+
+            let roots = await store.rootRefs(scope: lookupContext.rootScope)
+            let logicalRootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
+            if publishesInterimFileRows, let interimFileRowsHandler {
+                let interimModel = try await makeModel(
+                    source: source,
+                    lookupContext: lookupContext,
+                    resolution: resolution,
+                    roots: roots,
+                    codemapFilesByID: [:],
+                    store: store,
+                    filePathDisplay: filePathDisplay,
+                    codeMapUsage: .none,
+                    codemapPresentation: .empty,
+                    logicalRootDisplayNamesByRootID: logicalRootDisplayNames,
+                    entryMetricsSnapshot: entryMetricsSnapshot ?? .empty,
+                    phaseDidBeginForTesting: phaseDidBeginForTesting
+                )
+                await interimFileRowsHandler(interimModel)
+                try checkCancellation()
+            }
+            if codeMapUsage == .none {
+                return try await makeModel(
+                    source: source,
+                    lookupContext: lookupContext,
+                    resolution: resolution,
+                    roots: roots,
+                    codemapFilesByID: [:],
+                    store: store,
+                    filePathDisplay: filePathDisplay,
+                    codeMapUsage: codeMapUsage,
+                    codemapPresentation: .empty,
+                    logicalRootDisplayNamesByRootID: logicalRootDisplayNames,
+                    entryMetricsSnapshot: entryMetricsSnapshot,
+                    phaseDidBeginForTesting: phaseDidBeginForTesting
+                )
+            }
         }
-        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: store)
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            structureAttemptDidBegin: { attempt in
+                AgentSelectedFilesDiagnostics.event(
+                    "resolver.presentation.attempt",
+                    fields: ["attempt": String(attempt)]
+                )
+            },
+            presentationRetryScheduled: { attempt, source, reason in
+                AgentSelectedFilesDiagnostics.event(
+                    "resolver.presentation.retry",
+                    fields: [
+                        "attempt": String(attempt),
+                        "source": String(describing: source),
+                        "reason": String(describing: reason)
+                    ]
+                )
+            },
+            structurePhaseDidChange: { phase in
+                AgentSelectedFilesDiagnostics.event(
+                    "resolver.presentation.phase",
+                    fields: ["phase": String(describing: phase)]
+                )
+            }
+        )
         do {
             try await presentationWillBeginForTesting?()
             return try await coordinator.withPresentation(
@@ -1196,14 +1239,22 @@ enum AgentContextExportResolver {
         selection: StoredSelection,
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
-        profile: PathLocateProfile
+        profile: PathLocateProfile,
+        planningMetricsHandler: (@Sendable (WorkspaceCodemapPresentationPlanningMetrics) -> Void)? = nil
     ) async -> AgentCodemapPresentationPlan {
-        await WorkspaceCodemapPresentationIntentResolver.plan(
+        let metricsHandler = planningMetricsHandler ?? { metrics in
+            AgentSelectedFilesDiagnostics.event(
+                "resolver.presentation.plan",
+                fields: AgentSelectedFilesDiagnostics.planningMetricsFields(metrics)
+            )
+        }
+        return await WorkspaceCodemapPresentationIntentResolver.plan(
             codeMapUsage: codeMapUsage,
             selection: selection,
             store: store,
             rootScope: rootScope,
-            profile: profile
+            profile: profile,
+            planningMetricsHandler: metricsHandler
         )
     }
 
@@ -1278,6 +1329,8 @@ enum AgentContextExportResolver {
         }
         try checkCancellation()
         phaseDidBeginForTesting?(.metricsAssembly)
+        let metricsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let metricsSource = entryMetricsSnapshot == nil ? "computedBySelectedFilesResolver" : "reusedPublishedSnapshot"
         let metricsSnapshot: PromptContextEntryMetricsSnapshot = if let entryMetricsSnapshot {
             entryMetricsSnapshot
         } else {
@@ -1297,6 +1350,15 @@ enum AgentContextExportResolver {
                 }
             )
         }
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.metricsAssembly",
+            startMS: metricsStartMS,
+            fields: [
+                "source": metricsSource,
+                "entryCount": String(rowEntries.count),
+                "totalSelectedDisplayTokens": String(metricsSnapshot.totalSelectedDisplayTokens)
+            ]
+        )
         let selectedPhysicalRootIDs = Set(rowEntries.map(\.entry.file.rootID))
         let rootMetadata = rootMetadataByPhysicalRootID(
             roots: roots,

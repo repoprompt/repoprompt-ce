@@ -69,6 +69,10 @@ struct AgentContextControlDrawerView: View {
         hasPendingSwitchKeyChange || selectedFilesBlankingIdentity != nil
     }
 
+    private var selectedFilesBlankingTargetsCurrentRequest: Bool {
+        !hasPendingSwitchKeyChange && selectedFilesBlankingIdentity == exportContext.modelRequestIdentity
+    }
+
     private var isSwitchBlankingTokenEstimate: Bool {
         tokenBlankingSelection != nil
     }
@@ -385,7 +389,8 @@ struct AgentContextControlDrawerView: View {
                 detailStore: detailStore,
                 modelCoordinator: modelCoordinator,
                 exportContext: exportContext,
-                isSwitchBlankingRows: isSwitchBlankingSelectedFiles
+                isSwitchBlankingRows: isSwitchBlankingSelectedFiles,
+                blankingTargetsCurrentRequest: selectedFilesBlankingTargetsCurrentRequest
             )
         case .builder:
             AgentContextDrawerBuilderTab(

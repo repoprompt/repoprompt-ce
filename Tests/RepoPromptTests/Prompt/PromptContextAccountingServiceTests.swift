@@ -1072,6 +1072,7 @@ final class PromptContextAccountingServiceTests: XCTestCase {
             let api = makeSyntaxArtifact(path: file.standardizedFullPath)
             return (file, api.renderedCodeMap(displayPath: "AccountingCompleteCodemapBatch/\(file.standardizedRelativePath)"))
         })
+        await store.resetFilesInRootRequestCountForTesting()
 
         let resolution = await PromptContextAccountingService().resolveEntries(
             selection: StoredSelection(codemapAutoEnabled: false),
@@ -1080,9 +1081,11 @@ final class PromptContextAccountingServiceTests: XCTestCase {
             codemapPresentation: presentation
         )
 
+        let fileEnumerationRequests = await store.fileEnumerationRequestCountForTesting()
         XCTAssertEqual(resolution.codemapPresentation.id, presentation.id)
         XCTAssertEqual(resolution.entries.count, fileCount)
         XCTAssertTrue(resolution.entries.allSatisfy { $0.mode == .codemap })
+        XCTAssertEqual(fileEnumerationRequests, 0)
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {

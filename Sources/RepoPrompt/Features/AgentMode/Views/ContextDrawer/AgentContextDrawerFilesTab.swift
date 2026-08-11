@@ -8,11 +8,25 @@ func presentedSelectedContextCount(
     return authoritativeRowCount
 }
 
+func presentsDefinitiveEmptyAgentContextFiles(
+    activeSubtab: AgentContextDrawerUIStore.FilesSubtab,
+    explicitFileRowCount: Int,
+    isSwitchHidingRows: Bool,
+    blankingTargetsCurrentRequest: Bool,
+    isResolvingWithoutModel: Bool
+) -> Bool {
+    activeSubtab == .files
+        && explicitFileRowCount == 0
+        && (!isSwitchHidingRows || blankingTargetsCurrentRequest)
+        && isResolvingWithoutModel
+}
+
 struct AgentContextDrawerFilesTab: View {
     @ObservedObject var detailStore: AgentContextDrawerDetailStore
     @ObservedObject var modelCoordinator: AgentSelectedFilesModelCoordinator
     let exportContext: AgentContextExportViewContext
     let isSwitchBlankingRows: Bool
+    let blankingTargetsCurrentRequest: Bool
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @StateObject private var previewCoordinator = AgentSelectedFilePreviewLoadCoordinator()
@@ -45,6 +59,17 @@ struct AgentContextDrawerFilesTab: View {
 
     private var isResolvingWithoutModel: Bool {
         modelCoordinator.isLoading && currentModel == nil
+    }
+
+    private var presentsDefinitiveEmptyFiles: Bool {
+        let summary = exportContext.selectionSummary
+        return presentsDefinitiveEmptyAgentContextFiles(
+            activeSubtab: detailStore.filesSubtab,
+            explicitFileRowCount: summary.fullFileCount + summary.slicedFileCount,
+            isSwitchHidingRows: isSwitchHidingRows,
+            blankingTargetsCurrentRequest: blankingTargetsCurrentRequest,
+            isResolvingWithoutModel: isResolvingWithoutModel
+        )
     }
 
     private var trimmedFilterText: String {
@@ -352,9 +377,22 @@ struct AgentContextDrawerFilesTab: View {
 
     @ViewBuilder
     private var content: some View {
-        if isSwitchHidingRows || (modelCoordinator.isLoading && currentModel == nil) {
+        if presentsDefinitiveEmptyFiles {
+            emptyState(
+                icon: "doc.text",
+                title: "No files",
+                subtitle: "Full files and sliced files appear in this subtab."
+            )
+        } else if isSwitchHidingRows {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if isResolvingWithoutModel {
+            if detailStore.filesSubtab == .codemaps {
+                codemapProgress
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         } else if rows.isEmpty {
             emptyState(
                 icon: "doc.text.magnifyingglass",
@@ -362,8 +400,7 @@ struct AgentContextDrawerFilesTab: View {
                 subtitle: "Selections appear here when the agent or workspace selection adds files."
             )
         } else if isAwaitingCodemapRows {
-            ProgressView()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            codemapProgress
         } else if filteredRows.isEmpty {
             emptyState(
                 icon: "line.3.horizontal.decrease.circle",
@@ -390,6 +427,20 @@ struct AgentContextDrawerFilesTab: View {
                 .padding(.bottom, 20)
             }
         }
+    }
+
+    private var codemapProgress: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+            Text(
+                exportContext.modelRequestIdentity.codeMapUsage == .complete
+                    ? "Resolving complete CodeMaps…"
+                    : "Resolving CodeMaps…"
+            )
+            .font(fontPreset.captionFont)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func selectedFileCard(_ row: AgentContextExportRow) -> some View {

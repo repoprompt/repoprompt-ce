@@ -2,12 +2,16 @@ import Foundation
 
 #if DEBUG
     enum PromptTokenRecountDiagnostics {
+        @TaskLocal static var correlationFields: [String: String] = [:]
+
         static func start() -> Double? {
             WorkspaceRestorePerfLog.timestampMSIfEnabled()
         }
 
         static func event(_ name: String, fields: [String: String] = [:]) {
-            WorkspaceRestorePerfLog.event(name, fields: fields)
+            var mergedFields = correlationFields
+            mergedFields.merge(fields) { _, new in new }
+            WorkspaceRestorePerfLog.event(name, fields: mergedFields)
         }
 
         static func formatElapsedMS(since startMS: Double) -> String {

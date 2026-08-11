@@ -441,6 +441,7 @@ class TokenCountingViewModel: ObservableObject {
                 "suspendDepth": "\(automaticRecountSuspendDepth)",
                 "debouncePending": "\(tokenUpdateDebounceTask != nil)",
                 "updatePending": "\(updateTokenCountTask != nil)",
+                "schedulerGeneration": "\(tokenCountSchedulerGeneration)",
                 "immediateInProgress": "\(isImmediateRecountInProgress)",
                 "didComputeBaseline": "\(didComputeBaseline)",
                 "totalTokens": "\(totalTokenCount)",
@@ -680,16 +681,35 @@ class TokenCountingViewModel: ObservableObject {
         )
         #if DEBUG
             let accountingStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.accounting.begin")
+            var accountingCorrelationFields = debugSelectionFields(accountingSelection)
+            accountingCorrelationFields["schedulerGeneration"] = "\(tokenCountSchedulerGeneration)"
+            accountingCorrelationFields["codeMapUsage"] = "\(accountingCodeMapUsage)"
+            PromptTokenRecountDiagnostics.event(
+                "tokenRecount.calculate.accounting.begin",
+                fields: accountingCorrelationFields
+            )
         #endif
         let accountingResult: PromptContextAccountingResult
         do {
-            accountingResult = try await promptContextAccountingService.withPromptStats(
-                request: accountingRequest,
-                store: store,
-                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
-                fileTreePresentationRequest: fileTreePresentationRequest
-            ) { $0 }
+            #if DEBUG
+                accountingResult = try await PromptTokenRecountDiagnostics.$correlationFields.withValue(
+                    accountingCorrelationFields
+                ) {
+                    try await promptContextAccountingService.withPromptStats(
+                        request: accountingRequest,
+                        store: store,
+                        lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                        fileTreePresentationRequest: fileTreePresentationRequest
+                    ) { $0 }
+                }
+            #else
+                accountingResult = try await promptContextAccountingService.withPromptStats(
+                    request: accountingRequest,
+                    store: store,
+                    lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                    fileTreePresentationRequest: fileTreePresentationRequest
+                ) { $0 }
+            #endif
         } catch {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event(

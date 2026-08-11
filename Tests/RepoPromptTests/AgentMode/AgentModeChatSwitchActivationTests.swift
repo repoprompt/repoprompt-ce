@@ -245,6 +245,63 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         )
     }
 
+    func testPendingCompleteContextShowsDefinitiveEmptyFilesOnlyForCurrentIdentity() {
+        XCTAssertTrue(
+            presentsDefinitiveEmptyAgentContextFiles(
+                activeSubtab: .files,
+                explicitFileRowCount: 0,
+                isSwitchHidingRows: false,
+                blankingTargetsCurrentRequest: false,
+                isResolvingWithoutModel: true
+            )
+        )
+        XCTAssertTrue(
+            presentsDefinitiveEmptyAgentContextFiles(
+                activeSubtab: .files,
+                explicitFileRowCount: 0,
+                isSwitchHidingRows: true,
+                blankingTargetsCurrentRequest: true,
+                isResolvingWithoutModel: true
+            )
+        )
+        XCTAssertFalse(
+            presentsDefinitiveEmptyAgentContextFiles(
+                activeSubtab: .codemaps,
+                explicitFileRowCount: 0,
+                isSwitchHidingRows: false,
+                blankingTargetsCurrentRequest: false,
+                isResolvingWithoutModel: true
+            )
+        )
+        XCTAssertFalse(
+            presentsDefinitiveEmptyAgentContextFiles(
+                activeSubtab: .files,
+                explicitFileRowCount: 1,
+                isSwitchHidingRows: false,
+                blankingTargetsCurrentRequest: false,
+                isResolvingWithoutModel: true
+            )
+        )
+        XCTAssertFalse(
+            presentsDefinitiveEmptyAgentContextFiles(
+                activeSubtab: .files,
+                explicitFileRowCount: 0,
+                isSwitchHidingRows: true,
+                blankingTargetsCurrentRequest: false,
+                isResolvingWithoutModel: true
+            )
+        )
+        XCTAssertFalse(
+            presentsDefinitiveEmptyAgentContextFiles(
+                activeSubtab: .files,
+                explicitFileRowCount: 0,
+                isSwitchHidingRows: false,
+                blankingTargetsCurrentRequest: false,
+                isResolvingWithoutModel: false
+            )
+        )
+    }
+
     func testToggleContextComposerShortcutOutsideAgentModeDoesNotArmPresentation() async throws {
         try await withFixture { fixture in
             let drawerStore = fixture.viewModel.ui.contextDrawer
