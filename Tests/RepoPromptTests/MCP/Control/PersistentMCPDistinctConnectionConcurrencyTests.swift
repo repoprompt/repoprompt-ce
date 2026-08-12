@@ -1807,6 +1807,15 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             ]
             configuredWorkspace.activeComposeTabID = tabID
             window.workspaceManager.workspaces.append(configuredWorkspace)
+            await window.workspaceManager.switchWorkspace(
+                to: configuredWorkspace,
+                saveState: false,
+                reason: "PersistentMCPTestFixture"
+            )
+            window.promptManager.loadComposeTabsFromWorkspace(
+                configuredWorkspace,
+                syncPromptText: true
+            )
             let rootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
                 in: window,
                 path: rootURL.path
