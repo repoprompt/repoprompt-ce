@@ -4474,6 +4474,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         _ = await cancelAndDrainOracleGroup(in: session, using: oracleViewModel)
         let generation = session.followUpOracleGroupState.beginRun()
         let groupPrompt = ContextBuilderFrozenOraclePack.prompt(for: mode, prompt: prompt)
+        let oracleStore = AppDomainRuntimeComposition.shared.oracleConversationStore
 
         session.generatedAnswerRoute = nil
         session.isBackgroundPlanGenerating = true
@@ -4484,6 +4485,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         updateRuntimeBindings(from: session)
 
         await progressReporter?(.payloadPackaging)
+        try requireCurrentOracleRun(session: session, generation: generation)
         let aiMessage = try await promptManager.buildHeadlessAIMessage(
             from: HeadlessContextSnapshot(
                 workspaceID: originWorkspaceID,
@@ -4498,12 +4500,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mode: mode,
             gitScopeOverride: mode == .review ? gitScopeOverride : nil
         )
+        try requireCurrentOracleRun(session: session, generation: generation)
         let frozenPack = try await ContextBuilderFrozenOraclePack.make(
             mode: mode,
             prompt: groupPrompt,
             selection: selection,
             message: aiMessage,
-            store: AppDomainRuntimeComposition.shared.oracleConversationStore
+            store: oracleStore
+        )
+        try await requireCurrentOraclePrelaunch(
+            session: session,
+            generation: generation,
+            artifactID: frozenPack.reference.artifactID,
+            store: oracleStore
         )
         let packaging = OracleViewModel.OracleSendPackagingContext(
             sourceTabID: tabID,
@@ -4581,6 +4590,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             "model": .string(model.rawValue)
         ]
         await progressReporter?(.sessionCreationAndPersist)
+        try await requireCurrentOraclePrelaunch(
+            session: session,
+            generation: generation,
+            artifactID: frozenPack.reference.artifactID,
+            store: oracleStore
+        )
         let task = Task { @MainActor in
             try await oracleViewModel.tool_chatSendWithConfiguredRoster(
                 args: args,
@@ -4648,6 +4663,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             updateRuntimeBindings(from: session)
             return reply
         } catch {
+            try? await oracleStore.removeArtifactIfUnreferenced(id: frozenPack.reference.artifactID)
             guard session.followUpOracleGroupState.generation == generation else { throw error }
             let stillOwnsCleanup = await cancelAndDrainOracleGroup(
                 in: session,
@@ -4664,6 +4680,33 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
             throw error
+        }
+    }
+
+    private func requireCurrentOraclePrelaunch(
+        session: TabSession,
+        generation: UInt64,
+        artifactID: String,
+        store: DomainOracleConversationStore
+    ) async throws {
+        do {
+            try Task.checkCancellation()
+            guard session.followUpOracleGroupState.generation == generation else {
+                throw CancellationError()
+            }
+        } catch {
+            try? await store.removeArtifactIfUnreferenced(id: artifactID)
+            throw error
+        }
+    }
+
+    private func requireCurrentOracleRun(
+        session: TabSession,
+        generation: UInt64
+    ) throws {
+        try Task.checkCancellation()
+        guard session.followUpOracleGroupState.generation == generation else {
+            throw CancellationError()
         }
     }
 

@@ -542,7 +542,7 @@ actor DirectHeadlessOracleAdapter {
             turns: [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
         )
         guard let claimID = plan.claimID else { throw AdapterError.childCarrierMismatch }
-        _ = try groupCarrierBundle(for: plan, group: group)
+        let bundle = try groupCarrierBundle(for: plan, group: group)
         let claim = try await claimManager.acquire(
             group: prepared,
             owner: owner,
@@ -553,7 +553,12 @@ actor DirectHeadlessOracleAdapter {
         defer { claim.release() }
         try await store.create(prepared)
         do {
-            return try await executeGroup(plan: plan, prepared: prepared, request: request)
+            return try await executeGroup(
+                plan: plan,
+                prepared: prepared,
+                request: request,
+                bundle: bundle
+            )
         } catch {
             try await settlePreparedGroupIfNeeded(prepared, error: error)
             throw error
@@ -574,6 +579,7 @@ actor DirectHeadlessOracleAdapter {
         else {
             throw AdapterError.rosterConflict
         }
+        let bundle = try groupCarrierBundle(for: plan, group: current.group)
         let claim = try await claimManager.acquire(
             group: current,
             owner: owner,
@@ -601,7 +607,12 @@ actor DirectHeadlessOracleAdapter {
         )
         try await store.save(prepared, expectedRevision: current.revision)
         do {
-            return try await executeGroup(plan: plan, prepared: prepared, request: request)
+            return try await executeGroup(
+                plan: plan,
+                prepared: prepared,
+                request: request,
+                bundle: bundle
+            )
         } catch {
             try await settlePreparedGroupIfNeeded(prepared, error: error)
             throw error
@@ -611,9 +622,9 @@ actor DirectHeadlessOracleAdapter {
     private func executeGroup(
         plan: InvocationPlan,
         prepared: OracleGroupDocument,
-        request: DomainPhysicalToolRequest
+        request: DomainPhysicalToolRequest,
+        bundle: DomainChildLaunchCarrierBundle
     ) async throws -> Value {
-        let bundle = try groupCarrierBundle(for: plan, group: prepared.group)
         let priorTurns = Array(prepared.turns.dropLast())
         let plans = try prepared.members.map { member in
             let lane = try OracleLaneDescriptor(
@@ -748,7 +759,10 @@ actor DirectHeadlessOracleAdapter {
               bundle.plan.runID == plan.runID,
               bundle.plan.oracleGroupID == group.id,
               bundle.plan.oracleGroupClaimID == plan.claimID,
-              bundle.carriers.count == group.size
+              bundle.carriers.count == group.size,
+              bundle.plan.lanes.map(\.launchID) == plan.childLaunchPlan.lanes.map(\.launchID),
+              bundle.plan.lanes.map(\.providerIdentifier) == plan.childLaunchPlan.lanes.map(\.providerIdentifier),
+              bundle.plan.lanes.map(\.oracleLaneID) == plan.childLaunchPlan.lanes.map(\.oracleLaneID)
         else {
             throw AdapterError.childCarrierMismatch
         }

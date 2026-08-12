@@ -207,6 +207,26 @@ final class OracleGroupPersistenceTests: XCTestCase {
         }
     }
 
+    func testUnreferencedArtifactCleanupPreservesReferencedContent() async throws {
+        let fixture = makeStore(profile: "artifact-cleanup")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let orphanID = try await fixture.store.storeArtifact(Data("orphan".utf8))
+        try await fixture.store.removeArtifactIfUnreferenced(id: orphanID)
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.loadArtifact(id: orphanID)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(orphanID))
+        }
+
+        let sharedData = Data("shared".utf8)
+        let sharedID = try await fixture.store.storeArtifact(sharedData)
+        let group = try makeGroup(count: 2, seed: "shared-artifact", artifactID: sharedID)
+        try await fixture.store.create(group)
+        try await fixture.store.removeArtifactIfUnreferenced(id: sharedID)
+        let retainedData = try await fixture.store.loadArtifact(id: sharedID)
+        XCTAssertEqual(retainedData, sharedData)
+    }
+
     func testUnreadableGroupFailsRetentionClosedWithoutDeletingValidGroup() async throws {
         let fixture = makeStore(profile: "fail-closed")
         defer { try? FileManager.default.removeItem(at: fixture.root) }

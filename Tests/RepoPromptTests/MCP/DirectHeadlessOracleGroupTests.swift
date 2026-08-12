@@ -221,6 +221,51 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(try Self.object(latest)["chat_id"] as? String, primaryID)
     }
 
+    func testGroupContinuationRejectsMismatchedCarrierBeforeHistoryMutation() async throws {
+        let fixture = try Fixture(name: "continuation-carrier")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let started = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("first turn")]
+        )
+        let chatID = try XCTUnwrap(
+            (started["oracle_results"] as? [[String: Any]])?.first?["chat_id"] as? String
+        )
+        let owner = try OracleConversationOwner(
+            kind: "direct-headless",
+            identifier: fixture.profileName
+        )
+        guard case let .group(before)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
+            return XCTFail("Expected a durable group")
+        }
+
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "oracle_send",
+                arguments: ["chat_id": .string(chatID), "message": .string("second turn")],
+                mismatchedBundle: true
+            )
+            XCTFail("Expected carrier mismatch")
+        } catch {
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .childCarrierMismatch)
+        }
+        let after = try await prepared.oracleStore.load(groupID: before.group.id, owner: owner)
+        XCTAssertEqual(after?.revision, before.revision)
+        XCTAssertEqual(after?.turns, before.turns)
+    }
+
     func testPartialAndPrimaryFailuresRemainOrderedStructuredResults() async throws {
         let fixture = try Fixture(name: "failures")
         defer { fixture.cleanup() }
@@ -449,7 +494,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         prepared: DirectHeadlessMCPService.PreparedRuntime,
         backend: DirectHeadlessConversationBackend,
         toolName: String,
-        arguments: [String: Value]
+        arguments: [String: Value],
+        mismatchedBundle: Bool = false
     ) async throws -> [String: Any] {
         let security = try await securityContext(prepared)
         let plan = try await prepared.oracleAdapter.resolveChildLaunchPlan(
@@ -457,34 +503,49 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             arguments: arguments,
             securityContext: security
         )
-        let carriers = plan.lanes.map { lane in
+        let bundlePlan = if mismatchedBundle {
+            try DomainChildLaunchPlan(
+                runID: plan.runID,
+                oracleGroupID: plan.oracleGroupID,
+                oracleGroupClaimID: plan.oracleGroupClaimID,
+                lanes: plan.lanes.map {
+                    DomainChildLaunchLanePlan(
+                        providerIdentifier: $0.providerIdentifier,
+                        oracleLaneID: $0.oracleLaneID
+                    )
+                }
+            )
+        } else {
+            plan
+        }
+        let carriers = bundlePlan.lanes.map { lane in
             var environment: [String: String] = [
-                DomainChildLaunchCarrier.runIDEnvironmentKey: plan.runID.uuidString,
+                DomainChildLaunchCarrier.runIDEnvironmentKey: bundlePlan.runID.uuidString,
                 DomainChildLaunchCarrier.launchIDEnvironmentKey: lane.launchID.uuidString,
                 DomainChildLaunchCarrier.providerIdentifierEnvironmentKey: lane.providerIdentifier
             ]
-            if let groupID = plan.oracleGroupID {
+            if let groupID = bundlePlan.oracleGroupID {
                 environment[DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey] = groupID.rawValue.uuidString
             }
             if let laneID = lane.oracleLaneID {
                 environment[DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey] = "\(laneID.index)"
             }
-            if let claimID = plan.oracleGroupClaimID {
+            if let claimID = bundlePlan.oracleGroupClaimID {
                 environment[DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey] = claimID.uuidString
             }
             return DomainChildLaunchCarrier(
-                runID: plan.runID,
+                runID: bundlePlan.runID,
                 launchID: lane.launchID,
                 providerIdentifier: lane.providerIdentifier,
-                oracleGroupID: plan.oracleGroupID,
+                oracleGroupID: bundlePlan.oracleGroupID,
                 oracleLaneID: lane.oracleLaneID,
-                oracleGroupClaimID: plan.oracleGroupClaimID,
+                oracleGroupClaimID: bundlePlan.oracleGroupClaimID,
                 launchTokenID: UUID(),
                 credentialEnvelope: nil,
                 environment: environment
             )
         }
-        let bundle = try DomainChildLaunchCarrierBundle(plan: plan, carriers: carriers)
+        let bundle = try DomainChildLaunchCarrierBundle(plan: bundlePlan, carriers: carriers)
         let request = try DomainPhysicalToolRequest(
             argumentsJSON: JSONEncoder().encode(arguments),
             securityContext: security

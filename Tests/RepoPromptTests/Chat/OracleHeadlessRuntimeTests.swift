@@ -313,6 +313,92 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
         XCTAssertEqual(cancelledStreamIDs, [streamID])
         XCTAssertFalse(runtime.hasActiveStream(for: tabID))
     }
+
+    @MainActor
+    func testCancelAllCountsConcurrentPendingStreamsForSameTab() async throws {
+        let tabID = UUID()
+        let streamIDs = [UUID(), UUID()]
+        let gate = MultiPendingOracleSendPromptGate()
+        var nextIndex = 0
+        let bothStarted = expectation(description: "both sendPrompt calls started")
+        bothStarted.expectedFulfillmentCount = 2
+        let runtime = OracleHeadlessRuntime(
+            sendPrompt: { _, _ in
+                let index = nextIndex
+                nextIndex += 1
+                bothStarted.fulfill()
+                await gate.wait(index: index)
+                return (
+                    streamIDs[index],
+                    AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                        continuation.yield(ChatStreamOutput(
+                            text: "done",
+                            reasoning: nil,
+                            tokens: ChatTokenInfo(),
+                            terminalOutcome: .completed
+                        ))
+                        continuation.finish()
+                    }
+                )
+            },
+            cancelStream: { await gate.recordCancellation($0) },
+            cleanupConversation: { _, _ in }
+        )
+        let first = Task { @MainActor in
+            try await runtime.execute(
+                message: AIMessage(systemPrompt: "system", userMessage: "first"),
+                model: .claude4Sonnet,
+                tabID: tabID,
+                completionPolicy: .interactive
+            )
+        }
+        let second = Task { @MainActor in
+            try await runtime.execute(
+                message: AIMessage(systemPrompt: "system", userMessage: "second"),
+                model: .claude4Sonnet,
+                tabID: tabID,
+                completionPolicy: .interactive
+            )
+        }
+        await fulfillment(of: [bothStarted], timeout: 1)
+        await gate.release(index: 0)
+        let firstOutput = try await first.value
+        XCTAssertEqual(firstOutput.text, "done")
+        await runtime.cancelAllStreams()
+        await gate.release(index: 1)
+        do {
+            _ = try await second.value
+            XCTFail("Expected the still-pending stream to be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let cancelled = await gate.cancelledStreamIDs()
+        XCTAssertEqual(cancelled, [streamIDs[1]])
+    }
+}
+
+private actor MultiPendingOracleSendPromptGate {
+    private var released: Set<Int> = []
+    private var continuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var cancellations: [ChatStreamID] = []
+
+    func wait(index: Int) async {
+        guard !released.contains(index) else { return }
+        await withCheckedContinuation { continuations[index] = $0 }
+    }
+
+    func release(index: Int) {
+        released.insert(index)
+        continuations.removeValue(forKey: index)?.resume()
+    }
+
+    func recordCancellation(_ streamID: ChatStreamID) {
+        cancellations.append(streamID)
+    }
+
+    func cancelledStreamIDs() -> [ChatStreamID] {
+        cancellations
+    }
 }
 
 private actor OracleHeadlessSendPromptGate {
