@@ -501,14 +501,18 @@ enum DirectHeadlessWorktreeRouting {
     }
 
     private static func verifyWorktree(_ worktree: DirectHeadlessGitWorktree) async throws {
-        let output: String
+        guard canonicalPath(worktree.path).path == worktree.path.path else {
+            throw MCPError.invalidRequest(
+                "selected worktree identity could not be verified: \(worktree.path.path)"
+            )
+        }
+        let isInsideWorktree: String
         do {
-            output = try await DirectProcess.run(
+            isInsideWorktree = try await DirectProcess.run(
                 "/usr/bin/git",
                 arguments: [
                     "-C", worktree.path.path,
-                    "rev-parse", "--path-format=absolute",
-                    "--show-toplevel", "--git-dir", "--git-common-dir"
+                    "rev-parse", "--is-inside-work-tree"
                 ]
             )
         } catch {
@@ -516,19 +520,18 @@ enum DirectHeadlessWorktreeRouting {
                 "selected worktree identity could not be verified: \(worktree.path.path)"
             )
         }
-        let lines = output.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        guard lines.count == 3 else {
+        guard isInsideWorktree.trimmingCharacters(in: .whitespacesAndNewlines) == "true",
+              let layout = gitLayout(worktreeRoot: worktree.path)
+        else {
             throw MCPError.invalidRequest(
                 "selected worktree identity could not be verified: \(worktree.path.path)"
             )
         }
-        let topLevel = canonicalPath(URL(fileURLWithPath: lines[0], isDirectory: true))
-        let gitDirectory = canonicalPath(URL(fileURLWithPath: lines[1], isDirectory: true))
-        let commonDirectory = canonicalPath(URL(fileURLWithPath: lines[2], isDirectory: true))
+        let gitDirectory = layout.gitDirectory
+        let commonDirectory = layout.commonDirectory
         let isMain = gitDirectory.path == commonDirectory.path
         let stableComponent = isMain ? "main" : gitDirectory.path
-        guard topLevel.path == worktree.path.path,
-              gitDirectory.path == worktree.gitDirectory.path,
+        guard gitDirectory.path == worktree.gitDirectory.path,
               isMain == worktree.isMain,
               worktree.repositoryID == "gitrepo_\(sha256(commonDirectory.path))",
               worktree.worktreeID == "wt_\(sha256("\(worktree.repositoryID)\u{0}\(stableComponent)"))"
