@@ -240,6 +240,20 @@ enum AgentEffortPickerOpenTarget: Equatable {
     case claudeEffortLevel
 }
 
+private struct AgentPickerPresentationID: Hashable {
+    enum Kind: Hashable {
+        case model
+        case codexEffort
+        case claudeEffort
+    }
+
+    let kind: Kind
+    let tabID: UUID?
+    let selectedAgent: AgentProviderKind
+    let selectedModelRaw: String
+    let optionRawValues: [String]
+}
+
 enum AgentEffortPickerOpenRequestGuard {
     static func target(
         notification: Notification,
@@ -485,6 +499,43 @@ struct AgentComposerView: View, Equatable {
         props.selectedAgent.usesClaudeTooling
             && props.providerControls?.claudeTools != nil
             && !supportedClaudeEffortsForCurrentSelection().isEmpty
+    }
+
+    private var modelPickerProgrammaticPresentationAllowed: Bool {
+        currentTabID != nil
+            && currentTabID == props.currentTabID
+            && props.hasAvailableAgentProviders
+            && !modelControlsDisabled
+    }
+
+    private var modelPickerPresentationID: AgentPickerPresentationID {
+        AgentPickerPresentationID(
+            kind: .model,
+            tabID: props.currentTabID,
+            selectedAgent: props.selectedAgent,
+            selectedModelRaw: props.selectedModelRaw,
+            optionRawValues: props.availableAgents.map(\.rawValue)
+        )
+    }
+
+    private var codexEffortPickerPresentationID: AgentPickerPresentationID {
+        AgentPickerPresentationID(
+            kind: .codexEffort,
+            tabID: props.currentTabID,
+            selectedAgent: props.selectedAgent,
+            selectedModelRaw: props.selectedModelRaw,
+            optionRawValues: props.codexReasoningEffortOptions.map(\.rawValue)
+        )
+    }
+
+    private var claudeEffortPickerPresentationID: AgentPickerPresentationID {
+        AgentPickerPresentationID(
+            kind: .claudeEffort,
+            tabID: props.currentTabID,
+            selectedAgent: props.selectedAgent,
+            selectedModelRaw: props.selectedModelRaw,
+            optionRawValues: supportedClaudeEffortsForCurrentSelection().map(\.rawValue)
+        )
     }
 
     private var modelControlsDisabledTooltip: String {
@@ -967,6 +1018,8 @@ struct AgentComposerView: View, Equatable {
             items: agentProviderModelMenuItems,
             triggerStyle: .plain,
             openRequestCount: modelPickerOpenRequestCount,
+            programmaticPresentationID: modelPickerPresentationID,
+            isProgrammaticPresentationAllowed: modelPickerProgrammaticPresentationAllowed,
             onOpen: captureModelMenuSnapshot
         ) {
             HStack(spacing: 4) {
@@ -1112,7 +1165,9 @@ struct AgentComposerView: View, Equatable {
             StableMenuButton(
                 items: { reasoningEffortMenuItems(efforts: efforts) },
                 triggerStyle: .plain,
-                openRequestCount: codexEffortPickerOpenRequestCount
+                openRequestCount: codexEffortPickerOpenRequestCount,
+                programmaticPresentationID: codexEffortPickerPresentationID,
+                isProgrammaticPresentationAllowed: modelPickerProgrammaticPresentationAllowed && codexEffortsAreAvailable
             ) {
                 HStack(spacing: 4) {
                     Text(props.selectedReasoningEffortDisplayName)
@@ -1152,7 +1207,9 @@ struct AgentComposerView: View, Equatable {
             StableMenuButton(
                 items: { claudeEffortMenuItems(efforts: efforts, selectedLevel: claudeTools.effortLevel) },
                 triggerStyle: .plain,
-                openRequestCount: claudeEffortPickerOpenRequestCount
+                openRequestCount: claudeEffortPickerOpenRequestCount,
+                programmaticPresentationID: claudeEffortPickerPresentationID,
+                isProgrammaticPresentationAllowed: modelPickerProgrammaticPresentationAllowed && claudeEffortsAreAvailable
             ) {
                 HStack(spacing: 4) {
                     Text(claudeTools.effortLevel.displayName)
