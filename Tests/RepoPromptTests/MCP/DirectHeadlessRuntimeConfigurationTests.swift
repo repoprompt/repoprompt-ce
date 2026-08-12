@@ -1661,6 +1661,30 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 String(describing: error)
             )
         }
+
+        try originalGitFile.write(to: gitFile)
+        let replacementRoot = fixture.root.appendingPathComponent("replacement-worktree-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: replacementRoot, withIntermediateDirectories: true)
+        try originalGitFile.write(to: replacementRoot.appendingPathComponent(".git"))
+        try FileManager.default.removeItem(at: fixture.alternateWorktree)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.alternateWorktree,
+            withDestinationURL: replacementRoot
+        )
+        do {
+            _ = try await prepared.context.snapshot(
+                connectionID: prepared.connectionID,
+                sessionID: sessionID
+            )
+            XCTFail("Expected a symlink-replaced worktree root to fail closed")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(
+                message.contains("selected worktree identity could not be verified")
+                    || message.contains("rootMappingUnavailable"),
+                message
+            )
+        }
     }
 
     func testCloseTabAllowActivePreservesUnrelatedBindingForSameConnection() async throws {
