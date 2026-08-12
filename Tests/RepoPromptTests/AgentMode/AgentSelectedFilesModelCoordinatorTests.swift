@@ -183,6 +183,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         )
 
         func publishedSnapshot(
+            selectionMatchesExpected: Bool = true,
             isStale: Bool = false,
             refreshPending: Bool = false,
             codeMapUsage: CodeMapUsage? = .auto
@@ -203,6 +204,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
                 codeMapUsage: codeMapUsage,
                 filePathDisplay: .relative,
                 isComplete: true,
+                selectionMatchesExpected: selectionMatchesExpected,
                 isStale: isStale,
                 refreshPending: refreshPending || isStale
             )
@@ -227,13 +229,23 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
                 published: publishedSnapshot(isStale: true)
             )
         )
-        XCTAssertNil(
+        XCTAssertEqual(
             AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
                 source: selectedSource,
                 activeComposeTabID: activeTabID,
                 codeMapUsage: .auto,
                 filePathDisplay: .relative,
                 published: publishedSnapshot(refreshPending: true)
+            ),
+            providedMetricsSnapshot
+        )
+        XCTAssertNil(
+            AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
+                source: selectedSource,
+                activeComposeTabID: activeTabID,
+                codeMapUsage: .auto,
+                filePathDisplay: .relative,
+                published: publishedSnapshot(selectionMatchesExpected: false, isStale: true)
             )
         )
         XCTAssertNil(
@@ -549,6 +561,12 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.refreshIfNeeded(missingMetricsRequest, force: true), .started)
         let didPublishSecondInterim = await resolver.waitUntilInterimPublicationCount(2)
         XCTAssertTrue(didPublishSecondInterim)
+        let didPreserveKnownMetrics = await waitUntilDisplayedFileMetrics(
+            knownMetrics,
+            promptText: "Metric.swift",
+            in: coordinator
+        )
+        XCTAssertTrue(didPreserveKnownMetrics)
         XCTAssertEqual(coordinator.rowSplit.fileRows.first?.metrics, knownMetrics)
         XCTAssertEqual(coordinator.rowSplit.fileRows.first?.rootDisplayName, "Metric Root")
         XCTAssertEqual(coordinator.rowSplit.fileRows.first?.rootColorKey, "metric-root")
@@ -664,7 +682,9 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(coordinator.refreshIfNeeded(request), .started)
         let didStartInitialLoad = await resolver.waitUntilStartCount(.auto, count: 1)
+        let didInstallInitialGate = await resolver.waitUntilPendingContinuationCount(.auto, count: 1)
         XCTAssertTrue(didStartInitialLoad)
+        XCTAssertTrue(didInstallInitialGate)
         await resolver.releaseNext(.auto)
         let didLoadInitialModel = await waitUntilModel(promptText: "Stable.swift", in: coordinator)
         XCTAssertTrue(didLoadInitialModel)
@@ -683,6 +703,8 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
             AgentContextFileCodemapCountReadiness(file: .known(1), codemap: .known(2))
         )
 
+        let didInstallRefreshGate = await resolver.waitUntilPendingContinuationCount(.auto, count: 1)
+        XCTAssertTrue(didInstallRefreshGate)
         await resolver.releaseNext(.auto)
         let didReloadCompletedModel = await waitUntilModel(promptText: "Stable.swift", in: coordinator)
         XCTAssertTrue(didReloadCompletedModel)

@@ -1700,6 +1700,101 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testGenericLookupHydratesInactiveAgentWorktreeBinding() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let logicalRootURL = try makeTemporaryDirectory(named: "generic-hydration-logical")
+        let physicalRootURL = try makeTemporaryDirectory(named: "generic-hydration-physical")
+        defer {
+            try? FileManager.default.removeItem(at: logicalRootURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: physicalRootURL.deletingLastPathComponent())
+        }
+        let controllerTabID = UUID()
+        let agentTabID = UUID()
+        let sessionID = UUID()
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Generic Hydration \(UUID().uuidString.prefix(8))",
+            repoPaths: [logicalRootURL.path],
+            ephemeral: true
+        )
+        let workspaceIndex = try XCTUnwrap(
+            window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+        )
+        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+            ComposeTabState(id: controllerTabID, name: "Controller"),
+            ComposeTabState(
+                id: agentTabID,
+                name: "Inactive Agent",
+                activeAgentSessionID: sessionID
+            )
+        ]
+        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = controllerTabID
+        let restoredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
+        await window.workspaceManager.switchWorkspace(
+            to: restoredWorkspace,
+            saveState: false,
+            reason: "genericInactiveAgentBindingHydration"
+        )
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
+        let physicalRoot = try await window.workspaceFileContextStore.loadRoot(
+            path: physicalRootURL.path,
+            kind: .sessionWorktree
+        )
+        let binding = makeWorktreeBinding(
+            logicalRoot: WorkspaceRootRef(
+                id: logicalRoot.id,
+                name: logicalRoot.name,
+                fullPath: logicalRoot.standardizedFullPath
+            ),
+            physicalRoot: WorkspaceRootRef(
+                id: physicalRoot.id,
+                name: physicalRoot.name,
+                fullPath: physicalRoot.standardizedFullPath
+            )
+        )
+
+        var bindingState = AgentSessionWorktreeBindingState.unhydrated
+        window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
+            guard requestedSessionID == sessionID, requestedTabID == agentTabID else { return .unavailable }
+            return bindingState
+        }
+        window.mcpServer.registerAgentWorktreeBindingsResolver { requestedSessionID, requestedTabID in
+            XCTAssertEqual(requestedSessionID, sessionID)
+            XCTAssertEqual(requestedTabID, agentTabID)
+            bindingState = .hydrated([binding])
+            return bindingState
+        }
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: agentTabID,
+            windowID: window.windowID,
+            workspaceID: workspace.id,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "Inactive Agent",
+            runID: nil,
+            activeAgentSessionID: sessionID,
+            worktreeBindingState: .unhydrated,
+            explicitlyBound: true
+        )
+
+        let lookupContext = await window.mcpServer.lookupContext(for: snapshot)
+
+        XCTAssertEqual(
+            lookupContext.translateInputPath(logicalRootURL.appendingPathComponent("Sources/Read.swift").path),
+            physicalRootURL.appendingPathComponent("Sources/Read.swift").path
+        )
+    }
+
+    @MainActor
     func testInactiveAgentBindingHydrationDoesNotOverwriteReboundConnectionContext() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

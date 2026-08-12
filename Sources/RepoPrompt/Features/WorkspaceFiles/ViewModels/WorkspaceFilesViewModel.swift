@@ -491,6 +491,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     /// Stores the actual parent instances to avoid re-walking the tree / index by UUID.
     @MainActor private var pendingInsertParents: [UUID: FolderViewModel] = [:]
     @MainActor private var isInsertFlushScheduled: Bool = false
+    @MainActor private var insertFlushDeferralDepth: Int = 0
 
     let fileTogglePublisher = PassthroughSubject<FileViewModel, Never>()
     let folderDidFinishLoadingPublisher = PassthroughSubject<FolderViewModel, Never>()
@@ -4728,6 +4729,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         pendingChildInserts[parent.id, default: []].append(child)
         pendingInsertParents[parent.id] = parent
 
+        guard insertFlushDeferralDepth == 0 else { return }
         guard !isInsertFlushScheduled else { return }
         isInsertFlushScheduled = true
 
@@ -4737,6 +4739,23 @@ class WorkspaceFilesViewModel: ObservableObject {
             await MainActor.run {
                 self?.flushPendingInserts()
             }
+        }
+    }
+
+    @MainActor
+    private func beginInsertFlushDeferral() {
+        insertFlushDeferralDepth += 1
+    }
+
+    @MainActor
+    private func endInsertFlushDeferral() {
+        guard insertFlushDeferralDepth > 0 else {
+            assertionFailure("Unbalanced insert flush deferral")
+            return
+        }
+        insertFlushDeferralDepth -= 1
+        if insertFlushDeferralDepth == 0 {
+            flushPendingInserts()
         }
     }
 
@@ -4766,6 +4785,14 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     @MainActor
     private func flushPendingInserts() {
+        guard insertFlushDeferralDepth == 0 else {
+            // A previously scheduled next-turn flush may fire while a bulk operation
+            // is suspended at an await. Keep the inserts queued until that operation
+            // closes its explicit projection transaction.
+            isInsertFlushScheduled = false
+            return
+        }
+
         // Always clear the schedule flag so new enqueues can schedule another flush.
         isInsertFlushScheduled = false
 
@@ -4967,57 +4994,87 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func materializeFileViewModel(
         record: WorkspaceFileRecord
     ) async -> FileViewModel? {
-        guard !Task.isCancelled else { return nil }
-        guard let currentRecord = await workspaceFileContextStore.file(
-            rootID: record.rootID,
-            relativePath: record.standardizedRelativePath
-        ) else {
-            return nil
+        await materializeFileViewModels(records: [record])[record.standardizedFullPath]
+    }
+
+    /// Materializes a bulk lookup as one UI projection transaction. Selection restore
+    /// commonly resolves several store-backed files that are not yet represented by
+    /// `FileViewModel`s; publishing the hierarchy and invalidating path caches once per
+    /// file made a small selection wake the whole workspace and CodeMap graph repeatedly.
+    @MainActor
+    private func materializeFileViewModels(
+        records: [WorkspaceFileRecord]
+    ) async -> [String: FileViewModel] {
+        guard !records.isEmpty, !Task.isCancelled else { return [:] }
+
+        beginInsertFlushDeferral()
+        var insertFlushDeferralIsActive = true
+        defer {
+            if insertFlushDeferralIsActive {
+                endInsertFlushDeferral()
+            }
+        }
+        var seenPaths = Set<String>()
+        var materializedByPath: [String: FileViewModel] = [:]
+        var parentFoldersByID: [UUID: FolderViewModel] = [:]
+        var invalidatedRootKeys = Set<String>()
+
+        for record in records where seenPaths.insert(record.standardizedFullPath).inserted {
+            if Task.isCancelled { break }
+            guard let currentRecord = await workspaceFileContextStore.file(
+                rootID: record.rootID,
+                relativePath: record.standardizedRelativePath
+            ) else { continue }
+            guard let rootRecord = workspaceFileContextRootsByRootKey.values.first(where: {
+                $0.id == currentRecord.rootID
+            }) else { continue }
+            let rootKey = rootKey(forPath: rootRecord.standardizedFullPath)
+            guard workspaceFileContextRootsByRootKey[rootKey]?.id == currentRecord.rootID,
+                  let rootFolder = rootFolders.first(where: {
+                      $0.id == currentRecord.rootID || $0.standardizedFullPath == rootKey
+                  })
+            else { continue }
+
+            await materializeStoreFolderAncestors(
+                for: currentRecord.standardizedRelativePath,
+                onRootFolder: rootFolder,
+                rootID: currentRecord.rootID
+            )
+            if Task.isCancelled { break }
+            guard workspaceFileContextRootsByRootKey[rootKey]?.id == currentRecord.rootID,
+                  rootFolders.contains(where: { $0.id == rootFolder.id })
+            else { continue }
+            guard let outcome = await handleNewFile(
+                record: currentRecord,
+                onRootFolder: rootFolder
+            ) else { continue }
+            guard workspaceFileContextRootsByRootKey[rootKey]?.id == currentRecord.rootID,
+                  rootFolders.contains(where: { $0.id == rootFolder.id })
+            else {
+                fileHierarchyIndex.removeFile(
+                    forKey: currentRecord.standardizedFullPath,
+                    expectedRootKey: rootKey
+                )
+                continue
+            }
+
+            materializedByPath[currentRecord.standardizedFullPath] = outcome.file
+            if let parent = outcome.parentFolderForStateRecompute {
+                parentFoldersByID[parent.id] = parent
+            }
+            invalidatedRootKeys.insert(rootKey)
         }
 
-        guard let rootRecord = workspaceFileContextRootsByRootKey.values.first(where: { $0.id == currentRecord.rootID }) else {
-            return nil
+        endInsertFlushDeferral()
+        insertFlushDeferralIsActive = false
+        guard !materializedByPath.isEmpty else { return [:] }
+        recomputeAncestorStates(startingAtFolders: Array(parentFoldersByID.values))
+        for rootKey in invalidatedRootKeys {
+            invalidateStaticSnapshot(forRootFullPath: rootKey)
         }
-        let rootKey = rootKey(forPath: rootRecord.standardizedFullPath)
-        guard workspaceFileContextRootsByRootKey[rootKey]?.id == currentRecord.rootID else {
-            return nil
-        }
-        guard let rootFolder = rootFolders.first(where: { $0.id == currentRecord.rootID || $0.standardizedFullPath == rootKey }) else {
-            return nil
-        }
-
-        await materializeStoreFolderAncestors(
-            for: currentRecord.standardizedRelativePath,
-            onRootFolder: rootFolder,
-            rootID: currentRecord.rootID
-        )
-        guard !Task.isCancelled,
-              workspaceFileContextRootsByRootKey[rootKey]?.id == currentRecord.rootID,
-              rootFolders.contains(where: { $0.id == rootFolder.id })
-        else {
-            return nil
-        }
-
-        guard let outcome = await handleNewFile(
-            record: currentRecord,
-            onRootFolder: rootFolder
-        ) else {
-            return nil
-        }
-        guard workspaceFileContextRootsByRootKey[rootKey]?.id == currentRecord.rootID,
-              rootFolders.contains(where: { $0.id == rootFolder.id })
-        else {
-            fileHierarchyIndex.removeFile(forKey: currentRecord.standardizedFullPath, expectedRootKey: rootKey)
-            return nil
-        }
-        flushPendingInserts()
-        if let parent = outcome.parentFolderForStateRecompute {
-            recomputeAncestorStates(startingAt: parent)
-        }
-        invalidateStaticSnapshot(forRootFullPath: rootKey)
         await clearPathResolutionCaches()
         publishRootFoldersChanged()
-        return outcome.file
+        return materializedByPath
     }
 
     @MainActor
@@ -7832,14 +7889,23 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         let lookupResults = await workspaceFileContextStore.lookupPaths(lookupRequests)
 
+        var pendingMaterialization: [(originalPath: String, record: WorkspaceFileRecord)] = []
         for (originalPath, normalizedPath) in pathsNeedingMatcher {
             guard let lookup = lookupResults[normalizedPath], let lookupFile = lookup.file else { continue }
             if let fileVM = fileHierarchyIndex.filesByFullPath[lookupFile.standardizedFullPath] {
                 results[originalPath] = fileVM
-            } else if materializeMissing,
-                      let materialized = await materializeFileViewModel(record: lookupFile)
-            {
-                results[originalPath] = materialized
+            } else if materializeMissing {
+                pendingMaterialization.append((originalPath, lookupFile))
+            }
+        }
+        if !pendingMaterialization.isEmpty {
+            let materializedByPath = await materializeFileViewModels(
+                records: pendingMaterialization.map(\.record)
+            )
+            for pending in pendingMaterialization {
+                if let materialized = materializedByPath[pending.record.standardizedFullPath] {
+                    results[pending.originalPath] = materialized
+                }
             }
         }
 

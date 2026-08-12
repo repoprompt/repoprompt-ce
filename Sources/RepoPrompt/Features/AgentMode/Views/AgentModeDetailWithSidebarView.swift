@@ -142,7 +142,7 @@ struct AgentModeDetailWithSidebarView: View {
                 oracleViewModel: oracleViewModel,
                 selectionCoordinator: selectionCoordinator,
                 activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
-                agentModeVM: agentModeVM,
+                contextWorktreeBindings: statusPillsUI.snapshot.contextWorktreeBindings,
                 windowID: windowID,
                 currentTabID: currentTabID
             ) {
@@ -210,7 +210,7 @@ struct AgentModeDetailWithSidebarView: View {
                 oracleViewModel: oracleViewModel,
                 selectionCoordinator: selectionCoordinator,
                 activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
-                agentModeVM: agentModeVM,
+                contextWorktreeBindings: statusPillsUI.snapshot.contextWorktreeBindings,
                 windowID: windowID,
                 currentTabID: currentTabID
             ) {
@@ -342,7 +342,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
     let oracleViewModel: OracleViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let activeAgentSessionID: UUID?
-    let agentModeVM: AgentModeViewModel
+    let contextWorktreeBindings: AgentContextWorktreeBindingsProjection
     let windowID: Int
     let currentTabID: UUID?
     let primaryContent: PrimaryContent
@@ -355,7 +355,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
         oracleViewModel: OracleViewModel,
         selectionCoordinator: WorkspaceSelectionCoordinator,
         activeAgentSessionID: UUID?,
-        agentModeVM: AgentModeViewModel,
+        contextWorktreeBindings: AgentContextWorktreeBindingsProjection,
         windowID: Int,
         currentTabID: UUID?,
         @ViewBuilder primaryContent: () -> PrimaryContent
@@ -368,7 +368,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
         self.oracleViewModel = oracleViewModel
         self.selectionCoordinator = selectionCoordinator
         self.activeAgentSessionID = activeAgentSessionID
-        self.agentModeVM = agentModeVM
+        self.contextWorktreeBindings = contextWorktreeBindings
         self.windowID = windowID
         self.currentTabID = currentTabID
         self.primaryContent = primaryContent()
@@ -393,9 +393,7 @@ private struct AgentContextInspectorPresenter<PrimaryContent: View>: View {
                         windowID: windowID,
                         currentTabID: currentTabID,
                         activeAgentSessionID: activeAgentSessionID,
-                        worktreeBindingsProvider: { sessionID, tabID in
-                            agentModeVM.worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
-                        }
+                        contextWorktreeBindings: contextWorktreeBindings
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color(NSColor.windowBackgroundColor))

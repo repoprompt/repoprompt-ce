@@ -1,3 +1,4 @@
+import Combine
 @testable import RepoPromptApp
 import XCTest
 
@@ -55,6 +56,8 @@ final class TokenCountingViewModelTests: XCTestCase {
         )
         XCTAssertTrue(pendingNewSnapshot.isStale)
         XCTAssertTrue(pendingNewSnapshot.refreshPending)
+        XCTAssertFalse(pendingNewSnapshot.selectionMatchesExpected)
+        XCTAssertFalse(pendingNewSnapshot.hasUsablePublishedSelection)
 
         await tokenCounter.forceImmediateRecount()
 
@@ -63,6 +66,8 @@ final class TokenCountingViewModelTests: XCTestCase {
             scheduleRefreshIfNeeded: false
         )
         XCTAssertTrue(newSnapshot.isComplete)
+        XCTAssertTrue(newSnapshot.selectionMatchesExpected)
+        XCTAssertTrue(newSnapshot.hasUsablePublishedSelection)
         XCTAssertFalse(newSnapshot.isStale)
         XCTAssertFalse(newSnapshot.refreshPending)
         let oldSnapshot = tokenCounter.latestPublishedTokenSnapshot(
@@ -70,6 +75,61 @@ final class TokenCountingViewModelTests: XCTestCase {
             scheduleRefreshIfNeeded: false
         )
         XCTAssertTrue(oldSnapshot.isStale)
+        XCTAssertFalse(oldSnapshot.selectionMatchesExpected)
+        XCTAssertFalse(oldSnapshot.hasUsablePublishedSelection)
+        await tokenCounter.stopTokenCountUpdateTimer()
+    }
+
+    func testCompletedMatchingSelectionRemainsUsableWhileRefreshIsPending() async {
+        let selection = StoredSelection()
+        let fileManager = WorkspaceFilesViewModel()
+        let tokenCounter = makeTokenCounter(
+            includeFiles: false,
+            providedSelection: nil,
+            fileManager: fileManager
+        )
+        await tokenCounter.forceImmediateRecount()
+        tokenCounter.suspendAutomaticRecounts()
+        tokenCounter.markDirty(.settings)
+
+        let snapshot = tokenCounter.latestPublishedTokenSnapshot(
+            for: selection,
+            scheduleRefreshIfNeeded: false
+        )
+
+        XCTAssertTrue(snapshot.isComplete)
+        XCTAssertTrue(snapshot.selectionMatchesExpected)
+        XCTAssertTrue(snapshot.isStale)
+        XCTAssertTrue(snapshot.refreshPending)
+        XCTAssertTrue(snapshot.hasUsablePublishedSelection)
+        tokenCounter.resumeAutomaticRecounts()
+        await tokenCounter.stopTokenCountUpdateTimer()
+    }
+
+    func testCompletionPublisherObservesSettledRefreshState() async throws {
+        let selection = StoredSelection()
+        let fileManager = WorkspaceFilesViewModel()
+        let tokenCounter = makeTokenCounter(
+            includeFiles: false,
+            providedSelection: nil,
+            fileManager: fileManager
+        )
+        var completionSnapshots: [TokenCountingViewModel.PublishedTokenSnapshot] = []
+        let cancellable = tokenCounter.tokenCalculationCompletedPublisher.sink {
+            completionSnapshots.append(tokenCounter.latestPublishedTokenSnapshot(
+                for: selection,
+                scheduleRefreshIfNeeded: false
+            ))
+        }
+
+        await tokenCounter.forceImmediateRecount()
+
+        let completionSnapshot = try XCTUnwrap(completionSnapshots.first)
+        XCTAssertEqual(completionSnapshots.count, 1)
+        XCTAssertTrue(completionSnapshot.hasUsablePublishedSelection)
+        XCTAssertFalse(completionSnapshot.isStale)
+        XCTAssertFalse(completionSnapshot.refreshPending)
+        withExtendedLifetime(cancellable) {}
         await tokenCounter.stopTokenCountUpdateTimer()
     }
 
@@ -94,6 +154,8 @@ final class TokenCountingViewModelTests: XCTestCase {
             scheduleRefreshIfNeeded: false
         )
         XCTAssertTrue(snapshot.isComplete)
+        XCTAssertTrue(snapshot.selectionMatchesExpected)
+        XCTAssertTrue(snapshot.hasUsablePublishedSelection)
         XCTAssertFalse(snapshot.isStale)
         XCTAssertFalse(snapshot.refreshPending)
         await tokenCounter.stopTokenCountUpdateTimer()

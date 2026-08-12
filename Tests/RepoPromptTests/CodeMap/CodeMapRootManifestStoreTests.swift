@@ -1611,7 +1611,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             records: [unrelated.record],
             lastAccessEpochSeconds: 100
         )
-        XCTAssertTrue(scanRecorder.inspectedDigests.contains(unrelated.namespace.storageDigestHex))
+        XCTAssertFalse(scanRecorder.inspectedDigests.contains(unrelated.namespace.storageDigestHex))
         scanRecorder.reset()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -1684,6 +1684,108 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         XCTAssertTrue(removed)
         let removedCacheCount = await store.decodedManifestCacheEntryCountForTesting()
         XCTAssertEqual(removedCacheCount, 0)
+    }
+
+    func testSuccessivePublicationsReuseValidatedScanWitnessesWithoutStoreWideRescans() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = ManifestStoreWorkCounter()
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(scanStarted: { work.recordScan() })
+        )
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        var fixtures: [ManifestFixture] = []
+        for (index, worktreeByte) in [UInt8(0x41), 0x42, 0x43, 0x44, 0x45, 0x46].enumerated() {
+            try await fixtures.append(makeFixture(
+                root: root,
+                artifactStore: artifactStore,
+                namespaceScope: "\(#function)-\(index)",
+                worktreeByte: worktreeByte,
+                prefix: "",
+                path: "Sources/File\(index).swift",
+                text: "struct ManifestScanCache\(index) {}"
+            ))
+        }
+
+        for (index, fixture) in fixtures.enumerated() {
+            _ = try await store.replaceCurrentManifest(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                records: [fixture.record],
+                lastAccessEpochSeconds: UInt64(index + 1)
+            )
+        }
+        work.reset()
+
+        for (index, fixture) in fixtures.enumerated() {
+            _ = try await store.replaceCurrentManifest(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                records: [fixture.record],
+                lastAccessEpochSeconds: UInt64((index + 1) * 1000)
+            )
+        }
+
+        XCTAssertEqual(
+            work.scanCount,
+            0,
+            "Validated metadata witnesses should make publication work independent of unrelated manifest payloads."
+        )
+        let accounting = try await store.accounting()
+        XCTAssertEqual(accounting.manifestCount, fixtures.count)
+        XCTAssertEqual(accounting.recordCount, fixtures.count)
+    }
+
+    func testExternalPublicationInvalidatesScanWitnessCacheBeforeQuotaAdmission() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = ManifestStoreWorkCounter()
+        let firstStore = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(scanStarted: { work.recordScan() })
+        )
+        let secondStore = try CodeMapRootManifestStore(rootURL: root)
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        var fixtures: [ManifestFixture] = []
+        for (index, worktreeByte) in [UInt8(0x51), 0x52, 0x53].enumerated() {
+            try await fixtures.append(makeFixture(
+                root: root,
+                artifactStore: artifactStore,
+                namespaceScope: "\(#function)-\(index)",
+                worktreeByte: worktreeByte,
+                prefix: "",
+                path: "Sources/External\(index).swift",
+                text: "struct ExternalManifest\(index) {}"
+            ))
+        }
+        _ = try await firstStore.replaceCurrentManifest(
+            namespace: fixtures[0].namespace,
+            authority: fixtures[0].authority,
+            records: [fixtures[0].record],
+            lastAccessEpochSeconds: 1
+        )
+        work.reset()
+        _ = try await secondStore.replaceCurrentManifest(
+            namespace: fixtures[1].namespace,
+            authority: fixtures[1].authority,
+            records: [fixtures[1].record],
+            lastAccessEpochSeconds: 2
+        )
+        _ = try await firstStore.replaceCurrentManifest(
+            namespace: fixtures[2].namespace,
+            authority: fixtures[2].authority,
+            records: [fixtures[2].record],
+            lastAccessEpochSeconds: 3
+        )
+
+        XCTAssertGreaterThanOrEqual(
+            work.scanCount,
+            1,
+            "A participating external writer must invalidate the cached disk witness."
+        )
+        let accounting = try await firstStore.accounting()
+        XCTAssertEqual(accounting.manifestCount, 3)
     }
 
     func testEvictingPublicationUsesAtMostThreeBoundedStoreScans() async throws {
@@ -1808,7 +1910,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         )
         let elapsed = started.duration(to: clock.now)
 
-        XCTAssertEqual(work.scanCount, 2, "target publication scan count")
+        XCTAssertEqual(work.scanCount, 1, "target publication scan count")
         XCTAssertLessThan(elapsed, .seconds(15), "target publication elapsed time")
         let accounting = try await store.accounting()
         XCTAssertEqual(accounting.manifestCount, 256, "target publication manifest count")

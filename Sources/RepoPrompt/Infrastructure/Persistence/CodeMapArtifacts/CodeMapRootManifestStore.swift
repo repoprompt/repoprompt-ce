@@ -353,6 +353,10 @@ actor CodeMapRootManifestStore {
     private var decodedManifestCache: [ManifestCacheLocation: ManifestCachedSnapshot] = [:]
     private var decodedManifestCacheOrder: [ManifestCacheLocation] = []
     private var decodedManifestCacheByteCount: UInt64 = 0
+    /// Complete disk-derived scan retained only while its directory and leaf witnesses
+    /// remain current. Ordinary publications advance this projection transactionally;
+    /// any cross-process or same-UID mutation fails validation and falls back to a full scan.
+    private var publicationScanCache: ManifestScanResult?
     private var committedMaintenanceDebt: ManifestCommittedMaintenanceDebt = .idle
     #if DEBUG
         private var debugPublicationMetricsByNamespace: [
@@ -1335,7 +1339,9 @@ actor CodeMapRootManifestStore {
                 shard: shard,
                 snapshot: snapshot,
                 protectingDigest: name,
-                committedIdentity: committed
+                committedIdentity: committed,
+                replacedIdentity: existing.identity,
+                replacedRecordCount: existing.snapshot?.records.count ?? 0
             )
         }
         #if DEBUG
@@ -1365,6 +1371,7 @@ actor CodeMapRootManifestStore {
             return false
         }
         let name = namespace.storageDigestHex
+        publicationScanCache = nil
         let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
             if errno == ENOENT {
@@ -1537,6 +1544,7 @@ actor CodeMapRootManifestStore {
               current == held,
               current.isSecureRegularFile(in: shard.identity.device, expectedMode: Self.fileMode)
         else { return }
+        publicationScanCache = nil
         let quarantineName = "\(name).corrupt.\(UUID().uuidString.lowercased())"
         guard renameat(shard.rawValue, name, layout.quarantine.rawValue, quarantineName) == 0 else {
             if errno == ENOENT {
@@ -1578,7 +1586,16 @@ actor CodeMapRootManifestStore {
         incomingByteCount: UInt64,
         replacedByteCount: UInt64
     ) throws {
-        let scan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
+        let scan: ManifestScanResult
+        if let cached = publicationScanCache,
+           !cached.accounting.hasMore,
+           scanAuthorityIsCurrent(layout: layout, scan: cached)
+        {
+            scan = cached
+        } else {
+            publicationScanCache = nil
+            scan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
+        }
         hooks.beforeTerminalAuthorityCheck(.publicationQuota)
         guard scanAuthorityIsCurrent(layout: layout, scan: scan) else {
             throw CodeMapRootManifestStoreError.insecureDirectory
@@ -1600,12 +1617,15 @@ actor CodeMapRootManifestStore {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
         if evicted > 0 {
+            publicationScanCache = nil
             let terminalScan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
             guard scanAuthorityIsCurrent(layout: layout, scan: terminalScan) else {
                 throw CodeMapRootManifestStoreError.insecureDirectory
             }
+            publicationScanCache = terminalScan
             return
         }
+        publicationScanCache = scan
     }
 
     private func evictToQuotaLocked(
@@ -1697,8 +1717,22 @@ actor CodeMapRootManifestStore {
         shard: ManifestDirectoryDescriptor,
         snapshot: CodeMapRootManifestSnapshot,
         protectingDigest: String,
-        committedIdentity: ManifestFileIdentity
+        committedIdentity: ManifestFileIdentity,
+        replacedIdentity: ManifestFileIdentity?,
+        replacedRecordCount: Int
     ) throws {
+        if try advancePublicationScanCacheAfterCommit(
+            layout: layout,
+            shard: shard,
+            snapshot: snapshot,
+            committedIdentity: committedIdentity,
+            replacedIdentity: replacedIdentity,
+            replacedRecordCount: replacedRecordCount
+        ) {
+            clearCommittedMaintenanceDebt()
+            return
+        }
+        publicationScanCache = nil
         do {
             let terminalScan = try scanLocked(layout: layout, maximumEntries: nil, mutate: false)
             guard scanAuthorityIsCurrent(layout: layout, scan: terminalScan),
@@ -1708,6 +1742,7 @@ actor CodeMapRootManifestStore {
             else {
                 throw CodeMapRootManifestStoreError.insecureDirectory
             }
+            publicationScanCache = terminalScan
             clearCommittedMaintenanceDebt()
         } catch {
             do {
@@ -1721,8 +1756,10 @@ actor CodeMapRootManifestStore {
                 guard !outcome.terminalScan.accounting.hasMore else {
                     throw CodeMapRootManifestStoreError.quotaExceeded
                 }
+                publicationScanCache = outcome.terminalScan
                 clearCommittedMaintenanceDebt()
             } catch {
+                publicationScanCache = nil
                 guard Self.rootParentIsCurrent(lockAnchor, rootURL: rootURL),
                       Self.layoutIsCurrent(layout, rootURL: rootURL),
                       Self.directoryIsCurrent(
@@ -1744,6 +1781,86 @@ actor CodeMapRootManifestStore {
                 )
             }
         }
+    }
+
+    /// Advances the admitted full-scan projection after this actor's verified atomic
+    /// replacement. This is metadata-only: the newly committed snapshot already passed
+    /// canonical readback decoding above, while unchanged leaves retain their prior
+    /// validated identities and decoded metadata.
+    private func advancePublicationScanCacheAfterCommit(
+        layout: ManifestStoreLayout,
+        shard: ManifestDirectoryDescriptor,
+        snapshot: CodeMapRootManifestSnapshot,
+        committedIdentity: ManifestFileIdentity,
+        replacedIdentity: ManifestFileIdentity?,
+        replacedRecordCount: Int
+    ) throws -> Bool {
+        guard var scan = publicationScanCache,
+              scan.authorityComplete,
+              !scan.hasMore
+        else { return false }
+
+        let shardName = snapshot.namespace.shard
+        let digest = snapshot.namespace.storageDigestHex
+        let previousObservedIndex = scan.observedShardEntries.firstIndex {
+            $0.shard == shardName && $0.name == digest
+        }
+        let previousValidIndex = scan.validEntries.firstIndex {
+            $0.shard == shardName && $0.digest == digest
+        }
+        if let replacedIdentity {
+            guard previousObservedIndex.map({ scan.observedShardEntries[$0].identity }) == replacedIdentity,
+                  previousValidIndex.map({ scan.validEntries[$0].identity }) == replacedIdentity
+            else { return false }
+        } else {
+            guard previousObservedIndex == nil, previousValidIndex == nil else { return false }
+        }
+
+        if let previousObservedIndex {
+            scan.observedShardEntries.remove(at: previousObservedIndex)
+        }
+        if let previousValidIndex {
+            scan.validEntries.remove(at: previousValidIndex)
+        }
+        scan.observedShardEntries.append(ManifestObservedShardEntry(
+            shard: shardName,
+            shardIdentity: shard.identity,
+            name: digest,
+            identity: committedIdentity
+        ))
+        scan.validEntries.append(ManifestMaintenanceEntry(
+            shard: shardName,
+            digest: digest,
+            byteCount: UInt64(committedIdentity.size),
+            lastAccessEpochSeconds: snapshot.lastAccessEpochSeconds,
+            manifestGeneration: snapshot.manifestGeneration,
+            identity: committedIdentity
+        ))
+
+        if replacedIdentity == nil {
+            scan.manifestCount = try Self.adding(scan.manifestCount, 1)
+        }
+        let previousByteCount = replacedIdentity.map { UInt64($0.size) } ?? 0
+        scan.manifestByteCount = scan.manifestByteCount >= previousByteCount
+            ? scan.manifestByteCount - previousByteCount
+            : 0
+        scan.manifestByteCount = try Self.adding(scan.manifestByteCount, UInt64(committedIdentity.size))
+        guard scan.recordCount >= replacedRecordCount else { return false }
+        let (nextRecordCount, recordOverflow) = (scan.recordCount - replacedRecordCount)
+            .addingReportingOverflow(snapshot.records.count)
+        guard !recordOverflow else { throw CodeMapRootManifestStoreError.quotaExceeded }
+        scan.recordCount = nextRecordCount
+
+        scan.observedShards[shardName] = shard.identity
+        scan.observedShardMutations[shardName] = try Self.directoryMutationIdentity(shard.rawValue)
+        scan.manifestsMutation = try Self.directoryMutationIdentity(layout.manifests.rawValue)
+        scan.quarantineMutation = try Self.directoryMutationIdentity(layout.quarantine.rawValue)
+        guard scanAuthorityIsCurrent(layout: layout, scan: scan),
+              scan.accounting.manifestCount <= policy.maximumManifestCount,
+              scan.accounting.manifestByteCount <= policy.maximumStoreByteCount
+        else { return false }
+        publicationScanCache = scan
+        return true
     }
 
     private func scheduleCommittedMaintenanceRetryIfNeeded(
@@ -1963,12 +2080,26 @@ actor CodeMapRootManifestStore {
             else {
                 return false
             }
+            // Timestamp witnesses alone are not sufficient on every filesystem:
+            // two mutations can share one reported directory tick. An admitted
+            // full scan therefore also carries exact metadata-only membership.
+            // Bounded scans retain subset authority and cannot make this claim.
+            if !scan.hasMore {
+                let manifestRootListing = try Self.directoryEntryNames(
+                    layout.manifests,
+                    maximumCount: scan.observedShards.count + policy.maximumManifestCount + 1
+                )
+                guard !manifestRootListing.truncated,
+                      Set(manifestRootListing.names.filter(Self.isCanonicalShard)) == Set(scan.observedShards.keys)
+                else { return false }
+            }
             for (name, identity) in scan.observedShards {
                 guard try Self.directoryIdentityAt(parent: layout.manifests, name: name) == identity else {
                     return false
                 }
             }
             for (name, mutation) in scan.observedShardMutations {
+                let expectedNames = Set(scan.observedShardEntries.lazy.filter { $0.shard == name }.map(\.name))
                 guard let shard = try Self.openOwnedDirectory(
                     parent: layout.manifests,
                     name: name,
@@ -1976,6 +2107,10 @@ actor CodeMapRootManifestStore {
                 ), try Self.directoryMutationIdentity(shard.rawValue) == mutation
                 else {
                     return false
+                }
+                if !scan.hasMore {
+                    let listing = try Self.directoryEntryNames(shard, maximumCount: expectedNames.count + 1)
+                    guard !listing.truncated, Set(listing.names) == expectedNames else { return false }
                 }
             }
             for entry in scan.observedShardEntries {
@@ -1996,6 +2131,16 @@ actor CodeMapRootManifestStore {
                 ) == entry.identity else {
                     return false
                 }
+            }
+            if !scan.hasMore {
+                let expectedQuarantineNames = Set(scan.observedQuarantineEntries.map(\.name))
+                let quarantineListing = try Self.directoryEntryNames(
+                    layout.quarantine,
+                    maximumCount: expectedQuarantineNames.count + 1
+                )
+                guard !quarantineListing.truncated,
+                      Set(quarantineListing.names) == expectedQuarantineNames
+                else { return false }
             }
             return true
         } catch {

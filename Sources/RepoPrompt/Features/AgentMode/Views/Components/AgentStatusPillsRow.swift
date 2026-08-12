@@ -80,9 +80,7 @@ struct AgentStatusPillsRow: View {
                     runtimeVM: runtimeVM,
                     currentTabID: snapshot.currentTabID,
                     activeAgentSessionID: snapshot.activeAgentSessionID,
-                    worktreeBindingsProvider: { sessionID, tabID in
-                        agentModeVM.worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
-                    }
+                    contextWorktreeBindings: snapshot.contextWorktreeBindings
                 )
             }
         }

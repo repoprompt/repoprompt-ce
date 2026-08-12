@@ -113,7 +113,10 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 )
             ]
         )
-        func publishedSnapshot(refreshPending: Bool) -> TokenCountingViewModel.PublishedTokenSnapshot {
+        func publishedSnapshot(
+            refreshPending: Bool,
+            selectionMatchesExpected: Bool
+        ) -> TokenCountingViewModel.PublishedTokenSnapshot {
             TokenCountingViewModel.PublishedTokenSnapshot(
                 breakdown: TokenCountingViewModel.TokenBreakdown(
                     total: 73,
@@ -130,6 +133,7 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 codeMapUsage: CodeMapUsage.none,
                 filePathDisplay: .relative,
                 isComplete: true,
+                selectionMatchesExpected: selectionMatchesExpected,
                 isStale: false,
                 refreshPending: refreshPending
             )
@@ -141,7 +145,10 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 activeComposeTabID: tabID,
                 codeMapUsage: .none,
                 filePathDisplay: .relative,
-                published: publishedSnapshot(refreshPending: true)
+                published: publishedSnapshot(
+                    refreshPending: true,
+                    selectionMatchesExpected: false
+                )
             )
         )
         let completedMetrics = try XCTUnwrap(
@@ -150,7 +157,10 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 activeComposeTabID: tabID,
                 codeMapUsage: .none,
                 filePathDisplay: .relative,
-                published: publishedSnapshot(refreshPending: false)
+                published: publishedSnapshot(
+                    refreshPending: false,
+                    selectionMatchesExpected: true
+                )
             )
         )
         let completionRequest = AgentSelectedFilesModelRequest(

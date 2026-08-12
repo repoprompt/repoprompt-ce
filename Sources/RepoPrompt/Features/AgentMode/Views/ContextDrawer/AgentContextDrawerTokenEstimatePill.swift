@@ -8,7 +8,7 @@ struct AgentContextDrawerTokenEstimatePill: View {
 
     private func isWaitingForExpectedSelection(_ snapshot: TokenCountingViewModel.PublishedTokenSnapshot) -> Bool {
         guard tokenBlankingSelection != nil else { return false }
-        return !snapshot.isComplete || snapshot.isStale || snapshot.refreshPending
+        return !snapshot.hasUsablePublishedSelection
     }
 
     private var contextWindowTokens: Int {

@@ -47,9 +47,8 @@ enum AgentSelectedFilesRequestMetricsSnapshotResolver {
         guard !source.hasWorktreeBindings,
               source.activeAgentSessionID == nil,
               source.tabID == activeComposeTabID,
-              published.isComplete,
+              published.hasUsablePublishedSelection,
               !published.isStale,
-              !published.refreshPending,
               published.codeMapUsage == codeMapUsage,
               published.filePathDisplay == filePathDisplay
         else { return nil }

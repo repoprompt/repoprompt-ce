@@ -2369,6 +2369,65 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
     }
 
     @MainActor
+    func testExportViewContextFreezesWorktreeBindingProjectionOutsideRenderGetters() {
+        let tabID = UUID()
+        let sessionID = UUID()
+        let logicalRoot = URL(fileURLWithPath: "/repo/base")
+        let worktreeRoot = URL(fileURLWithPath: "/repo/worktree")
+        let store = WorkspaceFileContextStore()
+        let promptManager = makePrompt(store: store, windowID: 41008)
+        promptManager.loadComposeTabsFromWorkspace(
+            WorkspaceModel(
+                name: "Frozen binding projection",
+                repoPaths: [logicalRoot.path],
+                ephemeralFlag: true,
+                composeTabs: [
+                    ComposeTabState(
+                        id: tabID,
+                        name: "Agent",
+                        activeAgentSessionID: sessionID,
+                        selection: StoredSelection(
+                            selectedPaths: ["Sources/App.swift"],
+                            codemapAutoEnabled: false
+                        )
+                    )
+                ],
+                activeComposeTabID: tabID
+            ),
+            syncPromptText: true
+        )
+        let binding = makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)
+        var providerCallCount = 0
+        let exportContext = AgentContextExportViewContext(
+            promptManager: promptManager,
+            selectionCoordinator: nil,
+            currentTabID: tabID,
+            activeAgentSessionID: sessionID,
+            worktreeBindingsProvider: { requestedSessionID, requestedTabID in
+                providerCallCount += 1
+                return requestedSessionID == sessionID && requestedTabID == tabID ? [binding] : []
+            }
+        )
+
+        XCTAssertEqual(providerCallCount, 1, "The authority is projected once at the UI boundary.")
+        for _ in 0 ..< 20 {
+            XCTAssertEqual(exportContext.makeExportSource(flushPendingUI: false).worktreeBindings, [binding])
+            _ = exportContext.modelRequestIdentity
+            _ = exportContext.selectionSummary
+        }
+        XCTAssertEqual(providerCallCount, 1, "SwiftUI-derived getters must not call back into routing authority.")
+
+        let mismatched = AgentContextWorktreeBindingsProjection(
+            tabID: tabID,
+            activeAgentSessionID: sessionID,
+            bindings: [binding]
+        )
+        XCTAssertEqual(mismatched.bindings(for: sessionID, tabID: tabID), [binding])
+        XCTAssertTrue(mismatched.bindings(for: UUID(), tabID: tabID).isEmpty)
+        XCTAssertTrue(mismatched.bindings(for: sessionID, tabID: UUID()).isEmpty)
+    }
+
+    @MainActor
     func testClipboardUsesGitStateCapturedBeforeDelayedLookup() async throws {
         let gitFixture = try ReviewGitRepositoryFixture(name: "AgentExportGitSnapshotOriginal")
         let originalRoot = try gitFixture.makeRepository(
