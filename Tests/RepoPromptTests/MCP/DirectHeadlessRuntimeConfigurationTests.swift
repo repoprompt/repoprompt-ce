@@ -310,9 +310,14 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         XCTAssertEqual(created.document.metadata.repoPaths, [addedRoot.path])
     }
 
-    func testDuplicateCanonicalRootsRemainUnboundAndExplicitlyRecoverable() async throws {
+    func testEquivalentDuplicateCanonicalRootsRemainUnboundAndExplicitlyRecoverable() async throws {
         let fixture = try await makeSavedWorkspaceWorktreeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let canonicalAlias = fixture.root.appendingPathComponent("canonical-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: canonicalAlias,
+            withDestinationURL: fixture.canonicalRepo
+        )
         let storageRoot = fixture.root.appendingPathComponent("duplicate-state", isDirectory: true)
         let runtime = MCPDomainRuntime(configuration: .init(
             mode: .standalone,
@@ -328,15 +333,15 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         let firstContextID = UUID()
         let secondWorkspaceID = UUID()
         let secondContextID = UUID()
-        for (workspaceID, contextID, name) in [
-            (firstWorkspaceID, firstContextID, "first"),
-            (secondWorkspaceID, secondContextID, "second")
+        for (workspaceID, contextID, name, workspaceRoot) in [
+            (firstWorkspaceID, firstContextID, "first", fixture.canonicalRepo),
+            (secondWorkspaceID, secondContextID, "second", canonicalAlias)
         ] {
             try await createWorkspace(
                 makeWorkspaceDocument(
                     workspaceID: workspaceID,
                     contextID: contextID,
-                    roots: [fixture.canonicalRepo],
+                    roots: [workspaceRoot],
                     fileURL: storageRoot.appendingPathComponent("\(name).json")
                 ),
                 in: runtime
@@ -981,6 +986,76 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         }
     }
 
+    func testAbsoluteMissingSelectionUsesLongestOverlappingRootMappingAfterSymlinkCanonicalization() async throws {
+        let relativeRoot = "Packages/App"
+        let fixture = try await makeSavedWorkspaceWorktreeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let canonicalRoot = fixture.canonicalRepo.appendingPathComponent(relativeRoot, isDirectory: true)
+        let launchRoot = fixture.launchWorktree.appendingPathComponent(relativeRoot, isDirectory: true)
+        let alternateRoot = fixture.alternateWorktree.appendingPathComponent(relativeRoot, isDirectory: true)
+        let canonicalAlias = fixture.root.appendingPathComponent("selection-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: canonicalAlias,
+            withDestinationURL: fixture.canonicalRepo
+        )
+        let missingSelection = canonicalAlias
+            .appendingPathComponent(relativeRoot, isDirectory: true)
+            .appendingPathComponent("missing.swift", isDirectory: false)
+        let workspace = try makeWorkspaceDocument(
+            workspaceID: fixture.workspaceID,
+            contextID: fixture.contextID,
+            roots: [fixture.canonicalRepo, canonicalRoot],
+            fileURL: fixture.savedWorkspaceURL,
+            selectedPaths: [missingSelection.path]
+        )
+        try workspace.documentBytes.write(to: fixture.savedWorkspaceURL)
+
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "overlapping-selection-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": fixture.profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": [fixture.launchWorktree, launchRoot]
+                    .map(\.path)
+                    .joined(separator: ":"),
+                "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: fixture.launchWorktree
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+
+        let processSnapshot = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(
+            processSnapshot.selection,
+            [launchRoot.appendingPathComponent("missing.swift").path]
+        )
+
+        let sessionID = UUID()
+        _ = try await prepared.context.prepareSessionRootOverlay(
+            sessionID: sessionID,
+            sourceSessionID: nil,
+            arguments: [
+                "worktree": .string("@branch:route-alternate"),
+                "worktree_repo_root": .string(canonicalRoot.path),
+                "inherit_worktree": .bool(false)
+            ],
+            connectionID: prepared.connectionID
+        )
+        let sessionSnapshot = try await prepared.context.snapshot(
+            connectionID: prepared.connectionID,
+            sessionID: sessionID
+        )
+        XCTAssertEqual(
+            sessionSnapshot.roots.map(\.path),
+            [fixture.launchWorktree.path, alternateRoot.path]
+        )
+        XCTAssertEqual(
+            sessionSnapshot.selection,
+            [alternateRoot.appendingPathComponent("missing.swift").path]
+        )
+    }
+
     func testExplicitWorktreeSelectionRejectsSymlinkThatCollapsesSubdirectoryFence() async throws {
         let relativeRoot = "Packages/App"
         let fixture = try await makeSavedWorkspaceWorktreeFixture(workspaceRelativeRoot: relativeRoot)
@@ -1015,6 +1090,54 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             XCTFail("Expected a symlink-collapsed subdirectory root to fail closed")
         } catch {
             XCTAssertTrue(String(describing: error).contains("does not preserve the logical root fence"))
+        }
+    }
+
+    func testSelectedSubdirectoryRootRejectsSymlinkReplacementBeforeLaterUse() async throws {
+        let relativeRoot = "Packages/App"
+        let fixture = try await makeSavedWorkspaceWorktreeFixture(workspaceRelativeRoot: relativeRoot)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let launchRoot = fixture.launchWorktree.appendingPathComponent(relativeRoot, isDirectory: true)
+        let alternateRoot = fixture.alternateWorktree.appendingPathComponent(relativeRoot, isDirectory: true)
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-symlink-revalidation-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": fixture.profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": launchRoot.path,
+                "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: launchRoot
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let sessionID = UUID()
+        _ = try await prepared.context.prepareSessionRootOverlay(
+            sessionID: sessionID,
+            sourceSessionID: nil,
+            arguments: [
+                "worktree": .string("@branch:route-alternate"),
+                "inherit_worktree": .bool(false)
+            ],
+            connectionID: prepared.connectionID
+        )
+
+        try FileManager.default.removeItem(at: alternateRoot)
+        try FileManager.default.createSymbolicLink(
+            at: alternateRoot,
+            withDestinationURL: fixture.alternateWorktree
+        )
+        do {
+            _ = try await prepared.context.snapshot(
+                connectionID: prepared.connectionID,
+                sessionID: sessionID
+            )
+            XCTFail("Expected a changed subdirectory mapping to fail closed before later use")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("rootMappingUnavailable"),
+                String(describing: error)
+            )
         }
     }
 

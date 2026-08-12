@@ -372,7 +372,7 @@ actor DirectHeadlessDomainContext {
     ) throws -> [String] {
         try paths.map { rawPath in
             guard rawPath.hasPrefix("/") else { return rawPath }
-            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.resolvingSymlinksInPath().path
+            let path = canonicalSelectionPath(rawPath)
             if let translated = translateAbsolutePath(
                 path,
                 mappings: mappings,
@@ -398,9 +398,27 @@ actor DirectHeadlessDomainContext {
     ) -> [String] {
         paths.map { rawPath in
             guard rawPath.hasPrefix("/") else { return rawPath }
-            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            let path = canonicalSelectionPath(rawPath)
             return translateAbsolutePath(path, mappings: mappings, from: source, to: destination) ?? rawPath
         }
+    }
+
+    private nonisolated static func canonicalSelectionPath(_ rawPath: String) -> String {
+        var existingAncestor = URL(fileURLWithPath: rawPath).standardizedFileURL
+        var missingComponents: [String] = []
+        while !FileManager.default.fileExists(atPath: existingAncestor.path),
+              existingAncestor.path != "/"
+        {
+            missingComponents.append(existingAncestor.lastPathComponent)
+            let parent = existingAncestor.deletingLastPathComponent()
+            guard parent.path != existingAncestor.path else { break }
+            existingAncestor = parent
+        }
+        var resolved = existingAncestor.resolvingSymlinksInPath()
+        for component in missingComponents.reversed() {
+            resolved.appendPathComponent(component, isDirectory: false)
+        }
+        return resolved.standardizedFileURL.path
     }
 
     private nonisolated static func translateAbsolutePath(

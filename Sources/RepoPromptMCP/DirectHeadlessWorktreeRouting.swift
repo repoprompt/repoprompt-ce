@@ -237,10 +237,10 @@ enum DirectHeadlessWorktreeRouting {
             guard let layout = gitLayout(worktreeRoot: path) else { continue }
             let gitDirectory = layout.gitDirectory
             let candidateCommon = layout.commonDirectory
-            guard candidateCommon.path == commonDirectory.path else {
+            guard sameDirectoryIdentity(candidateCommon, commonDirectory) else {
                 throw MCPError.invalidRequest("listed worktree repository identity changed: \(record.path)")
             }
-            let isMain = gitDirectory.path == commonDirectory.path
+            let isMain = sameDirectoryIdentity(gitDirectory, commonDirectory)
             resolvedRecords.append(ResolvedRecord(
                 record: record,
                 path: path,
@@ -297,7 +297,9 @@ enum DirectHeadlessWorktreeRouting {
     static func verifyMappingsAtUse(_ mappings: [DirectHeadlessRootMapping]) async throws {
         for mapping in mappings {
             guard let worktree = mapping.worktree else { continue }
-            guard relativeSuffix(of: mapping.physicalRoot, within: worktree.path) != nil else {
+            guard canonicalPath(mapping.physicalRoot).path == mapping.physicalRoot.path,
+                  relativeSuffix(of: mapping.physicalRoot, within: worktree.path) != nil
+            else {
                 throw MCPError.invalidRequest(
                     "selected worktree path identity changed: \(mapping.physicalRoot.path)"
                 )
@@ -525,7 +527,7 @@ enum DirectHeadlessWorktreeRouting {
         let topLevel = canonicalPath(URL(fileURLWithPath: lines[0], isDirectory: true))
         let gitDirectory = canonicalPath(URL(fileURLWithPath: lines[1], isDirectory: true))
         let commonDirectory = canonicalPath(URL(fileURLWithPath: lines[2], isDirectory: true))
-        let isMain = gitDirectory.path == commonDirectory.path
+        let isMain = sameDirectoryIdentity(gitDirectory, commonDirectory)
         let stableComponent = isMain ? "main" : gitDirectory.path
         guard topLevel.path == worktree.path.path,
               gitDirectory.path == worktree.gitDirectory.path,
@@ -570,6 +572,19 @@ enum DirectHeadlessWorktreeRouting {
         guard count > 0, count <= 4096 else { return nil }
         data.removeSubrange(count ..< data.count)
         return String(data: data, encoding: .utf8)
+    }
+
+    private static func sameDirectoryIdentity(_ lhs: URL, _ rhs: URL) -> Bool {
+        let canonicalLHS = canonicalPath(lhs)
+        let canonicalRHS = canonicalPath(rhs)
+        if canonicalLHS.path == canonicalRHS.path { return true }
+        var lhsMetadata = stat()
+        var rhsMetadata = stat()
+        guard stat(canonicalLHS.path, &lhsMetadata) == 0,
+              stat(canonicalRHS.path, &rhsMetadata) == 0
+        else { return false }
+        return lhsMetadata.st_dev == rhsMetadata.st_dev
+            && lhsMetadata.st_ino == rhsMetadata.st_ino
     }
 
     private static func isHexColor(_ value: String) -> Bool {
