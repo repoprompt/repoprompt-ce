@@ -744,6 +744,11 @@ actor DirectHeadlessOracleAdapter {
         }
         guard bundle.plan.runID == plan.runID,
               bundle.plan.oracleGroupID == nil,
+              bundle.plan.oracleGroupClaimID == nil,
+              bundle.plan.lanes.count == 1,
+              bundle.plan.lanes.map(\.launchID) == plan.childLaunchPlan.lanes.map(\.launchID),
+              bundle.plan.lanes.map(\.providerIdentifier) == plan.childLaunchPlan.lanes.map(\.providerIdentifier),
+              bundle.plan.lanes.allSatisfy({ $0.oracleLaneID == nil }),
               let carrier = bundle.singleCarrier
         else {
             throw AdapterError.childCarrierMismatch

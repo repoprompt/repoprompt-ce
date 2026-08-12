@@ -2742,12 +2742,20 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    func autosaveChatHistory(for sessionID: UUID, force: Bool = false) {
+    func autosaveChatHistory(
+        for sessionID: UUID,
+        force: Bool = false,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         // ------------------------------------------------------------------
         // 0️⃣  Preconditions
         // ------------------------------------------------------------------
-        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+            completion?(false)
+            return
+        }
         guard let liveMessages = messageStore[sessionID] ?? (sessionID == currentSessionID ? messages : nil) else {
+            completion?(false)
             return
         }
 
@@ -2821,6 +2829,7 @@ class OracleViewModel: ObservableObject {
 
         if !force && !shouldSkipChangeCheck && nothingChanged {
             oracleViewModelDebugLog("autosaveChatHistory -> skipped (no meaningful changes)")
+            completion?(true)
             return
         }
 
@@ -2884,9 +2893,11 @@ class OracleViewModel: ObservableObject {
                     }
                     unloadNonCurrentSessions()
                     workspaceManager.pollAndSaveState()
+                    completion?(true)
                 }
             } catch {
                 print("Autosave failed: \(error)")
+                completion?(false)
             }
         }
     }

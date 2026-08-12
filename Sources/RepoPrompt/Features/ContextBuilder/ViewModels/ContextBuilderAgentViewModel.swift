@@ -312,6 +312,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         /// Task handle for this tab's background plan generation
         var backgroundPlanTask: Task<Void, Never>?
+        var backgroundPlanGenerationID: UUID?
 
         /// Live single-Oracle chat session used by the exact N=1 follow-up path.
         var followUpOracleSessionID: UUID?
@@ -1480,6 +1481,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         for session in sessions.values where !session.isMCPControlledRun {
             cancelPendingQuestion(for: session)
             session.backgroundPlanTask?.cancel()
+            session.backgroundPlanGenerationID = nil
             session.backgroundPlanTask = nil
             if let oracleVM = oracleViewModel,
                let followUpSessionID = session.followUpOracleSessionID
@@ -1540,6 +1542,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             if session.isBackgroundPlanGenerating {
                 debugLog("handleComposeTabsWillClose: cancelling background plan for tab \(tabID)")
                 session.backgroundPlanTask?.cancel()
+                session.backgroundPlanGenerationID = nil
                 session.backgroundPlanTask = nil
                 session.isBackgroundPlanGenerating = false
                 if let followUpSessionID = session.followUpOracleSessionID {
@@ -2961,6 +2964,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
             if session.isBackgroundPlanGenerating {
                 session.backgroundPlanTask?.cancel()
+                session.backgroundPlanGenerationID = nil
                 session.backgroundPlanTask = nil
                 session.isBackgroundPlanGenerating = false
                 if let followUpSessionID = session.followUpOracleSessionID {
@@ -4171,6 +4175,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         // Cancel any existing background plan task for THIS tab only
         session.backgroundPlanTask?.cancel()
+        let generationID = UUID()
+        session.backgroundPlanGenerationID = generationID
 
         session.generatedAnswerRoute = nil
         session.isBackgroundPlanGenerating = true
@@ -4193,6 +4199,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     chatName: chatName,
                     mode: mode
                 )
+                guard session.backgroundPlanGenerationID == generationID else { return }
                 // generatedAnswerRoute is set inside generatePlanFromDiscovery
                 session.isBackgroundPlanGenerating = false
                 if let response = reply.response, !response.isEmpty {
@@ -4202,6 +4209,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 applyPlanPreview(to: session)
                 updateRuntimeBindings(from: session)
             } catch {
+                guard session.backgroundPlanGenerationID == generationID else { return }
                 // Treat both outer Task cancellation and stream CancellationError as "user cancelled".
                 if Task.isCancelled || (error is CancellationError) {
                     session.backgroundPlanResponseText = nil
@@ -4217,6 +4225,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             // Clear task reference when this run ends for any reason
+            session.backgroundPlanGenerationID = nil
             session.backgroundPlanTask = nil
         }
     }
@@ -4239,6 +4248,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         // 2) Cancel the wrapper task and drain every grouped member before teardown completes.
         session.backgroundPlanTask?.cancel()
+        session.backgroundPlanGenerationID = nil
         if let oracleVM = oracleViewModel, session.followUpOracleGroupTask != nil {
             let generation = session.followUpOracleGroupState.generation
             Task { @MainActor [weak self] in
@@ -4511,7 +4521,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         try await requireCurrentOraclePrelaunch(
             session: session,
             generation: generation,
-            artifactID: frozenPack.reference.artifactID,
+            reservation: frozenPack.reservation,
             store: oracleStore
         )
         let packaging = OracleViewModel.OracleSendPackagingContext(
@@ -4593,7 +4603,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         try await requireCurrentOraclePrelaunch(
             session: session,
             generation: generation,
-            artifactID: frozenPack.reference.artifactID,
+            reservation: frozenPack.reservation,
             store: oracleStore
         )
         let task = Task { @MainActor in
@@ -4622,6 +4632,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     }
                 }
             }
+            try await oracleStore.releaseArtifactReservation(
+                frozenPack.reservation,
+                removeIfUnreferenced: false
+            )
             guard session.followUpOracleGroupState.generation == generation else {
                 throw CancellationError()
             }
@@ -4663,7 +4677,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             updateRuntimeBindings(from: session)
             return reply
         } catch {
-            try? await oracleStore.removeArtifactIfUnreferenced(id: frozenPack.reference.artifactID)
+            try? await oracleStore.releaseArtifactReservation(
+                frozenPack.reservation,
+                removeIfUnreferenced: true
+            )
             guard session.followUpOracleGroupState.generation == generation else { throw error }
             let stillOwnsCleanup = await cancelAndDrainOracleGroup(
                 in: session,
@@ -4686,7 +4703,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func requireCurrentOraclePrelaunch(
         session: TabSession,
         generation: UInt64,
-        artifactID: String,
+        reservation: OracleArtifactReservation,
         store: DomainOracleConversationStore
     ) async throws {
         do {
@@ -4695,7 +4712,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
         } catch {
-            try? await store.removeArtifactIfUnreferenced(id: artifactID)
+            try? await store.releaseArtifactReservation(reservation, removeIfUnreferenced: true)
             throw error
         }
     }

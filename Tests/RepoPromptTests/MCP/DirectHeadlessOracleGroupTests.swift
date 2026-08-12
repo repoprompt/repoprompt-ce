@@ -266,6 +266,38 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(after?.turns, before.turns)
     }
 
+    func testSingleStartRejectsMismatchedCarrierBeforeProviderDispatch() async throws {
+        let fixture = try Fixture(name: "single-carrier")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "ask_oracle",
+                arguments: ["message": .string("single turn")],
+                mismatchedBundle: true
+            )
+            XCTFail("Expected carrier mismatch")
+        } catch {
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .childCarrierMismatch)
+        }
+        let owner = try OracleConversationOwner(
+            kind: "direct-headless",
+            identifier: fixture.profileName
+        )
+        let conversation = try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
+        XCTAssertNil(conversation)
+    }
+
     func testPartialAndPrimaryFailuresRemainOrderedStructuredResults() async throws {
         let fixture = try Fixture(name: "failures")
         defer { fixture.cleanup() }

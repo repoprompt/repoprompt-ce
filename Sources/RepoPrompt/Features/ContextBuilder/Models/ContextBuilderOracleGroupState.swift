@@ -102,6 +102,7 @@ struct ContextBuilderFrozenOraclePack {
     let message: AIMessage
     let input: OracleInput
     let reference: OracleFrozenPackReference
+    let reservation: OracleArtifactReservation
     let data: Data
 
     @MainActor
@@ -119,18 +120,18 @@ struct ContextBuilderFrozenOraclePack {
             provenance: selection.selectedPaths.map { OracleEvidenceReference(path: $0) }
         )
         let data = try pack.canonicalData()
-        let artifactID = try await store.storeArtifact(data)
-        let reference = try OracleFrozenPackReference(artifactID: artifactID)
+        let reservation = try await store.reserveArtifact(data)
+        let reference = try OracleFrozenPackReference(artifactID: reservation.artifactID)
         let input = try OracleInput(
             mode: oracleMode,
             userMessage: prompt,
             context: OracleContextEnvelope(
-                content: .durableArtifact(id: artifactID),
-                sha256: artifactID,
+                content: .durableArtifact(id: reservation.artifactID),
+                sha256: reservation.artifactID,
                 provenance: pack.provenance
             )
         )
-        return Self(message: message, input: input, reference: reference, data: data)
+        return Self(message: message, input: input, reference: reference, reservation: reservation, data: data)
     }
 
     static func prompt(for mode: HeadlessMode, prompt: String) -> String {
