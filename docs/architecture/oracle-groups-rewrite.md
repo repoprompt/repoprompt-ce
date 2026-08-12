@@ -422,6 +422,15 @@ The transport must be able to represent these outcomes. Today `MCPError` is text
 
 Recommended rule: pre-dispatch validation, route, claim, and preparation failures throw ordinary tool errors; once any lane has dispatched, a non-cancelled N>1 call returns the structured group payload with `status: "completed"`, `"partial_failure"`, or `"failed"`, preserving every settled outcome and any Primary partial text. Parent cancellation remains structural at any phase: cancel and drain every lane, then throw `CancellationError`. If the MCP layer must mark a failed result as an error, it needs a protocol-supported structured error/result channel. Otherwise use a normal structured tool result whose status is failed. A versioned text envelope is an edge-only fallback with explicit decoding tests. The N=1 adapter keeps its existing error behavior unchanged.
 
+### Minimal adviser behavior
+
+The useful idea from [`pi-adviser`][pi-adviser] is a focused second opinion that reports only concrete mistakes, missing verification, risky behavior, or contradictions and stays quiet when there is nothing material to add. Apply that idea through the existing explicit `review` mode, not through a second always-on orchestration system.
+
+- One grouped `review` call sends the same frozen review package to every lane. Additional Oracles are independent reviewers; they do not wait for, interrupt, or rewrite Primary.
+- The review prompt asks for concise actionable concerns and an explicit clean result when none exist. Every lane result remains inspectable in the canonical ordered group payload.
+- The first rewrite does not add automatic per-tool-turn calls, a rolling adviser digest, or hidden injection into the next Agent message. Those behaviors add cost, stale-result, authorization, persistence, and observability contracts that the explicit Oracle call does not need.
+- Existing group cancellation, route claims, turn-generation fencing, and visible progress apply unchanged. A later automatic adviser feature requires separate evidence that its additional latency and cost improve outcomes.
+
 ## State and persistence
 
 ### One logical group document
@@ -917,3 +926,4 @@ The historical branch also surfaced compatibility names (`pair`, `secondary`) th
 [experiment-progress]: https://github.com/dsebban/repoprompt-ce/blob/c79948394d1297b16178d128cf4a87df10edd52c/Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPContextBuilderProgressTimeline.swift#L1-L438
 [experiment-preparation-tests]: https://github.com/dsebban/repoprompt-ce/blob/c79948394d1297b16178d128cf4a87df10edd52c/Tests/RepoPromptTests/Chat/OraclePairPreparationTests.swift
 [experiment-coordinator-tests]: https://github.com/dsebban/repoprompt-ce/blob/c79948394d1297b16178d128cf4a87df10edd52c/Tests/RepoPromptTests/MCP/OraclePairCoordinatorTests.swift
+[pi-adviser]: https://github.com/kartikkabadi/pi-adviser/blob/e552293a3458cda14cc15ad2cd51566abff2fe77/adviser.ts

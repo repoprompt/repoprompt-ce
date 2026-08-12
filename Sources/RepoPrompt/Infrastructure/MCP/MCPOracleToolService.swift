@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 struct MCPOracleToolService {
@@ -116,13 +117,13 @@ struct MCPOracleToolService {
     // MARK: - ask_oracle (agent-mode only)
 
     func executeAskOracle(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "export_response"]
+        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
             )
         }
 
@@ -138,23 +139,38 @@ struct MCPOracleToolService {
         let newChat = args["new_chat"]?.boolValue ?? false
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
+        let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let route: OracleConversationRoute
+        do {
+            route = try OracleConversationRoute.resolve(
+                chatID: normalizedChatID,
+                newChat: newChat,
+                modelOverride: requestedModelOverride
+            )
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        let (isStartRoute, continuationChatID, modelOverride): (Bool, String?, String?) = switch route {
+        case let .start(primaryModelOverride): (true, nil, primaryModelOverride)
+        case let .continuation(chatID): (false, chatID, nil)
+        }
         let targetWindow = try requireTargetWindow()
 
         let tabID = try await resolveTabIDForAgentMode(args, connectionID)
         let requestContext = try? await requireCurrentTabContext(askOracleToolName)
         let virtualContext = (requestContext?.tabID == tabID) ? requestContext : nil
-        if let normalizedChatID {
-            guard let session = oracleVM.resolveSession(id: normalizedChatID) else {
-                throw MCPError.invalidParams("Chat with ID '\(normalizedChatID)' not found")
+        if let continuationChatID {
+            guard let session = oracleVM.resolveSession(id: continuationChatID) else {
+                throw MCPError.invalidParams("Chat with ID '\(continuationChatID)' not found")
             }
             guard let sessionTabID = session.composeTabID else {
                 throw MCPError.invalidParams(
-                    "Chat with ID '\(normalizedChatID)' is not bound to a compose tab. Use a chat_id from the current tab."
+                    "Chat with ID '\(continuationChatID)' is not bound to a compose tab. Use a chat_id from the current tab."
                 )
             }
             guard sessionTabID == tabID else {
                 throw MCPError.invalidParams(
-                    "Chat with ID '\(normalizedChatID)' belongs to a different tab. ask_oracle can only continue chats from the current tab."
+                    "Chat with ID '\(continuationChatID)' belongs to a different tab. ask_oracle can only continue chats from the current tab."
                 )
             }
         }
@@ -229,10 +245,13 @@ struct MCPOracleToolService {
         var chatArgs: [String: Value] = [
             "message": .string(message),
             "mode": .string(modeRaw),
-            "new_chat": .bool(newChat)
+            "new_chat": .bool(isStartRoute)
         ]
-        if let normalizedChatID {
-            chatArgs["chat_id"] = .string(normalizedChatID)
+        if let continuationChatID {
+            chatArgs["chat_id"] = .string(continuationChatID)
+        }
+        if let modelOverride {
+            chatArgs["model"] = .string(modelOverride)
         }
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
@@ -252,7 +271,7 @@ struct MCPOracleToolService {
                 sourceTool: askOracleToolName,
                 mode: modeRaw,
                 message: message,
-                chatID: result["chat_id"]?.stringValue ?? normalizedChatID,
+                chatID: result["chat_id"]?.stringValue ?? continuationChatID,
                 response: result["response"]?.stringValue,
                 destination: exportDestination
             ))
@@ -376,6 +395,22 @@ struct MCPOracleToolService {
         return boolValue
     }
 
+    private func parseOracleModelOverride(_ value: Value?) throws -> String? {
+        guard let value else { return nil }
+        guard case let .string(raw) = value else {
+            throw MCPError.invalidParams("model must be a string")
+        }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              normalized.count <= OracleRosterContract.maximumModelIdentifierLength
+        else {
+            throw MCPError.invalidParams(
+                "model must be non-empty and at most \(OracleRosterContract.maximumModelIdentifierLength) characters"
+            )
+        }
+        return normalized
+    }
+
     private func validateCommonOracleArgs(_ args: [String: Value]) throws {
         let message = (args["message"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -390,10 +425,13 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("Invalid mode: \(modeRaw). Valid modes: chat, plan, review")
         }
 
-        if let chatIDRaw = args["chat_id"]?.stringValue,
-           chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            throw MCPError.invalidParams("chat_id cannot be empty when provided")
+        if let chatIDValue = args["chat_id"] {
+            guard let chatIDRaw = chatIDValue.stringValue else {
+                throw MCPError.invalidParams("chat_id must be a string")
+            }
+            guard !chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPError.invalidParams("chat_id cannot be empty when provided")
+            }
         }
         if let newChatValue = args["new_chat"], newChatValue.boolValue == nil {
             throw MCPError.invalidParams("new_chat must be a boolean")

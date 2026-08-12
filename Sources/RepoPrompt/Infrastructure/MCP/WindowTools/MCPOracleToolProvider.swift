@@ -58,7 +58,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
             description: """
             Agent-mode oracle send/continue tool.
 
-            Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.
+            Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab. Omit `chat_id` or set `new_chat=true` to start; otherwise `chat_id` continues. The optional `model` override changes only the primary model of a new conversation.
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -80,7 +80,11 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Continue a specific chat in the current agent tab"
                     ),
                     "new_chat": .boolean(
-                        description: "Start a new chat session (default: false; discouraged)"
+                        description: "Start a new conversation. Omitted chat_id also selects the start route; false with chat_id continues that conversation."
+                    ),
+                    "model": .string(
+                        description: "Optional primary-model override for a new conversation; rejected on continuation.",
+                        maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."

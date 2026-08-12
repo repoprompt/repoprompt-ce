@@ -927,7 +927,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
 
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 4)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 7)
         XCTAssertTrue(store.worktreeVisualIdentitiesByRepositoryID().isEmpty)
     }
 
@@ -957,11 +957,11 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         )
         XCTAssertEqual(
             GlobalSettingsFileStore.preservationBlockReason(
-                schemaVersion: 5,
+                schemaVersion: 8,
                 schemaLineage: GlobalSettingsDocument.schemaLineage,
-                supportedVersion: 4
+                supportedVersion: 7
             ),
-            .unsupportedFutureSchema(onDiskVersion: 5, supportedVersion: 4)
+            .unsupportedFutureSchema(onDiskVersion: 8, supportedVersion: 7)
         )
         XCTAssertNil(
             GlobalSettingsFileStore.preservationBlockReason(
@@ -970,6 +970,97 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                 supportedVersion: 4
             )
         )
+    }
+
+    func testOracleRosterRaisesSchemaOnlyWhenPopulatedAndPreservesOrderAndDuplicates() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let workspaceID = UUID()
+        let emptyProfile = AgentModelsSettingsProfile(
+            planningModelRaw: "primary-model",
+            additionalOracleModelRaws: []
+        )
+        let emptyDocument = GlobalSettingsDocument(agentModelsSettings: [
+            workspaceID: WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: emptyProfile
+            )
+        ])
+
+        XCTAssertEqual(emptyDocument.requiredSchemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+        try fileStore.save(emptyDocument)
+        var loaded = try fileStore.load()
+        XCTAssertEqual(loaded.schemaVersion, 4)
+        XCTAssertEqual(loaded.agentModelsSettings[workspaceID]?.profile?.additionalOracleModelRaws, [])
+
+        let orderedRoster = ["model-b", "model-b", "model-a"]
+        let globalRosterDocument = GlobalSettingsDocument(
+            agentModelsSettings: [
+                workspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: emptyProfile
+                )
+            ],
+            scalarPreferences: GlobalScalarPreferences(modelSelection: .init(
+                planningModel: "primary-model",
+                additionalOracleModels: orderedRoster
+            ))
+        )
+        XCTAssertEqual(globalRosterDocument.requiredSchemaVersion, GlobalSettingsDocument.oracleRosterSchemaVersion)
+        try fileStore.save(globalRosterDocument)
+        loaded = try fileStore.load()
+        XCTAssertEqual(loaded.schemaVersion, 7)
+        XCTAssertEqual(loaded.scalarPreferences?.modelSelection?.additionalOracleModels, orderedRoster)
+
+        let populatedDocument = GlobalSettingsDocument(agentModelsSettings: [
+            workspaceID: WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: AgentModelsSettingsProfile(
+                    planningModelRaw: "primary-model",
+                    additionalOracleModelRaws: orderedRoster
+                )
+            )
+        ])
+
+        XCTAssertEqual(populatedDocument.requiredSchemaVersion, GlobalSettingsDocument.oracleRosterSchemaVersion)
+        try fileStore.save(populatedDocument)
+        loaded = try fileStore.load()
+        XCTAssertEqual(loaded.schemaVersion, 7)
+        XCTAssertEqual(loaded.agentModelsSettings[workspaceID]?.profile?.additionalOracleModelRaws, orderedRoster)
+    }
+
+    func testUnshippedOraclePairSchemaVersionsAreNeverImportedAsAuthority() {
+        for version in GlobalSettingsDocument.rejectedExperimentalSchemaVersions {
+            XCTAssertEqual(
+                GlobalSettingsFileStore.preservationBlockReason(
+                    schemaVersion: version,
+                    schemaLineage: GlobalSettingsDocument.schemaLineage,
+                    supportedVersion: GlobalSettingsDocument.currentSchemaVersion
+                ),
+                .incompatibleSchema
+            )
+        }
+    }
+
+    func testUserInitiatedImportRejectsUnshippedOraclePairSchemaVersions() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = Data(
+            #"{"schemaVersion":5,"schemaLineage":"repoprompt-ce.global-settings","updatedAt":"2026-08-11T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{}}"#.utf8
+        )
+        try data.write(to: fileURL)
+
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        _ = fileStore.loadOrCreateDefault()
+        XCTAssertFalse(fileStore.performUserInitiatedCompatibleImport())
+        XCTAssertEqual(try Data(contentsOf: fileURL), data)
     }
 
     func testCorruptGlobalSettingsIsBackedUpAndReplacedWithDefaults() throws {

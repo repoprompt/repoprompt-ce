@@ -56,6 +56,7 @@ final class AppSettingsMCPService: Service {
                 - `{"op":"get","keys":["ui.appearance_mode","ui.show_tooltips"]}`
                 - `{"op":"get","group":"file_system"}`
                 - `{"op":"set","key":"models.planning_model","value":null}`
+                - `{"op":"set","key":"models.additional_oracle_models","value":["openai/gpt-5.2","anthropic/claude-opus-4-6"]}`
                 - `{"op":"set","key":"file_system.global_ignore_defaults","value":"**/node_modules/\\n"}`
                 - `{"op":"options","key":"models.planning_model","agent":"codexExec"}`
 
@@ -67,7 +68,15 @@ final class AppSettingsMCPService: Service {
                         "group": .string(description: "Settings group.", enum: ["ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"]),
                         "key": .string(description: "Allowlisted setting key (required for set/options)."),
                         "keys": .array(description: "Multiple keys (get only).", items: .string()),
-                        "value": .anyOf([.boolean(), .integer(), .number(), .string(), .null]),
+                        "value": .anyOf([
+                            .boolean(), .integer(), .number(), .string(),
+                            .array(
+                                description: "Ordered Oracle roster additions (maximum four model identifiers).",
+                                items: .string(maxLength: OracleRosterContract.maximumModelIdentifierLength),
+                                maxItems: OracleRosterContract.maximumAdditionalCount
+                            ),
+                            .null
+                        ]),
                         "agent": .string(description: "Filter options by CLI backend."),
                         "limit": .integer(description: "Maximum options returned (1–200)."),
                         "detailed": .boolean(description: "Include descriptions and model metadata.")
@@ -429,6 +438,7 @@ private enum AppSettingValueType: String {
     case boolean
     case string
     case optionalString = "string|null"
+    case stringArray = "string[]"
     case number
 }
 
@@ -710,6 +720,12 @@ private enum AppSettingsMCPRegistry {
                 reason: "app_settings.models.planning_model",
                 honorSync: true
             ) },
+            afterWrite: postRecommendationsDidApply,
+            candidateProvider: aiModelRawCandidates
+        ),
+        oracleRosterSetting(
+            read: { .array($0.additionalOracleModelRaws().map(Value.string)) },
+            write: { try $0.setAdditionalOracleModelRaws(requiredStringArray(from: $1)) },
             afterWrite: postRecommendationsDidApply,
             candidateProvider: aiModelRawCandidates
         ),
@@ -1084,6 +1100,38 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    private static func oracleRosterSetting(
+        read: @escaping @MainActor (GlobalSettingsStore) -> Value,
+        write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
+        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil,
+        candidateProvider: (@MainActor (AppSettingCandidateRequest) throws -> AppSettingCandidatesResult)? = nil
+    ) -> AppSettingDefinition {
+        let descriptor = OracleRosterSettingsDescriptor.additional
+        return AppSettingDefinition(
+            key: descriptor.key,
+            group: descriptor.group,
+            valueType: .stringArray,
+            label: "Additional Oracle Models",
+            description: descriptor.description,
+            allowedValues: nil,
+            valueFormat: "Ordered model identifiers; maximum \(OracleRosterContract.maximumAdditionalCount).",
+            read: read,
+            validate: { value in
+                guard let domainValue = DomainSettingValue(mcpValue: value) else {
+                    throw MCPError.invalidParams("\(descriptor.key) must be an array of model identifier strings.")
+                }
+                do {
+                    return try DomainAppSettingsCatalog.normalize(domainValue, for: descriptor).mcpValue
+                } catch {
+                    throw MCPError.invalidParams(error.localizedDescription)
+                }
+            },
+            write: write,
+            afterWrite: afterWrite,
+            candidateProvider: candidateProvider
+        )
+    }
+
     private static func optionalModelRawSetting(
         key: String,
         group: String,
@@ -1301,6 +1349,13 @@ private enum AppSettingsMCPRegistry {
     private static func optionalString(from value: Value) throws -> String? {
         if case .null = value { return nil }
         return try requiredString(from: value)
+    }
+
+    private static func requiredStringArray(from value: Value) throws -> [String] {
+        guard case let .array(values) = value else {
+            throw MCPError.invalidParams("Expected normalized string-array value.")
+        }
+        return try values.map(requiredString(from:))
     }
 
     private static func requiredDouble(from value: Value) throws -> Double {
