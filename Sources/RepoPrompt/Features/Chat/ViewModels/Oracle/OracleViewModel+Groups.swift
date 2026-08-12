@@ -276,10 +276,21 @@ extension OracleViewModel {
         tabID: UUID,
         tabContext: OracleSendTabContext?
     ) async throws {
-        for member in group.members where !sessions.contains(where: { $0.shortID == member.publicChatID }) {
+        for member in group.members {
+            let expectedName = Self.oracleProjectionName(base: group.name, laneIndex: member.laneID.index)
+            if let index = sessions.firstIndex(where: { $0.shortID == member.publicChatID }) {
+                guard sessions[index].name != expectedName else { continue }
+                sessions[index].name = expectedName
+                let savedURL = try await autosaveSession(sessions[index])
+                if let refreshed = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) {
+                    sessions[refreshed].fileURL = savedURL
+                    sessions[refreshed].savedAt = Date()
+                }
+                continue
+            }
             let created = await startNewChatSession(
                 id: member.memberID.rawValue,
-                name: Self.oracleProjectionName(base: group.name, laneIndex: member.laneID.index),
+                name: expectedName,
                 workspaceID: workspaceID,
                 tabID: tabID,
                 agentModeSessionID: tabContext?.agentModeSessionID,
@@ -583,15 +594,19 @@ extension OracleViewModel {
         ) else {
             throw ChatToolError.internalError("Canonical Oracle group was not found.")
         }
-        try await store.rename(
-            groupID: group.group.id,
-            owner: owner,
-            name: newName,
-            expectedRevision: group.revision
-        )
+        let normalizedName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if group.name != normalizedName {
+            try await store.rename(
+                groupID: group.group.id,
+                owner: owner,
+                name: normalizedName,
+                expectedRevision: group.revision
+            )
+        }
+        var projectionSaveFailed = false
         for member in group.members {
             guard let index = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) else { continue }
-            sessions[index].name = Self.oracleProjectionName(base: newName, laneIndex: member.laneID.index)
+            sessions[index].name = Self.oracleProjectionName(base: normalizedName, laneIndex: member.laneID.index)
             let projection = sessions[index]
             if projection.id == currentSessionID {
                 autosaveChatHistory(for: projection.id, force: true)
@@ -603,9 +618,14 @@ extension OracleViewModel {
                         sessions[refreshed].savedAt = Date()
                     }
                 } catch {
-                    // Canonical rename already succeeded. Projection repair is retried on use.
+                    projectionSaveFailed = true
                 }
             }
+        }
+        if projectionSaveFailed {
+            throw ChatToolError.internalError(
+                "The Oracle group was renamed, but one or more projection files could not be updated."
+            )
         }
     }
 }

@@ -455,6 +455,20 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         }
     }
 
+    package func removeArtifactIfUnreferenced(id: String) async throws {
+        try await perform { files in
+            try files.withMutationLock {
+                try files.recoverTransactions()
+                let referenced = Set(
+                    try files.loadAndValidateAllGroups().flatMap(files.referencedArtifactIDs)
+                        + files.loadAndValidateAllSingles().flatMap(files.referencedArtifactIDs)
+                )
+                guard !referenced.contains(id), files.exists(files.artifactURL(id)) else { return }
+                try files.commit([.remove(relativePath: files.relative(files.artifactURL(id)))])
+            }
+        }
+    }
+
     package func loadMostRecentConversation(
         owner: OracleConversationOwner
     ) async throws -> OracleStoredConversation? {
