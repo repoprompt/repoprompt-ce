@@ -1308,6 +1308,15 @@ actor WorkspaceCodemapSelectionGraph {
                 orderingFileIDs.insert(edge.targetFileID)
             }
         }
+        // Sorting an affected target's reverse adjacency also compares retained
+        // edges from unaffected sources. Include the complete lists being sorted,
+        // not only the edges rebuilt for this delta.
+        for target in affectedTargets {
+            for edge in reverse[target] ?? [] {
+                orderingFileIDs.insert(edge.sourceFileID)
+                orderingFileIDs.insert(edge.targetFileID)
+            }
+        }
         guard let fileOrdering = WorkspaceCodemapCandidateFileOrdering(
             nodes: nodes,
             participatingFileIDs: orderingFileIDs
