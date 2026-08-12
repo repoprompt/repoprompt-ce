@@ -91,6 +91,22 @@ class PromptViewModel: ObservableObject {
 
     typealias StoredPrompt = StoredPromptRecord
 
+    enum StoredPromptEditResult: Equatable {
+        case updated
+        case unchanged
+        case targetMissing
+        case targetChanged
+        case targetProtected
+        case invalidTitle
+    }
+
+    enum StoredPromptDeleteResult: Equatable {
+        case deleted
+        case targetMissing
+        case targetChanged
+        case targetProtected
+    }
+
     // MARK: - Core Properties
 
     @Published private(set) var fileManager: WorkspaceFilesViewModel
@@ -4283,7 +4299,64 @@ class PromptViewModel: ObservableObject {
         return newPrompt
     }
 
-    func removeStoredPrompt(_ prompt: StoredPrompt) {
+    func removeStoredPrompt(matching expected: StoredPrompt) -> StoredPromptDeleteResult {
+        guard let current = storedPrompts.first(where: { $0.id == expected.id }) else {
+            return .targetMissing
+        }
+        guard !builtInPromptIDs.contains(current.id) else {
+            return .targetProtected
+        }
+        guard storedPromptExactlyMatches(current, expected) else {
+            return .targetChanged
+        }
+
+        removeStoredPrompt(current)
+        return .deleted
+    }
+
+    func updateStoredPrompt(
+        matching expected: StoredPrompt,
+        title: String,
+        content: String
+    ) -> StoredPromptEditResult {
+        guard let index = storedPrompts.firstIndex(where: { $0.id == expected.id }) else {
+            return .targetMissing
+        }
+        let current = storedPrompts[index]
+        guard !builtInPromptIDs.contains(current.id) else {
+            return .targetProtected
+        }
+        guard storedPromptExactlyMatches(current, expected) else {
+            return .targetChanged
+        }
+
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedTitle.isEmpty else {
+            return .invalidTitle
+        }
+        guard normalizedTitle != current.title || content != current.content else {
+            return .unchanged
+        }
+
+        storedPrompts[index] = StoredPrompt(
+            id: current.id,
+            title: normalizedTitle,
+            content: content,
+            isUserEdited: current.isUserEdited
+        )
+        saveStoredPrompts()
+        updateSelectedInstructions()
+        return .updated
+    }
+
+    private func storedPromptExactlyMatches(_ lhs: StoredPrompt, _ rhs: StoredPrompt) -> Bool {
+        lhs.id == rhs.id &&
+            lhs.title == rhs.title &&
+            lhs.content == rhs.content &&
+            lhs.isUserEdited == rhs.isUserEdited
+    }
+
+    private func removeStoredPrompt(_ prompt: StoredPrompt) {
         storedPrompts.removeAll { $0.id == prompt.id }
         if selectedPromptIDs.contains(prompt.id) {
             var currentCopySelection = selectedPromptIDs
@@ -4296,19 +4369,6 @@ class PromptViewModel: ObservableObject {
             updatePromptSelection(currentChatSelection, for: .chat)
         }
         saveStoredPrompts()
-    }
-
-    func updateStoredPrompt(_ prompt: StoredPrompt) {
-        if let index = storedPrompts.firstIndex(where: { $0.id == prompt.id }) {
-            var updated = prompt
-            // Mark built-in prompts as user-edited so auto-upgrades are skipped
-            if builtInPromptIDs.contains(prompt.id) {
-                updated.isUserEdited = true
-            }
-            storedPrompts[index] = updated
-            saveStoredPrompts()
-            updateSelectedInstructions()
-        }
     }
 
     /// Clears out all saved prompts and re-adds the default ones.

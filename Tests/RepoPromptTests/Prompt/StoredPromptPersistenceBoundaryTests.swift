@@ -101,6 +101,134 @@ final class StoredPromptPersistenceBoundaryTests: XCTestCase {
     }
 
     @MainActor
+    func testCreatedPromptPersistsOnceAndCanBeSelectedWithoutResavingPrompts() {
+        let persistence = StoredPromptPersistenceSpy(loadResult: .success([]))
+        let viewModel = makePromptViewModel(persistence: persistence)
+        persistence.savedSnapshots.removeAll()
+
+        let prompt = viewModel.addStoredPrompt(title: "New prompt", content: "New body\n")
+        viewModel.selectNewPrompt(prompt)
+
+        XCTAssertEqual(viewModel.storedPrompts.last, prompt)
+        XCTAssertEqual(viewModel.promptSelection(for: .copy), [prompt.id])
+        XCTAssertEqual(persistence.savedSnapshots.count, 1)
+        XCTAssertEqual(persistence.savedSnapshots[0].last, prompt)
+    }
+
+    @MainActor
+    func testMatchingEditNormalizesTitleAndPersistsOnce() throws {
+        let persistence = StoredPromptPersistenceSpy(loadResult: .success([]))
+        let viewModel = makePromptViewModel(persistence: persistence)
+        let prompt = viewModel.addStoredPrompt(title: "Original", content: "Old body")
+        viewModel.updatePromptSelection([prompt.id], for: .copy)
+        persistence.savedSnapshots.removeAll()
+
+        let result = viewModel.updateStoredPrompt(
+            matching: prompt,
+            title: "  Updated title  ",
+            content: "New body\n"
+        )
+
+        XCTAssertEqual(result, .updated)
+        let updated = try XCTUnwrap(viewModel.storedPrompts.first { $0.id == prompt.id })
+        XCTAssertEqual(updated.title, "Updated title")
+        XCTAssertEqual(updated.content, "New body\n")
+        XCTAssertEqual(viewModel.promptSelection(for: .copy), [prompt.id])
+        XCTAssertEqual(persistence.savedSnapshots.count, 1)
+        XCTAssertEqual(persistence.savedSnapshots[0].first { $0.id == prompt.id }, updated)
+    }
+
+    @MainActor
+    func testMatchingEditRejectsInvalidUnchangedAndProtectedTargetsWithoutSaving() throws {
+        let persistence = StoredPromptPersistenceSpy(loadResult: .success([]))
+        let viewModel = makePromptViewModel(persistence: persistence)
+        let prompt = viewModel.addStoredPrompt(title: "Custom", content: "Body")
+        let builtIn = try XCTUnwrap(viewModel.builtInStoredPrompts.first)
+        viewModel.updatePromptSelection([prompt.id], for: .copy)
+        viewModel.updatePromptSelection([prompt.id], for: .chat)
+        persistence.savedSnapshots.removeAll()
+
+        XCTAssertEqual(
+            viewModel.updateStoredPrompt(matching: prompt, title: " Custom ", content: "Body"),
+            .unchanged
+        )
+        XCTAssertEqual(
+            viewModel.updateStoredPrompt(matching: prompt, title: "\n\t", content: "Body"),
+            .invalidTitle
+        )
+        XCTAssertEqual(viewModel.promptSelection(for: .copy), [prompt.id])
+        XCTAssertEqual(viewModel.promptSelection(for: .chat), [prompt.id])
+
+        viewModel.updatePromptSelection([builtIn.id], for: .copy)
+        viewModel.updatePromptSelection([builtIn.id], for: .chat)
+
+        XCTAssertEqual(
+            viewModel.updateStoredPrompt(matching: builtIn, title: "Changed", content: builtIn.content),
+            .targetProtected
+        )
+        XCTAssertEqual(viewModel.removeStoredPrompt(matching: builtIn), .targetProtected)
+        XCTAssertEqual(viewModel.promptSelection(for: .copy), [builtIn.id])
+        XCTAssertEqual(viewModel.promptSelection(for: .chat), [builtIn.id])
+        XCTAssertTrue(persistence.savedSnapshots.isEmpty)
+    }
+
+    @MainActor
+    func testMatchingMutationsRejectChangedAndMissingTargetsWithoutSaving() {
+        let persistence = StoredPromptPersistenceSpy(loadResult: .success([]))
+        let viewModel = makePromptViewModel(persistence: persistence)
+        let prompt = viewModel.addStoredPrompt(title: "Custom", content: "Body")
+        viewModel.updatePromptSelection([prompt.id], for: .copy)
+        viewModel.updatePromptSelection([prompt.id], for: .chat)
+        persistence.savedSnapshots.removeAll()
+
+        viewModel.storedPrompts = viewModel.storedPrompts.map { current in
+            guard current.id == prompt.id else { return current }
+            return StoredPromptRecord(
+                id: current.id,
+                title: current.title,
+                content: current.content,
+                isUserEdited: true
+            )
+        }
+
+        XCTAssertEqual(
+            viewModel.updateStoredPrompt(matching: prompt, title: "Changed", content: "Body"),
+            .targetChanged
+        )
+        XCTAssertEqual(viewModel.removeStoredPrompt(matching: prompt), .targetChanged)
+
+        viewModel.storedPrompts.removeAll { $0.id == prompt.id }
+
+        XCTAssertEqual(
+            viewModel.updateStoredPrompt(matching: prompt, title: "Changed", content: "Body"),
+            .targetMissing
+        )
+        XCTAssertEqual(viewModel.removeStoredPrompt(matching: prompt), .targetMissing)
+        XCTAssertEqual(viewModel.promptSelection(for: .copy), [prompt.id])
+        XCTAssertEqual(viewModel.promptSelection(for: .chat), [prompt.id])
+        XCTAssertTrue(persistence.savedSnapshots.isEmpty)
+    }
+
+    @MainActor
+    func testMatchingDeleteCleansCopyAndChatSelectionsBeforeSavingOnce() {
+        let persistence = StoredPromptPersistenceSpy(loadResult: .success([]))
+        let viewModel = makePromptViewModel(persistence: persistence)
+        let prompt = viewModel.addStoredPrompt(title: "Custom", content: "Body")
+        viewModel.updatePromptSelection([prompt.id], for: .copy)
+        viewModel.updatePromptSelection([prompt.id], for: .chat)
+        persistence.savedSnapshots.removeAll()
+
+        let result = viewModel.removeStoredPrompt(matching: prompt)
+
+        XCTAssertEqual(result, .deleted)
+        XCTAssertFalse(viewModel.storedPrompts.contains { $0.id == prompt.id })
+        XCTAssertFalse(viewModel.promptSelection(for: .copy).contains(prompt.id))
+        XCTAssertFalse(viewModel.promptSelection(for: .chat).contains(prompt.id))
+        XCTAssertEqual(persistence.savedSnapshots.count, 1)
+        XCTAssertFalse(persistence.savedSnapshots[0].contains { $0.id == prompt.id })
+    }
+
+    @MainActor
     private func makePromptViewModel(
         persistence: any StoredPromptPersistenceServing
     ) -> PromptViewModel {
