@@ -3,6 +3,26 @@ import Foundation
 import XCTest
 
 final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
+    private var previousAdditionalOracleModels: [String] = []
+
+    override func setUp() async throws {
+        previousAdditionalOracleModels = await MainActor.run {
+            GlobalSettingsStore.shared.additionalOracleModelRaws()
+        }
+        try await MainActor.run {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+        }
+        try await super.setUp()
+    }
+
+    override func tearDown() async throws {
+        let previousAdditionalOracleModels = previousAdditionalOracleModels
+        try await MainActor.run {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalOracleModels, commit: false)
+        }
+        try await super.tearDown()
+    }
+
     func testPhaseCatalogCoversExpectedDiscoveryAndGenerationSequence() {
         XCTAssertEqual(ContextBuilderMCPProgressPhase.allCases, [
             .providerProcessStarting,
