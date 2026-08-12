@@ -140,7 +140,7 @@ actor DirectHeadlessDomainContext {
             context: context,
             rootOverlay: rootOverlay,
             prompt: prompt,
-            selection: selection
+            selection: Self.translateSelectionToPhysical(selection, mappings: rootOverlay.mappings)
         )
     }
 
@@ -266,7 +266,10 @@ actor DirectHeadlessDomainContext {
         case let .setPrompt(prompt):
             contexts[index]["prompt"] = prompt
         case let .setSelection(paths):
-            contexts[index]["selectedPaths"] = paths
+            contexts[index]["selectedPaths"] = try Self.translateSelectionToCanonical(
+                paths,
+                mappings: current.rootOverlay.mappings
+            )
         }
         document["composeTabs"] = contexts
         let bytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
@@ -354,6 +357,65 @@ actor DirectHeadlessDomainContext {
             break
         }
         throw MCPError.invalidParams("\(name) must be a boolean.")
+    }
+
+    private nonisolated static func translateSelectionToPhysical(
+        _ paths: [String],
+        mappings: [DirectHeadlessRootMapping]
+    ) -> [String] {
+        translateAbsolutePaths(paths, mappings: mappings, from: \.canonicalRoot, to: \.physicalRoot)
+    }
+
+    private nonisolated static func translateSelectionToCanonical(
+        _ paths: [String],
+        mappings: [DirectHeadlessRootMapping]
+    ) throws -> [String] {
+        try paths.map { rawPath in
+            guard rawPath.hasPrefix("/") else { return rawPath }
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.resolvingSymlinksInPath().path
+            if let translated = translateAbsolutePath(
+                path,
+                mappings: mappings,
+                from: \.physicalRoot,
+                to: \.canonicalRoot
+            ) {
+                return translated
+            }
+            guard mappings.contains(where: {
+                path == $0.canonicalRoot.path || path.hasPrefix($0.canonicalRoot.path + "/")
+            }) else {
+                throw Error.pathOutsideWorkspace(rawPath)
+            }
+            return path
+        }
+    }
+
+    private nonisolated static func translateAbsolutePaths(
+        _ paths: [String],
+        mappings: [DirectHeadlessRootMapping],
+        from source: KeyPath<DirectHeadlessRootMapping, URL>,
+        to destination: KeyPath<DirectHeadlessRootMapping, URL>
+    ) -> [String] {
+        paths.map { rawPath in
+            guard rawPath.hasPrefix("/") else { return rawPath }
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            return translateAbsolutePath(path, mappings: mappings, from: source, to: destination) ?? rawPath
+        }
+    }
+
+    private nonisolated static func translateAbsolutePath(
+        _ path: String,
+        mappings: [DirectHeadlessRootMapping],
+        from source: KeyPath<DirectHeadlessRootMapping, URL>,
+        to destination: KeyPath<DirectHeadlessRootMapping, URL>
+    ) -> String? {
+        guard let mapping = mappings
+            .filter({ path == $0[keyPath: source].path || path.hasPrefix($0[keyPath: source].path + "/") })
+            .max(by: { $0[keyPath: source].path.count < $1[keyPath: source].path.count })
+        else { return nil }
+        let sourcePath = mapping[keyPath: source].path
+        let suffix = String(path.dropFirst(sourcePath.count))
+        return mapping[keyPath: destination].path + suffix
     }
 
     private static func contextObject(

@@ -55,7 +55,7 @@ enum DirectHeadlessWorktreeRouting {
         var physicalWorktreeInventories: [[DirectHeadlessGitWorktree]?] = []
         for physicalRoot in physicalRoots {
             guard let inventory = try? await listWorktrees(repositoryRoot: physicalRoot),
-                  let physicalWorktree = inventory.first(where: { $0.path.path == physicalRoot.path }),
+                  let physicalWorktree = containingWorktree(for: physicalRoot, in: inventory),
                   await (try? verifyWorktree(physicalWorktree)) != nil
             else {
                 physicalWorktreeInventories.append(nil)
@@ -75,15 +75,18 @@ enum DirectHeadlessWorktreeRouting {
                       physicalWorktreeInventories: physicalWorktreeInventories
                   )
             else { continue }
+            let needsOverlay = mappings.contains {
+                canonicalPath($0.canonicalRoot).path != canonicalPath($0.physicalRoot).path
+                    || $0.worktree != nil
+            }
             candidates.append(DirectHeadlessInitialRoute(
                 bindingWorkingDirectories: canonicalRoots,
-                rootOverlay: DirectHeadlessRootOverlay(
-                    mappings: mappings,
-                    activeRoot: physicalRoots.first
-                )
+                rootOverlay: needsOverlay
+                    ? DirectHeadlessRootOverlay(mappings: mappings, activeRoot: physicalRoots.first)
+                    : DirectHeadlessRootOverlay(mappings: [], activeRoot: nil)
             ))
         }
-        if candidates.count > 1 {
+        if candidates.count > 1, !candidates.dropFirst().allSatisfy({ routesAreEquivalent($0, candidates[0]) }) {
             throw MCPError.invalidRequest(
                 "working directories match multiple saved workspaces after existing-worktree resolution"
             )
@@ -91,18 +94,7 @@ enum DirectHeadlessWorktreeRouting {
         guard let route = candidates.first else {
             return DirectHeadlessInitialRoute(
                 bindingWorkingDirectories: physicalRoots,
-                rootOverlay: DirectHeadlessRootOverlay(
-                    mappings: physicalRoots.map {
-                        DirectHeadlessRootMapping(
-                            canonicalRoot: $0,
-                            physicalRoot: $0,
-                            worktree: nil,
-                            visualLabel: nil,
-                            visualColorHex: nil
-                        )
-                    },
-                    activeRoot: physicalRoots.first
-                )
+                rootOverlay: DirectHeadlessRootOverlay(mappings: [], activeRoot: nil)
             )
         }
         return route
@@ -158,13 +150,32 @@ enum DirectHeadlessWorktreeRouting {
             throw MCPError.invalidRequest("selected worktree path is unavailable: \(selected.path.path)")
         }
         try await verifyWorktree(selected)
+        guard let canonicalWorktree = containingWorktree(for: logicalRoot, in: worktrees),
+              let suffix = relativeSuffix(of: logicalRoot, within: canonicalWorktree.path)
+        else {
+            throw MCPError.invalidRequest("workspace root is not contained by the selected Git repository")
+        }
+        let unresolvedSelectedRoot = suffix.isEmpty
+            ? selected.path
+            : selected.path.appendingPathComponent(suffix, isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: unresolvedSelectedRoot.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              let selectedSuffix = relativeSuffix(of: unresolvedSelectedRoot, within: selected.path),
+              selectedSuffix == suffix
+        else {
+            throw MCPError.invalidRequest(
+                "selected worktree workspace root does not preserve the logical root fence: \(unresolvedSelectedRoot.path)"
+            )
+        }
+        let selectedPhysicalRoot = canonicalPath(unresolvedSelectedRoot)
 
         var result = baseOverlay.mappings.filter {
             canonicalPath($0.canonicalRoot).path != canonicalPath(logicalRoot).path
         }
         result.append(DirectHeadlessRootMapping(
             canonicalRoot: canonicalPath(logicalRoot),
-            physicalRoot: canonicalPath(selected.path),
+            physicalRoot: canonicalPath(selectedPhysicalRoot),
             worktree: selected,
             visualLabel: visualLabel,
             visualColorHex: visualColorHex?.uppercased()
@@ -180,7 +191,7 @@ enum DirectHeadlessWorktreeRouting {
         }
         return DirectHeadlessRootOverlay(
             mappings: mappings,
-            activeRoot: canonicalPath(selected.path)
+            activeRoot: canonicalPath(selectedPhysicalRoot)
         )
     }
 
@@ -286,7 +297,7 @@ enum DirectHeadlessWorktreeRouting {
     static func verifyMappingsAtUse(_ mappings: [DirectHeadlessRootMapping]) async throws {
         for mapping in mappings {
             guard let worktree = mapping.worktree else { continue }
-            guard canonicalPath(mapping.physicalRoot).path == worktree.path.path else {
+            guard relativeSuffix(of: mapping.physicalRoot, within: worktree.path) != nil else {
                 throw MCPError.invalidRequest(
                     "selected worktree path identity changed: \(mapping.physicalRoot.path)"
                 )
@@ -316,21 +327,22 @@ enum DirectHeadlessWorktreeRouting {
                 ))
                 continue
             }
-            let matches = remaining.enumerated().compactMap { remainingIndex, physicalIndex -> (Int, DirectHeadlessGitWorktree)? in
+            let matches = remaining.enumerated().compactMap {
+                remainingIndex, physicalIndex -> (remainingIndex: Int, physicalIndex: Int, worktree: DirectHeadlessGitWorktree)? in
                 guard let inventory = physicalWorktreeInventories[physicalIndex],
-                      inventory.contains(where: { $0.path.path == canonicalPath(canonicalRoot).path }),
-                      let worktree = inventory.first(where: {
-                          $0.path.path == canonicalPath(physicalRoots[physicalIndex]).path
-                      })
+                      let canonicalWorktree = containingWorktree(for: canonicalRoot, in: inventory),
+                      let physicalWorktree = containingWorktree(for: physicalRoots[physicalIndex], in: inventory),
+                      relativeSuffix(of: canonicalRoot, within: canonicalWorktree.path)
+                      == relativeSuffix(of: physicalRoots[physicalIndex], within: physicalWorktree.path)
                 else { return nil }
-                return (remainingIndex, worktree)
+                return (remainingIndex, physicalIndex, physicalWorktree)
             }
             guard matches.count == 1, let match = matches.first else { return nil }
-            remaining.remove(at: match.0)
+            remaining.remove(at: match.remainingIndex)
             result.append(DirectHeadlessRootMapping(
                 canonicalRoot: canonicalPath(canonicalRoot),
-                physicalRoot: match.1.path,
-                worktree: match.1,
+                physicalRoot: canonicalPath(physicalRoots[match.physicalIndex]),
+                worktree: match.worktree,
                 visualLabel: nil,
                 visualColorHex: nil
             ))
@@ -372,7 +384,7 @@ enum DirectHeadlessWorktreeRouting {
             matches = worktrees.filter { $0.worktreeID == worktreeID }
         } else if let selector {
             if selector == "@current" {
-                matches = worktrees.filter { $0.path.path == canonicalPath(currentPhysicalRoot).path }
+                matches = worktrees.filter { relativeSuffix(of: currentPhysicalRoot, within: $0.path) != nil }
             } else if selector == "@main" {
                 matches = worktrees.filter(\.isMain)
             } else if selector.hasPrefix("@id:") {
@@ -393,6 +405,39 @@ enum DirectHeadlessWorktreeRouting {
             throw MCPError.invalidParams("existing worktree selector is unknown or ambiguous: \(description)")
         }
         return match
+    }
+
+    private static func containingWorktree(
+        for root: URL,
+        in worktrees: [DirectHeadlessGitWorktree]
+    ) -> DirectHeadlessGitWorktree? {
+        worktrees
+            .filter { relativeSuffix(of: root, within: $0.path) != nil }
+            .max { $0.path.path.count < $1.path.path.count }
+    }
+
+    private static func routesAreEquivalent(
+        _ lhs: DirectHeadlessInitialRoute,
+        _ rhs: DirectHeadlessInitialRoute
+    ) -> Bool {
+        let lhsActiveRoot = lhs.rootOverlay.activeRoot.map { canonicalPath($0).path }
+        let rhsActiveRoot = rhs.rootOverlay.activeRoot.map { canonicalPath($0).path }
+        guard Set(lhs.bindingWorkingDirectories.map { canonicalPath($0).path })
+            == Set(rhs.bindingWorkingDirectories.map { canonicalPath($0).path }),
+            lhsActiveRoot == rhsActiveRoot,
+            lhs.rootOverlay.mappings.count == rhs.rootOverlay.mappings.count
+        else { return false }
+        let lhsMappings = lhs.rootOverlay.mappings.sorted { $0.canonicalRoot.path < $1.canonicalRoot.path }
+        let rhsMappings = rhs.rootOverlay.mappings.sorted { $0.canonicalRoot.path < $1.canonicalRoot.path }
+        return lhsMappings == rhsMappings
+    }
+
+    private static func relativeSuffix(of child: URL, within parent: URL) -> String? {
+        let childPath = canonicalPath(child).path
+        let parentPath = canonicalPath(parent).path
+        if childPath == parentPath { return "" }
+        guard childPath.hasPrefix(parentPath + "/") else { return nil }
+        return String(childPath.dropFirst(parentPath.count + 1))
     }
 
     private struct PorcelainRecord {
