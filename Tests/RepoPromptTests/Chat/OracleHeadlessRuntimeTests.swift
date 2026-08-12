@@ -217,6 +217,60 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
             throw error
         }
     }
+
+    @MainActor
+    func testCancelStreamCancelsEveryConcurrentStreamRegisteredToSameTab() async throws {
+        let tabID = UUID()
+        let streamIDs = [UUID(), UUID()]
+        var nextStreamIndex = 0
+        let controller = MultiOracleHeadlessTestStreamController()
+        let installed = expectation(description: "both stream continuations installed")
+        installed.expectedFulfillmentCount = 2
+        let progressed = expectation(description: "both streams produced output")
+        progressed.expectedFulfillmentCount = 2
+
+        let runtime = OracleHeadlessRuntime(
+            sendPrompt: { _, _ in
+                let streamID = streamIDs[nextStreamIndex]
+                nextStreamIndex += 1
+                let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                    Task {
+                        await controller.install(continuation, for: streamID)
+                        await MainActor.run { installed.fulfill() }
+                    }
+                    continuation.yield(ChatStreamOutput(text: "partial", reasoning: nil, tokens: ChatTokenInfo()))
+                }
+                return (streamID, stream)
+            },
+            cancelStream: { streamID in
+                await controller.cancelAndFinish(streamID)
+            },
+            cleanupConversation: { _, _ in },
+            timeout: .seconds(2)
+        )
+        let executions = (0 ..< 2).map { _ in
+            Task { @MainActor in
+                try await runtime.execute(
+                    message: AIMessage(systemPrompt: "system", userMessage: "prompt"),
+                    model: .claude4Sonnet,
+                    tabID: tabID,
+                    completionPolicy: .interactive,
+                    onProgress: { _, _ in progressed.fulfill() }
+                )
+            }
+        }
+
+        await fulfillment(of: [installed, progressed], timeout: 1)
+        XCTAssertTrue(runtime.hasActiveStream(for: tabID))
+        await runtime.cancelStream(for: tabID)
+        for execution in executions {
+            let output = try await execution.value
+            XCTAssertEqual(output.text, "partial")
+        }
+        let cancelledStreamIDs = await controller.cancelledStreamIDs()
+        XCTAssertEqual(Set(cancelledStreamIDs), Set(streamIDs))
+        XCTAssertFalse(runtime.hasActiveStream(for: tabID))
+    }
 }
 
 private actor OracleHeadlessTestStreamController {
@@ -238,6 +292,27 @@ private actor OracleHeadlessTestStreamController {
     func finish() {
         continuation?.finish()
         continuation = nil
+    }
+
+    func cancelledStreamIDs() -> [ChatStreamID] {
+        cancellations
+    }
+}
+
+private actor MultiOracleHeadlessTestStreamController {
+    private var continuations: [ChatStreamID: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation] = [:]
+    private var cancellations: [ChatStreamID] = []
+
+    func install(
+        _ continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation,
+        for streamID: ChatStreamID
+    ) {
+        continuations[streamID] = continuation
+    }
+
+    func cancelAndFinish(_ streamID: ChatStreamID) {
+        cancellations.append(streamID)
+        continuations.removeValue(forKey: streamID)?.finish()
     }
 
     func cancelledStreamIDs() -> [ChatStreamID] {

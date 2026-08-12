@@ -56,15 +56,29 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         XCTAssertTrue(askOracleText.contains("### Oracle 3"))
     }
 
+    func testDecodeRejectsRoleThatDoesNotMatchLaneIndex() {
+        let value: [String: Value] = [
+            "oracle_group_id": .string(UUID().uuidString),
+            "status": .string("completed"),
+            "oracle_count": .int(1),
+            "oracle_results": .array([
+                lane(index: 0, role: "additional", status: "completed", response: "answer")
+            ])
+        ]
+
+        XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(value))
+    }
+
     private func lane(
         index: Int,
+        role: String? = nil,
         status: String,
         response: String? = nil,
         error: String? = nil
     ) -> Value {
         var object: [String: Value] = [
             "lane_index": .int(index),
-            "role": .string(index == 0 ? "primary" : "additional"),
+            "role": .string(role ?? (index == 0 ? "primary" : "additional")),
             "chat_id": .string("chat-\(index)"),
             "model_id": .string("model-\(index)"),
             "status": .string(status)

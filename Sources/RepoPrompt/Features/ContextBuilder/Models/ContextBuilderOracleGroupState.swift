@@ -166,18 +166,7 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
     }
 
     func toMCPFields() -> [String: Value] {
-        var fields: [String: Value] = [
-            "oracle_group_id": .string(result.groupID.rawValue.uuidString),
-            "status": .string(result.status.rawValue),
-            "oracle_count": .int(result.oracleCount),
-            "oracle_results": .array(result.oracleResults.map(Self.laneValue))
-        ]
-        if !result.warnings.isEmpty {
-            fields["warnings"] = .array(result.warnings.map {
-                .object(["code": .string($0.code), "message": .string($0.message)])
-            })
-        }
-        return fields
+        OracleGroupMCPCodec.groupFields(result)
     }
 
     static func decode(_ object: [String: Value]) throws -> Self {
@@ -213,12 +202,18 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
     private static func decodeLane(_ value: Value) throws -> OracleLaneResult {
         guard let lane = value.objectValue,
               let laneIndex = lane["lane_index"]?.intValue,
+              let roleRaw = lane["role"]?.stringValue,
+              let role = OracleLaneRole(rawValue: roleRaw),
               let chatID = lane["chat_id"]?.stringValue,
               let modelID = lane["model_id"]?.stringValue,
               let statusRaw = lane["status"]?.stringValue,
               let status = OracleLaneResultStatus(rawValue: statusRaw)
         else {
             throw ChatToolError.internalError("Invalid Context Builder Oracle lane result")
+        }
+        let expectedRole: OracleLaneRole = laneIndex == 0 ? .primary : .additional
+        guard role == expectedRole else {
+            throw ChatToolError.internalError("Invalid Context Builder Oracle lane role")
         }
         let error: OracleLaneError? = if let errorValue = lane["error"]?.objectValue,
                                          let code = errorValue["code"]?.stringValue,
@@ -241,29 +236,6 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
             response: lane["response"]?.stringValue,
             error: error
         )
-    }
-
-    private static func laneValue(_ result: OracleLaneResult) -> Value {
-        var object: [String: Value] = [
-            "lane_index": .int(result.laneIndex),
-            "role": .string(result.role.rawValue),
-            "chat_id": .string(result.chatID),
-            "model_id": .string(result.modelID),
-            "status": .string(result.status.rawValue)
-        ]
-        if let providerID = result.providerID { object["provider_id"] = .string(providerID) }
-        if let response = result.response { object["response"] = .string(response) }
-        if let error = result.error {
-            var errorObject: [String: Value] = [
-                "code": .string(error.code),
-                "message": .string(error.message)
-            ]
-            if let partialResponse = error.partialResponse {
-                errorObject["partial_response"] = .string(partialResponse)
-            }
-            object["error"] = .object(errorObject)
-        }
-        return .object(object)
     }
 }
 
