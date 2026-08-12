@@ -1214,20 +1214,11 @@ actor WorkspaceCodemapSelectionGraph {
                 references[name, default: []].append(fileID)
             }
         }
-        guard let fileOrdering = WorkspaceCodemapCandidateFileOrdering(nodes: nodes) else {
-            return .cancelled
-        }
-        for name in changedDefinitionNames {
-            definitions[name]?.sort { fileOrdering.precedes($0, $1, nodes: nodes) }
-        }
         let changedReferenceNames = changedIDs.reduce(into: Set<String>()) { names, fileID in
             if let old = base?.nodesByFileID[fileID] {
                 names.formUnion(old.contribution.sortedUniqueReferences)
             }
             if let new = nodes[fileID] { names.formUnion(new.contribution.sortedUniqueReferences) }
-        }
-        for name in changedReferenceNames {
-            references[name]?.sort { fileOrdering.precedes($0, $1, nodes: nodes) }
         }
 
         var affectedSources = changedIDs
@@ -1293,7 +1284,6 @@ actor WorkspaceCodemapSelectionGraph {
                 outgoing[source, default: []].append(evidence)
                 reverse[target, default: []].append(evidence)
             }
-            outgoing[source]?.sort { edgePrecedes($0, $1, nodes: nodes, fileOrdering: fileOrdering) }
             unresolved[source]?.sort {
                 if $0.referencedName != $1.referencedName {
                     return utf8Precedes($0.referencedName, $1.referencedName)
@@ -1302,6 +1292,37 @@ actor WorkspaceCodemapSelectionGraph {
             }
         }
         let affectedTargets = Set(affectedSources.flatMap { outgoing[$0]?.map(\.targetFileID) ?? [] })
+
+        // Rank only files that participate in affected sorts. A sparse delta in a
+        // large graph must not introduce an O(V log V) whole-graph ordering pass.
+        var orderingFileIDs = Set<UUID>()
+        for name in changedDefinitionNames {
+            orderingFileIDs.formUnion(definitions[name] ?? [])
+        }
+        for name in changedReferenceNames {
+            orderingFileIDs.formUnion(references[name] ?? [])
+        }
+        for source in affectedSources {
+            for edge in outgoing[source] ?? [] {
+                orderingFileIDs.insert(edge.sourceFileID)
+                orderingFileIDs.insert(edge.targetFileID)
+            }
+        }
+        guard let fileOrdering = WorkspaceCodemapCandidateFileOrdering(
+            nodes: nodes,
+            participatingFileIDs: orderingFileIDs
+        ) else {
+            return .cancelled
+        }
+        for name in changedDefinitionNames {
+            definitions[name]?.sort { fileOrdering.precedes($0, $1, nodes: nodes) }
+        }
+        for name in changedReferenceNames {
+            references[name]?.sort { fileOrdering.precedes($0, $1, nodes: nodes) }
+        }
+        for source in affectedSources {
+            outgoing[source]?.sort { edgePrecedes($0, $1, nodes: nodes, fileOrdering: fileOrdering) }
+        }
         for target in affectedTargets {
             reverse[target]?.sort { edgePrecedes($0, $1, nodes: nodes, fileOrdering: fileOrdering) }
         }
@@ -1512,11 +1533,15 @@ private struct WorkspaceCodemapCandidateFileOrdering {
 
     private let rankByFileID: [UUID: Int]
 
-    init?(nodes: [UUID: WorkspaceCodemapGraphSnapshotNode]) {
+    init?(
+        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode],
+        participatingFileIDs: Set<UUID>
+    ) {
         var keys: [Key] = []
-        keys.reserveCapacity(nodes.count)
-        for (fileID, node) in nodes {
+        keys.reserveCapacity(participatingFileIDs.count)
+        for fileID in participatingFileIDs {
             guard !Task.isCancelled else { return nil }
+            guard let node = nodes[fileID] else { continue }
             keys.append(Key(
                 fileID: fileID,
                 pathBytes: Array(node.standardizedRelativePath.utf8),
