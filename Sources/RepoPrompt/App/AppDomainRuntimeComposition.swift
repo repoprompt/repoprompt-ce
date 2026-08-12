@@ -88,7 +88,8 @@ final class AppDomainRuntimeComposition: Sendable {
         )
         self.runtime = runtime
         oracleConversationStore = DomainOracleConversationStore(
-            persistence: runtime.persistenceCoordinator
+            persistence: runtime.persistenceCoordinator,
+            identity: runtime.identity
         )
         oracleGroupClaimManager = OracleGroupClaimManager(
             persistence: runtime.persistenceCoordinator,

@@ -358,13 +358,6 @@ actor ChatDataService {
                         groupID: OracleGroupID(rawValue: rawGroupID),
                         owner: owner
                     ) else { continue }
-                    let claim = try await AppDomainRuntimeComposition.shared.oracleGroupClaimManager.acquire(
-                        group: group,
-                        owner: owner,
-                        invocationID: UUID(),
-                        runID: UUID()
-                    )
-                    defer { claim.release() }
                     try await store.delete(
                         groupID: group.group.id,
                         owner: owner,

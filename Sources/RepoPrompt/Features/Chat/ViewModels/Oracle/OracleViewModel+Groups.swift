@@ -609,7 +609,12 @@ extension OracleViewModel {
             sessions[index].name = Self.oracleProjectionName(base: normalizedName, laneIndex: member.laneID.index)
             let projection = sessions[index]
             if projection.id == currentSessionID {
-                autosaveChatHistory(for: projection.id, force: true)
+                let saved = await withCheckedContinuation { continuation in
+                    autosaveChatHistory(for: projection.id, force: true) {
+                        continuation.resume(returning: $0)
+                    }
+                }
+                projectionSaveFailed = projectionSaveFailed || !saved
             } else {
                 do {
                     let savedURL = try await autosaveSession(projection)

@@ -48,17 +48,26 @@ package enum OracleStoredConversation: Sendable {
     case group(OracleGroupDocument)
 }
 
+package struct OracleArtifactReservation: Sendable {
+    package let id: UUID
+    package let artifactID: String
+}
+
 package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConversationStore, OracleArtifactStore {
     package typealias MutationObserver = @Sendable (OraclePersistenceMutationPhase) throws -> Void
 
     private let root: URL
     private let mutationObserver: MutationObserver
+    private let claimManager: OracleGroupClaimManager
+    private var artifactReservations: [UUID: String] = [:]
 
     package init(
         persistence: DomainPersistenceCoordinator,
+        identity: DomainRuntimeIdentity,
         mutationObserver: @escaping MutationObserver = { _ in }
     ) {
         root = persistence.oracleStorageRoot
+        claimManager = OracleGroupClaimManager(persistence: persistence, identity: identity)
         self.mutationObserver = mutationObserver
     }
 
@@ -212,6 +221,16 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         owner: OracleConversationOwner,
         expectedRevision: UInt64
     ) async throws {
+        guard let group = try await load(groupID: groupID, owner: owner) else {
+            throw OraclePersistenceError.notFound
+        }
+        let claim = try await claimManager.acquire(
+            group: group,
+            owner: owner,
+            invocationID: UUID(),
+            runID: UUID()
+        )
+        defer { claim.release() }
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
@@ -236,45 +255,68 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         owner: OracleConversationOwner
     ) async throws -> [OracleGroupID] {
         guard maximumCount >= 0 else { throw OraclePersistenceError.invalidRetentionCount }
-        return try await perform { files in
+        let candidates = try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
-                let allGroups = try files.loadAndValidateAllGroups()
-                let owned = allGroups.filter { $0.owner == owner }.sorted {
+                return try files.loadAndValidateAllGroups().filter { $0.owner == owner }.sorted {
                     if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
                     return $0.group.id.rawValue.uuidString < $1.group.id.rawValue.uuidString
                 }
-                let removed = Array(owned.dropFirst(maximumCount))
-                guard !removed.isEmpty else { return [] }
-                try files.deleteGroups(removed, from: allGroups)
-                return removed.map(\.group.id)
             }
         }
+        var removed: [OracleGroupID] = []
+        for group in candidates.dropFirst(maximumCount) {
+            do {
+                try await delete(
+                    groupID: group.group.id,
+                    owner: owner,
+                    expectedRevision: group.revision
+                )
+                removed.append(group.group.id)
+            } catch OracleGroupClaimError.conflict {
+                continue
+            }
+        }
+        return removed
     }
 
     package func deleteAllGroups(owner: OracleConversationOwner) async throws {
-        try await perform { files in
-            try files.withMutationLock {
-                try files.recoverTransactions()
-                let allGroups = try files.loadAndValidateAllGroups()
-                let owned = allGroups.filter { $0.owner == owner }
-                guard !owned.isEmpty else { return }
-                try files.deleteGroups(owned, from: allGroups)
-            }
-        }
+        try await deleteAllGroups { $0.owner == owner }
     }
 
     package func deleteAllGroups(
         ownerKind: String,
         identifierPrefix: String
     ) async throws {
+        try await deleteAllGroups {
+            $0.owner.kind == ownerKind && $0.owner.identifier.hasPrefix(identifierPrefix)
+        }
+    }
+
+    private func deleteAllGroups(
+        matching predicate: @escaping @Sendable (OracleGroupDocument) -> Bool
+    ) async throws {
+        let groups = try await perform { files in
+            try files.withMutationLock {
+                try files.recoverTransactions()
+                return try files.loadAndValidateAllGroups().filter(predicate)
+            }
+        }
+        var claims: [OracleGroupClaim] = []
+        defer { claims.forEach { $0.release() } }
+        for group in groups {
+            claims.append(try await claimManager.acquire(
+                group: group,
+                owner: group.owner,
+                invocationID: UUID(),
+                runID: UUID()
+            ))
+        }
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
                 let allGroups = try files.loadAndValidateAllGroups()
-                let owned = allGroups.filter {
-                    $0.owner.kind == ownerKind && $0.owner.identifier.hasPrefix(identifierPrefix)
-                }
+                let owned = allGroups.filter(predicate)
                 guard !owned.isEmpty else { return }
                 try files.deleteGroups(owned, from: allGroups)
             }
@@ -446,6 +488,24 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         }
     }
 
+    package func reserveArtifact(_ data: Data) async throws -> OracleArtifactReservation {
+        let artifactID = try await storeArtifact(data)
+        let reservation = OracleArtifactReservation(id: UUID(), artifactID: artifactID)
+        artifactReservations[reservation.id] = artifactID
+        return reservation
+    }
+
+    package func releaseArtifactReservation(
+        _ reservation: OracleArtifactReservation,
+        removeIfUnreferenced: Bool
+    ) async throws {
+        guard artifactReservations.removeValue(forKey: reservation.id) == reservation.artifactID else { return }
+        guard removeIfUnreferenced,
+              !artifactReservations.values.contains(reservation.artifactID)
+        else { return }
+        try await removeArtifactIfUnreferenced(id: reservation.artifactID)
+    }
+
     package func loadArtifact(id: String) async throws -> Data {
         try await perform { files in
             try files.withMutationLock {
@@ -456,6 +516,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     }
 
     package func removeArtifactIfUnreferenced(id: String) async throws {
+        guard !artifactReservations.values.contains(id) else { return }
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()

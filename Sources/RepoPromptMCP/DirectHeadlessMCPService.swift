@@ -205,7 +205,10 @@ actor DirectHeadlessMCPService {
                 settingsStore: settingsStore,
                 environment: environment
             )
-            let oracleStore = DomainOracleConversationStore(persistence: runtime.persistenceCoordinator)
+            let oracleStore = DomainOracleConversationStore(
+                persistence: runtime.persistenceCoordinator,
+                identity: runtime.identity
+            )
             let oracleAdapter = try DirectHeadlessOracleAdapter(
                 profileIdentifier: runtime.configuration.profileIdentifier,
                 rosterResolver: DirectHeadlessOracleRosterResolver(settingsStore: settingsStore),

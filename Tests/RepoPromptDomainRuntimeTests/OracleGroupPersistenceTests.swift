@@ -11,7 +11,10 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let prepared = try makeGroup(count: 5, seed: "cold", artifactID: artifactID)
         try await fixture.store.create(prepared)
 
-        let coldStore = DomainOracleConversationStore(persistence: fixture.persistence)
+        let coldStore = DomainOracleConversationStore(
+            persistence: fixture.persistence,
+            identity: makeIdentity()
+        )
         for member in prepared.members {
             let loaded = try await coldStore.load(
                 member: OracleMemberLookup(publicChatID: member.publicChatID),
@@ -48,6 +51,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let interrupter = OneShotPersistenceInterrupter()
         let interruptedStore = DomainOracleConversationStore(
             persistence: fixture.persistence,
+            identity: makeIdentity(),
             mutationObserver: { phase in try interrupter.observe(phase) }
         )
         let prepared = try makeGroup(count: 2, seed: "recover")
@@ -56,7 +60,10 @@ final class OracleGroupPersistenceTests: XCTestCase {
             try await interruptedStore.create(prepared)
         } verify: { _ in }
 
-        let recoveredStore = DomainOracleConversationStore(persistence: fixture.persistence)
+        let recoveredStore = DomainOracleConversationStore(
+            persistence: fixture.persistence,
+            identity: makeIdentity()
+        )
         let loaded = try await recoveredStore.load(
             member: OracleMemberLookup(publicChatID: prepared.members[1].publicChatID),
             owner: prepared.owner
@@ -227,6 +234,67 @@ final class OracleGroupPersistenceTests: XCTestCase {
         XCTAssertEqual(retainedData, sharedData)
     }
 
+    func testArtifactReservationPreventsConcurrentPublisherCleanup() async throws {
+        let fixture = makeStore(profile: "artifact-reservations")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let data = Data("shared-unpublished".utf8)
+        let first = try await fixture.store.reserveArtifact(data)
+        let second = try await fixture.store.reserveArtifact(data)
+        XCTAssertEqual(first.artifactID, second.artifactID)
+
+        try await fixture.store.releaseArtifactReservation(first, removeIfUnreferenced: true)
+        let retained = try await fixture.store.loadArtifact(id: second.artifactID)
+        XCTAssertEqual(retained, data)
+
+        try await fixture.store.releaseArtifactReservation(second, removeIfUnreferenced: true)
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.loadArtifact(id: second.artifactID)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(second.artifactID))
+        }
+    }
+
+    func testDestructiveGroupOperationsRespectActiveClaim() async throws {
+        let fixture = makeStore(profile: "claimed-deletion")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let group = try makeGroup(count: 2, seed: "claimed-deletion")
+        try await fixture.store.create(group)
+        let claimManager = OracleGroupClaimManager(
+            persistence: fixture.persistence,
+            identity: makeIdentity()
+        )
+        let claim = try await claimManager.acquire(
+            group: group,
+            owner: group.owner,
+            invocationID: UUID(),
+            runID: UUID()
+        )
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.delete(
+                groupID: group.group.id,
+                owner: group.owner,
+                expectedRevision: group.revision
+            )
+        } verify: {
+            XCTAssertEqual($0 as? OracleGroupClaimError, .conflict)
+        }
+        let retainedGroups = try await fixture.store.retainMostRecentGroups(0, owner: group.owner)
+        XCTAssertEqual(retainedGroups, [])
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.deleteAllGroups(owner: group.owner)
+        } verify: {
+            XCTAssertEqual($0 as? OracleGroupClaimError, .conflict)
+        }
+        let claimedGroup = try await fixture.store.load(groupID: group.group.id, owner: group.owner)
+        XCTAssertNotNil(claimedGroup)
+
+        claim.release()
+        try await fixture.store.deleteAllGroups(owner: group.owner)
+        let deletedGroup = try await fixture.store.load(groupID: group.group.id, owner: group.owner)
+        XCTAssertNil(deletedGroup)
+    }
+
     func testUnreadableGroupFailsRetentionClosedWithoutDeletingValidGroup() async throws {
         let fixture = makeStore(profile: "fail-closed")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -393,13 +461,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
     ) -> (root: URL, persistence: DomainPersistenceCoordinator, store: DomainOracleConversationStore) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("OracleGroupPersistenceTests-\(UUID().uuidString)", isDirectory: true)
-        let identity = DomainRuntimeIdentity(
-            runtimeID: UUID(),
-            lifecycleGeneration: 1,
-            processID: 42,
-            mode: .standalone,
-            createdAt: Date()
-        )
+        let identity = makeIdentity()
         let persistence = DomainPersistenceCoordinator(
             configuration: DomainRuntimeConfiguration(
                 mode: .standalone,
@@ -411,7 +473,21 @@ final class OracleGroupPersistenceTests: XCTestCase {
             ),
             identity: identity
         )
-        return (root, persistence, DomainOracleConversationStore(persistence: persistence))
+        return (
+            root,
+            persistence,
+            DomainOracleConversationStore(persistence: persistence, identity: identity)
+        )
+    }
+
+    private func makeIdentity() -> DomainRuntimeIdentity {
+        DomainRuntimeIdentity(
+            runtimeID: UUID(),
+            lifecycleGeneration: 1,
+            processID: 42,
+            mode: .standalone,
+            createdAt: Date()
+        )
     }
 
     private func makeGroup(
