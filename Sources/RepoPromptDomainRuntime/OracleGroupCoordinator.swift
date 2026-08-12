@@ -88,7 +88,6 @@ package struct OracleGroupCoordinator: Sendable {
         progress: @escaping ProgressHandler = { _ in }
     ) async throws -> OracleGroupResult {
         try Self.validate(group: group, plans: plans)
-        try Task.checkCancellation()
         await progress(OracleProgressEvent(
             kind: .groupPrepared,
             groupID: group.id,
@@ -125,16 +124,6 @@ package struct OracleGroupCoordinator: Sendable {
                 results.append(result)
             }
             return results
-        }
-
-        if Task.isCancelled {
-            await progress(OracleProgressEvent(
-                kind: .groupSettled,
-                groupID: group.id,
-                turnID: turnID,
-                text: "Cancelled"
-            ))
-            throw CancellationError()
         }
 
         let ordered = indexedResults.sorted { $0.0 < $1.0 }.map(\.1)

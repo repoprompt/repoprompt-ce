@@ -1,6 +1,12 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
+    raws.prefix(OracleRosterContract.maximumAdditionalCount).compactMap {
+        try? OracleRosterContract.normalizedModelID($0)
+    }
+}
+
 /// Versioned JSON document stored at
 /// `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`.
 ///
@@ -204,7 +210,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         restrictMCPAgentDiscoveryToRoleLabels: Bool = false
     ) {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
-        self.additionalOracleModelRaws = (try? OracleRosterContract.normalizedAdditionalModelIDs(additionalOracleModelRaws)) ?? []
+        self.additionalOracleModelRaws = sanitizedAdditionalOracleModelRaws(additionalOracleModelRaws)
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
         self.syncChatModelWithOracle = syncChatModelWithOracle
         self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
@@ -226,7 +232,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let additional = try OracleRosterContract.normalizedAdditionalModelIDs(
+        let additional = try sanitizedAdditionalOracleModelRaws(
             container.decodeIfPresent([String].self, forKey: .additionalOracleModelRaws) ?? []
         )
         try self.init(
@@ -506,7 +512,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             preferredComposeModel = try container.decodeIfPresent(String.self, forKey: .preferredComposeModel)
             planningModel = try container.decodeIfPresent(String.self, forKey: .planningModel)
             if let values = try container.decodeIfPresent([String].self, forKey: .additionalOracleModels) {
-                additionalOracleModels = try OracleRosterContract.normalizedAdditionalModelIDs(values)
+                additionalOracleModels = sanitizedAdditionalOracleModelRaws(values)
             } else {
                 additionalOracleModels = nil
             }

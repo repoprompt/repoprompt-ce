@@ -326,6 +326,7 @@ package actor DomainDirectSettingsStore {
     }
 
     package func set(key: String, value: DomainSettingValue) async throws -> UInt64 {
+        await bootstrap()
         if let healthReason { throw DomainDirectSettingsError.readOnlyDegraded(healthReason) }
         guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else {
             throw DomainDirectSettingsError.unknownKey(key)

@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 
 package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendable {
     case invalidLaneIndex(Int)
@@ -14,6 +15,7 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendabl
     case invalidGroupResult
     case invalidFrozenPackReference
     case invalidFrozenPack
+    case invalidUserMessage
 
     package var errorDescription: String? {
         switch self {
@@ -43,6 +45,8 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendabl
             "Oracle frozen-pack references must use oracle-pack:sha256:<64 lowercase hexadecimal characters>."
         case .invalidFrozenPack:
             "Oracle frozen context packs must use the current canonical schema and contain non-empty content."
+        case .invalidUserMessage:
+            "Oracle messages must be non-empty after trimming."
         }
     }
 }
@@ -288,7 +292,7 @@ package struct OracleFrozenPackReference: Codable, Equatable, Hashable, Sendable
 
     package init(artifactID: String) throws {
         guard artifactID.count == 64,
-              artifactID.allSatisfy({ $0.isHexDigit && !$0.isUppercase })
+              artifactID.utf8.allSatisfy({ (48 ... 57).contains($0) || (97 ... 102).contains($0) })
         else {
             throw OracleGroupContractError.invalidFrozenPackReference
         }
@@ -363,7 +367,7 @@ package struct OracleInput: Codable, Equatable, Sendable {
 
     package init(mode: OracleMode, userMessage: String, context: OracleContextEnvelope? = nil) throws {
         let message = userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else { throw OracleGroupContractError.invalidGroupResult }
+        guard !message.isEmpty else { throw OracleGroupContractError.invalidUserMessage }
         self.mode = mode
         self.userMessage = message
         self.context = context
@@ -423,6 +427,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
             laneIndex: laneIndex,
             role: role,
             chatID: chatID,
+            providerID: providerID,
             modelID: modelID,
             status: status,
             response: response,
@@ -463,6 +468,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
             laneIndex: laneIndex,
             role: role,
             chatID: chatID,
+            providerID: providerID,
             modelID: modelID,
             status: status,
             response: response,
@@ -482,6 +488,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         laneIndex: Int,
         role: OracleLaneRole,
         chatID: String,
+        providerID: String?,
         modelID: String,
         status: OracleLaneResultStatus,
         response: String?,
@@ -490,17 +497,27 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         guard laneIndex >= 0,
               role == (laneIndex == 0 ? .primary : .additional),
               !chatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              providerID.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? true,
               (try? OracleRosterContract.normalizedModelID(modelID)) != nil
         else {
             throw OracleGroupContractError.invalidLaneResult(laneIndex)
         }
         switch status {
         case .completed:
-            guard let response, !response.isEmpty, error == nil else {
+            guard let response,
+                  !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  error == nil
+            else {
                 throw OracleGroupContractError.invalidLaneResult(laneIndex)
             }
         case .failed, .cancelled:
-            guard error != nil else { throw OracleGroupContractError.invalidLaneResult(laneIndex) }
+            guard response == nil,
+                  let error,
+                  !error.code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !error.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                throw OracleGroupContractError.invalidLaneResult(laneIndex)
+            }
         }
     }
 }
@@ -597,6 +614,47 @@ package struct OracleGroupResult: Codable, Equatable, Sendable {
             !primaryCompleted
         }
         guard validStatus else { throw OracleGroupContractError.invalidGroupResult }
+    }
+}
+
+/// Canonical MCP fields shared by app, Context Builder, and direct-headless adapters.
+package enum OracleGroupMCPCodec {
+    package static func groupFields(_ result: OracleGroupResult) -> [String: Value] {
+        var fields: [String: Value] = [
+            "oracle_group_id": .string(result.groupID.rawValue.uuidString),
+            "status": .string(result.status.rawValue),
+            "oracle_count": .int(result.oracleCount),
+            "oracle_results": .array(result.oracleResults.map(laneValue))
+        ]
+        if !result.warnings.isEmpty {
+            fields["warnings"] = .array(result.warnings.map {
+                .object(["code": .string($0.code), "message": .string($0.message)])
+            })
+        }
+        return fields
+    }
+
+    package static func laneValue(_ result: OracleLaneResult) -> Value {
+        var fields: [String: Value] = [
+            "lane_index": .int(result.laneIndex),
+            "role": .string(result.role.rawValue),
+            "chat_id": .string(result.chatID),
+            "model_id": .string(result.modelID),
+            "status": .string(result.status.rawValue)
+        ]
+        if let providerID = result.providerID { fields["provider_id"] = .string(providerID) }
+        if let response = result.response { fields["response"] = .string(response) }
+        if let error = result.error {
+            var errorFields: [String: Value] = [
+                "code": .string(error.code),
+                "message": .string(error.message)
+            ]
+            if let partialResponse = error.partialResponse {
+                errorFields["partial_response"] = .string(partialResponse)
+            }
+            fields["error"] = .object(errorFields)
+        }
+        return .object(fields)
     }
 }
 
@@ -739,6 +797,37 @@ package struct OracleMemberLookup: Codable, Equatable, Sendable {
         let value = publicChatID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { throw OracleGroupContractError.invalidPublicChatID }
         self.publicChatID = value
+    }
+}
+
+package extension OracleGroupDocument {
+    func settling(_ result: OracleGroupResult, finishedAt: Date = Date()) throws -> Self {
+        guard result.groupID == group.id,
+              let turn = turns.last,
+              turn.state == .prepared
+        else {
+            throw OracleGroupContractError.invalidGroupResult
+        }
+        let terminalTurn = OracleTurnRecord(
+            id: turn.id,
+            input: turn.input,
+            state: .terminal,
+            startedAt: turn.startedAt,
+            finishedAt: finishedAt,
+            results: result.oracleResults
+        )
+        return try Self(
+            schemaVersion: schemaVersion,
+            group: group,
+            owner: owner,
+            name: name,
+            revision: revision &+ 1,
+            createdAt: createdAt,
+            updatedAt: finishedAt,
+            roster: roster,
+            members: members,
+            turns: Array(turns.dropLast()) + [terminalTurn]
+        )
     }
 }
 

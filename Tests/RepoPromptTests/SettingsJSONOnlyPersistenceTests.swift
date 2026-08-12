@@ -1031,6 +1031,42 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(loaded.agentModelsSettings[workspaceID]?.profile?.additionalOracleModelRaws, orderedRoster)
     }
 
+    func testOracleRosterDecodeDropsInvalidEntriesAndCapsAdditionalModels() throws {
+        let workspaceID = UUID()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": GlobalSettingsDocument.currentSchemaVersion,
+            "schemaLineage": GlobalSettingsDocument.schemaLineage,
+            "updatedAt": 0,
+            "copySettingsByWorkspaceID": [:],
+            "chatSettingsByWorkspaceID": [:],
+            "agentModelsSettingsByWorkspaceID": [
+                workspaceID.uuidString: [
+                    "inheritanceMode": "useWorkspaceOverrides",
+                    "profile": [
+                        "additionalOracleModelRaws": [" one ", "", "two", "three", "four", "ignored"]
+                    ]
+                ]
+            ],
+            "globalDefaults": [:],
+            "scalarPreferences": [
+                "modelSelection": [
+                    "additionalOracleModels": [" alpha ", "", "beta", "gamma", "delta", "ignored"]
+                ]
+            ]
+        ])
+
+        let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: data)
+
+        XCTAssertEqual(
+            decoded.agentModelsSettings[workspaceID]?.profile?.additionalOracleModelRaws,
+            ["one", "two", "three"]
+        )
+        XCTAssertEqual(
+            decoded.scalarPreferences?.modelSelection?.additionalOracleModels,
+            ["alpha", "beta", "gamma"]
+        )
+    }
+
     func testUnshippedOraclePairSchemaVersionsAreNeverImportedAsAuthority() {
         for version in GlobalSettingsDocument.rejectedExperimentalSchemaVersions {
             XCTAssertEqual(

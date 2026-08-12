@@ -230,6 +230,76 @@ final class OracleGroupPersistenceTests: XCTestCase {
         XCTAssertNil(deletedSingle)
     }
 
+    func testSharedArtifactsRemainUntilLastGroupOrSingleReferenceIsDeleted() async throws {
+        let fixture = makeStore(profile: "shared-artifacts")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let owner = try OracleConversationOwner(kind: "workspace", identifier: "shared-artifacts")
+
+        let groupFirstArtifact = try await fixture.store.storeArtifact(Data("group-first".utf8))
+        let groupFirst = try makeGroup(
+            count: 2,
+            seed: "group-first",
+            owner: owner,
+            artifactID: groupFirstArtifact
+        )
+        let groupFirstSingle = try makeSingle(
+            chatID: "group-first-single",
+            owner: owner,
+            artifactID: groupFirstArtifact
+        )
+        try await fixture.store.create(groupFirst)
+        try await fixture.store.create(groupFirstSingle)
+        try await fixture.store.delete(
+            groupID: groupFirst.group.id,
+            owner: owner,
+            expectedRevision: groupFirst.revision
+        )
+        let retainedAfterGroupDelete = try await fixture.store.loadArtifact(id: groupFirstArtifact)
+        XCTAssertEqual(retainedAfterGroupDelete, Data("group-first".utf8))
+        try await fixture.store.delete(
+            publicChatID: groupFirstSingle.publicChatID,
+            owner: owner,
+            expectedRevision: groupFirstSingle.revision
+        )
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.loadArtifact(id: groupFirstArtifact)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(groupFirstArtifact))
+        }
+
+        let singleFirstArtifact = try await fixture.store.storeArtifact(Data("single-first".utf8))
+        let singleFirst = try makeSingle(
+            chatID: "single-first-single",
+            owner: owner,
+            artifactID: singleFirstArtifact
+        )
+        let singleFirstGroup = try makeGroup(
+            count: 2,
+            seed: "single-first",
+            owner: owner,
+            artifactID: singleFirstArtifact
+        )
+        try await fixture.store.create(singleFirst)
+        try await fixture.store.create(singleFirstGroup)
+        try await fixture.store.delete(
+            publicChatID: singleFirst.publicChatID,
+            owner: owner,
+            expectedRevision: singleFirst.revision
+        )
+        let retainedAfterSingleDelete = try await fixture.store.loadArtifact(id: singleFirstArtifact)
+        XCTAssertEqual(retainedAfterSingleDelete, Data("single-first".utf8))
+        try await fixture.store.delete(
+            groupID: singleFirstGroup.group.id,
+            owner: owner,
+            expectedRevision: singleFirstGroup.revision
+        )
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.loadArtifact(id: singleFirstArtifact)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(singleFirstArtifact))
+        }
+    }
+
     private func makeStore(
         profile: String
     ) -> (root: URL, persistence: DomainPersistenceCoordinator, store: DomainOracleConversationStore) {
@@ -338,6 +408,32 @@ final class OracleGroupPersistenceTests: XCTestCase {
             roster: prepared.roster,
             members: prepared.members,
             turns: Array(prepared.turns.dropLast()) + [terminal]
+        )
+    }
+
+    private func makeSingle(
+        chatID: String,
+        owner: OracleConversationOwner,
+        artifactID: String
+    ) throws -> OracleSingleConversationDocument {
+        let timestamp = Date(timeIntervalSince1970: 1_000)
+        let model = try OracleModelReference(providerID: "fixture", modelID: "single-model")
+        let context = OracleContextEnvelope(
+            content: .durableArtifact(id: artifactID),
+            sha256: artifactID
+        )
+        return try OracleSingleConversationDocument(
+            publicChatID: chatID,
+            owner: owner,
+            model: model,
+            revision: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            turns: [OracleTurnRecord(
+                input: OracleInput(mode: .chat, userMessage: "single-message", context: context),
+                state: .prepared,
+                startedAt: timestamp
+            )]
         )
     }
 }
