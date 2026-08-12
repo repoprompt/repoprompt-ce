@@ -239,6 +239,22 @@ extension FileSystemService {
     }
 
     func awaitMutationDrain(conflictingWith relativePaths: Set<String>) async {
+        await awaitMutationDrain(conflictingWith: relativePaths, didRegister: nil)
+    }
+
+    #if DEBUG
+        func awaitMutationDrainForTesting(
+            conflictingWith relativePaths: Set<String>,
+            didRegister: @escaping @Sendable () -> Void
+        ) async {
+            await awaitMutationDrain(conflictingWith: relativePaths, didRegister: didRegister)
+        }
+    #endif
+
+    private func awaitMutationDrain(
+        conflictingWith relativePaths: Set<String>,
+        didRegister: (@Sendable () -> Void)?
+    ) async {
         let authorityPaths = mutationAuthorityPaths(relativePaths)
         guard hasInFlightMutation(conflictingWith: authorityPaths) else { return }
         await withCheckedContinuation { continuation in
@@ -246,6 +262,7 @@ extension FileSystemService {
                 relativePaths: authorityPaths,
                 continuation: continuation
             )
+            didRegister?()
         }
     }
 

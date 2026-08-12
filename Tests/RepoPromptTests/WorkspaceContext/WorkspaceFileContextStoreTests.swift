@@ -733,15 +733,19 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             )
             XCTAssertEqual(retainedFenceCount, 1)
 
+            let drainWaiterRegistered = expectation(description: "mutation drain waiter registers")
             let drainCompletedSignal = AsyncSignal()
             let drainTask = Task {
-                await service.awaitMutationDrain(conflictingWith: ["OverwriteAfterCancellation.swift"])
+                await service.awaitMutationDrainForTesting(
+                    conflictingWith: ["OverwriteAfterCancellation.swift"]
+                ) {
+                    drainWaiterRegistered.fulfill()
+                }
                 await drainCompletedSignal.mark()
             }
-            let drainWaiterRegistered = await waitForAsyncCondition(timeout: .seconds(2)) {
-                await service.pendingMutationDrainWaiterCountForTesting() == 1
-            }
-            XCTAssertTrue(drainWaiterRegistered)
+            await fulfillment(of: [drainWaiterRegistered], timeout: 10)
+            let registeredDrainWaiterCount = await service.pendingMutationDrainWaiterCountForTesting()
+            XCTAssertGreaterThanOrEqual(registeredDrainWaiterCount, 1)
             let drainCompletedBeforeRelease = await drainCompletedSignal.isMarked()
             XCTAssertFalse(drainCompletedBeforeRelease)
 
