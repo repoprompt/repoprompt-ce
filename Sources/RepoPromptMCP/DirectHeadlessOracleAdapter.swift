@@ -166,6 +166,7 @@ actor DirectHeadlessOracleAdapter {
         if arguments["provider"] != nil { throw AdapterError.unsupportedProviderOverride }
         let route: OracleConversationRoute
         let input: OracleInput
+        let resolvedStartRoster: OracleRoster?
         if toolName == "context_builder" {
             let mode = Self.contextBuilderMode(arguments["response_type"]?.stringValue)
             let roster = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(
@@ -205,6 +206,7 @@ actor DirectHeadlessOracleAdapter {
                 input = try OracleInput(mode: mode, userMessage: instructions)
             }
             route = .start(primaryModelOverride: arguments["model"]?.stringValue)
+            resolvedStartRoster = roster
         } else {
             guard let message = arguments["message"]?.stringValue else {
                 throw MCPError.invalidParams("\(toolName) requires message")
@@ -215,15 +217,20 @@ actor DirectHeadlessOracleAdapter {
                 newChat: arguments["new_chat"]?.boolValue == true,
                 modelOverride: arguments["model"]?.stringValue
             )
+            resolvedStartRoster = nil
         }
 
         let runID = UUID()
         switch route {
         case let .start(primaryModelOverride):
-            let roster = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(
-                primaryModelOverride: primaryModelOverride,
-                newChat: true
-            ))
+            let roster = if let resolvedStartRoster {
+                resolvedStartRoster
+            } else {
+                try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(
+                    primaryModelOverride: primaryModelOverride,
+                    newChat: true
+                ))
+            }
             try await provider.validateOracleRoster(roster)
             if roster.count == 1 {
                 let publicChatID = UUID().uuidString
@@ -407,6 +414,7 @@ actor DirectHeadlessOracleAdapter {
                 providerID: prepared.model.providerID,
                 model: prepared.model.modelID,
                 request: request,
+                purpose: .oracle,
                 carrierEnvironment: carrier?.environment
             )
             guard !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -451,7 +459,7 @@ actor DirectHeadlessOracleAdapter {
                     partialResponse: failure?.partialResponse
                 )
             )
-            try await saveSingleTerminal(prepared, result: result)
+            try? await saveSingleTerminal(prepared, result: result)
             throw error
         }
     }
@@ -582,48 +590,28 @@ actor DirectHeadlessOracleAdapter {
                     providerID: member.model.providerID,
                     model: member.model.modelID,
                     request: request,
+                    purpose: .oracle,
                     carrierEnvironment: carrier.environment
                 )
                 return OracleLaneExecutionResponse(response: response)
             }
         }
-        let turnID = prepared.turns.last?.id ?? OracleTurnID()
+        guard let turnID = prepared.turns.last?.id else {
+            throw OraclePersistenceError.invalidDocument("missing_prepared_turn")
+        }
         let result = try await coordinator.execute(
             group: prepared.group,
             turnID: turnID,
             input: plan.input,
             plans: plans
         )
-        try await saveGroupTerminal(prepared, result: result)
+        let terminal = try prepared.settling(result)
+        let store = store
+        try await Task.detached(priority: Task.currentPriority) {
+            try await store.save(terminal, expectedRevision: prepared.revision)
+        }.value
+        try Task.checkCancellation()
         return Self.groupValue(result)
-    }
-
-    private func saveGroupTerminal(
-        _ prepared: OracleGroupDocument,
-        result: OracleGroupResult
-    ) async throws {
-        guard let turn = prepared.turns.last else { throw OraclePersistenceError.invalidDocument("missing_prepared_turn") }
-        let terminalTurn = OracleTurnRecord(
-            id: turn.id,
-            input: turn.input,
-            state: .terminal,
-            startedAt: turn.startedAt,
-            finishedAt: Date(),
-            results: result.oracleResults
-        )
-        let terminal = try OracleGroupDocument(
-            schemaVersion: prepared.schemaVersion,
-            group: prepared.group,
-            owner: prepared.owner,
-            name: prepared.name,
-            revision: prepared.revision &+ 1,
-            createdAt: prepared.createdAt,
-            updatedAt: Date(),
-            roster: prepared.roster,
-            members: prepared.members,
-            turns: Array(prepared.turns.dropLast()) + [terminalTurn]
-        )
-        try await store.save(terminal, expectedRevision: prepared.revision)
     }
 
     private func singleCarrier(for plan: InvocationPlan) throws -> DomainChildLaunchCarrier? {

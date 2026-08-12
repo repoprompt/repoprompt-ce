@@ -9,6 +9,18 @@ actor DirectHeadlessProviderCoordinator {
         _ activationID: UUID
     ) async -> DomainAgentRunSessionStore.EpochBeginResult
 
+    enum ExecutionPurpose {
+        case oracle
+        case agent
+
+        var sandbox: String {
+            switch self {
+            case .oracle: "read-only"
+            case .agent: "workspace-write"
+            }
+        }
+    }
+
     struct ProviderDescriptor {
         let id: String
         let displayName: String
@@ -84,12 +96,12 @@ actor DirectHeadlessProviderCoordinator {
         ]
     }
 
-    static func codexExecArguments(model: String?) -> [String] {
+    static func codexExecArguments(model: String?, purpose: ExecutionPurpose) -> [String] {
         var arguments: [String] = []
         if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, model != "default" {
             arguments += ["--model", model]
         }
-        arguments += ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        arguments += ["exec", "--skip-git-repo-check", "--sandbox", purpose.sandbox, "--json", "-"]
         return arguments
     }
 
@@ -110,6 +122,7 @@ actor DirectHeadlessProviderCoordinator {
         model: String?,
         request: DomainPhysicalToolRequest,
         sessionID: UUID? = nil,
+        purpose: ExecutionPurpose,
         carrierEnvironment: [String: String]? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
@@ -127,7 +140,7 @@ actor DirectHeadlessProviderCoordinator {
         )
         guard !isShuttingDown else { throw CancellationError() }
         try Task.checkCancellation()
-        let arguments = Self.codexExecArguments(model: model)
+        let arguments = Self.codexExecArguments(model: model, purpose: purpose)
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
@@ -237,6 +250,7 @@ actor DirectHeadlessProviderCoordinator {
                         model: args["model"]?.stringValue,
                         request: capturedRequest,
                         sessionID: sessionID,
+                        purpose: .agent,
                         carrierEnvironment: capturedCarrierEnvironment
                     )
                     return .completed(assistantText: text)
