@@ -674,16 +674,21 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 }
 
 actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
-    private let coordinator: DirectHeadlessProviderCoordinator
+    private let providerCoordinator: DirectHeadlessProviderCoordinator
+    private let oracleAdapter: DirectHeadlessOracleAdapter
 
-    init(coordinator: DirectHeadlessProviderCoordinator) {
-        self.coordinator = coordinator
+    init(
+        providerCoordinator: DirectHeadlessProviderCoordinator,
+        oracleAdapter: DirectHeadlessOracleAdapter
+    ) {
+        self.providerCoordinator = providerCoordinator
+        self.oracleAdapter = oracleAdapter
     }
 
     func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         let op = args["op"]?.stringValue ?? "models"
-        let providers = await coordinator.providerCatalog().map(\.value)
+        let providers = await providerCoordinator.providerCatalog().map(\.value)
         return try .object([
             "op": .string(op),
             "models": .array(providers),
@@ -693,70 +698,23 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     }
 
     func startOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.mcpArguments()
-        guard let message = args["message"]?.stringValue, !message.isEmpty else {
-            throw MCPError.invalidParams("ask_oracle requires message")
-        }
-        let (id, response) = try await coordinator.createConversation(
-            providerID: args["provider"]?.stringValue,
-            message: message,
-            model: args["model"]?.stringValue,
-            request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        try await .mcp(oracleAdapter.start(arguments: request.mcpArguments(), request: request))
     }
 
     func continueOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.mcpArguments()
-        guard let rawID = args["chat_id"]?.stringValue,
-              let id = UUID(uuidString: rawID),
-              let message = args["message"]?.stringValue,
-              !message.isEmpty
-        else {
-            throw MCPError.invalidParams("oracle_send requires chat_id and message")
-        }
-        let response = try await coordinator.continueConversation(
-            id: id,
-            message: message,
-            model: args["model"]?.stringValue,
-            request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        try await .mcp(oracleAdapter.continue(arguments: request.mcpArguments(), request: request))
     }
 
     func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
-        let id = args["chat_id"]?.stringValue.flatMap(UUID.init(uuidString:))
-        return try await .mcp(coordinator.conversationLog(
-            id: id,
+        return try await .mcp(oracleAdapter.log(
+            chatID: args["chat_id"]?.stringValue,
             limit: args["limit"]?.intValue ?? 8
         ))
     }
 
     func buildContext(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.mcpArguments()
-        guard let instructions = args["instructions"]?.stringValue, !instructions.isEmpty else {
-            throw MCPError.invalidParams("context_builder requires instructions")
-        }
-        let (id, response) = try await coordinator.createConversation(
-            providerID: args["provider"]?.stringValue,
-            message: instructions,
-            model: args["model"]?.stringValue,
-            request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        try await .mcp(oracleAdapter.buildContext(arguments: request.mcpArguments(), request: request))
     }
 
     func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -1033,7 +991,11 @@ enum DirectProcess {
         DomainChildLaunchCarrier.credentialEnvelopeEnvironmentKey,
         DomainChildLaunchCarrier.clientPrincipalEnvironmentKey,
         DomainChildLaunchCarrier.providerIdentifierEnvironmentKey,
-        DomainChildLaunchCarrier.runIDEnvironmentKey
+        DomainChildLaunchCarrier.runIDEnvironmentKey,
+        DomainChildLaunchCarrier.launchIDEnvironmentKey,
+        DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey,
+        DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey,
+        DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey
     ]
 
     /// Removes private launch-carrier values from a stored parent environment before

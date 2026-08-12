@@ -111,7 +111,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
         let list = try Self.readJSONLine(from: output.fileHandleForReading)
         let result = try XCTUnwrap(list["result"] as? [String: Any])
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 20)
+        XCTAssertEqual(tools.count, 21)
         let bind = try XCTUnwrap(tools.first { $0["name"] as? String == "bind_context" })
         let bindSchema = try JSONSerialization.data(withJSONObject: bind["inputSchema"] as Any)
         XCTAssertFalse(String(decoding: bindSchema, as: UTF8.self).contains("window_id"))
@@ -119,7 +119,11 @@ final class DirectHeadlessProcessTests: XCTestCase {
         let fixturePath = root.appendingPathComponent("Package.swift").path
         let fixtureBefore = try Data(contentsOf: URL(fileURLWithPath: fixturePath))
         let invocationArguments: [String: [String: Any]] = [
-            "app_settings": ["op": "list"],
+            "app_settings": [
+                "op": "set",
+                "key": "models.additional_oracle_models",
+                "value": [" model-a ", "model-a", "model-b"]
+            ],
             "bind_context": ["op": "status"],
             "manage_workspaces": ["action": "list"],
             "manage_selection": ["op": "set", "paths": ["Package.swift"]],
@@ -132,6 +136,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "prompt": ["op": "set", "text": "headless process context mutation"],
             "apply_edits": ["path": fixturePath, "search": "not-present", "replace": "never"],
             "oracle_utils": ["op": "models"],
+            "ask_oracle": ["message": "start", "model": "primary-override"],
             "oracle_send": ["chat_id": UUID().uuidString, "message": "continue"],
             "context_builder": ["instructions": "Inspect the workspace"],
             "git": ["op": "status"],
@@ -163,7 +168,7 @@ final class DirectHeadlessProcessTests: XCTestCase {
             let callResult = try XCTUnwrap(reply["result"] as? [String: Any], "tool=\(name) reply=\(reply)")
             toolResults[name] = callResult
         }
-        let expectedDenied = Set(["file_actions", "apply_edits", "oracle_send", "context_builder"])
+        let expectedDenied = Set(["file_actions", "apply_edits", "ask_oracle", "oracle_send", "context_builder"])
         for (name, result) in toolResults {
             XCTAssertEqual(result["isError"] as? Bool ?? false, expectedDenied.contains(name), "tool=\(name) result=\(result)")
         }
