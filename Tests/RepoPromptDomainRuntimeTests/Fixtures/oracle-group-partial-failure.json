@@ -1,0 +1,43 @@
+{
+  "oracle_group_id" : "22222222-2222-2222-2222-222222222222",
+  "oracle_count" : 3,
+  "oracle_results" : [
+    {
+      "chat_id" : "primary-chat",
+      "lane_index" : 0,
+      "model_id" : "openai/gpt-5.2",
+      "response" : "Primary answer",
+      "role" : "primary",
+      "status" : "completed"
+    },
+    {
+      "chat_id" : "additional-chat-1",
+      "error" : {
+        "code" : "provider_error",
+        "message" : "Provider unavailable"
+      },
+      "lane_index" : 1,
+      "model_id" : "anthropic/claude-opus-4-6",
+      "role" : "additional",
+      "status" : "failed"
+    },
+    {
+      "chat_id" : "additional-chat-2",
+      "error" : {
+        "code" : "cancelled",
+        "message" : "Cancelled after the group settled"
+      },
+      "lane_index" : 2,
+      "model_id" : "google/gemini-2.5-pro",
+      "role" : "additional",
+      "status" : "cancelled"
+    }
+  ],
+  "status" : "partial_failure",
+  "warnings" : [
+    {
+      "code" : "lane_failures",
+      "message" : "Two lanes did not complete"
+    }
+  ]
+}
