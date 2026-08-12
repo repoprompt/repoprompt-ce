@@ -4596,6 +4596,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let primary = session.followUpOracleGroupState.members.first else {
                 throw ChatToolError.internalError("Context Builder Oracle group completed without Primary state")
             }
+            guard groupReply.result.primary.status == .completed,
+                  let primaryResponse = groupReply.result.primary.response
+            else {
+                let error = groupReply.result.primary.error
+                throw ChatToolError.internalError(
+                    error?.message ?? "Primary Oracle did not complete successfully."
+                )
+            }
             let errors = groupReply.orderedResults.dropFirst().compactMap { result in
                 result.error.map { "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)" }
             }
@@ -4603,7 +4611,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 chatId: primary.sessionID,
                 shortId: primary.chatID,
                 mode: mode.mcpModeName,
-                response: groupReply.result.primary.response,
+                response: primaryResponse,
                 errors: errors.isEmpty ? nil : errors,
                 oracleGroup: groupReply
             )

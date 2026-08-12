@@ -159,7 +159,10 @@ extension OracleViewModel {
         let runID = tabContext?.agentModeRunID ?? invocationID
 
         let prepared: OracleGroupDocument
-        if let current = existingGroup {
+        if var current = existingGroup {
+            if current.turns.last?.state == .prepared {
+                current = try await settleInterruptedOracleGroup(current, store: store)
+            }
             guard args["model"] == nil else {
                 throw ChatToolError.invalidParams(
                     "model can only be used when starting a new Oracle conversation; set new_chat=true."
@@ -191,20 +194,25 @@ extension OracleViewModel {
             )
             defer { claim.release() }
             try await store.save(prepared, expectedRevision: current.revision)
-            try await restoreOracleGroupProjectionsIfNeeded(
-                prepared,
-                workspaceID: workspaceID,
-                tabID: tabID,
-                tabContext: tabContext
-            )
-            return try await executeOracleGroup(
-                prepared,
-                args: args,
-                promptVM: promptVM,
-                tabContext: tabContext,
-                store: store,
-                callbacks: callbacks
-            )
+            do {
+                try await restoreOracleGroupProjectionsIfNeeded(
+                    prepared,
+                    workspaceID: workspaceID,
+                    tabID: tabID,
+                    tabContext: tabContext
+                )
+                return try await executeOracleGroup(
+                    prepared,
+                    args: args,
+                    promptVM: promptVM,
+                    tabContext: tabContext,
+                    store: store,
+                    callbacks: callbacks
+                )
+            } catch {
+                try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
+                throw error
+            }
         }
 
         let descriptor = try OracleGroupDescriptor(size: roster.count)
@@ -240,20 +248,25 @@ extension OracleViewModel {
             runID: runID
         )
         defer { claim.release() }
-        try await restoreOracleGroupProjectionsIfNeeded(
-            prepared,
-            workspaceID: workspaceID,
-            tabID: tabID,
-            tabContext: tabContext
-        )
-        return try await executeOracleGroup(
-            prepared,
-            args: args,
-            promptVM: promptVM,
-            tabContext: tabContext,
-            store: store,
-            callbacks: callbacks
-        )
+        do {
+            try await restoreOracleGroupProjectionsIfNeeded(
+                prepared,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                tabContext: tabContext
+            )
+            return try await executeOracleGroup(
+                prepared,
+                args: args,
+                promptVM: promptVM,
+                tabContext: tabContext,
+                store: store,
+                callbacks: callbacks
+            )
+        } catch {
+            try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
+            throw error
+        }
     }
 
     @MainActor
@@ -387,9 +400,44 @@ extension OracleViewModel {
             return OracleLaneExecutionResponse(response: response)
         } catch let failure as OracleLaneFailure {
             throw failure
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw OracleLaneFailure(message: String(describing: error))
         }
+    }
+
+    private func settleInterruptedOracleGroup(
+        _ prepared: OracleGroupDocument,
+        store: DomainOracleConversationStore
+    ) async throws -> OracleGroupDocument {
+        let terminal = try prepared.settlingInterrupted(
+            status: .failed,
+            code: "interrupted",
+            message: "The previous Oracle execution was interrupted before completion."
+        )
+        try await store.save(terminal, expectedRevision: prepared.revision)
+        return terminal
+    }
+
+    private func settlePreparedOracleGroupIfNeeded(
+        _ prepared: OracleGroupDocument,
+        error: Error,
+        store: DomainOracleConversationStore
+    ) async throws {
+        let status: OracleLaneResultStatus = error is CancellationError ? .cancelled : .failed
+        let code = error is CancellationError ? "cancelled" : "execution_failed"
+        let message = error is CancellationError
+            ? "Oracle provider was cancelled."
+            : String(String(describing: error).prefix(512))
+        try await Task.detached(priority: Task.currentPriority) {
+            guard let current = try await store.load(groupID: prepared.group.id, owner: prepared.owner),
+                  current.revision == prepared.revision,
+                  current.turns.last?.state == .prepared
+            else { return }
+            let terminal = try current.settlingInterrupted(status: status, code: code, message: message)
+            try await store.save(terminal, expectedRevision: current.revision)
+        }.value
     }
 
     private static func oracleRoster(
@@ -410,7 +458,7 @@ extension OracleViewModel {
         }
     }
 
-    private static func oracleGroupOwner(workspaceID: UUID?, tabID: UUID) throws -> OracleConversationOwner {
+    static func oracleGroupOwner(workspaceID: UUID?, tabID: UUID) throws -> OracleConversationOwner {
         try OracleConversationOwner(
             kind: "app-tab",
             identifier: "workspace:\(workspaceID?.uuidString ?? "none"):tab:\(tabID.uuidString)"

@@ -270,7 +270,10 @@ actor DirectHeadlessOracleAdapter {
 
         case let .continuation(chatID):
             let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
-            if let group = try await store.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner) {
+            if var group = try await store.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner) {
+                if group.turns.last?.state == .prepared {
+                    group = try await settleInterruptedGroup(group)
+                }
                 guard configured == group.roster else { throw AdapterError.rosterConflict }
                 try await provider.validateOracleRoster(group.roster)
                 let claimID = UUID()
@@ -293,8 +296,11 @@ actor DirectHeadlessOracleAdapter {
                     childLaunchPlan: childPlan
                 )
             }
-            guard let single = try await store.load(publicChatID: chatID, owner: owner) else {
+            guard var single = try await store.load(publicChatID: chatID, owner: owner) else {
                 throw AdapterError.unknownChatID
+            }
+            if single.turns.last?.state == .prepared {
+                single = try await settleInterruptedSingle(single)
             }
             guard configured.count == 1, configured.primary == single.model else {
                 throw AdapterError.rosterConflict
@@ -443,7 +449,10 @@ actor DirectHeadlessOracleAdapter {
                 status: .cancelled,
                 error: OracleLaneError(code: "cancelled", message: "Oracle provider was cancelled.")
             )
-            try? await saveSingleTerminal(prepared, result: result)
+            let store = store
+            try await Task.detached(priority: Task.currentPriority) {
+                try await Self.saveSingleTerminal(prepared, result: result, store: store)
+            }.value
             throw CancellationError()
         } catch {
             let failure = error as? OracleLaneFailure
@@ -459,7 +468,10 @@ actor DirectHeadlessOracleAdapter {
                     partialResponse: failure?.partialResponse
                 )
             )
-            try? await saveSingleTerminal(prepared, result: result)
+            let store = store
+            try await Task.detached(priority: Task.currentPriority) {
+                try await Self.saveSingleTerminal(prepared, result: result, store: store)
+            }.value
             throw error
         }
     }
@@ -467,6 +479,14 @@ actor DirectHeadlessOracleAdapter {
     private func saveSingleTerminal(
         _ prepared: OracleSingleConversationDocument,
         result: OracleLaneResult
+    ) async throws {
+        try await Self.saveSingleTerminal(prepared, result: result, store: store)
+    }
+
+    private static func saveSingleTerminal(
+        _ prepared: OracleSingleConversationDocument,
+        result: OracleLaneResult,
+        store: DomainOracleConversationStore
     ) async throws {
         guard let turn = prepared.turns.last else { throw OraclePersistenceError.invalidDocument("missing_prepared_turn") }
         let terminalTurn = OracleTurnRecord(
@@ -510,8 +530,8 @@ actor DirectHeadlessOracleAdapter {
             members: members,
             turns: [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
         )
-        try await store.create(prepared)
         guard let claimID = plan.claimID else { throw AdapterError.childCarrierMismatch }
+        _ = try groupCarrierBundle(for: plan, group: group)
         let claim = try await claimManager.acquire(
             group: prepared,
             owner: owner,
@@ -520,7 +540,13 @@ actor DirectHeadlessOracleAdapter {
             claimID: claimID
         )
         defer { claim.release() }
-        return try await executeGroup(plan: plan, prepared: prepared, request: request)
+        try await store.create(prepared)
+        do {
+            return try await executeGroup(plan: plan, prepared: prepared, request: request)
+        } catch {
+            try await settlePreparedGroupIfNeeded(prepared, error: error)
+            throw error
+        }
     }
 
     private func executeGroupContinuation(
@@ -560,7 +586,12 @@ actor DirectHeadlessOracleAdapter {
             turns: current.turns + [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
         )
         try await store.save(prepared, expectedRevision: current.revision)
-        return try await executeGroup(plan: plan, prepared: prepared, request: request)
+        do {
+            return try await executeGroup(plan: plan, prepared: prepared, request: request)
+        } catch {
+            try await settlePreparedGroupIfNeeded(prepared, error: error)
+            throw error
+        }
     }
 
     private func executeGroup(
@@ -612,6 +643,54 @@ actor DirectHeadlessOracleAdapter {
         }.value
         try Task.checkCancellation()
         return Self.groupValue(result)
+    }
+
+    private func settlePreparedGroupIfNeeded(
+        _ prepared: OracleGroupDocument,
+        error: Error
+    ) async throws {
+        let store = store
+        let status: OracleLaneResultStatus = error is CancellationError ? .cancelled : .failed
+        let code = error is CancellationError ? "cancelled" : "execution_failed"
+        let message = error is CancellationError
+            ? "Oracle provider was cancelled."
+            : String(String(describing: error).prefix(512))
+        try await Task.detached(priority: Task.currentPriority) {
+            guard let current = try await store.load(groupID: prepared.group.id, owner: prepared.owner),
+                  current.revision == prepared.revision,
+                  current.turns.last?.state == .prepared
+            else { return }
+            let terminal = try current.settlingInterrupted(status: status, code: code, message: message)
+            try await store.save(terminal, expectedRevision: current.revision)
+        }.value
+    }
+
+    private func settleInterruptedGroup(_ prepared: OracleGroupDocument) async throws -> OracleGroupDocument {
+        let terminal = try prepared.settlingInterrupted(
+            status: .failed,
+            code: "interrupted",
+            message: "The previous Oracle execution was interrupted before completion."
+        )
+        try await store.save(terminal, expectedRevision: prepared.revision)
+        return terminal
+    }
+
+    private func settleInterruptedSingle(
+        _ prepared: OracleSingleConversationDocument
+    ) async throws -> OracleSingleConversationDocument {
+        let member = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: prepared.publicChatID,
+            providerID: prepared.model.providerID,
+            modelID: prepared.model.modelID,
+            status: .failed,
+            error: OracleLaneError(
+                code: "interrupted",
+                message: "The previous Oracle execution was interrupted before completion."
+            )
+        )
+        try await saveSingleTerminal(prepared, result: member)
+        return try await store.load(publicChatID: prepared.publicChatID, owner: prepared.owner) ?? prepared
     }
 
     private func singleCarrier(for plan: InvocationPlan) throws -> DomainChildLaunchCarrier? {
@@ -726,41 +805,12 @@ actor DirectHeadlessOracleAdapter {
     }
 
     private static func groupValue(_ result: OracleGroupResult) -> Value {
-        var object: [String: Value] = [
+        var object = OracleGroupMCPCodec.groupFields(result)
+        object.merge([
             "chat_id": .string(result.primary.chatID),
             "response": result.primary.response.map(Value.string) ?? .null,
-            "backend": .string("headless"),
-            "oracle_group_id": .string(result.groupID.rawValue.uuidString),
-            "status": .string(result.status.rawValue),
-            "oracle_count": .int(result.oracleCount),
-            "oracle_results": .array(result.oracleResults.map(laneValue))
-        ]
-        if !result.warnings.isEmpty {
-            object["warnings"] = .array(result.warnings.map {
-                .object(["code": .string($0.code), "message": .string($0.message)])
-            })
-        }
-        return .object(object)
-    }
-
-    private static func laneValue(_ result: OracleLaneResult) -> Value {
-        var object: [String: Value] = [
-            "lane_index": .int(result.laneIndex),
-            "role": .string(result.role.rawValue),
-            "chat_id": .string(result.chatID),
-            "model_id": .string(result.modelID),
-            "status": .string(result.status.rawValue)
-        ]
-        if let providerID = result.providerID { object["provider_id"] = .string(providerID) }
-        if let response = result.response { object["response"] = .string(response) }
-        if let error = result.error {
-            var errorObject: [String: Value] = [
-                "code": .string(error.code),
-                "message": .string(error.message)
-            ]
-            if let partial = error.partialResponse { errorObject["partial_response"] = .string(partial) }
-            object["error"] = .object(errorObject)
-        }
+            "backend": .string("headless")
+        ]) { _, new in new }
         return .object(object)
     }
 }

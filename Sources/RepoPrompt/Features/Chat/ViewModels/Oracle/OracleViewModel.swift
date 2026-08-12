@@ -1755,12 +1755,18 @@ class OracleViewModel: ObservableObject {
 
         // 2) Delete chat JSON files only for this workspace
         do {
+            let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+            for tab in activeWS.composeTabs {
+                let owner = try Self.oracleGroupOwner(workspaceID: activeWS.id, tabID: tab.id)
+                try await store.deleteAllGroups(owner: owner)
+            }
             let files = try await chatData.listChatSessions(for: activeWS)
             for file in files {
                 try await chatData.deleteChatSessionFile(file)
             }
         } catch {
             print("Error clearing chats for workspace \(activeWS.name): \(error)")
+            return
         }
 
         // 3) Remove from memory all sessions belonging to the active workspace
