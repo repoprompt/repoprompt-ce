@@ -7,7 +7,19 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPAskOracleWorktreeTests: XCTestCase {
+        private var previousAdditionalOracleModels: [String] = []
+
+        override func setUp() async throws {
+            previousAdditionalOracleModels = GlobalSettingsStore.shared.additionalOracleModelRaws()
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+            try await super.setUp()
+        }
+
         override func tearDown() async throws {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(
+                previousAdditionalOracleModels,
+                commit: false
+            )
             await ServerNetworkManager.shared.debugSetBeforeToolResultFormattingForTesting(nil)
             await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(
                 toolName: MCPWindowToolName.readFile,
