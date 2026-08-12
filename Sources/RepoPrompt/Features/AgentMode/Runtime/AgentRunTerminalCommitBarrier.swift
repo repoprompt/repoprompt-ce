@@ -43,7 +43,7 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     struct Request {
-        // This request is concrete-TabSession-free. Its domain command values
+        // This request carries no concrete app session class. Its domain command values
         // carry no settlement authority; the exact-object binding applies them
         // through host-owned capabilities.
         let binding: AgentRunTerminalSessionBinding

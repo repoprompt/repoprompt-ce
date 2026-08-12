@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import XCTest
 
 final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
@@ -1988,13 +1989,16 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
 
         let effectivePermitLimit = CodeMapArtifactBuildCoordinatorPolicy.default.maximumConcurrentBuildCount
         XCTAssertEqual(effectivePermitLimit, FileSystemService.codeMapArtifactBuildBulkPermitLimit)
+        XCTAssertEqual(effectivePermitLimit, FileSystemService.contentReadBulkPermitLimitForTesting)
         XCTAssertEqual(
             effectivePermitLimit,
-            ContentReadAsyncLimiter.bulkPermitLimit(
-                forCapacity: FileSystemService.contentReadWorkerLimitForTesting
-            )
+            ContentReadConcurrencyCapacity.maximumConcurrentBulkReads
         )
         XCTAssertGreaterThanOrEqual(effectivePermitLimit, 1)
+        XCTAssertLessThanOrEqual(effectivePermitLimit, 3)
+        if FileSystemService.contentReadWorkerLimitForTesting > 1 {
+            XCTAssertLessThan(effectivePermitLimit, FileSystemService.contentReadWorkerLimitForTesting)
+        }
         XCTAssertGreaterThan(inputs.count, effectivePermitLimit)
         let expectedQueuedBuildCount = inputs.count - effectivePermitLimit
 

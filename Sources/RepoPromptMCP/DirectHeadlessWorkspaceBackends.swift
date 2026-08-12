@@ -31,11 +31,16 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
     private let context: DirectHeadlessDomainContext
     private let settingsStore: DomainDirectSettingsStore
 
-    init(runtime: MCPDomainRuntime, scopeID: DomainStandaloneScopeID, context: DirectHeadlessDomainContext) {
+    init(
+        runtime: MCPDomainRuntime,
+        scopeID: DomainStandaloneScopeID,
+        context: DirectHeadlessDomainContext,
+        settingsStore: DomainDirectSettingsStore? = nil
+    ) {
         self.runtime = runtime
         self.scopeID = scopeID
         self.context = context
-        settingsStore = DomainDirectSettingsStore(
+        self.settingsStore = settingsStore ?? DomainDirectSettingsStore(
             persistence: runtime.persistenceCoordinator,
             profileIdentifier: runtime.configuration.profileIdentifier
         )
@@ -255,9 +260,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             let fileURL = runtime.configuration.workspaceStorageDirectory
                 .appendingPathComponent("\(workspaceID.uuidString).json", isDirectory: false)
             let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
-            if !document.metadata.repoPaths.isEmpty {
-                try await context.validateWorkspaceRoots(document.metadata.repoPaths)
-            }
+            try await context.validateWorkspaceRoots(document.metadata.repoPaths)
             try await MCPDomainMutationCommitContext.willCommit()
             let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
                 operationID: operationID,

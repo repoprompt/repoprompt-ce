@@ -167,11 +167,15 @@ actor DirectHeadlessDomainContext {
             baseOverlay: baseOverlay
         )
         let previousOverlay = sessionRootOverlays.updateValue(resolved, forKey: sessionID)
+        let isUnmodifiedInheritance = inheritedOverlay != nil
+            && selectorIntent.selector == nil
+            && selectorIntent.worktreeID == nil
+            && !selectorIntent.create
+        let bindingSource = isUnmodifiedInheritance
+            ? "direct-headless-inherited-overlay"
+            : "direct-headless-session-overlay"
         let bindings = resolved.mappings.compactMap {
-            DirectHeadlessWorktreeRouting.binding(
-                mapping: $0,
-                source: inheritedOverlay == nil ? "direct-headless-session-overlay" : "direct-headless-inherited-overlay"
-            )
+            DirectHeadlessWorktreeRouting.binding(mapping: $0, source: bindingSource)
         }
         return SessionRootOverlayPreparation(
             sessionID: sessionID,

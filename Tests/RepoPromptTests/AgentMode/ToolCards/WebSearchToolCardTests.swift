@@ -2,6 +2,57 @@
 import XCTest
 
 final class WebSearchToolCardTests: XCTestCase {
+    func testToolNamePolicyBoundsNormalizationByUTF8Length() {
+        let maximum = AgentToolNamePolicy.maximumUTF8Length
+        let exactASCII = String(repeating: "a", count: maximum)
+        let oversizedASCII = exactASCII + "a"
+        XCTAssertEqual(normalizedToolCardName(exactASCII), exactASCII)
+        XCTAssertNil(normalizedToolCardName(oversizedASCII))
+        XCTAssertNil(AgentWebToolCanonicalNames.canonicalToolCardName(oversizedASCII))
+
+        let robot = "🤖"
+        let exactMultibyte = String(repeating: robot, count: maximum / robot.utf8.count)
+        let oversizedMultibyte = exactMultibyte + robot
+        XCTAssertEqual(exactMultibyte.utf8.count, maximum)
+        XCTAssertEqual(normalizedToolCardName(exactMultibyte), exactMultibyte)
+        XCTAssertNil(normalizedToolCardName(oversizedMultibyte))
+    }
+
+    func testToolNamePolicyAppliesToLiveMutationsAndPersistedDecoding() throws {
+        let oversizedName = String(repeating: "x", count: AgentToolNamePolicy.maximumUTF8Length + 1)
+        let factoryItem = AgentChatItem.toolCall(name: oversizedName, argsJSON: nil)
+        XCTAssertNil(factoryItem.toolName)
+        XCTAssertEqual(factoryItem.text, "Using tool")
+
+        var item = AgentChatItem.toolCall(name: "search", argsJSON: nil)
+        item.toolName = oversizedName
+        XCTAssertNil(item.toolName)
+
+        let encodedItem = try JSONEncoder().encode(AgentChatItem.toolCall(name: "search", argsJSON: nil))
+        var itemObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encodedItem) as? [String: Any])
+        itemObject["toolName"] = oversizedName
+        let oversizedItemData = try JSONSerialization.data(withJSONObject: itemObject)
+        let decodedItem = try JSONDecoder().decode(AgentChatItem.self, from: oversizedItemData)
+        XCTAssertNil(decodedItem.toolName)
+
+        let persisted = AgentChatItemPersist(from: AgentChatItem.toolCall(name: "search", argsJSON: nil))
+        let encoded = try JSONEncoder().encode(persisted)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object["toolName"] = oversizedName
+        let oversizedPersistedData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(AgentChatItemPersist.self, from: oversizedPersistedData)
+        XCTAssertNil(decoded.toolName)
+        XCTAssertNil(decoded.toItem().toolName)
+    }
+
+    func testOversizedToolNameFallsBackBeforeRenderRouting() {
+        let oversizedName = String(repeating: "search", count: AgentToolNamePolicy.maximumUTF8Length)
+        var item = AgentChatItem(kind: .toolCall, text: "Using tool", toolName: "search")
+        item.toolName = oversizedName
+        XCTAssertNil(item.toolName)
+        XCTAssertNil(ToolCardRouter.callPresentation(for: item))
+    }
+
     func testWebSearchNamesStayDistinctFromFileSearchAndRouteAsKnownResult() {
         for alias in ["search", "web_search", "web_search_request", "google_web_search", "search_web", "websearch"] {
             XCTAssertEqual(normalizedToolCardName(alias), "search", alias)

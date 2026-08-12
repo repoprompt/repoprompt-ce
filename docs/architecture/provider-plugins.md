@@ -110,7 +110,7 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 | Agent Mode transcript mutation, tool-card UI, run-state ownership | core |
 | Native process control (`ClaudeNativeProcessSessionController`) | core (this wave) |
 | Provider-neutral runtime contract (`NativeAgentRuntimeControlling`) | core |
-| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`Infrastructure/AI/Prompts/Workflows`) | core |
+| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`RepoPromptShared/Workflows`) | core |
 | Headless wrapper (`ClaudeCodeAgentProvider`) | core (delegates pure rules to package) |
 | `AgentModel` raw values, option DTOs, defaults | core (adapter forwards plugin DTOs back to these) |
 | Plugin IDs (`ClaudeCompatibleProviderPluginID`), runtime variants, backend IDs | package DTOs |
@@ -285,7 +285,7 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
-- `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.
+- `Sources/RepoPromptShared/Workflows/` — provider-neutral RepoPrompt workflow IDs, catalog metadata, variants, and renderers shared by the app, installs, MCP prompt registration, and direct headless execution.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` — `makeClaudeCompatibleNativeController(...)`.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.

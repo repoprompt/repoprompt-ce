@@ -132,6 +132,9 @@ package actor MCPDomainHost {
     private let smallReadAdmissionController = MCPDomainToolResourceAdmissionController(
         limit: MCPDomainToolAdmissionLimits.smallReadPerWindow
     )
+    private let fileReadAdmissionController = MCPDomainToolResourceAdmissionController(
+        limit: MCPDomainToolAdmissionLimits.fileReadPerWindow
+    )
     private var lifecycle: MCPDomainHostLifecycle = .accepting
     private var activeInvocations: [UUID: ActiveInvocation] = [:]
     private var invocationIDsByConnection: [UUID: Set<UUID>] = [:]
@@ -358,6 +361,13 @@ package actor MCPDomainHost {
         return try await smallReadAdmissionController.acquire(.window(windowID))
     }
 
+    package func acquireFileReadResourceAdmission(
+        windowID: Int
+    ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
+        guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
+        return try await fileReadAdmissionController.acquire(.window(windowID))
+    }
+
     package func cancelInvocations(
         connectionID: UUID,
         connectionGeneration: UInt64
@@ -403,6 +413,7 @@ package actor MCPDomainHost {
         lifecycle = .draining
         _ = mutationAdmissionController.close()
         _ = smallReadAdmissionController.close()
+        _ = fileReadAdmissionController.close()
         for invocation in activeInvocations.values {
             invocation.task.cancel()
         }
@@ -566,9 +577,10 @@ package actor MCPDomainHost {
     private var resourceAdmissionSnapshot: (activeLeaseCount: Int, waiterCount: Int) {
         let mutation = mutationAdmissionController.snapshot()
         let smallRead = smallReadAdmissionController.snapshot()
+        let fileRead = fileReadAdmissionController.snapshot()
         return (
-            mutation.activeLeaseCount + smallRead.activeLeaseCount,
-            mutation.waiterCount + smallRead.waiterCount
+            mutation.activeLeaseCount + smallRead.activeLeaseCount + fileRead.activeLeaseCount,
+            mutation.waiterCount + smallRead.waiterCount + fileRead.waiterCount
         )
     }
 

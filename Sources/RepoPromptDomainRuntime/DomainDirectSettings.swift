@@ -160,6 +160,12 @@ private struct DomainDirectSettingsDocument: Codable, Sendable {
     let updatedAt: Date
 }
 
+enum DomainDirectSettingsBootstrapEvent: Equatable, Sendable {
+    case loadStarted
+    case waiterJoined
+    case loadPublished
+}
+
 package actor DomainDirectSettingsStore {
     private let persistence: DomainPersistenceCoordinator
     private let profileIdentifier: String
@@ -168,6 +174,8 @@ package actor DomainDirectSettingsStore {
     private var persistedDigest: String?
     private var healthReason: String?
     private var didBootstrap = false
+    private var bootstrapTask: Task<Void, Never>?
+    private var bootstrapEventHandler: (@Sendable (DomainDirectSettingsBootstrapEvent) async -> Void)?
 
     package init(persistence: DomainPersistenceCoordinator, profileIdentifier: String) {
         self.persistence = persistence
@@ -176,25 +184,40 @@ package actor DomainDirectSettingsStore {
 
     package func bootstrap() async {
         guard !didBootstrap else { return }
-        didBootstrap = true
+        if let bootstrapTask {
+            await bootstrapEventHandler?(.waiterJoined)
+            await bootstrapTask.value
+            return
+        }
+        let task = Task { await self.loadPersistedSettings() }
+        bootstrapTask = task
+        await task.value
+        bootstrapTask = nil
+    }
+
+    private func loadPersistedSettings() async {
+        await bootstrapEventHandler?(.loadStarted)
         do {
             let snapshot = try await persistence.loadDirectSettingsData()
             persistedDigest = snapshot.data.map(DomainContentDigest.sha256)
-            guard let data = snapshot.data else { return }
-            let document = try JSONDecoder().decode(DomainDirectSettingsDocument.self, from: data)
-            guard document.version <= DomainDirectSettingsDocument.version else { throw DomainDirectSettingsError.futureDocument }
-            guard document.profileIdentifier == profileIdentifier else { throw DomainDirectSettingsError.wrongProfile }
-            for (key, value) in document.values {
-                guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else { continue }
-                try DomainAppSettingsCatalog.validate(value, for: descriptor)
-                values[key] = value
+            if let data = snapshot.data {
+                let document = try JSONDecoder().decode(DomainDirectSettingsDocument.self, from: data)
+                guard document.version <= DomainDirectSettingsDocument.version else { throw DomainDirectSettingsError.futureDocument }
+                guard document.profileIdentifier == profileIdentifier else { throw DomainDirectSettingsError.wrongProfile }
+                for (key, value) in document.values {
+                    guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else { continue }
+                    try DomainAppSettingsCatalog.validate(value, for: descriptor)
+                    values[key] = value
+                }
+                revision = document.revision
             }
-            revision = document.revision
         } catch let error as DomainDirectSettingsError {
             healthReason = error.localizedDescription
         } catch {
             healthReason = DomainDirectSettingsError.corruptDocument.localizedDescription
         }
+        didBootstrap = true
+        await bootstrapEventHandler?(.loadPublished)
     }
 
     package func effectiveValue(for key: String) throws -> DomainSettingValue {
@@ -236,5 +259,13 @@ package actor DomainDirectSettingsStore {
         revision = nextRevision
         persistedDigest = DomainContentDigest.sha256(data)
         return revision
+    }
+}
+
+extension DomainDirectSettingsStore {
+    func test_setBootstrapEventHandler(
+        _ handler: (@Sendable (DomainDirectSettingsBootstrapEvent) async -> Void)?
+    ) {
+        bootstrapEventHandler = handler
     }
 }

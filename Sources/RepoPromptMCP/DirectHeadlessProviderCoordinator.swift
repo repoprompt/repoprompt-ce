@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 actor DirectHeadlessProviderCoordinator {
     typealias BeginEpoch = @Sendable (
@@ -46,6 +47,7 @@ actor DirectHeadlessProviderCoordinator {
 
     private let runtime: MCPDomainRuntime
     private let context: DirectHeadlessDomainContext
+    private let settingsStore: DomainDirectSettingsStore
     private let environment: [String: String]
     private let beginEpoch: BeginEpoch
     private var agents: [UUID: AgentRecord] = [:]
@@ -55,11 +57,13 @@ actor DirectHeadlessProviderCoordinator {
     init(
         runtime: MCPDomainRuntime,
         context: DirectHeadlessDomainContext,
+        settingsStore: DomainDirectSettingsStore,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         beginEpoch: BeginEpoch? = nil
     ) {
         self.runtime = runtime
         self.context = context
+        self.settingsStore = settingsStore
         self.environment = environment
         let sessionStore = runtime.agentSessionStore
         self.beginEpoch = beginEpoch ?? { registration, activationID in
@@ -133,9 +137,17 @@ actor DirectHeadlessProviderCoordinator {
 
     func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
         guard !isShuttingDown else { throw CancellationError() }
-        guard let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
-            throw MCPError.invalidParams("agent_run start requires message")
+        await settingsStore.bootstrap()
+        let cleanupGuidance = try await settingsStore.effectiveValue(
+            for: "agent_mode.show_built_in_workflow_cleanup_guidance"
+        )
+        guard case let .bool(includeSessionCleanupGuidance) = cleanupGuidance else {
+            throw MCPError.internalError("Built-in workflow cleanup guidance setting is not boolean.")
         }
+        let message = try Self.resolvedLaunchMessage(
+            args: args,
+            includeSessionCleanupGuidance: includeSessionCleanupGuidance
+        )
         let providerID = args["model_id"]?.stringValue ?? args["agent"]?.stringValue ?? "codexExec"
         let descriptor = try resolveProvider(providerID)
         guard descriptor.executable != nil else {
@@ -199,28 +211,24 @@ actor DirectHeadlessProviderCoordinator {
         let capturedCarrierEnvironment = DomainChildLaunchContext.current?.environment ?? [:]
         let task = Task { [weak self] in
             guard let self else { return }
-            do {
-                let text = try await runProviderOnce(
-                    message: message,
-                    providerID: descriptor.id,
-                    model: args["model"]?.stringValue,
-                    request: capturedRequest,
-                    sessionID: sessionID,
-                    carrierEnvironment: capturedCarrierEnvironment
-                )
-                await finishAgent(sessionID: sessionID, outcome: .completed(assistantText: text))
-            } catch is CancellationError {
-                await finishAgent(sessionID: sessionID, outcome: .cancelled())
-            } catch {
-                if Task.isCancelled {
-                    await finishAgent(sessionID: sessionID, outcome: .cancelled())
-                } else {
-                    await finishAgent(
+            let report = await DomainAgentRunExecutionCore.execute {
+                do {
+                    let text = try await runProviderOnce(
+                        message: message,
+                        providerID: descriptor.id,
+                        model: args["model"]?.stringValue,
+                        request: capturedRequest,
                         sessionID: sessionID,
-                        outcome: .failed(assistantText: error.localizedDescription)
+                        carrierEnvironment: capturedCarrierEnvironment
                     )
+                    return .completed(assistantText: text)
+                } catch {
+                    if Task.isCancelled { throw CancellationError() }
+                    throw error
                 }
             }
+            guard case let .terminal(outcome) = report.result else { return }
+            await finishAgent(sessionID: sessionID, outcome: outcome)
         }
         agents[sessionID]?.task = task
         await runtime.agentSessionStore.installCancellationHandler(registration: registration) { [weak self] in
@@ -475,6 +483,31 @@ actor DirectHeadlessProviderCoordinator {
             throw MCPError.invalidParams("unknown standalone provider '\(id)'")
         }
         return descriptor
+    }
+
+    nonisolated static func resolvedLaunchMessage(
+        args: [String: Value],
+        includeSessionCleanupGuidance: Bool = true
+    ) throws -> String {
+        guard let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
+            throw MCPError.invalidParams("agent_run start requires message")
+        }
+        do {
+            let workflow = try RepoPromptBuiltInAgentWorkflow.resolve(
+                workflowID: args["workflow_id"]?.stringValue,
+                workflowName: args["workflow_name"]?.stringValue
+            )
+            return workflow?.wrapUserText(
+                message,
+                includeSessionCleanupGuidance: includeSessionCleanupGuidance
+            ) ?? message
+        } catch RepoPromptBuiltInAgentWorkflow.ResolutionError.conflictingReferences {
+            throw MCPError.invalidParams("Specify either workflow_id or workflow_name, not both.")
+        } catch let RepoPromptBuiltInAgentWorkflow.ResolutionError.unknownReference(reference) {
+            throw MCPError.invalidParams("Workflow '\(reference)' was not found.")
+        } catch {
+            throw MCPError.invalidParams("Invalid workflow selection.")
+        }
     }
 
     private nonisolated static func findExecutable(named command: String, path: String?) -> String? {

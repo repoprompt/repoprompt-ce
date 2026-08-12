@@ -225,6 +225,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let harness = makeHarness(recorder: recorder, claudeController: claudeController)
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = .claudeCode
+            harness.host.test_installLiveSession(session)
 
             let outcome = await harness.service.startRun(
                 tabID: session.tabID,
@@ -244,6 +245,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertFalse(recorder.contains("factory:acp-provider"))
             XCTAssertFalse(recorder.contains("factory:headless"))
             await session.agentTask?.value
+            XCTAssertEqual(session.runState, .failed)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertNotNil(session.lastTerminalCommitRevision)
+            XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
+            XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "run-active:false" }), 1)
+            XCTAssertTrue(recorder.contains("attachments:deleteFiles"))
+            XCTAssertTrue(recorder.contains("save"))
         }
 
         do {
@@ -376,7 +385,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 idleWaiter: { _ in recorder.record("idle") },
                 claudeController: claudeController
             )
-            let session = makeRunningClaudeSession(controller: claudeController)
+            let session = makeRunningClaudeSession(controller: claudeController, host: harness.host)
             session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "steer successfully")]
 
             let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
@@ -402,7 +411,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 idleWaiter: { _ in recorder.record("idle") },
                 claudeController: claudeController
             )
-            let session = makeRunningClaudeSession(controller: claudeController)
+            let session = makeRunningClaudeSession(controller: claudeController, host: harness.host)
+            let ownership = session.activeRunOwnership
             session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "restore me")]
             session.pendingNonCodexUserInputTokenQueue = [7]
 
@@ -412,8 +422,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
             XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
             XCTAssertEqual(session.pendingNonCodexUserInputTokenQueue, [7])
+            XCTAssertEqual(session.runState, .running)
+            XCTAssertEqual(session.activeRunOwnership, ownership)
+            XCTAssertNil(session.lastTerminalCommitRevision)
+            XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
             XCTAssertTrue(recorder.contains("draft:restore me"))
             XCTAssertFalse(recorder.contains("delivered"))
+            XCTAssertFalse(recorder.contains(prefix: "commit:"))
             assertOrderedEvents(["idle", "claude:interrupt:interrupt", "claude:send", "draft:restore me"], in: recorder)
         }
     }
@@ -783,7 +798,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("commit:\(revision.commitID.uuidString)")
             }
         )
-        let session = makeRunningClaudeSession(controller: controller)
+        let session = makeRunningClaudeSession(controller: controller, host: harness.host)
         session.pendingAssistantDelta = "buffered terminal tail"
 
         await harness.service.cancelRun(
@@ -1956,13 +1971,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
-    func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
+    func makeRunningClaudeSession(
+        controller: LifecycleFakeNativeController,
+        host: AgentModeViewModel? = nil
+    ) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.runState = .running
         session.installRunID(UUID())
         session.beginRunAttempt(source: "test")
         session.claudeController = controller
+        host?.test_installLiveSession(session)
         return session
     }
 

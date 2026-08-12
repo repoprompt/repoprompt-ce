@@ -1523,6 +1523,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private weak var oracleViewModel: OracleViewModel?
 
+    private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
+        ClaudeAgentModeCoordinator.HostCapabilities(
+            isSessionCurrent: { [weak self] session in
+                guard let self else { return false }
+                return sessions[session.tabID] === session
+            },
+            requestUIRefresh: { [weak self] session, urgent in
+                guard let self, sessions[session.tabID] === session else { return }
+                requestUIRefresh(tabID: session.tabID, urgent: urgent)
+            },
+            scheduleSave: { [weak self] session in
+                self?.scheduleSave(for: session)
+            },
+            stageClaudeResumeRecoveryHandoff: { [weak self] session in
+                await self?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session)
+            },
+            prependPendingHandoff: { [weak self] text, session in
+                self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+            }
+        )
+    }
+
     init(
         windowID: Int,
         promptManager: PromptViewModel,
@@ -1681,7 +1703,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         codexCoordinator.attach(viewModel: self)
-        claudeCoordinator.attach(viewModel: self)
+        claudeCoordinator.installHostCapabilities(
+            makeClaudeCoordinatorHostCapabilities(),
+            providerBindingService: providerBindingService
+        )
         runInteractionStateObserver = codexCoordinator
         mcpServer.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
             guard let self else { return .unavailable }
@@ -1865,7 +1890,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             providerBindingService = AgentModeProviderBindingService()
             codexCoordinator.attach(viewModel: self)
-            claudeCoordinator.attach(viewModel: self)
+            claudeCoordinator.installHostCapabilities(
+                makeClaudeCoordinatorHostCapabilities(),
+                providerBindingService: providerBindingService
+            )
             runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
                 guard let self else { return .unavailable }
@@ -3132,7 +3160,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshSessionListCache(for: workspace, owner: owner)
     }
 
-    func toggleComposeInspectorIfActive() {
+    func toggleContextComposerIfActive() {
         guard isAgentModeActive else { return }
         ui.contextDrawer.toggle()
     }
@@ -3388,7 +3416,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await codexCoordinator.ensureCodexNativeSession(session: session)
             }
             if session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive {
-                await claudeCoordinator.ensureClaudeNativeSession(session: session)
+                await reconnectClaudeNativeSessionIfNeeded(session)
             }
         }
     }
@@ -4726,6 +4754,87 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
+    private func reconnectClaudeNativeSessionIfNeeded(_ session: TabSession) async {
+        guard session.selectedAgent.usesClaudeNativeRuntime,
+              session.runState.isActive,
+              session.activeRunOwnership == nil
+        else {
+            return
+        }
+
+        let currency = session.persistentBindingTransitionToken()
+        let expectedRunID = session.runID
+        let expectedProviderSessionID = session.providerSessionID
+        guard let expectedRunID,
+              let expectedProviderSessionID,
+              !expectedProviderSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            recoverOwnershiplessClaudeReconnectFailure(
+                session,
+                currency: currency,
+                expectedRunID: expectedRunID,
+                expectedProviderSessionID: expectedProviderSessionID,
+                message: "Claude reconnect failed because the prior runtime identity is unavailable."
+            )
+            return
+        }
+
+        let outcome = await claudeCoordinator.ensureClaudeNativeSession(
+            session: session,
+            intent: .reconnect(
+                runID: expectedRunID,
+                providerSessionID: expectedProviderSessionID,
+                currency: currency
+            )
+        )
+        guard case let .failed(message) = outcome else { return }
+        recoverOwnershiplessClaudeReconnectFailure(
+            session,
+            currency: currency,
+            expectedRunID: expectedRunID,
+            expectedProviderSessionID: expectedProviderSessionID,
+            message: message
+        )
+    }
+
+    private func recoverOwnershiplessClaudeReconnectFailure(
+        _ session: TabSession,
+        currency: PersistentBindingTransitionToken,
+        expectedRunID: UUID?,
+        expectedProviderSessionID: String?,
+        message: String
+    ) {
+        guard persistentBindingTransitionIsCurrent(currency),
+              sessions[session.tabID] === session,
+              session.selectedAgent.usesClaudeNativeRuntime,
+              session.runState.isActive,
+              session.activeRunOwnership == nil,
+              session.runID == expectedRunID,
+              session.providerSessionID == expectedProviderSessionID
+        else {
+            return
+        }
+
+        if session.items.last?.kind != .error || session.items.last?.text != message {
+            session.appendItem(
+                AgentChatItem.error(
+                    message,
+                    sequenceIndex: session.nextSequenceIndex
+                )
+            )
+        }
+        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        session.setRunningStatus(nil, source: nil)
+        session.waitingPrompt = nil
+        session.runState = .idle
+        session.isDirty = true
+        setAgentRunActive(session, isActive: false)
+        updateBindingsFromSession(session)
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+        scheduleSave(for: session)
+        publishMCPStateChange(for: session)
+    }
+
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
     func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
@@ -4745,7 +4854,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await codexCoordinator.ensureCodexNativeSession(session: session)
         }
         if reconnectActiveProviders, session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive {
-            await claudeCoordinator.ensureClaudeNativeSession(session: session)
+            await reconnectClaudeNativeSessionIfNeeded(session)
         }
 
         return session

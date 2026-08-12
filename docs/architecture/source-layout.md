@@ -17,7 +17,7 @@ Sources/
       Views/
     Features/
       AgentMode/                 # Agent Mode UI, models, view models, onboarding, recommendations, and shared agent runtime ownership
-        Views/ContextDrawer/     # Compose inspector shell, tabs, selected-context rows, previews, and click-time export context
+        Views/ContextDrawer/     # Context Composer shell, tabs, selected-context rows, previews, and click-time export context
         Runtime/Providers/       # provider/runtime enum and provider factory shared by Context Builder, Agent Mode, MCP, and recommendations
         History/                 # cross-workspace session history scanner, MCP tool service (history.list_sessions / search / time / get_session)
       Chat/                      # chat/oracle models, services, diff state, view models, and views
@@ -85,7 +85,7 @@ The old native file-tree visualization is no longer a live product surface. Do n
 
 “File tree” remains valid when it refers to compatibility or textual context contracts, including the MCP `get_file_tree` tool, tool result cards, API/persisted symbols such as `FileTreeOption`, historical plans, and prompt/context output such as `<file_map>` / project structure maps. Contributor-facing UI and docs should prefer “project structure map” when describing generated textual context so it is not confused with the removed native UI.
 
-The old IDE-era Prompt selected-files panel is also removed. Do not add back `PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, or the Prompt-owned copy/chat preset picker helpers. The compact Prompt selected-files UI remains `SelectedFilesGrid` plus `FilePreviewPopover`. Agent Mode owns its current selected-context workflow in the native Compose inspector under `Features/AgentMode/Views/ContextDrawer`; see [`compose.md`](compose.md). The Settings chat preset picker lives under `Features/Settings`. Textual file previews use the read-only `TextKitView`; app syntax queries remain a separate parsing and validation concern rather than a colored preview renderer.
+The old IDE-era Prompt selected-files panel is also removed. Do not add back `PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, or the Prompt-owned copy/chat preset picker helpers. The compact Prompt selected-files UI remains `SelectedFilesGrid` plus `FilePreviewPopover`. Agent Mode owns its current selected-context workflow in Context Composer under `Features/AgentMode/Views/ContextDrawer`; see [`context-composer.md`](context-composer.md). The Settings chat preset picker lives under `Features/Settings`. Textual file previews use the read-only `TextKitView`; app syntax queries remain a separate parsing and validation concern rather than a colored preview renderer.
 
 ## Placement rules for new files
 
@@ -99,7 +99,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
 - Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
-- Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
+- Provider-neutral workflow IDs, catalog metadata, and prompt renderers go under `Sources/RepoPromptShared/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
@@ -188,7 +188,7 @@ The guardrail script verifies:
 - The old top-level layer buckets were pruned as part of Work Item 11.
 - The native file-tree visualization, IDE-era search view-model layer, and eager root materialization seams were removed. Textual project structure maps and MCP `get_file_tree` output remain supported compatibility surfaces.
 - The Claude-compatible Agent Mode provider family was extracted into the `RepoPromptClaudeCompatibleProvider` package product under `Packages/RepoPromptAgentProviders/`; see `docs/architecture/provider-plugins.md` for the bridge/adapter layout and rules for adding new providers.
-- Workflow prompt generation now lives in the provider-neutral catalog under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; the old provider-specific `ClaudeCodeCommands` surface and duplicated bundled prompt mirror under `AppResources/Services/AI/Prompts/` should not be restored.
+- Workflow prompt generation now lives in the provider-neutral catalog under `Sources/RepoPromptShared/Workflows/`; the old provider-specific `ClaudeCodeCommands` surface and duplicated bundled prompt mirror under `AppResources/Services/AI/Prompts/` should not be restored.
 
 ## Contributor validation commands
 

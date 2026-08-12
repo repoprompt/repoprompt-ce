@@ -131,7 +131,12 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
 
     /// Tool metadata (for toolCall/toolResult kinds)
-    public var toolName: String?
+    public var toolName: String? {
+        didSet {
+            toolName = AgentToolNamePolicy.accepted(toolName)
+        }
+    }
+
     public var toolInvocationID: UUID?
     public var toolArgsJSON: String? // JSON string of tool arguments
     public var toolResultJSON: String? // Tool execution result JSON (for toolResult kind)
@@ -180,7 +185,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.text = text
         self.attachments = attachments
         self.taggedFileAttachments = taggedFileAttachments
-        self.toolName = toolName
+        self.toolName = AgentToolNamePolicy.accepted(toolName)
         self.toolInvocationID = toolInvocationID
         self.toolArgsJSON = toolArgsJSON
         self.toolResultJSON = toolResultJSON
@@ -214,7 +219,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         text = try c.decode(String.self, forKey: .text)
         attachments = try c.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try c.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
-        toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
+        toolName = try AgentToolNamePolicy.accepted(c.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try c.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
         toolArgsJSON = try c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
         toolResultJSON = try c.decodeIfPresent(String.self, forKey: .toolResultJSON)
@@ -242,7 +247,15 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     }
 
     public static func toolCall(name: String, invocationID: UUID? = nil, argsJSON: String?, sequenceIndex: Int = 0) -> AgentChatItem {
-        AgentChatItem(kind: .toolCall, text: "Using tool: \(name)", toolName: name, toolInvocationID: invocationID, toolArgsJSON: argsJSON, sequenceIndex: sequenceIndex)
+        let acceptedName = AgentToolNamePolicy.accepted(name)
+        return AgentChatItem(
+            kind: .toolCall,
+            text: acceptedName.map { "Using tool: \($0)" } ?? "Using tool",
+            toolName: acceptedName,
+            toolInvocationID: invocationID,
+            toolArgsJSON: argsJSON,
+            sequenceIndex: sequenceIndex
+        )
     }
 
     public static func toolResult(name: String, invocationID: UUID? = nil, argsJSON: String? = nil, resultJSON: String, isError: Bool? = nil, sequenceIndex: Int = 0) -> AgentChatItem {
@@ -296,7 +309,12 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var text: String
     public var attachments: [AgentImageAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
-    public var toolName: String?
+    public var toolName: String? {
+        didSet {
+            toolName = AgentToolNamePolicy.accepted(toolName)
+        }
+    }
+
     public var toolInvocationID: UUID?
     public var toolArgsJSON: String?
     public var toolResultJSON: String?
@@ -314,7 +332,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         kind = item.kind
         attachments = item.attachments
         taggedFileAttachments = item.taggedFileAttachments
-        toolName = item.toolName
+        toolName = AgentToolNamePolicy.accepted(item.toolName)
         toolInvocationID = item.toolInvocationID
         toolArgsJSON = sanitizeToolResults && (item.kind == .toolCall || item.kind == .toolResult) ? nil : item.toolArgsJSON
         reasoning = item.reasoning
@@ -451,7 +469,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         text = try container.decode(String.self, forKey: .text)
         attachments = try container.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try container.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
-        toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+        toolName = try AgentToolNamePolicy.accepted(container.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try container.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
         toolArgsJSON = try container.decodeIfPresent(String.self, forKey: .toolArgsJSON)
         toolResultJSON = try container.decodeIfPresent(String.self, forKey: .toolResultJSON)

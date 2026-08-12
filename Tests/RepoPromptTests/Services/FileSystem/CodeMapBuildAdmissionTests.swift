@@ -50,7 +50,7 @@ final class CodeMapBuildAdmissionTests: XCTestCase {
         }
 
         func testCancellingQueuedCodemapBuildAdmissionRemovesWaiterWithoutPermitLeak() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 2)
+            let limiter = ContentReadAsyncLimiter(capacity: 1, bulkPermitLimit: 1, maxQueuedWaiterCount: 2)
             let foregroundToken = await limiter.beginForegroundActivity(kind: .storeBackedSearch)
             let operationStarted = CodeMapAdmissionSignal()
             let build = Task {
@@ -92,7 +92,7 @@ final class CodeMapBuildAdmissionTests: XCTestCase {
         }
 
         func testCodemapBuildAdmissionPreservesForegroundPriorityAndOwnerRoundRobin() async throws {
-            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 8)
+            let limiter = ContentReadAsyncLimiter(capacity: 1, bulkPermitLimit: 1, maxQueuedWaiterCount: 8)
             let heldGate = CodeMapAdmissionGate()
             let recorder = CodeMapAdmissionRecorder()
             let ownerA = UUID()

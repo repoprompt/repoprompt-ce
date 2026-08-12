@@ -346,7 +346,7 @@
           "jsonrpc_request_id": 2,
           "request_ordinal": 2
         },
-        "sanitized_dimensions": "tool=read_file outcome=queued activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=false terminalBarrier=false"
+        "sanitized_dimensions": "tool=read_file outcome=queued activeCount=0 admissionClass=file_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=false terminalBarrier=false"
       },
       {
         "correlation_id": "local-call-read",
@@ -360,7 +360,7 @@
           "jsonrpc_request_id": 2,
           "request_ordinal": 2
         },
-        "sanitized_dimensions": "tool=read_file outcome=acquired activeCount=1 admissionClass=small_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=true publicationPending=false terminalBarrier=false"
+        "sanitized_dimensions": "tool=read_file outcome=acquired activeCount=1 admissionClass=file_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=true publicationPending=false terminalBarrier=false"
       },
       {
         "correlation_id": "local-call-read",
@@ -556,7 +556,7 @@
           "jsonrpc_request_id": 2,
           "request_ordinal": 2
         },
-        "sanitized_dimensions": "tool=read_file outcome=completed activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=true terminalBarrier=false"
+        "sanitized_dimensions": "tool=read_file outcome=completed activeCount=0 admissionClass=file_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=true terminalBarrier=false"
       },
       {
         "correlation_id": "local-call-read",
@@ -626,7 +626,7 @@
           "jsonrpc_request_id": 3,
           "request_ordinal": 3
         },
-        "sanitized_dimensions": "tool=read_file outcome=queued activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=false terminalBarrier=false"
+        "sanitized_dimensions": "tool=read_file outcome=queued activeCount=0 admissionClass=file_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=false terminalBarrier=false"
       },
       {
         "correlation_id": "worktree-call-read",
@@ -640,7 +640,7 @@
           "jsonrpc_request_id": 3,
           "request_ordinal": 3
         },
-        "sanitized_dimensions": "tool=read_file outcome=acquired activeCount=1 admissionClass=small_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=true publicationPending=false terminalBarrier=false"
+        "sanitized_dimensions": "tool=read_file outcome=acquired activeCount=1 admissionClass=file_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=true publicationPending=false terminalBarrier=false"
       },
       {
         "correlation_id": "worktree-call-read",
@@ -808,7 +808,7 @@
           "jsonrpc_request_id": 3,
           "request_ordinal": 3
         },
-        "sanitized_dimensions": "tool=read_file outcome=completed activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=true terminalBarrier=false"
+        "sanitized_dimensions": "tool=read_file outcome=completed activeCount=0 admissionClass=file_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=true terminalBarrier=false"
       },
       {
         "correlation_id": "worktree-call-read",

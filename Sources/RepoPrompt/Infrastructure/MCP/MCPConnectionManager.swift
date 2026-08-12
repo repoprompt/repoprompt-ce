@@ -499,6 +499,7 @@ actor ServerNetworkManager {
     }
 
     nonisolated static let smallReadCallLaneLimit = MCPToolAdmissionPolicy.smallReadConnectionLimit
+    nonisolated static let fileReadCallLaneLimit = MCPToolAdmissionPolicy.fileReadConnectionLimit
     nonisolated static let controlCallLaneLimit = MCPToolAdmissionPolicy.controlConnectionLimit
     nonisolated static let gitReadCallLaneLimit = MCPToolAdmissionPolicy.gitReadConnectionLimit
 
@@ -2955,7 +2956,8 @@ actor ServerNetworkManager {
     private func mapConnectionToRunIDForPendingPolicy(
         _ connectionID: UUID,
         runID: UUID,
-        windowID: Int
+        windowID: Int,
+        clientName: String
     ) async -> MCPServerViewModel.PendingPolicyRunIDMappingToken? {
         let token = await MainActor.run { () -> MCPServerViewModel.PendingPolicyRunIDMappingToken? in
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
@@ -2965,7 +2967,8 @@ actor ServerNetworkManager {
             return window.mcpServer.registerPendingPolicyRunIDMapping(
                 connectionID: connectionID,
                 runID: runID,
-                windowID: windowID
+                windowID: windowID,
+                clientName: clientName
             )
         }
         guard let token else {
@@ -5016,6 +5019,7 @@ actor ServerNetworkManager {
             limit: limiterLimit(for: connectionID),
             controlLimit: controlLimiterLimit(for: connectionID),
             smallReadLimit: smallReadLimiterLimit(for: connectionID),
+            fileReadLimit: fileReadLimiterLimit(for: connectionID),
             gitReadLimit: gitReadLimiterLimit(for: connectionID),
             fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
         )
@@ -8834,6 +8838,7 @@ actor ServerNetworkManager {
         #if DEBUG
             func debugInstallConnectionLimiterForTesting(
                 connectionID: UUID,
+                fileReadLimit: Int? = nil,
                 idleWaitSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
                     try await Task.sleep(for: duration)
                 }
@@ -8842,6 +8847,7 @@ actor ServerNetworkManager {
                     limit: limiterLimit(for: connectionID),
                     controlLimit: controlLimiterLimit(for: connectionID),
                     smallReadLimit: smallReadLimiterLimit(for: connectionID),
+                    fileReadLimit: fileReadLimit ?? fileReadLimiterLimit(for: connectionID),
                     gitReadLimit: gitReadLimiterLimit(for: connectionID),
                     fileSearchLimit: fileSearchLimiterLimit(for: connectionID),
                     idleWaitSleep: idleWaitSleep
@@ -8878,6 +8884,7 @@ actor ServerNetworkManager {
                     limit: limiterLimit(for: connectionID),
                     controlLimit: controlLimiterLimit(for: connectionID),
                     smallReadLimit: smallReadLimiterLimit(for: connectionID),
+                    fileReadLimit: fileReadLimiterLimit(for: connectionID),
                     gitReadLimit: gitReadLimiterLimit(for: connectionID),
                     fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                 )
@@ -9206,6 +9213,7 @@ actor ServerNetworkManager {
                         limit: limiterLimit(for: connectionID),
                         controlLimit: controlLimiterLimit(for: connectionID),
                         smallReadLimit: smallReadLimiterLimit(for: connectionID),
+                        fileReadLimit: fileReadLimiterLimit(for: connectionID),
                         gitReadLimit: gitReadLimiterLimit(for: connectionID),
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                     )
@@ -10215,7 +10223,8 @@ actor ServerNetworkManager {
                 pendingPolicyRunIDMappingToken = await mapConnectionToRunIDForPendingPolicy(
                     connectionID,
                     runID: runID,
-                    windowID: policy.windowID
+                    windowID: policy.windowID,
+                    clientName: clientName
                 )
                 routed = pendingPolicyRunIDMappingToken != nil
             }
@@ -10973,13 +10982,6 @@ actor ServerNetworkManager {
             let evidenceClass = MCPToolConcurrencyEvidenceClass(
                 admissionClass: MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName)
             )
-            defer {
-                MCPToolConcurrencyEvidenceRecorder.shared.recordCallCompleted(
-                    classKey: evidenceClass,
-                    canonicalToolName: toolName,
-                    totalMilliseconds: evidenceArrival.duration(to: evidenceClock.now).mcpMilliseconds
-                )
-            }
             let preLimiterEnvelopeState = EditFlowPerf.begin(
                 EditFlowPerf.Stage.MCPToolCall.preLimiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
@@ -11017,6 +11019,18 @@ actor ServerNetworkManager {
             let extractedRawJSON = normalized.rawJSON
             let cleanedArguments = normalized.payload
             let capturedRawJSON = extractedRawJSON
+            let evidenceOperationIdentity = MCPToolAdmissionPolicy.operationIdentity(
+                forCanonicalToolName: toolName,
+                arguments: cleanedArguments
+            )
+            defer {
+                MCPToolConcurrencyEvidenceRecorder.shared.recordCallCompleted(
+                    classKey: evidenceClass,
+                    canonicalToolName: toolName,
+                    operationIdentity: evidenceOperationIdentity,
+                    totalMilliseconds: evidenceArrival.duration(to: evidenceClock.now).mcpMilliseconds
+                )
+            }
             connectionLog("tools/call \(toolName): args normalized keys=\(cleanedArguments.keys.sorted().joined(separator: ","))")
 
             // tools/list already performs any needed persisted routing hydration.
@@ -11186,6 +11200,7 @@ actor ServerNetworkManager {
             } catch {
                 MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
                     classKey: .unclassified,
+                    operationIdentity: evidenceOperationIdentity,
                     reason: .unclassifiedTool
                 )
                 return Self.executionContractToolErrorResult(
@@ -11295,6 +11310,7 @@ actor ServerNetworkManager {
                         MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitAbandoned(classKey: evidenceClass)
                         MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
                             classKey: evidenceClass,
+                            operationIdentity: evidenceOperationIdentity,
                             reason: .laneWaitCancelled
                         )
                         return Self.executionContractToolErrorResult(
@@ -11306,6 +11322,7 @@ actor ServerNetworkManager {
                 ) {
                     MCPToolConcurrencyEvidenceRecorder.shared.recordLaneAdmitted(
                         classKey: evidenceClass,
+                        operationIdentity: evidenceOperationIdentity,
                         waitMilliseconds: evidenceLaneWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
                     )
                     defer { MCPToolConcurrencyEvidenceRecorder.shared.recordLanePermitReleased(classKey: evidenceClass) }
@@ -11554,11 +11571,13 @@ actor ServerNetworkManager {
                                         mutationAdmissionLease = try await self.domainHost.acquireMutationResourceAdmission(mutationResource)
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                                             classKey: evidenceClass,
+                                            operationIdentity: evidenceOperationIdentity,
                                             milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
                                         )
                                     } catch {
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
                                             classKey: evidenceClass,
+                                            operationIdentity: evidenceOperationIdentity,
                                             reason: .leaseWaitTermination(for: error)
                                         )
                                         return Self.executionContractToolErrorResult(
@@ -11586,11 +11605,13 @@ actor ServerNetworkManager {
                                         smallReadAdmissionLease = try await self.domainHost.acquireSmallReadResourceAdmission(windowID: chosenID)
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                                             classKey: evidenceClass,
+                                            operationIdentity: evidenceOperationIdentity,
                                             milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
                                         )
                                     } catch {
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
                                             classKey: evidenceClass,
+                                            operationIdentity: evidenceOperationIdentity,
                                             reason: .leaseWaitTermination(for: error)
                                         )
                                         return Self.executionContractToolErrorResult(
@@ -11604,6 +11625,40 @@ actor ServerNetworkManager {
                                 }
                                 defer { smallReadAdmissionLease?.release() }
 
+                                let fileReadAdmissionLease: MCPDomainToolResourceAdmissionController.Lease?
+                                if admissionClass == .fileRead {
+                                    guard let chosenID else {
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_execution_read_resource_unresolved",
+                                            message: "The file-read tool '\(toolName)' has no resolved window/store resource."
+                                        )
+                                    }
+                                    do {
+                                        let evidenceLeaseWaitStart = evidenceClock.now
+                                        fileReadAdmissionLease = try await self.domainHost.acquireFileReadResourceAdmission(windowID: chosenID)
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
+                                            classKey: evidenceClass,
+                                            operationIdentity: evidenceOperationIdentity,
+                                            milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
+                                        )
+                                    } catch {
+                                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                                            classKey: evidenceClass,
+                                            operationIdentity: evidenceOperationIdentity,
+                                            reason: .leaseWaitTermination(for: error)
+                                        )
+                                        return Self.executionContractToolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            code: "tool_execution_connection_terminal",
+                                            message: "The MCP connection closed while waiting for file-read admission."
+                                        )
+                                    }
+                                } else {
+                                    fileReadAdmissionLease = nil
+                                }
+                                defer { fileReadAdmissionLease?.release() }
+
                                 let resourceAdmissionWindowID = chosenID
                                 let resourceAdmissionOwner = MCPGlobalToolName.orderedToolNames.contains(toolName)
                                     ? "app_wide"
@@ -11611,7 +11666,8 @@ actor ServerNetworkManager {
                                 @Sendable func releaseResourceAdmissionLeases(outcome: String) {
                                     let releasedMutation = mutationAdmissionLease?.release() ?? false
                                     let releasedSmallRead = smallReadAdmissionLease?.release() ?? false
-                                    guard releasedMutation || releasedSmallRead else { return }
+                                    let releasedFileRead = fileReadAdmissionLease?.release() ?? false
+                                    guard releasedMutation || releasedSmallRead || releasedFileRead else { return }
                                     EditFlowPerf.lifecycleEvent(
                                         EditFlowPerf.Lifecycle.MCPToolCall.resourceAdmissionReleased,
                                         correlation: lifecycleCorrelation,
@@ -11809,6 +11865,7 @@ actor ServerNetworkManager {
                                         }
                                         MCPToolExecutionTracer.emit(MCPToolExecutionTraceEvent(
                                             toolName: toolName,
+                                            operationIdentity: evidenceOperationIdentity,
                                             connectionID: connectionID,
                                             invocationID: invocationID,
                                             runID: observerRunIDForCallbacksFinal,
@@ -13497,6 +13554,11 @@ actor ServerNetworkManager {
         return Self.smallReadCallLaneLimit
     }
 
+    private func fileReadLimiterLimit(for connectionID: UUID) -> Int {
+        _ = connectionID
+        return Self.fileReadCallLaneLimit
+    }
+
     private func gitReadLimiterLimit(for connectionID: UUID) -> Int {
         _ = connectionID
         return Self.gitReadCallLaneLimit
@@ -13897,13 +13959,14 @@ actor ServerNetworkManager {
             }
         }
 
-        // closeIfIdle() admitted no owners before closing both lanes. Replacing that exact,
+        // closeIfIdle() admitted no owners before closing all lanes. Replacing that exact,
         // still-registered bundle is therefore a safe rollback: stale references can only
         // observe cancellation, while all subsequent calls resolve these fresh open lanes.
         let replacement = MCPConnectionCallLimiters(
             limit: limiterLimit(for: id),
             controlLimit: controlLimiterLimit(for: id),
             smallReadLimit: smallReadLimiterLimit(for: id),
+            fileReadLimit: fileReadLimiterLimit(for: id),
             gitReadLimit: gitReadLimiterLimit(for: id),
             fileSearchLimit: fileSearchLimiterLimit(for: id)
         )

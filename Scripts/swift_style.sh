@@ -42,16 +42,16 @@ EXCLUDED_SWIFT_PREFIXES=(
 )
 
 EXCLUDED_SWIFT_FILES=(
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPromptSharedFragments.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+DeepPlan.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Investigate.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Optimize.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+OracleExport.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Orchestrate.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Refactor.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Reminder.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Review.swift"
 )
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }

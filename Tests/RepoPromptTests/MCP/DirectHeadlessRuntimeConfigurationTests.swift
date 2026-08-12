@@ -476,6 +476,10 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         let rejectingCoordinator = DirectHeadlessProviderCoordinator(
             runtime: prepared.runtime,
             context: prepared.context,
+            settingsStore: DomainDirectSettingsStore(
+                persistence: prepared.runtime.persistenceCoordinator,
+                profileIdentifier: prepared.runtime.configuration.profileIdentifier
+            ),
             environment: [
                 "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
                 "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
@@ -860,6 +864,10 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         )
         XCTAssertEqual(partialOverrideTerminal.status, .completed)
         XCTAssertEqual(
+            Set(partialOverrideTerminal.worktreeBindings.map(\.source)),
+            ["direct-headless-session-overlay"]
+        )
+        XCTAssertEqual(
             try URL(fileURLWithPath: XCTUnwrap(partialOverrideTerminal.latestAssistantPreview))
                 .standardizedFileURL.resolvingSymlinksInPath().path,
             fixture.canonicalRepo.path
@@ -1064,6 +1072,73 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             scopeID: prepared.scopeID
         ).binding
         XCTAssertEqual(bindingAfterRejectedCreate, originalBinding)
+    }
+
+    func testWorktreeRouteRejectsRootlessWorkspaceCreateBeforeCommitForBothSwitchModes() async throws {
+        let fixture = try await makeSavedWorkspaceWorktreeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "worktree-rootless-create-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": fixture.profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": fixture.launchWorktree.path,
+                "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: fixture.launchWorktree
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessGlobalBackend(
+            runtime: prepared.runtime,
+            scopeID: prepared.scopeID,
+            context: prepared.context
+        )
+        let security = await DirectHeadlessMCPService.securityContext(
+            prepared: prepared,
+            connection: DirectHeadlessMCPService.ConnectionContext(
+                connectionID: prepared.connectionID,
+                connectionGeneration: prepared.connectionGeneration,
+                principal: prepared.principal,
+                policyProfile: .direct,
+                restrictedToolNames: [],
+                additionalToolNames: [],
+                ephemeralGrantedOperations: []
+            ),
+            invocationID: UUID()
+        )
+        let originalCatalog = await prepared.runtime.workspaceStore.snapshot()
+        let originalBinding = try await prepared.runtime.standaloneScopeCoordinator.snapshot(
+            scopeID: prepared.scopeID
+        ).binding
+
+        for switchToCreated in [false, true] {
+            let request = try DomainPhysicalToolRequest(
+                argumentsJSON: JSONEncoder().encode([
+                    "action": Value.string("create"),
+                    "name": .string("Rejected rootless workspace \(switchToCreated)"),
+                    "switch_to_created": .bool(switchToCreated)
+                ]),
+                securityContext: security
+            )
+            let controller = DomainMutationCommitController(operation: {
+                throw MCPError.internalError("rootless create reached the commit boundary")
+            })
+            do {
+                _ = try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
+                    try await backend.manageWorkspaceLifecycle(request)
+                }
+                XCTFail("Expected rootless workspace creation to fail before persistence")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("rootMappingUnavailable"), String(describing: error))
+            }
+            let catalog = await prepared.runtime.workspaceStore.snapshot()
+            XCTAssertEqual(catalog, originalCatalog)
+            let binding = try await prepared.runtime.standaloneScopeCoordinator.snapshot(
+                scopeID: prepared.scopeID
+            ).binding
+            XCTAssertEqual(binding, originalBinding)
+        }
     }
 
     func testSelectedWorktreeMetadataIsBoundedAndIdentityRevalidatedBeforeLaterUse() async throws {

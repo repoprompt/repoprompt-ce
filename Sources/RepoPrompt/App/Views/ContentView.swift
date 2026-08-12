@@ -36,7 +36,6 @@ struct ContentView: View {
             ContentViewToolbarContent(
                 windowState: viewModel.state,
                 recommendationWizardViewModel: recommendationWizardViewModel,
-                isAgentModeActive: viewModel.rootRoute == .main,
                 showRecommendationsPopover: $showRecommendationsPopover,
                 showMCPServerPopover: $showMCPServerPopover
             )
