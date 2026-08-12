@@ -298,8 +298,10 @@ final class OracleGroupPersistenceTests: XCTestCase {
     func testDestructiveGroupOperationsRespectActiveClaim() async throws {
         let fixture = makeStore(profile: "claimed-deletion")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let group = try makeGroup(count: 2, seed: "claimed-deletion")
+        var group = try makeGroup(count: 2, seed: "claimed-deletion")
         try await fixture.store.create(group)
+        group = try terminalDocument(from: group)
+        try await fixture.store.save(group, expectedRevision: group.revision - 1)
         let claimManager = OracleGroupClaimManager(
             persistence: fixture.persistence,
             identity: makeIdentity()
@@ -311,6 +313,16 @@ final class OracleGroupPersistenceTests: XCTestCase {
             runID: UUID()
         )
 
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.rename(
+                groupID: group.group.id,
+                owner: group.owner,
+                name: "Claimed rename",
+                expectedRevision: group.revision
+            )
+        } verify: {
+            XCTAssertEqual($0 as? OracleGroupClaimError, .conflict)
+        }
         await XCTAssertOraclePersistenceThrowsErrorAsync {
             try await fixture.store.delete(
                 groupID: group.group.id,
@@ -334,6 +346,54 @@ final class OracleGroupPersistenceTests: XCTestCase {
         try await fixture.store.deleteAllGroups(owner: group.owner)
         let deletedGroup = try await fixture.store.load(groupID: group.group.id, owner: group.owner)
         XCTAssertNil(deletedGroup)
+    }
+
+    func testSingleDeletionRespectsActiveClaim() async throws {
+        let fixture = makeStore(profile: "claimed-single-deletion")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let owner = try OracleConversationOwner(kind: "direct", identifier: "claimed-single-deletion")
+        let artifactID = try await fixture.store.storeArtifact(Data("claimed-single".utf8))
+        let single = try makeSingle(
+            chatID: "claimed-single",
+            owner: owner,
+            artifactID: artifactID
+        )
+        try await fixture.store.create(single)
+        let claimManager = OracleGroupClaimManager(
+            persistence: fixture.persistence,
+            identity: makeIdentity()
+        )
+        let claim = try await claimManager.acquireSingle(
+            publicChatID: single.publicChatID,
+            owner: single.owner
+        )
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.delete(
+                publicChatID: single.publicChatID,
+                owner: single.owner,
+                expectedRevision: single.revision
+            )
+        } verify: {
+            XCTAssertEqual($0 as? OracleGroupClaimError, .conflict)
+        }
+        let retained = try await fixture.store.load(
+            publicChatID: single.publicChatID,
+            owner: single.owner
+        )
+        XCTAssertNotNil(retained)
+
+        claim.release()
+        try await fixture.store.delete(
+            publicChatID: single.publicChatID,
+            owner: single.owner,
+            expectedRevision: single.revision
+        )
+        let deleted = try await fixture.store.load(
+            publicChatID: single.publicChatID,
+            owner: single.owner
+        )
+        XCTAssertNil(deleted)
     }
 
     func testUnreadableGroupFailsRetentionClosedWithoutDeletingValidGroup() async throws {

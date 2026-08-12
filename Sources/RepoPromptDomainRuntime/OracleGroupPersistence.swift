@@ -205,6 +205,16 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     ) async throws {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { throw OraclePersistenceError.invalidDocument("empty_name") }
+        guard let group = try await load(groupID: groupID, owner: owner) else {
+            throw OraclePersistenceError.notFound
+        }
+        let claim = try await claimManager.acquire(
+            group: group,
+            owner: owner,
+            invocationID: UUID(),
+            runID: UUID()
+        )
+        defer { claim.release() }
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
@@ -466,6 +476,8 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         owner: OracleConversationOwner,
         expectedRevision: UInt64
     ) async throws {
+        let claim = try await claimManager.acquireSingle(publicChatID: publicChatID, owner: owner)
+        defer { claim.release() }
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
