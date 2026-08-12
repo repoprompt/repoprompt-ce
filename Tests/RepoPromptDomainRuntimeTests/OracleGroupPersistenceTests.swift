@@ -254,6 +254,47 @@ final class OracleGroupPersistenceTests: XCTestCase {
         }
     }
 
+    func testArtifactReservationSurvivesFinalGroupAndSingleReferenceDeletion() async throws {
+        let fixture = makeStore(profile: "reserved-deletion")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let owner = try OracleConversationOwner(kind: "workspace", identifier: "reserved-deletion")
+
+        let groupData = Data("reserved-group".utf8)
+        let groupReservation = try await fixture.store.reserveArtifact(groupData)
+        let group = try makeGroup(
+            count: 2,
+            seed: "reserved-group",
+            owner: owner,
+            artifactID: groupReservation.artifactID
+        )
+        try await fixture.store.create(group)
+        try await fixture.store.delete(
+            groupID: group.group.id,
+            owner: owner,
+            expectedRevision: group.revision
+        )
+        let retainedGroupArtifact = try await fixture.store.loadArtifact(id: groupReservation.artifactID)
+        XCTAssertEqual(retainedGroupArtifact, groupData)
+        try await fixture.store.releaseArtifactReservation(groupReservation, removeIfUnreferenced: true)
+
+        let singleData = Data("reserved-single".utf8)
+        let singleReservation = try await fixture.store.reserveArtifact(singleData)
+        let single = try makeSingle(
+            chatID: "reserved-single",
+            owner: owner,
+            artifactID: singleReservation.artifactID
+        )
+        try await fixture.store.create(single)
+        try await fixture.store.delete(
+            publicChatID: single.publicChatID,
+            owner: owner,
+            expectedRevision: single.revision
+        )
+        let retainedSingleArtifact = try await fixture.store.loadArtifact(id: singleReservation.artifactID)
+        XCTAssertEqual(retainedSingleArtifact, singleData)
+        try await fixture.store.releaseArtifactReservation(singleReservation, removeIfUnreferenced: true)
+    }
+
     func testDestructiveGroupOperationsRespectActiveClaim() async throws {
         let fixture = makeStore(profile: "claimed-deletion")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
