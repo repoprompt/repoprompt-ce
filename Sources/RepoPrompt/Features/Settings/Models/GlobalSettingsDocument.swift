@@ -2,9 +2,7 @@ import Foundation
 import RepoPromptDomainRuntime
 
 private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
-    raws.prefix(OracleRosterContract.maximumAdditionalCount).compactMap {
-        try? OracleRosterContract.normalizedModelID($0)
-    }
+    OracleRosterContract.sanitizedAdditionalModelIDs(raws)
 }
 
 /// Versioned JSON document stored at

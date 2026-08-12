@@ -180,6 +180,7 @@ package enum DomainRunLaunchTokenError: Error, Equatable {
     case contextUnavailable
     case staleContextRevision(expected: UInt64, actual: UInt64)
     case runContextConflict
+    case incompleteOracleIdentity
     case randomGenerationFailed
 }
 
@@ -521,6 +522,14 @@ package actor DomainRoutingCoordinator {
         _ request: DomainRunLaunchReservationRequest
     ) async throws -> DomainRunLaunchToken {
         guard !isStopped else { throw DomainRunLaunchTokenError.runtimeStopped }
+        let oracleIdentityCount = [
+            request.oracleGroupID != nil,
+            request.oracleLaneID != nil,
+            request.oracleGroupClaimID != nil,
+        ].count(where: { $0 })
+        guard oracleIdentityCount == 0 || oracleIdentityCount == 3 else {
+            throw DomainRunLaunchTokenError.incompleteOracleIdentity
+        }
         guard let context = await contextStore.snapshot(request.context) else {
             throw DomainRunLaunchTokenError.contextUnavailable
         }

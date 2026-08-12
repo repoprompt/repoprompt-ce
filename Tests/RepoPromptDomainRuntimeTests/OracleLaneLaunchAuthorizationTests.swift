@@ -337,6 +337,45 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         XCTAssertEqual(counts.pendingRunContexts, 0)
     }
 
+    func testPartialOracleIdentityIsRejectedBeforeTokenIssuance() async throws {
+        let fixture = try await makeRuntimeWithContext(profile: "partial-oracle-identity")
+        defer { Task { await fixture.runtime.shutdown() } }
+        let groupID = OracleGroupID()
+        let laneID = try OracleLaneID(index: 0)
+        let claimID = UUID()
+        let identities: [(OracleGroupID?, OracleLaneID?, UUID?)] = [
+            (groupID, nil, nil),
+            (nil, laneID, nil),
+            (nil, nil, claimID),
+            (groupID, laneID, nil),
+            (groupID, nil, claimID),
+            (nil, laneID, claimID),
+        ]
+
+        for identity in identities {
+            let request = DomainRunLaunchReservationRequest(
+                runID: UUID(),
+                oracleGroupID: identity.0,
+                oracleLaneID: identity.1,
+                oracleGroupClaimID: identity.2,
+                context: fixture.context,
+                expectedContextRevision: 1,
+                windowID: nil,
+                clientPrincipal: "oracle-agent",
+                providerIdentifier: "fixture",
+                runPurpose: "oracle-group"
+            )
+            await XCTAssertOracleLaunchThrowsErrorAsync {
+                _ = try await fixture.runtime.routingCoordinator.issueLaunchToken(request)
+            } verify: {
+                XCTAssertEqual($0 as? DomainRunLaunchTokenError, .incompleteOracleIdentity)
+            }
+        }
+        let counts = await fixture.runtime.routingCoordinator.tokenBookkeepingCounts()
+        XCTAssertEqual(counts.records, 0)
+        XCTAssertEqual(counts.pendingRunContexts, 0)
+    }
+
     func testExpiredTokenIsSweptBeforeSameRunContextConflictCheck() async throws {
         let fixture = try await makeRuntimeWithContext(profile: "expired-context")
         defer { Task { await fixture.runtime.shutdown() } }

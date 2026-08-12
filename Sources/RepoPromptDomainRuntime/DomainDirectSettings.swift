@@ -299,10 +299,18 @@ package actor DomainDirectSettingsStore {
                 let document = try JSONDecoder().decode(DomainDirectSettingsDocument.self, from: data)
                 guard document.version <= DomainDirectSettingsDocument.version else { throw DomainDirectSettingsError.futureDocument }
                 guard document.profileIdentifier == profileIdentifier else { throw DomainDirectSettingsError.wrongProfile }
+                var loadedValues: [String: DomainSettingValue] = [:]
                 for (key, value) in document.values {
                     guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else { continue }
-                    values[key] = try DomainAppSettingsCatalog.normalize(value, for: descriptor)
+                    if key == OracleRosterContract.additionalSettingKey,
+                       case let .stringArray(raws) = value
+                    {
+                        loadedValues[key] = .stringArray(OracleRosterContract.sanitizedAdditionalModelIDs(raws))
+                    } else {
+                        loadedValues[key] = try DomainAppSettingsCatalog.normalize(value, for: descriptor)
+                    }
                 }
+                values = loadedValues
                 revision = document.revision
             }
         } catch let error as DomainDirectSettingsError {

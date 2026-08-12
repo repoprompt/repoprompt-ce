@@ -607,6 +607,14 @@ package struct DomainPrivateChildLaunchHarness: Sendable {
         request: DomainRunLaunchReservationRequest,
         credential: (bytes: [UInt8], scope: DomainCredentialScope)? = nil
     ) async throws -> DomainChildLaunchCarrier {
+        let oracleIdentityCount = [
+            request.oracleGroupID != nil,
+            request.oracleLaneID != nil,
+            request.oracleGroupClaimID != nil,
+        ].count(where: { $0 })
+        guard oracleIdentityCount == 0 || oracleIdentityCount == 3 else {
+            throw DomainRunLaunchTokenError.incompleteOracleIdentity
+        }
         if let credential {
             let scope = credential.scope
             let isGrouped = request.oracleGroupID != nil

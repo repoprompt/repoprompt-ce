@@ -182,6 +182,9 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                     )
                 }
                 try files.validate(current)
+                guard current.turns.last?.state == .terminal else {
+                    throw OraclePersistenceError.invalidDocument("cannot_rename_prepared_group")
+                }
                 let renamed = try OracleGroupDocument(
                     schemaVersion: current.schemaVersion,
                     group: current.group,
@@ -245,6 +248,18 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 guard !removed.isEmpty else { return [] }
                 try files.deleteGroups(removed, from: allGroups)
                 return removed.map(\.group.id)
+            }
+        }
+    }
+
+    package func deleteAllGroups(owner: OracleConversationOwner) async throws {
+        try await perform { files in
+            try files.withMutationLock {
+                try files.recoverTransactions()
+                let allGroups = try files.loadAndValidateAllGroups()
+                let owned = allGroups.filter { $0.owner == owner }
+                guard !owned.isEmpty else { return }
+                try files.deleteGroups(owned, from: allGroups)
             }
         }
     }
