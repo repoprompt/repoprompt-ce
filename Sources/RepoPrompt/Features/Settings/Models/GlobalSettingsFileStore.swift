@@ -217,6 +217,12 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             let data = try Data(contentsOf: fileURL)
             let header = try Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data)
             guard Self.preservationBlockReason(for: header) == .incompatibleSchema else { return false }
+            let lineage = header.schemaLineage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard lineage != GlobalSettingsDocument.schemaLineage
+                || !GlobalSettingsDocument.rejectedExperimentalSchemaVersions.contains(header.schemaVersion)
+            else {
+                return false
+            }
             importedDocument = try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
         } catch {
             print("⚠️ Failed to decode compatible global settings import at \(fileURL.path): \(error)")
@@ -678,6 +684,9 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     ) -> GlobalSettingsPersistenceBlockReason? {
         let normalizedLineage = schemaLineage?.trimmingCharacters(in: .whitespacesAndNewlines)
         if normalizedLineage == GlobalSettingsDocument.schemaLineage {
+            if GlobalSettingsDocument.rejectedExperimentalSchemaVersions.contains(schemaVersion) {
+                return .incompatibleSchema
+            }
             return schemaVersion > supportedVersion
                 ? .unsupportedFutureSchema(onDiskVersion: schemaVersion, supportedVersion: supportedVersion)
                 : nil

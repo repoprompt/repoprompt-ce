@@ -983,7 +983,7 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func purgeSessionStorage(_ sessionID: UUID) {
+    func purgeSessionStorage(_ sessionID: UUID) {
         let messageIDs: [UUID]
         if let stored = messageStore.removeValue(forKey: sessionID) {
             messageStoreRevision &+= 1
@@ -1696,6 +1696,7 @@ class OracleViewModel: ObservableObject {
     /// 3) If this was the current session, switch to another or create a new one.
     @MainActor
     func deleteSession(_ session: ChatSession) async {
+        if await deleteOracleGroupIfNeeded(containing: session) { return }
         sessionSwitchGeneration += 1
         if isSessionStreaming(session.id) {
             await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
@@ -2101,17 +2102,24 @@ class OracleViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func startNewChatSession(
+        id: UUID = UUID(),
         name: String = "New Chat",
+        workspaceID: UUID? = nil,
         tabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        oracleGroupID: UUID? = nil,
+        oracleLaneIndex: Int? = nil,
+        oracleGroupSize: Int? = nil,
+        oracleModelRaw: String? = nil,
         activateInUI: Bool = true,
-        setActiveForTab: Bool = true
+        setActiveForTab: Bool = true,
+        reuseBlankSession: Bool = true
     ) async -> UUID? {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         // If there's already a blank session with that name, just switch to it
-        if let existingIndex = sessions.firstIndex(where: {
+        if reuseBlankSession, let existingIndex = sessions.firstIndex(where: {
             $0.name == name &&
                 $0.effectiveMessageCount == 0 &&
                 $0.composeTabID == resolvedTabID &&
@@ -2161,10 +2169,15 @@ class OracleViewModel: ObservableObject {
         let selectedChatPresetId = promptViewModel.selectedChatPresetID
 
         let newSession = ChatSession(
-            workspaceID: workspaceManager.activeWorkspace?.id,
+            id: id,
+            workspaceID: workspaceID ?? workspaceManager.activeWorkspace?.id,
             composeTabID: resolvedTabID,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
+            oracleGroupID: oracleGroupID,
+            oracleLaneIndex: oracleLaneIndex,
+            oracleGroupSize: oracleGroupSize,
+            oracleModelRaw: oracleModelRaw,
             name: name,
             selectedFilePaths: currentSelectedPaths,
             selectedPromptIDs: currentSelectedPrompts,
@@ -3816,6 +3829,13 @@ class OracleViewModel: ObservableObject {
         }
         guard let index = sessions.firstIndex(where: { $0.id == id }) else {
             print("Session \(id) not found for renaming.")
+            return
+        }
+        if sessions[index].oracleGroupID != nil {
+            let session = sessions[index]
+            Task { [weak self] in
+                await self?.renameOracleGroup(containing: session, newName: newName)
+            }
             return
         }
 

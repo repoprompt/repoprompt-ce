@@ -1,5 +1,7 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class OracleHeadlessRuntimeTests: XCTestCase {
@@ -100,6 +102,49 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
 
         await fulfillment(of: [cleanupExpectation], timeout: 1)
         XCTAssertFalse(runtime.hasActiveStream(for: tabID))
+    }
+
+    func testEmptyAdditionalRosterUsesExactSingleOracleBypass() {
+        XCTAssertFalse(AppOracleGroupRouting.usesGroup(additionalModelRaws: []))
+        XCTAssertTrue(AppOracleGroupRouting.usesGroup(additionalModelRaws: ["secondary-model"]))
+    }
+
+    @MainActor
+    func testCanonicalGroupReplyPreservesOrderAndRoutesTopLevelFieldsToPrimary() throws {
+        let groupID = try OracleGroupID(rawValue: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")))
+        let result = try OracleGroupResult(
+            groupID: groupID,
+            status: .completed,
+            oracleResults: [
+                OracleLaneResult(
+                    laneIndex: 0,
+                    chatID: "primary-chat",
+                    providerID: "provider-a",
+                    modelID: "model-a",
+                    status: .completed,
+                    response: "primary-response"
+                ),
+                OracleLaneResult(
+                    laneIndex: 1,
+                    chatID: "secondary-chat",
+                    providerID: "provider-b",
+                    modelID: "model-b",
+                    status: .completed,
+                    response: "secondary-response"
+                )
+            ]
+        )
+
+        let reply = OracleViewModel.oracleGroupValue(result, mode: "review", tabContext: nil)
+        XCTAssertEqual(reply["chat_id"]?.stringValue, "primary-chat")
+        XCTAssertEqual(reply["response"]?.stringValue, "primary-response")
+        XCTAssertEqual(reply["mode"]?.stringValue, "review")
+        XCTAssertEqual(reply["backend"]?.stringValue, "app")
+        XCTAssertEqual(reply["oracle_group_id"]?.stringValue, groupID.rawValue.uuidString)
+        XCTAssertEqual(reply["oracle_count"]?.intValue, 2)
+        let lanes = try XCTUnwrap(reply["oracle_results"]?.arrayValue)
+        XCTAssertEqual(lanes.compactMap { $0.objectValue?["chat_id"]?.stringValue }, ["primary-chat", "secondary-chat"])
+        XCTAssertEqual(lanes.compactMap { $0.objectValue?["role"]?.stringValue }, ["primary", "additional"])
     }
 
     @MainActor

@@ -496,6 +496,10 @@ private struct ContextBuilderCompletedSummaryView: View {
         return selection
     }
 
+    private var oracleLanes: [ContextBuilderOracleLaneSummary] {
+        contextBuilderOracleLaneSummaries(for: dto)
+    }
+
     private func openOraclePreview() {
         guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
@@ -523,13 +527,22 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .lineLimit(3)
             }
 
-            if let followUpChatID, !followUpChatID.isEmpty {
+            if !oracleLanes.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(oracleLanes, id: \.laneIndex) { lane in
+                        Text("\(lane.label): \(lane.status) • \(lane.modelID) • \(lane.chatID)")
+                            .font(.system(size: 10, weight: lane.laneIndex == 0 ? .medium : .regular))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            } else if let followUpChatID, !followUpChatID.isEmpty {
                 Text("Oracle chat: \(followUpChatID)")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
             }
 
-            Button("Open Oracle", action: openOraclePreview)
+            Button("Open Primary Oracle", action: openOraclePreview)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(contextBuilderOraclePopoverUserInfo(
@@ -557,10 +570,52 @@ func contextBuilderOraclePopoverUserInfo(
     )
 }
 
+struct ContextBuilderOracleLaneSummary: Equatable {
+    let laneIndex: Int
+    let label: String
+    let chatID: String
+    let modelID: String
+    let status: String
+}
+
+func contextBuilderOracleLaneSummaries(
+    for dto: ToolResultDTOs.ContextBuilderDTO?
+) -> [ContextBuilderOracleLaneSummary] {
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return [] }
+    let reply = switch branch {
+    case .review: dto.review
+    case .plan: dto.plan
+    }
+    guard let results = reply?.oracleResults,
+          reply?.oracleCount == results.count,
+          results.count > 1
+    else { return [] }
+
+    let ordered = results.sorted { $0.laneIndex < $1.laneIndex }
+    guard ordered.enumerated().allSatisfy({ offset, lane in
+        lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+    }) else { return [] }
+
+    return ordered.map { lane in
+        ContextBuilderOracleLaneSummary(
+            laneIndex: lane.laneIndex,
+            label: lane.laneIndex == 0 ? "Primary Oracle" : "Oracle \(lane.laneIndex + 1)",
+            chatID: lane.chatID,
+            modelID: lane.modelID,
+            status: lane.status
+        )
+    }
+}
+
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
     guard let dto,
           let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
     else { return nil }
+    if let primaryChatID = contextBuilderOracleLaneSummaries(for: dto).first?.chatID {
+        return nonEmptyContextBuilderValue(primaryChatID)
+    }
     switch branch {
     case .review:
         return nonEmptyContextBuilderValue(dto.review?.chatID)
