@@ -466,6 +466,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 _ runID: UUID,
                 _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
             ) async -> Void)?
+            let afterOracleArtifactReservationReleased: (@MainActor @Sendable (_ generation: UInt64) async -> Void)?
 
             init(
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
@@ -481,6 +482,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 afterCommittedTabSnapshotCaptured: (@MainActor @Sendable (
                     _ runID: UUID,
                     _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
+                ) async -> Void)? = nil,
+                afterOracleArtifactReservationReleased: (@MainActor @Sendable (
+                    _ generation: UInt64
                 ) async -> Void)? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
@@ -492,6 +496,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.validateContextBuilderProviders = validateContextBuilderProviders
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
                 self.afterCommittedTabSnapshotCaptured = afterCommittedTabSnapshotCaptured
+                self.afterOracleArtifactReservationReleased = afterOracleArtifactReservationReleased
             }
         }
 
@@ -511,6 +516,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         func replaceSessionForTesting(tabID: UUID) {
             sessions[tabID] = TabSession(tabID: tabID)
+        }
+
+        func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
+            sessions[tabID]?.followUpOracleGroupTask != nil
         }
 
         func retireStaleRunRecordForTesting(
@@ -4617,6 +4626,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         session.followUpOracleGroupTask = task
 
+        var artifactReservationReleased = false
         do {
             let value = try await withTaskCancellationHandler {
                 try await task.value
@@ -4651,6 +4661,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 frozenPack.reservation,
                 removeIfUnreferenced: false
             )
+            artifactReservationReleased = true
+            #if DEBUG
+                await runTestHooks?.afterOracleArtifactReservationReleased?(generation)
+            #endif
+            guard session.followUpOracleGroupState.generation == generation else {
+                throw CancellationError()
+            }
             let errors = groupReply.orderedResults.dropFirst().compactMap { result in
                 result.error.map { "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)" }
             }
@@ -4677,10 +4694,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             updateRuntimeBindings(from: session)
             return reply
         } catch {
-            try? await oracleStore.releaseArtifactReservation(
-                frozenPack.reservation,
-                removeIfUnreferenced: true
-            )
+            if !artifactReservationReleased {
+                try? await oracleStore.releaseArtifactReservation(
+                    frozenPack.reservation,
+                    removeIfUnreferenced: true
+                )
+            }
             guard session.followUpOracleGroupState.generation == generation else { throw error }
             let stillOwnsCleanup = await cancelAndDrainOracleGroup(
                 in: session,
