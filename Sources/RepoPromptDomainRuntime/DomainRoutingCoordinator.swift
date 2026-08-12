@@ -531,6 +531,8 @@ package actor DomainRoutingCoordinator {
                 actual: context.revisions.workingRevision
             )
         }
+        let now = clock.now
+        sweepExpiredTokens(now: now)
         if pendingLaunchCountsByRunID[request.runID, default: 0] > 0,
            pendingRunContexts[request.runID] != request.context
         {
@@ -545,9 +547,7 @@ package actor DomainRoutingCoordinator {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         let digest = DomainContentDigest.sha256(Data(material.utf8))
-        let now = clock.now
         let tokenID = UUID()
-        sweepExpiredTokens(now: now)
         tokenRecords[digest] = TokenRecord(
             tokenID: tokenID,
             digest: digest,

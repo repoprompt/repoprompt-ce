@@ -149,7 +149,6 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
         let second = Task {
             let result: TestTaskResult<UInt64>
             do {
-                await store.bootstrap()
                 result = try await .success(store.set(
                     key: "agent_mode.show_built_in_workflow_cleanup_guidance",
                     value: .bool(true)

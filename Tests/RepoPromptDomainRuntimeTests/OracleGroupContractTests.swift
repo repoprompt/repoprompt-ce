@@ -81,6 +81,38 @@ final class OracleGroupContractTests: XCTestCase {
         XCTAssertEqual(roster.orderedModels.map(\.providerID), Array(repeating: "provider", count: 4))
     }
 
+    func testInputAndLaneResultsRejectWhitespaceOnlyPayloads() throws {
+        XCTAssertThrowsError(try OracleInput(mode: .chat, userMessage: " \n "))
+        XCTAssertEqual(
+            try OracleInput(mode: .chat, userMessage: "  message  ").userMessage,
+            "message"
+        )
+        XCTAssertThrowsError(try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: "  ",
+            modelID: "model",
+            status: .completed,
+            response: "answer"
+        ))
+        XCTAssertThrowsError(try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: "provider",
+            modelID: "model",
+            status: .completed,
+            response: " \n "
+        ))
+        XCTAssertThrowsError(try OracleLaneResult(
+            laneIndex: 1,
+            chatID: "chat",
+            providerID: "provider",
+            modelID: "model",
+            status: .failed,
+            error: OracleLaneError(code: " ", message: "failure")
+        ))
+    }
+
     func testCompletedResultFixtureRoundTripsCanonicalShape() throws {
         let result = try decodeFixture("oracle-group-completed")
         XCTAssertEqual(result.status, .completed)

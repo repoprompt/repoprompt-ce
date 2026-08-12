@@ -373,7 +373,25 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                         actual: current.revision
                     )
                 }
-                try files.commit([.remove(relativePath: files.relative(url))])
+                try files.validate(current)
+                let groups = try files.loadAndValidateAllGroups()
+                let singles = try files.loadAndValidateAllSingles()
+                let retainedSingles = singles.filter {
+                    $0.owner != owner || $0.publicChatID != publicChatID
+                }
+                let retainedArtifacts = Set(
+                    groups.flatMap(files.referencedArtifactIDs)
+                        + retainedSingles.flatMap(files.referencedArtifactIDs)
+                )
+                let removedArtifacts = Set(files.referencedArtifactIDs(current))
+                    .subtracting(retainedArtifacts)
+                var writes: [OracleTransactionWrite] = [
+                    .remove(relativePath: files.relative(url))
+                ]
+                writes.append(contentsOf: removedArtifacts.map {
+                    .remove(relativePath: files.relative(files.artifactURL($0)))
+                })
+                try files.commit(writes)
             }
         }
     }
@@ -822,7 +840,11 @@ private struct OracleStorageFiles: @unchecked Sendable {
         var index = try loadIndex()
         index = index.replacing(entries: index.entries.filter { !removedIDs.contains($0.groupID) })
         let retained = allGroups.filter { !removedIDs.contains($0.group.id) }
-        let retainedArtifacts = Set(retained.flatMap(referencedArtifactIDs))
+        let retainedSingles = try loadAndValidateAllSingles()
+        let retainedArtifacts = Set(
+            retained.flatMap(referencedArtifactIDs)
+                + retainedSingles.flatMap(referencedArtifactIDs)
+        )
         let removedArtifacts = Set(removed.flatMap(referencedArtifactIDs)).subtracting(retainedArtifacts)
         var writes = removed.map { OracleTransactionWrite.remove(relativePath: relative(groupURL($0.group.id))) }
         writes.append(.write(relativePath: relative(indexURL), data: try encode(index)))
@@ -832,8 +854,16 @@ private struct OracleStorageFiles: @unchecked Sendable {
         try commit(writes)
     }
 
-    private func referencedArtifactIDs(_ group: OracleGroupDocument) -> [String] {
-        group.turns.compactMap { turn in
+    func referencedArtifactIDs(_ group: OracleGroupDocument) -> [String] {
+        referencedArtifactIDs(group.turns)
+    }
+
+    func referencedArtifactIDs(_ conversation: OracleSingleConversationDocument) -> [String] {
+        referencedArtifactIDs(conversation.turns)
+    }
+
+    private func referencedArtifactIDs(_ turns: [OracleTurnRecord]) -> [String] {
+        turns.compactMap { turn in
             guard case let .durableArtifact(id)? = turn.input.context?.content else { return nil }
             return id
         }

@@ -146,10 +146,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
 
         await fulfillment(of: [started], timeout: 2)
         task.cancel()
-        do {
-            _ = try await task.value
-            XCTFail("Expected structural cancellation")
-        } catch is CancellationError {}
+        let result = try await task.value
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertEqual(result.oracleResults.map(\.status), Array(repeating: .cancelled, count: 5))
         await fulfillment(of: [drained], timeout: 2)
         let eventsAtReturn = await progress.events()
         try await Task.sleep(for: .milliseconds(20))

@@ -337,6 +337,37 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         XCTAssertEqual(counts.pendingRunContexts, 0)
     }
 
+    func testExpiredTokenIsSweptBeforeSameRunContextConflictCheck() async throws {
+        let fixture = try await makeRuntimeWithContext(profile: "expired-context")
+        defer { Task { await fixture.runtime.shutdown() } }
+        let runID = UUID()
+        let expired = DomainRunLaunchReservationRequest(
+            runID: runID,
+            context: fixture.context,
+            expectedContextRevision: 1,
+            windowID: nil,
+            clientPrincipal: "oracle-agent",
+            providerIdentifier: "fixture",
+            runPurpose: "oracle-group",
+            lifetime: .zero
+        )
+        _ = try await fixture.runtime.routingCoordinator.issueLaunchToken(expired)
+
+        let replacement = DomainRunLaunchReservationRequest(
+            runID: runID,
+            context: fixture.alternateContext,
+            expectedContextRevision: 1,
+            windowID: nil,
+            clientPrincipal: "oracle-agent",
+            providerIdentifier: "fixture",
+            runPurpose: "oracle-group"
+        )
+        _ = try await fixture.runtime.routingCoordinator.issueLaunchToken(replacement)
+
+        let snapshot = await fixture.runtime.routingCoordinator.snapshot()
+        XCTAssertEqual(snapshot.pendingRunContexts[runID], fixture.alternateContext)
+    }
+
     private func makeRuntime(mode: DomainRuntimeMode, profile: String) -> MCPDomainRuntime {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("OracleLaneLaunchAuthorizationTests-\(UUID().uuidString)", isDirectory: true)
