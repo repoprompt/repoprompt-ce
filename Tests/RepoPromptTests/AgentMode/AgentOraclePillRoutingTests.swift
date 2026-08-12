@@ -460,7 +460,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
     }
 
-    func testGroupedDeleteFailsClosedWhenCanonicalDocumentIsMissing() async throws {
+    func testGroupedDeleteFallsBackToProjectionCleanupWhenCanonicalDocumentIsMissing() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
         var projection = ChatSession(
@@ -478,12 +478,11 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
         fixture.oracleViewModel.sessions = [projection]
 
-        do {
-            _ = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: projection)
-            XCTFail("Expected a missing canonical group to fail closed")
-        } catch {}
-        XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [projection.id])
-        XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(projection.fileURL).path))
+        let handledAsGroup = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: projection)
+        XCTAssertFalse(handledAsGroup)
+        await fixture.oracleViewModel.deleteSession(projection)
+        XCTAssertTrue(fixture.oracleViewModel.sessions.isEmpty)
+        XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(projection.fileURL).path))
     }
 
     func testEmptyRosterConfiguredEntryPointUsesLegacyValidationBeforeGroupPersistence() async throws {
@@ -606,7 +605,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             )
         }
 
-        XCTAssertTrue(handledAsGroup)
+        XCTAssertFalse(handledAsGroup)
         XCTAssertNotNil(retained)
         XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [mismatchedProjection.id])
         XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(mismatchedProjection.fileURL).path))

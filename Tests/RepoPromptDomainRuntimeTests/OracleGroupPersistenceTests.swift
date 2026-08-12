@@ -153,6 +153,40 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let remaining = try await fixture.store.load(groupID: retained.group.id, owner: otherOwner)
         XCTAssertNil(deleted)
         XCTAssertNotNil(remaining)
+
+        let openTabOwner = try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:workspace-id:tab:open"
+        )
+        let closedTabOwner = try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:workspace-id:tab:closed"
+        )
+        let otherWorkspaceOwner = try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:other:tab:closed"
+        )
+        let openTab = try makeGroup(count: 2, seed: "open-tab", owner: openTabOwner)
+        let closedTab = try makeGroup(count: 2, seed: "closed-tab", owner: closedTabOwner)
+        let otherWorkspace = try makeGroup(count: 2, seed: "other-workspace", owner: otherWorkspaceOwner)
+        try await fixture.store.create(openTab)
+        try await fixture.store.create(closedTab)
+        try await fixture.store.create(otherWorkspace)
+
+        try await fixture.store.deleteAllGroups(
+            ownerKind: "app-tab",
+            identifierPrefix: "workspace:workspace-id:tab:"
+        )
+
+        let deletedOpenTab = try await fixture.store.load(groupID: openTab.group.id, owner: openTabOwner)
+        let deletedClosedTab = try await fixture.store.load(groupID: closedTab.group.id, owner: closedTabOwner)
+        let retainedOtherWorkspace = try await fixture.store.load(
+            groupID: otherWorkspace.group.id,
+            owner: otherWorkspaceOwner
+        )
+        XCTAssertNil(deletedOpenTab)
+        XCTAssertNil(deletedClosedTab)
+        XCTAssertNotNil(retainedOtherWorkspace)
     }
 
     func testDigestMismatchedArtifactFailsColdLoadClosed() async throws {

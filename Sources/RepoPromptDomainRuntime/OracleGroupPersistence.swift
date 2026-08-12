@@ -264,6 +264,23 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         }
     }
 
+    package func deleteAllGroups(
+        ownerKind: String,
+        identifierPrefix: String
+    ) async throws {
+        try await perform { files in
+            try files.withMutationLock {
+                try files.recoverTransactions()
+                let allGroups = try files.loadAndValidateAllGroups()
+                let owned = allGroups.filter {
+                    $0.owner.kind == ownerKind && $0.owner.identifier.hasPrefix(identifierPrefix)
+                }
+                guard !owned.isEmpty else { return }
+                try files.deleteGroups(owned, from: allGroups)
+            }
+        }
+    }
+
     package func recoverPreparedGroups(
         owner: OracleConversationOwner
     ) async throws -> [OracleGroupDocument] {

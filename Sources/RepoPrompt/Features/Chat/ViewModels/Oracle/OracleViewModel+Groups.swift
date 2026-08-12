@@ -160,6 +160,13 @@ extension OracleViewModel {
 
         let prepared: OracleGroupDocument
         if var current = existingGroup {
+            let claim = try await AppDomainRuntimeComposition.shared.oracleGroupClaimManager.acquire(
+                group: current,
+                owner: owner,
+                invocationID: invocationID,
+                runID: runID
+            )
+            defer { claim.release() }
             if current.turns.last?.state == .prepared {
                 current = try await settleInterruptedOracleGroup(current, store: store)
             }
@@ -186,13 +193,6 @@ extension OracleViewModel {
                 members: current.members,
                 turns: current.turns + [OracleTurnRecord(input: input, state: .prepared, startedAt: now)]
             )
-            let claim = try await AppDomainRuntimeComposition.shared.oracleGroupClaimManager.acquire(
-                group: current,
-                owner: owner,
-                invocationID: invocationID,
-                runID: runID
-            )
-            defer { claim.release() }
             try await store.save(prepared, expectedRevision: current.revision)
             do {
                 try await restoreOracleGroupProjectionsIfNeeded(
@@ -239,8 +239,6 @@ extension OracleViewModel {
             members: members,
             turns: [OracleTurnRecord(input: input, state: .prepared, startedAt: now)]
         )
-        // The canonical prepared group exists before any app projection becomes visible.
-        try await store.create(prepared)
         let claim = try await AppDomainRuntimeComposition.shared.oracleGroupClaimManager.acquire(
             group: prepared,
             owner: owner,
@@ -248,6 +246,8 @@ extension OracleViewModel {
             runID: runID
         )
         defer { claim.release() }
+        // The canonical prepared group exists before any app projection becomes visible.
+        try await store.create(prepared)
         do {
             try await restoreOracleGroupProjectionsIfNeeded(
                 prepared,
@@ -523,11 +523,9 @@ extension OracleViewModel {
         guard let group = try await store.load(
             groupID: OracleGroupID(rawValue: rawGroupID),
             owner: owner
-        ) else {
-            throw ChatToolError.internalError("Canonical Oracle group was not found.")
-        }
+        ) else { return false }
         let memberIDs = Set(group.members.map(\.memberID.rawValue))
-        guard memberIDs.contains(session.id) else { return true }
+        guard memberIDs.contains(session.id) else { return false }
         for memberSession in sessions where memberIDs.contains(memberSession.id) && isSessionStreaming(memberSession.id) {
             await cancelAIResponse(in: memberSession.id, skipPartialParseAndSave: true)
         }
@@ -537,10 +535,15 @@ extension OracleViewModel {
             expectedRevision: group.revision
         )
         let removed = sessions.filter { memberIDs.contains($0.id) }
+        var projectionCleanupFailed = false
         for projection in removed {
             clearMCPSessionUIState(for: projection.id)
             if let fileURL = projection.fileURL {
-                try? await chatData.deleteChatSessionFile(fileURL)
+                do {
+                    try await chatData.deleteChatSessionFile(fileURL)
+                } catch {
+                    projectionCleanupFailed = true
+                }
             }
             purgeSessionStorage(projection.id)
         }
@@ -558,6 +561,11 @@ extension OracleViewModel {
         if currentSessionID.map(memberIDs.contains) == true {
             currentSessionID = nil
             _ = await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        }
+        if projectionCleanupFailed {
+            throw ChatToolError.internalError(
+                "The Oracle group was deleted, but one or more projection files could not be removed."
+            )
         }
         return true
     }

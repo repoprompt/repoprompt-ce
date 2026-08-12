@@ -57,6 +57,72 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(messages.compactMap { $0["text"] as? String }.first, "first question")
     }
 
+    func testConcurrentSingleContinuationCannotOverwriteActivePreparedTurn() async throws {
+        let fixture = try Fixture(name: "single-claim")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "cancel-0", additional: [])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let task = Task {
+            try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "ask_oracle",
+                arguments: ["message": .string("active single")]
+            )
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while try fixture.calls().isEmpty, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let owner = try OracleConversationOwner(
+            kind: "direct-headless",
+            identifier: fixture.profileName
+        )
+        guard case let .single(single)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
+            task.cancel()
+            return XCTFail("Expected an active prepared single conversation")
+        }
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "oracle_send",
+                arguments: [
+                    "chat_id": .string(single.publicChatID),
+                    "message": .string("must be rejected")
+                ]
+            )
+            XCTFail("Expected the live single claim to reject the continuation")
+        } catch {
+            XCTAssertEqual(error as? OracleGroupClaimError, .conflict)
+        }
+        let stillPrepared = try await prepared.oracleStore.load(
+            publicChatID: single.publicChatID,
+            owner: owner
+        )
+        XCTAssertEqual(stillPrepared?.revision, single.revision)
+        XCTAssertEqual(stillPrepared?.turns.last?.state, .prepared)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected structural cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let terminal = try await prepared.oracleStore.load(
+            publicChatID: single.publicChatID,
+            owner: owner
+        )
+        XCTAssertEqual(terminal?.turns.last?.state, .terminal)
+        XCTAssertEqual(terminal?.turns.last?.results.first?.status, .cancelled)
+    }
+
     func testTwoAndFiveOracleStartsUsePhysicalLaneCarriersAndReturnLaneOrder() async throws {
         let fixture = try Fixture(name: "ordering")
         defer { fixture.cleanup() }
@@ -318,6 +384,34 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         }
         let pids = try fixture.calls().map(\.processID)
         XCTAssertEqual(pids.count, 2)
+        let owner = try OracleConversationOwner(
+            kind: "direct-headless",
+            identifier: fixture.profileName
+        )
+        guard case let .group(preparedGroup)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
+            task.cancel()
+            return XCTFail("Expected an active prepared Oracle group")
+        }
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "oracle_send",
+                arguments: [
+                    "chat_id": .string(preparedGroup.members[1].publicChatID),
+                    "message": .string("must not overwrite the active turn")
+                ]
+            )
+            XCTFail("Expected the live group claim to reject the continuation")
+        } catch {
+            XCTAssertEqual(error as? OracleGroupClaimError, .conflict)
+        }
+        let stillPrepared = try await prepared.oracleStore.load(
+            groupID: preparedGroup.group.id,
+            owner: owner
+        )
+        XCTAssertEqual(stillPrepared?.revision, preparedGroup.revision)
+        XCTAssertEqual(stillPrepared?.turns.last?.state, .prepared)
         task.cancel()
         do {
             _ = try await task.value
@@ -329,10 +423,6 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             XCTAssertEqual(kill(pid, 0), -1, "provider process still alive: \(pid)")
             XCTAssertEqual(errno, ESRCH)
         }
-        let owner = try OracleConversationOwner(
-            kind: "direct-headless",
-            identifier: fixture.profileName
-        )
         guard case let .group(group)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
             return XCTFail("Expected the cancelled Oracle group to remain durable")
         }

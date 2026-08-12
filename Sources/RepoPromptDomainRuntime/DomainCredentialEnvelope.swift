@@ -253,6 +253,14 @@ package actor DomainCredentialEnvelopeStore {
         lifetime: Duration = .seconds(60)
     ) throws -> DomainCredentialEnvelopeDescriptor {
         guard !isShuttingDown, !bytes.isEmpty else { throw DomainCredentialEnvelopeError.unavailable }
+        let oracleIdentityCount = [
+            scope.oracleGroupID != nil,
+            scope.oracleLaneID != nil,
+            scope.oracleGroupClaimID != nil,
+        ].count(where: { $0 })
+        guard oracleIdentityCount == 0 || (oracleIdentityCount == 3 && scope.launchID != nil) else {
+            throw DomainCredentialEnvelopeError.scopeMismatch
+        }
         guard bytes.count <= Self.maximumPayloadBytes else {
             throw DomainCredentialEnvelopeError.payloadTooLarge
         }

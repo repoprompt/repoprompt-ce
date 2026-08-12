@@ -527,6 +527,7 @@ class OracleViewModel: ObservableObject {
     }
 
     @Published private(set) var visibleSessions: [ChatSession] = []
+    @Published private(set) var sessionOperationError: String?
 
     struct MCPSessionUIState: Equatable {
         var modelInfo: String
@@ -1699,9 +1700,10 @@ class OracleViewModel: ObservableObject {
         do {
             if try await deleteOracleGroupIfNeeded(containing: session) { return }
         } catch {
-            print("Error deleting Oracle group: \(error)")
+            sessionOperationError = error.asFriendlyString()
             return
         }
+        sessionOperationError = nil
         sessionSwitchGeneration += 1
         if isSessionStreaming(session.id) {
             await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
@@ -1756,18 +1758,19 @@ class OracleViewModel: ObservableObject {
         // 2) Delete chat JSON files only for this workspace
         do {
             let store = AppDomainRuntimeComposition.shared.oracleConversationStore
-            for tab in activeWS.composeTabs {
-                let owner = try Self.oracleGroupOwner(workspaceID: activeWS.id, tabID: tab.id)
-                try await store.deleteAllGroups(owner: owner)
-            }
+            try await store.deleteAllGroups(
+                ownerKind: "app-tab",
+                identifierPrefix: "workspace:\(activeWS.id.uuidString):tab:"
+            )
             let files = try await chatData.listChatSessions(for: activeWS)
             for file in files {
                 try await chatData.deleteChatSessionFile(file)
             }
         } catch {
-            print("Error clearing chats for workspace \(activeWS.name): \(error)")
+            sessionOperationError = error.asFriendlyString()
             return
         }
+        sessionOperationError = nil
 
         // 3) Remove from memory all sessions belonging to the active workspace
         sessions.removeAll()
@@ -3651,9 +3654,7 @@ class OracleViewModel: ObservableObject {
     private func handleComposeTabsWillClose(_ tabIDs: Set<UUID>) async {
         for tabID in tabIDs {
             // 1. Cancel headless stream (plan/question generation) for this tab
-            if headlessRuntime.hasActiveStream(for: tabID) {
-                await cancelHeadlessStream(forTabID: tabID)
-            }
+            await cancelHeadlessStream(forTabID: tabID)
 
             // 2. Cancel normal chat streaming sessions associated with this tab
             let sessionsForTab = sessions.filter { $0.composeTabID == tabID }
@@ -3847,8 +3848,9 @@ class OracleViewModel: ObservableObject {
             Task { [weak self] in
                 do {
                     try await self?.renameOracleGroup(containing: session, newName: newName)
+                    self?.sessionOperationError = nil
                 } catch {
-                    print("Error renaming Oracle group: \(error)")
+                    self?.sessionOperationError = error.asFriendlyString()
                 }
             }
             return

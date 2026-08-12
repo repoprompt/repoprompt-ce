@@ -42,6 +42,8 @@ final class OracleHeadlessRuntime {
     private let cleanupConversation: CleanupConversation
     private let timeout: Duration
     private var streamIDsByTabID: [UUID: Set<ChatStreamID>] = [:]
+    private var cancellationGenerationByTabID: [UUID: UInt64] = [:]
+    private var pendingStreamTabs: Set<UUID> = []
 
     convenience init(aiQueriesService: AIQueriesService) {
         self.init(
@@ -89,7 +91,21 @@ final class OracleHeadlessRuntime {
     ) async throws -> Output {
         try Task.checkCancellation()
 
-        let (streamID, stream) = try await sendPrompt(message, model)
+        let cancellationGeneration = cancellationGenerationByTabID[tabID, default: 0]
+        pendingStreamTabs.insert(tabID)
+        let streamID: ChatStreamID
+        let stream: AsyncThrowingStream<ChatStreamOutput, Error>
+        do {
+            (streamID, stream) = try await sendPrompt(message, model)
+        } catch {
+            pendingStreamTabs.remove(tabID)
+            throw error
+        }
+        pendingStreamTabs.remove(tabID)
+        guard cancellationGenerationByTabID[tabID, default: 0] == cancellationGeneration else {
+            await cancelStream(streamID)
+            throw CancellationError()
+        }
         let cleanupHandleBox = OracleHeadlessCleanupHandleBox()
         var completedSuccessfully = false
         defer {
@@ -200,6 +216,7 @@ final class OracleHeadlessRuntime {
     }
 
     func cancelStream(for tabID: UUID) async {
+        cancellationGenerationByTabID[tabID, default: 0] &+= 1
         let streamIDs = streamIDsByTabID.removeValue(forKey: tabID) ?? []
         for streamID in streamIDs {
             await cancelStream(streamID)
@@ -207,6 +224,10 @@ final class OracleHeadlessRuntime {
     }
 
     func cancelAllStreams() async {
+        let tabIDs = Set(streamIDsByTabID.keys).union(pendingStreamTabs)
+        for tabID in tabIDs {
+            cancellationGenerationByTabID[tabID, default: 0] &+= 1
+        }
         let streamIDs = streamIDsByTabID.values.flatMap { Array($0) }
         streamIDsByTabID.removeAll(keepingCapacity: false)
         for streamID in streamIDs {

@@ -4240,9 +4240,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // 2) Cancel the wrapper task and drain every grouped member before teardown completes.
         session.backgroundPlanTask?.cancel()
         if let oracleVM = oracleViewModel, session.followUpOracleGroupTask != nil {
+            let generation = session.followUpOracleGroupState.generation
             Task { @MainActor [weak self] in
                 guard let self, let session = sessions[targetTabID] else { return }
-                await cancelAndDrainOracleGroup(in: session, using: oracleVM)
+                _ = await cancelAndDrainOracleGroup(
+                    in: session,
+                    using: oracleVM,
+                    expectedGeneration: generation
+                )
             }
         }
         session.backgroundPlanTask = nil
@@ -4422,16 +4427,27 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     private func cancelAndDrainOracleGroup(
         in session: TabSession,
-        using oracleViewModel: OracleViewModel
-    ) async {
+        using oracleViewModel: OracleViewModel,
+        expectedGeneration: UInt64? = nil
+    ) async -> Bool {
+        if let expectedGeneration,
+           session.followUpOracleGroupState.generation != expectedGeneration
+        {
+            return false
+        }
         let task = session.followUpOracleGroupTask
         let members = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let cleanupGeneration = session.followUpOracleGroupState.generation
         task?.cancel()
         for member in members {
             await oracleViewModel.cancelStreaming(in: member.sessionID)
         }
         if let task { _ = await task.result }
-        session.followUpOracleGroupTask = nil
+        let stillOwnsCleanup = session.followUpOracleGroupState.generation == cleanupGeneration
+        if stillOwnsCleanup {
+            session.followUpOracleGroupTask = nil
+        }
+        return stillOwnsCleanup
     }
 
     @MainActor
@@ -4455,7 +4471,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply {
         let session = session(for: tabID)
-        await cancelAndDrainOracleGroup(in: session, using: oracleViewModel)
+        _ = await cancelAndDrainOracleGroup(in: session, using: oracleViewModel)
         let generation = session.followUpOracleGroupState.beginRun()
         let groupPrompt = ContextBuilderFrozenOraclePack.prompt(for: mode, prompt: prompt)
 
@@ -4582,7 +4598,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             } onCancel: {
                 task.cancel()
                 Task { @MainActor [weak self] in
-                    guard let self, let session = sessions[tabID] else { return }
+                    guard let self, let session = sessions[tabID],
+                          session.followUpOracleGroupState.generation == generation
+                    else { return }
                     let members = session.followUpOracleGroupState.members
                     for member in members {
                         await oracleViewModel.cancelStreaming(in: member.sessionID)
@@ -4630,10 +4648,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             updateRuntimeBindings(from: session)
             return reply
         } catch {
-            await cancelAndDrainOracleGroup(in: session, using: oracleViewModel)
-            if session.followUpOracleGroupState.generation == generation {
-                session.followUpOracleGroupState.finish(generation: generation)
-            }
+            guard session.followUpOracleGroupState.generation == generation else { throw error }
+            let stillOwnsCleanup = await cancelAndDrainOracleGroup(
+                in: session,
+                using: oracleViewModel,
+                expectedGeneration: generation
+            )
+            guard stillOwnsCleanup else { throw error }
             session.isBackgroundPlanGenerating = false
             session.backgroundPlanResponseText = nil
             session.backgroundPlanReasoningText = nil

@@ -270,10 +270,7 @@ actor DirectHeadlessOracleAdapter {
 
         case let .continuation(chatID):
             let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
-            if var group = try await store.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner) {
-                if group.turns.last?.state == .prepared {
-                    group = try await settleInterruptedGroup(group)
-                }
+            if let group = try await store.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner) {
                 guard configured == group.roster else { throw AdapterError.rosterConflict }
                 try await provider.validateOracleRoster(group.roster)
                 let claimID = UUID()
@@ -296,11 +293,8 @@ actor DirectHeadlessOracleAdapter {
                     childLaunchPlan: childPlan
                 )
             }
-            guard var single = try await store.load(publicChatID: chatID, owner: owner) else {
+            guard let single = try await store.load(publicChatID: chatID, owner: owner) else {
                 throw AdapterError.unknownChatID
-            }
-            if single.turns.last?.state == .prepared {
-                single = try await settleInterruptedSingle(single)
             }
             guard configured.count == 1, configured.primary == single.model else {
                 throw AdapterError.rosterConflict
@@ -363,6 +357,9 @@ actor DirectHeadlessOracleAdapter {
         model: OracleModelReference,
         request: DomainPhysicalToolRequest
     ) async throws -> Value {
+        let carrier = try singleCarrier(for: plan, secured: request.securityContext != nil)
+        let claim = try await claimManager.acquireSingle(publicChatID: publicChatID, owner: owner)
+        defer { claim.release() }
         let now = Date()
         let prepared = try OracleSingleConversationDocument(
             publicChatID: publicChatID,
@@ -374,7 +371,12 @@ actor DirectHeadlessOracleAdapter {
             turns: [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
         )
         try await store.create(prepared)
-        return try await executeSingle(plan: plan, prepared: prepared, request: request)
+        return try await executeSingle(
+            plan: plan,
+            prepared: prepared,
+            request: request,
+            carrier: carrier
+        )
     }
 
     private func executeSingleContinuation(
@@ -384,13 +386,17 @@ actor DirectHeadlessOracleAdapter {
         model: OracleModelReference,
         request: DomainPhysicalToolRequest
     ) async throws -> Value {
-        guard let current = try await store.load(publicChatID: publicChatID, owner: owner),
+        guard var current = try await store.load(publicChatID: publicChatID, owner: owner),
               current.revision == expectedRevision,
-              current.model == model,
-              current.turns.last?.state == .terminal
-        else {
-            throw AdapterError.rosterConflict
+              current.model == model
+        else { throw AdapterError.rosterConflict }
+        let carrier = try singleCarrier(for: plan, secured: request.securityContext != nil)
+        let claim = try await claimManager.acquireSingle(publicChatID: publicChatID, owner: owner)
+        defer { claim.release() }
+        if current.turns.last?.state == .prepared {
+            current = try await settleInterruptedSingle(current)
         }
+        guard current.turns.last?.state == .terminal else { throw AdapterError.rosterConflict }
         let now = Date()
         let prepared = try OracleSingleConversationDocument(
             schemaVersion: current.schemaVersion,
@@ -404,16 +410,21 @@ actor DirectHeadlessOracleAdapter {
             turns: current.turns + [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
         )
         try await store.save(prepared, expectedRevision: current.revision)
-        return try await executeSingle(plan: plan, prepared: prepared, request: request)
+        return try await executeSingle(
+            plan: plan,
+            prepared: prepared,
+            request: request,
+            carrier: carrier
+        )
     }
 
     private func executeSingle(
         plan: InvocationPlan,
         prepared: OracleSingleConversationDocument,
-        request: DomainPhysicalToolRequest
+        request: DomainPhysicalToolRequest,
+        carrier: DomainChildLaunchCarrier?
     ) async throws -> Value {
         let prompt = Self.prompt(turns: Array(prepared.turns.dropLast()), laneIndex: 0, next: plan.input.userMessage)
-        let carrier = try singleCarrier(for: plan)
         do {
             let response = try await provider.runProviderOnce(
                 message: prompt,
@@ -556,10 +567,9 @@ actor DirectHeadlessOracleAdapter {
         roster: OracleRoster,
         request: DomainPhysicalToolRequest
     ) async throws -> Value {
-        guard let current = try await store.load(groupID: groupID, owner: owner),
+        guard var current = try await store.load(groupID: groupID, owner: owner),
               current.revision == expectedRevision,
               current.roster == roster,
-              current.turns.last?.state == .terminal,
               let claimID = plan.claimID
         else {
             throw AdapterError.rosterConflict
@@ -572,6 +582,10 @@ actor DirectHeadlessOracleAdapter {
             claimID: claimID
         )
         defer { claim.release() }
+        if current.turns.last?.state == .prepared {
+            current = try await settleInterruptedGroup(current)
+        }
+        guard current.turns.last?.state == .terminal else { throw AdapterError.rosterConflict }
         let now = Date()
         let prepared = try OracleGroupDocument(
             schemaVersion: current.schemaVersion,
@@ -693,9 +707,29 @@ actor DirectHeadlessOracleAdapter {
         return try await store.load(publicChatID: prepared.publicChatID, owner: prepared.owner) ?? prepared
     }
 
-    private func singleCarrier(for plan: InvocationPlan) throws -> DomainChildLaunchCarrier? {
+    private func singleCarrier(
+        for plan: InvocationPlan,
+        secured: Bool
+    ) throws -> DomainChildLaunchCarrier? {
         guard let bundle = DomainChildLaunchContext.bundle else {
-            return DomainChildLaunchContext.current
+            let carrier = DomainChildLaunchContext.current
+            guard !secured || carrier != nil else {
+                throw AdapterError.childCarrierMismatch
+            }
+            if let carrier {
+                guard let lane = plan.childLaunchPlan.lanes.first,
+                      plan.childLaunchPlan.lanes.count == 1,
+                      carrier.runID == plan.runID,
+                      carrier.launchID == lane.launchID,
+                      carrier.providerIdentifier == lane.providerIdentifier,
+                      carrier.oracleGroupID == nil,
+                      carrier.oracleLaneID == nil,
+                      carrier.oracleGroupClaimID == nil
+                else {
+                    throw AdapterError.childCarrierMismatch
+                }
+            }
+            return carrier
         }
         guard bundle.plan.runID == plan.runID,
               bundle.plan.oracleGroupID == nil,
