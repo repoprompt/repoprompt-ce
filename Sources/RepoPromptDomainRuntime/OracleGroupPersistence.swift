@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 package enum OraclePersistenceError: Error, LocalizedError, Equatable, Sendable {
     case alreadyExists
@@ -53,13 +54,38 @@ package struct OracleArtifactReservation: Sendable {
     package let artifactID: String
 }
 
+private final class OracleArtifactReservationRegistry: @unchecked Sendable {
+    private let reservations = OSAllocatedUnfairLock(initialState: [UUID: String]())
+
+    func reserve(artifactID: String) -> OracleArtifactReservation {
+        let reservation = OracleArtifactReservation(id: UUID(), artifactID: artifactID)
+        reservations.withLock { $0[reservation.id] = artifactID }
+        return reservation
+    }
+
+    func release(_ reservation: OracleArtifactReservation) -> Bool {
+        reservations.withLock { reservations in
+            guard reservations.removeValue(forKey: reservation.id) == reservation.artifactID else { return false }
+            return !reservations.values.contains(reservation.artifactID)
+        }
+    }
+
+    func contains(_ artifactID: String) -> Bool {
+        reservations.withLock { $0.values.contains(artifactID) }
+    }
+
+    func artifactIDs() -> Set<String> {
+        reservations.withLock { Set($0.values) }
+    }
+}
+
 package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConversationStore, OracleArtifactStore {
     package typealias MutationObserver = @Sendable (OraclePersistenceMutationPhase) throws -> Void
 
     private let root: URL
     private let mutationObserver: MutationObserver
     private let claimManager: OracleGroupClaimManager
-    private var artifactReservations: [UUID: String] = [:]
+    private let artifactReservations = OracleArtifactReservationRegistry()
 
     package init(
         persistence: DomainPersistenceCoordinator,
@@ -245,7 +271,11 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                         actual: current.revision
                     )
                 }
-                try files.deleteGroups([current], from: allGroups)
+                try files.deleteGroups(
+                    [current],
+                    from: allGroups,
+                    retainingArtifacts: self.artifactReservations.artifactIDs()
+                )
             }
         }
     }
@@ -312,13 +342,18 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 runID: UUID()
             ))
         }
+        let claimedIDs = Set(claims.map(\.groupID))
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
                 let allGroups = try files.loadAndValidateAllGroups()
-                let owned = allGroups.filter(predicate)
+                let owned = allGroups.filter { claimedIDs.contains($0.group.id) && predicate($0) }
                 guard !owned.isEmpty else { return }
-                try files.deleteGroups(owned, from: allGroups)
+                try files.deleteGroups(
+                    owned,
+                    from: allGroups,
+                    retainingArtifacts: self.artifactReservations.artifactIDs()
+                )
             }
         }
     }
@@ -456,7 +491,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 let retainedArtifacts = Set(
                     groups.flatMap(files.referencedArtifactIDs)
                         + retainedSingles.flatMap(files.referencedArtifactIDs)
-                )
+                ).union(self.artifactReservations.artifactIDs())
                 let removedArtifacts = Set(files.referencedArtifactIDs(current))
                     .subtracting(retainedArtifacts)
                 var writes: [OracleTransactionWrite] = [
@@ -489,20 +524,22 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     }
 
     package func reserveArtifact(_ data: Data) async throws -> OracleArtifactReservation {
-        let artifactID = try await storeArtifact(data)
-        let reservation = OracleArtifactReservation(id: UUID(), artifactID: artifactID)
-        artifactReservations[reservation.id] = artifactID
-        return reservation
+        let artifactID = DomainContentDigest.sha256(data)
+        let reservation = artifactReservations.reserve(artifactID: artifactID)
+        do {
+            _ = try await storeArtifact(data)
+            return reservation
+        } catch {
+            _ = artifactReservations.release(reservation)
+            throw error
+        }
     }
 
     package func releaseArtifactReservation(
         _ reservation: OracleArtifactReservation,
         removeIfUnreferenced: Bool
     ) async throws {
-        guard artifactReservations.removeValue(forKey: reservation.id) == reservation.artifactID else { return }
-        guard removeIfUnreferenced,
-              !artifactReservations.values.contains(reservation.artifactID)
-        else { return }
+        guard artifactReservations.release(reservation), removeIfUnreferenced else { return }
         try await removeArtifactIfUnreferenced(id: reservation.artifactID)
     }
 
@@ -516,10 +553,10 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     }
 
     package func removeArtifactIfUnreferenced(id: String) async throws {
-        guard !artifactReservations.values.contains(id) else { return }
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
+                guard !self.artifactReservations.contains(id) else { return }
                 let referenced = Set(
                     try files.loadAndValidateAllGroups().flatMap(files.referencedArtifactIDs)
                         + files.loadAndValidateAllSingles().flatMap(files.referencedArtifactIDs)
@@ -942,7 +979,11 @@ private struct OracleStorageFiles: @unchecked Sendable {
         return data
     }
 
-    func deleteGroups(_ removed: [OracleGroupDocument], from allGroups: [OracleGroupDocument]) throws {
+    func deleteGroups(
+        _ removed: [OracleGroupDocument],
+        from allGroups: [OracleGroupDocument],
+        retainingArtifacts reservedArtifacts: Set<String>
+    ) throws {
         let removedIDs = Set(removed.map(\.group.id))
         var index = try loadIndex()
         index = index.replacing(entries: index.entries.filter { !removedIDs.contains($0.groupID) })
@@ -951,7 +992,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
         let retainedArtifacts = Set(
             retained.flatMap(referencedArtifactIDs)
                 + retainedSingles.flatMap(referencedArtifactIDs)
-        )
+        ).union(reservedArtifacts)
         let removedArtifacts = Set(removed.flatMap(referencedArtifactIDs)).subtracting(retainedArtifacts)
         var writes = removed.map { OracleTransactionWrite.remove(relativePath: relative(groupURL($0.group.id))) }
         writes.append(.write(relativePath: relative(indexURL), data: try encode(index)))

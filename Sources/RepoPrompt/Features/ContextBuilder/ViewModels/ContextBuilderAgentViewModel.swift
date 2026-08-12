@@ -4632,10 +4632,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     }
                 }
             }
-            try await oracleStore.releaseArtifactReservation(
-                frozenPack.reservation,
-                removeIfUnreferenced: false
-            )
             guard session.followUpOracleGroupState.generation == generation else {
                 throw CancellationError()
             }
@@ -4651,6 +4647,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     error?.message ?? "Primary Oracle did not complete successfully."
                 )
             }
+            try await oracleStore.releaseArtifactReservation(
+                frozenPack.reservation,
+                removeIfUnreferenced: false
+            )
             let errors = groupReply.orderedResults.dropFirst().compactMap { result in
                 result.error.map { "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)" }
             }
