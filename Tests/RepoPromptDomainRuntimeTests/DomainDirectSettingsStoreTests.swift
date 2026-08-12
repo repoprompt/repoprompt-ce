@@ -3,6 +3,25 @@ import Foundation
 import XCTest
 
 final class DomainDirectSettingsStoreTests: XCTestCase {
+    func testOrderedOracleRosterStringArrayPersistsAndReloads() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "oracle-roster"
+        let persistence = makePersistence(root: root, profile: profile)
+        let writer = DomainDirectSettingsStore(persistence: persistence, profileIdentifier: profile)
+        await writer.bootstrap()
+        _ = try await writer.set(
+            key: OracleRosterContract.additionalSettingKey,
+            value: .stringArray([" model-a ", "model-a", "model-b"])
+        )
+
+        let reader = DomainDirectSettingsStore(persistence: persistence, profileIdentifier: profile)
+        await reader.bootstrap()
+        let value = try await reader.effectiveValue(for: OracleRosterContract.additionalSettingKey)
+        XCTAssertEqual(value, .stringArray(["model-a", "model-a", "model-b"]))
+    }
+
     func testConcurrentColdStartBootstrapWaitsForPersistedSettingsLoad() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)

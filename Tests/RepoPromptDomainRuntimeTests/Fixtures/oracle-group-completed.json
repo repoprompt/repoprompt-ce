@@ -1,0 +1,25 @@
+{
+  "oracle_group_id" : "11111111-1111-1111-1111-111111111111",
+  "oracle_count" : 2,
+  "oracle_results" : [
+    {
+      "chat_id" : "primary-chat",
+      "lane_index" : 0,
+      "model_id" : "openai/gpt-5.2",
+      "provider_id" : "openai",
+      "response" : "Primary answer",
+      "role" : "primary",
+      "status" : "completed"
+    },
+    {
+      "chat_id" : "additional-chat-1",
+      "lane_index" : 1,
+      "model_id" : "anthropic/claude-opus-4-6",
+      "provider_id" : "anthropic",
+      "response" : "Additional answer",
+      "role" : "additional",
+      "status" : "completed"
+    }
+  ],
+  "status" : "completed"
+}
