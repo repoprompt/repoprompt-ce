@@ -907,6 +907,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         let host = WorkspaceFileEditHost(
             store: store,
+            target: .existing(readRecord),
             lookupRootScope: lookupContext.rootScope,
             createPathResolutionPolicy: .canonicalAliasFirst,
             selectCreatedFiles: false

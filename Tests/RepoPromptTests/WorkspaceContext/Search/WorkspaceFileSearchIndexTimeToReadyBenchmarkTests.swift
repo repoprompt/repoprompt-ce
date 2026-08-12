@@ -365,16 +365,20 @@ import XCTest
                         let readableService = WorkspaceReadableFileService(store: store)
                         let roots = await store.rootRefs(scope: projection.lookupRootScope)
                         try await readableService.awaitFreshnessForExplicitRequest(physicalReadPath, rootRefs: roots)
-                        let resolution = await readableService.resolveReadFileRequest(
-                            physicalReadPath,
-                            profile: .mcpRead,
+                        let lookupContext = WorkspaceLookupContext(
                             rootScope: projection.lookupRootScope,
-                            rootRefs: roots
+                            bindingProjection: projection
                         )
-                        guard case let .readable(.workspace(file)) = resolution else {
+                        let resolution = try await readableService.resolveReadFileRequest(
+                            WorkspaceExactFileInput.parse(physicalReadPath),
+                            rootScope: projection.lookupRootScope,
+                            rootRefs: roots,
+                            namespace: lookupContext.exactFileNamespace(storeRoots: roots)
+                        )
+                        guard case let .workspace(match) = resolution else {
                             throw BenchmarkInvariantError(message: "Production-equivalent read must resolve the scoped worktree file")
                         }
-                        guard let readSnapshot = try await store.interactiveReadSnapshot(for: file) else {
+                        guard let readSnapshot = try await store.interactiveReadSnapshot(for: match.file) else {
                             throw BenchmarkInvariantError(message: "Production-equivalent read content must be available")
                         }
                         let readFinished = DispatchTime.now()

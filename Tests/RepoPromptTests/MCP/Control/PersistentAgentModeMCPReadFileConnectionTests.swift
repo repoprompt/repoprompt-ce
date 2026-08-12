@@ -2020,8 +2020,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ]
             )
             let fullText = try Self.readFileText(from: fullRead, id: 12)
-            XCTAssertTrue(fullText.contains("/\(Fixture.liveRelativePath)"), fullText)
-            XCTAssertFalse(fullText.contains("**Path**: `\(Fixture.liveRelativePath)`"), fullText)
+            XCTAssertTrue(fullText.contains("**Path**: `\(Fixture.liveRelativePath)`"), fullText)
+            XCTAssertFalse(fullText.contains("**Path**: `/"), fullText)
             XCTAssertTrue(fullText.contains("**Lines**: 1–175 of 175"), fullText)
             XCTAssertTrue(fullText.contains("final class GeneratedOracleExportFileWriterTests"), fullText)
             try await requireGateStarted(gate)

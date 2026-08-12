@@ -456,6 +456,80 @@ struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
     }
 }
 
+struct WorkspaceExactFileNamespace: Equatable {
+    struct RootBinding: Equatable {
+        enum LookupRole: Equatable {
+            case canonical
+            case projectedPhysical
+        }
+
+        let lookupRoot: WorkspaceRootRef
+        let lookupRole: LookupRole
+        let clientRoots: [WorkspaceRootRef]
+        let preferredClientRoot: WorkspaceRootRef
+    }
+
+    let rootBindings: [RootBinding]
+    let explicitAliasByClientRootID: [UUID: String]
+
+    init(rootBindings: [RootBinding]) {
+        self.rootBindings = rootBindings
+        let clientRoots = rootBindings.flatMap(\.clientRoots)
+        explicitAliasByClientRootID = ClientPathFormatter.exactRootAliases(visibleRoots: clientRoots)
+    }
+
+    static func identity(roots: [WorkspaceRootRef]) -> WorkspaceExactFileNamespace {
+        WorkspaceExactFileNamespace(
+            rootBindings: roots.map {
+                RootBinding(
+                    lookupRoot: $0,
+                    lookupRole: .canonical,
+                    clientRoots: [$0],
+                    preferredClientRoot: $0
+                )
+            }
+        )
+    }
+
+    var lookupRoots: [WorkspaceRootRef] {
+        rootBindings.map(\.lookupRoot)
+    }
+
+    var clientRoots: [WorkspaceRootRef] {
+        var seenPaths: Set<String> = []
+        return rootBindings.flatMap(\.clientRoots).filter {
+            seenPaths.insert($0.standardizedFullPath).inserted
+        }
+    }
+
+    func binding(lookupRootID: UUID) -> RootBinding? {
+        rootBindings.first { $0.lookupRoot.id == lookupRootID }
+    }
+
+    func explicitAlias(clientRootID: UUID) -> String? {
+        explicitAliasByClientRootID[clientRootID]
+    }
+}
+
+struct WorkspaceExactExistingFileMatch: Equatable {
+    let file: WorkspaceFileRecord
+    let canonicalPath: String
+}
+
+struct WorkspaceExactDirectoryMatch: Equatable {
+    let lookupRoot: WorkspaceRootRef
+    let relativePath: String
+    let displayPath: String
+}
+
+enum WorkspaceExactExistingFileResolution: Equatable {
+    case matched(WorkspaceExactExistingFileMatch)
+    case directory(WorkspaceExactDirectoryMatch)
+    case issue(PathResolutionIssue)
+    case claimedMissing
+    case noCandidate
+}
+
 struct ResolvedWorkspaceSelection: Equatable {
     let files: [WorkspaceFileRecord]
     let folders: [WorkspaceFolderRecord]

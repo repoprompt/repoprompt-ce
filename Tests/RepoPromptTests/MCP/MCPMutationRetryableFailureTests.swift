@@ -77,7 +77,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertTrue(failure?.errorMessage.contains("No filesystem mutation was started") == true)
     }
 
-    func testApplyEditsProviderStopsOnMutationScopeFailureBeforeTranslationOrFreshness() throws {
+    func testApplyEditsProviderStopsOnMutationScopeFailureBeforeFreshnessOrExactResolution() throws {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPApplyEditsToolProvider.swift")
         let body = try XCTUnwrap(source.slice(
             from: "    private func executeApplyEdits(args: [String: Value]) async throws -> EditSummary {",
@@ -90,8 +90,12 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
             "return Self.retryableFailureSummary(request: request, failure: failure)",
             "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
             "return Self.retryableFailureSummary(request: request, failure: failure)",
-            "let effectivePath = lookupContext.translateInputPath(request.path)",
-            "awaitAppliedIngressForExplicitRequest("
+            "WorkspaceExactFileInput.parse(request.path)",
+            "let namespace = lookupContext.exactFileNamespace(storeRoots: roots)",
+            "awaitAppliedIngressForExplicitRequest(",
+            "mutationService.resolveExactExistingFile(exactInput, namespace: namespace)",
+            "effectivePath = lookupContext.translateInputPath(request.path)",
+            "target = .create(path: effectivePath)"
         ], in: body)
     }
 

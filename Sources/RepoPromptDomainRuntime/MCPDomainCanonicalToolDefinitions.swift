@@ -1047,6 +1047,16 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if definition.name == MCPWindowToolName.readFile {
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description
+                    + "\n\n**Exact workspace paths**: Existing workspace files use literal-first exact resolution. Reuse a returned path unchanged with `read_file` or `apply_edits`; use `<root-alias>//<relative-path>` when explicit root qualification is needed. Basename, suffix, and head-trim matching are not supported. Approved external read paths remain read-only.",
+                inputSchema: definition.inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
         if definition.name == MCPWindowToolName.agentRun {
             let oldWaitDescription = "Returns `interaction_id` when input is pending."
             let currentWaitDescription = oldWaitDescription

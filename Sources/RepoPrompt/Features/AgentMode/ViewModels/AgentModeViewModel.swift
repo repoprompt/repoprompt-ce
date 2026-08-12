@@ -14462,9 +14462,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for taggedPath in taggedPaths {
             guard orderedFiles.count < maxFiles else { break }
             let translatedPath = lookupContext.translateInputPath(taggedPath)
-            guard let readable = await readableService.resolveReadableFile(
+            guard let readable = try? await readableService.resolveReadableFile(
                 translatedPath,
-                profile: .mcpRead,
                 rootScope: lookupContext.rootScope
             ) else { continue }
             switch readable {
