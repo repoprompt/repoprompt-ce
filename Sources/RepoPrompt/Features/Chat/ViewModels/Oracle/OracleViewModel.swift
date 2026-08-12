@@ -1696,7 +1696,12 @@ class OracleViewModel: ObservableObject {
     /// 3) If this was the current session, switch to another or create a new one.
     @MainActor
     func deleteSession(_ session: ChatSession) async {
-        if await deleteOracleGroupIfNeeded(containing: session) { return }
+        do {
+            if try await deleteOracleGroupIfNeeded(containing: session) { return }
+        } catch {
+            print("Error deleting Oracle group: \(error)")
+            return
+        }
         sessionSwitchGeneration += 1
         if isSessionStreaming(session.id) {
             await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
@@ -3834,7 +3839,11 @@ class OracleViewModel: ObservableObject {
         if sessions[index].oracleGroupID != nil {
             let session = sessions[index]
             Task { [weak self] in
-                await self?.renameOracleGroup(containing: session, newName: newName)
+                do {
+                    try await self?.renameOracleGroup(containing: session, newName: newName)
+                } catch {
+                    print("Error renaming Oracle group: \(error)")
+                }
             }
             return
         }

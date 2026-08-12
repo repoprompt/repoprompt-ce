@@ -41,7 +41,7 @@ final class OracleHeadlessRuntime {
     private let cancelStream: CancelStream
     private let cleanupConversation: CleanupConversation
     private let timeout: Duration
-    private var streamIDsByTabID: [UUID: ChatStreamID] = [:]
+    private var streamIDsByTabID: [UUID: Set<ChatStreamID>] = [:]
 
     convenience init(aiQueriesService: AIQueriesService) {
         self.init(
@@ -103,9 +103,12 @@ final class OracleHeadlessRuntime {
             }
         }
 
-        streamIDsByTabID[tabID] = streamID
+        streamIDsByTabID[tabID, default: []].insert(streamID)
         defer {
-            streamIDsByTabID.removeValue(forKey: tabID)
+            streamIDsByTabID[tabID]?.remove(streamID)
+            if streamIDsByTabID[tabID]?.isEmpty == true {
+                streamIDsByTabID.removeValue(forKey: tabID)
+            }
         }
 
         let timeout = timeout
@@ -193,16 +196,18 @@ final class OracleHeadlessRuntime {
     }
 
     func hasActiveStream(for tabID: UUID) -> Bool {
-        streamIDsByTabID[tabID] != nil
+        streamIDsByTabID[tabID]?.isEmpty == false
     }
 
     func cancelStream(for tabID: UUID) async {
-        guard let streamID = streamIDsByTabID.removeValue(forKey: tabID) else { return }
-        await cancelStream(streamID)
+        let streamIDs = streamIDsByTabID.removeValue(forKey: tabID) ?? []
+        for streamID in streamIDs {
+            await cancelStream(streamID)
+        }
     }
 
     func cancelAllStreams() async {
-        let streamIDs = Array(streamIDsByTabID.values)
+        let streamIDs = streamIDsByTabID.values.flatMap { Array($0) }
         streamIDsByTabID.removeAll(keepingCapacity: false)
         for streamID in streamIDs {
             await cancelStream(streamID)

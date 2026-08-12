@@ -478,9 +478,10 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
         fixture.oracleViewModel.sessions = [projection]
 
-        let handledAsGroup = await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: projection)
-
-        XCTAssertTrue(handledAsGroup)
+        do {
+            _ = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: projection)
+            XCTFail("Expected a missing canonical group to fail closed")
+        } catch {}
         XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [projection.id])
         XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(projection.fileURL).path))
     }
@@ -595,7 +596,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
         fixture.oracleViewModel.sessions = [mismatchedProjection]
 
-        let handledAsGroup = await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: mismatchedProjection)
+        let handledAsGroup = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: mismatchedProjection)
         let retained = try await store.load(groupID: descriptor.id, owner: owner)
         if let retained {
             try await store.delete(

@@ -36,9 +36,20 @@ extension OracleViewModel {
     ) async throws -> [String: Value] {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
         let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
-        guard AppOracleGroupRouting.usesGroup(
+        let usesConfiguredGroup = AppOracleGroupRouting.usesGroup(
             additionalModelRaws: profile.additionalOracleModelRaws
-        ) else {
+        )
+        let continuesExistingGroup = if usesConfiguredGroup {
+            false
+        } else {
+            try await resolvesExistingOracleGroup(
+                args: args,
+                promptVM: promptVM,
+                tabContext: tabContext,
+                workspaceID: workspaceID
+            )
+        }
+        guard usesConfiguredGroup || continuesExistingGroup else {
             return try await tool_chatSend(args: args, promptVM: promptVM, tabContext: tabContext)
         }
         return try await tool_chatSendGroup(
@@ -50,6 +61,32 @@ extension OracleViewModel {
             frozenInput: frozenInput,
             callbacks: callbacks
         )
+    }
+
+    @MainActor
+    private func resolvesExistingOracleGroup(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?,
+        workspaceID: UUID?
+    ) async throws -> Bool {
+        guard args["new_chat"]?.boolValue != true else { return false }
+        let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
+        guard let tabID else { return false }
+        let owner = try Self.oracleGroupOwner(workspaceID: workspaceID, tabID: tabID)
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        if let chatID = args["chat_id"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !chatID.isEmpty
+        {
+            return try await store.load(
+                member: OracleMemberLookup(publicChatID: chatID),
+                owner: owner
+            ) != nil
+        }
+        guard let latest = try await store.loadMostRecentConversation(owner: owner) else { return false }
+        if case .group = latest { return true }
+        return false
     }
 
     @MainActor
@@ -72,7 +109,7 @@ extension OracleViewModel {
                 throw ChatToolError.invalidParams("Active tab prompt is empty (use_tab_prompt=true)")
             }
         } else {
-            message = rawMessage
+            message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !message.isEmpty else { throw ChatToolError.invalidParams("message cannot be empty") }
         }
         let modeRaw = args["mode"]?.stringValue?
@@ -291,27 +328,11 @@ extension OracleViewModel {
                 await callbacks?.progress(event)
             }
         )
-        let terminalTurn = OracleTurnRecord(
-            id: turn.id,
-            input: turn.input,
-            state: .terminal,
-            startedAt: turn.startedAt,
-            finishedAt: Date(),
-            results: result.oracleResults
-        )
-        let terminal = try OracleGroupDocument(
-            schemaVersion: prepared.schemaVersion,
-            group: prepared.group,
-            owner: prepared.owner,
-            name: prepared.name,
-            revision: prepared.revision &+ 1,
-            createdAt: prepared.createdAt,
-            updatedAt: Date(),
-            roster: prepared.roster,
-            members: prepared.members,
-            turns: Array(prepared.turns.dropLast()) + [terminalTurn]
-        )
-        try await store.save(terminal, expectedRevision: prepared.revision)
+        let terminal = try prepared.settling(result)
+        try await Task.detached(priority: Task.currentPriority) {
+            try await store.save(terminal, expectedRevision: prepared.revision)
+        }.value
+        try Task.checkCancellation()
         return Self.oracleGroupValue(result, mode: turn.input.mode.rawValue, tabContext: tabContext)
     }
 
@@ -425,16 +446,13 @@ extension OracleViewModel {
         mode: String,
         tabContext: OracleSendTabContext?
     ) -> [String: Value] {
-        var object: [String: Value] = [
+        var object = OracleGroupMCPCodec.groupFields(result)
+        object.merge([
             "chat_id": .string(result.primary.chatID),
             "mode": .string(mode),
             "response": result.primary.response.map(Value.string) ?? .null,
-            "backend": .string("app"),
-            "oracle_group_id": .string(result.groupID.rawValue.uuidString),
-            "status": .string(result.status.rawValue),
-            "oracle_count": .int(result.oracleCount),
-            "oracle_results": .array(result.oracleResults.map(oracleLaneValue))
-        ]
+            "backend": .string("app")
+        ]) { _, new in new }
         if let tabID = tabContext?.tabID { object["context_id"] = .string(tabID.uuidString) }
         if let sessionID = tabContext?.agentModeSessionID {
             object["agent_session_id"] = .string(sessionID.uuidString)
@@ -446,38 +464,30 @@ extension OracleViewModel {
     }
 
     @MainActor
-    func deleteOracleGroupIfNeeded(containing session: ChatSession) async -> Bool {
+    func deleteOracleGroupIfNeeded(containing session: ChatSession) async throws -> Bool {
         guard let rawGroupID = session.oracleGroupID else { return false }
         guard let tabID = session.composeTabID,
               let owner = try? Self.oracleGroupOwner(workspaceID: session.workspaceID, tabID: tabID)
         else {
-            return true
+            throw ChatToolError.internalError("Oracle group projection is missing its tab owner.")
         }
         let store = AppDomainRuntimeComposition.shared.oracleConversationStore
-        let group: OracleGroupDocument
-        do {
-            guard let loaded = try await store.load(
-                groupID: OracleGroupID(rawValue: rawGroupID),
-                owner: owner
-            ) else { return true }
-            group = loaded
-        } catch {
-            return true
+        guard let group = try await store.load(
+            groupID: OracleGroupID(rawValue: rawGroupID),
+            owner: owner
+        ) else {
+            throw ChatToolError.internalError("Canonical Oracle group was not found.")
         }
         let memberIDs = Set(group.members.map(\.memberID.rawValue))
         guard memberIDs.contains(session.id) else { return true }
         for memberSession in sessions where memberIDs.contains(memberSession.id) && isSessionStreaming(memberSession.id) {
             await cancelAIResponse(in: memberSession.id, skipPartialParseAndSave: true)
         }
-        do {
-            try await store.delete(
-                groupID: group.group.id,
-                owner: owner,
-                expectedRevision: group.revision
-            )
-        } catch {
-            return true
-        }
+        try await store.delete(
+            groupID: group.group.id,
+            owner: owner,
+            expectedRevision: group.revision
+        )
         let removed = sessions.filter { memberIDs.contains($0.id) }
         for projection in removed {
             clearMCPSessionUIState(for: projection.id)
@@ -505,28 +515,24 @@ extension OracleViewModel {
     }
 
     @MainActor
-    func renameOracleGroup(containing session: ChatSession, newName: String) async {
+    func renameOracleGroup(containing session: ChatSession, newName: String) async throws {
         guard let rawGroupID = session.oracleGroupID,
               let tabID = session.composeTabID,
               let owner = try? Self.oracleGroupOwner(workspaceID: session.workspaceID, tabID: tabID)
-        else { return }
+        else { throw ChatToolError.internalError("Oracle group projection is missing its durable owner.") }
         let store = AppDomainRuntimeComposition.shared.oracleConversationStore
-        let group: OracleGroupDocument
-        do {
-            guard let loaded = try await store.load(
-                groupID: OracleGroupID(rawValue: rawGroupID),
-                owner: owner
-            ) else { return }
-            group = loaded
-            try await store.rename(
-                groupID: group.group.id,
-                owner: owner,
-                name: newName,
-                expectedRevision: group.revision
-            )
-        } catch {
-            return
+        guard let group = try await store.load(
+            groupID: OracleGroupID(rawValue: rawGroupID),
+            owner: owner
+        ) else {
+            throw ChatToolError.internalError("Canonical Oracle group was not found.")
         }
+        try await store.rename(
+            groupID: group.group.id,
+            owner: owner,
+            name: newName,
+            expectedRevision: group.revision
+        )
         for member in group.members {
             guard let index = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) else { continue }
             sessions[index].name = Self.oracleProjectionName(base: newName, laneIndex: member.laneID.index)
@@ -545,26 +551,5 @@ extension OracleViewModel {
                 }
             }
         }
-    }
-
-    private static func oracleLaneValue(_ result: OracleLaneResult) -> Value {
-        var object: [String: Value] = [
-            "lane_index": .int(result.laneIndex),
-            "role": .string(result.role.rawValue),
-            "chat_id": .string(result.chatID),
-            "model_id": .string(result.modelID),
-            "status": .string(result.status.rawValue)
-        ]
-        if let providerID = result.providerID { object["provider_id"] = .string(providerID) }
-        if let response = result.response { object["response"] = .string(response) }
-        if let error = result.error {
-            var errorObject: [String: Value] = [
-                "code": .string(error.code),
-                "message": .string(error.message)
-            ]
-            if let partial = error.partialResponse { errorObject["partial_response"] = .string(partial) }
-            object["error"] = .object(errorObject)
-        }
-        return .object(object)
     }
 }
