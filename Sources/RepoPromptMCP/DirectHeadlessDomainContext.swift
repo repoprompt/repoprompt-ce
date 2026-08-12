@@ -372,8 +372,8 @@ actor DirectHeadlessDomainContext {
     ) throws -> [String] {
         try paths.map { rawPath in
             guard rawPath.hasPrefix("/") else { return rawPath }
-            let path = canonicalSelectionPath(rawPath)
-            if let translated = translateAbsolutePath(
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            if let translated = translateAbsolutePathPreservingSuffix(
                 path,
                 mappings: mappings,
                 from: \.physicalRoot,
@@ -398,27 +398,41 @@ actor DirectHeadlessDomainContext {
     ) -> [String] {
         paths.map { rawPath in
             guard rawPath.hasPrefix("/") else { return rawPath }
-            let path = canonicalSelectionPath(rawPath)
-            return translateAbsolutePath(path, mappings: mappings, from: source, to: destination) ?? rawPath
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            return translateAbsolutePathPreservingSuffix(
+                path,
+                mappings: mappings,
+                from: source,
+                to: destination
+            ) ?? rawPath
         }
     }
 
-    private nonisolated static func canonicalSelectionPath(_ rawPath: String) -> String {
-        var existingAncestor = URL(fileURLWithPath: rawPath).standardizedFileURL
-        var missingComponents: [String] = []
-        while !FileManager.default.fileExists(atPath: existingAncestor.path),
-              existingAncestor.path != "/"
-        {
-            missingComponents.append(existingAncestor.lastPathComponent)
-            let parent = existingAncestor.deletingLastPathComponent()
-            guard parent.path != existingAncestor.path else { break }
-            existingAncestor = parent
+    private nonisolated static func translateAbsolutePathPreservingSuffix(
+        _ path: String,
+        mappings: [DirectHeadlessRootMapping],
+        from source: KeyPath<DirectHeadlessRootMapping, URL>,
+        to destination: KeyPath<DirectHeadlessRootMapping, URL>
+    ) -> String? {
+        if let translated = translateAbsolutePath(path, mappings: mappings, from: source, to: destination) {
+            return translated
         }
-        var resolved = existingAncestor.resolvingSymlinksInPath()
-        for component in missingComponents.reversed() {
-            resolved.appendPathComponent(component, isDirectory: false)
+
+        var ancestor = URL(fileURLWithPath: path).standardizedFileURL
+        var suffix: [String] = []
+        while true {
+            let resolvedAncestor = ancestor.resolvingSymlinksInPath().standardizedFileURL.path
+            if let mapping = mappings.first(where: { resolvedAncestor == $0[keyPath: source].path }) {
+                var translated = mapping[keyPath: destination]
+                for component in suffix.reversed() {
+                    translated.appendPathComponent(component)
+                }
+                return translated.standardizedFileURL.path
+            }
+            guard ancestor.path != "/" else { return nil }
+            suffix.append(ancestor.lastPathComponent)
+            ancestor = ancestor.deletingLastPathComponent()
         }
-        return resolved.standardizedFileURL.path
     }
 
     private nonisolated static func translateAbsolutePath(

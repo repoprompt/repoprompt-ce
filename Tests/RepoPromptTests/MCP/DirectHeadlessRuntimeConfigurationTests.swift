@@ -1056,6 +1056,115 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         )
     }
 
+    func testAbsoluteAliasedSelectionPreservesExistingSymlinkNameAcrossWorktrees() async throws {
+        let fixture = try await makeSavedWorkspaceWorktreeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let canonicalAlias = fixture.root.appendingPathComponent("selection-symlink-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: canonicalAlias,
+            withDestinationURL: fixture.canonicalRepo
+        )
+        for (root, target) in [
+            (fixture.canonicalRepo, "canonical-target.swift"),
+            (fixture.launchWorktree, "launch-target.swift"),
+            (fixture.alternateWorktree, "alternate-target.swift")
+        ] {
+            let targetURL = root.appendingPathComponent(target)
+            try Data("// \(target)\n".utf8).write(to: targetURL)
+            for selectionName in ["current.swift", "next.swift"] {
+                try FileManager.default.createSymbolicLink(
+                    at: root.appendingPathComponent(selectionName),
+                    withDestinationURL: targetURL
+                )
+            }
+        }
+        let canonicalSelection = canonicalAlias.appendingPathComponent("current.swift")
+        let workspace = try makeWorkspaceDocument(
+            workspaceID: fixture.workspaceID,
+            contextID: fixture.contextID,
+            roots: [fixture.canonicalRepo],
+            fileURL: fixture.savedWorkspaceURL,
+            selectedPaths: [canonicalSelection.path]
+        )
+        try workspace.documentBytes.write(to: fixture.savedWorkspaceURL)
+
+        let service = DirectHeadlessMCPService(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_PROFILE": "selection-symlink-name-test",
+                "REPOPROMPT_MCP_HEADLESS_PROFILE_DIR": fixture.profile.path,
+                "REPOPROMPT_MCP_WORKING_DIRS": fixture.launchWorktree.path,
+                "REPOPROMPT_CODEX_COMMAND": fixture.provider.path,
+                "PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""
+            ],
+            currentDirectory: fixture.launchWorktree
+        )
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+
+        let processSnapshot = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(
+            processSnapshot.selection,
+            [fixture.launchWorktree.appendingPathComponent("current.swift").path]
+        )
+
+        let sessionID = UUID()
+        _ = try await prepared.context.prepareSessionRootOverlay(
+            sessionID: sessionID,
+            sourceSessionID: nil,
+            arguments: [
+                "worktree": .string("@branch:route-alternate"),
+                "inherit_worktree": .bool(false)
+            ],
+            connectionID: prepared.connectionID
+        )
+        let sessionSnapshot = try await prepared.context.snapshot(
+            connectionID: prepared.connectionID,
+            sessionID: sessionID
+        )
+        XCTAssertEqual(
+            sessionSnapshot.selection,
+            [fixture.alternateWorktree.appendingPathComponent("current.swift").path]
+        )
+
+        let security = await DirectHeadlessMCPService.securityContext(
+            prepared: prepared,
+            connection: DirectHeadlessMCPService.ConnectionContext(
+                connectionID: prepared.connectionID,
+                connectionGeneration: prepared.connectionGeneration,
+                principal: DomainClientPrincipal(
+                    principalID: UUID(),
+                    stableKey: "selection-symlink-name",
+                    displayName: "Selection symlink name",
+                    kind: .runScoped,
+                    assurance: .hostLaunchToken,
+                    processID: nil,
+                    runID: sessionID,
+                    provider: "test"
+                ),
+                policyProfile: .direct,
+                restrictedToolNames: [],
+                additionalToolNames: [],
+                ephemeralGrantedOperations: []
+            ),
+            invocationID: UUID()
+        )
+        let physicalSelection = fixture.alternateWorktree.appendingPathComponent("next.swift").path
+        _ = try await prepared.context.mutate(
+            request: DomainPhysicalToolRequest(argumentsJSON: Data(), securityContext: security),
+            mutation: .setSelection([physicalSelection])
+        )
+        let storedSnapshot = await prepared.runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        let persistedSnapshot = try XCTUnwrap(storedSnapshot)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: persistedSnapshot.document.documentBytes) as? [String: Any]
+        )
+        let tabs = try XCTUnwrap(object["composeTabs"] as? [[String: Any]])
+        XCTAssertEqual(
+            tabs.first?["selectedPaths"] as? [String],
+            [fixture.canonicalRepo.appendingPathComponent("next.swift").path]
+        )
+    }
+
     func testExplicitWorktreeSelectionRejectsSymlinkThatCollapsesSubdirectoryFence() async throws {
         let relativeRoot = "Packages/App"
         let fixture = try await makeSavedWorkspaceWorktreeFixture(workspaceRelativeRoot: relativeRoot)
