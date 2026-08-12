@@ -121,17 +121,22 @@ struct ContextBuilderFrozenOraclePack {
         )
         let data = try pack.canonicalData()
         let reservation = try await store.reserveArtifact(data)
-        let reference = try OracleFrozenPackReference(artifactID: reservation.artifactID)
-        let input = try OracleInput(
-            mode: oracleMode,
-            userMessage: prompt,
-            context: OracleContextEnvelope(
-                content: .durableArtifact(id: reservation.artifactID),
-                sha256: reservation.artifactID,
-                provenance: pack.provenance
+        do {
+            let reference = try OracleFrozenPackReference(artifactID: reservation.artifactID)
+            let input = try OracleInput(
+                mode: oracleMode,
+                userMessage: prompt,
+                context: OracleContextEnvelope(
+                    content: .durableArtifact(id: reservation.artifactID),
+                    sha256: reservation.artifactID,
+                    provenance: pack.provenance
+                )
             )
-        )
-        return Self(message: message, input: input, reference: reference, reservation: reservation, data: data)
+            return Self(message: message, input: input, reference: reference, reservation: reservation, data: data)
+        } catch {
+            try await store.releaseArtifactReservation(reservation, removeIfUnreferenced: true)
+            throw error
+        }
     }
 
     static func prompt(for mode: HeadlessMode, prompt: String) -> String {
