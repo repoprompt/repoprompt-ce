@@ -376,6 +376,43 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         XCTAssertEqual(counts.pendingRunContexts, 0)
     }
 
+    func testCredentialEnvelopeRejectsPartialOracleIdentity() async throws {
+        let runtime = makeRuntime(mode: .standalone, profile: "partial-envelope-identity")
+        defer { Task { await runtime.shutdown() } }
+        let groupID = OracleGroupID()
+        let laneID = try OracleLaneID(index: 0)
+        let claimID = UUID()
+        let launchID = UUID()
+        let identities: [(OracleGroupID?, OracleLaneID?, UUID?)] = [
+            (groupID, nil, nil),
+            (nil, laneID, nil),
+            (nil, nil, claimID),
+            (groupID, laneID, nil),
+            (groupID, nil, claimID),
+            (nil, laneID, claimID),
+        ]
+
+        for identity in identities {
+            let scope = DomainCredentialScope(
+                providerIdentifier: "fixture",
+                runID: UUID(),
+                launchID: launchID,
+                oracleGroupID: identity.0,
+                oracleLaneID: identity.1,
+                oracleGroupClaimID: identity.2,
+                principalID: UUID(),
+                purpose: "oracle-group"
+            )
+            await XCTAssertOracleLaunchThrowsErrorAsync {
+                _ = try await runtime.credentialEnvelopeStore.issue(bytes: [1], scope: scope)
+            } verify: {
+                XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .scopeMismatch)
+            }
+        }
+        let recordCount = await runtime.credentialEnvelopeStore.test_recordCount()
+        XCTAssertEqual(recordCount, 0)
+    }
+
     func testExpiredTokenIsSweptBeforeSameRunContextConflictCheck() async throws {
         let fixture = try await makeRuntimeWithContext(profile: "expired-context")
         defer { Task { await fixture.runtime.shutdown() } }

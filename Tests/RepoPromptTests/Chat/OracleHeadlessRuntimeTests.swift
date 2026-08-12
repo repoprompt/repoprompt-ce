@@ -271,6 +271,73 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
         XCTAssertEqual(Set(cancelledStreamIDs), Set(streamIDs))
         XCTAssertFalse(runtime.hasActiveStream(for: tabID))
     }
+
+    @MainActor
+    func testCancellationWhileSendPromptIsPendingCancelsReturnedStream() async throws {
+        let tabID = UUID()
+        let streamID = UUID()
+        let gate = OracleHeadlessSendPromptGate()
+        let started = expectation(description: "sendPrompt started")
+
+        let runtime = OracleHeadlessRuntime(
+            sendPrompt: { _, _ in
+                started.fulfill()
+                await gate.wait()
+                return (
+                    streamID,
+                    AsyncThrowingStream<ChatStreamOutput, Error> { $0.finish() }
+                )
+            },
+            cancelStream: { await gate.recordCancellation($0) },
+            cleanupConversation: { _, _ in }
+        )
+        let execution = Task { @MainActor in
+            try await runtime.execute(
+                message: AIMessage(systemPrompt: "system", userMessage: "prompt"),
+                model: .claude4Sonnet,
+                tabID: tabID,
+                completionPolicy: .interactive
+            )
+        }
+
+        await fulfillment(of: [started], timeout: 1)
+        await runtime.cancelStream(for: tabID)
+        await gate.release()
+        do {
+            _ = try await execution.value
+            XCTFail("Expected structural cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let cancelledStreamIDs = await gate.cancelledStreamIDs()
+        XCTAssertEqual(cancelledStreamIDs, [streamID])
+        XCTAssertFalse(runtime.hasActiveStream(for: tabID))
+    }
+}
+
+private actor OracleHeadlessSendPromptGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    private var cancellations: [ChatStreamID] = []
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func recordCancellation(_ streamID: ChatStreamID) {
+        cancellations.append(streamID)
+    }
+
+    func cancelledStreamIDs() -> [ChatStreamID] {
+        cancellations
+    }
 }
 
 private actor OracleHeadlessTestStreamController {
