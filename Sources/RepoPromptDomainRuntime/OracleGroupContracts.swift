@@ -75,6 +75,10 @@ package enum OracleRosterContract {
         }
         return try raws.map(normalizedModelID)
     }
+
+    package static func sanitizedAdditionalModelIDs(_ raws: [String]) -> [String] {
+        Array(raws.compactMap { try? normalizedModelID($0) }.prefix(maximumAdditionalCount))
+    }
 }
 
 /// Canonical settings descriptors consumed by both app-backed and direct adapters.
@@ -827,6 +831,28 @@ package extension OracleGroupDocument {
             roster: roster,
             members: members,
             turns: Array(turns.dropLast()) + [terminalTurn]
+        )
+    }
+
+    func settlingInterrupted(
+        status: OracleLaneResultStatus,
+        code: String,
+        message: String,
+        finishedAt: Date = Date()
+    ) throws -> Self {
+        let results = try members.map { member in
+            try OracleLaneResult(
+                laneIndex: member.laneID.index,
+                chatID: member.publicChatID,
+                providerID: member.model.providerID,
+                modelID: member.model.modelID,
+                status: status,
+                error: OracleLaneError(code: code, message: message)
+            )
+        }
+        return try settling(
+            OracleGroupResult(groupID: group.id, status: .failed, oracleResults: results),
+            finishedAt: finishedAt
         )
     }
 }

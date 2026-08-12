@@ -86,6 +86,22 @@ final class OracleGroupPersistenceTests: XCTestCase {
             try await fixture.store.create(group)
         }
 
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.rename(
+                groupID: groups[2].group.id,
+                owner: owner,
+                name: "Too early",
+                expectedRevision: groups[2].revision
+            )
+        } verify: {
+            XCTAssertEqual(
+                $0 as? OraclePersistenceError,
+                .invalidDocument("cannot_rename_prepared_group")
+            )
+        }
+        groups[2] = try terminalDocument(from: groups[2])
+        try await fixture.store.save(groups[2], expectedRevision: groups[2].revision - 1)
+
         try await fixture.store.rename(
             groupID: groups[2].group.id,
             owner: owner,
@@ -119,6 +135,24 @@ final class OracleGroupPersistenceTests: XCTestCase {
         } verify: {
             XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(artifactIDs[2]))
         }
+    }
+
+    func testDeleteAllGroupsRemovesOnlyTheRequestedOwnersGroups() async throws {
+        let fixture = makeStore(profile: "delete-all")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let owner = try OracleConversationOwner(kind: "workspace", identifier: "delete-all")
+        let otherOwner = try OracleConversationOwner(kind: "workspace", identifier: "retained")
+        let owned = try makeGroup(count: 2, seed: "owned", owner: owner)
+        let retained = try makeGroup(count: 2, seed: "retained", owner: otherOwner)
+        try await fixture.store.create(owned)
+        try await fixture.store.create(retained)
+
+        try await fixture.store.deleteAllGroups(owner: owner)
+
+        let deleted = try await fixture.store.load(groupID: owned.group.id, owner: owner)
+        let remaining = try await fixture.store.load(groupID: retained.group.id, owner: otherOwner)
+        XCTAssertNil(deleted)
+        XCTAssertNotNil(remaining)
     }
 
     func testDigestMismatchedArtifactFailsColdLoadClosed() async throws {
