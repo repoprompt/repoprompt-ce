@@ -6505,7 +6505,7 @@ actor ServerNetworkManager {
             collectMatchesForContextID: { contextID in
                 await MainActor.run {
                     WindowStatesManager.shared.allWindows.compactMap { windowState in
-                        guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
+                        guard let candidate = windowState.workspaceManager.storedBindingCandidate(forContextID: contextID) else {
                             return nil
                         }
                         return MCPContextBindingMatch(

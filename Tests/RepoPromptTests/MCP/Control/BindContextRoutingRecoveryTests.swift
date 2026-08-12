@@ -4,6 +4,101 @@ import MCP
 import XCTest
 
 final class BindContextRoutingRecoveryTests: XCTestCase {
+    @MainActor
+    func testContextIDBindIgnoresStaleAffinityToInactiveSavedWorkspace() async throws {
+        let contextID = UUID()
+        let target = workspace(name: "NickClaw", root: "/tmp/nickclaw", contextID: contextID)
+        let unrelated = workspace(name: "TTA", root: "/tmp/tta", contextID: UUID())
+        let staleWindow = try await makeWindow(activeWorkspace: unrelated, savedWorkspaces: [target])
+        let targetWindow = try await makeWindow(activeWorkspace: target)
+        let service = installWindows([staleWindow, targetWindow])
+        XCTAssertEqual(staleWindow.workspaceManager.activeWorkspaceID, unrelated.id)
+        XCTAssertNotNil(staleWindow.workspaceManager.composeTab(for: .init(
+            workspaceID: target.id,
+            tabID: contextID
+        )))
+
+        let resolved = try service.test_resolveContextIDBindTarget(
+            contextID: contextID,
+            connectionPreferredWindowID: staleWindow.windowID
+        )
+
+        XCTAssertEqual(resolved.windowID, targetWindow.windowID)
+        XCTAssertEqual(resolved.workspaceID, target.id)
+        XCTAssertEqual(resolved.repoPaths, target.repoPaths)
+    }
+
+    @MainActor
+    func testContextIDBindLowestWindowFallbackExcludesInactiveSavedWorkspace() async throws {
+        let contextID = UUID()
+        let target = workspace(name: "NickClaw", root: "/tmp/nickclaw", contextID: contextID)
+        let unrelated = workspace(name: "TTA", root: "/tmp/tta", contextID: UUID())
+        let staleWindow = try await makeWindow(activeWorkspace: unrelated, savedWorkspaces: [target])
+        let targetWindow = try await makeWindow(activeWorkspace: target)
+        let service = installWindows([staleWindow, targetWindow])
+        XCTAssertEqual(staleWindow.workspaceManager.activeWorkspaceID, unrelated.id)
+        XCTAssertNotNil(staleWindow.workspaceManager.composeTab(for: .init(
+            workspaceID: target.id,
+            tabID: contextID
+        )))
+
+        let resolved = try service.test_resolveContextIDBindTarget(
+            contextID: contextID,
+            connectionPreferredWindowID: nil
+        )
+
+        XCTAssertEqual(resolved.windowID, targetWindow.windowID)
+    }
+
+    @MainActor
+    func testContextIDBindPreservesActiveSameWorkspaceMultiWindowRouting() async throws {
+        let contextID = UUID()
+        let target = workspace(name: "Shared", root: "/tmp/shared", contextID: contextID)
+        let firstWindow = try await makeWindow(activeWorkspace: target)
+        let secondWindow = try await makeWindow(activeWorkspace: target)
+        let service = installWindows([firstWindow, secondWindow])
+
+        let preferred = try service.test_resolveContextIDBindTarget(
+            contextID: contextID,
+            connectionPreferredWindowID: secondWindow.windowID
+        )
+        XCTAssertEqual(preferred.windowID, secondWindow.windowID)
+        XCTAssertEqual(preferred.workspaceID, target.id)
+        XCTAssertEqual(preferred.tabID, contextID)
+
+        let lowest = try service.test_resolveContextIDBindTarget(
+            contextID: contextID,
+            connectionPreferredWindowID: nil
+        )
+        XCTAssertEqual(
+            lowest.windowID,
+            min(firstWindow.windowID, secondWindow.windowID)
+        )
+    }
+
+    @MainActor
+    func testContextIDBindFailsClosedWhenContextExistsOnlyInInactiveWorkspace() async throws {
+        let contextID = UUID()
+        let target = workspace(name: "NickClaw", root: "/tmp/nickclaw", contextID: contextID)
+        let unrelated = workspace(name: "TTA", root: "/tmp/tta", contextID: UUID())
+        let staleWindow = try await makeWindow(activeWorkspace: unrelated, savedWorkspaces: [target])
+        let service = installWindows([staleWindow])
+        XCTAssertEqual(staleWindow.workspaceManager.activeWorkspaceID, unrelated.id)
+        XCTAssertNotNil(staleWindow.workspaceManager.composeTab(for: .init(
+            workspaceID: target.id,
+            tabID: contextID
+        )))
+
+        XCTAssertThrowsError(try service.test_resolveContextIDBindTarget(
+            contextID: contextID,
+            connectionPreferredWindowID: staleWindow.windowID
+        )) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("No open RepoPrompt window actively shows context_id"), message)
+            XCTAssertTrue(message.contains("working_dirs"), message)
+        }
+    }
+
     func testBindContextParsesWorkingDirsAndPrefersSelectedWindow() throws {
         let projectSourcePath = "/Users/repoprompt-test/project/Sources"
         let request = try WindowRoutingService.parseBindContextRequest([
@@ -89,5 +184,48 @@ final class BindContextRoutingRecoveryTests: XCTestCase {
         let root = try RepoRoot.url()
         let url = root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
         return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    private func workspace(name: String, root: String, contextID: UUID) -> WorkspaceModel {
+        WorkspaceModel(
+            name: name,
+            repoPaths: [root],
+            composeTabs: [ComposeTabState(id: contextID, name: "Context")],
+            activeComposeTabID: contextID
+        )
+    }
+
+    @MainActor
+    private func makeWindow(
+        activeWorkspace: WorkspaceModel,
+        savedWorkspaces: [WorkspaceModel] = []
+    ) async throws -> WindowState {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        window.workspaceManager.workspaces = [activeWorkspace] + savedWorkspaces
+        let result = await window.workspaceManager.switchWorkspace(
+            to: activeWorkspace,
+            saveState: false,
+            reason: "bindContextRoutingRecoveryTest"
+        )
+        guard result.didSwitch else {
+            throw XCTSkip("Could not activate test workspace")
+        }
+        return window
+    }
+
+    @MainActor
+    private func installWindows(_ windows: [WindowState]) -> WindowRoutingService {
+        let previousWindows = WindowStatesManager.shared.allWindows
+        WindowStatesManager.shared.allWindows = windows
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.allWindows = previousWindows
+        }
+        return WindowRoutingService(
+            windowStates: WindowStatesManager.shared,
+            networkMgr: ServerNetworkManager.shared
+        )
     }
 }

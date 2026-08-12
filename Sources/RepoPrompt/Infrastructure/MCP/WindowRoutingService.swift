@@ -1672,25 +1672,43 @@ final class WindowRoutingService: Service {
 
         guard !matches.isEmpty else {
             if let windowID {
-                throw MCPError.invalidParams("Window \(windowID) does not host context_id '\(contextID.uuidString)'.")
+                throw MCPError.invalidParams("Window \(windowID) does not actively show context_id '\(contextID.uuidString)'. Bind with working_dirs for the desired workspace's absolute roots, or use bind_context op=list to discover active context_id values.")
             }
-            throw MCPError.invalidParams("No RepoPrompt context matches context_id '\(contextID.uuidString)'. Use bind_context op=list to discover available context_id values.")
+            throw MCPError.invalidParams("No open RepoPrompt window actively shows context_id '\(contextID.uuidString)'. Bind with working_dirs for the desired workspace's absolute roots, or use bind_context op=list to discover active context_id values.")
         }
 
-        if matches.count == 1 {
-            return matches[0]
+        guard let targetWindowID = Self.preferredContextIDBindWindowID(
+            matchingWindowIDs: matches.map(\.windowID),
+            connectionPreferredWindowID: connectionPreferredWindowID
+        ), let target = matches.first(where: { $0.windowID == targetWindowID }) else {
+            throw MCPError.internalError("Failed to select an active context_id bind target.")
         }
+        return target
+    }
 
-        // Same logical tab visible in multiple windows.
-        // Prefer the connection's current window to avoid silently rebinding.
+    private nonisolated static func preferredContextIDBindWindowID(
+        matchingWindowIDs: [Int],
+        connectionPreferredWindowID: Int?
+    ) -> Int? {
+        guard !matchingWindowIDs.isEmpty else { return nil }
         if let connectionPreferredWindowID,
-           let preferred = matches.first(where: { $0.windowID == connectionPreferredWindowID })
+           matchingWindowIDs.contains(connectionPreferredWindowID)
         {
-            return preferred
+            return connectionPreferredWindowID
         }
+        return matchingWindowIDs.min()
+    }
 
-        // Fall back to deterministic selection (lowest window ID).
-        return matches.sorted(by: { $0.windowID < $1.windowID })[0]
+    func test_resolveContextIDBindTarget(
+        contextID: UUID,
+        connectionPreferredWindowID: Int?
+    ) throws -> (windowID: Int, workspaceID: UUID, tabID: UUID, repoPaths: [String]) {
+        let target = try resolveContextIDBindTarget(
+            contextID: contextID,
+            windowID: nil,
+            connectionPreferredWindowID: connectionPreferredWindowID
+        )
+        return (target.windowID, target.workspaceID, target.tabID, target.repoPaths)
     }
 
     private func resolveWorkingDirsBindTarget(
