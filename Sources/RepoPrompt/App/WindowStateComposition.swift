@@ -31,6 +31,7 @@ enum WindowStateCompositionFactory {
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
+        settingsStore: GlobalSettingsStore = .shared,
         domainRuntime: MCPDomainRuntime? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
@@ -65,7 +66,7 @@ enum WindowStateCompositionFactory {
         )
 
         // 5) Settings Manager (per-window overlay)
-        let settingsManager = WindowSettingsManager(windowID: windowID)
+        let settingsManager = WindowSettingsManager(windowID: windowID, store: settingsStore)
 
         // 6) Prompt
         let promptManager = PromptViewModel(
@@ -157,6 +158,7 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
+            settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
             codexModelPollingService: codexModelPollingService
         )
