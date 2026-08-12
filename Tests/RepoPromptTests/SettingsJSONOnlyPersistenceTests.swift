@@ -1059,11 +1059,11 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertEqual(
             decoded.agentModelsSettings[workspaceID]?.profile?.additionalOracleModelRaws,
-            ["one", "two", "three"]
+            ["one", "two", "three", "four"]
         )
         XCTAssertEqual(
             decoded.scalarPreferences?.modelSelection?.additionalOracleModels,
-            ["alpha", "beta", "gamma"]
+            ["alpha", "beta", "gamma", "delta"]
         )
     }
 
