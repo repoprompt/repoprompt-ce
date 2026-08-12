@@ -329,6 +329,15 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             XCTAssertEqual(kill(pid, 0), -1, "provider process still alive: \(pid)")
             XCTAssertEqual(errno, ESRCH)
         }
+        let owner = try OracleConversationOwner(
+            kind: "direct-headless",
+            identifier: fixture.profileName
+        )
+        guard case let .group(group)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
+            return XCTFail("Expected the cancelled Oracle group to remain durable")
+        }
+        XCTAssertEqual(group.turns.last?.state, .terminal)
+        XCTAssertEqual(group.turns.last?.results.map(\.status), [.cancelled, .cancelled])
     }
 
     private static func setRoster(
