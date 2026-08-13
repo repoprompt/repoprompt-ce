@@ -250,6 +250,84 @@ struct AgentModeSessionsSidebarView: View {
 
 // MARK: - Sessions List
 
+private struct AgentSidebarSelectionRenderIdentity: Equatable {
+    let workspaceID: UUID?
+    let renderedOrder: [AgentSidebarSelectionIdentity]
+}
+
+/// Compact, evenly-sized pill used for the sidebar bulk-action row. Renders an
+/// SF Symbol plus the affected-chat count and matches the app's plain,
+/// `fontPreset`-scaled chip language rather than bordered system buttons.
+private struct BulkActionChip: View {
+    let systemImage: String
+    let verb: String
+    let count: Int
+    var isDestructive = false
+    var tooltip: String?
+    let action: () -> Void
+
+    @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var isHovered = false
+    private var fontPreset: FontScalePreset {
+        fontScale.preset
+    }
+
+    private var cornerRadius: CGFloat {
+        fontPreset.scaledClamped(8, max: 11)
+    }
+
+    private var horizontalPadding: CGFloat {
+        fontPreset.scaledClamped(6, max: 9)
+    }
+
+    private var verticalPadding: CGFloat {
+        fontPreset.scaledClamped(5, max: 7)
+    }
+
+    private var iconSize: CGFloat {
+        fontPreset.scaledClamped(11, max: 14)
+    }
+
+    private var fillColor: Color {
+        if isDestructive {
+            return Color.red.opacity(isHovered ? 0.22 : 0.12)
+        }
+        return Color(NSColor.labelColor).opacity(isHovered ? 0.14 : 0.07)
+    }
+
+    private var foreground: Color {
+        if isDestructive { return .red }
+        return isHovered ? Color(NSColor.labelColor) : .secondary
+    }
+
+    private var accessibilityText: String {
+        "\(verb) \(count) \(count == 1 ? "chat" : "chats")"
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: iconSize, weight: .semibold))
+                Text("\(count)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, verticalPadding)
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(fillColor)
+            )
+            .foregroundStyle(foreground)
+            .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .hoverTooltip(tooltip ?? verb)
+        .accessibilityLabel(accessibilityText)
+    }
+}
+
 struct AgentModeSessionsListView: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
@@ -257,6 +335,7 @@ struct AgentModeSessionsListView: View {
     let currentTabID: UUID?
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
+    @State private var showingBulkDeleteConfirmation = false
     @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
     private var showComposeTabsWithoutAgentSessions = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -296,188 +375,458 @@ struct AgentModeSessionsListView: View {
         fontPreset.scaledClamped(4, max: 6)
     }
 
+    private var bulkBarRowSpacing: CGFloat {
+        fontPreset.scaledClamped(8, max: 10)
+    }
+
+    private var bulkChipSpacing: CGFloat {
+        fontPreset.scaledClamped(6, max: 8)
+    }
+
+    private var bulkBarInnerHorizontalPadding: CGFloat {
+        fontPreset.scaledClamped(10, max: 14)
+    }
+
+    private var bulkBarInnerVerticalPadding: CGFloat {
+        fontPreset.scaledClamped(8, max: 11)
+    }
+
+    private var bulkBarCornerRadius: CGFloat {
+        fontPreset.scaledClamped(12, max: 16)
+    }
+
     var body: some View {
         #if DEBUG
             let _ = Self.recordBodyMetric()
         #endif
         let sidebarSnapshot = sidebarUI.snapshot
+        let activeWorkspaceID = agentModeVM.workspaceManager?.activeWorkspaceID
+        let workspaceSnapshot = promptManager.sidebarWorkspaceSnapshot.flatMap { snapshot in
+            activeWorkspaceID == snapshot.workspaceID ? snapshot : nil
+        }
         let snapshot = agentModeVM.sidebarListProjection(
-            composeTabs: promptManager.currentComposeTabs,
-            stashedTabs: promptManager.currentStashedTabs,
+            workspaceID: workspaceSnapshot?.workspaceID,
+            composeTabs: workspaceSnapshot?.composeTabs ?? [],
+            stashedTabs: workspaceSnapshot?.stashedTabs ?? [],
             currentTabID: currentTabID,
             sidebarSnapshot: sidebarSnapshot,
             archivedSessionsExpanded: archivedSessionsExpanded,
             showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions
         )
+        let selectionRenderIdentity = AgentSidebarSelectionRenderIdentity(
+            workspaceID: snapshot.workspaceID,
+            renderedOrder: snapshot.renderedSelectionOrder
+        )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
         let firstActiveSectionID = activeSections.first?.id
-        ScrollView {
-            VStack(spacing: listRowSpacing) {
-                ForEach(activeSections) { section in
-                    AgentSidebarDateSectionHeader(
-                        title: section.bucket.title,
-                        isFirst: section.id == firstActiveSectionID
+        let selectionState = sidebarUI.selectionState
+        VStack(spacing: 4) {
+            if selectionState.isSelectionMode {
+                if let bulkTargets = agentModeVM.sidebarBulkMutationTargets(
+                    selection: selectionState.selectedIdentities,
+                    selectionWorkspaceID: selectionState.workspaceID,
+                    projection: snapshot,
+                    composeTabs: workspaceSnapshot?.composeTabs ?? [],
+                    stashedTabs: workspaceSnapshot?.stashedTabs ?? []
+                ) {
+                    bulkActionBar(
+                        selectionState: selectionState,
+                        targets: bulkTargets,
+                        renderedOrder: snapshot.renderedSelectionOrder
                     )
-
-                    ForEach(section.groups) { group in
-                        ForEach(group.rows, id: \.id) { session in
-                            let hasAgentSession = session.sessionID != nil
-                            let runState: AgentSessionRunState = hasAgentSession
-                                ? agentModeVM.runState(for: session.tabID)
-                                : .idle
-                            let attentionRunState: AgentSessionRunState? = hasAgentSession
-                                ? sidebarUI.snapshot.attentionRunStateByTabID[session.tabID]
-                                : nil
-                            let toggleThreadAction: (() -> Void)? = session.hasThreadChildren
-                                ? { agentModeVM.requestSidebarThreadDisclosureToggle(for: session) }
-                                : nil
-                            // Archived Sessions excludes tabs without indexed conversation content,
-                            // so stashing a session-less tab would hide it from both sidebar lists.
-                            let stashAction: (() -> Void)? = hasAgentSession
-                                ? { Task { await promptManager.stashTab(session.tabID) } }
-                                : nil
-                            let dismissAttentionAction: (() -> Void)? = hasAgentSession
-                                ? { agentModeVM.dismissSidebarRunAttention(tabID: session.tabID) }
-                                : nil
-
-                            AgentSessionRow(
-                                title: session.title,
-                                isActive: session.tabID == currentTabID,
-                                isPinned: session.isPinned,
-                                isMCPControlled: session.isMCPControlled,
-                                runState: runState,
-                                attentionRunState: attentionRunState,
-                                worktree: session.worktree,
-                                worktreeMergeAttention: session.worktreeMergeAttention,
-                                threadDepth: session.depth,
-                                hasThreadChildren: session.hasThreadChildren,
-                                isThreadCollapsed: session.isThreadCollapsed,
-                                hiddenThreadDescendantCount: session.hiddenThreadDescendantCount,
-                                hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
-                                onToggleThreadCollapse: toggleThreadAction,
-                                onSelect: {
-                                    Task { await promptManager.switchComposeTab(session.tabID) }
-                                },
-                                onTogglePin: {
-                                    promptManager.toggleComposeTabPinned(session.tabID)
-                                },
-                                onStash: stashAction,
-                                onDelete: {
-                                    #if DEBUG
-                                        agentModeVM.debugBeginSidebarDeleteRequest(
-                                            tabID: session.tabID,
-                                            source: "AgentSessionsSidebarView.rowDelete",
-                                            reason: "row_delete_confirmation"
-                                        )
-                                    #endif
-                                    Task { await promptManager.closeComposeTab(session.tabID) }
-                                },
-                                onRename: { newName in
-                                    agentModeVM.renameSession(tabID: session.tabID, to: newName)
-                                },
-                                onDismissAttention: dismissAttentionAction
-                            )
-                        }
-                    }
                 }
-
-                if snapshot.hasMoreSessions {
-                    Button {
-                        agentModeVM.showMoreSidebarSessions()
-                    } label: {
-                        Text("Show more (\(snapshot.remainingSessionCount))")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, showMoreHorizontalPadding)
-                    .padding(.vertical, showMoreVerticalPadding)
-                    .foregroundColor(.accentColor)
-                }
-
-                if !snapshot.archivedSessionTabsForHeader.isEmpty {
-                    Divider()
-                        .padding(.vertical, dividerVerticalPadding)
-
-                    VStack(spacing: listRowSpacing) {
-                        HStack(spacing: archivedHeaderSpacing) {
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    archivedSessionsExpanded.toggle()
-                                }
-                            } label: {
-                                HStack(spacing: archivedHeaderSpacing) {
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: fontPreset.scaledClamped(11, max: 14), weight: .semibold))
-                                        .foregroundStyle(.secondary)
-                                        .rotationEffect(.degrees(archivedSessionsExpanded ? 90 : 0))
-                                        .animation(.easeInOut(duration: 0.15), value: archivedSessionsExpanded)
-                                    Image(systemName: "archivebox")
-                                        .font(.system(size: fontPreset.scaledClamped(13, max: 16)))
-                                        .foregroundStyle(.secondary)
-                                    Text("Archived Sessions")
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                                        .foregroundStyle(.secondary)
-                                    Text("\(snapshot.archivedSessionTabsForHeader.count)")
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                        .foregroundStyle(.tertiary)
-                                    Spacer()
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            Button("Clear…") {
-                                showingClearArchivedConfirmation = true
-                            }
-                            .buttonStyle(.plain)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                            .popover(isPresented: $showingClearArchivedConfirmation, arrowEdge: .bottom) {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    Text("Clear archived sessions?")
-                                        .font(.headline)
-                                    Text("This removes \(snapshot.archivedSessionTabsForHeader.count) archived sessions from stashed tabs.")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                    HStack {
-                                        Spacer()
-                                        Button("Cancel") {
-                                            showingClearArchivedConfirmation = false
-                                        }
-                                        Button("Clear") {
-                                            showingClearArchivedConfirmation = false
-                                            Task {
-                                                await promptManager.deleteStashedTabs(withIDs: Set(snapshot.archivedSessionTabsForHeader.map(\.id)))
-                                            }
-                                        }
-                                        .keyboardShortcut(.defaultAction)
-                                    }
-                                }
-                                .padding()
-                                .frame(width: 300)
-                            }
-                        }
-                        .padding(.horizontal, archivedHeaderHorizontalPadding)
-                        .padding(.bottom, archivedHeaderBottomPadding)
-
-                        if archivedSessionsExpanded {
-                            ArchivedSessionsPagedList(
-                                allTabs: snapshot.sortedArchivedSessionTabsForRows,
-                                isSearching: !sidebarUI.snapshot.searchText.isEmpty,
-                                dateInfoByStashedTabID: snapshot.archivedDateInfoByStashedTabID,
-                                agentModeVM: agentModeVM,
-                                promptManager: promptManager
-                            )
-                        }
-                    }
-                }
+            } else if let notice = selectionState.notice {
+                bulkNotice(notice)
+                    .padding(.horizontal, listHorizontalPadding)
+                    .padding(.top, 4)
             }
-            .padding(.horizontal, listHorizontalPadding)
+            ScrollView {
+                VStack(spacing: listRowSpacing) {
+                    ForEach(activeSections) { section in
+                        AgentSidebarDateSectionHeader(
+                            title: section.bucket.title,
+                            isFirst: section.id == firstActiveSectionID
+                        )
+
+                        ForEach(section.groups) { group in
+                            ForEach(group.rows, id: \.id) { session in
+                                let hasAgentSession = session.sessionID != nil
+                                let runState: AgentSessionRunState = hasAgentSession
+                                    ? agentModeVM.runState(for: session.tabID)
+                                    : .idle
+                                let attentionRunState: AgentSessionRunState? = hasAgentSession
+                                    ? sidebarUI.snapshot.attentionRunStateByTabID[session.tabID]
+                                    : nil
+                                let toggleThreadAction: (() -> Void)? = session.hasThreadChildren
+                                    ? { agentModeVM.requestSidebarThreadDisclosureToggle(for: session) }
+                                    : nil
+                                let stashAction: (() -> Void)? = session.canStash
+                                    ? { performSingleActiveBulkAction(.stash, tabID: session.tabID, workspaceID: snapshot.workspaceID) }
+                                    : nil
+                                let dismissAttentionAction: (() -> Void)? = hasAgentSession
+                                    ? {
+                                        guard agentModeVM.workspaceManager?.activeWorkspaceID == snapshot.workspaceID else { return }
+                                        agentModeVM.dismissSidebarRunAttention(tabID: session.tabID)
+                                    }
+                                    : nil
+
+                                AgentSessionRow(
+                                    title: session.title,
+                                    isActive: session.tabID == currentTabID,
+                                    isPinned: session.isPinned,
+                                    isMCPControlled: session.isMCPControlled,
+                                    runState: runState,
+                                    attentionRunState: attentionRunState,
+                                    worktree: session.worktree,
+                                    worktreeMergeAttention: session.worktreeMergeAttention,
+                                    threadDepth: session.depth,
+                                    hasThreadChildren: session.hasThreadChildren,
+                                    isThreadCollapsed: session.isThreadCollapsed,
+                                    hiddenThreadDescendantCount: session.hiddenThreadDescendantCount,
+                                    hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
+                                    onToggleThreadCollapse: toggleThreadAction,
+                                    isSelected: selectionState.selectedIdentities.contains(.active(tabID: session.tabID)),
+                                    isSelectionMode: selectionState.isSelectionMode,
+                                    isSelectionEnabled: selectionState.inFlightAction == nil,
+                                    onSelectionGesture: { gesture in
+                                        agentModeVM.handleSidebarSelectionGesture(
+                                            gesture,
+                                            identity: .active(tabID: session.tabID),
+                                            renderedOrder: snapshot.renderedSelectionOrder,
+                                            workspaceID: snapshot.workspaceID
+                                        )
+                                    },
+                                    onSelect: {
+                                        Task {
+                                            guard agentModeVM.workspaceManager?.activeWorkspaceID == snapshot.workspaceID else { return }
+                                            await promptManager.switchComposeTab(session.tabID)
+                                        }
+                                    },
+                                    onTogglePin: {
+                                        performSingleActiveBulkAction(
+                                            session.isPinned ? .unpin : .pin,
+                                            tabID: session.tabID,
+                                            workspaceID: snapshot.workspaceID
+                                        )
+                                    },
+                                    onStash: stashAction,
+                                    onDelete: {
+                                        #if DEBUG
+                                            agentModeVM.debugBeginSidebarDeleteRequest(
+                                                tabID: session.tabID,
+                                                source: "AgentSessionsSidebarView.rowDelete",
+                                                reason: "row_delete_confirmation"
+                                            )
+                                        #endif
+                                        performSingleActiveBulkAction(.delete, tabID: session.tabID, workspaceID: snapshot.workspaceID)
+                                    },
+                                    onRename: { newName in
+                                        guard agentModeVM.workspaceManager?.activeWorkspaceID == snapshot.workspaceID else { return }
+                                        agentModeVM.renameSession(tabID: session.tabID, to: newName)
+                                    },
+                                    onDismissAttention: dismissAttentionAction
+                                )
+                            }
+                        }
+                    }
+
+                    if snapshot.hasMoreSessions {
+                        Button {
+                            agentModeVM.showMoreSidebarSessions()
+                        } label: {
+                            Text("Show more (\(snapshot.remainingSessionCount))")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, showMoreHorizontalPadding)
+                        .padding(.vertical, showMoreVerticalPadding)
+                        .foregroundColor(.accentColor)
+                    }
+
+                    if !snapshot.archivedSessionTabsForHeader.isEmpty {
+                        Divider()
+                            .padding(.vertical, dividerVerticalPadding)
+
+                        VStack(spacing: listRowSpacing) {
+                            HStack(spacing: archivedHeaderSpacing) {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        archivedSessionsExpanded.toggle()
+                                    }
+                                } label: {
+                                    HStack(spacing: archivedHeaderSpacing) {
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: fontPreset.scaledClamped(11, max: 14), weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                            .rotationEffect(.degrees(archivedSessionsExpanded ? 90 : 0))
+                                            .animation(.easeInOut(duration: 0.15), value: archivedSessionsExpanded)
+                                        Image(systemName: "archivebox")
+                                            .font(.system(size: fontPreset.scaledClamped(13, max: 16)))
+                                            .foregroundStyle(.secondary)
+                                        Text("Archived Sessions")
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                        Text("\(snapshot.archivedSessionTabsForHeader.count)")
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                            .foregroundStyle(.tertiary)
+                                        Spacer()
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                Button("Clear…") {
+                                    showingClearArchivedConfirmation = true
+                                }
+                                .buttonStyle(.plain)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                                .disabled(selectionState.isSelectionMode)
+                                .popover(isPresented: $showingClearArchivedConfirmation, arrowEdge: .bottom) {
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        Text("Clear archived sessions?")
+                                            .font(.headline)
+                                        Text("This permanently deletes \(snapshot.archivedSessionTabsForHeader.count) archived sessions. Related active and archived sub-agent chats may also be deleted.")
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                        HStack {
+                                            Spacer()
+                                            Button("Cancel") {
+                                                showingClearArchivedConfirmation = false
+                                            }
+                                            Button("Clear") {
+                                                showingClearArchivedConfirmation = false
+                                                guard let workspaceID = snapshot.workspaceID else { return }
+                                                let archivedTargets = Set(snapshot.archivedSessionTabsForHeader.map {
+                                                    PromptViewModel.ArchivedTabMutationTarget(
+                                                        stashedTabID: $0.id,
+                                                        tabID: $0.tab.id
+                                                    )
+                                                })
+                                                performBulkAction(.delete, targets: .init(
+                                                    workspaceID: workspaceID,
+                                                    activeDeleteTabIDs: [],
+                                                    archivedDeleteTargets: archivedTargets,
+                                                    stashTabIDs: [],
+                                                    pinTabIDs: [],
+                                                    unpinTabIDs: []
+                                                ))
+                                            }
+                                            .keyboardShortcut(.defaultAction)
+                                        }
+                                    }
+                                    .padding()
+                                    .frame(width: 300)
+                                }
+                            }
+                            .padding(.horizontal, archivedHeaderHorizontalPadding)
+                            .padding(.bottom, archivedHeaderBottomPadding)
+
+                            if archivedSessionsExpanded {
+                                ArchivedSessionsList(
+                                    tabs: snapshot.pagedArchivedSessionTabsForRows,
+                                    hasMore: snapshot.hasMoreArchivedSessions,
+                                    remainingCount: snapshot.remainingArchivedSessionCount,
+                                    dateInfoByStashedTabID: snapshot.archivedDateInfoByStashedTabID,
+                                    workspaceID: snapshot.workspaceID,
+                                    selectionState: selectionState,
+                                    renderedOrder: snapshot.renderedSelectionOrder,
+                                    agentModeVM: agentModeVM,
+                                    promptManager: promptManager
+                                )
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, listHorizontalPadding)
+            }
+        }
+        .id(snapshot.workspaceID)
+        .task(id: activeWorkspaceID) {
+            showingClearArchivedConfirmation = false
+            showingBulkDeleteConfirmation = false
         }
         .task(id: defaultCollapseSeedKeys) {
             agentModeVM.seedDefaultCollapsedSidebarThreads(defaultCollapseSeedKeys)
+        }
+        .task(id: selectionRenderIdentity) {
+            sidebarUI.reconcileSelection(
+                renderedOrder: selectionRenderIdentity.renderedOrder,
+                workspaceID: selectionRenderIdentity.workspaceID
+            )
+            if snapshot.renderedSelectionOrder.isEmpty { showingBulkDeleteConfirmation = false }
+        }
+    }
+
+    private func bulkActionBar(
+        selectionState: AgentSidebarSelectionState,
+        targets: AgentModeViewModel.SidebarBulkMutationTargets,
+        renderedOrder: [AgentSidebarSelectionIdentity]
+    ) -> some View {
+        let selectedCount = selectionState.selectedIdentities.count
+        let deleteCount = targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
+        let isBusy = selectionState.inFlightAction != nil
+        let canSelectAll = !isBusy && selectedCount != renderedOrder.count
+        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+            HStack(spacing: 8) {
+                Text("\(selectedCount) selected")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 8)
+                Button("Select All") {
+                    sidebarUI.selectAll(renderedOrder: renderedOrder, workspaceID: targets.workspaceID)
+                }
+                .buttonStyle(.plain)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                .foregroundStyle(canSelectAll ? Color.accentColor : Color.secondary.opacity(0.5))
+                .disabled(!canSelectAll)
+                Button("Cancel") { sidebarUI.clearSelection() }
+                    .buttonStyle(.plain)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    .foregroundStyle(isBusy ? Color.secondary.opacity(0.5) : .secondary)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isBusy)
+            }
+
+            if let operation = selectionState.inFlightAction {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) chats…")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+            } else {
+                HStack(spacing: bulkChipSpacing) {
+                    if !targets.pinTabIDs.isEmpty {
+                        BulkActionChip(systemImage: "pin", verb: "Pin", count: targets.pinTabIDs.count) {
+                            performBulkAction(.pin, targets: targets)
+                        }
+                    }
+                    if !targets.unpinTabIDs.isEmpty {
+                        BulkActionChip(systemImage: "pin.slash", verb: "Unpin", count: targets.unpinTabIDs.count) {
+                            performBulkAction(.unpin, targets: targets)
+                        }
+                    }
+                    if !targets.stashTabIDs.isEmpty {
+                        BulkActionChip(
+                            systemImage: "tray.and.arrow.down",
+                            verb: "Stash",
+                            count: targets.stashTabIDs.count,
+                            tooltip: "Stash — related sub-agent chats may also be stashed"
+                        ) {
+                            performBulkAction(.stash, targets: targets)
+                        }
+                    }
+                    BulkActionChip(
+                        systemImage: "trash",
+                        verb: "Delete",
+                        count: deleteCount,
+                        isDestructive: true
+                    ) {
+                        showingBulkDeleteConfirmation = true
+                    }
+                    .popover(isPresented: $showingBulkDeleteConfirmation, arrowEdge: .bottom) {
+                        bulkDeleteConfirmation(targets: targets)
+                    }
+                }
+            }
+
+            if let notice = selectionState.notice { bulkNotice(notice) }
+        }
+        .padding(.horizontal, bulkBarInnerHorizontalPadding)
+        .padding(.vertical, bulkBarInnerVerticalPadding)
+        .background(
+            RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                .fill(Color(NSColor.systemGray).opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                        .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
+                )
+        )
+        .padding(.horizontal, listHorizontalPadding)
+        .padding(.top, 4)
+    }
+
+    @ViewBuilder
+    private func bulkDeleteConfirmation(targets: AgentModeViewModel.SidebarBulkMutationTargets) -> some View {
+        let count = targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Delete \(count) chats?").font(.headline)
+            Text("This permanently deletes \(targets.activeDeleteTabIDs.count) active chats and \(targets.archivedDeleteTargets.count) archived chats. Related sub-agent chats may also be removed. This cannot be undone.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { showingBulkDeleteConfirmation = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Delete", role: .destructive) {
+                    showingBulkDeleteConfirmation = false
+                    performBulkAction(.delete, targets: targets)
+                }
+            }
+        }
+        .padding()
+        .frame(width: 340)
+    }
+
+    private func bulkNotice(_ notice: AgentSidebarBulkActionNotice) -> some View {
+        let presentation: (icon: String, color: Color, accessibilityPrefix: String) = switch notice.severity {
+        case .error:
+            ("exclamationmark.triangle.fill", .red, "Error")
+        case .warning:
+            ("exclamationmark.triangle", .orange, "Warning")
+        case .information:
+            ("info.circle", .secondary, "Information")
+        }
+        return HStack(alignment: .top, spacing: 6) {
+            Image(systemName: presentation.icon)
+                .font(.system(size: fontPreset.scaledClamped(11, max: 14)))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.title).font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                Text(notice.message).font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(presentation.accessibilityPrefix): \(notice.title). \(notice.message)")
+            Spacer(minLength: 0)
+            Button { sidebarUI.dismissBulkActionNotice() } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .font(.system(size: fontPreset.scaledClamped(10, max: 13)))
+                .accessibilityLabel("Dismiss bulk action notice")
+        }
+        .foregroundStyle(presentation.color)
+    }
+
+    private func performSingleActiveBulkAction(
+        _ action: AgentSidebarBulkActionKind,
+        tabID: UUID,
+        workspaceID: UUID?
+    ) {
+        guard let workspaceID else { return }
+        performBulkAction(action, targets: .init(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: action == .delete ? [tabID] : [],
+            archivedDeleteTargets: [],
+            stashTabIDs: action == .stash ? [tabID] : [],
+            pinTabIDs: action == .pin ? [tabID] : [],
+            unpinTabIDs: action == .unpin ? [tabID] : []
+        ))
+    }
+
+    private func performBulkAction(
+        _ action: AgentSidebarBulkActionKind,
+        targets: AgentModeViewModel.SidebarBulkMutationTargets
+    ) {
+        Task {
+            await agentModeVM.performSidebarBulkAction(
+                action,
+                targets: targets,
+                promptManager: promptManager
+            )
         }
     }
 
@@ -728,100 +1077,95 @@ enum AgentSidebarDateSectionBuilder {
     }
 }
 
-// MARK: - Archived Sessions Paged List
+// MARK: - Archived Sessions List
 
-/// Paginated list of archived (stashed) agent sessions.
-/// Owns its own page count so the parent view doesn't recompute on every page tap.
-/// When `isSearching` is true, all matching tabs are shown without pagination.
-struct ArchivedSessionsPagedList: View {
-    let allTabs: [StashedTab]
-    let isSearching: Bool
+struct ArchivedSessionsList: View {
+    let tabs: [StashedTab]
+    let hasMore: Bool
+    let remainingCount: Int
     let dateInfoByStashedTabID: [UUID: AgentModeViewModel.SidebarSessionDateInfo]
+    let workspaceID: UUID?
+    let selectionState: AgentSidebarSelectionState
+    let renderedOrder: [AgentSidebarSelectionIdentity]
     let agentModeVM: AgentModeViewModel
     @ObservedObject var promptManager: PromptViewModel
-    @State private var visibleCount = 20
     @ObservedObject private var fontScale = FontScaleManager.shared
-    private static let pageSize = 20
+
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
 
-    private var rowSpacing: CGFloat {
-        fontPreset.scaledClamped(2, max: 3)
-    }
-
-    private var showMoreHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(10, max: 14)
-    }
-
-    private var showMoreVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(8, max: 12)
-    }
-
-    private var topPadding: CGFloat {
-        fontPreset.scaledClamped(4, max: 6)
-    }
-
-    private var displayedTabs: ArraySlice<StashedTab> {
-        isSearching ? allTabs[...] : allTabs.prefix(visibleCount)
-    }
-
-    private var hasMore: Bool {
-        !isSearching && allTabs.count > visibleCount
+    private func deleteArchived(_ stashed: StashedTab) {
+        guard let workspaceID else { return }
+        let target = PromptViewModel.ArchivedTabMutationTarget(
+            stashedTabID: stashed.id,
+            tabID: stashed.tab.id
+        )
+        let targets = AgentModeViewModel.SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: [],
+            archivedDeleteTargets: [target],
+            stashTabIDs: [],
+            pinTabIDs: [],
+            unpinTabIDs: []
+        )
+        Task {
+            await agentModeVM.performSidebarBulkAction(.delete, targets: targets, promptManager: promptManager)
+        }
     }
 
     var body: some View {
-        #if DEBUG
-            let _ = Self.recordBodyMetric()
-        #endif
         let sections = AgentSidebarDateSectionBuilder.archivedSections(
-            for: Array(displayedTabs),
-            dateInfo: { stashed in
-                dateInfoByStashedTabID[stashed.id] ?? agentModeVM.archivedSessionDateInfo(for: stashed)
-            }
+            for: tabs,
+            dateInfo: { dateInfoByStashedTabID[$0.id] ?? agentModeVM.archivedSessionDateInfo(for: $0) }
         )
         let firstSectionID = sections.first?.id
-        VStack(spacing: rowSpacing) {
+        VStack(spacing: fontPreset.scaledClamped(2, max: 3)) {
             ForEach(sections) { section in
-                AgentSidebarDateSectionHeader(
-                    title: section.bucket.title,
-                    isFirst: section.id == firstSectionID
-                )
-
+                AgentSidebarDateSectionHeader(title: section.bucket.title, isFirst: section.id == firstSectionID)
                 ForEach(section.rows) { row in
                     let stashed = row.stashed
+                    let identity = AgentSidebarSelectionIdentity.archived(
+                        stashedTabID: stashed.id,
+                        tabID: stashed.tab.id
+                    )
                     AgentStashedSessionRow(
                         stashed: stashed,
-                        onRestore: {
-                            Task { await promptManager.unstashTab(stashed.id) }
+                        isSelected: selectionState.selectedIdentities.contains(identity),
+                        isSelectionMode: selectionState.isSelectionMode,
+                        isSelectionEnabled: selectionState.inFlightAction == nil,
+                        onSelectionGesture: { gesture in
+                            agentModeVM.handleSidebarSelectionGesture(
+                                gesture,
+                                identity: identity,
+                                renderedOrder: renderedOrder,
+                                workspaceID: workspaceID
+                            )
                         },
-                        onDelete: {
-                            Task { await promptManager.deleteStashedTab(stashed.id) }
-                        }
+                        onRestore: {
+                            Task {
+                                guard agentModeVM.workspaceManager?.activeWorkspaceID == workspaceID else { return }
+                                await promptManager.unstashTab(stashed.id)
+                            }
+                        },
+                        onDelete: { deleteArchived(stashed) }
                     )
                 }
             }
-
             if hasMore {
                 Button {
-                    visibleCount += Self.pageSize
+                    agentModeVM.showMoreArchivedSidebarSessions()
                 } label: {
-                    Text("Show more (\(allTabs.count - visibleCount))")
+                    Text("Show more (\(remainingCount))")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, showMoreHorizontalPadding)
-                .padding(.vertical, showMoreVerticalPadding)
+                .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+                .padding(.vertical, fontPreset.scaledClamped(8, max: 12))
                 .foregroundColor(.accentColor)
             }
         }
-        .padding(.top, topPadding)
+        .padding(.top, fontPreset.scaledClamped(4, max: 6))
     }
-
-    #if DEBUG
-        private static func recordBodyMetric() {
-            AgentModePerfDiagnostics.increment("ui.body.archivedSessionsPagedList")
-        }
-    #endif
 }

@@ -5,7 +5,8 @@ import Foundation
 #endif
 
 enum WorkspaceReadableFileResolution {
-    case readable(WorkspaceReadableFileHandle)
+    case workspace(WorkspaceExactExistingFileMatch)
+    case external(WorkspaceExternalReadableFile)
     case folder(displayPath: String)
     case issue(PathResolutionIssue)
     case noCandidate
@@ -151,69 +152,60 @@ struct WorkspaceReadableFileService {
 
     func resolveReadableFile(
         _ userPath: String,
-        profile: PathLocateProfile = .mcpRead,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> WorkspaceReadableFileHandle? {
+    ) async throws -> WorkspaceReadableFileHandle? {
         let roots = await store.rootRefs(scope: rootScope)
-        let resolution = await resolveReadFileRequest(
-            userPath,
-            profile: profile,
+        let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
+        let resolution = try await resolveReadFileRequest(
+            WorkspaceExactFileInput.parse(userPath),
             rootScope: rootScope,
-            rootRefs: roots
+            rootRefs: roots,
+            namespace: namespace
         )
-        guard case let .readable(handle) = resolution else { return nil }
-        return handle
+        switch resolution {
+        case let .workspace(match):
+            return .workspace(match.file)
+        case let .external(file):
+            return .external(file)
+        case .folder, .issue, .noCandidate:
+            return nil
+        }
     }
 
     func resolveReadFileRequest(
-        _ userPath: String,
-        profile: PathLocateProfile,
+        _ input: WorkspaceExactFileInput,
         rootScope: WorkspaceLookupRootScope,
-        rootRefs roots: [WorkspaceRootRef]
-    ) async -> WorkspaceReadableFileResolution {
-        await FileSystemService.withContentReadForegroundActivity(kind: .readResolution) {
-            let trimmed = normalizedInput(userPath)
-            guard !trimmed.isEmpty else { return .issue(.emptyInput) }
-
-            if let issue = await store.exactPathResolutionIssue(
-                for: trimmed,
-                kind: .either,
-                rootRefs: roots
-            ) {
+        rootRefs roots: [WorkspaceRootRef],
+        namespace: WorkspaceExactFileNamespace
+    ) async throws -> WorkspaceReadableFileResolution {
+        try await FileSystemService.withContentReadForegroundActivity(kind: .readResolution) {
+            switch try await store.resolveExactExistingWorkspaceFile(input, namespace: namespace) {
+            case let .matched(match):
+                return .workspace(match)
+            case let .directory(directory):
+                return .folder(displayPath: directory.displayPath)
+            case let .issue(issue):
                 return .issue(issue)
-            }
-
-            let exactCatalogLookupAwait = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogLookupAwait)
-            let exactCatalogLookup = await store.lookupCatalogFileForExplicitRequest(trimmed, rootRefs: roots)
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.ReadFile.exactCatalogLookupAwait,
-                exactCatalogLookupAwait,
-                EditFlowPerf.Dimensions(outcome: {
-                    switch exactCatalogLookup {
-                    case .matched:
-                        "matched"
-                    case .noCandidate:
-                        "noCandidate"
-                    case .ambiguous:
-                        "ambiguous"
-                    case .blocked:
-                        "blocked"
-                    }
-                }())
-            )
-            switch exactCatalogLookup {
-            case let .matched(file):
-                return .readable(.workspace(file))
-            case .ambiguous, .blocked:
+            case .claimedMissing:
                 return .noCandidate
             case .noCandidate:
                 break
             }
 
+            let path: String
+            switch input {
+            case let .absolute(absolutePath):
+                path = absolutePath
+            case let .relative(relativePath):
+                path = relativePath
+            case .explicitRoot:
+                return .noCandidate
+            }
+
             let folderResolution = await store.resolveFolderInput(
-                trimmed,
+                path,
                 rootScope: rootScope,
-                profile: profile,
+                profile: .mcpRead,
                 rootRefs: roots,
                 validateIssue: false,
                 allowGeneralLookupFallback: false
@@ -230,83 +222,12 @@ struct WorkspaceReadableFileService {
                 return .folder(displayPath: displayPath)
             }
 
-            if let externalFolderPath = resolveAlwaysReadableExternalFolderDisplayPath(trimmed) {
+            if let externalFolderPath = resolveAlwaysReadableExternalFolderDisplayPath(path) {
                 return .folder(displayPath: externalFolderPath)
             }
-
-            let explicitMaterialization = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.explicitMaterialization)
-            let materialization = try? await store.materializeExplicitlyRequestedFile(
-                trimmed,
-                rootRefs: roots
-            )
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.ReadFile.explicitMaterialization,
-                explicitMaterialization,
-                EditFlowPerf.Dimensions(outcome: {
-                    switch materialization {
-                    case .some(.materialized):
-                        "materialized"
-                    case .some(.noCandidate):
-                        "noCandidate"
-                    case .some(.ambiguous):
-                        "ambiguous"
-                    case .some(.blocked):
-                        "blocked"
-                    case .none:
-                        "error"
-                    }
-                }())
-            )
-            switch materialization {
-            case let .some(.materialized(file)):
-                return .readable(.workspace(file))
-            case .some(.ambiguous), .some(.blocked):
-                return .noCandidate
-            case .some(.noCandidate), .none:
-                break
-            }
-
-            let generalLookupFallback = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.generalLookupFallback)
-            let lookup = await store.lookupPath(
-                WorkspacePathLookupRequest(
-                    userPath: trimmed,
-                    profile: profile,
-                    rootScope: rootScope
-                ),
-                rootRefs: roots
-            )
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.ReadFile.generalLookupFallback,
-                generalLookupFallback,
-                EditFlowPerf.Dimensions(outcome: {
-                    if lookup?.file != nil { return "file" }
-                    if lookup?.folder != nil { return "folder" }
-                    return "noCandidate"
-                }())
-            )
-            if let file = lookup?.file {
-                return .readable(.workspace(file))
-            }
-            if let folder = lookup?.folder {
-                let displayPath = roots.first(where: { $0.id == folder.rootID }).map { root in
-                    ClientPathFormatter.displayPath(
-                        root: root,
-                        relativePath: folder.standardizedRelativePath,
-                        visibleRoots: roots
-                    )
-                } ?? folder.standardizedFullPath
-                return .folder(displayPath: displayPath)
-            }
-
-            guard trimmed.hasPrefix("/") else { return .noCandidate }
-            let externalFileFallback = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.externalFileFallback)
-            let externalFile = resolveAlwaysReadableExternalFile(atAbsolutePath: trimmed)
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.ReadFile.externalFileFallback,
-                externalFileFallback,
-                EditFlowPerf.Dimensions(outcome: externalFile == nil ? "noCandidate" : "external")
-            )
-            return externalFile.map { .readable(.external($0)) } ?? .noCandidate
+            guard path.hasPrefix("/") else { return .noCandidate }
+            return resolveAlwaysReadableExternalFile(atAbsolutePath: path).map(WorkspaceReadableFileResolution.external)
+                ?? .noCandidate
         }
     }
 

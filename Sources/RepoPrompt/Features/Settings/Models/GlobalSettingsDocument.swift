@@ -107,10 +107,15 @@ struct GlobalSettingsDocument: Codable {
     }
 
     private static func decodeUUIDKeyedDictionary<Value>(_ values: [String: Value]) -> [UUID: Value] {
-        values.reduce(into: [UUID: Value]()) { result, entry in
-            guard let uuid = UUID(uuidString: entry.key) else { return }
-            result[uuid] = entry.value
+        var winners: [UUID: (rawKey: String, value: Value)] = [:]
+        for rawKey in values.keys.sorted() {
+            guard let uuid = UUID(uuidString: rawKey), let value = values[rawKey] else { continue }
+            let canonicalKey = uuid.uuidString
+            if winners[uuid] == nil || rawKey == canonicalKey {
+                winners[uuid] = (rawKey, value)
+            }
         }
+        return winners.mapValues(\.value)
     }
 }
 
@@ -353,6 +358,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var ui: UISettings?
     var promptPackaging: PromptPackagingSettings?
     var modelSelection: ModelSelectionSettings?
+    var contextBuilder: ContextBuilderSettings?
     var mcp: MCPSettings?
     var fileSystem: FileSystemSettings?
     var agentMode: AgentModeSettings?
@@ -363,6 +369,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         ui: UISettings? = nil,
         promptPackaging: PromptPackagingSettings? = nil,
         modelSelection: ModelSelectionSettings? = nil,
+        contextBuilder: ContextBuilderSettings? = nil,
         mcp: MCPSettings? = nil,
         fileSystem: FileSystemSettings? = nil,
         agentMode: AgentModeSettings? = nil,
@@ -372,6 +379,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.ui = ui
         self.promptPackaging = promptPackaging
         self.modelSelection = modelSelection
+        self.contextBuilder = contextBuilder
         self.mcp = mcp
         self.fileSystem = fileSystem
         self.agentMode = agentMode
@@ -463,6 +471,34 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.preferredComposeModel = preferredComposeModel
             self.planningModel = planningModel
             self.syncChatModelWithOracle = syncChatModelWithOracle
+        }
+    }
+
+    struct ContextBuilderSettings: Codable, Equatable {
+        var contextTokenBudget: Int?
+        var analysisTokenBudget: Int?
+        var enhancementMode: String?
+        var questionTimeoutSeconds: TimeInterval?
+        var allowUIClarifyingQuestions: Bool?
+        var allowMCPClarifyingQuestions: Bool?
+        var followUpAnalysisEnabled: Bool?
+
+        init(
+            contextTokenBudget: Int? = nil,
+            analysisTokenBudget: Int? = nil,
+            enhancementMode: String? = nil,
+            questionTimeoutSeconds: TimeInterval? = nil,
+            allowUIClarifyingQuestions: Bool? = nil,
+            allowMCPClarifyingQuestions: Bool? = nil,
+            followUpAnalysisEnabled: Bool? = nil
+        ) {
+            self.contextTokenBudget = contextTokenBudget
+            self.analysisTokenBudget = analysisTokenBudget
+            self.enhancementMode = enhancementMode
+            self.questionTimeoutSeconds = questionTimeoutSeconds
+            self.allowUIClarifyingQuestions = allowUIClarifyingQuestions
+            self.allowMCPClarifyingQuestions = allowMCPClarifyingQuestions
+            self.followUpAnalysisEnabled = followUpAnalysisEnabled
         }
     }
 

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -1976,6 +1977,150 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertEqual(state.selectedPrompts.map(\.id), [storedPromptID])
         XCTAssertEqual(state.selectedPrompts.map(\.content), [storedPrompt.content])
         XCTAssertEqual(promptManager.promptSelection(for: .copy), [storedPromptID])
+    }
+
+    @MainActor
+    func testPromptRowPresentationsGateManagementToManualCustomPrompts() throws {
+        let store = WorkspaceFileContextStore()
+        let promptManager = makePrompt(store: store, windowID: 41012)
+        let builtIn = try XCTUnwrap(promptManager.builtInStoredPrompts.first)
+        let custom = PromptViewModel.StoredPrompt(
+            id: UUID(),
+            title: "Custom instructions",
+            content: "Custom body"
+        )
+        promptManager.storedPrompts = [builtIn, custom]
+        promptManager.selectCopyPreset(
+            BuiltInCopyPresets.manual.id,
+            applySettings: false,
+            restoreManualSnapshot: false
+        )
+        promptManager.updatePromptSelection([custom.id], for: .copy)
+        let exportContext = AgentContextExportViewContext(
+            promptManager: promptManager,
+            selectionCoordinator: nil,
+            currentTabID: nil,
+            activeAgentSessionID: nil,
+            worktreeBindingsProvider: nil
+        )
+        let promptTab = AgentContextDrawerPromptTab(
+            promptManager: promptManager,
+            modelCoordinator: AgentSelectedFilesModelCoordinator(),
+            exportContext: exportContext,
+            isSwitchBlankingSelectedFiles: false
+        )
+
+        let manualRows = promptTab.makeRenderState().promptRows
+
+        XCTAssertEqual(manualRows.map(\.id), [builtIn.id, custom.id])
+        XCTAssertTrue(manualRows[0].allowsSelectionMutation)
+        XCTAssertTrue(manualRows[0].allowsCopy)
+        XCTAssertFalse(manualRows[0].allowsDestructiveManagement)
+        XCTAssertFalse(manualRows[0].isSelected)
+        XCTAssertTrue(manualRows[1].allowsSelectionMutation)
+        XCTAssertTrue(manualRows[1].allowsCopy)
+        XCTAssertTrue(manualRows[1].allowsDestructiveManagement)
+        XCTAssertTrue(manualRows[1].isSelected)
+
+        let customPreset = CopyPreset(
+            name: "Stored prompt presentation",
+            includeMetaPrompts: true,
+            storedPromptIds: [custom.id]
+        )
+        let presetManager = CopyPresetManager.shared
+        presetManager.add(customPreset)
+        defer { presetManager.remove(id: customPreset.id) }
+        promptManager.selectCopyPreset(customPreset.id)
+
+        let presetRows = promptTab.makeRenderState().promptRows
+
+        XCTAssertEqual(presetRows.map(\.id), [custom.id])
+        XCTAssertFalse(presetRows[0].allowsSelectionMutation)
+        XCTAssertFalse(presetRows[0].allowsCopy)
+        XCTAssertFalse(presetRows[0].allowsDestructiveManagement)
+        XCTAssertTrue(presetRows[0].isSelected)
+    }
+
+    @MainActor
+    func testStoredPromptClipboardWritesExactContentWithoutPackaging() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptClipboard-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let prompt = PromptViewModel.StoredPrompt(
+            id: UUID(),
+            title: "Title that must not be copied",
+            content: "  first line\n<instructions>exact</instructions>\n\n"
+        )
+
+        let didWrite = AgentContextStoredPromptClipboard.write(prompt: prompt, to: pasteboard)
+
+        XCTAssertTrue(didWrite)
+        XCTAssertEqual(pasteboard.string(forType: .string), prompt.content)
+        XCTAssertFalse(pasteboard.string(forType: .string)?.contains(prompt.title) ?? true)
+    }
+
+    @MainActor
+    func testStoredPromptClipboardMissingIDPreservesExistingContent() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptMissing-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString("existing clipboard content", forType: .string))
+
+        let didWrite = AgentContextStoredPromptClipboard.write(
+            promptID: UUID(),
+            from: [],
+            to: pasteboard
+        )
+
+        XCTAssertNil(didWrite)
+        XCTAssertEqual(pasteboard.string(forType: .string), "existing clipboard content")
+    }
+
+    @MainActor
+    func testStoredPromptCopyResolvesLatestContentAtInvocation() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptLatest-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let promptID = UUID()
+        let latestPrompt = PromptViewModel.StoredPrompt(
+            id: promptID,
+            title: "Current",
+            content: "latest content"
+        )
+
+        let didWrite = AgentContextStoredPromptClipboard.write(
+            promptID: promptID,
+            from: [latestPrompt],
+            to: pasteboard
+        )
+
+        XCTAssertEqual(didWrite, true)
+        XCTAssertEqual(pasteboard.string(forType: .string), latestPrompt.content)
+    }
+
+    @MainActor
+    func testSupersededContextCopyCannotOverwriteStoredPromptCopyAcrossOwners() async {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptIntent-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let buildFence = TestReleaseFence(name: "suspended prompt context build")
+        let prompt = PromptViewModel.StoredPrompt(
+            id: UUID(),
+            title: "Latest",
+            content: "newer stored prompt content"
+        )
+        let staleIntent = PromptClipboardIntentCoordinator.shared.begin()
+        let staleCopy = Task {
+            await PromptClipboardIntentCoordinator.shared.buildAndWrite(intent: staleIntent, to: pasteboard) {
+                await buildFence.enterAndWait()
+                return "stale full context"
+            }
+        }
+
+        await buildFence.waitUntilEntered()
+        XCTAssertTrue(AgentContextStoredPromptClipboard.write(prompt: prompt, to: pasteboard))
+        buildFence.release()
+
+        let staleCopyDidWrite = await staleCopy.value
+        XCTAssertFalse(staleCopyDidWrite)
+        XCTAssertEqual(pasteboard.string(forType: .string), prompt.content)
     }
 
     @MainActor

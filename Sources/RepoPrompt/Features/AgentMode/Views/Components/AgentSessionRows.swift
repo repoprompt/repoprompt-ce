@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Agent Session Row
@@ -31,6 +32,10 @@ struct AgentSessionRow: View {
     /// tinted to mirror the mcp-status-style "something happened" cue.
     var hiddenThreadDescendantAttentionCount: Int = 0
     var onToggleThreadCollapse: (() -> Void)?
+    var isSelected = false
+    var isSelectionMode = false
+    var isSelectionEnabled = true
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onSelect: () -> Void
     let onTogglePin: () -> Void
     var onStash: (() -> Void)?
@@ -145,8 +150,38 @@ struct AgentSessionRow: View {
         showDeleteConfirmation = true
     }
 
+    private var currentSelectionGesture: AgentSidebarSelectionGesture {
+        var modifiers: AgentSidebarSelectionModifiers = []
+        let flags = NSApp.currentEvent?.modifierFlags ?? []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        return AgentSidebarSelectionGesture(modifiers: modifiers)
+    }
+
+    private func handleRowTap() {
+        if onSelectionGesture(currentSelectionGesture) == .activate {
+            onSelect()
+        }
+    }
+
+    private func toggleSelection() {
+        guard isSelectionEnabled else { return }
+        _ = onSelectionGesture(.toggle)
+    }
+
     var body: some View {
         HStack(spacing: rowSpacing) {
+            if isSelectionMode {
+                Button(action: toggleSelection) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(!isSelectionEnabled)
+                .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
+                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+            }
+
             if threadDepth > 0 {
                 Spacer()
                     .frame(width: leadingIndent)
@@ -195,7 +230,7 @@ struct AgentSessionRow: View {
             Spacer()
 
             // Trailing indicator (checkmark or delete button)
-            if isHovered {
+            if isHovered, !isSelectionMode {
                 if attentionRunState != nil, let onDismissAttention {
                     Button(action: onDismissAttention) {
                         Image(systemName: "bell.slash")
@@ -254,7 +289,10 @@ struct AgentSessionRow: View {
         .frame(maxWidth: .infinity, minHeight: rowMinHeight, alignment: .leading)
         .background(
             Group {
-                if isActive {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
+                        .fill(Color.accentColor.opacity(isActive ? 0.28 : 0.18))
+                } else if isActive {
                     RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
                         .fill(Color.accentColor.opacity(0.15))
                 } else if isHovered {
@@ -265,25 +303,38 @@ struct AgentSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            Button(pinActionLabel, action: onTogglePin)
+            if !isSelectionMode {
+                Button("Select chat", action: toggleSelection)
 
-            Button(renameActionLabel, action: beginRename)
+                Divider()
 
-            if let onStash {
-                Button(stashActionLabel, action: onStash)
+                Button(pinActionLabel, action: onTogglePin)
+
+                Button(renameActionLabel, action: beginRename)
+
+                if let onStash {
+                    Button(stashActionLabel, action: onStash)
+                }
+
+                if attentionRunState != nil, let onDismissAttention {
+                    Button(dismissAttentionActionLabel, action: onDismissAttention)
+                }
+
+                Divider()
+
+                Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
             }
-
-            if attentionRunState != nil, let onDismissAttention {
-                Button(dismissAttentionActionLabel, action: onDismissAttention)
-            }
-
-            Divider()
-
-            Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
         }
         .onHover { isHovered = $0 }
-        .onTapGesture { onSelect() }
+        .onTapGesture(perform: handleRowTap)
+        .focusable()
+        .onKeyPress(.space) {
+            toggleSelection()
+            return .handled
+        }
         .accessibilityLabel(title)
+        .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityAction(named: Text(isSelected ? "Deselect chat" : "Select chat"), toggleSelection)
         .popover(isPresented: $showDeleteConfirmation, attachmentAnchor: .rect(.bounds), arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Delete chat?")
@@ -695,6 +746,10 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
+    var isSelected = false
+    var isSelectionMode = false
+    var isSelectionEnabled = true
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onRestore: () -> Void
     let onDelete: () -> Void
 
@@ -750,8 +805,38 @@ struct AgentStashedSessionRow: View {
         "Delete stashed tab"
     }
 
+    private var currentSelectionGesture: AgentSidebarSelectionGesture {
+        var modifiers: AgentSidebarSelectionModifiers = []
+        let flags = NSApp.currentEvent?.modifierFlags ?? []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        return AgentSidebarSelectionGesture(modifiers: modifiers)
+    }
+
+    private func handleRowTap() {
+        if onSelectionGesture(currentSelectionGesture) == .activate {
+            onRestore()
+        }
+    }
+
+    private func toggleSelection() {
+        guard isSelectionEnabled else { return }
+        _ = onSelectionGesture(.toggle)
+    }
+
     var body: some View {
         HStack(spacing: rowSpacing) {
+            if isSelectionMode {
+                Button(action: toggleSelection) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(!isSelectionEnabled)
+                .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(stashed.tab.name)")
+                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+            }
+
             Image(systemName: "tray.and.arrow.down")
                 .font(.system(size: leadingIconSize))
                 .foregroundStyle(.secondary)
@@ -772,7 +857,7 @@ struct AgentStashedSessionRow: View {
 
             Spacer()
 
-            if isHovered {
+            if isHovered, !isSelectionMode {
                 Button(action: onRestore) {
                     Image(systemName: "tray.and.arrow.up")
                         .font(.system(size: 11))
@@ -797,7 +882,10 @@ struct AgentStashedSessionRow: View {
         .frame(maxWidth: .infinity, minHeight: rowMinHeight, alignment: .leading)
         .background(
             Group {
-                if isHovered {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.18))
+                } else if isHovered {
                     RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
                         .stroke(Color(NSColor.systemGray).opacity(0.4), lineWidth: 1)
                 }
@@ -805,15 +893,24 @@ struct AgentStashedSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            Button(restoreActionLabel, action: onRestore)
-
-            Divider()
-
-            Button(deleteActionLabel, role: .destructive, action: onDelete)
+            if !isSelectionMode {
+                Button("Select chat", action: toggleSelection)
+                Divider()
+                Button(restoreActionLabel, action: onRestore)
+                Divider()
+                Button(deleteActionLabel, role: .destructive, action: onDelete)
+            }
         }
         .onHover { isHovered = $0 }
-        .onTapGesture(perform: onRestore)
+        .onTapGesture(perform: handleRowTap)
+        .focusable()
+        .onKeyPress(.space) {
+            toggleSelection()
+            return .handled
+        }
         .accessibilityLabel("\(stashed.tab.name), archived session")
+        .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityAction(named: Text(isSelected ? "Deselect chat" : "Select chat"), toggleSelection)
     }
 }
 

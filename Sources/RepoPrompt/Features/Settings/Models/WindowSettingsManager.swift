@@ -15,6 +15,8 @@ protocol SettingsManaging {
     func chatSettings(for workspaceID: UUID) -> ChatGlobalSettings
     func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool?)
     func updateChatSettings(_ settings: ChatGlobalSettings, commit: Bool?)
+    func contextBuilderBehaviorSettings() -> ContextBuilderBehaviorSettings
+    func setContextBuilderBehaviorSettings(_ settings: ContextBuilderBehaviorSettings, commit: Bool)
     func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?)
     func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?)
     func setGlobalContextBuilderAgentSelection(agentRaw: String, modelRaw: String, markUserDefined: Bool)
@@ -180,6 +182,17 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
         if commit ?? autoPersistWindowSettings {
             store.updateChatSettings(settings)
         }
+    }
+
+    func contextBuilderBehaviorSettings() -> ContextBuilderBehaviorSettings {
+        store.contextBuilderBehaviorSettings()
+    }
+
+    func setContextBuilderBehaviorSettings(
+        _ settings: ContextBuilderBehaviorSettings,
+        commit: Bool = true
+    ) {
+        store.setContextBuilderBehaviorSettings(settings, commit: commit)
     }
 
     func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
