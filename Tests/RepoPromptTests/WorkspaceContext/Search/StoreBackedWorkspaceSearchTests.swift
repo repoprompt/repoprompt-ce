@@ -72,7 +72,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)
         let readableService = WorkspaceReadableFileService(store: store)
-        let readable = await readableService.resolveReadableFile(ignoredURL.path, profile: .mcpRead, rootScope: .visibleWorkspace)
+        let readable = try await readableService.resolveReadableFile(ignoredURL.path, rootScope: .visibleWorkspace)
         guard case .workspace = readable else {
             return XCTFail("Expected ignored absolute read fallback to materialize a managed-only record")
         }

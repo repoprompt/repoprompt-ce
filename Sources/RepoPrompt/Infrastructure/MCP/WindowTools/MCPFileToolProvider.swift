@@ -398,10 +398,15 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             authority.lookupContext
         }
         try Task.checkCancellation()
-        let (worktreeScope, translatedLookupPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
+        let (worktreeScope, translatedArtifactPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
             let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-            let translatedLookupPath = lookupContext.translateInputPath(path)
-            return (worktreeScope, translatedLookupPath)
+            return (worktreeScope, lookupContext.translateInputPath(path))
+        }
+        let exactInput: WorkspaceExactFileInput
+        do {
+            exactInput = try WorkspaceExactFileInput.parse(path)
+        } catch let issue as PathResolutionIssue {
+            throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
         }
         try Task.checkCancellation()
         let unprojectedReadResult: MCPAppFileReadResult
@@ -409,7 +414,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             unprojectedReadResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
                 if let artifactReply = try await dependencies.files.readSelectedAuthorizedGitArtifact(
                     path,
-                    translatedLookupPath,
+                    translatedArtifactPath,
                     startLine1Based,
                     limit,
                     metadata,
@@ -418,10 +423,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     return .nonSelecting(reply: artifactReply)
                 }
                 return try await dependencies.files.readFile(
-                    translatedLookupPath,
+                    exactInput,
                     startLine1Based,
                     limit,
-                    lookupContext.rootScope
+                    lookupContext
                 )
             }
         } catch WorkspaceAppliedIngressWaitError.timedOut {
@@ -434,15 +439,12 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         let unprojectedReply = switch unprojectedReadResult {
         case let .workspace(reply, _), let .nonSelecting(reply): reply
         }
-        let projectedDisplayPath = unprojectedReply.displayPath.map { displayPath in
-            lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
-        }
         let readResult: MCPAppFileReadResult = try await EditFlowPerf.measure(
             EditFlowPerf.Stage.ReadFile.providerReplyProjection
         ) {
             let reply = try await MCPReadFileToolProjection.projectReply(
                 unprojectedReply,
-                displayPath: projectedDisplayPath,
+                displayPath: unprojectedReply.displayPath,
                 worktreeScope: worktreeScope
             )
             return switch unprojectedReadResult {

@@ -130,9 +130,8 @@ struct GeneratedOracleExportFileWriter {
         rootScope: WorkspaceLookupRootScope
     ) async throws {
         let readableService = WorkspaceReadableFileService(store: store)
-        let readable = await readableService.resolveReadableFile(
+        let readable = try await readableService.resolveReadableFile(
             physicalPath,
-            profile: .mcpRead,
             rootScope: rootScope
         )
         guard case let .workspace(file) = readable else {

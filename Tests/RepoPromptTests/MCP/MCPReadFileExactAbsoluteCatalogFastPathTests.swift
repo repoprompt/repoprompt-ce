@@ -12,46 +12,46 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             ), caseLabel)
 
             try assertOrdered([
-                "let roots = await store.rootRefs(scope: lookupRootScope)",
-                "await readableService.awaitFreshnessForExplicitRequest(",
+                "let roots = await store.rootRefs(scope: lookupContext.rootScope)",
+                "let namespace = lookupContext.exactFileNamespace(storeRoots: roots)",
+                "try await readableService.awaitFreshnessForExplicitRequest(",
                 "timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout",
-                "await readableService.resolveReadFileRequest("
+                "try await readableService.resolveReadFileRequest("
             ], in: readFile, label: caseLabel)
-            XCTAssertEqual(readFile.components(separatedBy: "store.rootRefs(scope: lookupRootScope)").count - 1, 1, caseLabel)
-            XCTAssertFalse(readFile.contains("resolveExactWorkspaceCatalogHit(path"), caseLabel)
-            XCTAssertFalse(readFile.contains("resolveFolderInput(path"), caseLabel)
+            XCTAssertEqual(readFile.components(separatedBy: "store.rootRefs(scope: lookupContext.rootScope)").count - 1, 1, caseLabel)
 
             let serviceSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
             let resolver = try XCTUnwrap(serviceSource.slice(
                 from: "    func resolveReadFileRequest(\n",
-                to: "    func resolveAlwaysReadableExternalFolderDisplayPath"
+                to: "    func resolveAlwaysReadableExternalFolderDisplayPath("
             ), caseLabel)
             try assertOrdered([
-                "store.exactPathResolutionIssue(",
-                "store.lookupCatalogFileForExplicitRequest(trimmed, rootRefs: roots)",
+                "store.resolveExactExistingWorkspaceFile(input, namespace: namespace)",
                 "allowGeneralLookupFallback: false",
-                "store.materializeExplicitlyRequestedFile(",
-                "let lookup = await store.lookupPath("
+                "resolveAlwaysReadableExternalFolderDisplayPath(path)",
+                "resolveAlwaysReadableExternalFile(atAbsolutePath: path)"
             ], in: resolver, label: caseLabel)
-            XCTAssertEqual(resolver.components(separatedBy: "lookupCatalogFileForExplicitRequest").count - 1, 1, caseLabel)
-            XCTAssertEqual(resolver.components(separatedBy: "store.lookupPath(").count - 1, 1, caseLabel)
-            XCTAssertTrue(resolver.contains("is a folder") == false, caseLabel)
+            XCTAssertFalse(resolver.contains("store.lookupPath("), caseLabel)
+            XCTAssertFalse(resolver.contains("exactPathResolutionIssue"), caseLabel)
         }
 
         do {
-            let caseLabel = "testProviderTranslationPrecedesScopedReadDependencyCall"
+            let caseLabel = "testProviderTranslatesArtifactsButPassesTypedWorkspaceIdentity"
             let providerSource = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
-            let translation = try XCTUnwrap(providerSource.range(of: "let translatedLookupPath = lookupContext.translateInputPath(path)"), caseLabel)
+            let translation = try XCTUnwrap(
+                providerSource.range(of: "lookupContext.translateInputPath(path)"),
+                caseLabel
+            )
+            let parsing = try XCTUnwrap(providerSource.range(of: "WorkspaceExactFileInput.parse(path)"), caseLabel)
             let authorizedRead = try XCTUnwrap(
                 providerSource.range(of: "dependencies.files.readSelectedAuthorizedGitArtifact("),
                 caseLabel
             )
-            let scopedRead = try XCTUnwrap(
-                providerSource.range(of: "dependencies.files.readFile("),
-                caseLabel
-            )
+            let scopedRead = try XCTUnwrap(providerSource.range(of: "dependencies.files.readFile("), caseLabel)
             XCTAssertLessThan(translation.lowerBound, authorizedRead.lowerBound, caseLabel)
+            XCTAssertLessThan(parsing.lowerBound, scopedRead.lowerBound, caseLabel)
             XCTAssertLessThan(authorizedRead.lowerBound, scopedRead.lowerBound, caseLabel)
+            XCTAssertTrue(providerSource.contains("exactInput,\n                    startLine1Based,\n                    limit,\n                    lookupContext"), caseLabel)
         }
     }
 
@@ -77,7 +77,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         ], in: startFolderResolver, label: caseLabel)
     }
 
-    func testExactAbsoluteInputValidationCoversQualificationEmptyAndEmbeddedNUL() async throws {
+    func testExactAbsoluteInputValidationCoversQualificationEmptyAndEmbeddedNUL() throws {
         do {
             let caseLabel = "testExactAbsoluteQualificationAcceptsTrimmedAndTildeExpandedAbsoluteInputsOnly"
             XCTAssertEqual(
@@ -98,21 +98,17 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         }
 
         do {
-            let caseLabel = "testEmptyAndEmbeddedNULIssuesRemainValidatedBeforeShortcut"
-            let store = WorkspaceFileContextStore()
-            let emptyIssue = await store.exactPathResolutionIssue(for: " \n ", kind: .either, rootScope: .visibleWorkspace)
-            XCTAssertEqual(emptyIssue, .emptyInput, caseLabel)
-            let issue = await store.exactPathResolutionIssue(for: "/tmp/blocked\0.swift", kind: .either, rootScope: .visibleWorkspace)
-            guard case let .invalidPathCharacters(input, reason) = issue else {
-                return XCTFail(caseLabel + ": Expected embedded NUL validation issue")
+            let caseLabel = "testExactInputParserOwnsEmptyAndEmbeddedNULValidation"
+            XCTAssertThrowsError(try WorkspaceExactFileInput.parse(" \n "), caseLabel) { error in
+                XCTAssertEqual(error as? PathResolutionIssue, .emptyInput, caseLabel)
             }
-            XCTAssertEqual(input, "/tmp/blocked\0.swift", caseLabel)
-            XCTAssertTrue(reason.contains("embedded NUL"), caseLabel)
-
-            let serviceSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
-            let validation = try XCTUnwrap(serviceSource.range(of: "store.exactPathResolutionIssue("), caseLabel)
-            let shortcut = try XCTUnwrap(serviceSource.range(of: "store.lookupCatalogFileForExplicitRequest(trimmed, rootRefs: roots)"), caseLabel)
-            XCTAssertLessThan(validation.lowerBound, shortcut.lowerBound, caseLabel)
+            XCTAssertThrowsError(try WorkspaceExactFileInput.parse("/tmp/blocked\0.swift"), caseLabel) { error in
+                guard case let .invalidPathCharacters(input, reason) = error as? PathResolutionIssue else {
+                    return XCTFail(caseLabel + ": Expected embedded NUL validation issue")
+                }
+                XCTAssertEqual(input, "/tmp/blocked\0.swift", caseLabel)
+                XCTAssertTrue(reason.contains("NUL"), caseLabel)
+            }
         }
     }
 
@@ -173,7 +169,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
 
             let shortcutHit = await service.resolveExactWorkspaceCatalogHit(ignoredURL.path, rootScope: .visibleWorkspace)
             XCTAssertNil(shortcutHit, caseLabel)
-            let readable = await service.resolveReadableFile(ignoredURL.path, profile: .mcpRead, rootScope: .visibleWorkspace)
+            let readable = try await service.resolveReadableFile(ignoredURL.path, rootScope: .visibleWorkspace)
             guard case let .workspace(file) = readable else {
                 return XCTFail(caseLabel + ": Expected ignored absolute miss to materialize through the existing fallback")
             }
@@ -205,7 +201,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             let externalShortcutHit = await service.resolveExactWorkspaceCatalogHit(externalFile.path, rootScope: .visibleWorkspace)
             XCTAssertNil(externalShortcutHit, caseLabel)
             XCTAssertEqual(service.resolveAlwaysReadableExternalFolderDisplayPath(externalFolder.path), "~/.agents/skills/example", caseLabel)
-            let readable = await service.resolveReadableFile(externalFile.path, profile: .mcpRead, rootScope: .visibleWorkspace)
+            let readable = try await service.resolveReadableFile(externalFile.path, rootScope: .visibleWorkspace)
             guard case let .external(file) = readable else {
                 return XCTFail(caseLabel + ": Expected external support file to resolve through the existing fallback")
             }
@@ -237,9 +233,8 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
                 rootScope: .visibleWorkspace
             )
             XCTAssertNil(externalShortcutHit, caseLabel)
-            let readable = await service.resolveReadableFile(
+            let readable = try await service.resolveReadableFile(
                 nominalSkillFile.path,
-                profile: .mcpRead,
                 rootScope: .visibleWorkspace
             )
             guard case let .external(file) = readable else {

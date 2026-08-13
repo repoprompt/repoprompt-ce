@@ -13,7 +13,8 @@ extension AgentModeViewModel {
         #endif
         ui.sessionSidebar.update(
             searchText: sessionSidebarSearchText,
-            visibleSessionCount: sessionSidebarVisibleSessionCount
+            visibleSessionCount: sessionSidebarVisibleSessionCount,
+            archivedVisibleSessionCount: sessionSidebarArchivedVisibleSessionCount
         )
         #if DEBUG
             let storeUpdateDurationMS = storeUpdateStartMS.map { AgentModePerfDiagnostics.elapsedMS(since: $0) }
@@ -114,6 +115,152 @@ extension AgentModeViewModel {
     func showMoreSidebarSessions() {
         sessionSidebarVisibleSessionCount += Self.sessionSidebarPageSize
         syncSidebarUIState()
+    }
+
+    func showMoreArchivedSidebarSessions() {
+        sessionSidebarArchivedVisibleSessionCount += Self.sessionSidebarArchivedPageSize
+        syncSidebarUIState()
+    }
+
+    func handleSidebarSelectionGesture(
+        _ gesture: AgentSidebarSelectionGesture,
+        identity: AgentSidebarSelectionIdentity,
+        renderedOrder: [AgentSidebarSelectionIdentity],
+        workspaceID: UUID?
+    ) -> AgentSidebarSelectionGestureDisposition {
+        guard let workspaceID, workspaceManager?.activeWorkspaceID == workspaceID else { return .ignored }
+        return ui.sessionSidebar.handleSelectionGesture(
+            gesture,
+            identity: identity,
+            renderedOrder: renderedOrder,
+            workspaceID: workspaceID
+        )
+    }
+
+    func performSidebarBulkAction(
+        _ action: AgentSidebarBulkActionKind,
+        targets: SidebarBulkMutationTargets,
+        promptManager: PromptViewModel
+    ) async {
+        let targetCount: Int = switch action {
+        case .delete: targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
+        case .stash: targets.stashTabIDs.count
+        case .pin: targets.pinTabIDs.count
+        case .unpin: targets.unpinTabIDs.count
+        }
+        guard workspaceManager?.activeWorkspaceID == targets.workspaceID,
+              let token = ui.sessionSidebar.beginBulkAction(
+                  kind: action,
+                  targetCount: targetCount,
+                  workspaceID: targets.workspaceID
+              )
+        else { return }
+
+        let workspaceID = targets.workspaceID
+        let contextIsCurrent: @MainActor () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return workspaceManager?.activeWorkspaceID == workspaceID
+                && ui.sessionSidebar.isCurrentBulkAction(token: token, workspaceID: targets.workspaceID)
+        }
+        var notice: AgentSidebarBulkActionNotice?
+
+        switch action {
+        case .delete:
+            #if DEBUG
+                for tabID in targets.activeDeleteTabIDs {
+                    debugBeginSidebarDeleteRequest(
+                        tabID: tabID,
+                        source: "AgentModeViewModel.performSidebarBulkAction",
+                        reason: "bulk_delete"
+                    )
+                }
+            #endif
+            let report = await promptManager.deleteComposeAndStashedTabs(
+                composeTabIDs: targets.activeDeleteTabIDs,
+                archivedTargets: targets.archivedDeleteTargets,
+                isMutationContextCurrent: contextIsCurrent
+            )
+            notice = sidebarBulkActionNotice(for: report, action: action)
+        case .stash:
+            let report = await promptManager.stashComposeTabs(
+                withIDs: targets.stashTabIDs,
+                isMutationContextCurrent: contextIsCurrent
+            )
+            notice = sidebarBulkActionNotice(for: report, action: action)
+        case .pin:
+            let report = promptManager.setComposeTabsPinned(
+                true,
+                for: targets.pinTabIDs,
+                isMutationContextCurrent: contextIsCurrent
+            )
+            if report.contextRejected {
+                notice = AgentSidebarBulkActionNotice(
+                    severity: .warning,
+                    title: "Chats were not pinned",
+                    message: "The workspace or selected chats changed before the action could be applied."
+                )
+            }
+        case .unpin:
+            let report = promptManager.setComposeTabsPinned(
+                false,
+                for: targets.unpinTabIDs,
+                isMutationContextCurrent: contextIsCurrent
+            )
+            if report.contextRejected {
+                notice = AgentSidebarBulkActionNotice(
+                    severity: .warning,
+                    title: "Chats were not unpinned",
+                    message: "The workspace or selected chats changed before the action could be applied."
+                )
+            }
+        }
+        ui.sessionSidebar.finishBulkAction(
+            token: token,
+            workspaceID: targets.workspaceID,
+            notice: notice
+        )
+    }
+
+    func sidebarBulkActionNotice(
+        for report: PromptViewModel.ComposeTabMutationReport,
+        action: AgentSidebarBulkActionKind
+    ) -> AgentSidebarBulkActionNotice? {
+        if let cleanupIssue = report.cleanupIssues.first, !report.rejections.isEmpty {
+            return AgentSidebarBulkActionNotice(
+                severity: .error,
+                title: "Bulk action partially completed",
+                message: "Some chats changed, cleanup failed for \(report.cleanupIssues.count) chat(s), and some selected or related chats were not changed. \(cleanupIssue.message)"
+            )
+        }
+        if let cleanupIssue = report.cleanupIssues.first {
+            return AgentSidebarBulkActionNotice(
+                severity: .error,
+                title: "Some chat cleanup failed",
+                message: "The sidebar was updated, but cleanup failed for \(report.cleanupIssues.count) chat(s). \(cleanupIssue.message)"
+            )
+        }
+        if report.didMutateProjection, !report.rejections.isEmpty {
+            return AgentSidebarBulkActionNotice(
+                severity: .warning,
+                title: "Bulk action partially completed",
+                message: "Some chats changed, but some selected or related chats were rejected before mutation."
+            )
+        }
+        if let rejection = report.rejections.first {
+            return AgentSidebarBulkActionNotice(
+                severity: .warning,
+                title: "No chats were changed",
+                message: rejection.message
+            )
+        }
+        if !report.didMutateProjection, !report.noOpReasons.isEmpty {
+            return AgentSidebarBulkActionNotice(
+                severity: .information,
+                title: "No chats were changed",
+                message: "The selected chats no longer matched the \(action.rawValue) action."
+            )
+        }
+        return nil
     }
 
     func sidebarSearchBinding() -> Binding<String> {
@@ -351,6 +498,7 @@ extension AgentModeViewModel {
                     parentSessionID: session.parentSessionID,
                     hasLoadedPersistedState: session.hasLoadedPersistedState,
                     itemsIsEmpty: session.items.isEmpty,
+                    transcriptTurnsIsEmpty: session.transcript.turns.isEmpty,
                     runState: session.runState,
                     lastActivityAt: session.lastActivityAt,
                     lastUserMessageAt: session.lastUserMessageAt
@@ -529,6 +677,10 @@ extension AgentModeViewModel {
                 if previousSession.itemsIsEmpty != currentSession.itemsIsEmpty { categories.insert("session.itemsIsEmpty")
                     changed = true
                 }
+                if previousSession.transcriptTurnsIsEmpty != currentSession.transcriptTurnsIsEmpty {
+                    categories.insert("session.transcriptTurnsIsEmpty")
+                    changed = true
+                }
                 if previousSession.runState != currentSession.runState {
                     categories.insert("session.runState")
                     changes.changedRunStateCount += 1
@@ -554,7 +706,8 @@ extension AgentModeViewModel {
                 "currentTabID", "sessionListCacheReady", "tabsWithActiveAgentRun", "mcpControlledTabIDs",
                 "tabMetadata.count", "tabMetadata.order", "tabMetadata.name", "tabMetadata.activeAgentSessionID",
                 "tabMetadata.isPinned", "tabMetadata.lastModified", "session.count", "session.activeAgentSessionID",
-                "session.parentSessionID", "session.hasLoadedPersistedState", "session.itemsIsEmpty", "session.runState",
+                "session.parentSessionID", "session.hasLoadedPersistedState", "session.itemsIsEmpty",
+                "session.transcriptTurnsIsEmpty", "session.runState",
                 "session.lastActivityAt", "session.lastUserMessageAt", "sessionIndex", "sessionListSortDates",
                 "sidebarRestoreFrozenOrder"
             ]
