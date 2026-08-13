@@ -5,12 +5,20 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
         in bindings: [AgentSessionWorktreeBinding],
         fallbackWorkspacePath: String?
     ) -> AgentSessionWorktreeBinding? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        return primaryWorkspacePath.flatMap { primaryPath in
-            bindings.first { binding in
-                standardizedWorkspacePath(binding.logicalRootPath) == primaryPath
-            }
-        } ?? (primaryWorkspacePath == nil && bindings.count == 1 ? bindings[0] : nil)
+        guard let firstBinding = bindings.first else {
+            return nil
+        }
+        guard bindings.count > 1 else {
+            return firstBinding
+        }
+        guard let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath) else {
+            return nil
+        }
+        let canonicalPrimaryPath = GitRepoRootAuthorization.canonicalPath(primaryWorkspacePath)
+        return bindings.first { binding in
+            standardizedWorkspacePath(binding.logicalRootPath).map(GitRepoRootAuthorization.canonicalPath)
+                == canonicalPrimaryPath
+        }
     }
 
     static func effectiveWorkspacePath(

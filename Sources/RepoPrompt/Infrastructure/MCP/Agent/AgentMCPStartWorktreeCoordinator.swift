@@ -175,7 +175,6 @@ struct AgentMCPStartWorktreeCoordinator {
                     request: request,
                     targetWindow: targetWindow
                 )
-                try validateRuntimeRoot(context.logicalRoot, targetWindow: targetWindow)
                 let worktree: GitWorktreeDescriptor
                 let initializationReceipt: GitWorktreeCreationReceipt?
                 let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
@@ -233,7 +232,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     repositoryRelativeRootPrefix: rootPrefix,
                     visualIdentity: identity,
                     replacing: agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID).first {
-                        standardizedPath($0.logicalRootPath) == standardizedPath(context.logicalRoot.standardizedFullPath)
+                        logicalRootsEqual($0.logicalRootPath, context.logicalRoot.standardizedFullPath)
                     }
                 )
                 #if DEBUG
@@ -251,7 +250,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     }
                 #endif
                 var desiredBindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
-                    .filter { standardizedPath($0.logicalRootPath) != standardizedPath(context.logicalRoot.standardizedFullPath) }
+                    .filter { !logicalRootsEqual($0.logicalRootPath, context.logicalRoot.standardizedFullPath) }
                 desiredBindings.append(binding)
                 let initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = if let initializationReceipt,
                                                                                                     let startupContext
@@ -423,17 +422,24 @@ struct AgentMCPStartWorktreeCoordinator {
     ) async throws -> RepositoryContext {
         let store = targetWindow.promptManager.workspaceFileContextStore
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        let declaredPrimaryRoot = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first
         let discoveryRoots = Self.repositoryDiscoveryRoots(
-            primaryRoot: targetWindow.workspaceManager.activeWorkspace?.repoPaths.first,
+            primaryRoot: declaredPrimaryRoot,
             visibleRoots: visibleRoots
         )
+        let declaredPrimaryPath = declaredPrimaryRoot.map(GitRepoRootAuthorization.canonicalPath)
+        var declaredPrimaryCandidate: RepositoryCandidate?
         var candidates: [RepositoryCandidate] = []
         var seen = Set<String>()
         for root in discoveryRoots {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
                 let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
+                let candidate = RepositoryCandidate(repo: descriptor, logicalRoot: root)
+                if GitRepoRootAuthorization.canonicalPath(root.standardizedFullPath) == declaredPrimaryPath {
+                    declaredPrimaryCandidate = candidate
+                }
                 if seen.insert(descriptor.rootPath.lowercased()).inserted {
-                    candidates.append(RepositoryCandidate(repo: descriptor, logicalRoot: root))
+                    candidates.append(candidate)
                 }
             }
         }
@@ -458,8 +464,19 @@ struct AgentMCPStartWorktreeCoordinator {
                 throw MCPError.invalidParams(error.message)
             }
         } else {
-            repo = defaultCandidate.repo
-            explicitLogicalRoot = defaultCandidate.logicalRoot
+            let implicitCandidate: RepositoryCandidate
+            if declaredPrimaryPath != nil {
+                guard let declaredPrimaryCandidate else {
+                    throw MCPError.invalidParams(
+                        "The primary workspace root is not a Git repository for \(operationName) worktree binding. Select another loaded repository explicitly with worktree_repo_root."
+                    )
+                }
+                implicitCandidate = declaredPrimaryCandidate
+            } else {
+                implicitCandidate = defaultCandidate
+            }
+            repo = implicitCandidate.repo
+            explicitLogicalRoot = implicitCandidate.logicalRoot
         }
         let logicalRoot = try await logicalRoot(
             for: repo,
@@ -471,18 +488,6 @@ struct AgentMCPStartWorktreeCoordinator {
             visibleRoots: visibleRoots,
             logicalRoot: logicalRoot
         )
-    }
-
-    private func validateRuntimeRoot(_ logicalRoot: WorkspaceRootRef, targetWindow: WindowState) throws {
-        guard let primaryRoot = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first else {
-            return
-        }
-        let primary = standardizedPath((primaryRoot as NSString).expandingTildeInPath)
-        guard standardizedPath(logicalRoot.standardizedFullPath) == primary else {
-            throw MCPError.invalidParams(
-                "\(operationName) worktree binding currently supports the primary workspace root only. Requested root '\(logicalRoot.name)' at \(logicalRoot.standardizedFullPath), but the provider runtime cwd resolves from primary root \(primary)."
-            )
-        }
     }
 
     private func createWorktree(
@@ -617,8 +622,8 @@ struct AgentMCPStartWorktreeCoordinator {
         logicalRoot: WorkspaceRootRef,
         repositoryRoot: URL
     ) throws -> GitRepositoryRelativeRootPrefix {
-        let rootPath = StandardizedPath.absolute(logicalRoot.standardizedFullPath)
-        let repositoryPath = StandardizedPath.absolute(repositoryRoot.path)
+        let rootPath = GitRepoRootAuthorization.canonicalPath(logicalRoot.standardizedFullPath)
+        let repositoryPath = GitRepoRootAuthorization.canonicalPath(repositoryRoot.path)
         guard rootPath == repositoryPath || rootPath.hasPrefix(repositoryPath + "/") else {
             throw MCPError.invalidParams("The logical root is outside the selected Git repository.")
         }
@@ -762,6 +767,10 @@ struct AgentMCPStartWorktreeCoordinator {
             branch: worktree.branch,
             isMain: worktree.isMain
         )
+    }
+
+    private func logicalRootsEqual(_ lhs: String, _ rhs: String) -> Bool {
+        GitRepoRootAuthorization.canonicalPath(lhs) == GitRepoRootAuthorization.canonicalPath(rhs)
     }
 
     private func standardizedPath(_ path: String) -> String {
