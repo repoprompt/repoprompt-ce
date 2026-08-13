@@ -57,6 +57,51 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(messages.compactMap { $0["text"] as? String }.first, "first question")
     }
 
+    func testSuccessfulProviderResponseIsNotSettledFailedWhenTerminalSaveThrows() async throws {
+        let fixture = try Fixture(name: "persist-after-success")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "configured-primary", additional: [])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let task = Task {
+            try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "ask_oracle",
+                arguments: ["message": .string("keep provider success")]
+            )
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while try fixture.calls().isEmpty, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertFalse(try fixture.calls().isEmpty, "Expected the provider to run before the terminal save")
+        await prepared.oracleStore.failNextSaves(1)
+        do {
+            _ = try await task.value
+            XCTFail("Expected the terminal save to fail")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("debug_forced_save_failure"),
+                String(describing: error)
+            )
+        }
+        let owner = try OracleConversationOwner(
+            kind: "direct-headless",
+            identifier: fixture.profileName
+        )
+        guard case let .single(conversation)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
+            return XCTFail("Expected the prepared conversation to remain durable")
+        }
+        XCTAssertEqual(conversation.turns.last?.state, .prepared)
+        XCTAssertEqual(conversation.turns.last?.results ?? [], [])
+    }
+
     func testConcurrentSingleContinuationCannotOverwriteActivePreparedTurn() async throws {
         let fixture = try Fixture(name: "single-claim")
         defer { fixture.cleanup() }

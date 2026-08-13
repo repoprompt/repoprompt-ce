@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 extension Value {
     /// Decode this Value into a Decodable type by going through JSON.
@@ -4403,7 +4404,7 @@ extension ToolOutputFormatter {
             lines.append("- Oracle group: `\(groupID)`")
         }
         for lane in ordered {
-            let label = lane.laneIndex == 0 ? "Primary Oracle" : "Oracle \(lane.laneIndex + 1)"
+            let label = OracleRosterContract.displayLabel(laneIndex: lane.laneIndex)
             lines.append("")
             lines.append("### \(label)")
             lines.append("- Status: \(lane.status)")

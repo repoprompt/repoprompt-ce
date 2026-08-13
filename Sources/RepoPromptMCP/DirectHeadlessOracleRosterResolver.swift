@@ -23,7 +23,7 @@ struct DirectHeadlessOracleRosterResolver: OracleRosterResolver {
         case let .string(value):
             configuredPrimary = value
         default:
-            throw MCPError.internalError("Primary Oracle model setting has an invalid value type.")
+            throw MCPError.internalError("Oracle model setting has an invalid value type.")
         }
 
         let additional: [String]

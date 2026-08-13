@@ -86,6 +86,9 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     private let mutationObserver: MutationObserver
     private let claimManager: OracleGroupClaimManager
     private let artifactReservations = OracleArtifactReservationRegistry()
+    #if DEBUG
+        private var remainingForcedSaveFailures = 0
+    #endif
 
     package init(
         persistence: DomainPersistenceCoordinator,
@@ -97,7 +100,22 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         self.mutationObserver = mutationObserver
     }
 
+    #if DEBUG
+        package func failNextSaves(_ count: Int) {
+            remainingForcedSaveFailures = count
+        }
+
+        private func consumeForcedSaveFailure() throws {
+            guard remainingForcedSaveFailures > 0 else { return }
+            remainingForcedSaveFailures -= 1
+            throw OraclePersistenceError.invalidDocument("debug_forced_save_failure")
+        }
+    #endif
+
     package func create(_ group: OracleGroupDocument) async throws {
+        #if DEBUG
+            try consumeForcedSaveFailure()
+        #endif
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
@@ -173,6 +191,9 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     }
 
     package func save(_ group: OracleGroupDocument, expectedRevision: UInt64) async throws {
+        #if DEBUG
+            try consumeForcedSaveFailure()
+        #endif
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
@@ -382,6 +403,9 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     }
 
     package func create(_ conversation: OracleSingleConversationDocument) async throws {
+        #if DEBUG
+            try consumeForcedSaveFailure()
+        #endif
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
@@ -420,6 +444,9 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         _ conversation: OracleSingleConversationDocument,
         expectedRevision: UInt64
     ) async throws {
+        #if DEBUG
+            try consumeForcedSaveFailure()
+        #endif
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()

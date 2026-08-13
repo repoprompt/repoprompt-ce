@@ -4,6 +4,13 @@ import MCP
 import XCTest
 
 final class OracleGroupContractTests: XCTestCase {
+    func testDisplayLabelUsesOracleAndNumberedLanes() {
+        XCTAssertEqual(
+            (0 ... 4).map(OracleRosterContract.displayLabel(laneIndex:)),
+            ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
+        )
+    }
+
     func testRosterDescriptorNormalizesOrderedStringArrayWithoutDeduplicating() throws {
         let descriptor = try XCTUnwrap(
             DomainAppSettingsCatalog.descriptor(for: OracleRosterContract.additionalSettingKey)

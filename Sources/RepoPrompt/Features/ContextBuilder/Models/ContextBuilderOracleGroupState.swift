@@ -258,7 +258,7 @@ extension HeadlessMode {
 enum ContextBuilderOracleGroupProgressProjection {
     static func activity(for event: OracleProgressEvent) -> (ContextBuilderMCPProgressPhase, String)? {
         guard let laneID = event.laneID else { return nil }
-        let label = laneID.index == 0 ? "Primary Oracle" : "Oracle \(laneID.index + 1)"
+        let label = OracleRosterContract.displayLabel(laneIndex: laneID.index)
         switch event.kind {
         case .laneStarted:
             return (.streaming, "\(label) response streaming started")

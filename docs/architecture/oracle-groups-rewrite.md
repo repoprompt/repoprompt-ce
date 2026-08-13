@@ -20,7 +20,7 @@ The app should own presentation and app-specific projections. The direct MCP exe
 
 The proposed user-facing contract is intentionally small:
 
-- Oracle 1 is the permanent Primary Oracle. It cannot be removed.
+- The first Oracle is permanent and cannot be removed.
 - The user can add zero to four additional Oracles with `+ Add Oracle`, for a total of one to five.
 - Additional Oracles are ordered and removable. Removing a row disables that lane; there are no persisted blank or “Disabled” rows.
 - Duplicate model selections are allowed. They are independent samples, not a set of unique model identifiers.
@@ -147,7 +147,7 @@ package struct OracleLaneID: Hashable, Codable, Sendable {
 }
 ```
 
-Primary is `index == 0`. Labels such as “Primary Oracle”, “Secondary Oracle”, or “Oracle 3” are presentation/compatibility projections. The central roster policy enforces `1...5`; the identity type does not require a source edit when the product cap changes.
+Index `0` is the first Oracle. User-facing labels are “Oracle”, then “Oracle 2” through “Oracle 5”. The central roster policy enforces `1...5`; the identity type does not require a source edit when the product cap changes.
 
 ### Expected cardinality is required durable metadata
 
@@ -621,7 +621,7 @@ The envelope is appended to that backend's existing Primary projection: app-back
 
 Every item carries its own lane, model, chat, and status metadata. Consumers must not infer lane identity from completion order.
 
-The canonical DTO deliberately omits human labels. App/tool-card presentation derives labels from lane index and compatibility policy so “Secondary Oracle” does not become a second domain role.
+The canonical DTO deliberately omits human labels. App/tool-card presentation derives labels from lane index so “Oracle 2” does not become a second domain role.
 
 ## UI and presentation
 
@@ -637,7 +637,7 @@ The canonical DTO deliberately omits human labels. App/tool-card presentation de
 
 Five permanent pills will crowd the current status row. Prefer one permanent aggregate pill such as `Oracles · 3`, with ordered member rows/tabs in its popover and a settings shortcut before the first run.
 
-If individual pills remain, only Primary should handle legacy “open latest Oracle” behavior. Labels are presentation compatibility: retain “Secondary Oracle” where existing tests/tool cards use it, then use “Oracle 3” through “Oracle 5”.
+If individual pills remain, only the first Oracle should handle legacy “open latest Oracle” behavior. Labels are “Oracle”, then “Oracle 2” through “Oracle 5”.
 
 ### Context Builder
 
@@ -823,7 +823,7 @@ The rewrite is complete only when all of the following are true:
 
 - One source of truth defines roster validation and group execution.
 - App-backed and direct-headless Oracle calls share the same semantic group contract.
-- Primary is permanent and the UI can configure up to four ordered additional Oracles.
+- The first Oracle is permanent and the UI can configure up to four ordered additional Oracles.
 - App-backed N=1 takes the exact existing single path; direct N=1 remains one provider operation with the existing flat wire shape while honoring the approved Primary/durability contract.
 - N=2...5 return deterministic ordered metadata despite concurrent completion.
 - Group continuation, persistence, deletion, rename, recovery, and cancellation are whole-group operations.

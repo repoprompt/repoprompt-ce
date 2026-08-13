@@ -4,8 +4,9 @@ import SwiftOpenAI
 import XCTest
 
 final class ProviderStreamCompletionTests: XCTestCase {
-    func testOpenAIStopReasonReportsSuccessfulCompletion() {
+    func testOpenAICompatibleSuccessfulCompletionReasonsAreExplicit() {
         XCTAssertEqual(openAIChatCompletionOutcome(.string("stop")), .completed)
+        XCTAssertEqual(openAIChatCompletionOutcome(.string("end_turn")), .completed)
         XCTAssertNil(openAIChatCompletionOutcome(nil))
     }
 

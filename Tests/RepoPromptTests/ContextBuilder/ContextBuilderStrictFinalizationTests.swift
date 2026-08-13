@@ -414,6 +414,105 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     }
 
     @MainActor
+    func testGroupIncompleteTerminationPreservesPartialResponsesAndReportsExecutionPhases() async throws {
+        #if DEBUG
+            let testModel = AIModel.customProviderUser(name: "oracle-group-incomplete-test")
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(
+                [testModel.rawValue],
+                commit: false
+            )
+            let composition = makeComposition(
+                windowID: -184,
+                terminalOutcome: .incomplete(reason: "max_tokens")
+            )
+            await composition.workspaceManager.awaitInitialized()
+            let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
+            composition.apiSettingsViewModel.isCustomProviderValid = true
+            defer { composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity }
+
+            let root = makeTemporaryRoot(label: "group-incomplete")
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = composition.workspaceManager.createWorkspace(
+                name: "Context Builder grouped incomplete test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await composition.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderStrictFinalizationTests.group-incomplete"
+            )
+            let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let viewModel = composition.contextBuilderAgentViewModel
+            viewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    resolveMCPFollowUpModel: { _ in
+                        (model: testModel, chatPresetID: nil, mcpControlInfo: nil)
+                    }
+                )
+            )
+            defer { viewModel.installRunTestHooks(nil) }
+
+            let phaseRecorder = ContextBuilderStrictFinalizationPhaseRecorder()
+            do {
+                _ = try await viewModel.runMCPPlanOrQuestion(
+                    for: tabID,
+                    oracleViewModel: composition.oracleViewModel,
+                    mode: .plan,
+                    prompt: "Produce a grouped plan.",
+                    selection: StoredSelection(),
+                    reviewGitContext: .automaticOnly(),
+                    progressReporter: { phase in
+                        await phaseRecorder.record(phase)
+                    }
+                )
+                XCTFail("Expected incomplete primary termination to fail")
+            } catch let error as ChatToolError {
+                XCTAssertEqual(error.code, .internalError)
+                XCTAssertEqual(
+                    error.message,
+                    "The provider ended the response before successful completion (reason: max_tokens)."
+                )
+            }
+
+            let owner = try OracleViewModel.oracleGroupOwner(
+                workspaceID: workspace.id,
+                tabID: tabID
+            )
+            guard case let .group(group)? = try await AppDomainRuntimeComposition.shared
+                .oracleConversationStore.loadMostRecentConversation(owner: owner)
+            else {
+                return XCTFail("Expected a persisted Oracle group")
+            }
+            let results = try XCTUnwrap(group.turns.last?.results)
+            XCTAssertEqual(results.map(\.status), [.failed, .failed])
+            XCTAssertEqual(results.map { $0.error?.partialResponse }, ["partial response", "partial response"])
+            XCTAssertEqual(viewModel.generatedPlanResponseText(for: tabID), "partial response")
+            XCTAssertNotNil(viewModel.currentFollowUpOracleChatID(for: tabID))
+            guard case .error = viewModel.planStatus(for: tabID) else {
+                return XCTFail("Expected Context Builder error state with retained partial response")
+            }
+            let phases = await phaseRecorder.snapshot()
+            XCTAssertEqual(phases, [
+                .modelResolution,
+                .payloadPackaging,
+                .sessionCreationAndPersist,
+                .streaming,
+                .messageFinalization
+            ])
+        #else
+            throw XCTSkip("Strict finalization injection is DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
     func testReplacementOracleRunOwnsStateWhilePredecessorResumesAfterReservationRelease() async throws {
         #if DEBUG
             let testModel = AIModel.customProviderUser(name: "oracle-group-replacement-test")
@@ -607,6 +706,18 @@ private actor ContextBuilderStrictFinalizationResponseCounter {
     func next() -> Int {
         value += 1
         return value
+    }
+}
+
+private actor ContextBuilderStrictFinalizationPhaseRecorder {
+    private var phases: [ContextBuilderMCPProgressPhase] = []
+
+    func record(_ phase: ContextBuilderMCPProgressPhase) {
+        phases.append(phase)
+    }
+
+    func snapshot() -> [ContextBuilderMCPProgressPhase] {
+        phases
     }
 }
 
