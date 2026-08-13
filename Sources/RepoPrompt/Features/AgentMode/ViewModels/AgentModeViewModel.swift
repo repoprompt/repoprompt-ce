@@ -6952,6 +6952,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw MCPError.invalidParams("The requested agent session is not currently available.")
             }
             let effectiveParentSessionID = indexedParentSessionID ?? parentSessionID
+            let parentWasLocallyRepresentedAtAdmissionStart = effectiveParentSessionID.map {
+                sessionTreeNodes()[$0] != nil
+            } ?? false
             let createdTabID = try await mcpCreateBackgroundSessionTab(
                 name: sessionName,
                 sessionID: sessionID,
@@ -6961,7 +6964,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #if DEBUG
                 await test_afterDurableChildTabCreation?()
             #endif
-            try requireSpawnAdmissionStillCurrent(childTabID: createdTabID, parentSessionID: effectiveParentSessionID)
+            try requireSpawnAdmissionStillCurrent(
+                childTabID: createdTabID,
+                parentSessionID: effectiveParentSessionID,
+                parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
+            )
             let hydrated = await ensureSessionReady(tabID: createdTabID)
             await loadSessionFromDisk(for: hydrated)
             applySpawnParentSessionID(
@@ -7012,6 +7019,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("No target agent session was specified.")
         }
         let intendedSessionID = UUID()
+        let parentWasLocallyRepresentedAtAdmissionStart = parentSessionID.map {
+            sessionTreeNodes()[$0] != nil
+        } ?? false
         let createdTabID = try await mcpCreateBackgroundSessionTab(
             name: sessionName,
             sessionID: intendedSessionID,
@@ -7021,7 +7031,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #if DEBUG
             await test_afterDurableChildTabCreation?()
         #endif
-        try requireSpawnAdmissionStillCurrent(childTabID: createdTabID, parentSessionID: parentSessionID)
+        try requireSpawnAdmissionStillCurrent(
+            childTabID: createdTabID,
+            parentSessionID: parentSessionID,
+            parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
+        )
         let hydrated = await ensureSessionReady(tabID: createdTabID)
         guard hydrated.activeAgentSessionID == intendedSessionID else {
             throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
@@ -7103,11 +7117,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func requireSpawnAdmissionStillCurrent(childTabID: UUID, parentSessionID: UUID?) throws {
+    private func requireSpawnAdmissionStillCurrent(
+        childTabID: UUID,
+        parentSessionID: UUID?,
+        parentWasLocallyRepresentedAtAdmissionStart: Bool
+    ) throws {
         guard workspaceManager?.composeTab(with: childTabID) != nil else {
             throw MCPError.invalidParams("The new child Agent session was removed before admission completed.")
         }
-        if let parentSessionID, sessionTreeNodes()[parentSessionID] == nil {
+        if parentWasLocallyRepresentedAtAdmissionStart,
+           let parentSessionID,
+           sessionTreeNodes()[parentSessionID] == nil
+        {
             throw MCPError.invalidParams("The parent Agent session was removed before child admission completed.")
         }
     }
