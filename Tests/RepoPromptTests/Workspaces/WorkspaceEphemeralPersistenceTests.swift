@@ -63,6 +63,33 @@ import XCTest
             )
         }
 
+        func testAuthorityProjectionPreservesActiveLocalEphemeralWorkspace() async {
+            let manager = makeManager(windowID: -771)
+            await manager.awaitInitialized()
+            let persistedProjection = manager.workspaces.filter { !$0.isEphemeral }
+            let ephemeral = manager.createEphemeralWorkspace(
+                name: "Temporary Projection",
+                repoPaths: []
+            )
+            let switchResult = await manager.switchWorkspace(to: ephemeral, saveState: false)
+            XCTAssertTrue(switchResult.didSwitch)
+
+            manager.applyDomainWorkspaceProjection(
+                persistedProjection,
+                fileURLsByWorkspaceID: [:],
+                revisionsByWorkspaceID: [:],
+                digestsByWorkspaceID: [:],
+                healthByWorkspaceID: [:],
+                catalogRevision: 1,
+                preferredActiveWorkspaceID: ephemeral.id,
+                publicationSequence: 1
+            )
+
+            XCTAssertEqual(manager.activeWorkspaceID, ephemeral.id)
+            XCTAssertEqual(manager.workspace(withID: ephemeral.id)?.name, ephemeral.name)
+            XCTAssertTrue(manager.workspace(withID: ephemeral.id)?.isEphemeral == true)
+        }
+
         func testIndexedPersistedEphemeralWorkspaceIsExcludedWithoutDeletingLegacyFiles() async throws {
             let workspace = WorkspaceModel(
                 name: "Legacy Temporary",

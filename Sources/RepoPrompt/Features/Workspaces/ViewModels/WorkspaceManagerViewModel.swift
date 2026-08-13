@@ -4452,6 +4452,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         lastDomainProjectionSequence = publicationSequence
         let persistedProjection = projectedWorkspaces.filter { !$0.isEphemeral }
         let persistedWorkspaceIDs = Set(persistedProjection.map(\.id))
+        let localEphemeralWorkspaces = workspaces.filter(\.isEphemeral)
+        let localEphemeralByID = Dictionary(
+            localEphemeralWorkspaces.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var localProjection = persistedProjection.map { projected in
+            localEphemeralByID[projected.id] ?? projected
+        }
+        localProjection.append(contentsOf: localEphemeralWorkspaces.filter {
+            !persistedWorkspaceIDs.contains($0.id)
+        })
         if domainWorkspaceAuthorityClient != nil {
             // A projected canonical transition (external reload, cross-window commit, deletion)
             // can replace workspace content without touching this manager's dirty-tracking
@@ -4474,10 +4485,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
         let lifecycleProjection = agentSessionProjectionReconciler?(
-            persistedProjection,
+            localProjection,
             workspaces
         )
-        let reconciledWorkspaces = lifecycleProjection?.workspaces ?? persistedProjection
+        let reconciledWorkspaces = lifecycleProjection?.workspaces ?? localProjection
         workspaces = reconciledWorkspaces
         recordRepoPathBaselines(for: reconciledWorkspaces)
         if let preferredActiveWorkspaceID,
