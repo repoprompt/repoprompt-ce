@@ -406,6 +406,102 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         }))
     }
 
+    func testParentDeleteIncludesChildPausedAfterDurableAdmission() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let parentTab = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first)
+        let parentSessionID = try XCTUnwrap(parentTab.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let admissionGate = ComposeRemovalPreflightGate()
+        viewModel.test_setAfterDurableChildTabCreation {
+            await admissionGate.markStartedAndWaitForRelease()
+        }
+
+        let admissionTask = Task {
+            try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil,
+                sessionID: nil,
+                createIfNeeded: true,
+                sessionName: "Paused child",
+                parentSessionID: parentSessionID
+            )
+        }
+        let admissionPaused = await admissionGate.waitUntilStarted()
+        XCTAssertTrue(admissionPaused)
+        let childTabID = try XCTUnwrap(
+            fixture.manager.activeWorkspace?.composeTabs.first(where: { $0.id != parentTab.id && $0.name == "Paused child" })?.id
+        )
+
+        let report = await fixture.prompt.deleteComposeAndStashedTabs(
+            composeTabIDs: [parentTab.id],
+            archivedTargets: []
+        )
+        await admissionGate.release()
+
+        XCTAssertTrue(report.removedComposeTabIDs.contains(parentTab.id))
+        XCTAssertTrue(report.removedComposeTabIDs.contains(childTabID))
+        XCTAssertFalse(fixture.prompt.currentComposeTabs.contains(where: { $0.id == parentTab.id || $0.id == childTabID }))
+        do {
+            _ = try await admissionTask.value
+            XCTFail("Expected paused child admission to reject after cascade deletion")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("removed before admission completed"))
+        }
+    }
+
+    func testArchivedDeleteRejectsChildAdmittedDuringRequiredPersistence() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let archived = try XCTUnwrap(fixture.manager.activeWorkspace?.stashedTabs.first)
+        let parentSessionID = try XCTUnwrap(archived.tab.activeAgentSessionID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let preflightGate = ComposeRemovalPreflightGate()
+        let admissionGate = ComposeRemovalPreflightGate()
+        viewModel.test_setAfterDurableChildTabCreation {
+            await admissionGate.markStartedAndWaitForRelease()
+        }
+        let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { _, reason, _ in
+            if reason == .deleteStashed {
+                await preflightGate.markStartedAndWaitForRelease()
+            }
+            return .proceed
+        }
+        defer { fixture.prompt.removeComposeTabsRemovalPreflight(preflightToken) }
+        let target = PromptViewModel.ArchivedTabMutationTarget(
+            stashedTabID: archived.id,
+            tabID: archived.tab.id
+        )
+
+        let deleteTask = Task {
+            await fixture.prompt.deleteComposeAndStashedTabs(
+                composeTabIDs: [],
+                archivedTargets: [target]
+            )
+        }
+        let preflightStarted = await preflightGate.waitUntilStarted()
+        XCTAssertTrue(preflightStarted)
+        let admissionTask = Task {
+            try await viewModel.mcpResolveOrCreateSessionTarget(
+                tabID: nil,
+                sessionID: nil,
+                createIfNeeded: true,
+                sessionName: "Late archived child",
+                parentSessionID: parentSessionID
+            )
+        }
+        let admissionPaused = await admissionGate.waitUntilStarted()
+        XCTAssertTrue(admissionPaused)
+        let childTabID = try XCTUnwrap(
+            fixture.manager.activeWorkspace?.composeTabs.first(where: { $0.name == "Late archived child" })?.id
+        )
+        await preflightGate.release()
+        let report = await deleteTask.value
+        await admissionGate.release()
+        _ = try await admissionTask.value
+
+        XCTAssertTrue(report.rejections.contains(where: { $0.reason == .mutationContextChanged }))
+        XCTAssertTrue(fixture.prompt.currentStashedTabs.contains(where: { $0.id == archived.id }))
+        XCTAssertTrue(fixture.prompt.currentComposeTabs.contains(where: { $0.id == childTabID }))
+    }
+
     func testDeleteRejectsCascadeAddedArchivedIdentityReplacement() async throws {
         let fixture = makeFixture(initialTabCount: 2)
         let activeTabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
@@ -474,6 +570,11 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             ])
         }
         fixture.prompt.stashedTabCascadeResolver = { _ in PromptViewModel.AgentSessionCascadePlan() }
+        fixture.prompt.agentSessionCascadeSnapshotResolver = { _, _, _ in
+            PromptViewModel.AgentSessionCascadePlan(archivedTargets: [
+                .init(stashedTabID: stashed.id, tabID: stashed.tab.id)
+            ])
+        }
         let preflightRecorder = RemovalPreflightRecorder()
         let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { _, reason, _ in
             await preflightRecorder.record(reason)
@@ -507,6 +608,9 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         fixture.prompt.stashedTabCascadeResolver = { _ in
             PromptViewModel.AgentSessionCascadePlan(composeTabIDs: [activeTabID])
         }
+        fixture.prompt.agentSessionCascadeSnapshotResolver = { _, _, _ in
+            PromptViewModel.AgentSessionCascadePlan(composeTabIDs: [activeTabID])
+        }
         let preflightRecorder = RemovalPreflightRecorder()
         let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { _, reason, _ in
             await preflightRecorder.record(reason)
@@ -538,6 +642,9 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         let activeTabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
         let stashed = try XCTUnwrap(fixture.manager.activeWorkspace?.stashedTabs.first)
         fixture.prompt.stashedTabCascadeResolver = { _ in
+            PromptViewModel.AgentSessionCascadePlan(composeTabIDs: [activeTabID])
+        }
+        fixture.prompt.agentSessionCascadeSnapshotResolver = { _, _, _ in
             PromptViewModel.AgentSessionCascadePlan(composeTabIDs: [activeTabID])
         }
         let context = MutationContextFlag()

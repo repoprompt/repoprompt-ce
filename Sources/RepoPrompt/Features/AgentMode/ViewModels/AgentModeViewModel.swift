@@ -475,6 +475,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]
+
     private struct AgentRunOracleReviewKey: Hashable {
         let sessionID: UUID
         let runID: UUID
@@ -703,6 +705,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_sidebarSessionRowsBuildCount = 0
         var test_sidebarListProjectionBuildCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
+        private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
         private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
@@ -800,6 +803,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ) {
             self.promptManager = promptManager
             self.workspaceManager = workspaceManager
+            installPromptManagerCascadeResolvers(promptManager)
             installAgentSessionLifecycleProjectionAuthority()
         }
 
@@ -809,6 +813,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
             test_afterMCPStoreEpochBegan = hook
+        }
+
+        func test_setAfterDurableChildTabCreation(_ hook: (@MainActor () async -> Void)?) {
+            test_afterDurableChildTabCreation = hook
         }
 
         func test_setTerminalPublicationOverride(
@@ -2863,6 +2871,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self.sessionTreeCascadePlan(forStashedTabIDs: stashedTabIDs)
             }
         }
+        promptManager.agentSessionCascadeSnapshotResolver = makeAgentSessionCascadeSnapshotResolver()
+    }
+
+    private func makeAgentSessionCascadeSnapshotResolver() -> PromptViewModel.AgentSessionCascadeSnapshotResolver {
+        { [weak self] composeTabIDs, archivedTargets, reason in
+            guard let self else { return .init() }
+            var plan = sessionTreeCascadePlan(forComposeTabIDs: composeTabIDs, reason: reason)
+            let archivedPlan = sessionTreeCascadePlan(
+                forStashedTabIDs: Set(archivedTargets.map(\.stashedTabID))
+            )
+            plan.composeTabIDs.formUnion(archivedPlan.composeTabIDs)
+            plan.archivedTargets.formUnion(archivedPlan.archivedTargets)
+            return plan
+        }
     }
 
     func isComposeTabProtectedFromSidebarArchiveSuggestion(_ tabID: UUID) -> Bool {
@@ -3011,6 +3033,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nodes[sessionID] = node
         }
 
+        for (sessionID, parentSessionID) in provisionalParentSessionIDBySessionID {
+            merge(sessionID: sessionID, parentSessionID: parentSessionID)
+        }
         for session in sessions.values where validComposeTabIDs.contains(session.tabID) {
             guard let sessionID = session.activeAgentSessionID else { continue }
             if let explicitSessionID = explicitSessionIDByTabID[session.tabID],
@@ -6926,14 +6951,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard createIfNeeded else {
                 throw MCPError.invalidParams("The requested agent session is not currently available.")
             }
+            let effectiveParentSessionID = indexedParentSessionID ?? parentSessionID
             let createdTabID = try await mcpCreateBackgroundSessionTab(
                 name: sessionName,
-                sessionID: sessionID
+                sessionID: sessionID,
+                parentSessionID: effectiveParentSessionID
             )
+            defer { provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID) }
+            #if DEBUG
+                await test_afterDurableChildTabCreation?()
+            #endif
+            try requireSpawnAdmissionStillCurrent(childTabID: createdTabID, parentSessionID: effectiveParentSessionID)
             let hydrated = await ensureSessionReady(tabID: createdTabID)
             await loadSessionFromDisk(for: hydrated)
             applySpawnParentSessionID(
-                indexedParentSessionID ?? parentSessionID,
+                effectiveParentSessionID,
                 to: hydrated,
                 inheritWorktreeBindings: inheritWorktreeBindings
             )
@@ -6982,8 +7014,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let intendedSessionID = UUID()
         let createdTabID = try await mcpCreateBackgroundSessionTab(
             name: sessionName,
-            sessionID: intendedSessionID
+            sessionID: intendedSessionID,
+            parentSessionID: parentSessionID
         )
+        defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
+        #if DEBUG
+            await test_afterDurableChildTabCreation?()
+        #endif
+        try requireSpawnAdmissionStillCurrent(childTabID: createdTabID, parentSessionID: parentSessionID)
         let hydrated = await ensureSessionReady(tabID: createdTabID)
         guard hydrated.activeAgentSessionID == intendedSessionID else {
             throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
@@ -7065,7 +7103,38 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private func requireSpawnAdmissionStillCurrent(childTabID: UUID, parentSessionID: UUID?) throws {
+        guard workspaceManager?.composeTab(with: childTabID) != nil else {
+            throw MCPError.invalidParams("The new child Agent session was removed before admission completed.")
+        }
+        if let parentSessionID, sessionTreeNodes()[parentSessionID] == nil {
+            throw MCPError.invalidParams("The parent Agent session was removed before child admission completed.")
+        }
+    }
+
     private func mcpCreateBackgroundSessionTab(
+        name: String?,
+        sessionID: UUID,
+        parentSessionID: UUID?
+    ) async throws -> UUID {
+        guard let promptManager else {
+            throw MCPError.internalError("Prompt manager unavailable.")
+        }
+        if let parentSessionID, parentSessionID != sessionID {
+            provisionalParentSessionIDBySessionID[sessionID] = parentSessionID
+        }
+        do {
+            return try await createBackgroundSessionTab(
+                name: name,
+                sessionID: sessionID
+            )
+        } catch {
+            provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
+            throw error
+        }
+    }
+
+    private func createBackgroundSessionTab(
         name: String?,
         sessionID: UUID
     ) async throws -> UUID {

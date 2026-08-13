@@ -237,11 +237,17 @@ class PromptViewModel: ObservableObject {
     ) async -> ComposeTabRemovalDecision
     typealias ComposeTabCascadeResolver = @Sendable (_ tabIDs: Set<UUID>, _ reason: ComposeTabRemovalReason) async -> AgentSessionCascadePlan
     typealias StashedTabCascadeResolver = @Sendable (_ stashedTabIDs: Set<UUID>) async -> AgentSessionCascadePlan
+    typealias AgentSessionCascadeSnapshotResolver = @MainActor (
+        _ composeTabIDs: Set<UUID>,
+        _ archivedTargets: Set<ArchivedTabMutationTarget>,
+        _ reason: ComposeTabRemovalReason
+    ) -> AgentSessionCascadePlan
     private var composeTabsWillCloseListeners: [UUID: ComposeTabsWillCloseListener] = [:]
     private var composeTabsDidRemoveListeners: [UUID: ComposeTabsDidRemoveListener] = [:]
     private var composeTabsRemovalPreflight: (token: UUID, hook: ComposeTabsRemovalHook)?
     var composeTabCascadeResolver: ComposeTabCascadeResolver?
     var stashedTabCascadeResolver: StashedTabCascadeResolver?
+    var agentSessionCascadeSnapshotResolver: AgentSessionCascadeSnapshotResolver?
 
     // MARK: - UI State Properties
 
@@ -3035,12 +3041,24 @@ class PromptViewModel: ObservableObject {
             )])
         }
 
+        let expectedComposeTabIDs = resolvedComposeTabIDs
+        let expectedArchivedTargets = allArchivedTargets
+        let cascadeIsCurrentAfterPreflight: @MainActor () -> Bool = {
+            guard mutationContextIsCurrent(),
+                  let agentSessionCascadeSnapshotResolver = self.agentSessionCascadeSnapshotResolver
+            else { return false }
+            let freshCascadePlan = agentSessionCascadeSnapshotResolver(composeTabIDs, archivedTargets, .close)
+            return composeTabIDs.union(freshCascadePlan.composeTabIDs) == expectedComposeTabIDs
+                && archivedTargets.union(freshCascadePlan.archivedTargets) == expectedArchivedTargets
+        }
+
         var report = ComposeTabMutationReport()
         if !resolvedComposeTabIDs.isEmpty {
             await report.merge(removeComposeTabs(
                 withIDs: resolvedComposeTabIDs,
                 expandCascade: false,
-                isMutationContextCurrent: mutationContextIsCurrent
+                isMutationContextCurrent: mutationContextIsCurrent,
+                postPreflightValidation: cascadeIsCurrentAfterPreflight
             ))
         }
         if !allArchivedTargets.isEmpty, report.rejections.isEmpty {
@@ -3121,7 +3139,8 @@ class PromptViewModel: ObservableObject {
         preferredActiveID: UUID? = nil,
         reason: ComposeTabRemovalReason = .close,
         expandCascade: Bool = true,
-        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        postPreflightValidation: (@MainActor () -> Bool)? = nil
     ) async -> ComposeTabMutationReport {
         guard !ids.isEmpty else {
             return ComposeTabMutationReport(noOpReasons: [reason])
@@ -3240,6 +3259,33 @@ class PromptViewModel: ObservableObject {
         }
         guard mutationContextIsCurrent() else {
             return rejection(.mutationContextChanged, message: "The workspace or selection changed during preflight.")
+        }
+        if expandCascade, composeTabCascadeResolver != nil {
+            guard let agentSessionCascadeSnapshotResolver else {
+                return rejection(.mutationContextChanged, message: "Related chat verification is unavailable.")
+            }
+            let freshCascadePlan = agentSessionCascadeSnapshotResolver(ids, [], reason)
+            let freshResolvedIDs = ids.union(freshCascadePlan.composeTabIDs)
+            let freshArchivedTargets = reason == .close ? freshCascadePlan.archivedTargets : []
+            guard freshResolvedIDs == resolvedIDs,
+                  freshArchivedTargets == archivedTargetsToDelete
+            else {
+                return rejection(
+                    .mutationContextChanged,
+                    message: "The related chat set changed during required persistence."
+                )
+            }
+        }
+        if let postPreflightValidation {
+            guard postPreflightValidation() else {
+                return rejection(
+                    .mutationContextChanged,
+                    message: "The related chat set changed during required persistence."
+                )
+            }
+        }
+        guard mutationContextIsCurrent() else {
+            return rejection(.mutationContextChanged, message: "The workspace or selection changed after cascade verification.")
         }
         tabs = manager.workspaces[index].composeTabs
         tabsBeforeClose = tabs
@@ -3684,6 +3730,19 @@ class PromptViewModel: ObservableObject {
         guard expectedTabIDByStashedID.allSatisfy({ freshTabIDByStashedID[$0.key] == $0.value }) else {
             report.merge(contextRejection("A targeted archived chat changed during preflight."))
             return report
+        }
+        if stashedTabCascadeResolver != nil {
+            guard let agentSessionCascadeSnapshotResolver else {
+                report.merge(contextRejection("Related chat verification is unavailable."))
+                return report
+            }
+            let freshCascadePlan = agentSessionCascadeSnapshotResolver([], targets, .deleteStashed)
+            guard freshCascadePlan.composeTabIDs.isEmpty,
+                  targets.union(freshCascadePlan.archivedTargets) == targets
+            else {
+                report.merge(contextRejection("The related chat set changed during required persistence."))
+                return report
+            }
         }
         manager.workspaces[index].stashedTabs = freshStashedTabs.filter { !stashedTabIDs.contains($0.id) }
         loadComposeTabsFromWorkspace(manager.workspaces[index])

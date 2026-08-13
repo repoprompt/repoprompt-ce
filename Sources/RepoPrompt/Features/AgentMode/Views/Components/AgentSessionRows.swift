@@ -164,12 +164,15 @@ struct AgentSessionRow: View {
         }
     }
 
+    private func toggleSelection() {
+        guard isSelectionEnabled else { return }
+        _ = onSelectionGesture(.toggle)
+    }
+
     var body: some View {
         HStack(spacing: rowSpacing) {
             if isSelectionMode {
-                Button {
-                    _ = onSelectionGesture(.toggle)
-                } label: {
+                Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 }
@@ -301,6 +304,10 @@ struct AgentSessionRow: View {
         .contentShape(Rectangle())
         .contextMenu {
             if !isSelectionMode {
+                Button("Select chat", action: toggleSelection)
+
+                Divider()
+
                 Button(pinActionLabel, action: onTogglePin)
 
                 Button(renameActionLabel, action: beginRename)
@@ -320,8 +327,14 @@ struct AgentSessionRow: View {
         }
         .onHover { isHovered = $0 }
         .onTapGesture(perform: handleRowTap)
+        .focusable()
+        .onKeyPress(.space) {
+            toggleSelection()
+            return .handled
+        }
         .accessibilityLabel(title)
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityAction(named: Text(isSelected ? "Deselect chat" : "Select chat"), toggleSelection)
         .popover(isPresented: $showDeleteConfirmation, attachmentAnchor: .rect(.bounds), arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Delete chat?")
@@ -806,12 +819,15 @@ struct AgentStashedSessionRow: View {
         }
     }
 
+    private func toggleSelection() {
+        guard isSelectionEnabled else { return }
+        _ = onSelectionGesture(.toggle)
+    }
+
     var body: some View {
         HStack(spacing: rowSpacing) {
             if isSelectionMode {
-                Button {
-                    _ = onSelectionGesture(.toggle)
-                } label: {
+                Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 }
@@ -878,6 +894,8 @@ struct AgentStashedSessionRow: View {
         .contentShape(Rectangle())
         .contextMenu {
             if !isSelectionMode {
+                Button("Select chat", action: toggleSelection)
+                Divider()
                 Button(restoreActionLabel, action: onRestore)
                 Divider()
                 Button(deleteActionLabel, role: .destructive, action: onDelete)
@@ -885,8 +903,14 @@ struct AgentStashedSessionRow: View {
         }
         .onHover { isHovered = $0 }
         .onTapGesture(perform: handleRowTap)
+        .focusable()
+        .onKeyPress(.space) {
+            toggleSelection()
+            return .handled
+        }
         .accessibilityLabel("\(stashed.tab.name), archived session")
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityAction(named: Text(isSelected ? "Deselect chat" : "Select chat"), toggleSelection)
     }
 }
 
