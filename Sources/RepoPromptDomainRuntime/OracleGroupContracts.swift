@@ -79,6 +79,11 @@ package enum OracleRosterContract {
     package static func sanitizedAdditionalModelIDs(_ raws: [String]) -> [String] {
         Array(raws.compactMap { try? normalizedModelID($0) }.prefix(maximumAdditionalCount))
     }
+
+    /// User-facing lane title. Index 0 is "Oracle"; later lanes are "Oracle 2"…"Oracle 5".
+    package static func displayLabel(laneIndex: Int) -> String {
+        laneIndex <= 0 ? "Oracle" : "Oracle \(laneIndex + 1)"
+    }
 }
 
 /// Canonical settings descriptors consumed by both app-backed and direct adapters.
@@ -88,7 +93,7 @@ package enum OracleRosterSettingsDescriptor {
         group: "models",
         valueKind: .string,
         defaultValue: .null,
-        description: "Preferred Primary Oracle model raw identifier, if set.",
+        description: "Preferred Oracle model raw identifier, if set.",
         optionsAvailable: true,
         allowsNull: true,
         maximumStringLength: OracleRosterContract.maximumModelIdentifierLength
@@ -99,7 +104,7 @@ package enum OracleRosterSettingsDescriptor {
         group: "models",
         valueKind: .stringArray,
         defaultValue: .stringArray([]),
-        description: "Ordered independent Oracle model raw identifiers after the permanent Primary Oracle (zero to four); duplicates are retained.",
+        description: "Ordered independent Oracle model raw identifiers after the permanent first Oracle (zero to four); duplicates are retained.",
         optionsAvailable: true,
         allowsNull: false,
         maximumArrayCount: OracleRosterContract.maximumAdditionalCount,

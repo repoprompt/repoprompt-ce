@@ -352,7 +352,7 @@ struct AgentModelsSettingsView: View {
         settingsCard {
             sectionHeader(
                 title: "Oracle Models",
-                subtitle: "Primary is permanent. Add up to four independent Oracles for parallel ask_oracle, oracle_send, plan, and review responses."
+                subtitle: "The first Oracle is permanent. Add up to four independent Oracles for parallel ask_oracle, oracle_send, plan, and review responses."
             )
 
             VStack(alignment: .leading, spacing: 12) {
@@ -371,7 +371,7 @@ struct AgentModelsSettingsView: View {
                 .hoverTooltip(
                     viewModel.canAddOracle
                         ? "Add another Oracle model."
-                        : "Choose a Primary Oracle first, or remove an Oracle to stay within the five-model limit."
+                        : "Choose an Oracle first, or remove an Oracle to stay within the five-model limit."
                 )
             }
         }

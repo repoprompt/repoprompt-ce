@@ -456,7 +456,32 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
         XCTAssertEqual(
             (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
-            ["Primary Oracle", "Secondary Oracle", "Oracle 3", "Oracle 4", "Oracle 5"]
+            ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(isStreaming: true, lastAssistantContent: "Error: stale"),
+            .streaming
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "partial answer\n\n--\nError:\nstatus code 502"
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "Error: status code 502 Gemini response stalled"
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "Review looks correct. Mention error handling."
+            ),
+            .completed
         )
     }
 

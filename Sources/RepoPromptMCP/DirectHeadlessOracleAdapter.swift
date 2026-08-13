@@ -425,8 +425,9 @@ actor DirectHeadlessOracleAdapter {
         carrier: DomainChildLaunchCarrier?
     ) async throws -> Value {
         let prompt = Self.prompt(turns: Array(prepared.turns.dropLast()), laneIndex: 0, next: plan.input.userMessage)
+        let response: String
         do {
-            let response = try await provider.runProviderOnce(
+            response = try await provider.runProviderOnce(
                 message: prompt,
                 providerID: prepared.model.providerID,
                 model: prepared.model.modelID,
@@ -437,20 +438,6 @@ actor DirectHeadlessOracleAdapter {
             guard !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle provider returned an empty response.")
             }
-            let result = try OracleLaneResult(
-                laneIndex: 0,
-                chatID: prepared.publicChatID,
-                providerID: prepared.model.providerID,
-                modelID: prepared.model.modelID,
-                status: .completed,
-                response: response
-            )
-            try await saveSingleTerminal(prepared, result: result)
-            return .object([
-                "chat_id": .string(prepared.publicChatID),
-                "response": .string(response),
-                "backend": .string("headless")
-            ])
         } catch is CancellationError {
             let result = try OracleLaneResult(
                 laneIndex: 0,
@@ -485,6 +472,20 @@ actor DirectHeadlessOracleAdapter {
             }.value
             throw error
         }
+        let result = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: prepared.publicChatID,
+            providerID: prepared.model.providerID,
+            modelID: prepared.model.modelID,
+            status: .completed,
+            response: response
+        )
+        try await saveSingleTerminal(prepared, result: result)
+        return .object([
+            "chat_id": .string(prepared.publicChatID),
+            "response": .string(response),
+            "backend": .string("headless")
+        ])
     }
 
     private func saveSingleTerminal(
@@ -552,17 +553,12 @@ actor DirectHeadlessOracleAdapter {
         )
         defer { claim.release() }
         try await store.create(prepared)
-        do {
-            return try await executeGroup(
-                plan: plan,
-                prepared: prepared,
-                request: request,
-                bundle: bundle
-            )
-        } catch {
-            try await settlePreparedGroupIfNeeded(prepared, error: error)
-            throw error
-        }
+        return try await executeGroup(
+            plan: plan,
+            prepared: prepared,
+            request: request,
+            bundle: bundle
+        )
     }
 
     private func executeGroupContinuation(
@@ -606,17 +602,12 @@ actor DirectHeadlessOracleAdapter {
             turns: current.turns + [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
         )
         try await store.save(prepared, expectedRevision: current.revision)
-        do {
-            return try await executeGroup(
-                plan: plan,
-                prepared: prepared,
-                request: request,
-                bundle: bundle
-            )
-        } catch {
-            try await settlePreparedGroupIfNeeded(prepared, error: error)
-            throw error
-        }
+        return try await executeGroup(
+            plan: plan,
+            prepared: prepared,
+            request: request,
+            bundle: bundle
+        )
     }
 
     private func executeGroup(
@@ -625,42 +616,48 @@ actor DirectHeadlessOracleAdapter {
         request: DomainPhysicalToolRequest,
         bundle: DomainChildLaunchCarrierBundle
     ) async throws -> Value {
-        let priorTurns = Array(prepared.turns.dropLast())
-        let plans = try prepared.members.map { member in
-            let lane = try OracleLaneDescriptor(
-                group: prepared.group,
-                laneID: member.laneID,
-                model: member.model
-            )
-            guard let carrier = bundle.carrier(for: member.laneID) else {
-                throw AdapterError.childCarrierMismatch
-            }
-            let prompt = Self.prompt(
-                turns: priorTurns,
-                laneIndex: member.laneID.index,
-                next: plan.input.userMessage
-            )
-            return try OracleLanePlan(lane: lane, publicChatID: member.publicChatID) { [provider] _ in
-                let response = try await provider.runProviderOnce(
-                    message: prompt,
-                    providerID: member.model.providerID,
-                    model: member.model.modelID,
-                    request: request,
-                    purpose: .oracle,
-                    carrierEnvironment: carrier.environment
+        let result: OracleGroupResult
+        do {
+            let priorTurns = Array(prepared.turns.dropLast())
+            let plans = try prepared.members.map { member in
+                let lane = try OracleLaneDescriptor(
+                    group: prepared.group,
+                    laneID: member.laneID,
+                    model: member.model
                 )
-                return OracleLaneExecutionResponse(response: response)
+                guard let carrier = bundle.carrier(for: member.laneID) else {
+                    throw AdapterError.childCarrierMismatch
+                }
+                let prompt = Self.prompt(
+                    turns: priorTurns,
+                    laneIndex: member.laneID.index,
+                    next: plan.input.userMessage
+                )
+                return try OracleLanePlan(lane: lane, publicChatID: member.publicChatID) { [provider] _ in
+                    let response = try await provider.runProviderOnce(
+                        message: prompt,
+                        providerID: member.model.providerID,
+                        model: member.model.modelID,
+                        request: request,
+                        purpose: .oracle,
+                        carrierEnvironment: carrier.environment
+                    )
+                    return OracleLaneExecutionResponse(response: response)
+                }
             }
+            guard let turnID = prepared.turns.last?.id else {
+                throw OraclePersistenceError.invalidDocument("missing_prepared_turn")
+            }
+            result = try await coordinator.execute(
+                group: prepared.group,
+                turnID: turnID,
+                input: plan.input,
+                plans: plans
+            )
+        } catch {
+            try await settlePreparedGroupIfNeeded(prepared, error: error)
+            throw error
         }
-        guard let turnID = prepared.turns.last?.id else {
-            throw OraclePersistenceError.invalidDocument("missing_prepared_turn")
-        }
-        let result = try await coordinator.execute(
-            group: prepared.group,
-            turnID: turnID,
-            input: plan.input,
-            plans: plans
-        )
         let terminal = try prepared.settling(result)
         let store = store
         try await Task.detached(priority: Task.currentPriority) {

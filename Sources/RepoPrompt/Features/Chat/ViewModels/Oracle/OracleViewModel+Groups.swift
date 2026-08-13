@@ -201,18 +201,18 @@ extension OracleViewModel {
                     tabID: tabID,
                     tabContext: tabContext
                 )
-                return try await executeOracleGroup(
-                    prepared,
-                    args: args,
-                    promptVM: promptVM,
-                    tabContext: tabContext,
-                    store: store,
-                    callbacks: callbacks
-                )
             } catch {
                 try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
                 throw error
             }
+            return try await executeOracleGroup(
+                prepared,
+                args: args,
+                promptVM: promptVM,
+                tabContext: tabContext,
+                store: store,
+                callbacks: callbacks
+            )
         }
 
         let descriptor = try OracleGroupDescriptor(size: roster.count)
@@ -255,18 +255,18 @@ extension OracleViewModel {
                 tabID: tabID,
                 tabContext: tabContext
             )
-            return try await executeOracleGroup(
-                prepared,
-                args: args,
-                promptVM: promptVM,
-                tabContext: tabContext,
-                store: store,
-                callbacks: callbacks
-            )
         } catch {
             try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
             throw error
         }
+        return try await executeOracleGroup(
+            prepared,
+            args: args,
+            promptVM: promptVM,
+            tabContext: tabContext,
+            store: store,
+            callbacks: callbacks
+        )
     }
 
     @MainActor
@@ -322,36 +322,45 @@ extension OracleViewModel {
             throw ChatToolError.internalError("Oracle group is not prepared")
         }
         await callbacks?.prepared(prepared.group.id, turn.id, prepared.members)
-        let plans = try prepared.members.map { member in
-            let lane = try OracleLaneDescriptor(
-                group: prepared.group,
-                laneID: member.laneID,
-                model: member.model
-            )
-            return try OracleLanePlan(
-                lane: lane,
-                publicChatID: member.publicChatID
-            ) { [weak self] context in
-                guard let self else { throw CancellationError() }
-                return try await executeOracleLane(
-                    member: member,
-                    args: args,
-                    promptVM: promptVM,
-                    tabContext: tabContext,
-                    executionContext: context,
-                    callbacks: callbacks
+        let result: OracleGroupResult
+        do {
+            let plans = try prepared.members.map { member in
+                let lane = try OracleLaneDescriptor(
+                    group: prepared.group,
+                    laneID: member.laneID,
+                    model: member.model
                 )
+                return try OracleLanePlan(
+                    lane: lane,
+                    publicChatID: member.publicChatID
+                ) { [weak self] context in
+                    guard let self else { throw CancellationError() }
+                    return try await executeOracleLane(
+                        member: member,
+                        args: args,
+                        promptVM: promptVM,
+                        tabContext: tabContext,
+                        executionContext: context,
+                        callbacks: callbacks
+                    )
+                }
             }
+            result = try await OracleGroupCoordinator().execute(
+                group: prepared.group,
+                turnID: turn.id,
+                input: turn.input,
+                plans: plans,
+                progress: { event in
+                    await callbacks?.progress(event)
+                }
+            )
+        } catch {
+            try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
+            throw error
         }
-        let result = try await OracleGroupCoordinator().execute(
-            group: prepared.group,
-            turnID: turn.id,
-            input: turn.input,
-            plans: plans,
-            progress: { event in
-                await callbacks?.progress(event)
-            }
-        )
+        if Task.isCancelled {
+            await cancelOracleGroupLaneStreams(prepared.members)
+        }
         let terminal = try prepared.settling(result)
         try await Task.detached(priority: Task.currentPriority) {
             try await store.save(terminal, expectedRevision: prepared.revision)
@@ -394,27 +403,51 @@ extension OracleViewModel {
         } else {
             nil
         }
+        let sessionID = member.memberID.rawValue
+        var partialResponse: String?
         do {
-            let reply = try await tool_chatSend(
-                args: laneArgs,
-                promptVM: promptVM,
-                tabContext: laneContext,
-                resolvedModel: resolvedModel,
-                onProgress: { text, reasoning in
-                    callbacks?.laneProgress(member.laneID, text, reasoning)
+            let reply = try await withTaskCancellationHandler {
+                try await tool_chatSend(
+                    args: laneArgs,
+                    promptVM: promptVM,
+                    tabContext: laneContext,
+                    resolvedModel: resolvedModel,
+                    onProgress: { text, reasoning in
+                        partialResponse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+                        callbacks?.laneProgress(member.laneID, text, reasoning)
+                    }
+                )
+            } onCancel: { [weak self] in
+                Task { @MainActor in
+                    await self?.cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
                 }
-            )
+            }
             guard let response = reply["response"]?.stringValue else {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
             }
             await executionContext.emitDelta(response)
             return OracleLaneExecutionResponse(response: response)
         } catch let failure as OracleLaneFailure {
-            throw failure
+            throw OracleLaneFailure(
+                code: failure.code,
+                message: failure.message,
+                partialResponse: failure.partialResponse ?? partialResponse
+            )
         } catch is CancellationError {
+            await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
             throw CancellationError()
         } catch {
-            throw OracleLaneFailure(message: String(describing: error))
+            throw OracleLaneFailure(
+                message: error.localizedDescription,
+                partialResponse: partialResponse
+            )
+        }
+    }
+
+    @MainActor
+    private func cancelOracleGroupLaneStreams(_ members: [OracleGroupMember]) async {
+        for member in members {
+            await cancelAIResponse(in: member.memberID.rawValue, skipPartialParseAndSave: true)
         }
     }
 
@@ -459,7 +492,7 @@ extension OracleViewModel {
               !primaryRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             throw ChatToolError.invalidParams(
-                "Choose a Primary Oracle model before using an additional Oracle roster."
+                "Choose an Oracle model before using an additional Oracle roster."
             )
         }
         do {
@@ -481,11 +514,7 @@ extension OracleViewModel {
     }
 
     static func oracleLabel(laneIndex: Int) -> String {
-        switch laneIndex {
-        case 0: "Primary Oracle"
-        case 1: "Secondary Oracle"
-        default: "Oracle \(laneIndex + 1)"
-        }
+        OracleRosterContract.displayLabel(laneIndex: laneIndex)
     }
 
     private static func backgroundOracleContext(_ context: OracleSendTabContext) -> OracleSendTabContext {

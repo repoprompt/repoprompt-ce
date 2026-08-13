@@ -27,9 +27,20 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         ])
         let dto = try XCTUnwrap(raw.decode(ToolResultDTOs.ContextBuilderDTO.self))
         let summaries = contextBuilderOracleLaneSummaries(for: dto)
-        XCTAssertEqual(summaries.map(\.label), ["Primary Oracle", "Oracle 2", "Oracle 3"])
+        XCTAssertEqual(summaries.map(\.label), ["Oracle", "Oracle 2", "Oracle 3"])
         XCTAssertEqual(summaries.map(\.chatID), ["chat-0", "chat-1", "chat-2"])
         XCTAssertEqual(contextBuilderFollowUpChatID(for: dto), "chat-0")
+        XCTAssertEqual(
+            contextBuilderFollowUpModelLine(dto: dto, fallback: "CLI-GPT"),
+            "model-0 + model-1 + model-2"
+        )
+        XCTAssertEqual(
+            contextBuilderJoinedFollowUpModelLine(
+                primaryDisplayName: "CLI-GPT-5.6 Sol High",
+                additionalModelRaws: ["second-raw", "  ", "third-raw"]
+            ),
+            "CLI-GPT-5.6 Sol High + second-raw + third-raw"
+        )
 
         let text = ToolOutputFormatter.formatDiscoverContext(value: raw).compactMap { block -> String? in
             guard case let .text(text, _, _) = block else { return nil }
@@ -51,9 +62,11 @@ final class ContextBuilderOracleResultTests: XCTestCase {
             return text
         }.joined(separator: "\n")
         XCTAssertTrue(askOracleText.contains("Oracle group status: partial_failure"))
-        XCTAssertTrue(askOracleText.contains("### Primary Oracle"))
+        XCTAssertTrue(askOracleText.split(separator: "\n").contains("### Oracle"))
         XCTAssertTrue(askOracleText.contains("### Oracle 2"))
         XCTAssertTrue(askOracleText.contains("### Oracle 3"))
+        XCTAssertFalse(askOracleText.contains("Primary Oracle"))
+        XCTAssertFalse(askOracleText.contains("Secondary Oracle"))
     }
 
     func testDecodeRejectsRoleThatDoesNotMatchLaneIndex() {

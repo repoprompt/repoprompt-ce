@@ -193,6 +193,35 @@ enum AgentOraclePillLogic {
         guard matches.count == 1 else { return nil }
         return matches[0]
     }
+
+    enum LaneDotState: Equatable {
+        case streaming
+        case failed
+        case completed
+    }
+
+    static func lastAssistantContent(
+        liveMessages: [AIChatMessage],
+        storedMessages: [StoredMessage]
+    ) -> String? {
+        if let last = liveMessages.last(where: { !$0.isUser }) {
+            return last.content
+        }
+        return storedMessages.last(where: { !$0.isUser })?.rawText
+    }
+
+    static func assistantContentIndicatesFailure(_ content: String?) -> Bool {
+        guard let content else { return false }
+        if content.contains("\n--\nError:\n") { return true }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("Error:")
+    }
+
+    static func laneDotState(isStreaming: Bool, lastAssistantContent: String?) -> LaneDotState {
+        if isStreaming { return .streaming }
+        if assistantContentIndicatesFailure(lastAssistantContent) { return .failed }
+        return .completed
+    }
 }
 
 /// Pill that appears when there are oracle chat sessions for the current tab.
@@ -280,6 +309,20 @@ struct AgentOraclePill: View {
             return "Latest tab chat"
         }
         return session.name
+    }
+
+    private func laneDotColor(for session: ChatSession) -> Color {
+        switch AgentOraclePillLogic.laneDotState(
+            isStreaming: oracleViewModel.streamingSessions.contains(session.id),
+            lastAssistantContent: AgentOraclePillLogic.lastAssistantContent(
+                liveMessages: oracleViewModel.messagesSnapshot(for: session.id),
+                storedMessages: session.messages
+            )
+        ) {
+        case .streaming: Color.purple
+        case .failed: Color.red
+        case .completed: Color.green
+        }
     }
 
     private var hasAnySessions: Bool {
@@ -455,7 +498,7 @@ struct AgentOraclePill: View {
                             } label: {
                                 HStack(spacing: 4) {
                                     Circle()
-                                        .fill(oracleViewModel.streamingSessions.contains(member.id) ? Color.purple : Color.green)
+                                        .fill(laneDotColor(for: member))
                                         .frame(width: 6, height: 6)
                                     Text(OracleViewModel.oracleLabel(laneIndex: laneIndex))
                                         .lineLimit(1)

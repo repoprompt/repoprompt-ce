@@ -4,10 +4,13 @@ import SwiftOpenAI
 func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> AIProviderCompletionOutcome? {
     guard let finishReason else { return nil }
     switch finishReason {
-    case .string("stop"):
-        return .completed
     case let .string(reason):
-        return .incomplete(reason: reason)
+        switch reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "stop", "end_turn":
+            return .completed
+        default:
+            return .incomplete(reason: reason)
+        }
     case let .int(reason):
         return .incomplete(reason: String(reason))
     }

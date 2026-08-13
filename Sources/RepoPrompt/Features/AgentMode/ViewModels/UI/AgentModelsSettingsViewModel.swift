@@ -196,11 +196,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     func oracleLabel(at index: Int) -> String {
-        switch index {
-        case 0: "Primary Oracle"
-        case 1: "Secondary Oracle"
-        default: "Oracle \(index + 1)"
-        }
+        OracleRosterContract.displayLabel(laneIndex: index)
     }
 
     func oracleModelName(at index: Int) -> String {

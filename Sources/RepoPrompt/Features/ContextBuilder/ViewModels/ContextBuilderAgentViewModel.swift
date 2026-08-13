@@ -1787,7 +1787,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.mcpWorkspaceID = identity.workspaceID
         session.mcpPlanningModelRaw = configuration.planningModelRaw
         session.mcpResponseType = configuration.responseType
-        session.mcpPlanModel = planModelName
+        session.mcpPlanModel = contextBuilderJoinedFollowUpModelLine(
+            primaryDisplayName: planModelName,
+            additionalModelRaws: GlobalSettingsStore.shared
+                .effectiveAgentModelsProfile(workspaceID: identity.workspaceID)
+                .additionalOracleModelRaws
+        )
         updateRuntimeBindings(from: session)
 
         guard runRegistry.activeRecord(tabID: tabID) == nil,
@@ -4561,6 +4566,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let callbacks = AppOracleGroupExecutionCallbacks(
             prepared: { [weak self] groupID, turnID, members in
                 guard let self, let session = sessions[tabID] else { return }
+                await progressReporter?(.streaming)
                 let handles = members.map {
                     ContextBuilderOracleMemberHandle(
                         laneID: $0.laneID,
@@ -4585,7 +4591,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 guard let self, let session = sessions[tabID],
                       session.followUpOracleGroupState.accept(event, generation: generation)
                 else { return }
-                if let activity = ContextBuilderOracleGroupProgressProjection.activity(for: event) {
+                if event.kind == .groupSettled {
+                    await progressReporter?(.messageFinalization)
+                } else if let activity = ContextBuilderOracleGroupProgressProjection.activity(for: event) {
                     await activityReporter?(activity.0, activity.1)
                 }
             },
@@ -4654,7 +4662,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             else {
                 let error = groupReply.result.primary.error
                 throw ChatToolError.internalError(
-                    error?.message ?? "Primary Oracle did not complete successfully."
+                    error?.message ?? "Oracle did not complete successfully."
                 )
             }
             try await oracleStore.releaseArtifactReservation(
@@ -4708,10 +4716,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
             guard stillOwnsCleanup else { throw error }
             session.isBackgroundPlanGenerating = false
-            session.backgroundPlanResponseText = nil
-            session.backgroundPlanReasoningText = nil
-            session.generatedAnswerRoute = nil
-            session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+            if error is CancellationError {
+                session.backgroundPlanResponseText = nil
+                session.backgroundPlanReasoningText = nil
+                session.generatedAnswerRoute = nil
+                session.backgroundPlanError = nil
+            } else {
+                session.backgroundPlanError = error.asFriendlyString()
+            }
             clearPendingBackgroundPlanUIRefresh(for: tabID)
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
