@@ -1489,12 +1489,18 @@ class WindowState: ObservableObject {
         // Apply new prompt if provided
         if let prompt = command.newPrompt {
             // 1. add to the PromptViewModel's storage
-            let stored = promptManager.addStoredPrompt(
+            let result = promptManager.addStoredPrompt(
                 title: prompt.title,
                 content: prompt.content
             )
             // 2. select it so it appears checked/active
-            promptManager.selectNewPrompt(stored)
+            switch result {
+            case let .created(stored):
+                promptManager.selectNewPrompt(stored)
+            case .persistenceFailed:
+                presentStoredPromptCommandPersistenceFailure()
+                return
+            }
 
             // 3. if this window isn't front-most and focus flag was set, focus us
             if command.focus == true {
@@ -1622,6 +1628,19 @@ class WindowState: ObservableObject {
         if command.focus == true {
             NSApplication.shared.activate(ignoringOtherApps: true)
             focusWindowIfPossible()
+        }
+    }
+
+    private func presentStoredPromptCommandPersistenceFailure() {
+        let alert = NSAlert()
+        alert.messageText = "Stored Prompt Could Not Be Saved"
+        alert.informativeText = "The command was stopped because the stored prompt could not be written."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        if let nsWindow, nsWindow.attachedSheet == nil {
+            alert.beginSheetModal(for: nsWindow)
+        } else {
+            alert.runModal()
         }
     }
 

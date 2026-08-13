@@ -107,10 +107,13 @@ struct AgentContextDrawerPromptTab: View {
             AgentContextStoredPromptEditorSheet(
                 mode: mode,
                 onCreate: { title, content in
-                    let prompt = promptManager.addStoredPrompt(title: title, content: content)
-                    promptManager.selectNewPrompt(prompt)
-                    copyStatus = .idle
-                    storedPromptActionMessage = nil
+                    let result = promptManager.addStoredPrompt(title: title, content: content)
+                    if case let .created(prompt) = result {
+                        promptManager.selectNewPrompt(prompt)
+                        copyStatus = .idle
+                        storedPromptActionMessage = nil
+                    }
+                    return result
                 },
                 onSave: { target, title, content in
                     let result = promptManager.updateStoredPrompt(
@@ -749,7 +752,7 @@ struct AgentContextDrawerPromptTab: View {
     private func copyPromptContext() {
         fullContextCopyGeneration &+= 1
         let localCopyGeneration = fullContextCopyGeneration
-        let copyIntent = AgentContextCopyIntentCoordinator.shared.begin()
+        let copyIntent = PromptClipboardIntentCoordinator.shared.begin()
         let currentPreset = promptManager.currentCopyPreset()
         let cfg = promptManager.resolvePromptContext()
         copyStatus = .copying
@@ -764,7 +767,7 @@ struct AgentContextDrawerPromptTab: View {
             )
             await MainActor.run {
                 guard localCopyGeneration == fullContextCopyGeneration else { return }
-                guard AgentContextCopyIntentCoordinator.shared.isCurrent(copyIntent) else {
+                guard PromptClipboardIntentCoordinator.shared.isCurrent(copyIntent) else {
                     copyStatus = .idle
                     return
                 }
@@ -786,7 +789,6 @@ struct AgentContextDrawerPromptTab: View {
     }
 
     private func copyStoredPrompt(_ promptID: UUID) -> Bool {
-        _ = AgentContextCopyIntentCoordinator.shared.begin()
         copyStatus = .idle
         storedPromptActionMessage = nil
         guard let didWrite = AgentContextStoredPromptClipboard.write(
@@ -834,6 +836,8 @@ struct AgentContextDrawerPromptTab: View {
             storedPromptActionMessage = "The stored prompt changed after confirmation opened. Nothing was deleted; reopen Delete to confirm the current version."
         case .targetProtected:
             storedPromptActionMessage = "Built-in stored prompts cannot be deleted."
+        case .persistenceFailed:
+            storedPromptActionMessage = "The stored prompt could not be deleted. Nothing changed on disk."
         }
     }
 

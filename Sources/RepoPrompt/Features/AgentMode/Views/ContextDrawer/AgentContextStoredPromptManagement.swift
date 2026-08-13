@@ -2,37 +2,13 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class AgentContextCopyIntentCoordinator {
-    static let shared = AgentContextCopyIntentCoordinator()
-
-    private var generation: UInt = 0
-
-    private init() {}
-
-    func begin() -> UInt {
-        generation &+= 1
-        return generation
-    }
-
-    func isCurrent(_ candidate: UInt) -> Bool {
-        candidate == generation
-    }
-
-    func commitIfCurrent(_ candidate: UInt, action: () -> Void) -> Bool {
-        guard isCurrent(candidate) else { return false }
-        action()
-        return true
-    }
-}
-
-@MainActor
 enum AgentContextStoredPromptClipboard {
     static func write(
         prompt: PromptViewModel.StoredPrompt,
         to pasteboard: NSPasteboard = .general
     ) -> Bool {
-        pasteboard.clearContents()
-        return pasteboard.setString(prompt.content, forType: .string)
+        let intent = PromptClipboardIntentCoordinator.shared.begin()
+        return PromptClipboardIntentCoordinator.shared.write(prompt.content, intent: intent, to: pasteboard)
     }
 
     static func write(
@@ -49,12 +25,7 @@ enum AgentContextStoredPromptClipboard {
         intent: UInt,
         to pasteboard: NSPasteboard = .general
     ) -> Bool {
-        var didWrite = false
-        let didCommit = AgentContextCopyIntentCoordinator.shared.commitIfCurrent(intent) {
-            pasteboard.clearContents()
-            didWrite = pasteboard.setString(content, forType: .string)
-        }
-        return didCommit && didWrite
+        PromptClipboardIntentCoordinator.shared.write(content, intent: intent, to: pasteboard)
     }
 }
 
@@ -317,7 +288,7 @@ enum AgentContextStoredPromptEditorMode: Identifiable {
 
 struct AgentContextStoredPromptEditorSheet: View {
     let mode: AgentContextStoredPromptEditorMode
-    let onCreate: (String, String) -> Void
+    let onCreate: (String, String) -> PromptViewModel.StoredPromptCreateResult
     let onSave: (PromptViewModel.StoredPrompt, String, String) -> PromptViewModel.StoredPromptEditResult
 
     @Environment(\.dismiss) private var dismiss
@@ -325,10 +296,11 @@ struct AgentContextStoredPromptEditorSheet: View {
     @State private var title: String
     @State private var content: String
     @State private var errorMessage: String?
+    @State private var saveBlocked = false
 
     init(
         mode: AgentContextStoredPromptEditorMode,
-        onCreate: @escaping (String, String) -> Void,
+        onCreate: @escaping (String, String) -> PromptViewModel.StoredPromptCreateResult,
         onSave: @escaping (PromptViewModel.StoredPrompt, String, String) -> PromptViewModel.StoredPromptEditResult
     ) {
         self.mode = mode
@@ -347,7 +319,7 @@ struct AgentContextStoredPromptEditorSheet: View {
     }
 
     private var saveDisabled: Bool {
-        guard errorMessage == nil, !normalizedTitle.isEmpty else { return true }
+        guard !saveBlocked, !normalizedTitle.isEmpty else { return true }
         if case let .edit(prompt) = mode {
             return normalizedTitle == prompt.title && content == prompt.content
         }
@@ -403,20 +375,31 @@ struct AgentContextStoredPromptEditorSheet: View {
     private func save() {
         switch mode {
         case .create:
-            onCreate(normalizedTitle, content)
-            dismiss()
+            switch onCreate(normalizedTitle, content) {
+            case .created:
+                dismiss()
+            case .persistenceFailed:
+                saveBlocked = false
+                errorMessage = "This stored prompt could not be saved. Your draft is still open."
+            }
         case let .edit(prompt):
             switch onSave(prompt, title, content) {
             case .updated, .unchanged:
                 dismiss()
             case .targetMissing:
+                saveBlocked = true
                 errorMessage = "This stored prompt was deleted while the editor was open. Your changes were not saved."
             case .targetChanged:
+                saveBlocked = true
                 errorMessage = "This stored prompt changed while the editor was open. Close and reopen it before saving."
             case .targetProtected:
+                saveBlocked = true
                 errorMessage = "Built-in stored prompts cannot be edited."
             case .invalidTitle:
                 errorMessage = "Enter a prompt title before saving."
+            case .persistenceFailed:
+                saveBlocked = false
+                errorMessage = "This stored prompt could not be saved. Your changes remain in the editor."
             }
         }
     }

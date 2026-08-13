@@ -2097,26 +2097,29 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
     }
 
     @MainActor
-    func testSupersededContextCopyCannotOverwriteStoredPromptCopyAcrossOwners() {
+    func testSupersededContextCopyCannotOverwriteStoredPromptCopyAcrossOwners() async {
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptIntent-\(UUID().uuidString)"))
         defer { pasteboard.clearContents() }
-        let authority = AgentContextCopyIntentCoordinator.shared
-        let staleFullContextIntent = authority.begin()
+        let buildFence = TestReleaseFence(name: "suspended prompt context build")
         let prompt = PromptViewModel.StoredPrompt(
             id: UUID(),
             title: "Latest",
             content: "newer stored prompt content"
         )
+        let staleIntent = PromptClipboardIntentCoordinator.shared.begin()
+        let staleCopy = Task {
+            await PromptClipboardIntentCoordinator.shared.buildAndWrite(intent: staleIntent, to: pasteboard) {
+                await buildFence.enterAndWait()
+                return "stale full context"
+            }
+        }
 
-        _ = authority.begin()
+        await buildFence.waitUntilEntered()
         XCTAssertTrue(AgentContextStoredPromptClipboard.write(prompt: prompt, to: pasteboard))
-        XCTAssertFalse(
-            AgentContextStoredPromptClipboard.writeFullContext(
-                "stale full context",
-                intent: staleFullContextIntent,
-                to: pasteboard
-            )
-        )
+        buildFence.release()
+
+        let staleCopyDidWrite = await staleCopy.value
+        XCTAssertFalse(staleCopyDidWrite)
         XCTAssertEqual(pasteboard.string(forType: .string), prompt.content)
     }
 
