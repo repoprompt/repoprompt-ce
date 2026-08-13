@@ -4452,17 +4452,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         lastDomainProjectionSequence = publicationSequence
         let persistedProjection = projectedWorkspaces.filter { !$0.isEphemeral }
         let persistedWorkspaceIDs = Set(persistedProjection.map(\.id))
-        let localEphemeralWorkspaces = workspaces.filter(\.isEphemeral)
-        let localEphemeralByID = Dictionary(
-            localEphemeralWorkspaces.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
+        let localProjection = Self.preservingLocalEphemeralWorkspaces(
+            in: persistedProjection,
+            currentWorkspaces: workspaces
         )
-        var localProjection = persistedProjection.map { projected in
-            localEphemeralByID[projected.id] ?? projected
-        }
-        localProjection.append(contentsOf: localEphemeralWorkspaces.filter {
-            !persistedWorkspaceIDs.contains($0.id)
-        })
         if domainWorkspaceAuthorityClient != nil {
             // A projected canonical transition (external reload, cross-window commit, deletion)
             // can replace workspace content without touching this manager's dirty-tracking
@@ -4507,6 +4500,27 @@ class WorkspaceManagerViewModel: ObservableObject {
             publishDomainAuthorityIssueIfChanged(nil)
         }
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
+    }
+
+    /// Canonical projections intentionally exclude ephemeral records. Preserve locally owned
+    /// ephemeral session state while replacing durable workspaces from authority or disk.
+    private static func preservingLocalEphemeralWorkspaces(
+        in projectedWorkspaces: [WorkspaceModel],
+        currentWorkspaces: [WorkspaceModel]
+    ) -> [WorkspaceModel] {
+        let localEphemeralWorkspaces = currentWorkspaces.filter(\.isEphemeral)
+        let localEphemeralByID = Dictionary(
+            localEphemeralWorkspaces.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let projectedWorkspaceIDs = Set(projectedWorkspaces.map(\.id))
+        var localProjection = projectedWorkspaces.map { projected in
+            localEphemeralByID[projected.id] ?? projected
+        }
+        localProjection.append(contentsOf: localEphemeralWorkspaces.filter {
+            !projectedWorkspaceIDs.contains($0.id)
+        })
+        return localProjection
     }
 
     private func adoptProjectedActiveWorkspaceID(_ workspaceID: UUID?) {
@@ -6425,11 +6439,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let diskSnapshot = await loadWorkspaceSnapshotFromDisk()
         if !diskSnapshot.isEmpty {
+            let localProjection = Self.preservingLocalEphemeralWorkspaces(
+                in: diskSnapshot,
+                currentWorkspaces: workspaces
+            )
             let lifecycleProjection = agentSessionProjectionReconciler?(
-                diskSnapshot,
+                localProjection,
                 workspaces
             )
-            workspaces = lifecycleProjection?.workspaces ?? diskSnapshot
+            workspaces = lifecycleProjection?.workspaces ?? localProjection
         }
 
         let activeWorkspaceIDs = Set(windowStates.allWindows.compactMap { $0.workspaceManager.activeWorkspace?.id })
