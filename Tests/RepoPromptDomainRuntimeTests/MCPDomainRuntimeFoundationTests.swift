@@ -22,6 +22,10 @@ final class MCPDomainToolCatalogTests: XCTestCase {
             !MCPDomainToolCatalog.toolNames(for: [$0]).isEmpty
         })
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "read_file"), [.fileRead])
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "read_file"), .fileRead)
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "get_code_structure"), .smallRead)
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "get_file_tree"), .smallRead)
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "oracle_chat_log"), .smallRead)
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "file_search"), [.fileSearch])
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "history"), [.historyRead])
         XCTAssertEqual(MCPToolCapability.statusPublication.externalName, "agent_session_control")
@@ -117,10 +121,21 @@ final class MCPDomainToolCatalogTests: XCTestCase {
         XCTAssertEqual(appMutation.resourceLease, MCPDomainToolAdmissionLimits.exclusiveConnection)
         XCTAssertEqual(appMutation.resourceScope, .application)
 
-        let smallRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.readFile))
-        XCTAssertEqual(smallRead.connectionLane, MCPDomainToolAdmissionLimits.smallReadConnection)
-        XCTAssertEqual(smallRead.resourceLease, MCPDomainToolAdmissionLimits.smallReadPerWindow)
-        XCTAssertEqual(smallRead.resourceScope, .window)
+        let fileRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.readFile))
+        XCTAssertEqual(fileRead.connectionLane, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(fileRead.resourceLease, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(fileRead.resourceScope, .window)
+
+        for toolName in [
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.oracleChatLog
+        ] {
+            let smallRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: toolName))
+            XCTAssertEqual(smallRead.connectionLane, 2, toolName)
+            XCTAssertEqual(smallRead.resourceLease, 2, toolName)
+            XCTAssertEqual(smallRead.resourceScope, .window, toolName)
+        }
 
         let gitRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.git))
         XCTAssertEqual(gitRead.connectionLane, MCPDomainToolAdmissionLimits.gitReadConnection)
@@ -132,6 +147,24 @@ final class MCPDomainToolCatalogTests: XCTestCase {
         XCTAssertNil(control.resourceLease)
         XCTAssertNil(control.resourceScope)
         XCTAssertNil(MCPDomainToolCatalog.configuredLimits(for: "unknown"))
+    }
+
+    func testContentReadCapacityScalesWithoutCapWhileBulkCapacityPreservesReserveAndCeiling() {
+        XCTAssertEqual(
+            ContentReadConcurrencyCapacity.maximumConcurrentReads,
+            max(2, ProcessInfo.processInfo.activeProcessorCount)
+        )
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 1), 1)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 2), 1)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 3), 2)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 4), 3)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 64), 3)
+        XCTAssertEqual(
+            ContentReadConcurrencyCapacity.maximumConcurrentBulkReads,
+            ContentReadConcurrencyCapacity.bulkReadLimit(
+                forReadCapacity: ContentReadConcurrencyCapacity.maximumConcurrentReads
+            )
+        )
     }
 
     func testEveryClientProfileHasExplicitPolicyAndPreservesFrozenVisibility() {

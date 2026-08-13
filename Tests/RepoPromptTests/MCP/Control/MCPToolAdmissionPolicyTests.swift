@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -13,16 +14,16 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
         XCTAssertNil(ServerNetworkManager.callLane(forCanonicalToolName: "future_unreviewed_tool"))
 
-        // Cheap read-only tools sharing a tight per-window cap. history is excluded:
+        // Cheap read-only tools retain the conservative shared small-read lane. history is excluded:
         // `search`/calendar `time` can decode up to maxSessionsScanned transcripts on the
         // shared scanner actor — heavier than these per-file reads, so history rides the
-        // .control lane to avoid starving read_file/get_code_structure under the small-read cap.
+        // .control lane to avoid starving read_file/get_code_structure under content-read load.
         assertClass(.smallRead, tools: [
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.getFileTree,
-            MCPWindowToolName.readFile,
             MCPWindowToolName.oracleChatLog
         ])
+        assertClass(.fileRead, tools: [MCPWindowToolName.readFile])
         assertClass(.gitRead, tools: [MCPWindowToolName.git])
         assertClass(.fileSearch, tools: [MCPWindowToolName.search])
         assertClass(.control, tools: [
@@ -56,15 +57,23 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(ServerNetworkManager.admissionClass(forCanonicalToolName: alias), .exclusive)
     }
 
-    func testGateBCapacitiesRecordConservativeWI3BaselineChoices() {
-        XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
-        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)
+    func testAdmissionCapacitiesUseMachineDerivedContentReadAuthorityAndPreserveOtherLimits() {
+        let contentReadCapacity = ContentReadConcurrencyCapacity.maximumConcurrentReads
+        XCTAssertEqual(contentReadCapacity, max(2, ProcessInfo.processInfo.activeProcessorCount))
+        XCTAssertEqual(MCPToolAdmissionPolicy.fileReadConnectionLimit, contentReadCapacity)
+        XCTAssertEqual(MCPToolAdmissionPolicy.fileReadPerWindowLimit, contentReadCapacity)
+        XCTAssertEqual(ServerNetworkManager.fileReadCallLaneLimit, contentReadCapacity)
+        XCTAssertEqual(FileSystemService.contentReadWorkerLimitForTesting, contentReadCapacity)
         XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 2)
         XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 2)
+        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 2)
+        XCTAssertEqual(FileSystemService.contentReadBulkPermitLimitForTesting, min(3, contentReadCapacity - 1))
+
+        XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
+        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)
         XCTAssertEqual(MCPToolAdmissionPolicy.gitReadConnectionLimit, 2)
         XCTAssertEqual(MCPToolAdmissionPolicy.gitReadPerRepositoryLimit, 1)
         XCTAssertEqual(MCPToolAdmissionPolicy.fileSearchConnectionLimit, 4)
-        XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 2)
         XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 8)
         XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 2)
         XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 4)
@@ -101,13 +110,51 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         )
     }
 
-    func testSameConnectionSmallReadsOverlapAtBoundedCapacity() async throws {
+    func testReadFileUsesMachineScaledLaneWhileOtherSmallReadsRemainAtTwo() async throws {
+        let fileReadLimits = try XCTUnwrap(
+            MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.readFile)
+        )
+        XCTAssertEqual(ServerNetworkManager.callLane(forCanonicalToolName: MCPWindowToolName.readFile), .fileRead)
+        XCTAssertEqual(fileReadLimits.connectionLane, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(fileReadLimits.resourceLease, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+
+        for toolName in [
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.oracleChatLog
+        ] {
+            let limits = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: toolName))
+            XCTAssertEqual(ServerNetworkManager.callLane(forCanonicalToolName: toolName), .smallRead, toolName)
+            XCTAssertEqual(limits.connectionLane, 2, toolName)
+            XCTAssertEqual(limits.resourceLease, 2, toolName)
+        }
+
+        let manager = ServerNetworkManager()
+        let connectionID = UUID()
+        _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
+        let smallReadSnapshot = await manager.connectionLimiterSnapshotForTesting(
+            connectionID: connectionID,
+            lane: .smallRead
+        )
+        let fileReadSnapshot = await manager.connectionLimiterSnapshotForTesting(
+            connectionID: connectionID,
+            lane: .fileRead
+        )
+        let smallRead = try XCTUnwrap(smallReadSnapshot)
+        let fileRead = try XCTUnwrap(fileReadSnapshot)
+        XCTAssertEqual(smallRead.limit, 2)
+        XCTAssertEqual(fileRead.limit, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        await manager.debugRemoveConnection(connectionID)
+    }
+
+    func testSameConnectionSmallReadsFillFixedCapacityAndQueueOneAdditionalRead() async throws {
         let manager = ServerNetworkManager()
         let connectionID = UUID()
         _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
         let gate = AdmissionTestGate()
+        let capacity = MCPToolAdmissionPolicy.smallReadConnectionLimit
 
-        let tasks = (0 ..< 2).map { _ in
+        let tasks = (0 ... capacity).map { _ in
             Task {
                 try await manager.withConnectionCallPermitForTesting(
                     connectionID: connectionID,
@@ -118,12 +165,22 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
             }
         }
 
-        let didStartBothSmallReads = await waitUntil { await gate.startedCount() == 2 }
-        XCTAssertTrue(didStartBothSmallReads)
+        let didSaturateCapacity = await waitUntil {
+            let snapshot = await manager.connectionLimiterSnapshotForTesting(
+                connectionID: connectionID,
+                lane: .smallRead
+            )
+            return snapshot?.activePermitCount == capacity && snapshot?.waiterCount == 1
+        }
+        XCTAssertTrue(didSaturateCapacity)
+        let startedBeforeRelease = await gate.startedCount()
+        XCTAssertEqual(startedBeforeRelease, capacity)
         await gate.release()
         for task in tasks {
             try await task.value
         }
+        let finalStartedCount = await gate.startedCount()
+        XCTAssertEqual(finalStartedCount, capacity + 1)
         await manager.debugRemoveConnection(connectionID)
     }
 
@@ -234,12 +291,12 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         let controller = MCPToolResourceAdmissionController(limit: 1)
         let gate = AdmissionTestGate()
 
-        let firstWindow = mutationTask(controller: controller, resource: .window(10), gate: gate)
+        let firstWindow = resourceAdmissionTask(controller: controller, resource: .window(10), gate: gate)
         let didStartFirstWindow = await waitUntil { await gate.startedCount() == 1 }
         XCTAssertTrue(didStartFirstWindow)
 
-        let sameWindow = mutationTask(controller: controller, resource: .window(10), gate: gate)
-        let otherWindow = mutationTask(controller: controller, resource: .window(20), gate: gate)
+        let sameWindow = resourceAdmissionTask(controller: controller, resource: .window(10), gate: gate)
+        let otherWindow = resourceAdmissionTask(controller: controller, resource: .window(20), gate: gate)
 
         let didOverlapDistinctWindows = await waitUntil { await gate.startedCount() == 2 }
         XCTAssertTrue(didOverlapDistinctWindows)
@@ -257,32 +314,33 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(controller.activeCount(for: .window(20)), 0)
     }
 
-    func testSmallReadResourceAdmissionBoundsOneWindowAndOverlapsDistinctWindows() async throws {
-        let controller = MCPToolResourceAdmissionController(
-            limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
-        )
+    func testSmallReadResourceAdmissionFillsFixedCapacityPerWindowAndQueuesOneAdditionalRead() async throws {
+        let capacity = MCPToolAdmissionPolicy.smallReadPerWindowLimit
+        let controller = MCPToolResourceAdmissionController(limit: capacity)
         let gate = AdmissionTestGate()
 
-        let first = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let second = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let didFillWindowCapacity = await waitUntil { await gate.startedCount() == 2 }
+        let sameWindowReads = (0 ..< capacity).map { _ in
+            resourceAdmissionTask(controller: controller, resource: .window(30), gate: gate)
+        }
+        let didFillWindowCapacity = await waitUntil { await gate.startedCount() == capacity }
         XCTAssertTrue(didFillWindowCapacity)
 
-        let queuedSameWindow = mutationTask(controller: controller, resource: .window(30), gate: gate)
-        let distinctWindow = mutationTask(controller: controller, resource: .window(40), gate: gate)
-        let didOverlapDistinctWindow = await waitUntil { await gate.startedCount() == 3 }
+        let queuedSameWindow = resourceAdmissionTask(controller: controller, resource: .window(30), gate: gate)
+        let distinctWindow = resourceAdmissionTask(controller: controller, resource: .window(40), gate: gate)
+        let didOverlapDistinctWindow = await waitUntil { await gate.startedCount() == capacity + 1 }
         XCTAssertTrue(didOverlapDistinctWindow)
-        XCTAssertEqual(controller.activeCount(for: .window(30)), 2)
+        XCTAssertEqual(controller.activeCount(for: .window(30)), capacity)
         XCTAssertEqual(controller.activeCount(for: .window(40)), 1)
         XCTAssertEqual(controller.waiterCount(for: .window(30)), 1)
 
         await gate.release()
-        try await first.value
-        try await second.value
+        for read in sameWindowReads {
+            try await read.value
+        }
         try await queuedSameWindow.value
         try await distinctWindow.value
-        let finalReadCount = await gate.startedCount()
-        XCTAssertEqual(finalReadCount, 4)
+        let finalStartedCount = await gate.startedCount()
+        XCTAssertEqual(finalStartedCount, capacity + 2)
         XCTAssertEqual(controller.activeCount(for: .window(30)), 0)
         XCTAssertEqual(controller.activeCount(for: .window(40)), 0)
     }
@@ -399,7 +457,7 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         }
     }
 
-    private func mutationTask(
+    private func resourceAdmissionTask(
         controller: MCPToolResourceAdmissionController,
         resource: MCPToolResourceAdmissionController.Resource,
         gate: AdmissionTestGate

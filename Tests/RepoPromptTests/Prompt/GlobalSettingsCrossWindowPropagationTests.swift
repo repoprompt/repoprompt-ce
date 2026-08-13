@@ -48,6 +48,60 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertEqual(windowB.planningModelName, "sonnet")
     }
 
+    func testContextBuilderBehaviorChangePropagatesAcrossWindows() async throws {
+        let store = try makeIsolatedStore()
+        let windowA = WindowSettingsManager(windowID: 1, store: store)
+        let windowB = WindowSettingsManager(windowID: 2, store: store)
+        var settings = windowA.contextBuilderBehaviorSettings()
+        settings.contextTokenBudget = 43210
+        settings.analysisTokenBudget = 54321
+        settings.followUpAnalysisEnabled = true
+
+        windowA.setContextBuilderBehaviorSettings(settings, commit: true)
+        await drainMainQueue()
+
+        XCTAssertEqual(windowB.contextBuilderBehaviorSettings(), settings)
+    }
+
+    func testContextBuilderBehaviorPropagationDoesNotFeedbackLoop() async throws {
+        let store = try makeIsolatedStore()
+        let windowA = WindowSettingsManager(windowID: 1, store: store)
+        _ = WindowSettingsManager(windowID: 2, store: store)
+        var emissions = 0
+        let cancellable = store.objectWillChange.sink { emissions += 1 }
+        defer { cancellable.cancel() }
+        var settings = windowA.contextBuilderBehaviorSettings()
+        settings.enhancementMode = .augment
+
+        windowA.setContextBuilderBehaviorSettings(settings, commit: true)
+        windowA.setContextBuilderBehaviorSettings(settings, commit: true)
+        await drainMainQueue()
+
+        XCTAssertEqual(emissions, 1)
+    }
+
+    func testContextBuilderBehaviorResetPropagatesAllSevenDefaultsAcrossWindows() async throws {
+        let store = try makeIsolatedStore()
+        let windowA = WindowSettingsManager(windowID: 1, store: store)
+        let windowB = WindowSettingsManager(windowID: 2, store: store)
+        let changed = ContextBuilderBehaviorSettings(
+            contextTokenBudget: 43210,
+            analysisTokenBudget: 54321,
+            enhancementMode: .preserve,
+            questionTimeoutSeconds: 91,
+            allowUIClarifyingQuestions: false,
+            allowMCPClarifyingQuestions: true,
+            followUpAnalysisEnabled: true
+        )
+        windowA.setContextBuilderBehaviorSettings(changed, commit: true)
+
+        windowA.setContextBuilderBehaviorSettings(ContextBuilderDefaults.behaviorSettings, commit: true)
+        await drainMainQueue()
+
+        XCTAssertEqual(windowA.contextBuilderBehaviorSettings(), ContextBuilderDefaults.behaviorSettings)
+        XCTAssertEqual(windowB.contextBuilderBehaviorSettings(), ContextBuilderDefaults.behaviorSettings)
+    }
+
     func testContextBuilderPickerExplicitCommitPersistsDisplayedRuntimeFallback() async throws {
         let previousCodexConnected = UserDefaults.standard.object(forKey: "CodexCLIConnected")
         defer {

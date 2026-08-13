@@ -5,6 +5,8 @@ package enum MCPDomainToolAdmissionLimits {
     package static let controlConnection = 8
     package static let smallReadConnection = 2
     package static let smallReadPerWindow = 2
+    package static let fileReadConnection = ContentReadConcurrencyCapacity.maximumConcurrentReads
+    package static let fileReadPerWindow = ContentReadConcurrencyCapacity.maximumConcurrentReads
     package static let gitReadConnection = 2
     package static let fileSearchConnection = 4
     package static let gitReadPerRepository = 1

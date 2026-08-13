@@ -56,7 +56,7 @@
     "connection_removal_late_waiter": "blocked_after_suspended_availability",
     "app_ui": "current routed presenter with exact cancellation registration",
     "app_presentation_tombstone_limit": 256,
-    "default_timeout": "workspace questionTimeoutSeconds setting",
+    "default_timeout": "Context Builder captured or Agent Mode live global questionTimeoutSeconds setting",
     "internal_settlement_grace_seconds": 1,
     "settlement": "exactly_once_generation_fenced",
     "terminal_paths": ["response", "timed_out", "cancelled", "unavailable", "failed"],

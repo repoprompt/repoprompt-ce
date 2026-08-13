@@ -132,28 +132,66 @@ struct ContextBuilderResolvedRunAuthority {
     let modelRaw: String
 }
 
+struct ContextBuilderRunBehavior: Equatable {
+    let tokenBudget: Int
+    let enhancementMode: PromptEnhancementMode
+    let questionTimeoutSeconds: TimeInterval
+    let allowClarifyingQuestions: Bool
+    let automaticFollowUp: ContextBuilderFollowUpType?
+
+    static func ui(
+        settings: ContextBuilderBehaviorSettings,
+        selectedFollowUp: ContextBuilderFollowUpType
+    ) -> ContextBuilderRunBehavior {
+        ContextBuilderRunBehavior(
+            tokenBudget: ContextBuilderBudgetResolver.resolveUIBudget(behaviorSettings: settings),
+            enhancementMode: settings.enhancementMode,
+            questionTimeoutSeconds: settings.questionTimeoutSeconds,
+            allowClarifyingQuestions: settings.allowUIClarifyingQuestions,
+            automaticFollowUp: settings.followUpAnalysisEnabled ? selectedFollowUp : nil
+        )
+    }
+
+    static func mcp(
+        settings: ContextBuilderBehaviorSettings,
+        wantsResponse: Bool,
+        targetIsActive: Bool
+    ) -> ContextBuilderRunBehavior {
+        ContextBuilderRunBehavior(
+            tokenBudget: ContextBuilderBudgetResolver.resolveMCPBudget(
+                wantsResponse: wantsResponse,
+                behaviorSettings: settings
+            ),
+            enhancementMode: settings.enhancementMode,
+            questionTimeoutSeconds: settings.questionTimeoutSeconds,
+            allowClarifyingQuestions: targetIsActive && settings.allowMCPClarifyingQuestions,
+            automaticFollowUp: nil
+        )
+    }
+}
+
+enum ContextBuilderRunError: LocalizedError {
+    case missingRunBehavior
+
+    var errorDescription: String? {
+        switch self {
+        case .missingRunBehavior:
+            "Context Builder run behavior was not captured at run start."
+        }
+    }
+}
+
 struct ContextBuilderMCPRunConfiguration {
     let identity: WorkspaceSelectionIdentity
     let nestedTabContext: MCPServerViewModel.TabContextSnapshot
     let providerWorkspacePath: String
-    let discoveryTokenBudget: Int
-    let planTokenBudget: Int
-    let enhancementMode: PromptEnhancementMode
-    let allowClarifyingQuestions: Bool
-    let questionTimeoutSeconds: TimeInterval
+    let runBehavior: ContextBuilderRunBehavior
     let responseType: String?
     let planningModelRaw: String?
     let isSystemWorkspace: Bool
 
     var effectiveTokenBudget: Int {
-        let wantsResponse = responseType.flatMap {
-            ContextBuilderResponseType(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        }?.wantsResponse ?? false
-        return ContextBuilderBudgetResolver.resolveBudget(
-            wantsResponse: wantsResponse,
-            discoveryTokenBudget: discoveryTokenBudget,
-            planTokenBudget: planTokenBudget
-        )
+        runBehavior.tokenBudget
     }
 }
 

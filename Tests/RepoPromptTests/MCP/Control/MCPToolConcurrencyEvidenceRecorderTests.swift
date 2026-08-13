@@ -191,7 +191,7 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
     func testCallCompletionCountsClassifiedToolNamesOnly() throws {
         let recorder = MCPToolConcurrencyEvidenceRecorder()
         recorder.recordCallCompleted(
-            classKey: .smallRead,
+            classKey: .fileRead,
             canonicalToolName: MCPWindowToolName.readFile,
             operationIdentity: MCPDomainToolCatalog.operationIdentity(
                 for: MCPWindowToolName.readFile,
@@ -220,9 +220,9 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         XCTAssertFalse(snapshot.operations.description.contains("private/path/id/prompt"))
         XCTAssertFalse(snapshot.operations.description.contains("some_private_or_future_tool"))
 
-        let smallRead = try XCTUnwrap(classSnapshot(snapshot, .smallRead))
+        let fileRead = try XCTUnwrap(classSnapshot(snapshot, .fileRead))
         let total = try XCTUnwrap(
-            smallRead.stageHistograms[MCPToolConcurrencyEvidenceStage.total.rawValue]
+            fileRead.stageHistograms[MCPToolConcurrencyEvidenceStage.total.rawValue]
         )
         XCTAssertEqual(total.count, 1)
     }
@@ -379,21 +379,21 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         ))
 
         let snapshot = recorder.snapshot()
-        let smallRead = try XCTUnwrap(classSnapshot(snapshot, .smallRead))
+        let fileRead = try XCTUnwrap(classSnapshot(snapshot, .fileRead))
         XCTAssertEqual(
-            smallRead.executionTracePhaseCounts[
+            fileRead.executionTracePhaseCounts[
                 MCPToolExecutionTraceEvent.Phase.started.rawValue
             ],
             1
         )
         XCTAssertEqual(
-            smallRead.executionTracePhaseCounts[
+            fileRead.executionTracePhaseCounts[
                 MCPToolExecutionTraceEvent.Phase.deadlineExpired.rawValue
             ],
             1
         )
         let execution = try XCTUnwrap(
-            smallRead.stageHistograms[MCPToolConcurrencyEvidenceStage.execution.rawValue]
+            fileRead.stageHistograms[MCPToolConcurrencyEvidenceStage.execution.rawValue]
         )
         XCTAssertEqual(execution.count, 1)
         XCTAssertEqual(execution.sumMilliseconds, 77)
@@ -450,14 +450,14 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
 
     func testSnapshotAndResetIsAtomicallyEquivalentToSnapshotThenReset() throws {
         let recorder = MCPToolConcurrencyEvidenceRecorder()
-        recorder.recordLaneWaitBegan(classKey: .smallRead)
-        recorder.recordLaneAdmitted(classKey: .smallRead, waitMilliseconds: 3)
+        recorder.recordLaneWaitBegan(classKey: .fileRead)
+        recorder.recordLaneAdmitted(classKey: .fileRead, waitMilliseconds: 3)
         let identity = MCPDomainToolCatalog.operationIdentity(
             for: MCPWindowToolName.readFile,
             input: .missing
         )
         recorder.recordCallCompleted(
-            classKey: .smallRead,
+            classKey: .fileRead,
             canonicalToolName: MCPWindowToolName.readFile,
             operationIdentity: identity,
             totalMilliseconds: 20
@@ -484,7 +484,7 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
     func testCompletionKeepsTotalHistogramAndPerToolCountsConsistent() {
         let recorder = MCPToolConcurrencyEvidenceRecorder()
         recorder.recordCallCompleted(
-            classKey: .smallRead,
+            classKey: .fileRead,
             canonicalToolName: MCPWindowToolName.readFile,
             totalMilliseconds: 5
         )
@@ -527,6 +527,10 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         XCTAssertEqual(
             MCPToolConcurrencyEvidenceClass(admissionClass: .smallRead).rawValue,
             MCPToolAdmissionClass.smallRead.rawValue
+        )
+        XCTAssertEqual(
+            MCPToolConcurrencyEvidenceClass(admissionClass: .fileRead).rawValue,
+            MCPToolAdmissionClass.fileRead.rawValue
         )
         XCTAssertEqual(
             MCPToolConcurrencyEvidenceClass(admissionClass: nil),

@@ -1274,7 +1274,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Ask the user a clarifying question and wait for their response.\n\nUse this tool to gather additional context or clarification from the user.\nThe tool will block until the user responds.\n\n**When to use:**\n- Task requirements are ambiguous\n- Multiple valid approaches exist and you need user preference\n- Critical context is missing\n- Confirming before making significant changes\n\n**Best practices:**\n- Ask early, not at the end\n- Be specific - explain what you're trying to determine\n- Provide options when the choices are clear\n- Limit questions to avoid disrupting the user\n\n**Input:**\n- `questions`: Required array of structured questions. Each question requires stable `id` and `question` fields. Use `allows_multiple` and `allows_custom` for selection/custom-answer behavior.\n- `title`: Optional title for the wizard card.\n- `context`: Optional overall context shown above the questions.\n- `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting.\n\n**Response:**\n- `answers`: Object keyed by question ID. Each value contains `answers`, `selected_options`, `custom_response`, and `skipped`.\n- `timed_out`: True if the interaction timed out.\n- `skipped`: True if user explicitly skipped the interaction.\n- `elapsed_seconds`: How long the user took to respond.",
+      "description" : "Ask the user a clarifying question and wait for their response.\n\nUse this tool to gather additional context or clarification from the user.\nThe tool will block until the user responds.\n\n**When to use:**\n- Task requirements are ambiguous\n- Multiple valid approaches exist and you need user preference\n- Critical context is missing\n- Confirming before making significant changes\n\n**Best practices:**\n- Ask early, not at the end\n- Be specific - explain what you're trying to determine\n- Provide options when the choices are clear\n- Limit questions to avoid disrupting the user\n\n**Input:**\n- `questions`: Required array of structured questions. Each question requires stable `id` and `question` fields. Use `allows_multiple` and `allows_custom` for selection/custom-answer behavior.\n- `title`: Optional title for the wizard card.\n- `context`: Optional overall context shown above the questions.\n- `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference.\n\n**Response:**\n- `answers`: Object keyed by question ID. Each value contains `answers`, `selected_options`, `custom_response`, and `skipped`.\n- `timed_out`: True if the interaction timed out.\n- `skipped`: True if user explicitly skipped the interaction.\n- `elapsed_seconds`: How long the user took to respond.",
       "inputSchema" : {
         "properties" : {
           "context" : {
@@ -1347,7 +1347,7 @@
             "type" : "array"
           },
           "timeout_seconds" : {
-            "description" : "Timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting.",
+            "description" : "Timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference.",
             "type" : "integer"
           },
           "title" : {

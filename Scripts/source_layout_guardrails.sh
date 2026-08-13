@@ -451,7 +451,7 @@ assert value["session_persistence"]["write_protocol"] == "advisory_lock_digest_c
 assert value["session_persistence"]["duplicate_session_ids"] == "byte_preserved_degraded_read_only"
 assert value["session_persistence"]["committed_base_advances_after_each_successful_cas"] is True
 assert value["session_persistence"]["retained_record_limit"] == 512
-assert value["interaction"]["default_timeout"] == "workspace questionTimeoutSeconds setting"
+assert value["interaction"]["default_timeout"] == "Context Builder captured or Agent Mode live global questionTimeoutSeconds setting"
 assert value["interaction"]["app_presentation_tombstone_limit"] == 256
 assert value["interaction"]["connection_removal_late_waiter"] == "blocked_after_suspended_availability"
 assert value["child_launch"]["real_private_endpoint"] == "deferred_to_M6B"

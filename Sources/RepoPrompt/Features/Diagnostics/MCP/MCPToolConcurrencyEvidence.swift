@@ -35,6 +35,7 @@ enum MCPToolConcurrencyEvidenceClass: String, CaseIterable {
     case exclusive
     case control
     case smallRead = "small_read"
+    case fileRead = "file_read"
     case gitRead = "git_read"
     case fileSearch = "file_search"
     case unclassified
@@ -44,6 +45,7 @@ enum MCPToolConcurrencyEvidenceClass: String, CaseIterable {
         case .exclusive: self = .exclusive
         case .control: self = .control
         case .smallRead: self = .smallRead
+        case .fileRead: self = .fileRead
         case .gitRead: self = .gitRead
         case .fileSearch: self = .fileSearch
         case nil: self = .unclassified
@@ -56,7 +58,7 @@ enum MCPToolConcurrencyEvidenceStage: String, CaseIterable {
     /// Connection-lane (per-connection `AsyncLimiter`) admission wait.
     case laneWait = "lane_wait"
     /// Cross-connection resource lease wait (window/app mutation, per-window
-    /// small-read, per-repository git tool lease).
+    /// small-read/file-read, per-repository git tool lease).
     case leaseWait = "lease_wait"
     /// Provider execution from dispatch origin to handler completion, sourced from
     /// `MCPToolExecutionTraceEvent(.handlerCompleted)`.

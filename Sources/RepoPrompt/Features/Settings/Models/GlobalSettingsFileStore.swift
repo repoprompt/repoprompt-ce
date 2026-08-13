@@ -8,6 +8,10 @@ protocol GlobalSettingsFileStoring {
     func load() throws -> GlobalSettingsDocument
     func loadOrCreateDefault() -> GlobalSettingsDocument
     func save(_ document: GlobalSettingsDocument) throws
+    func saveStartupMigrationPreservingUnknownFields(
+        _ document: GlobalSettingsDocument,
+        includeModelSelectionRepair: Bool
+    ) throws
     /// User-initiated recovery: backs up the offending file, writes a current-schema replacement, clears the block.
     @discardableResult
     func performUserInitiatedRecovery(replacementDocument: GlobalSettingsDocument) -> Bool
@@ -226,8 +230,14 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         preservingFailedAutomaticNormalization = false
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
-        var documentToWrite = importedDocument
-        documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
+        let documentToWrite = GlobalSettingsDocument(
+            updatedAt: importedDocument.updatedAt,
+            copySettings: importedDocument.copySettings,
+            chatSettings: importedDocument.chatSettings,
+            agentModelsSettings: importedDocument.agentModelsSettings,
+            globalDefaults: importedDocument.globalDefaults,
+            scalarPreferences: importedDocument.scalarPreferences
+        )
         do {
             try save(documentToWrite)
             blockReason = nil
@@ -272,6 +282,170 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     func save(_ document: GlobalSettingsDocument) throws {
+        try validateSavePermission()
+        try ensureSettingsDirectoryExists()
+        var documentToWrite = document
+        documentToWrite.schemaVersion = documentToWrite.requiredSchemaVersion
+        documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
+        documentToWrite.updatedAt = now()
+        let data = try Self.encoder.encode(documentToWrite)
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            blockReason = nil
+        } catch {
+            blockReason = .saveFailed
+            throw error
+        }
+    }
+
+    func saveStartupMigrationPreservingUnknownFields(
+        _ document: GlobalSettingsDocument,
+        includeModelSelectionRepair: Bool
+    ) throws {
+        try validateSavePermission()
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            try save(document)
+            return
+        }
+
+        var documentToWrite = document
+        documentToWrite.schemaVersion = documentToWrite.requiredSchemaVersion
+        documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
+        documentToWrite.updatedAt = now()
+        let knownData = try Self.encoder.encode(documentToWrite)
+        guard let knownRoot = try JSONSerialization.jsonObject(with: knownData) as? [String: Any],
+              var rawRoot = try JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any],
+              let knownScalarPreferences = knownRoot["scalarPreferences"] as? [String: Any],
+              let knownContextBuilder = knownScalarPreferences["contextBuilder"],
+              let knownFileSystem = knownScalarPreferences["fileSystem"] as? [String: Any],
+              let knownGlobalIgnoreDefaults = knownFileSystem["globalIgnoreDefaults"],
+              let knownGlobalDefaults = knownRoot["globalDefaults"] as? [String: Any]
+        else {
+            throw GlobalSettingsFileStoreError.contextBuilderMigrationEncodingFailed
+        }
+
+        var rawScalarPreferences = rawRoot["scalarPreferences"] as? [String: Any] ?? [:]
+        if rawScalarPreferences["contextBuilder"] == nil || rawScalarPreferences["contextBuilder"] is NSNull {
+            rawScalarPreferences["contextBuilder"] = knownContextBuilder
+        }
+        var rawFileSystem = rawScalarPreferences["fileSystem"] as? [String: Any] ?? [:]
+        rawFileSystem["globalIgnoreDefaults"] = knownGlobalIgnoreDefaults
+        rawScalarPreferences["fileSystem"] = rawFileSystem
+        if includeModelSelectionRepair,
+           let knownModelSelection = knownScalarPreferences["modelSelection"] as? [String: Any]
+        {
+            var rawModelSelection = rawScalarPreferences["modelSelection"] as? [String: Any] ?? [:]
+            if let value = knownModelSelection["syncChatModelWithOracle"] {
+                rawModelSelection["syncChatModelWithOracle"] = value
+            } else {
+                rawModelSelection.removeValue(forKey: "syncChatModelWithOracle")
+            }
+            rawScalarPreferences["modelSelection"] = rawModelSelection
+        }
+        rawRoot["scalarPreferences"] = rawScalarPreferences
+
+        let knownAgentModels = knownRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any] ?? [:]
+        let rawAgentModels = rawRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any] ?? [:]
+        var rawAgentModelsByCanonicalID: [String: Any] = [:]
+        for rawWorkspaceID in rawAgentModels.keys.sorted() {
+            guard let workspaceID = UUID(uuidString: rawWorkspaceID),
+                  let rawValue = rawAgentModels[rawWorkspaceID]
+            else {
+                continue
+            }
+            let canonicalID = workspaceID.uuidString
+            // Canonical spelling wins duplicates; otherwise the lexicographically first key wins
+            if rawAgentModelsByCanonicalID[canonicalID] == nil || rawWorkspaceID == canonicalID {
+                rawAgentModelsByCanonicalID[canonicalID] = rawValue
+            }
+        }
+
+        var migratedAgentModels: [String: Any] = [:]
+        for (workspaceID, knownValue) in knownAgentModels {
+            guard let knownWorkspace = knownValue as? [String: Any] else {
+                migratedAgentModels[workspaceID] = knownValue
+                continue
+            }
+            var rawWorkspace = rawAgentModelsByCanonicalID[workspaceID] as? [String: Any] ?? knownWorkspace
+            if includeModelSelectionRepair,
+               let knownProfile = knownWorkspace["profile"] as? [String: Any]
+            {
+                var rawProfile = rawWorkspace["profile"] as? [String: Any] ?? knownProfile
+                if let value = knownProfile["syncChatModelWithOracle"] {
+                    rawProfile["syncChatModelWithOracle"] = value
+                } else {
+                    rawProfile.removeValue(forKey: "syncChatModelWithOracle")
+                }
+                rawWorkspace["profile"] = rawProfile
+            }
+            migratedAgentModels[workspaceID] = rawWorkspace
+        }
+        if migratedAgentModels.isEmpty {
+            rawRoot.removeValue(forKey: "agentModelsSettingsByWorkspaceID")
+        } else {
+            rawRoot["agentModelsSettingsByWorkspaceID"] = migratedAgentModels
+        }
+
+        var rawGlobalDefaults = rawRoot["globalDefaults"] as? [String: Any] ?? [:]
+        for key in [
+            "discoverAgentRaw",
+            "discoverModelsByAgent",
+            "didUserSetDiscoverAgentDefaults",
+            "contextBuilderAgentRaw"
+        ] {
+            if let value = knownGlobalDefaults[key] {
+                rawGlobalDefaults[key] = value
+            } else {
+                rawGlobalDefaults.removeValue(forKey: key)
+            }
+        }
+        rawRoot["globalDefaults"] = rawGlobalDefaults
+
+        let legacyWorkspaceKeys = [
+            "lastUsedDiscoverAgentRaw",
+            "lastUsedDiscoverModelsByAgent",
+            "discoveryTokenBudget",
+            "discoveryEnhancementMode",
+            "discoveryAutoGeneratePlan",
+            "discoveryAllowClarifyingQuestions",
+            "discoveryAllowClarifyingQuestionsForMCP",
+            "discoveryQuestionTimeoutSeconds",
+            "discoveryPlanTokenBudget",
+            "contextBuilderAgentRaw",
+            "contextBuilderAgentModelRaw",
+            "didUserSetDiscoverAgentDefaults",
+            "didUserSetContextBuilderDefaults",
+            "didAutoApplyRecommendationsAt"
+        ]
+        if var rawChatSettings = rawRoot["chatSettingsByWorkspaceID"] as? [String: Any] {
+            for (workspaceID, value) in rawChatSettings {
+                guard var workspaceSettings = value as? [String: Any] else { continue }
+                for key in legacyWorkspaceKeys {
+                    workspaceSettings.removeValue(forKey: key)
+                }
+                rawChatSettings[workspaceID] = workspaceSettings
+            }
+            rawRoot["chatSettingsByWorkspaceID"] = rawChatSettings
+        }
+
+        rawRoot["schemaVersion"] = knownRoot["schemaVersion"]
+        rawRoot["schemaLineage"] = knownRoot["schemaLineage"]
+        rawRoot["updatedAt"] = knownRoot["updatedAt"]
+        let migratedData = try JSONSerialization.data(
+            withJSONObject: rawRoot,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try ensureSettingsDirectoryExists()
+        do {
+            try migratedData.write(to: fileURL, options: .atomic)
+            blockReason = nil
+        } catch {
+            blockReason = .saveFailed
+            throw error
+        }
+    }
+
+    private func validateSavePermission() throws {
         guard !preservingFailedAutomaticNormalization else {
             blockReason = .automaticSchemaNormalizationFailed
             throw GlobalSettingsFileStoreError.automaticSchemaNormalizationPreserved
@@ -305,19 +479,6 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 assertionFailure("Unexpected settings preservation reason during save: \(reason)")
                 throw GlobalSettingsFileStoreError.incompatibleSchemaPreserved
             }
-        }
-        try ensureSettingsDirectoryExists()
-        var documentToWrite = document
-        documentToWrite.schemaVersion = documentToWrite.requiredSchemaVersion
-        documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
-        documentToWrite.updatedAt = now()
-        let data = try Self.encoder.encode(documentToWrite)
-        do {
-            try data.write(to: fileURL, options: .atomic)
-            blockReason = nil
-        } catch {
-            blockReason = .saveFailed
-            throw error
         }
     }
 
@@ -563,6 +724,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         case corruptDocumentPreserved
         case automaticSchemaNormalizationFailed
         case automaticSchemaNormalizationPreserved
+        case contextBuilderMigrationEncodingFailed
     }
 
     private static let encoder: JSONEncoder = {
