@@ -8,6 +8,29 @@ package enum DomainMutationJournalStatus: String, Codable, Sendable {
     case cancelledBeforeCommit = "cancelled_before_commit"
     case failedBeforeCommit = "failed_before_commit"
     case indeterminateAfterCommit = "indeterminate_after_commit"
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+        if rawValue == "failed_before_write" {
+            // Schema-v1 builds emitted this spelling. Delete this alias when v1 documents are no longer accepted;
+            // encoding below rewrites the record with the canonical current spelling.
+            self = .failedBeforeCommit
+            return
+        }
+        guard let status = Self(rawValue: rawValue) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Cannot initialize DomainMutationJournalStatus from invalid String value \(rawValue)"
+            )
+        }
+        self = status
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 package struct DomainMutationJournalRecord: Codable, Sendable {
