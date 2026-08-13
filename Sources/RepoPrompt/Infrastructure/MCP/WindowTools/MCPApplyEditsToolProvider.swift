@@ -238,11 +238,22 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                         EditFlowPerf.Stage.ApplyEdits.hostWrite,
                         EditFlowPerf.Dimensions(fileBytes: previewResult.updatedText.utf8.count, appliedCount: previewResult.editsApplied)
                     ) {
-                        try await host.writeText(
-                            path: effectivePath,
-                            content: previewResult.updatedText,
-                            overwrite: preview.exists
-                        )
+                        if preview.exists {
+                            guard let originalText = preview.originalText else {
+                                throw MCPError.internalError("Existing-file preview did not capture its original content.")
+                            }
+                            try await host.writeTextIfUnchanged(
+                                path: effectivePath,
+                                content: previewResult.updatedText,
+                                expectedOriginalText: originalText
+                            )
+                        } else {
+                            try await host.writeText(
+                                path: effectivePath,
+                                content: previewResult.updatedText,
+                                overwrite: false
+                            )
+                        }
                     }
                     let freshness = await postMutationFreshness(
                         userPath: effectivePath,

@@ -97,6 +97,29 @@ struct WorkspaceFileMutationService {
         return WorkspaceFileMutationWriteResult(diskSucceeded: true, materializedFile: nil, catalogIneligibility: nil)
     }
 
+    @discardableResult
+    func overwriteIfUnchanged(
+        file: WorkspaceFileRecord,
+        content: String,
+        expectedOriginalContent: String,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
+    ) async throws -> WorkspaceFileMutationWriteResult {
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            [file.standardizedFullPath],
+            rootMappings: mutationRootMappings
+        )
+        let result = try await store.editFile(
+            rootID: file.rootID,
+            relativePath: file.standardizedRelativePath,
+            newContent: content,
+            expectedOriginalContent: expectedOriginalContent
+        )
+        if let result {
+            return .fromCatalogMaterialization(result)
+        }
+        return WorkspaceFileMutationWriteResult(diskSucceeded: true, materializedFile: nil, catalogIneligibility: nil)
+    }
+
     func createFile(
         userPath: String,
         content: String,

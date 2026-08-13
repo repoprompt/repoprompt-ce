@@ -16359,7 +16359,12 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
-    func editFile(rootID: UUID, relativePath: String, newContent: String) async throws -> WorkspaceFileCatalogMaterializationResult? {
+    func editFile(
+        rootID: UUID,
+        relativePath: String,
+        newContent: String,
+        expectedOriginalContent: String? = nil
+    ) async throws -> WorkspaceFileCatalogMaterializationResult? {
         let state = try state(for: rootID)
         let expectedLifetimeID = state.lifetimeID
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
@@ -16379,11 +16384,21 @@ actor WorkspaceFileContextStore {
         }
         let deferredPublicationToken: FileSystemDeferredEditPublicationToken
         do {
-            guard let token = try await state.service.editFile(
-                atRelativePath: standardizedRelativePath,
-                newContent: newContent,
-                modificationPublicationPolicy: .deferSyntheticModificationToSuccessfulCaller
-            ) else {
+            let token = if let expectedOriginalContent {
+                try await state.service.editFileIfUnchanged(
+                    atRelativePath: standardizedRelativePath,
+                    newContent: newContent,
+                    expectedOriginalContent: expectedOriginalContent,
+                    modificationPublicationPolicy: .deferSyntheticModificationToSuccessfulCaller
+                )
+            } else {
+                try await state.service.editFile(
+                    atRelativePath: standardizedRelativePath,
+                    newContent: newContent,
+                    modificationPublicationPolicy: .deferSyntheticModificationToSuccessfulCaller
+                )
+            }
+            guard let token else {
                 throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
                     "store-owned edit completed without a deferred modification publication token"
                 )
@@ -16936,6 +16951,9 @@ actor WorkspaceFileContextStore {
                     candidateRoots: literalCandidates.matches.map(\.binding.preferredClientRoot)
                 ))
             }
+            if literalCandidates.blocked || literalCandidates.hasUnavailableBinding {
+                return .issue(.unresolved(input: relativePath))
+            }
             if let literalCandidate = literalCandidates.matches.first {
                 switch try await materializeSingleExactFile(
                     from: literalCandidates,
@@ -17094,6 +17112,7 @@ actor WorkspaceFileContextStore {
     private struct ExactFileCandidates {
         let matches: [ExactFileCandidate]
         let blocked: Bool
+        let hasUnavailableBinding: Bool
         let directoryBindings: [WorkspaceExactFileNamespace.RootBinding]
     }
 
@@ -17103,6 +17122,7 @@ actor WorkspaceFileContextStore {
     ) async -> ExactFileCandidates {
         var matches: [ExactFileCandidate] = []
         var blocked = false
+        var hasUnavailableBinding = false
         var directoryBindings: [WorkspaceExactFileNamespace.RootBinding] = []
         for binding in bindings {
             if let candidate = file(rootID: binding.lookupRoot.id, relativePath: relativePath),
@@ -17111,7 +17131,10 @@ actor WorkspaceFileContextStore {
                 matches.append(ExactFileCandidate(binding: binding, file: current))
                 continue
             }
-            guard let state = rootStatesByID[binding.lookupRoot.id] else { continue }
+            guard let state = rootStatesByID[binding.lookupRoot.id] else {
+                hasUnavailableBinding = true
+                continue
+            }
             switch await state.service.catalogRegularFileEligibility(relativePath: relativePath) {
             case .eligible, .ineligible(.ignored):
                 matches.append(ExactFileCandidate(binding: binding, file: nil))
@@ -17131,6 +17154,7 @@ actor WorkspaceFileContextStore {
         return ExactFileCandidates(
             matches: matches,
             blocked: blocked,
+            hasUnavailableBinding: hasUnavailableBinding,
             directoryBindings: directoryBindings
         )
     }
@@ -17176,6 +17200,8 @@ actor WorkspaceFileContextStore {
             == .relative(file.standardizedRelativePath)
         if candidates.matches.count == 1,
            candidates.matches[0].file?.id == file.id,
+           !candidates.blocked,
+           !candidates.hasUnavailableBinding,
            !relativePathUsesAliasFallback,
            relativePathRoundTrips == true
         {

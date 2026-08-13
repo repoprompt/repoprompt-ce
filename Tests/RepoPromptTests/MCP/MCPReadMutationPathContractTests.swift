@@ -333,6 +333,64 @@ final class MCPReadMutationPathContractTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: logicalFile, encoding: .utf8), "base token\n")
     }
 
+    func testUnavailableWorktreeBlocksRelativeUniquenessBesideAvailableMatch() async throws {
+        let parent = try makeTemporaryDirectory(name: "UnavailableWorktreeRelativeCollision")
+        let canonicalRootURL = parent.appendingPathComponent("repo", isDirectory: true)
+        let unavailablePhysicalURL = parent.appendingPathComponent("missing-worktree", isDirectory: true)
+        let canonicalFile = canonicalRootURL.appendingPathComponent("Sources/App.swift")
+        try write("base token\n", to: canonicalFile)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: canonicalRootURL.path)
+        let loadedRoots = await store.rootRefs(scope: .allLoaded)
+        let canonicalRoot = try XCTUnwrap(loadedRoots.first)
+        let logicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/logical/project")
+        let unavailablePhysical = WorkspaceRootRef(
+            id: UUID(),
+            name: "Project",
+            fullPath: unavailablePhysicalURL.path
+        )
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: logicalRoot,
+                    physicalRoot: unavailablePhysical,
+                    binding: AgentSessionWorktreeBinding(
+                        id: "binding-unavailable-collision",
+                        repositoryID: "repo-unavailable-collision",
+                        repoKey: "repo-key",
+                        logicalRootPath: logicalRoot.fullPath,
+                        logicalRootName: logicalRoot.name,
+                        worktreeID: "worktree-unavailable-collision",
+                        worktreeRootPath: unavailablePhysical.fullPath,
+                        source: "test"
+                    )
+                )
+            ],
+            visibleLogicalRoots: [canonicalRoot, logicalRoot]
+        )
+        let namespace = WorkspaceLookupContext(
+            rootScope: projection.lookupRootScope,
+            bindingProjection: projection
+        ).exactFileNamespace(storeRoots: [canonicalRoot])
+
+        let relativeResolution = try await store.resolveExactExistingWorkspaceFile(
+            WorkspaceExactFileInput.parse("Sources/App.swift"),
+            namespace: namespace
+        )
+        XCTAssertEqual(relativeResolution, .issue(.unresolved(input: "Sources/App.swift")))
+
+        let absoluteResolution = try await store.resolveExactExistingWorkspaceFile(
+            WorkspaceExactFileInput.parse(canonicalFile.path),
+            namespace: namespace
+        )
+        guard case let .matched(match) = absoluteResolution else {
+            return XCTFail("Expected the absolute canonical file to remain addressable")
+        }
+        XCTAssertTrue(match.canonicalPath.hasSuffix("//Sources/App.swift"))
+    }
+
     func testNestedBoundLogicalAbsolutePathResolvesWorktree() async throws {
         let parent = try makeTemporaryDirectory(name: "NestedBoundLogicalRoot")
         let canonicalRootURL = parent.appendingPathComponent("repo", isDirectory: true)
@@ -470,6 +528,96 @@ final class MCPReadMutationPathContractTests: XCTestCase {
                 XCTFail("Expected FileManagerError for \(input), got \(error)")
             }
         }
+    }
+
+    func testApprovedWriteRejectsReplacementAfterPreview() async throws {
+        let root = try makeTemporaryDirectory(name: "ApprovedWriteReplacement")
+        let fileURL = root.appendingPathComponent("Target.swift")
+        try write("reviewed token\n", to: fileURL)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
+        let resolution = try await store.resolveExactExistingWorkspaceFile(
+            WorkspaceExactFileInput.parse("Target.swift"),
+            namespace: namespace
+        )
+        guard case let .matched(match) = resolution else {
+            return XCTFail("Expected the target file")
+        }
+        let host = WorkspaceFileEditHost(store: store, target: .existing(match.file))
+        let preview = try await ApplyEditsService(engine: .default, host: host).preview(
+            ApplyEditsRequest(
+                path: match.canonicalPath,
+                mode: .single(search: "reviewed", replace: "approved", replaceAll: false),
+                verbose: true
+            )
+        )
+        let originalText = try XCTUnwrap(preview.originalText)
+        try write("replacement content\n", to: fileURL)
+
+        do {
+            try await host.writeTextIfUnchanged(
+                path: match.canonicalPath,
+                content: preview.result.updatedText,
+                expectedOriginalText: originalText
+            )
+            XCTFail("Expected the approved write to reject replacement content")
+        } catch FileSystemError.fileContentChanged {
+            XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "replacement content\n")
+        } catch {
+            XCTFail("Expected fileContentChanged, got \(error)")
+        }
+
+        try await host.writeTextIfUnchanged(
+            path: match.canonicalPath,
+            content: "accepted replacement\n",
+            expectedOriginalText: "replacement content\n"
+        )
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "accepted replacement\n")
+    }
+
+    func testApprovedWriteUsesStreamedPreviewEncodingAtCommit() async throws {
+        let root = try makeTemporaryDirectory(name: "ApprovedWriteStreamedEncoding")
+        let fileURL = root.appendingPathComponent("Large.swift")
+        let fileBody = String(repeating: "a", count: 1_100_000) + " reviewed token\n"
+        let reviewedText = "\u{FEFF}" + fileBody
+        var originalData = Data([0xFF, 0xFE])
+        try originalData.append(XCTUnwrap(fileBody.data(using: .utf16LittleEndian)))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try originalData.write(to: fileURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
+        let resolution = try await store.resolveExactExistingWorkspaceFile(
+            WorkspaceExactFileInput.parse("Large.swift"),
+            namespace: namespace
+        )
+        guard case let .matched(match) = resolution else {
+            return XCTFail("Expected the streamed target file")
+        }
+        let host = WorkspaceFileEditHost(store: store, target: .existing(match.file))
+        let preview = try await ApplyEditsService(engine: .default, host: host).preview(
+            ApplyEditsRequest(
+                path: match.canonicalPath,
+                mode: .single(search: "reviewed", replace: "approved", replaceAll: false),
+                verbose: false
+            )
+        )
+        let previewOriginalText = try XCTUnwrap(preview.originalText)
+        XCTAssertEqual(previewOriginalText, reviewedText)
+
+        try await host.writeTextIfUnchanged(
+            path: match.canonicalPath,
+            content: preview.result.updatedText,
+            expectedOriginalText: previewOriginalText
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fileURL, encoding: .utf16LittleEndian),
+            "\u{FEFF}" + String(repeating: "a", count: 1_100_000) + " approved token\n"
+        )
     }
 
     func testMissingResolvedTargetFailsInsteadOfReadingEmptyContent() async throws {

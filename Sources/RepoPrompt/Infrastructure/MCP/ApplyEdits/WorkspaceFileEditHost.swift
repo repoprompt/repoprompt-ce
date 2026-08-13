@@ -50,6 +50,19 @@ struct WorkspaceFileEditHost: FileEditHost {
         return content
     }
 
+    func writeTextIfUnchanged(path _: String, content: String, expectedOriginalText: String) async throws {
+        guard case let .existing(file) = target else {
+            throw FileManagerError.fileSystemServiceNotFoundWithContext("Approved writes require an existing file.")
+        }
+        try Task.checkCancellation()
+        try await mutationService.overwriteIfUnchanged(
+            file: file,
+            content: content,
+            expectedOriginalContent: expectedOriginalText,
+            mutationRootMappings: mutationRootMappings
+        )
+    }
+
     func writeText(path _: String, content: String, overwrite: Bool) async throws {
         switch target {
         case let .existing(file):

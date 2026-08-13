@@ -637,6 +637,34 @@ extension FileSystemService {
         newContent: String,
         modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
     ) async throws -> FileSystemDeferredEditPublicationToken? {
+        try await editFile(
+            atRelativePath: relativePath,
+            newContent: newContent,
+            expectedOriginalContent: nil,
+            modificationPublicationPolicy: modificationPublicationPolicy
+        )
+    }
+
+    func editFileIfUnchanged(
+        atRelativePath relativePath: String,
+        newContent: String,
+        expectedOriginalContent: String,
+        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
+    ) async throws -> FileSystemDeferredEditPublicationToken? {
+        try await editFile(
+            atRelativePath: relativePath,
+            newContent: newContent,
+            expectedOriginalContent: expectedOriginalContent,
+            modificationPublicationPolicy: modificationPublicationPolicy
+        )
+    }
+
+    private func editFile(
+        atRelativePath relativePath: String,
+        newContent: String,
+        expectedOriginalContent: String?,
+        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
+    ) async throws -> FileSystemDeferredEditPublicationToken? {
         try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
         let fullPath = target.url.path
@@ -664,12 +692,17 @@ extension FileSystemService {
                 )
             )
         }
-
         let mutation = try await startUncancellableMutation(
             .edit,
             relativePaths: [target.relativePath]
         ) { executor in
             try await executor {
+                if let expectedOriginalContent {
+                    let currentData = try Data(contentsOf: fullURL)
+                    guard String(data: currentData, encoding: encoding) == expectedOriginalContent else {
+                        throw FileSystemError.fileContentChanged
+                    }
+                }
                 try FileSystemService.writeFileRobust(to: fullURL, data: data)
             }
         }
@@ -681,6 +714,11 @@ extension FileSystemService {
                     relativePath: target.relativePath,
                     encoding: encoding,
                     modificationPublicationPolicy: modificationPublicationPolicy
+                )
+            } catch FileSystemError.fileContentChanged {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.fileContentChanged
                 )
             } catch {
                 await self?.completeMutationWaiter(
