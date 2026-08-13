@@ -179,6 +179,8 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grokBuild(level):
+            GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
     }
 

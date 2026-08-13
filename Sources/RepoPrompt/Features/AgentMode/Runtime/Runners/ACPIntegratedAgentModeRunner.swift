@@ -231,14 +231,28 @@ final class ACPIntegratedAgentModeRunner {
         let lease = makeLease(runID)
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
 
-        guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
+        let provider: any ACPAgentProvider
+        do {
+            guard let created = try await providerFactory(runRequest.agentKind, runRequest.modelString) else {
+                await failBeforeProviderSend(
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    attachmentReservationID: attachmentReservationID,
+                    errorText: "No ACP provider is registered for \(runRequest.agentKind.displayName)."
+                )
+                return
+            }
+            provider = created
+        } catch {
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
                 attachmentReservationID: attachmentReservationID,
-                errorText: "No ACP provider is registered for \(runRequest.agentKind.displayName)."
+                errorText: "ACP provider construction failed: \(error.localizedDescription)"
             )
             return
         }
@@ -806,7 +820,7 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor else { return }
+        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor || runRequest.agentKind == .grokBuild else { return }
         guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -818,6 +832,15 @@ final class ACPIntegratedAgentModeRunner {
            AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) != true
         {
             return
+        }
+        if runRequest.agentKind == .grokBuild,
+           AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.contains(rawModel: model) != true
+        {
+            // Grok has no provider-side alias surface: an unknown concrete model fails the
+            // run instead of silently running Grok's current default.
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build model `\(model)` is not in the discovered model set. Refresh Grok Build models and retry."
+            )
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
         try await controller.setSessionModel(model)

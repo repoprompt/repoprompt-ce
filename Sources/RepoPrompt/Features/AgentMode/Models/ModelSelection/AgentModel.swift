@@ -298,6 +298,8 @@ enum AgentModel: String, CaseIterable, Codable {
             ]
         case .openCode:
             [.defaultModel]
+        case .grokBuild:
+            [.defaultModel]
         case .cursor:
             [.cursorAuto, .cursorComposer2]
         case .claudeCodeGLM:

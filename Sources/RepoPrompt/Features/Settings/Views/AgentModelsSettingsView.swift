@@ -476,7 +476,7 @@ struct AgentModelsSettingsView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundColor(.secondary)
-                    Text("Connect Claude Code, Codex, OpenCode, or Cursor to configure role defaults.")
+                    Text("Connect Claude Code, Codex, OpenCode, Cursor, or Grok Build to configure role defaults.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer(minLength: 0)

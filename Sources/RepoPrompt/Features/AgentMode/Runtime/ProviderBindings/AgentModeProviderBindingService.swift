@@ -223,6 +223,12 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .grokBuild:
+                // Grok full access is a launch-time `--always-approve` flag; it applies to
+                // newly launched processes and never mutates a running controller. The next
+                // run builds a fresh controller because `isCompatibleWith` keys on the
+                // permission flag for Grok.
+                break
             }
         }
 

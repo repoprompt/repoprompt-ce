@@ -3,6 +3,7 @@ import Foundation
 enum ACPProviderID: String, Hashable {
     case openCode
     case cursor
+    case grokBuild
 }
 
 enum ACPSupportResult: Equatable {
@@ -175,6 +176,42 @@ enum NormalizedAgentRuntimeEvent {
     case approvalRequested(AgentApprovalRequest)
     case approvalCancelled(AgentApprovalRequestID)
     case terminal(state: AgentSessionRunState, errorText: String?)
+}
+
+/// Result of parsing a provider-specific session-open model advertisement.
+enum ACPProviderModelSnapshotResult: Equatable {
+    /// The provider response carries no usable model metadata.
+    case absent
+    /// A valid snapshot was parsed.
+    case valid(ACPDiscoveredSessionModels)
+    /// Metadata was present but malformed; explicit model selection must be
+    /// unavailable and the failure recorded/diagnosed. Never persisted.
+    case malformed(reason: String)
+}
+
+/// A provider-owned direct model-selection RPC (e.g. Grok's `session/set_model`).
+/// The controller stays unaware of provider method names and parameter keys.
+struct ACPDirectModelSelectionRequest {
+    let method: String
+    let params: [String: Any]
+}
+
+/// Bounded capability for ACP providers that advertise session models outside the
+/// modern `configOptions` contract (e.g. Grok's top-level `SessionModelState`) and
+/// apply selections through a provider-specific RPC instead of
+/// `session/set_config_option`.
+///
+/// The controller consults this ONLY when modern `configOptions` metadata is
+/// absent; a malformed modern selector never falls back to this path.
+protocol ACPDirectSessionModelProvider: Sendable {
+    func parseDirectSessionModelSnapshot(
+        from sessionResponse: [String: Any]
+    ) -> ACPProviderModelSnapshotResult
+
+    func makeDirectModelSelectionRequest(
+        sessionID: String,
+        modelRaw: String
+    ) -> ACPDirectModelSelectionRequest
 }
 
 protocol ACPAgentProvider: Sendable {

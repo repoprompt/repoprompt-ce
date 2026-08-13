@@ -7,6 +7,7 @@ enum CLIPathHints {
     static let codex: [String] = CLILaunchProfiles.codex.supplementalSearchPaths
     static let openCode: [String] = CLILaunchProfiles.openCodeProviderSpecificPaths
     static let cursor: [String] = CLILaunchProfiles.cursorProviderSpecificPaths
+    static let grokBuild: [String] = CLILaunchProfiles.grokBuildProviderSpecificPaths
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
         CLILaunchProfiles.nativeDefaultsSupplemented(with: providerSpecificPaths)

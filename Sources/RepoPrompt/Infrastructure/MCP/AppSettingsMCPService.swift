@@ -1335,6 +1335,10 @@ private enum AppSettingsMCPRegistry {
             .openCode
         case .cursor:
             .cursor
+        case .grokBuild:
+            // Grok Build is an Agent Mode ACP provider only; `AIProviderType.grok` is the
+            // HTTP chat provider and does not describe Agent Mode models.
+            nil
         }
     }
 

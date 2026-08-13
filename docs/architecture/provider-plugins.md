@@ -220,6 +220,17 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 - **OpenCode:** Timeout values are milliseconds. For a 10,000-second call, set `"timeout": 10000000` on the existing RepoPrompt MCP server entry, preserving its `type`, `command`, and `environment` fields.
 - **Cursor Agent:** Current builds expose no supported ACP, CLI, environment, or configuration override that RepoPrompt CE can set to 10,000 seconds. Do not add a speculative CE timeout control; add one only if Cursor documents a supported configuration surface.
+- **Grok Build:** The session-injected RepoPrompt MCP server follows Grok's default MCP timeout. To pin one, add `tool_timeout_sec` under `[mcp_servers.RepoPromptCE]` in `~/.grok/config.toml` (Grok's per-server MCP config; seconds).
+
+### Grok Build provider notes
+
+`AgentProviderKind.grokBuild` drives `grok agent stdio` (ACP protocolVersion 1). Verified wire facts as of grok 1.0.3 (2026-08-13):
+
+- Model advertisement is a top-level `SessionModelState` (`models` in `session/new`/`session/load` responses), not modern `configOptions`; explicit selection goes through `session/set_model` (`{sessionId, modelId}`). The controller consults the provider's `ACPDirectSessionModelProvider` conformance only when no modern model selector exists; malformed modern selectors never fall back.
+- Usage arrives in the `session/prompt` response `_meta.usage` (same field names as the ACP-standard top-level `usage`); Grok emits no `usage_update` notifications.
+- Full access is a launch flag (`grok agent --always-approve stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
+- Auth: RepoPrompt never sends ACP `authenticate`; Grok's own precedence (config.toml key → `~/.grok/auth.json` → `XAI_API_KEY` env, the last injected from the existing `.grokAPI` keychain account at provider construction) applies.
+- MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
 
 ## How a new provider plugs in
 

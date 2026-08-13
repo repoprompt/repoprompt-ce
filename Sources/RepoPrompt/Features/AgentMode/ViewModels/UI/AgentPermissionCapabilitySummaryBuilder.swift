@@ -172,6 +172,22 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
+        case .grokBuild:
+            let level = grokBuildPermissionLevel(profile: profile)
+            let warnings = level == .fullAccess
+                ? ["Grok Build launches with `--always-approve` — its tools run without per-request confirmation."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Always-approve launch: \(level.launchesWithAlwaysApprove ? "on" : "off")",
+                shell: "Handled by Grok Build CLI",
+                externalMCP: "Third-party MCP: managed by Grok Build",
+                search: "Managed by Grok Build CLI",
+                approvalModeDescription: level.launchesWithAlwaysApprove ? "Always-approve: on" : "Always-approve: off",
+                warnings: warnings
+            )
         }
     }
 
@@ -193,6 +209,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
+        case .grokBuild: availability.grokBuildAvailable
         }
     }
 
@@ -249,6 +266,19 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .mcpSafeDefaults:
             .managedDefault
         case let .providerOverride(.cursor(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func grokBuildPermissionLevel(profile: AgentProviderPermissionProfile) -> GrokBuildAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.grokBuild(level)):
             level
         case .providerOverride:
             .managedDefault

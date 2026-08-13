@@ -956,6 +956,7 @@ class WindowStatesManager: ObservableObject {
         await CodexModelPollingService.shared.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
+        await GrokBuildACPModelPollingService.shared.shutdown()
     }
 
     // MARK: - Instance Number Management

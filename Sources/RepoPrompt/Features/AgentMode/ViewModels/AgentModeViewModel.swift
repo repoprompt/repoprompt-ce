@@ -48,7 +48,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
     typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
-    typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
+    typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
         _ clientName: String,
@@ -617,6 +617,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var uiRefreshTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
+    private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()
@@ -1407,6 +1408,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
+        updateGrokBuildModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateOpenCodeModelPolling() {
@@ -1474,7 +1476,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cursorModelsSubscriptionTask = nil
     }
 
+    private func updateGrokBuildModelPolling(startPolling: Bool = true) {
+        guard selectedAgent == .grokBuild else {
+            stopGrokBuildModelsSubscription()
+            return
+        }
+        guard startPolling,
+              AgentModelCatalog.isAgentAvailable(.grokBuild, availability: agentAvailabilityContext)
+        else {
+            return
+        }
+        startGrokBuildModelsSubscriptionIfNeeded()
+    }
+
+    private func startGrokBuildModelsSubscriptionIfNeeded() {
+        guard grokBuildModelsSubscriptionTask == nil else { return }
+        let workspacePath = workspacePathProvider()
+        grokBuildModelsSubscriptionTask = Task { [weak self, workspacePath] in
+            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await _ in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    acpDynamicModelRevision &+= 1
+                    syncSelectedACPModelFromRegistryIfNeeded(for: .grokBuild)
+                    syncComposerUIState()
+                }
+            }
+        }
+    }
+
+    private func stopGrokBuildModelsSubscription() {
+        grokBuildModelsSubscriptionTask?.cancel()
+        grokBuildModelsSubscriptionTask = nil
+    }
+
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
+        // Grok's "default" selection must stick: a discovered session's current model is
+        // never auto-adopted as an explicit selection (default sends no model mutation).
+        guard agent != .grokBuild else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
@@ -1635,7 +1675,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         headlessProviderFactory = Self.defaultHeadlessProviderFactory
         acpProviderFactory = { agent, modelString in
-            ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         }
         acpControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -1780,7 +1820,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
-                ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+                try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
             },
             acpControllerFactory: @escaping ACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -4771,7 +4811,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -14541,7 +14581,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
-        case .codexExec:
+        case .codexExec, .grokBuild:
             return text
         }
     }

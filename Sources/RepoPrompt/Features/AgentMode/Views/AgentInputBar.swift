@@ -323,7 +323,8 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var canAttachImages: Bool {
-        !props.isAgentBusy && currentTabID != nil
+        // Grok Build advertises no ACP image capability; its provider rejects attachments.
+        !props.isAgentBusy && currentTabID != nil && props.selectedAgent != .grokBuild
     }
 
     private var renderedSubmitTarget: AgentComposerSubmitTarget? {

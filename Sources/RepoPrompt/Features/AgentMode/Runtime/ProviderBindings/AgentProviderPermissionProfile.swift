@@ -144,11 +144,22 @@ extension AgentProviderPermissionProfile {
         }
     }
 
+    func grokBuildPermissionLevel(
+        userConfigured: GrokBuildAgentToolPreferences.PermissionLevel = GrokBuildAgentToolPreferences.permissionLevel()
+    ) -> GrokBuildAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: userConfigured
+        case .mcpSafeDefaults: .managedDefault
+        case let .providerOverride(.grokBuild(level)): level
+        case .providerOverride: .managedDefault
+        }
+    }
+
     func acpSessionModeID(for agent: AgentProviderKind) -> String? {
         switch agent {
         case .openCode:
             openCodeSessionModeID
-        case .cursor:
+        case .cursor, .grokBuild:
             nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil

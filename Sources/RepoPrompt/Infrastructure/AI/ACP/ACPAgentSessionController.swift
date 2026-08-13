@@ -269,6 +269,10 @@ actor ACPAgentSessionController {
     private var loadSessionSupported = false
     private var discoveredSessionModels: ACPDiscoveredSessionModels?
     private var sessionModelConfigOptionID: String?
+    /// True when the provider conforms to `ACPDirectSessionModelProvider` and the session
+    /// advertised no modern `configOptions` model selector, so model application flows
+    /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
+    private var sessionModelDirectSelectionSupported = false
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
@@ -334,6 +338,18 @@ actor ACPAgentSessionController {
               normalizedWorkspacePath(runRequest.workspacePath) == normalizedWorkspacePath(request.workspacePath)
         else {
             return false
+        }
+        if provider.providerID == .grokBuild {
+            // Grok full access is a launch flag and "default" sends no model RPC, so a live
+            // process can never move between permission profiles or back to the provider
+            // default: those transitions must build a fresh controller.
+            guard runRequest.autoApproveAllToolPermissions == request.autoApproveAllToolPermissions else {
+                return false
+            }
+            guard normalizedModelString(runRequest.modelString) == normalizedModelString(request.modelString) else {
+                return false
+            }
+            return true
         }
         // Selection changes are already blocked/managed by the agent-mode UI while
         // a run is active. For live steering, controller identity + provider +
@@ -655,9 +671,54 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+            }
+            if provider.providerID == .grokBuild, sessionModelConfigOptionID == nil {
+                // Direct (SessionModelState) path: no modern selector was advertised, so
+                // model application flows through the provider-owned RPC.
+                guard sessionModelDirectSelectionSupported,
+                      let directProvider = provider as? ACPDirectSessionModelProvider
+                else {
+                    throw ControllerError.requestFailed("Grok Build ACP runtime does not advertise model switching.")
+                }
+                let canonicalModel = try canonicalDirectSessionModelValue(model)
+                if discoveredSessionModels?.currentModelRaw == canonicalModel {
+                    return
+                }
+                let selectionRequest = directProvider.makeDirectModelSelectionRequest(
+                    sessionID: sessionID,
+                    modelRaw: canonicalModel
+                )
+                // A rejected direct selection preserves the session's current model. Grok
+                // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
+                // the Err variant is a failure even though the RPC itself succeeded.
+                let selectionResponse = try await sendRequestResponse(
+                    method: selectionRequest.method,
+                    params: selectionRequest.params
+                )
+                if let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any],
+                   let modelError = modelOutcome["Err"]
+                {
+                    throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
+                }
+                var updatedOptions = discoveredSessionModels?.options
+                    ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
+                    ?? []
+                if !updatedOptions.contains(where: { $0.rawValue == canonicalModel }) {
+                    updatedOptions.append(AgentModelOption(
+                        rawValue: canonicalModel,
+                        displayName: canonicalModel,
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    ))
+                }
+                let updated = ACPDiscoveredSessionModels(options: updatedOptions, currentModelRaw: canonicalModel)
+                discoveredSessionModels = updated
+                _ = AgentACPModelRegistry.shared.updateDiscoveredModels(updated, for: provider.providerID)
+                return
             }
             if provider.providerID == .cursor,
                normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
@@ -692,6 +753,24 @@ actor ACPAgentSessionController {
                 requiredModelValue: configValue
             )
         }
+    }
+
+    /// Validation for direct (non-configOptions) model selection: exact/case-insensitive
+    /// match against the live session snapshot first, then the warmed persisted registry
+    /// (a `session/load` response may legitimately omit model metadata on some providers).
+    private func canonicalDirectSessionModelValue(_ requestedValue: String) throws -> String {
+        if let live = discoveredSessionModels {
+            if let match = live.option(matching: requestedValue) {
+                return match.rawValue
+            }
+            throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
+        }
+        if let warmed = AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID),
+           let match = warmed.option(matching: requestedValue)
+        {
+            return match.rawValue
+        }
+        throw ControllerError.requestFailed("Grok Build model '\(requestedValue)' is not in the discovered model set. Refresh Grok Build models and retry.")
     }
 
     func setSessionMode(_ modeID: String) async throws {
@@ -1011,6 +1090,7 @@ actor ACPAgentSessionController {
         process = nil
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -1912,6 +1992,7 @@ actor ACPAgentSessionController {
     private func beginOpeningSessionConfiguration() {
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -2274,6 +2355,7 @@ actor ACPAgentSessionController {
         switch parseModernModelSnapshot(from: response) {
         case let .valid(configID, models):
             sessionModelConfigOptionID = configID
+            sessionModelDirectSelectionSupported = false
             sessionModelFailureReason = nil
             parsed = models
             if response["models"] != nil {
@@ -2282,12 +2364,32 @@ actor ACPAgentSessionController {
         case .absent:
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = nil
-            parsed = nil
-            if response["models"] != nil {
-                diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+            if let directProvider = provider as? ACPDirectSessionModelProvider {
+                switch directProvider.parseDirectSessionModelSnapshot(from: response) {
+                case let .valid(models):
+                    sessionModelDirectSelectionSupported = true
+                    parsed = models
+                case .absent:
+                    // Conforming providers guarantee the direct selection RPC; explicit
+                    // models validate against this snapshot or the warmed registry.
+                    sessionModelDirectSelectionSupported = true
+                    parsed = nil
+                case let .malformed(reason):
+                    sessionModelDirectSelectionSupported = false
+                    sessionModelFailureReason = reason
+                    parsed = nil
+                    diagnose(.info("ACP session advertised malformed provider model metadata: \(reason)"))
+                }
+            } else {
+                sessionModelDirectSelectionSupported = false
+                parsed = nil
+                if response["models"] != nil {
+                    diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+                }
             }
         case let .malformed(reason):
             sessionModelConfigOptionID = nil
+            sessionModelDirectSelectionSupported = false
             sessionModelFailureReason = reason
             parsed = nil
             diagnose(.info("ACP session advertised a malformed modern model config option; legacy fallback is disabled: \(reason)"))
@@ -2481,7 +2583,10 @@ actor ACPAgentSessionController {
         sessionID: String,
         stopReason: String?
     ) -> AIStreamResult {
-        let usage = response["usage"] as? [String: Any]
+        // Grok Build carries usage under `_meta.usage` with the same field names; top-level
+        // `usage` remains the preferred ACP-standard location.
+        let usage = (response["usage"] as? [String: Any])
+            ?? ((response["_meta"] as? [String: Any])?["usage"] as? [String: Any])
         let inputTokens = intValue(usage?["inputTokens"])
         let outputTokens = intValue(usage?["outputTokens"])
         let cachedReadTokens = intValue(usage?["cachedReadTokens"])
@@ -2692,19 +2797,42 @@ actor ACPAgentSessionController {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
         case .openCode, .cursor:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
+        case .grokBuild:
+            grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
         }
-        return optionID(for: options, preferences: preferences) ?? options.first?.optionID ?? ""
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        return optionID(for: filteredOptions, preferences: preferences) ?? filteredOptions.first?.optionID ?? ""
+    }
+
+    private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
+        if sessionScoped {
+            return [
+                .optionID("allow-edits-session"),
+                .optionID("always"),
+                .optionID("allow_always"),
+                .kind("allow_always")
+            ]
+        }
+        return [
+            .optionID("allow-once"),
+            .optionID("once"),
+            .optionID("allow_once"),
+            .kind("allow_once")
+        ]
     }
 
     private func preferredRejectOptionID(for options: [PermissionOption]) -> String? {
         optionID(for: options, preferences: [
+            .optionID("reject-once"),
             .optionID("reject_once"),
             .optionID("reject"),
             .kind("reject_once"),
             .kind("reject"),
             .optionID("reject_always"),
+            .optionID("reject-always"),
             .kind("reject_always"),
             .optionID("deny_once"),
+            .optionID("deny-once"),
             .optionID("deny"),
             .kind("deny_once"),
             .kind("deny"),
@@ -2718,7 +2846,9 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode:
+        case .openCode, .grokBuild:
+            // Grok full access is provider-native (`grok agent --always-approve stdio`); the
+            // controller never auto-selects permission options for it.
             return nil
         }
     }
@@ -2770,10 +2900,28 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
+        case .grokBuild:
+            // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
+            // session-scoped `allow-edits-session` here.
+            [
+                .optionID("allow-once"),
+                .optionID("once"),
+                .optionID("allow_once"),
+                .kind("allow_once")
+            ]
         }
 
-        guard let optionID = optionID(for: options, preferences: preferences) else { return nil }
+        guard let optionID = optionID(for: safePermissionOptionsForAutoSelection(options), preferences: preferences) else { return nil }
         return AutoApprovalSelection(optionID: optionID, match: match)
+    }
+
+    /// Options that must never be picked by an automatic or fallback selection path.
+    /// Grok's `enable-always-approve` is typed AllowOnce for backward compatibility, so a
+    /// bare kind match would select it — it is excluded by explicit ID before any matching.
+    private func safePermissionOptionsForAutoSelection(_ options: [PermissionOption]) -> [PermissionOption] {
+        options.filter { option in
+            ACPPermissionOptionPolicy.isAutoSelectable(optionID: option.optionID, for: provider.providerID)
+        }
     }
 
     private func isStrictACPRepoPromptPermissionMatch(
@@ -2953,6 +3101,8 @@ actor ACPAgentSessionController {
                 "RP_CURSOR_RAW_CAPTURE_PATH"
             case .openCode:
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
+            case .grokBuild:
+                "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
