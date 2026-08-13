@@ -6948,12 +6948,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if let warning = Self.artifactCleanupWarning(from: outcome) {
                     result.artifactCleanupWarningsByWorkspaceID[workspaceID] = warning
                 }
-                snapshotsByID.removeValue(forKey: workspaceID)
                 snapshot = await domainWorkspaceAuthorityClient.snapshot()
+                snapshotsByID = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0)
+                })
             } else if outcome.errorCode == .workspaceUnavailable {
                 result.alreadyAbsentWorkspaceIDs.append(workspaceID)
-                snapshotsByID.removeValue(forKey: workspaceID)
                 snapshot = await domainWorkspaceAuthorityClient.snapshot()
+                snapshotsByID = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0)
+                })
             } else {
                 result.failedReasonsByWorkspaceID[workspaceID] = Self.deleteFailureReason(from: outcome)
                 snapshot = await domainWorkspaceAuthorityClient.snapshot()

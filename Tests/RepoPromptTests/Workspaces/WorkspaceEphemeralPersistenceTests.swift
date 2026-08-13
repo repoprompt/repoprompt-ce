@@ -429,6 +429,63 @@ import XCTest
             XCTAssertFalse(authoritativeAfter.workspaces.contains { $0.document.workspaceID == laterID })
         }
 
+        func testBulkDeleteRefreshesWorkspaceRevisionAfterSuccessfulDeletion() async throws {
+            let firstID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+            let laterID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+            let first = WorkspaceModel(id: firstID, name: "First", repoPaths: ["/tmp/first"])
+            let later = WorkspaceModel(id: laterID, name: "Later", repoPaths: ["/tmp/later"])
+            for workspace in [first, later] {
+                try writeWorkspace(workspace)
+            }
+            try writeLegacyIndex([first, later])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-delete-refresh-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -770)
+            let manager = makeManager(
+                windowID: -770,
+                domainWorkspaceAuthorityClient: client
+            )
+            await manager.awaitInitialized()
+
+            let initialLaterSnapshot = await client.canonicalWorkspaceSnapshot(laterID)
+            let initialLater = try XCTUnwrap(initialLaterSnapshot)
+            var revisedLater = later
+            revisedLater.name = "Later Revised"
+            var revisionOutcome: DomainCommandOutcome?
+            var revisionError: Error?
+            manager.setWorkspaceDeleteWillExecuteHandlerForTesting { workspaceID in
+                guard workspaceID == firstID else { return }
+                do {
+                    revisionOutcome = try await client.replaceWorking(
+                        revisedLater,
+                        fileURL: initialLater.document.fileURL,
+                        expectedWorkspaceRevision: initialLater.revisions.workingRevision
+                    )
+                } catch {
+                    revisionError = error
+                }
+            }
+
+            let result = await manager.deleteWorkspacesAsync(workspaceIDs: [firstID, laterID])
+            manager.setWorkspaceDeleteWillExecuteHandlerForTesting(nil)
+
+            XCTAssertNil(revisionError)
+            XCTAssertEqual(revisionOutcome?.disposition, .applied)
+            XCTAssertEqual(Set(result.deletedWorkspaceIDs), [firstID, laterID])
+            XCTAssertTrue(result.failedReasonsByWorkspaceID.isEmpty)
+        }
+
         private func leakedFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
             WorkspaceModel(
                 id: id,
