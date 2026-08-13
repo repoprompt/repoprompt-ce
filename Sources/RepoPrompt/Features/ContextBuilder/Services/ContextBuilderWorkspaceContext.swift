@@ -95,10 +95,9 @@ struct ContextBuilderWorkspaceContext {
         if let target = reviewTargetResolution.availableTarget {
             providerWorkspacePath = target.primaryCheckout.checkoutRootPath
         } else if !bindings.isEmpty {
-            let fallback = workspaceRepoPaths.first ?? workspaceDirectoryPath
             guard let projected = try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
                 bindings: bindings,
-                fallbackWorkspacePath: fallback
+                workspaceRootPaths: workspaceRepoPaths
             ) else {
                 throw ContextBuilderWorkspaceContextError.missingWorkspaceRoot
             }

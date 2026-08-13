@@ -576,6 +576,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
     private let workspacePathProvider: () -> String?
+    private let workspaceRootPathsProvider: () -> [String]
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
     private let acpProviderFactory: ACPProviderFactory
@@ -1597,12 +1598,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
-        let codexWorkspacePathProvider = { [weak workspaceManager] in
-            workspaceManager?.activeWorkspace?.repoPaths.first
+        let codexWorkspaceRootPathsProvider = { [weak workspaceManager] in
+            workspaceManager?.activeWorkspace?.repoPaths ?? []
         }
+        let codexWorkspacePathProvider = { codexWorkspaceRootPathsProvider().first }
         let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
-            Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
+            Self.makeSessionWorkspaceProviders(workspaceRootPaths: codexWorkspaceRootPathsProvider)
         workspacePathProvider = codexWorkspacePathProvider
+        workspaceRootPathsProvider = codexWorkspaceRootPathsProvider
         attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
             guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
                 return nil
@@ -1768,6 +1771,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         init(
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
+            testWorkspacePaths: [String]? = nil,
             testWorkspaceDirectory: URL? = nil,
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
@@ -1839,10 +1843,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 return FileManager.default.temporaryDirectory
             }
-            let codexWorkspacePathProvider = { testWorkspacePath }
+            let codexWorkspaceRootPathsProvider = {
+                testWorkspacePaths ?? testWorkspacePath.map { [$0] } ?? []
+            }
+            let codexWorkspacePathProvider = { codexWorkspaceRootPathsProvider().first }
             let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
-                Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
+                Self.makeSessionWorkspaceProviders(workspaceRootPaths: codexWorkspaceRootPathsProvider)
             workspacePathProvider = codexWorkspacePathProvider
+            workspaceRootPathsProvider = codexWorkspaceRootPathsProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
@@ -2039,19 +2047,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func effectiveWorkspacePath(for session: TabSession) throws -> String? {
         try Self.effectiveWorkspacePath(
             for: session,
-            fallbackWorkspacePath: workspacePathProvider()
+            workspaceRootPaths: workspaceRootPathsProvider()
         )
     }
 
     func codexRuntimeWorkspacePaths(for session: TabSession) throws -> CodexRuntimeWorkspacePaths {
         try Self.codexRuntimeWorkspacePaths(
             for: session,
-            fallbackWorkspacePath: workspacePathProvider()
+            workspaceRootPaths: workspaceRootPathsProvider()
         )
     }
 
     func primaryExecutionBinding(for session: TabSession) -> AgentSessionWorktreeBinding? {
-        Self.primaryExecutionBinding(in: session.worktreeBindings, fallbackWorkspacePath: workspacePathProvider())
+        Self.primaryExecutionBinding(in: session.worktreeBindings, workspaceRootPaths: workspaceRootPathsProvider())
     }
 
     func primaryExecutionWorktreeIndicator(forTabID tabID: UUID) -> AgentWorktreeIndicator? {
@@ -2067,29 +2075,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private static func primaryExecutionBinding(
         in bindings: [AgentSessionWorktreeBinding],
-        fallbackWorkspacePath: String?
+        workspaceRootPaths: [String]
     ) -> AgentSessionWorktreeBinding? {
-        AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+        try? AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
             in: bindings,
-            fallbackWorkspacePath: fallbackWorkspacePath
+            workspaceRootPaths: workspaceRootPaths
         )
     }
 
     private static func effectiveWorkspacePath(
         for session: TabSession,
-        fallbackWorkspacePath: String?
+        workspaceRootPaths: [String]
     ) throws -> String? {
         try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
             bindings: session.worktreeBindings,
-            fallbackWorkspacePath: fallbackWorkspacePath
+            workspaceRootPaths: workspaceRootPaths
         )
     }
 
     /// One projection contract for both initializers: session-scoped scalar
     /// workspace path and Codex launch/execution path pair, derived from the
-    /// same fallback workspace provider.
+    /// complete active workspace root provider.
     private static func makeSessionWorkspaceProviders(
-        fallbackWorkspacePath: @escaping () -> String?
+        workspaceRootPaths: @escaping () -> [String]
     ) -> (
         sessionWorkspacePath: (TabSession) throws -> String?,
         codexRuntimeWorkspacePaths: (TabSession) throws -> CodexRuntimeWorkspacePaths
@@ -2098,13 +2106,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessionWorkspacePath: { session in
                 try Self.effectiveWorkspacePath(
                     for: session,
-                    fallbackWorkspacePath: fallbackWorkspacePath()
+                    workspaceRootPaths: workspaceRootPaths()
                 )
             },
             codexRuntimeWorkspacePaths: { session in
                 try Self.codexRuntimeWorkspacePaths(
                     for: session,
-                    fallbackWorkspacePath: fallbackWorkspacePath()
+                    workspaceRootPaths: workspaceRootPaths()
                 )
             }
         )
@@ -2112,11 +2120,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private static func codexRuntimeWorkspacePaths(
         for session: TabSession,
-        fallbackWorkspacePath: String?
+        workspaceRootPaths: [String]
     ) throws -> CodexRuntimeWorkspacePaths {
         try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
             bindings: session.worktreeBindings,
-            fallbackWorkspacePath: fallbackWorkspacePath
+            workspaceRootPaths: workspaceRootPaths
         )
     }
 
@@ -6719,7 +6727,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func executionDestinationIdentity(in bindings: [AgentSessionWorktreeBinding]) -> ExecutionDestinationIdentity {
-        let binding = Self.primaryExecutionBinding(in: bindings, fallbackWorkspacePath: workspacePathProvider())
+        let binding = Self.primaryExecutionBinding(in: bindings, workspaceRootPaths: workspaceRootPathsProvider())
         return ExecutionDestinationIdentity(
             repositoryID: binding?.repositoryID,
             worktreeID: binding?.worktreeID,
