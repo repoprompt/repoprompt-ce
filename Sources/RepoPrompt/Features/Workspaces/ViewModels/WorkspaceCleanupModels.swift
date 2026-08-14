@@ -5,20 +5,26 @@ enum WorkspaceBulkDeletePolicy {
 }
 
 enum WorkspaceLeakedTestFixtureIdentity {
-    private static let workspaceNamePrefix = "Agent Mode Chat Switch "
-    private static let fixtureDirectoryPrefix = "AgentModeChatSwitchActivationTests-"
+    private static let chatSwitchWorkspaceNamePrefix = "Agent Mode Chat Switch "
+    private static let chatSwitchFixtureDirectoryPrefix = "AgentModeChatSwitchActivationTests-"
+    private static let persistentReadWorkspaceName = "Persistent Agent Mode MCP Read"
+    private static let persistentReadFixtureDirectory = "PersistentAgentModeMCPReadFileConnectionTests"
 
     static func matches(
         isEphemeral: Bool,
         name: String,
         repoPaths: [String]
     ) -> Bool {
-        guard isEphemeral,
-              hasUppercaseHexSuffix(name, prefix: workspaceNamePrefix, count: 8)
-        else { return false }
-        return repoPaths.contains { path in
-            URL(fileURLWithPath: path).pathComponents.contains(where: isFixtureDirectoryComponent)
+        guard isEphemeral else { return false }
+
+        if hasUppercaseHexSuffix(name, prefix: chatSwitchWorkspaceNamePrefix, count: 8) {
+            return repoPaths.contains { path in
+                URL(fileURLWithPath: path).pathComponents.contains(where: isChatSwitchFixtureDirectoryComponent)
+            }
         }
+
+        guard name == persistentReadWorkspaceName else { return false }
+        return repoPaths.contains(where: containsPersistentReadFixtureIdentity)
     }
 
     private static func hasUppercaseHexSuffix(
@@ -34,11 +40,25 @@ enum WorkspaceLeakedTestFixtureIdentity {
         }
     }
 
-    private static func isFixtureDirectoryComponent(_ component: String) -> Bool {
-        guard component.hasPrefix(fixtureDirectoryPrefix) else { return false }
-        let suffix = String(component.dropFirst(fixtureDirectoryPrefix.count))
-        guard let uuid = UUID(uuidString: suffix) else { return false }
-        return uuid.uuidString == suffix
+    private static func isChatSwitchFixtureDirectoryComponent(_ component: String) -> Bool {
+        guard component.hasPrefix(chatSwitchFixtureDirectoryPrefix) else { return false }
+        let suffix = String(component.dropFirst(chatSwitchFixtureDirectoryPrefix.count))
+        return isCanonicalUppercaseUUID(suffix)
+    }
+
+    private static func containsPersistentReadFixtureIdentity(_ path: String) -> Bool {
+        let components = URL(fileURLWithPath: path).pathComponents
+        guard let directoryIndex = components.lastIndex(of: persistentReadFixtureDirectory) else {
+            return false
+        }
+        let uuidIndex = components.index(after: directoryIndex)
+        guard uuidIndex < components.endIndex else { return false }
+        return isCanonicalUppercaseUUID(components[uuidIndex])
+    }
+
+    private static func isCanonicalUppercaseUUID(_ value: String) -> Bool {
+        guard let uuid = UUID(uuidString: value) else { return false }
+        return uuid.uuidString == value
     }
 }
 

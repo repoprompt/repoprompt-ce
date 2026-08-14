@@ -165,16 +165,57 @@ import XCTest
             ))
         }
 
+        func testPersistentReadFixtureIdentityMatchesProductionShapeAndRejectsNearMatches() {
+            let fixtureUUID = UUID().uuidString
+            let validPath = "/private/var/folders/fixture/PersistentAgentModeMCPReadFileConnectionTests/\(fixtureUUID)"
+
+            XCTAssertTrue(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Persistent Agent Mode MCP Read",
+                repoPaths: [validPath]
+            ))
+
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: false,
+                name: "Persistent Agent Mode MCP Read",
+                repoPaths: [validPath]
+            ))
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Persistent Agent Mode MCP Read Extra",
+                repoPaths: [validPath]
+            ))
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Persistent Agent Mode MCP Read",
+                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID.lowercased())]
+            ))
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Persistent Agent Mode MCP Read",
+                repoPaths: [validPath.replacingOccurrences(
+                    of: "PersistentAgentModeMCPReadFileConnectionTests",
+                    with: "PersistentAgentModeMCPReadFileConnectionTests-Auxiliary"
+                )]
+            ))
+            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
+                isEphemeral: true,
+                name: "Persistent Agent Mode MCP Read",
+                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID + "-extra")]
+            ))
+        }
+
         func testRuntimeCatalogCleanupFindsLegacyInventoryOmissionsAndAppliesIdempotently() async throws {
             let normal = WorkspaceModel(name: "User Workspace", repoPaths: ["/Users/example/project"])
             let removableLeak = leakedFixtureWorkspace()
+            let persistentReadLeak = persistentReadFixtureWorkspace()
             let protectedLeak = leakedFixtureWorkspace()
             let unrelatedEphemeral = WorkspaceModel(
                 name: "Temporary User Session",
                 repoPaths: ["/tmp/user-session"],
                 ephemeralFlag: true
             )
-            let allWorkspaces = [normal, removableLeak, protectedLeak, unrelatedEphemeral]
+            let allWorkspaces = [normal, removableLeak, persistentReadLeak, protectedLeak, unrelatedEphemeral]
             for workspace in allWorkspaces {
                 try writeWorkspace(workspace)
             }
@@ -217,6 +258,7 @@ import XCTest
             let legacyInventory = await manager.loadWorkspaceSnapshotFromDisk()
             XCTAssertEqual(legacyInventory.map(\.id), [normal.id])
             XCTAssertFalse(manager.workspaces.contains { $0.id == removableLeak.id })
+            XCTAssertFalse(manager.workspaces.contains { $0.id == persistentReadLeak.id })
             XCTAssertTrue(manager.workspaces.contains { $0.id == normal.id })
 
             let oversized = await manager.deleteWorkspacesAsync(
@@ -237,7 +279,10 @@ import XCTest
 
             let protectedIDs: Set<UUID> = [normal.id, protectedLeak.id]
             let preview = await manager.previewLeakedTestWorkspaces(protectedWorkspaceIDs: protectedIDs)
-            XCTAssertEqual(Set(preview.records.map(\.id)), [removableLeak.id, protectedLeak.id])
+            XCTAssertEqual(
+                Set(preview.records.map(\.id)),
+                [removableLeak.id, persistentReadLeak.id, protectedLeak.id]
+            )
             XCTAssertTrue(preview.records.first(where: { $0.id == removableLeak.id })?.isDeletable == true)
             XCTAssertEqual(
                 preview.records.first(where: { $0.id == protectedLeak.id })?.deletionBlockReason,
@@ -246,17 +291,19 @@ import XCTest
             XCTAssertFalse(preview.records.contains { $0.id == unrelatedEphemeral.id })
 
             let firstApply = await manager.deleteWorkspacesAsync(
-                workspaceIDs: [removableLeak.id, protectedLeak.id],
-                leakedTestFixtureWorkspaceIDs: [removableLeak.id, protectedLeak.id]
+                workspaceIDs: [removableLeak.id, persistentReadLeak.id, protectedLeak.id],
+                leakedTestFixtureWorkspaceIDs: [removableLeak.id, persistentReadLeak.id, protectedLeak.id]
             )
-            XCTAssertEqual(firstApply.deletedWorkspaceIDs, [removableLeak.id])
+            XCTAssertEqual(Set(firstApply.deletedWorkspaceIDs), [removableLeak.id, persistentReadLeak.id])
             XCTAssertEqual(Set(firstApply.skippedReasonsByWorkspaceID.keys), [protectedLeak.id])
             XCTAssertTrue(firstApply.failedReasonsByWorkspaceID.isEmpty)
             XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFileURL(for: removableLeak).path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFileURL(for: persistentReadLeak).path))
 
             let authoritativeAfter = await runtime.workspaceStore.snapshot()
             let survivingIDs = Set(authoritativeAfter.workspaces.map(\.document.workspaceID))
             XCTAssertFalse(survivingIDs.contains(removableLeak.id))
+            XCTAssertFalse(survivingIDs.contains(persistentReadLeak.id))
             XCTAssertTrue(survivingIDs.isSuperset(of: [normal.id, protectedLeak.id, unrelatedEphemeral.id]))
 
             let repeatedApply = await manager.deleteWorkspacesAsync(
@@ -521,6 +568,20 @@ import XCTest
                     storageRoot
                         .appendingPathComponent("AgentModeChatSwitchActivationTests-\(UUID().uuidString)", isDirectory: true)
                         .appendingPathComponent("repo", isDirectory: true)
+                        .path
+                ],
+                ephemeralFlag: true
+            )
+        }
+
+        private func persistentReadFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
+            WorkspaceModel(
+                id: id,
+                name: "Persistent Agent Mode MCP Read",
+                repoPaths: [
+                    storageRoot
+                        .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests", isDirectory: true)
+                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
                         .path
                 ],
                 ephemeralFlag: true
