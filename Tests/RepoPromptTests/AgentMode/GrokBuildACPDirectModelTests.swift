@@ -129,6 +129,54 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertEqual(loadCalls.first?.params["sessionId"] as? String, "grok-direct-session")
     }
 
+    func testStderrNoiseIsFilteredThroughProviderOverride() async throws {
+        // Regression: `shouldEmitStderrLine` must be a protocol requirement so the
+        // controller's existential call dispatches to the Grok override. The fake server
+        // emits both suppressed noise and a regular stderr line.
+        let workspace = try makeTestDirectory(name: "GrokBuildStderrFilter")
+        let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
+        let recordURL = workspace.appendingPathComponent("requests.jsonl")
+        let provider = GrokDirectFakeACPProvider(
+            commandPath: scriptURL.path,
+            environment: [
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_SHAPE": "grok_direct",
+                "PATH": "/usr/bin:/bin"
+            ]
+        )
+        let request = ACPRunRequest(
+            agentKind: .grokBuild,
+            modelString: nil,
+            workspacePath: workspace.path,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let events = await controller.currentEventsStream()
+        var systemTexts: [String] = []
+        let collector = Task {
+            for await event in events {
+                if case let .stream(result) = event, result.type == "system", let text = result.text {
+                    systemTexts.append(text)
+                }
+            }
+        }
+        _ = try await controller.bootstrap()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await controller.shutdown()
+        _ = await collector.value
+
+        XCTAssertFalse(
+            systemTexts.contains { $0.contains("worker quit with fatal: Transport channel closed") },
+            "suppressed worker-transport noise must not surface: \(systemTexts)"
+        )
+        XCTAssertTrue(
+            systemTexts.contains { $0.contains("ordinary grok stderr line") },
+            "regular stderr lines must still surface: \(systemTexts)"
+        )
+    }
+
     // MARK: - Harness
 
     private struct Fixture {
@@ -262,6 +310,11 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                 }
             return {"sessionId": session_id}
 
+        sys.stderr.write("2026-08-14T00:00:00Z ERROR worker quit with fatal: Transport channel closed, when Auth(AuthorizationRequired)\n")
+        sys.stderr.flush()
+        sys.stderr.write("ordinary grok stderr line\n")
+        sys.stderr.flush()
+
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -374,6 +427,10 @@ private struct GrokDirectFakeACPProvider: ACPAgentProvider, ACPDirectSessionMode
 
     func normalizeSessionUpdate(_ payload: [String: Any], sessionID _: String) -> [NormalizedAgentRuntimeEvent] {
         GrokBuildACPEventNormalizer.normalize(payload)
+    }
+
+    func shouldEmitStderrLine(_ line: String) -> Bool {
+        directDelegate.shouldEmitStderrLine(line)
     }
 
     func normalizeError(_ error: Error) -> Error {

@@ -234,6 +234,11 @@ protocol ACPAgentProvider: Sendable {
     func preferredAuthMethodID(context: ACPAuthenticationContext) -> String?
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
     func normalizeError(_ error: Error) -> Error
+
+    /// Whether a provider's stderr line should be surfaced into the transcript as a system
+    /// event. Must be declared here (not only in the extension) so the controller's call
+    /// through the existential dispatches to provider overrides.
+    func shouldEmitStderrLine(_ line: String) -> Bool
 }
 
 extension ACPAgentProvider {
