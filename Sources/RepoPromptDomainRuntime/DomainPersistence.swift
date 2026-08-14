@@ -160,6 +160,7 @@ struct DomainPersistenceSavedCommit {
 struct DomainPersistenceDeleteCommit {
     let catalogRevision: UInt64
     let tombstone: DomainDeletionTombstone
+    let artifactCleanupWarnings: [String]
 }
 
 enum DomainPersistenceError: Error, Equatable {
@@ -910,8 +911,11 @@ package struct DomainPersistenceCoordinator {
             else { return nil }
             return tombstone
         }
+        // The catalog remains deletion authority. When both records exist, prefer the
+        // sidecar's operation outcome because cleanup status is recorded there after the
+        // authoritative catalog tombstone is committed.
         let deletionTombstones = Dictionary(
-            (sidecarTombstones + (catalog?.deletions ?? [])).map { ($0.workspaceID, $0) },
+            ((catalog?.deletions ?? []) + sidecarTombstones).map { ($0.workspaceID, $0) },
             uniquingKeysWith: { _, latest in latest }
         ).values.sorted { $0.workspaceID.uuidString < $1.workspaceID.uuidString }
         let deletedIDs = Set(deletionTombstones.map(\.workspaceID))
@@ -1604,41 +1608,122 @@ package struct DomainPersistenceCoordinator {
                 // Catalog deletion is the crash-safe authority point. The sidecar and artifact
                 // cleanup follow while both identity and workspace locks remain held.
                 try DomainPersistenceLock.atomicWrite(encoder.encode(next), to: catalogURL)
+                var artifactCleanupWarnings = [String]()
                 // The catalog embeds the full tombstone. Its sidecar is a recoverable
                 // convenience and cannot turn an already-authoritative delete into failure.
-                try? DomainPersistenceLock.atomicWrite(
-                    try encoder.encode(tombstone),
-                    to: deletionURL(document.workspaceID)
-                )
-                try? fileManager.removeItem(at: journalURL(document.workspaceID))
-                try? fileManager.removeItem(at: revisionURL(document.workspaceID))
-                try? fileManager.removeItem(at: document.fileURL)
-                finalizeDeletedWorkspaceArtifacts(document)
+                do {
+                    try DomainPersistenceLock.atomicWrite(
+                        encoder.encode(tombstone),
+                        to: deletionURL(document.workspaceID)
+                    )
+                } catch {
+                    artifactCleanupWarnings.append("deletion sidecar: \(error.localizedDescription)")
+                }
+                if let warning = removeDeletedArtifact(
+                    at: journalURL(document.workspaceID),
+                    label: "working journal"
+                ) {
+                    artifactCleanupWarnings.append(warning)
+                }
+                if let warning = removeDeletedArtifact(
+                    at: revisionURL(document.workspaceID),
+                    label: "revision sidecar"
+                ) {
+                    artifactCleanupWarnings.append(warning)
+                }
+                if let warning = removeDeletedArtifact(
+                    at: document.fileURL,
+                    label: "workspace document"
+                ) {
+                    artifactCleanupWarnings.append(warning)
+                }
+                artifactCleanupWarnings.append(contentsOf: finalizeDeletedWorkspaceArtifacts(document))
+
+                var recordedTombstone = tombstone
+                if !artifactCleanupWarnings.isEmpty {
+                    recordedTombstone = tombstoneRecordingCleanupWarnings(
+                        tombstone,
+                        warnings: artifactCleanupWarnings
+                    )
+                    do {
+                        try DomainPersistenceLock.atomicWrite(
+                            encoder.encode(recordedTombstone),
+                            to: deletionURL(document.workspaceID)
+                        )
+                    } catch {
+                        artifactCleanupWarnings.append("cleanup status sidecar: \(error.localizedDescription)")
+                        recordedTombstone = tombstoneRecordingCleanupWarnings(
+                            tombstone,
+                            warnings: artifactCleanupWarnings
+                        )
+                    }
+                }
                 return DomainPersistenceDeleteCommit(
                     catalogRevision: next.revision,
-                    tombstone: tombstone
+                    tombstone: recordedTombstone,
+                    artifactCleanupWarnings: artifactCleanupWarnings
                 )
             }
         }
     }
 
-    private func finalizeDeletedWorkspaceArtifacts(_ document: DomainWorkspaceDocument) {
+    private func tombstoneRecordingCleanupWarnings(
+        _ tombstone: DomainDeletionTombstone,
+        warnings: [String]
+    ) -> DomainDeletionTombstone {
+        let operation = tombstone.operation
+        let outcome = DomainCommandOutcome(
+            operationID: operation.operationID,
+            disposition: operation.disposition,
+            before: operation.before,
+            after: operation.after,
+            catalogRevision: operation.catalogRevision,
+            resultingDigest: operation.resultingDigest,
+            errorCode: operation.errorCode,
+            diagnostic: "artifact_cleanup_incomplete: \(warnings.joined(separator: "; "))"
+        )
+        return DomainDeletionTombstone(
+            workspaceID: tombstone.workspaceID,
+            fileURL: tombstone.fileURL,
+            operation: DomainRecordedOperation(
+                fingerprint: operation.fingerprint,
+                recordedAt: operation.recordedAt,
+                outcome: outcome
+            ),
+            deletedAt: tombstone.deletedAt
+        )
+    }
+
+    private func finalizeDeletedWorkspaceArtifacts(_ document: DomainWorkspaceDocument) -> [String] {
         let fileURL = document.fileURL.standardizedFileURL
-        guard fileURL.lastPathComponent == "workspace.json" else { return }
+        guard fileURL.lastPathComponent == "workspace.json" else { return [] }
         let workspaceDirectory = fileURL.deletingLastPathComponent()
         if document.metadata.customStoragePath != nil {
-            try? fileManager.removeItem(
-                at: workspaceDirectory.appendingPathComponent("_git_data", isDirectory: true)
-            )
-            return
+            return removeDeletedArtifact(
+                at: workspaceDirectory.appendingPathComponent("_git_data", isDirectory: true),
+                label: "workspace git-data directory"
+            ).map { [$0] } ?? []
         }
 
         let expectedParent = workspaceRoot.standardizedFileURL
         let identitySuffix = "-\(document.workspaceID.uuidString)"
         guard workspaceDirectory.deletingLastPathComponent().standardizedFileURL == expectedParent,
               workspaceDirectory.lastPathComponent.hasSuffix(identitySuffix)
-        else { return }
-        try? fileManager.removeItem(at: workspaceDirectory)
+        else { return [] }
+        return removeDeletedArtifact(
+            at: workspaceDirectory,
+            label: "workspace artifact directory"
+        ).map { [$0] } ?? []
+    }
+
+    private func removeDeletedArtifact(at url: URL, label: String) -> String? {
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        do {
+            try fileManager.removeItem(at: url)
+            return nil
+        } catch {
+            return "\(label): \(error.localizedDescription)"
+        }
     }
 
     private func externalDocumentBlocking(

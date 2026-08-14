@@ -430,6 +430,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var workspaceSaveCapturePublicationCountByWorkspaceIDForTesting: [UUID: Int] = [:]
         private var cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting: Set<UUID> = []
         private var savePathComposeTabReloadCountForTesting = 0
+        private var workspaceDeleteWillExecuteHandlerForTesting:
+            (@MainActor (UUID) async -> Void)?
+        private var workspaceActivationLeaseDidAcquireHandlerForTesting:
+            (@MainActor (UUID) async -> Void)?
     #endif
 
     @MainActor
@@ -913,6 +917,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     let workspaceSearchService: WorkspaceSearchService
     /// Non-nil only in production composition; nil is the isolated legacy test owner.
     private let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
+    let workspaceActivityCoordinator: WorkspaceActivityCoordinator
     private var agentSessionProjectionReconciler: ((
         _ projectedWorkspaces: [WorkspaceModel],
         _ currentWorkspaces: [WorkspaceModel]
@@ -1889,6 +1894,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         promptViewModel: PromptViewModel,
         workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
+        workspaceActivityCoordinator: WorkspaceActivityCoordinator? = nil,
         switchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         performInitialWorkspaceActivation: Bool = true
     ) {
@@ -1899,6 +1905,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.promptViewModel = promptViewModel
         self.workspaceSearchService = workspaceSearchService
         self.domainWorkspaceAuthorityClient = domainWorkspaceAuthorityClient
+        self.workspaceActivityCoordinator = workspaceActivityCoordinator
+            ?? WindowStatesManager.shared.workspaceActivityCoordinator
         self.switchTimingPolicy = switchTimingPolicy
         self.promptViewModel.attachWorkspaceManager(self)
         self.fileManager.setWorkspaceManager(self)
@@ -1996,10 +2004,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
-                    let loadResult = try Self.loadWorkspaceFromFileResult(
+                    guard let loadResult = try Self.loadPersistedWorkspaceFromFileResult(
                         at: wURL,
                         scheduleNormalizationWriteback: domainWorkspaceAuthorityClient == nil
-                    )
+                    ) else { continue }
                     let ws = loadResult.workspace
                     #if DEBUG
                         decodedWorkspaceCount += 1
@@ -2081,6 +2089,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        self.workspaceActivityCoordinator.register(ownerID: instanceID, workspaceManager: self)
+
         self.fileManager.onRequestRefresh = { [weak self] in
             Task {
                 guard let self, let activeWS = self.activeWorkspace else { return }
@@ -2119,6 +2129,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func prepareForWindowClose() {
+        workspaceActivityCoordinator.unregister(ownerID: instanceID)
         stopPollTimer()
         reloadWorkspacesTask?.cancel()
         reloadWorkspacesTask = nil
@@ -2288,7 +2299,12 @@ class WorkspaceManagerViewModel: ObservableObject {
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     do {
-                        try loadedMutable.append(Self.loadWorkspaceFromFile(at: wURL, scheduleNormalizationWriteback: true))
+                        if let workspace = try Self.loadPersistedWorkspaceFromFile(
+                            at: wURL,
+                            scheduleNormalizationWriteback: true
+                        ) {
+                            loadedMutable.append(workspace)
+                        }
                     } catch {
                         print("Error loading workspace from new scheme: \(error)")
                     }
@@ -2384,9 +2400,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
                     do {
-                        let ws = try Self.loadWorkspaceFromFile(at: wURL, scheduleNormalizationWriteback: false)
-                        print("[WorkspaceSnapshot] Loaded \(ws.name): \(ws.repoPaths.count) repoPaths")
-                        loaded.append(ws)
+                        if let ws = try Self.loadPersistedWorkspaceFromFile(
+                            at: wURL,
+                            scheduleNormalizationWriteback: false
+                        ) {
+                            print("[WorkspaceSnapshot] Loaded \(ws.name): \(ws.repoPaths.count) repoPaths")
+                            loaded.append(ws)
+                        }
                     } catch {
                         print("[WorkspaceSnapshot] Failed to load from \(wURL.path): \(error)")
                     }
@@ -2431,8 +2451,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
 
                 do {
-                    let ws = try Self.loadWorkspaceFromFile(at: wURL, scheduleNormalizationWriteback: false)
-                    updatesMutable.append((entry.id, ws.presets, ws.activePresetID))
+                    if let ws = try Self.loadPersistedWorkspaceFromFile(
+                        at: wURL,
+                        scheduleNormalizationWriteback: false
+                    ) {
+                        updatesMutable.append((entry.id, ws.presets, ws.activePresetID))
+                    }
                 } catch {
                     print("Error reloading presets for workspace \(entry.name): \(error)")
                 }
@@ -2967,6 +2991,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                 .blocked("Cannot switch workspaces while refresh is in progress.")
             )
         }
+        guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: newWorkspace.id) else {
+            return userVisibleWorkspaceSwitchResult(
+                .blocked("Workspace \"\(newWorkspace.name)\" is being deleted and cannot be activated.")
+            )
+        }
+        defer { workspaceActivityCoordinator.endActivation(activationLease) }
+        #if DEBUG
+            await workspaceActivationLeaseDidAcquireHandlerForTesting?(newWorkspace.id)
+        #endif
         guard let operationID = beginWorkspaceSwitchOperation(to: newWorkspace, reason: reason) else {
             let result = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace)
                 ?? .blocked("Workspace switch already in progress.")
@@ -3143,6 +3176,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceSwitchPhaseDidChangeHandlerForTesting = handler
         }
 
+        func setWorkspaceDeleteWillExecuteHandlerForTesting(
+            _ handler: (@MainActor (UUID) async -> Void)?
+        ) {
+            workspaceDeleteWillExecuteHandlerForTesting = handler
+        }
+
+        func setWorkspaceActivationLeaseDidAcquireHandlerForTesting(
+            _ handler: (@MainActor (UUID) async -> Void)?
+        ) {
+            workspaceActivationLeaseDidAcquireHandlerForTesting = handler
+        }
+
         func setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(
             _ handler: (@MainActor () async -> Void)?
         ) {
@@ -3296,6 +3341,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         if isRefreshing {
             return .blocked("Cannot reload the active workspace while refresh is in progress.")
         }
+        guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: workspace.id) else {
+            return .blocked("Workspace \"\(workspace.name)\" is being deleted and cannot be reloaded.")
+        }
+        defer { workspaceActivityCoordinator.endActivation(activationLease) }
+        #if DEBUG
+            await workspaceActivationLeaseDidAcquireHandlerForTesting?(workspace.id)
+        #endif
         guard let operationID = beginWorkspaceSwitchOperation(to: workspace, reason: reason) else {
             return concurrentWorkspaceSwitchResult(requestedWorkspace: workspace)
                 ?? .blocked("Workspace reload already in progress.")
@@ -3323,6 +3375,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         if isRefreshing {
             return .blocked("Cannot switch workspaces while refresh is in progress.")
         }
+        guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: newWorkspace.id) else {
+            return .blocked("Workspace \"\(newWorkspace.name)\" is being deleted and cannot be activated.")
+        }
+        defer { workspaceActivityCoordinator.endActivation(activationLease) }
+        #if DEBUG
+            await workspaceActivationLeaseDidAcquireHandlerForTesting?(newWorkspace.id)
+        #endif
         guard let operationID = beginWorkspaceSwitchOperation(to: newWorkspace, reason: reason) else {
             return concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace)
                 ?? .blocked("Workspace switch already in progress.")
@@ -4098,7 +4157,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Coalesces high-frequency UI captures before issuing one durable working-state command.
     private func publishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) {
-        guard let domainWorkspaceAuthorityClient else { return }
+        guard !workspace.isEphemeral, let domainWorkspaceAuthorityClient else { return }
         let workspaceID = workspace.id
         let generation = domainWorkingCommitGeneration[workspaceID, default: 0] &+ 1
         domainWorkingCommitGeneration[workspaceID] = generation
@@ -4115,7 +4174,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             do {
                 try await Task.sleep(for: .milliseconds(200))
                 guard let self,
-                      domainWorkingCommitGeneration[workspaceID] == generation
+                      domainWorkingCommitGeneration[workspaceID] == generation,
+                      self.workspace(withID: workspaceID)?.isEphemeral == false
                 else { return }
                 let outcome = try await domainWorkspaceAuthorityClient.replaceWorking(
                     workspace,
@@ -4390,6 +4450,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     ) {
         guard publicationSequence >= lastDomainProjectionSequence else { return }
         lastDomainProjectionSequence = publicationSequence
+        let persistedProjection = projectedWorkspaces.filter { !$0.isEphemeral }
+        let persistedWorkspaceIDs = Set(persistedProjection.map(\.id))
+        let localProjection = Self.preservingLocalEphemeralWorkspaces(
+            in: persistedProjection,
+            currentWorkspaces: workspaces
+        )
         if domainWorkspaceAuthorityClient != nil {
             // A projected canonical transition (external reload, cross-window commit, deletion)
             // can replace workspace content without touching this manager's dirty-tracking
@@ -4397,12 +4463,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             // re-validated against the projected digests.
             invalidateConfirmedDomainReadRegistrations(
                 previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
-                projectedDigestsByWorkspaceID: digestsByWorkspaceID
+                projectedDigestsByWorkspaceID: digestsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
             )
-            domainWorkspaceFileURLsByID = fileURLsByWorkspaceID
-            domainWorkspaceRevisionsByID = revisionsByWorkspaceID
-            domainWorkspaceDigestsByID = digestsByWorkspaceID
-            domainWorkspaceHealthByID = healthByWorkspaceID
+            domainWorkspaceFileURLsByID = fileURLsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
+            domainWorkspaceRevisionsByID = revisionsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
+            domainWorkspaceDigestsByID = digestsByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
+            domainWorkspaceHealthByID = healthByWorkspaceID.filter { persistedWorkspaceIDs.contains($0.key) }
             domainWorkspaceCatalogRevision = catalogRevision
         } else {
             let trackedWorkspaceIDs = Set(confirmedDomainReadRegistrationsByWorkspaceID.keys)
@@ -4412,18 +4478,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
         let lifecycleProjection = agentSessionProjectionReconciler?(
-            projectedWorkspaces,
+            localProjection,
             workspaces
         )
-        let reconciledWorkspaces = lifecycleProjection?.workspaces ?? projectedWorkspaces
+        let reconciledWorkspaces = lifecycleProjection?.workspaces ?? localProjection
         workspaces = reconciledWorkspaces
         recordRepoPathBaselines(for: reconciledWorkspaces)
         if let preferredActiveWorkspaceID,
            reconciledWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
         {
-            activeWorkspaceID = preferredActiveWorkspaceID
+            adoptProjectedActiveWorkspaceID(preferredActiveWorkspaceID)
         } else if !reconciledWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
-            activeWorkspaceID = reconciledWorkspaces.first?.id
+            adoptProjectedActiveWorkspaceID(reconciledWorkspaces.first?.id)
         }
         if let protectedWorkspaceIDs = lifecycleProjection?.protectedWorkspaceIDs {
             for workspaceID in protectedWorkspaceIDs {
@@ -4434,6 +4500,41 @@ class WorkspaceManagerViewModel: ObservableObject {
             publishDomainAuthorityIssueIfChanged(nil)
         }
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
+    }
+
+    /// Canonical projections intentionally exclude ephemeral records. Preserve locally owned
+    /// ephemeral session state while replacing durable workspaces from authority or disk.
+    private static func preservingLocalEphemeralWorkspaces(
+        in projectedWorkspaces: [WorkspaceModel],
+        currentWorkspaces: [WorkspaceModel]
+    ) -> [WorkspaceModel] {
+        let localEphemeralWorkspaces = currentWorkspaces.filter(\.isEphemeral)
+        let localEphemeralByID = Dictionary(
+            localEphemeralWorkspaces.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let projectedWorkspaceIDs = Set(projectedWorkspaces.map(\.id))
+        var localProjection = projectedWorkspaces.map { projected in
+            localEphemeralByID[projected.id] ?? projected
+        }
+        localProjection.append(contentsOf: localEphemeralWorkspaces.filter {
+            !projectedWorkspaceIDs.contains($0.id)
+        })
+        return localProjection
+    }
+
+    private func adoptProjectedActiveWorkspaceID(_ workspaceID: UUID?) {
+        guard workspaceID != activeWorkspaceID else { return }
+        guard let workspaceID else {
+            activeWorkspaceID = nil
+            return
+        }
+        guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: workspaceID) else {
+            activeWorkspaceID = nil
+            return
+        }
+        defer { workspaceActivityCoordinator.endActivation(activationLease) }
+        activeWorkspaceID = workspaceID
     }
 
     func applyDomainAuthorityMetadataProjection(
@@ -5719,10 +5820,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .pollAndSaveStateAsync
     ) async -> WorkspacePersistenceOutcome {
         guard let wsID = requestedWorkspaceID ?? activeWorkspace?.id,
-              workspace(withID: wsID) != nil
+              let currentWorkspace = workspace(withID: wsID)
         else {
             return .rejected(reason: "active_workspace_unavailable")
         }
+        guard !currentWorkspace.isEphemeral else { return .notRequired(workspaceID: wsID) }
         let cur = stateVersionByWorkspaceID[wsID, default: 0]
         let last = lastSavedVersionByWorkspaceID[wsID, default: -1]
 
@@ -6337,11 +6439,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let diskSnapshot = await loadWorkspaceSnapshotFromDisk()
         if !diskSnapshot.isEmpty {
+            let localProjection = Self.preservingLocalEphemeralWorkspaces(
+                in: diskSnapshot,
+                currentWorkspaces: workspaces
+            )
             let lifecycleProjection = agentSessionProjectionReconciler?(
-                diskSnapshot,
+                localProjection,
                 workspaces
             )
-            workspaces = lifecycleProjection?.workspaces ?? diskSnapshot
+            workspaces = lifecycleProjection?.workspaces ?? localProjection
         }
 
         let activeWorkspaceIDs = Set(windowStates.allWindows.compactMap { $0.workspaceManager.activeWorkspace?.id })
@@ -6774,6 +6880,150 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - CRUD
 
+    func previewLeakedTestWorkspaces(
+        protectedWorkspaceIDs: Set<UUID>
+    ) async -> WorkspaceLeakCleanupPreview {
+        guard let domainWorkspaceAuthorityClient else { return .empty }
+        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+        let records = snapshot.workspaces.compactMap { authoritative -> WorkspaceLeakCleanupRecord? in
+            let metadata = authoritative.document.metadata
+            guard Self.isLeakedTestFixture(metadata) else { return nil }
+            guard let workspace = try? Self.decodeDomainWorkspaceProjection(
+                documentBytes: authoritative.document.documentBytes,
+                fileURL: authoritative.document.fileURL
+            ) else { return nil }
+
+            let blockReason: String? = if metadata.isSystemWorkspace {
+                "System workspaces cannot be deleted."
+            } else if protectedWorkspaceIDs.contains(metadata.workspaceID) {
+                "Workspace is active in an open window."
+            } else if metadata.agentIdentityClaims.contains(where: \.requiresProtection) {
+                "Workspace contains an active or pinned agent session."
+            } else {
+                nil
+            }
+            return WorkspaceLeakCleanupRecord(
+                workspace: workspace,
+                fileURL: authoritative.document.fileURL,
+                evidence: [
+                    "ephemeralFlag=true",
+                    "name matches Agent Mode Chat Switch <8 uppercase hex>",
+                    "repo path contains AgentModeChatSwitchActivationTests-<UUID>"
+                ],
+                deletionBlockReason: blockReason
+            )
+        }.sorted {
+            if $0.workspace.name != $1.workspace.name {
+                return $0.workspace.name.localizedCaseInsensitiveCompare($1.workspace.name) == .orderedAscending
+            }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        return WorkspaceLeakCleanupPreview(catalogRevision: snapshot.catalogRevision, records: records)
+    }
+
+    func deleteWorkspacesAsync(
+        workspaceIDs: Set<UUID>,
+        leakedTestFixtureWorkspaceIDs: Set<UUID> = []
+    ) async -> WorkspaceBulkDeleteResult {
+        var result = WorkspaceBulkDeleteResult()
+        guard workspaceIDs.count <= WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
+            result.requestFailureReason = "Bulk deletion is limited to \(WorkspaceBulkDeletePolicy.maximumWorkspaceCount) workspaces per request; no records were changed."
+            return result
+        }
+        guard let domainWorkspaceAuthorityClient else {
+            result.requestFailureReason = "Authoritative workspace runtime is unavailable; no records were changed."
+            return result
+        }
+
+        let deletionClaim = workspaceActivityCoordinator.claimDeletion(workspaceIDs: workspaceIDs)
+        defer { workspaceActivityCoordinator.releaseDeletion(deletionClaim.lease) }
+        result.skippedReasonsByWorkspaceID = deletionClaim.blockedReasonsByWorkspaceID
+
+        var snapshot = await domainWorkspaceAuthorityClient.snapshot()
+        var snapshotsByID = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+            ($0.document.workspaceID, $0)
+        })
+        for workspaceID in deletionClaim.lease.workspaceIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let authoritative = snapshotsByID[workspaceID] else {
+                result.alreadyAbsentWorkspaceIDs.append(workspaceID)
+                continue
+            }
+            let metadata = authoritative.document.metadata
+            if leakedTestFixtureWorkspaceIDs.contains(workspaceID),
+               !Self.isLeakedTestFixture(metadata)
+            {
+                result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace no longer matches the reviewed test-fixture evidence."
+                continue
+            }
+            if metadata.isSystemWorkspace {
+                result.skippedReasonsByWorkspaceID[workspaceID] = "System workspaces cannot be deleted."
+                continue
+            }
+            if metadata.agentIdentityClaims.contains(where: \.requiresProtection) {
+                result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace contains an active or pinned agent session."
+                continue
+            }
+
+            #if DEBUG
+                await workspaceDeleteWillExecuteHandlerForTesting?(workspaceID)
+            #endif
+            let outcome = await domainWorkspaceAuthorityClient.delete(
+                workspaceID: workspaceID,
+                expectedCatalogRevision: snapshot.catalogRevision,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision
+            )
+            if Self.isSuccessfulDomainOutcome(outcome) {
+                result.deletedWorkspaceIDs.append(workspaceID)
+                if let warning = Self.artifactCleanupWarning(from: outcome) {
+                    result.artifactCleanupWarningsByWorkspaceID[workspaceID] = warning
+                }
+                snapshot = await domainWorkspaceAuthorityClient.snapshot()
+                snapshotsByID = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0)
+                })
+            } else if outcome.errorCode == .workspaceUnavailable {
+                result.alreadyAbsentWorkspaceIDs.append(workspaceID)
+                snapshot = await domainWorkspaceAuthorityClient.snapshot()
+                snapshotsByID = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0)
+                })
+            } else {
+                result.failedReasonsByWorkspaceID[workspaceID] = Self.deleteFailureReason(from: outcome)
+                snapshot = await domainWorkspaceAuthorityClient.snapshot()
+                snapshotsByID = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                    ($0.document.workspaceID, $0)
+                })
+            }
+        }
+        reloadWorkspacesFromDisk()
+        return result
+    }
+
+    private static func isLeakedTestFixture(_ metadata: DomainWorkspaceMetadata) -> Bool {
+        WorkspaceLeakedTestFixtureIdentity.matches(
+            isEphemeral: metadata.isEphemeral,
+            name: metadata.name,
+            repoPaths: metadata.repoPaths
+        )
+    }
+
+    private static func artifactCleanupWarning(from outcome: DomainCommandOutcome) -> String? {
+        let prefix = "artifact_cleanup_incomplete:"
+        guard let diagnostic = outcome.diagnostic,
+              diagnostic.hasPrefix(prefix)
+        else { return nil }
+        return String(diagnostic.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func deleteFailureReason(from outcome: DomainCommandOutcome) -> String {
+        if outcome.errorCode == .stateConflict {
+            return "Workspace changed after review, possibly due to window or agent activity. Review and retry."
+        }
+        return outcome.diagnostic
+            ?? outcome.errorCode?.rawValue
+            ?? "Workspace deletion failed."
+    }
+
     func deleteWorkspace(_ workspace: WorkspaceModel) {
         Task { @MainActor [weak self] in
             _ = await self?.deleteWorkspaceAsync(workspace)
@@ -6782,13 +7032,24 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @discardableResult
     func deleteWorkspaceAsync(_ workspace: WorkspaceModel) async -> Bool {
+        let deletionClaim = workspaceActivityCoordinator.claimDeletion(workspaceIDs: [workspace.id])
+        guard deletionClaim.lease.workspaceIDs.contains(workspace.id) else { return false }
+        defer { workspaceActivityCoordinator.releaseDeletion(deletionClaim.lease) }
+
         if let domainWorkspaceAuthorityClient {
+            let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+            guard let authoritative = snapshot.workspaces.first(where: {
+                $0.document.workspaceID == workspace.id
+            }) else { return false }
+            let metadata = authoritative.document.metadata
+            guard !metadata.isSystemWorkspace,
+                  !metadata.agentIdentityClaims.contains(where: \.requiresProtection)
+            else { return false }
+
             let outcome = await domainWorkspaceAuthorityClient.delete(
                 workspaceID: workspace.id,
-                expectedCatalogRevision: domainWorkspaceCatalogRevision,
-                expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
-                    workspace.id
-                ]?.workingRevision
+                expectedCatalogRevision: snapshot.catalogRevision,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision
             )
             applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
             guard Self.isSuccessfulDomainOutcome(outcome) else {
@@ -8307,13 +8568,16 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .saveWorkspaceAsync,
         remainingRetryCount: Int = 1
     ) async -> Int? {
-        guard !Task.isCancelled else { return nil }
-        if domainWorkspaceAuthorityClient != nil,
-           let currentIndex = workspaceIndex(for: workspaceID)
-        {
+        guard !Task.isCancelled,
+              let initialIndex = workspaceIndex(for: workspaceID)
+        else { return nil }
+        guard !workspaces[initialIndex].isEphemeral else {
+            return stateVersionByWorkspaceID[workspaceID, default: 0]
+        }
+        if domainWorkspaceAuthorityClient != nil {
             do {
                 let result = try await persistWorkspaceThroughDomainAuthority(
-                    workspaces[currentIndex],
+                    workspaces[initialIndex],
                     targetURL: fileURL,
                     preserveDiskRepoPathsIfUnchangedSinceBaseline: true,
                     source: source,
@@ -8337,7 +8601,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
         guard !Task.isCancelled,
-              let currentIndex = workspaceIndex(for: workspaceID)
+              let currentIndex = workspaceIndex(for: workspaceID),
+              !workspaces[currentIndex].isEphemeral
         else { return nil }
 
         let current = workspaces[currentIndex]
@@ -8399,7 +8664,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
             #endif
             guard !Task.isCancelled,
-                  let latestIndex = workspaceIndex(for: workspaceID)
+                  let latestIndex = workspaceIndex(for: workspaceID),
+                  !workspaces[latestIndex].isEphemeral
             else { return nil }
             let latestStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
             if latestStateVersion != capturedStateVersion {
@@ -8473,6 +8739,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource,
         remainingRetryCount: Int
     ) async throws -> DomainAuthoritySaveResult {
+        guard !workspace.isEphemeral else {
+            return DomainAuthoritySaveResult(
+                savedStateVersion: stateVersionByWorkspaceID[workspace.id, default: 0],
+                fileURL: targetURL
+            )
+        }
         guard let domainWorkspaceAuthorityClient else {
             throw NSError(
                 domain: "RepoPrompt.DomainWorkspaceAuthority",
@@ -8509,6 +8781,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }.value
         let workspaceToSave = mergeResult.workspace
+        guard self.workspace(withID: workspaceToSave.id)?.isEphemeral != true else {
+            return DomainAuthoritySaveResult(
+                savedStateVersion: capturedStateVersion,
+                fileURL: targetURL
+            )
+        }
 
         #if DEBUG
             await workspaceSavePreparationDidFinishHandlerForTesting?(
@@ -8607,6 +8885,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .directUnknown
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
+        guard !workspace.isEphemeral else { return targetURL }
         if domainWorkspaceAuthorityClient != nil {
             let result = try await persistWorkspaceThroughDomainAuthority(
                 workspace,
@@ -8671,6 +8950,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         metadata: WorkspaceSavePayloadMetadata? = nil
     ) async throws -> URL {
         let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
+        guard !workspace.isEphemeral else { return finalURL }
         guard domainWorkspaceAuthorityClient == nil else {
             WorkspaceSaveTracer.event(
                 "workspaceSave.direct.denied",
@@ -8698,6 +8978,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
+        let finalURL = workspaceFileURL(for: workspace)
+        guard !workspace.isEphemeral else { return finalURL }
         guard domainWorkspaceAuthorityClient == nil else {
             throw NSError(
                 domain: "RepoPrompt.DomainWorkspaceAuthority",
@@ -8707,8 +8989,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         // Encode JSON and prepare file path
         let encoded = try JSONEncoder().encode(workspace)
-        let folder = try ensureWorkspaceDirectoryExists(for: workspace)
-        let finalURL = folder.appendingPathComponent("workspace.json")
+        _ = try ensureWorkspaceDirectoryExists(for: workspace)
         let metadata = workspaceSaveMetadata(for: workspace, source: source)
 
         // Write synchronously for direct save paths.
@@ -8740,6 +9021,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let cachedResult = try WorkspaceFileDecodeCache.shared.loadWorkspace(at: fileURL)
         let normalizationSaveTask: Task<Void, Never>?
         if scheduleNormalizationWriteback,
+           !cachedResult.workspace.isEphemeral,
            cachedResult.normalizationRequiresSave,
            WorkspaceFileDecodeCache.shared.claimNormalizationSave(for: cachedResult.cacheKey)
         {
@@ -8779,6 +9061,27 @@ class WorkspaceManagerViewModel: ObservableObject {
             composeTabsNormalized: cachedResult.composeTabsNormalized,
             normalizationSaveTask: normalizationSaveTask
         )
+    }
+
+    nonisolated static func loadPersistedWorkspaceFromFileResult(
+        at fileURL: URL,
+        scheduleNormalizationWriteback: Bool
+    ) throws -> WorkspaceFileLoadResult? {
+        let result = try loadWorkspaceFromFileResult(
+            at: fileURL,
+            scheduleNormalizationWriteback: scheduleNormalizationWriteback
+        )
+        return result.workspace.isEphemeral ? nil : result
+    }
+
+    nonisolated static func loadPersistedWorkspaceFromFile(
+        at fileURL: URL,
+        scheduleNormalizationWriteback: Bool
+    ) throws -> WorkspaceModel? {
+        try loadPersistedWorkspaceFromFileResult(
+            at: fileURL,
+            scheduleNormalizationWriteback: scheduleNormalizationWriteback
+        )?.workspace
     }
 
     nonisolated static func loadWorkspaceFromFile(
@@ -9645,12 +9948,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Creates an ephemeral workspace (non-persisted)
     func createEphemeralWorkspace(name: String, repoPaths: [String]) -> WorkspaceModel {
-        var ws = createWorkspace(name: name, repoPaths: repoPaths)
-        if let idx = workspaces.firstIndex(where: { $0.id == ws.id }) {
-            workspaces[idx].isEphemeral = true
-            ws = workspaces[idx] // re-fetch the mutated copy
-        }
-        return ws
+        createWorkspace(name: name, repoPaths: repoPaths, ephemeral: true)
     }
 
     @MainActor
