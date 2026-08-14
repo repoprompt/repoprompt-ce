@@ -102,7 +102,52 @@ import XCTest
             XCTAssertFalse(FileManager.default.fileExists(atPath: alternateRoot.path))
         }
 
-        func testBulkDeleteRemovesLocalEphemeralWorkspaceMissingFromRuntimeCatalog() async throws {
+        func testAutosaveBecomingEphemeralMidSaveReturnsNotRequiredWithoutAuthorityIssue() async throws {
+            let workspace = WorkspaceModel(
+                name: "Becomes Temporary During Save",
+                repoPaths: ["/tmp/becomes-temporary"]
+            )
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "mid-save-ephemeral-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -774,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -774
+                )
+            )
+            await manager.awaitInitialized()
+            let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(switchResult.didSwitch)
+            manager.markWorkspaceDirty()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, _ in
+                await MainActor.run {
+                    manager.setWorkspaceEphemeral(workspaceID, true)
+                }
+            }
+
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspace.id)
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+
+            XCTAssertEqual(outcome, .notRequired(workspaceID: workspace.id))
+            XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
+            XCTAssertTrue(manager.workspace(withID: workspace.id)?.isEphemeral == true)
+        }
+
+        func testBulkAndSingleDeleteRemoveLocalEphemeralWorkspacesMissingFromRuntimeCatalog() async throws {
             let runtime = MCPDomainRuntime(configuration: .init(
                 mode: .app,
                 profileIdentifier: "local-ephemeral-bulk-delete-\(UUID().uuidString)",
@@ -123,26 +168,50 @@ import XCTest
                 )
             )
             await manager.awaitInitialized()
-            let workspace = manager.createEphemeralWorkspace(
-                name: "Local Temporary Workspace",
+            let bulkWorkspace = manager.createEphemeralWorkspace(
+                name: "Bulk Temporary Workspace",
                 repoPaths: []
             )
+            let singleWorkspace = manager.createEphemeralWorkspace(
+                name: "Single Temporary Workspace",
+                repoPaths: []
+            )
+
+            func materializeLocalArtifacts(for workspace: WorkspaceModel) throws -> URL {
+                let directory = manager.workspaceFileURL(for: workspace).deletingLastPathComponent()
+                let gitData = directory.appendingPathComponent("_git_data", isDirectory: true)
+                try FileManager.default.createDirectory(at: gitData, withIntermediateDirectories: true)
+                try Data("artifact".utf8).write(to: gitData.appendingPathComponent("marker"))
+                return directory
+            }
+
+            let bulkDirectory = try materializeLocalArtifacts(for: bulkWorkspace)
+            let singleDirectory = try materializeLocalArtifacts(for: singleWorkspace)
             let before = await runtime.workspaceStore.snapshot()
             XCTAssertFalse(before.workspaces.contains {
-                $0.document.workspaceID == workspace.id
+                $0.document.workspaceID == bulkWorkspace.id
+                    || $0.document.workspaceID == singleWorkspace.id
             })
-            XCTAssertNotNil(manager.workspace(withID: workspace.id))
 
-            let result = await manager.deleteWorkspacesAsync(workspaceIDs: [workspace.id])
+            let result = await manager.deleteWorkspacesAsync(workspaceIDs: [bulkWorkspace.id])
 
-            XCTAssertEqual(result.deletedWorkspaceIDs, [workspace.id])
+            XCTAssertEqual(result.deletedWorkspaceIDs, [bulkWorkspace.id])
             XCTAssertTrue(result.alreadyAbsentWorkspaceIDs.isEmpty)
             XCTAssertTrue(result.skippedReasonsByWorkspaceID.isEmpty)
             XCTAssertTrue(result.failedReasonsByWorkspaceID.isEmpty)
-            XCTAssertNil(manager.workspace(withID: workspace.id))
+            XCTAssertNil(manager.workspace(withID: bulkWorkspace.id))
+            XCTAssertNotNil(manager.workspace(withID: singleWorkspace.id))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: bulkDirectory.path))
+
+            let singleDeleted = await manager.deleteWorkspaceAsync(singleWorkspace)
+            XCTAssertTrue(singleDeleted)
+            XCTAssertNil(manager.workspace(withID: singleWorkspace.id))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: singleDirectory.path))
+
             let after = await runtime.workspaceStore.snapshot()
             XCTAssertFalse(after.workspaces.contains {
-                $0.document.workspaceID == workspace.id
+                $0.document.workspaceID == bulkWorkspace.id
+                    || $0.document.workspaceID == singleWorkspace.id
             })
         }
 

@@ -5875,6 +5875,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             fileURL: fileURL,
             source: source
         ) else {
+            if workspace(withID: wsID)?.isEphemeral == true {
+                return .notRequired(workspaceID: wsID)
+            }
             let issueCategory = if domainWorkspaceAuthorityIssue?.message
                 .localizedCaseInsensitiveContains("workspace_not_writable") == true
             {
@@ -6959,16 +6962,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                     result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace no longer matches the reviewed test-fixture evidence."
                     continue
                 }
-                if localWorkspace.isSystemWorkspace {
-                    result.skippedReasonsByWorkspaceID[workspaceID] = "System workspaces cannot be deleted."
+                if let blockReason = Self.localEphemeralDeletionBlockReason(localWorkspace) {
+                    result.skippedReasonsByWorkspaceID[workspaceID] = blockReason
                     continue
                 }
-                let protectedTabs = localWorkspace.composeTabs + localWorkspace.stashedTabs.map(\.tab)
-                if protectedTabs.contains(where: { $0.activeAgentSessionID != nil || $0.isPinned }) {
-                    result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace contains an active or pinned agent session."
-                    continue
-                }
-                await finalizeWorkspaceDeletion(localWorkspace, saveLegacyIndex: false)
+                await finalizeWorkspaceDeletion(
+                    localWorkspace,
+                    saveLegacyIndex: false,
+                    cleanupLocalArtifacts: true
+                )
                 result.deletedWorkspaceIDs.append(workspaceID)
                 continue
             }
@@ -7045,6 +7047,20 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
+    private static func localEphemeralDeletionBlockReason(
+        _ workspace: WorkspaceModel
+    ) -> String? {
+        guard workspace.isEphemeral else { return "Workspace is not a local temporary workspace." }
+        if workspace.isSystemWorkspace {
+            return "System workspaces cannot be deleted."
+        }
+        let protectedTabs = workspace.composeTabs + workspace.stashedTabs.map(\.tab)
+        if protectedTabs.contains(where: { $0.activeAgentSessionID != nil || $0.isPinned }) {
+            return "Workspace contains an active or pinned agent session."
+        }
+        return nil
+    }
+
     private static func artifactCleanupWarning(from outcome: DomainCommandOutcome) -> String? {
         let prefix = "artifact_cleanup_incomplete:"
         guard let diagnostic = outcome.diagnostic,
@@ -7078,7 +7094,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             let snapshot = await domainWorkspaceAuthorityClient.snapshot()
             guard let authoritative = snapshot.workspaces.first(where: {
                 $0.document.workspaceID == workspace.id
-            }) else { return false }
+            }) else {
+                guard Self.localEphemeralDeletionBlockReason(workspace) == nil else {
+                    return false
+                }
+                await finalizeWorkspaceDeletion(
+                    workspace,
+                    saveLegacyIndex: false,
+                    cleanupLocalArtifacts: true
+                )
+                return true
+            }
             let metadata = authoritative.document.metadata
             guard !metadata.isSystemWorkspace,
                   !metadata.agentIdentityClaims.contains(where: \.requiresProtection)
@@ -7103,7 +7129,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private func finalizeWorkspaceDeletion(
         _ workspace: WorkspaceModel,
-        saveLegacyIndex: Bool
+        saveLegacyIndex: Bool,
+        cleanupLocalArtifacts: Bool = false
     ) async {
         workspaces.removeAll { $0.id == workspace.id }
         invalidateDomainReadRegistration(for: workspace.id)
@@ -7115,7 +7142,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
-        if saveLegacyIndex {
+        if saveLegacyIndex || cleanupLocalArtifacts {
             let workspaceDir = workspaceDirectory(for: workspace)
             await Task.detached(priority: .utility) {
                 await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDir)
@@ -7125,6 +7152,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     try? FileManager.default.removeItem(at: workspaceDir)
                 }
             }.value
+        }
+        if saveLegacyIndex {
             await rebuildAndSaveIndexAsync()
             await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
         }
@@ -8625,6 +8654,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return result.savedStateVersion
             } catch is CancellationError {
                 return nil
+            } catch WorkspaceDirectWriteError.ephemeralWorkspace {
+                return nil
             } catch let error as DomainWorkspaceAuthorityOperationError {
                 reportDomainAuthorityIssue(error.outcome, operation: "save_workspace")
                 return nil
@@ -8829,6 +8860,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         #endif
         try Task.checkCancellation()
+        guard self.workspace(withID: workspace.id)?.isEphemeral != true else {
+            throw WorkspaceDirectWriteError.ephemeralWorkspace
+        }
         let latestStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         if latestStateVersion != capturedStateVersion,
            let index = workspaceIndex(for: workspace.id)

@@ -475,7 +475,7 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
-            if prior.disposition == .applied,
+            if (prior.disposition == .applied || prior.disposition == .unchanged),
                case let .createWorkspace(document) = envelope.command
             {
                 do {
@@ -507,7 +507,7 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
-            if prior.disposition == .applied,
+            if (prior.disposition == .applied || prior.disposition == .unchanged),
                case let .createWorkspace(document) = envelope.command
             {
                 do {
