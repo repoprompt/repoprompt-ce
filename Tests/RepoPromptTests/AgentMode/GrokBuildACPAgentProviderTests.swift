@@ -263,3 +263,18 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         XCTAssertEqual(request.params["modelId"] as? String, "grok-4.5")
     }
 }
+
+extension GrokBuildACPAgentProviderTests {
+    /// The interactive factory must not OR the global Full Access preference into the
+    /// launch config: the per-run permission binding (which honors .mcpSafeDefaults and
+    /// custom profiles) is authoritative. Regression coverage for the Safe Managed bypass.
+    func testInteractiveFactoryLeavesAlwaysApproveToRunRequest() async throws {
+        let provider = try await ACPAgentProviderFactory.makeProvider(
+            for: .grokBuild,
+            modelString: nil,
+            grokAPIKeyProvider: { nil }
+        )
+        let grokProvider = try XCTUnwrap(provider as? GrokBuildACPAgentProvider)
+        XCTAssertFalse(grokProvider.test_config.alwaysApproveTools)
+    }
+}

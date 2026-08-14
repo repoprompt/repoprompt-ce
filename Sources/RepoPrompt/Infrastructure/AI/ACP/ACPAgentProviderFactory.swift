@@ -38,7 +38,11 @@ enum ACPAgentProviderFactory {
                 config: GrokBuildAgentConfig(
                     enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
                     modelString: modelString,
-                    alwaysApproveTools: GrokBuildAgentToolPreferences.permissionLevel() == .fullAccess,
+                    // The per-run permission binding is authoritative for interactive runs:
+                    // `ACPRunRequest.autoApproveAllToolPermissions` already reflects the
+                    // effective profile (including .mcpSafeDefaults overrides), so this
+                    // config must not OR the global preference back in.
+                    alwaysApproveTools: false,
                     apiKey: grokAPIKeyProvider()
                 )
             )
