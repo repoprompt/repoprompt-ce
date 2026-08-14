@@ -3132,13 +3132,22 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     ) async -> Bool {
         guard record.installCommittedTabSnapshot(snapshot) else {
             #if DEBUG
+                let recordWorkspaceName = workspaceManager?.workspaces.first(where: {
+                    $0.composeTabs.contains(where: { $0.id == record.tabID })
+                })?.name ?? "unknown"
+                let snapshotWorkspaceName = workspaceManager?.workspaces.first(where: {
+                    $0.composeTabs.contains(where: { $0.id == snapshot.identity.tabID })
+                })?.name ?? "unknown"
                 await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                     runID: record.runID,
                     event: "context_builder.commit_retain_rejected",
                     fields: [
                         "snapshot_nested_run_id": snapshot.nestedRunID.uuidString,
                         "snapshot_identity_tab_id": snapshot.identity.tabID.uuidString,
+                        "snapshot_identity_workspace_id": snapshot.identity.workspaceID.uuidString,
+                        "snapshot_workspace_name": snapshotWorkspaceName,
                         "record_tab_id": record.tabID.uuidString,
+                        "record_workspace_name": recordWorkspaceName,
                         "already_installed": String(record.committedTabSnapshot != nil)
                     ]
                 )

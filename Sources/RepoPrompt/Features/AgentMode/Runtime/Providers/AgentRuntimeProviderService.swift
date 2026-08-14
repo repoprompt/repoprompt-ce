@@ -50,8 +50,11 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
     /// Grok Build presents `grok-shell-<injected server name>` (e.g. `grok-shell-RepoPromptCE`)
-    /// to MCP servers; the canonical `grok-shell` family in `MCPClientIdentity` owns matching.
-    static let grokBuildMCPClientID = "grok-shell"
+    /// to MCP servers. The hint must equal that exact registered name: the pending run-scoped
+    /// tab-context store keys are raw client names (no family canonicalization), so a
+    /// family-only hint would never bind the run's frozen tab context. The canonical
+    /// `grok-shell` family in `MCPClientIdentity` still covers family-level matching.
+    static let grokBuildMCPClientID = "grok-shell-\(RepoPromptMCPServerConfiguration.defaultServerName)"
 
     var commandName: String {
         switch self {
