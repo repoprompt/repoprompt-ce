@@ -132,25 +132,40 @@ class PromptStorage {
         completion: ((Result<Void, Error>) -> Void)? = nil
     ) {
         Self.queue.async {
-            do {
-                let data = try JSONEncoder().encode(prompts)
-                // Use .atomicWrite so it writes to a temp file, then renames it on success
-                try data.write(to: self.fileURL, options: .atomicWrite)
-
-                // If we got here, the write succeeded.
-                // Jump back to the main thread (or stay on the same queue) to call completion:
-                DispatchQueue.main.async {
-                    completion?(.success(()))
-                }
-            } catch {
+            let result = Result { try self.writePrompts(prompts) }
+            if case let .failure(error) = result {
                 print("Failed to write prompts: \(error)")
-
-                // If there's an error, pass it back via completion as well
-                DispatchQueue.main.async {
-                    completion?(.failure(error))
-                }
+            }
+            DispatchQueue.main.async {
+                completion?(result)
             }
         }
+    }
+
+    func mutatePrompts<Value>(
+        _ mutation: (inout [StoredPromptRecord]) -> (value: Value, shouldSave: Bool)
+    ) -> Result<(value: Value, prompts: [StoredPromptRecord]), Error> {
+        Self.queue.sync {
+            Result {
+                var prompts = try readPrompts()
+                let result = mutation(&prompts)
+                if result.shouldSave {
+                    try writePrompts(prompts)
+                }
+                return (result.value, prompts)
+            }
+        }
+    }
+
+    private func readPrompts() throws -> [StoredPromptRecord] {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        let data = try Data(contentsOf: fileURL)
+        return try JSONDecoder().decode([StoredPromptRecord].self, from: data)
+    }
+
+    private func writePrompts(_ prompts: [StoredPromptRecord]) throws {
+        let data = try JSONEncoder().encode(prompts)
+        try data.write(to: fileURL, options: .atomicWrite)
     }
 }
 

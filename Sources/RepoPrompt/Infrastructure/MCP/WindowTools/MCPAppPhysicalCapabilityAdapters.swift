@@ -284,7 +284,12 @@ enum MCPAppPhysicalCapabilityAdapters {
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope, _ maximumSeedCount: Int) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
-    typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> MCPAppFileReadResult
+    typealias ReadFile = @MainActor @Sendable (
+        _ input: WorkspaceExactFileInput,
+        _ startLine1Based: Int?,
+        _ lineCount: Int?,
+        _ lookupContext: WorkspaceLookupContext
+    ) async throws -> MCPAppFileReadResult
     typealias ReadSelectedAuthorizedGitArtifact = @MainActor @Sendable (
         _ requestedPath: String,
         _ translatedLookupPath: String,

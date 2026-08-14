@@ -6,7 +6,7 @@ import XCTest
 
 @MainActor
 final class InteractiveLifecycleExecutionContractTests: XCTestCase {
-    func testAskUserPreservesWorkspaceDefaultAndLongerCallerTimeout() throws {
+    func testAskUserPreservesResolvedDefaultAndLongerCallerTimeout() throws {
         XCTAssertEqual(
             try MCPAskUserToolProvider.resolvedInteractionTimeoutSeconds(
                 nil,

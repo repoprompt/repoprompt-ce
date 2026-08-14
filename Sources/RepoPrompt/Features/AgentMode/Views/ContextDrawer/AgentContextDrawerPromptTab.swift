@@ -8,11 +8,15 @@ struct AgentContextDrawerPromptTab: View {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @State private var copyStatus: CopyStatus = .idle
+    @State private var fullContextCopyGeneration: UInt = 0
+    @State private var showCopyError = false
     @State private var showCopyPresetPopover = false
     @State private var showFileTreePopover = false
     @State private var showCodeMapPopover = false
     @State private var showGitPopover = false
     @State private var showPromptsPopover = false
+    @State private var storedPromptEditorMode: AgentContextStoredPromptEditorMode?
+    @State private var storedPromptActionMessage: String?
 
     private enum CopyStatus: Equatable {
         case idle
@@ -34,6 +38,7 @@ struct AgentContextDrawerPromptTab: View {
         let isManualPreset: Bool
         let selectedPromptIDs: Set<UUID>
         let selectedPrompts: [PromptViewModel.StoredPrompt]
+        let promptRows: [AgentContextStoredPromptRowPresentation]
 
         var selectedPresetID: UUID {
             selectedOption.id
@@ -95,7 +100,33 @@ struct AgentContextDrawerPromptTab: View {
             guard !isSwitchBlankingSelectedFiles else { return }
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
             copyStatus = .idle
+            storedPromptActionMessage = nil
             refreshIfNeeded()
+        }
+        .sheet(item: $storedPromptEditorMode) { mode in
+            AgentContextStoredPromptEditorSheet(
+                mode: mode,
+                onCreate: { title, content in
+                    let result = promptManager.addStoredPrompt(title: title, content: content)
+                    if case let .created(prompt) = result {
+                        promptManager.selectNewPrompt(prompt)
+                        copyStatus = .idle
+                        storedPromptActionMessage = nil
+                    }
+                    return result
+                },
+                onSave: { target, title, content in
+                    let result = promptManager.updateStoredPrompt(
+                        matching: target,
+                        title: title,
+                        content: content
+                    )
+                    if result == .updated {
+                        copyStatus = .idle
+                    }
+                    return result
+                }
+            )
         }
     }
 
@@ -139,6 +170,20 @@ struct AgentContextDrawerPromptTab: View {
             Set(resolvedConfig.storedPromptIds ?? currentPreset.storedPromptIds ?? [])
         }
         let selectedPrompts = promptManager.storedPrompts.filter { selectedPromptIDs.contains($0.id) }
+        let builtInPromptIDs = Set(promptManager.builtInStoredPrompts.map(\.id))
+        let promptRows = if isManualPreset {
+            promptManager.storedPrompts.map { prompt in
+                let isSelected = selectedPromptIDs.contains(prompt.id)
+                let access: AgentContextStoredPromptRowPresentation.Access = builtInPromptIDs.contains(prompt.id)
+                    ? .manualBuiltIn(isSelected: isSelected)
+                    : .manualCustom(isSelected: isSelected)
+                return AgentContextStoredPromptRowPresentation(prompt: prompt, access: access)
+            }
+        } else {
+            selectedPrompts.map {
+                AgentContextStoredPromptRowPresentation(prompt: $0, access: .presetSupplied)
+            }
+        }
 
         return RenderState(
             presetOptions: presetOptions,
@@ -146,7 +191,8 @@ struct AgentContextDrawerPromptTab: View {
             resolvedConfig: resolvedConfig,
             isManualPreset: isManualPreset,
             selectedPromptIDs: selectedPromptIDs,
-            selectedPrompts: selectedPrompts
+            selectedPrompts: selectedPrompts,
+            promptRows: promptRows
         )
     }
 
@@ -310,6 +356,11 @@ struct AgentContextDrawerPromptTab: View {
         }
         .buttonStyle(CustomButtonStyle(verticalPadding: 6, horizontalPadding: 12, height: 30))
         .disabled(copyStatus == .copying)
+        .alert("Copy failed", isPresented: $showCopyError) {
+            Button("OK") {}
+        } message: {
+            Text("The prompt could not be written to the clipboard.")
+        }
     }
 
     private func copyPresetPopover(_ state: RenderState) -> some View {
@@ -412,45 +463,64 @@ struct AgentContextDrawerPromptTab: View {
 
     private func promptsPopover(_ state: RenderState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            popoverHeader(
-                title: "Prompts",
-                subtitle: state.isManualPreset
-                    ? "Choose stored prompts for Manual copy mode."
-                    : "This preset supplies its stored prompt selection."
-            )
+            HStack(alignment: .top, spacing: 12) {
+                popoverHeader(
+                    title: "Prompts",
+                    subtitle: state.isManualPreset
+                        ? "Choose stored prompts for Manual copy mode."
+                        : "This preset supplies its stored prompt selection."
+                )
+
+                Spacer(minLength: 8)
+
+                if state.isManualPreset {
+                    Button {
+                        beginCreatingStoredPrompt()
+                    } label: {
+                        Label("New Prompt", systemImage: "plus")
+                            .font(fontPreset.captionFont.weight(.semibold))
+                    }
+                    .buttonStyle(CustomButtonStyle(verticalPadding: 4, horizontalPadding: 8, height: 26))
+                    .accessibilityLabel("New Stored Prompt")
+                }
+            }
+
+            if let storedPromptActionMessage {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                    Text(storedPromptActionMessage)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        self.storedPromptActionMessage = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .hoverTooltip("Dismiss")
+                    .accessibilityLabel("Dismiss stored prompt message")
+                }
+                .font(fontPreset.captionFont)
+                .foregroundStyle(.orange)
+                .accessibilityLabel(storedPromptActionMessage)
+            }
 
             if promptManager.storedPrompts.isEmpty {
                 emptyPopoverText("No stored prompts available")
-            } else if state.isManualPreset {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(promptManager.storedPrompts) { prompt in
-                            promptSelectionRow(
-                                prompt,
-                                isSelected: state.selectedPromptIDs.contains(prompt.id),
-                                isEditable: true
-                            ) {
-                                toggleManualPrompt(prompt)
-                            }
-                        }
-                    }
-                }
-                .frame(maxHeight: 320)
-            } else if state.selectedPrompts.isEmpty {
+            } else if state.promptRows.isEmpty {
                 emptyPopoverText("No stored prompts selected")
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(state.selectedPrompts) { prompt in
-                            promptSelectionRow(prompt, isSelected: true, isEditable: false) {}
+                        ForEach(state.promptRows) { row in
+                            promptSelectionRow(row)
                         }
                     }
                 }
-                .frame(maxHeight: 260)
+                .frame(maxHeight: state.isManualPreset ? 320 : 260)
             }
         }
         .padding(12)
-        .frame(width: 380)
+        .frame(width: 440)
     }
 
     private func popoverHeader(title: String, subtitle: String) -> some View {
@@ -507,36 +577,15 @@ struct AgentContextDrawerPromptTab: View {
         .buttonStyle(.plain)
     }
 
-    private func promptSelectionRow(
-        _ prompt: PromptViewModel.StoredPrompt,
-        isSelected: Bool,
-        isEditable: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
-        HStack(spacing: 8) {
-            Button(action: action) {
-                HStack(spacing: 7) {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                    Text(prompt.title)
-                        .font(fontPreset.captionFont.weight(.medium))
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(!isEditable)
-
-            AgentContextStoredPromptPreviewButton(prompt: prompt)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 7)
-        .background(isSelected ? Color.teal.opacity(0.10) : Color(NSColor.controlBackgroundColor).opacity(0.18))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .textSelection(.disabled)
+    private func promptSelectionRow(_ row: AgentContextStoredPromptRowPresentation) -> some View {
+        AgentContextStoredPromptRow(
+            presentation: row,
+            fontPreset: fontPreset,
+            onToggle: { toggleManualPrompt(row.prompt) },
+            onCopy: copyStoredPrompt,
+            onEdit: beginEditingStoredPrompt,
+            onConfirmDelete: confirmStoredPromptDeletion
+        )
     }
 
     private func emptyPopoverText(_ text: String) -> some View {
@@ -701,6 +750,9 @@ struct AgentContextDrawerPromptTab: View {
     }
 
     private func copyPromptContext() {
+        fullContextCopyGeneration &+= 1
+        let localCopyGeneration = fullContextCopyGeneration
+        let copyIntent = PromptClipboardIntentCoordinator.shared.begin()
         let currentPreset = promptManager.currentCopyPreset()
         let cfg = promptManager.resolvePromptContext()
         copyStatus = .copying
@@ -714,16 +766,78 @@ struct AgentContextDrawerPromptTab: View {
                 selectedPromptIDsOverride: selectedPromptIDsOverride
             )
             await MainActor.run {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(clipboard, forType: .string)
+                guard localCopyGeneration == fullContextCopyGeneration else { return }
+                guard PromptClipboardIntentCoordinator.shared.isCurrent(copyIntent) else {
+                    copyStatus = .idle
+                    return
+                }
+                guard AgentContextStoredPromptClipboard.writeFullContext(clipboard, intent: copyIntent) else {
+                    copyStatus = .idle
+                    showCopyError = true
+                    return
+                }
                 copyStatus = .copied
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
             await MainActor.run {
+                guard localCopyGeneration == fullContextCopyGeneration else { return }
                 if copyStatus == .copied {
                     copyStatus = .idle
                 }
             }
+        }
+    }
+
+    private func copyStoredPrompt(_ promptID: UUID) -> Bool {
+        copyStatus = .idle
+        storedPromptActionMessage = nil
+        guard let didWrite = AgentContextStoredPromptClipboard.write(
+            promptID: promptID,
+            from: promptManager.storedPrompts
+        ) else {
+            storedPromptActionMessage = "The stored prompt is no longer available to copy."
+            return false
+        }
+        guard didWrite else {
+            storedPromptActionMessage = "The prompt could not be written to the clipboard."
+            return false
+        }
+        return true
+    }
+
+    private func beginCreatingStoredPrompt() {
+        storedPromptActionMessage = nil
+        showPromptsPopover = false
+        DispatchQueue.main.async {
+            storedPromptEditorMode = .create(id: UUID())
+        }
+    }
+
+    private func beginEditingStoredPrompt(_ promptID: UUID) {
+        storedPromptActionMessage = nil
+        guard let prompt = promptManager.customStoredPrompts.first(where: { $0.id == promptID }) else {
+            storedPromptActionMessage = "The stored prompt is no longer available to edit."
+            return
+        }
+        showPromptsPopover = false
+        DispatchQueue.main.async {
+            storedPromptEditorMode = .edit(prompt)
+        }
+    }
+
+    private func confirmStoredPromptDeletion(_ prompt: PromptViewModel.StoredPrompt) {
+        switch promptManager.removeStoredPrompt(matching: prompt) {
+        case .deleted:
+            storedPromptActionMessage = nil
+            copyStatus = .idle
+        case .targetMissing:
+            storedPromptActionMessage = "The stored prompt was already deleted. Nothing else changed."
+        case .targetChanged:
+            storedPromptActionMessage = "The stored prompt changed after confirmation opened. Nothing was deleted; reopen Delete to confirm the current version."
+        case .targetProtected:
+            storedPromptActionMessage = "Built-in stored prompts cannot be deleted."
+        case .persistenceFailed:
+            storedPromptActionMessage = "The stored prompt could not be deleted. Nothing changed on disk."
         }
     }
 
@@ -1229,42 +1343,5 @@ private struct AgentContextDrawerControlLabel: View {
         .contentShape(Rectangle())
         .textSelection(.disabled)
         .onHover { isHovering = $0 }
-    }
-}
-
-private struct AgentContextStoredPromptPreviewButton: View {
-    let prompt: PromptViewModel.StoredPrompt
-
-    @ObservedObject private var fontScale = FontScaleManager.shared
-    @State private var showPreview = false
-
-    private var fontPreset: FontScalePreset {
-        fontScale.preset
-    }
-
-    var body: some View {
-        Button {
-            showPreview = true
-        } label: {
-            Image(systemName: "eye")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
-        .hoverTooltip("Preview prompt")
-        .popover(isPresented: $showPreview) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(prompt.title)
-                    .font(fontPreset.standardFont.weight(.semibold))
-                ScrollView {
-                    Text(prompt.content)
-                        .font(fontPreset.standardFont)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(width: 360, height: 260)
-            }
-            .padding(12)
-        }
     }
 }

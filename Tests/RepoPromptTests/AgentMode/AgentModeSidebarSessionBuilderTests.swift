@@ -543,6 +543,37 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         )
     }
 
+    func testCanStashUsesPersistedConversationContent() throws {
+        let tabID = id(69)
+        let sessionID = id(169)
+        let rows = build(
+            tabs: [tab(tabID, sessionID: sessionID)],
+            sessionIndex: sessionIndex([
+                entry(sessionID, tabID: tabID, lastUserMessageAt: date(10))
+            ])
+        )
+
+        XCTAssertTrue(try row(for: tabID, in: rows).canStash)
+    }
+
+    func testCanStashUsesLiveConversationItems() throws {
+        let tabID = id(70)
+        let sessionID = id(170)
+        let session = liveSession(
+            tabID: tabID,
+            sessionID: sessionID,
+            lastUserMessageAt: date(10)
+        )
+        session.setItemsSilently([.user("Content", sequenceIndex: 0)], reason: .testOverride)
+        let rows = build(
+            tabs: [tab(tabID, sessionID: sessionID)],
+            sessions: [tabID: session],
+            sessionIndex: [:]
+        )
+
+        XCTAssertTrue(try row(for: tabID, in: rows).canStash)
+    }
+
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],

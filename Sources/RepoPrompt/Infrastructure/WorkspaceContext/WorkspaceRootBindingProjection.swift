@@ -767,6 +767,52 @@ struct WorkspaceLookupContext: Equatable {
         bindingProjection?.physicalizeSelection(selection) ?? selection
     }
 
+    func exactFileNamespace(storeRoots: [WorkspaceRootRef]) -> WorkspaceExactFileNamespace {
+        guard let bindingProjection else { return .identity(roots: storeRoots) }
+        let boundRoots = bindingProjection.boundRootsForMetadata
+        let visibleLogicalRoots = bindingProjection.visibleLogicalRootRefs
+        var bindings = storeRoots.map { lookupRoot in
+            let logicalMatches = boundRoots
+                .filter { $0.physicalRoot.standardizedFullPath == lookupRoot.standardizedFullPath }
+                .map(\.logicalRoot)
+            let canonicalMatch = visibleLogicalRoots.first {
+                $0.standardizedFullPath == lookupRoot.standardizedFullPath
+            }
+            let clientRoots = logicalMatches.isEmpty ? [canonicalMatch ?? lookupRoot] : logicalMatches
+            let sortedClientRoots = clientRoots.sorted { $0.standardizedFullPath < $1.standardizedFullPath }
+            return WorkspaceExactFileNamespace.RootBinding(
+                lookupRoot: lookupRoot,
+                lookupRole: logicalMatches.isEmpty ? .canonical : .projectedPhysical,
+                clientRoots: sortedClientRoots,
+                preferredClientRoot: sortedClientRoots[0]
+            )
+        }
+        let representedPhysicalPaths = Set(storeRoots.map(\.standardizedFullPath))
+        let unavailableByPhysicalPath = Dictionary(grouping: boundRoots) {
+            $0.physicalRoot.standardizedFullPath
+        }
+        for physicalPath in unavailableByPhysicalPath.keys.sorted()
+            where !representedPhysicalPaths.contains(physicalPath)
+        {
+            guard let unavailableRoots = unavailableByPhysicalPath[physicalPath] else { continue }
+            let lookupRoot = unavailableRoots
+                .map(\.physicalRoot)
+                .sorted { $0.id.uuidString < $1.id.uuidString }[0]
+            var seenLogicalPaths: Set<String> = []
+            let clientRoots = unavailableRoots
+                .map(\.logicalRoot)
+                .sorted { $0.standardizedFullPath < $1.standardizedFullPath }
+                .filter { seenLogicalPaths.insert($0.standardizedFullPath).inserted }
+            bindings.append(WorkspaceExactFileNamespace.RootBinding(
+                lookupRoot: lookupRoot,
+                lookupRole: .projectedPhysical,
+                clientRoots: clientRoots,
+                preferredClientRoot: clientRoots[0]
+            ))
+        }
+        return WorkspaceExactFileNamespace(rootBindings: bindings)
+    }
+
     func domainMutationPhysicalRootMappings(
         store: WorkspaceFileContextStore
     ) async -> [DomainMutationPhysicalRootMapping] {

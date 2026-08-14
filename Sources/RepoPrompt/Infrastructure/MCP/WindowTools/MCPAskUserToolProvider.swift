@@ -17,9 +17,10 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
     }
 
     var domainInteractionAdapter: DomainLongRunningInteractionAdapter {
-        let requireTargetWindow = dependencies.requireTargetWindow
-        let requireCurrentTabContext = dependencies.requireCurrentTabContext
-        let resolveAgentModeTabID = dependencies.resolveAgentModeTabID
+        let execution = dependencies
+        let requireTargetWindow = execution.requireTargetWindow
+        let requireCurrentTabContext = execution.requireCurrentTabContext
+        let resolveAgentModeTabID = execution.resolveAgentModeTabID
         return DomainLongRunningInteractionAdapter(
             isAvailable: { request in
                 guard let connectionID = request.clientID,
@@ -57,11 +58,14 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                     return false
                 }
             },
-            resolveDefaultTimeoutSeconds: { _ in
-                try await MainActor.run {
-                    let targetWindow = try requireTargetWindow()
-                    return targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds
+            resolveDefaultTimeoutSeconds: { request in
+                guard let connectionID = request.clientID else {
+                    throw MCPError.invalidParams("ask_user requires an active MCP connection")
                 }
+                return try await Self.resolveDefaultTimeoutSeconds(
+                    connectionID: connectionID,
+                    dependencies: execution
+                )
             },
             cancel: { requestID in
                 await MCPAskUserPresentationCoordinator.shared.cancel(requestID: requestID)
@@ -102,7 +106,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
             - `questions`: Required array of structured questions. Each question requires stable `id` and `question` fields. Use `allows_multiple` and `allows_custom` for selection/custom-answer behavior.
             - `title`: Optional title for the wizard card.
             - `context`: Optional overall context shown above the questions.
-            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting.
+            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference.
 
             **Response:**
             - `answers`: Object keyed by question ID. Each value contains `answers`, `selected_options`, `custom_response`, and `skipped`.
@@ -115,7 +119,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                 properties: [
                     "title": .string(description: "Optional title shown above the question wizard."),
                     "context": .string(description: "Optional overall context shown above the wizard."),
-                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting."),
+                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference."),
                     "questions": .array(
                         description: "One or more structured questions to ask as a single wizard.",
                         items: .object(
@@ -165,9 +169,11 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         // Get target window.
         let targetWindow = try dependencies.requireTargetWindow()
 
-        // Resolve timeout: use explicit value from caller, or workspace setting.
-        let workspaceTimeout = await MainActor.run { targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds }
-        let parsed = try parseAskUserInteraction(args: args, defaultTimeout: workspaceTimeout)
+        let defaultTimeout = try await resolveDefaultTimeoutSeconds(
+            connectionID: connectionID,
+            dependencies: dependencies
+        )
+        let parsed = try parseAskUserInteraction(args: args, defaultTimeout: defaultTimeout)
 
         // Route based on run purpose.
         let response: AgentAskUserResponse
@@ -238,6 +244,31 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         }
 
         return askUserResponseValue(response, includeLegacyResponse: parsed.includeLegacyResponse)
+    }
+
+    private static func resolveDefaultTimeoutSeconds(
+        connectionID: UUID,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
+    ) async throws -> TimeInterval {
+        let targetWindow = try dependencies.requireTargetWindow()
+        switch await ServerNetworkManager.shared.runPurpose(for: connectionID) {
+        case .discoverRun:
+            let tabContext = try await dependencies.requireCurrentTabContext(MCPWindowToolName.askUser)
+            guard let runID = tabContext.runID else {
+                throw MCPError.invalidParams("ask_user requires an active Context Builder run with tab context")
+            }
+            guard let timeout = targetWindow.contextBuilderAgentViewModel.capturedQuestionTimeoutSeconds(
+                tabID: tabContext.tabID,
+                runID: runID
+            ) else {
+                throw MCPError.internalError("ask_user Context Builder run behavior is unavailable")
+            }
+            return timeout
+        case .agentModeRun:
+            return targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds
+        case .unknown:
+            throw MCPError.invalidParams("ask_user is only available during Context Builder or agent mode runs")
+        }
     }
 
     private static func withPresentationRegistration<Result>(

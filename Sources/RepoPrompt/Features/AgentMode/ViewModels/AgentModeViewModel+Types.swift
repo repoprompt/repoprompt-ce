@@ -119,6 +119,17 @@ extension AgentModeViewModel {
         let requestedSessionID: UUID
     }
 
+    struct RemovalPreflightSessionClaim: Equatable {
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier?
+        let activeAgentSessionID: UUID?
+        let binding: AgentPersistentSessionBindingIdentity?
+        let bindingTransitionGeneration: UInt64
+        let sourceItemsRevision: Int
+        let persistenceMutationGeneration: UInt64
+        let saveRequestGeneration: UInt64
+    }
+
     struct SessionSaveCommitToken: Equatable {
         let tabID: UUID
         let sessionIdentity: ObjectIdentifier
@@ -174,7 +185,7 @@ extension AgentModeViewModel {
 
     struct SidebarSessionRowsCacheKey: Equatable {
         let workspaceID: UUID?
-        let sidebarRevision: Int
+        let rowContentRevision: Int
         let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
     }
 
@@ -189,13 +200,15 @@ extension AgentModeViewModel {
     }
 
     struct SidebarListProjection {
+        let workspaceID: UUID?
         let filteredSessions: [SidebarSession]
         let pagedSessions: [SidebarSession]
         let effectiveVisibleSessionCount: Int
         let archivedSessionTabsForHeader: [StashedTab]
-        let sortedArchivedSessionTabsForRows: [StashedTab]
+        let pagedArchivedSessionTabsForRows: [StashedTab]
         let archivedDateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
         let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
+        let renderedSelectionOrder: [AgentSidebarSelectionIdentity]
 
         var hasMoreSessions: Bool {
             filteredSessions.count > effectiveVisibleSessionCount
@@ -204,6 +217,23 @@ extension AgentModeViewModel {
         var remainingSessionCount: Int {
             max(0, filteredSessions.count - effectiveVisibleSessionCount)
         }
+
+        var hasMoreArchivedSessions: Bool {
+            archivedSessionTabsForHeader.count > pagedArchivedSessionTabsForRows.count
+        }
+
+        var remainingArchivedSessionCount: Int {
+            max(0, archivedSessionTabsForHeader.count - pagedArchivedSessionTabsForRows.count)
+        }
+    }
+
+    struct SidebarBulkMutationTargets: Equatable {
+        let workspaceID: UUID
+        let activeDeleteTabIDs: Set<UUID>
+        let archivedDeleteTargets: Set<PromptViewModel.ArchivedTabMutationTarget>
+        let stashTabIDs: Set<UUID>
+        let pinTabIDs: Set<UUID>
+        let unpinTabIDs: Set<UUID>
     }
 
     /// Signature of a compose tab's sidebar-rendered metadata. Captured separately
@@ -238,6 +268,7 @@ extension AgentModeViewModel {
         let parentSessionID: UUID?
         let hasLoadedPersistedState: Bool
         let itemsIsEmpty: Bool
+        let transcriptTurnsIsEmpty: Bool
         let runState: AgentSessionRunState
         let lastActivityAt: Date
         let lastUserMessageAt: Date?
@@ -761,6 +792,7 @@ extension AgentModeViewModel {
         let activityDate: Date
         let isPinned: Bool
         let sessionID: UUID?
+        let canStash: Bool
         let parentSessionID: UUID?
         let depth: Int
         let isMCPControlled: Bool
@@ -792,6 +824,7 @@ extension AgentModeViewModel {
             activityDate: Date,
             isPinned: Bool,
             sessionID: UUID?,
+            canStash: Bool = false,
             parentSessionID: UUID?,
             depth: Int,
             isMCPControlled: Bool,
@@ -812,6 +845,7 @@ extension AgentModeViewModel {
             self.activityDate = activityDate
             self.isPinned = isPinned
             self.sessionID = sessionID
+            self.canStash = canStash
             self.parentSessionID = parentSessionID
             self.depth = depth
             self.isMCPControlled = isMCPControlled

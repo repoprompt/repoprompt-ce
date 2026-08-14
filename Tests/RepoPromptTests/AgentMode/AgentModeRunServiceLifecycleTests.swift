@@ -698,12 +698,25 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         for (reason, name) in rows {
             let fixture = try await makeRetainedACPFixture(processIDFileName: "compose-\(name)-acp-process-id.txt")
             fixture.host.test_installLiveSession(fixture.session)
+            fixture.host.setAgentRunActive(fixture.session.tabID, isActive: true)
+            XCTAssertTrue(fixture.host.tabsWithActiveAgentRun.contains(fixture.session.tabID), name)
             XCTAssertTrue(Self.processIsRunning(fixture.processID), name)
 
-            await fixture.host.handleComposeTabsDidRemove([fixture.session.tabID], reason: reason)
+            let issues = await fixture.host.handleComposeTabsDidRemove(
+                [fixture.session.tabID],
+                reason: reason,
+                workspaceID: UUID()
+            )
+            if reason == .stash {
+                XCTAssertTrue(issues.isEmpty, name)
+            } else {
+                XCTAssertEqual(issues.count, 1, name)
+                XCTAssertTrue(issues.first?.message.contains("owning workspace") == true, name)
+            }
 
             XCTAssertNil(fixture.session.acpController, name)
             XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)
+            XCTAssertFalse(fixture.host.tabsWithActiveAgentRun.contains(fixture.session.tabID), name)
             try await waitUntilProcessExits(
                 fixture.processID,
                 "Compose tab \(name) should terminate retained ACP process"

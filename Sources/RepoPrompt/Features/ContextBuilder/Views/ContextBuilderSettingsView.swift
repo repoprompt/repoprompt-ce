@@ -97,26 +97,50 @@ struct ContextBuilderSettingsView: View {
     private var sharedSettingsSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {
-                // Token Budget
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("Context Budget")
                             .font(fontPreset.font)
                         Spacer()
-                        Text("\(contextBuilderVM.tokenBudget / 1000)k")
+                        Text("\(contextBuilderVM.contextTokenBudget / 1000)k")
                             .font(fontPreset.font)
                             .foregroundColor(.secondary)
                             .monospacedDigit()
                     }
                     Slider(
                         value: Binding(
-                            get: { Double(contextBuilderVM.tokenBudget) },
-                            set: { contextBuilderVM.tokenBudget = Int($0) }
+                            get: { Double(contextBuilderVM.contextTokenBudget) },
+                            set: { contextBuilderVM.contextTokenBudget = Int($0) }
                         ),
                         in: 10000 ... 200_000,
                         step: 5000
                     )
-                    Text("Target prompt size. Use ~160k for ChatGPT/web exports by default, or lower for a more token-efficient prompt.")
+                    Text("Sets the target size of the context package. Use ~160k for ChatGPT/web exports by default, or lower for a more token-efficient prompt.")
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.secondary)
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Analysis Budget")
+                            .font(fontPreset.font)
+                        Spacer()
+                        Text("\(contextBuilderVM.analysisTokenBudget / 1000)k")
+                            .font(fontPreset.font)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(contextBuilderVM.analysisTokenBudget) },
+                            set: { contextBuilderVM.analysisTokenBudget = Int($0) }
+                        ),
+                        in: 40000 ... 200_000,
+                        step: 5000
+                    )
+                    Text("Sets the target size of the context package when Context Builder will immediately produce a plan, review, or answer.")
                         .font(fontPreset.captionFont)
                         .foregroundColor(.secondary)
                 }
@@ -127,7 +151,13 @@ struct ContextBuilderSettingsView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Prompt Enhancement")
                         .font(fontPreset.font)
-                    Picker("", selection: $contextBuilderVM.enhancementMode) {
+                    Picker(
+                        "",
+                        selection: Binding(
+                            get: { contextBuilderVM.enhancementMode },
+                            set: { contextBuilderVM.enhancementMode = $0 }
+                        )
+                    ) {
                         Text("Rewrite").tag(PromptEnhancementMode.fullRewrite)
                         Text("Augment").tag(PromptEnhancementMode.augment)
                         Text("Preserve").tag(PromptEnhancementMode.preserve)
@@ -146,7 +176,13 @@ struct ContextBuilderSettingsView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Question Timeout")
                         .font(fontPreset.font)
-                    Picker("", selection: $contextBuilderVM.questionTimeoutSeconds) {
+                    Picker(
+                        "",
+                        selection: Binding(
+                            get: { contextBuilderVM.questionTimeoutSeconds },
+                            set: { contextBuilderVM.questionTimeoutSeconds = $0 }
+                        )
+                    ) {
                         Text("30 sec").tag(TimeInterval(30))
                         Text("1 min").tag(TimeInterval(60))
                         Text("2 min").tag(TimeInterval(120))
@@ -186,8 +222,12 @@ struct ContextBuilderSettingsView: View {
                     .font(fontPreset.captionFont)
                     .foregroundColor(.secondary)
 
-                // Clarifying Questions
-                Toggle(isOn: $contextBuilderVM.allowClarifyingQuestions) {
+                Toggle(
+                    isOn: Binding(
+                        get: { contextBuilderVM.allowUIClarifyingQuestions },
+                        set: { contextBuilderVM.allowUIClarifyingQuestions = $0 }
+                    )
+                ) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Allow Clarifying Questions")
                             .font(fontPreset.font)
@@ -200,56 +240,21 @@ struct ContextBuilderSettingsView: View {
 
                 Divider()
 
-                // Follow-up Analysis
-                Toggle(isOn: $contextBuilderVM.autoGeneratePlan) {
+                Toggle(
+                    isOn: Binding(
+                        get: { contextBuilderVM.followUpAnalysisEnabled },
+                        set: { contextBuilderVM.followUpAnalysisEnabled = $0 }
+                    )
+                ) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Follow-up Analysis")
                             .font(fontPreset.font)
-                        Text("Auto-run plan/review/question after Context Builder completes")
+                        Text("Automatically run this tab’s selected plan, review, or question after Context Builder completes")
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary)
                     }
                 }
                 .toggleStyle(.switch)
-
-                if contextBuilderVM.autoGeneratePlan {
-                    VStack(alignment: .leading, spacing: 8) {
-                        // Analysis budget
-                        HStack {
-                            Text("Analysis Budget")
-                                .font(fontPreset.captionFont)
-                            Spacer()
-                            Text("\(contextBuilderVM.planTokenBudget / 1000)k")
-                                .font(fontPreset.captionFont)
-                                .monospacedDigit()
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { Double(contextBuilderVM.planTokenBudget) },
-                                set: { contextBuilderVM.planTokenBudget = Int($0) }
-                            ),
-                            in: 40000 ... 200_000,
-                            step: 5000
-                        )
-
-                        HStack(spacing: 6) {
-                            Image(systemName: "brain")
-                                .foregroundColor(.secondary)
-                                .font(.caption)
-                            Text("Analysis uses the Oracle Model: \(promptVM.planningModel.displayName). Change it in Agent Models.")
-                                .font(fontPreset.captionFont)
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        Text("After context building, a separate API call generates a plan, review, or answer.")
-                            .font(fontPreset.captionFont)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(10)
-                    .background(Color.orange.opacity(0.05))
-                    .cornerRadius(8)
-                }
 
                 Divider()
 
@@ -336,8 +341,12 @@ struct ContextBuilderSettingsView: View {
                     .font(fontPreset.captionFont)
                     .foregroundColor(.secondary)
 
-                // Clarifying Questions
-                Toggle(isOn: $contextBuilderVM.allowClarifyingQuestionsForMCP) {
+                Toggle(
+                    isOn: Binding(
+                        get: { contextBuilderVM.allowMCPClarifyingQuestions },
+                        set: { contextBuilderVM.allowMCPClarifyingQuestions = $0 }
+                    )
+                ) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Allow Clarifying Questions")
                             .font(fontPreset.font)
@@ -348,11 +357,11 @@ struct ContextBuilderSettingsView: View {
                 }
                 .toggleStyle(.switch)
 
-                if contextBuilderVM.allowClarifyingQuestionsForMCP {
+                if contextBuilderVM.allowMCPClarifyingQuestions {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.orange)
-                        Text("You must be watching RepoPrompt to respond. Questions timeout after \(formattedQuestionTimeout).")
+                        Text("You must be watching RepoPrompt to respond. Questions timeout after \(formattedQuestionTimeout) and are always disabled for inactive target workspaces.")
                             .font(fontPreset.captionFont)
                             .foregroundColor(.orange)
                     }

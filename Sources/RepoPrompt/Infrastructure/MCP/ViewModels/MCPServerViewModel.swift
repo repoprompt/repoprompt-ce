@@ -1558,9 +1558,14 @@ final class MCPServerViewModel: ObservableObject {
                 lookupContext: lookupContext
             )
         },
-        readFile: { [weak self] path, startLine1Based, lineCount, lookupRootScope in
+        readFile: { [weak self] input, startLine1Based, lineCount, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while reading file") }
-            return try await readFile(path: path, startLine1Based: startLine1Based, lineCount: lineCount, lookupRootScope: lookupRootScope)
+            return try await readFile(
+                input: input,
+                startLine1Based: startLine1Based,
+                lineCount: lineCount,
+                lookupContext: lookupContext
+            )
         },
         enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, absolutePhysicalPath, metadata in
             guard let self else { throw MCPError.internalError("Window deallocated while enqueuing read_file auto-selection") }
@@ -4356,14 +4361,14 @@ final class MCPServerViewModel: ObservableObject {
             return
         }
         let intent: MCPReadFileAutoSelectionCoordinator.Intent = switch selection {
-        case let .full(path):
+        case .full:
             .full(
-                paths: [path],
+                paths: [absolutePhysicalPath],
                 automaticCodemapDisposition: .disableAutomaticPreservingManual
             )
         case let .slice(entry):
             .slices(
-                entries: [WorkspaceSelectionSliceInput(path: entry.path, ranges: entry.ranges)],
+                entries: [WorkspaceSelectionSliceInput(path: absolutePhysicalPath, ranges: entry.ranges)],
                 automaticCodemapDisposition: .disableAutomaticPreservingManual
             )
         }
@@ -6161,110 +6166,101 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func readFile(
-        path: String,
+        input: WorkspaceExactFileInput,
         startLine1Based: Int? = nil,
         lineCount: Int? = nil,
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> MCPAppFileReadResult {
         try await MCPToolWorkCountDiagnostics.withReadFileInvocation { [self] in
             try await readFileBody(
-                path: path,
+                input: input,
                 startLine1Based: startLine1Based,
                 lineCount: lineCount,
-                lookupRootScope: lookupRootScope
+                lookupContext: lookupContext
             )
         }
     }
 
     private func readFileBody(
-        path: String,
+        input: WorkspaceExactFileInput,
         startLine1Based: Int? = nil,
         lineCount: Int? = nil,
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> MCPAppFileReadResult {
         try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
-
-        let rootRefsLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.rootRefsLookup)
-        let roots = await store.rootRefs(scope: lookupRootScope)
-        try Task.checkCancellation()
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
+        let roots = await store.rootRefs(scope: lookupContext.rootScope)
+        let namespace = lookupContext.exactFileNamespace(storeRoots: roots)
+        let requestedPath = input.renderedPath
+        let freshnessPath = switch input {
+        case let .absolute(path): lookupContext.translateInputPath(path)
+        case .explicitRoot, .relative: requestedPath
+        }
 
         try await readableService.awaitFreshnessForExplicitRequest(
-            path,
+            freshnessPath,
             rootRefs: roots,
             timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
         )
         try Task.checkCancellation()
 
-        let resolution = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
-            await readableService.resolveReadFileRequest(
-                path,
-                profile: .mcpRead,
-                rootScope: lookupRootScope,
-                rootRefs: roots
+        let resolution = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
+            try await readableService.resolveReadFileRequest(
+                input,
+                rootScope: lookupContext.rootScope,
+                rootRefs: roots,
+                namespace: namespace
             )
         }
         try Task.checkCancellation()
 
         let readableFile: WorkspaceReadableFileHandle
+        let displayPath: String
         switch resolution {
-        case let .readable(handle):
-            readableFile = handle
-        case let .folder(displayPath):
-            throw MCPError.invalidParams("'\(displayPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
+        case let .workspace(match):
+            readableFile = .workspace(match.file)
+            displayPath = match.canonicalPath
+        case let .external(file):
+            readableFile = .external(file)
+            displayPath = file.displayPath
+        case let .folder(folderDisplayPath):
+            throw MCPError.invalidParams("'\(folderDisplayPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
         case let .issue(issue):
             throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
         case .noCandidate:
-            if readableService.isAlwaysReadableExternalPath(path) {
-                throw MCPError.invalidParams("File not found: '\(readableService.displayPath(forExternalPath: path))'.")
+            if readableService.isAlwaysReadableExternalPath(requestedPath) {
+                throw MCPError.invalidParams("File not found: '\(readableService.displayPath(forExternalPath: requestedPath))'.")
             }
-            let msg = await workspaceContextMessage(forOperation: "read file", path: path)
-            throw MCPError.invalidParams("Cannot read '\(path)'. \(msg)")
+            let msg = await workspaceContextMessage(forOperation: "read file", path: requestedPath)
+            throw MCPError.invalidParams("Cannot read '\(requestedPath)'. \(msg)")
         }
 
         let preparedContent: WorkspaceInteractiveReadPreparedContent
-        let displayPath: String
         let cacheHit: Bool
         switch readableFile {
         case let .workspace(file):
             guard let snapshot = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.ReadFile.workspaceContentLoad,
-                operation: {
-                    try await store.interactiveReadSnapshot(for: file)
-                }
-            ) else {
-                throw MCPError.internalError("content unavailable")
-            }
-            try Task.checkCancellation()
+                operation: { try await store.interactiveReadSnapshot(for: file) }
+            ) else { throw MCPError.internalError("content unavailable") }
             preparedContent = snapshot.preparedContent
             cacheHit = snapshot.cacheHit
-            displayPath = ClientPathFormatter.displayAbsolutePath(
-                fullPath: file.standardizedFullPath,
-                visibleRoots: roots
-            )
         case let .external(externalFile):
             do {
                 let full = try await readableService.readAlwaysReadableExternalFile(externalFile)
-                try Task.checkCancellation()
-                let splitState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.splitPreservingLineEndings)
                 preparedContent = await WorkspaceInteractiveReadProcessor.prepareOffActor(full)
-                EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.splitPreservingLineEndings, splitState)
-                try Task.checkCancellation()
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 throw MCPError.invalidParams("Cannot read '\(externalFile.displayPath)': \(error.localizedDescription)")
             }
             cacheHit = false
-            displayPath = externalFile.displayPath
         }
+        try Task.checkCancellation()
 
         let preparedReply: MCPReadFileToolProjection.PreparedReply
         do {
-            let sliceState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.buildSlice)
-            defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.buildSlice, sliceState) }
             preparedReply = try await MCPReadFileToolProjection.makeBaseReply(
                 preparedContent: preparedContent,
                 startLine1Based: startLine1Based,
@@ -6276,7 +6272,6 @@ final class MCPServerViewModel: ObservableObject {
         } catch WorkspaceInteractiveReadRangeError.zeroStart {
             throw MCPError.invalidParams("start_line must be positive (1-based) or negative (tail-like behavior)")
         }
-        try Task.checkCancellation()
 
         MCPToolWorkCountDiagnostics.recordReadFileResult(
             returnedBytes: preparedReply.reply.content.utf8.count,
@@ -6285,10 +6280,7 @@ final class MCPServerViewModel: ObservableObject {
         )
         switch readableFile {
         case let .workspace(file):
-            return .workspace(
-                reply: preparedReply.reply,
-                absolutePhysicalPath: file.standardizedFullPath
-            )
+            return .workspace(reply: preparedReply.reply, absolutePhysicalPath: file.standardizedFullPath)
         case .external:
             return .nonSelecting(reply: preparedReply.reply)
         }
@@ -6476,8 +6468,18 @@ final class MCPServerViewModel: ObservableObject {
     ) async throws {
         do {
             let store = promptVM.workspaceFileContextStore
+            let mutationService = WorkspaceFileMutationService(store: store)
+            let target: WorkspaceFileEditHost.Target = if let existing = await mutationService.exactExistingFile(
+                path,
+                rootScope: lookupRootScope
+            ) {
+                .existing(existing)
+            } else {
+                .create(path: path)
+            }
             let host = WorkspaceFileEditHost(
                 store: store,
+                target: target,
                 selectionCoordinator: selectionCoordinator,
                 lookupRootScope: lookupRootScope,
                 createPathResolutionPolicy: .literalPreferredIfStronger,
