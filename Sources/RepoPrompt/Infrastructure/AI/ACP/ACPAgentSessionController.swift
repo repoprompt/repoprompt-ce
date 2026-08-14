@@ -693,15 +693,25 @@ actor ACPAgentSessionController {
                 )
                 // A rejected direct selection preserves the session's current model. Grok
                 // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
-                // the Err variant is a failure even though the RPC itself succeeded.
+                // the Err variant is a failure even though the RPC itself succeeded. Fail
+                // closed: only an `Ok` echoing the requested model may update local model
+                // authority — missing, malformed, or mismatched acknowledgements leave the
+                // session's real current model unknown, so local state must not move.
                 let selectionResponse = try await sendRequestResponse(
                     method: selectionRequest.method,
                     params: selectionRequest.params
                 )
-                if let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any],
-                   let modelError = modelOutcome["Err"]
-                {
+                let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
+                if let modelError = modelOutcome?["Err"] {
                     throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
+                }
+                guard let confirmedModel = modelOutcome?["Ok"] as? String,
+                      confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                      .caseInsensitiveCompare(canonicalModel) == .orderedSame
+                else {
+                    throw ControllerError.protocolViolation(
+                        "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
+                    )
                 }
                 var updatedOptions = discoveredSessionModels?.options
                     ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options

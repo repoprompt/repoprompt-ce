@@ -72,6 +72,73 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/set_model").isEmpty)
     }
 
+    func testErrModelOutcomeThrowsAndPreservesCurrentModel() async throws {
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "err")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected Err outcome to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("rejected"), "unexpected error: \(error)")
+        }
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "grok-4.6",
+            "a rejected selection must not move local model authority"
+        )
+    }
+
+    func testMissingModelAckFailsClosed() async throws {
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "missing")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected missing acknowledgement to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "grok-4.6"
+        )
+    }
+
+    func testMalformedModelAckFailsClosed() async throws {
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "malformed")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected malformed acknowledgement to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "grok-4.6"
+        )
+    }
+
+    func testMismatchedOkFailsClosed() async throws {
+        // The server confirms a DIFFERENT model than requested: local state must not move.
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "mismatch")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected mismatched Ok to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "grok-4.6",
+            "an Ok naming another model must not be treated as confirmation"
+        )
+    }
+
     func testMalformedSessionModelStateDoesNotPersistAndSelectionFails() async throws {
         let fixture = try makeFixture(shape: "grok_direct_malformed")
         try await bootstrap(fixture.controller)
@@ -218,13 +285,14 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         }
     }
 
-    private func makeFixture(shape: String) throws -> Fixture {
+    private func makeFixture(shape: String, setModelAck: String = "ok") throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
         let environment = [
             "ACP_RECORD_PATH": recordURL.path,
             "ACP_SHAPE": shape,
+            "ACP_SET_MODEL_ACK": setModelAck,
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -253,6 +321,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
 
         record_path = os.environ.get("ACP_RECORD_PATH")
         shape = os.environ.get("ACP_SHAPE", "grok_direct")
+        set_model_ack = os.environ.get("ACP_SET_MODEL_ACK", "ok")
         session_id = "grok-direct-session"
         current_model = "grok-4.6"
         modern_current_model = "model-a"
@@ -341,7 +410,15 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                 respond(request_id, session_result())
             elif method == "session/set_model":
                 requested = params.get("modelId")
-                if requested in ("grok-4.5", "grok-4.6"):
+                if set_model_ack == "missing":
+                    respond(request_id, {})
+                elif set_model_ack == "malformed":
+                    respond(request_id, {"_meta": {"model": "not-a-model-outcome"}})
+                elif set_model_ack == "mismatch":
+                    respond(request_id, {"_meta": {"model": {"Ok": "grok-4.6"}}})
+                elif set_model_ack == "err":
+                    respond(request_id, {"_meta": {"model": {"Err": {"message": "model unavailable"}}}})
+                elif requested in ("grok-4.5", "grok-4.6"):
                     current_model = requested
                     respond(request_id, {"_meta": {"model": {"Ok": requested}}})
                 else:
