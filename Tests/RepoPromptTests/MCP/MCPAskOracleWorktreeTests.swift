@@ -1248,10 +1248,20 @@ import XCTest
                         files: ["Sources/Secondary.swift": "let secondary = 1\n"]
                     )
                     let secondaryFile = secondaryRoot.appendingPathComponent("Sources/Secondary.swift")
-                    try await window.workspaceManager.addFolder(
-                        secondaryRoot,
-                        to: XCTUnwrap(window.workspaceManager.activeWorkspace)
+                    let workspaceIndex = try XCTUnwrap(
+                        window.workspaceManager.workspaces.firstIndex { $0.id == fixture.contextA.workspaceID }
                     )
+                    window.workspaceManager.workspaces[workspaceIndex].repoPaths.append(secondaryRoot.path)
+                    try await window.workspaceManager.fileManager.loadFolder(
+                        at: secondaryRoot,
+                        for: window.workspaceManager.workspaces[workspaceIndex],
+                        freshStart: false
+                    )
+                    defer {
+                        Task {
+                            await window.workspaceManager.fileManager.unloadRootFolderPath(secondaryRoot.path)
+                        }
+                    }
                     let sourceSelection = StoredSelection(
                         selectedPaths: [fixture.contextA.fileURL.path, secondaryFile.path],
                         codemapAutoEnabled: false

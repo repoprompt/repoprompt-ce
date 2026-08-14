@@ -1029,10 +1029,20 @@ import XCTest
                         files: ["Sources/Selected.swift": "let ce = 1\n"]
                     )
                     let ceFile = ceRoot.appendingPathComponent("Sources/Selected.swift")
-                    try await fixture.contextA.window.workspaceManager.addFolder(
-                        ceRoot,
-                        to: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
+                    let workspaceManager = fixture.contextA.window.workspaceManager
+                    let workspaceIndex = try XCTUnwrap(
+                        workspaceManager.workspaces.firstIndex { $0.id == fixture.contextA.workspaceID }
                     )
+                    workspaceManager.workspaces[workspaceIndex].repoPaths.append(ceRoot.path)
+                    let ceRootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: fixture.contextA.window,
+                        path: ceRoot.path
+                    )
+                    defer {
+                        Task {
+                            await fixture.contextA.window.workspaceFileContextStore.unloadRoot(id: ceRootRecord.id)
+                        }
+                    }
                     let orderedRepoPaths = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.activeWorkspace
                     ).repoPaths.map { ($0 as NSString).standardizingPath }
@@ -1909,6 +1919,7 @@ import XCTest
                         "inactive-workspace-authority-\(fixture.contextB.workspaceID.uuidString)",
                         isDirectory: true
                     )
+                    sourceWorkspaceB.isEphemeral = false
                     sourceWorkspaceB.customStoragePath = authorityDirectory
                     let authorityURL = authorityDirectory.appendingPathComponent("workspace.json")
                     let authorityClient = DomainWorkspaceAuthorityClient(

@@ -799,6 +799,8 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
 
     func testRejectedConcurrentAgentAdmissionsPreserveActiveLivePinnedSession() async throws {
         let fixture = makeFixture(initialTabCount: 2)
+        let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspaceID)
+        fixture.manager.setWorkspaceEphemeral(workspaceID, false)
         let tabID = try XCTUnwrap(fixture.prompt.activeComposeTabID)
         fixture.prompt.setComposeTabPinned(true, for: tabID)
         let sessionID = try XCTUnwrap(fixture.manager.composeTab(with: tabID)?.activeAgentSessionID)
