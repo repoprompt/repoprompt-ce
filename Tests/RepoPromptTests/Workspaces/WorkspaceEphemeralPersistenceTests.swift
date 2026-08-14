@@ -169,11 +169,17 @@ import XCTest
             let fixtureUUID = UUID().uuidString
             let validPath = "/private/var/folders/fixture/PersistentAgentModeMCPReadFileConnectionTests/\(fixtureUUID)"
 
-            XCTAssertTrue(WorkspaceLeakedTestFixtureIdentity.matches(
+            let match = WorkspaceLeakedTestFixtureIdentity.match(
                 isEphemeral: true,
                 name: "Persistent Agent Mode MCP Read",
                 repoPaths: [validPath]
-            ))
+            )
+            XCTAssertEqual(match, .persistentRead)
+            XCTAssertEqual(match?.evidence, [
+                "ephemeralFlag=true",
+                "name is Persistent Agent Mode MCP Read",
+                "repo path contains PersistentAgentModeMCPReadFileConnectionTests/<UUID>"
+            ])
 
             XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
                 isEphemeral: false,
@@ -284,6 +290,14 @@ import XCTest
                 [removableLeak.id, persistentReadLeak.id, protectedLeak.id]
             )
             XCTAssertTrue(preview.records.first(where: { $0.id == removableLeak.id })?.isDeletable == true)
+            XCTAssertEqual(
+                preview.records.first(where: { $0.id == persistentReadLeak.id })?.evidence,
+                [
+                    "ephemeralFlag=true",
+                    "name is Persistent Agent Mode MCP Read",
+                    "repo path contains PersistentAgentModeMCPReadFileConnectionTests/<UUID>"
+                ]
+            )
             XCTAssertEqual(
                 preview.records.first(where: { $0.id == protectedLeak.id })?.deletionBlockReason,
                 "Workspace is active in an open window."

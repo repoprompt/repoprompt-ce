@@ -5,26 +5,58 @@ enum WorkspaceBulkDeletePolicy {
 }
 
 enum WorkspaceLeakedTestFixtureIdentity {
+    enum Match: Equatable {
+        case chatSwitch
+        case persistentRead
+
+        var evidence: [String] {
+            switch self {
+            case .chatSwitch:
+                [
+                    "ephemeralFlag=true",
+                    "name matches Agent Mode Chat Switch <8 uppercase hex>",
+                    "repo path contains AgentModeChatSwitchActivationTests-<UUID>"
+                ]
+            case .persistentRead:
+                [
+                    "ephemeralFlag=true",
+                    "name is Persistent Agent Mode MCP Read",
+                    "repo path contains PersistentAgentModeMCPReadFileConnectionTests/<UUID>"
+                ]
+            }
+        }
+    }
+
     private static let chatSwitchWorkspaceNamePrefix = "Agent Mode Chat Switch "
     private static let chatSwitchFixtureDirectoryPrefix = "AgentModeChatSwitchActivationTests-"
     private static let persistentReadWorkspaceName = "Persistent Agent Mode MCP Read"
     private static let persistentReadFixtureDirectory = "PersistentAgentModeMCPReadFileConnectionTests"
+
+    static func match(
+        isEphemeral: Bool,
+        name: String,
+        repoPaths: [String]
+    ) -> Match? {
+        guard isEphemeral else { return nil }
+
+        if hasUppercaseHexSuffix(name, prefix: chatSwitchWorkspaceNamePrefix, count: 8),
+           repoPaths.contains(where: containsChatSwitchFixtureIdentity)
+        {
+            return .chatSwitch
+        }
+
+        guard name == persistentReadWorkspaceName,
+              repoPaths.contains(where: containsPersistentReadFixtureIdentity)
+        else { return nil }
+        return .persistentRead
+    }
 
     static func matches(
         isEphemeral: Bool,
         name: String,
         repoPaths: [String]
     ) -> Bool {
-        guard isEphemeral else { return false }
-
-        if hasUppercaseHexSuffix(name, prefix: chatSwitchWorkspaceNamePrefix, count: 8) {
-            return repoPaths.contains { path in
-                URL(fileURLWithPath: path).pathComponents.contains(where: isChatSwitchFixtureDirectoryComponent)
-            }
-        }
-
-        guard name == persistentReadWorkspaceName else { return false }
-        return repoPaths.contains(where: containsPersistentReadFixtureIdentity)
+        match(isEphemeral: isEphemeral, name: name, repoPaths: repoPaths) != nil
     }
 
     private static func hasUppercaseHexSuffix(
@@ -38,6 +70,10 @@ enum WorkspaceLeakedTestFixtureIdentity {
         return suffix.utf8.allSatisfy {
             ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 70)
         }
+    }
+
+    private static func containsChatSwitchFixtureIdentity(_ path: String) -> Bool {
+        URL(fileURLWithPath: path).pathComponents.contains(where: isChatSwitchFixtureDirectoryComponent)
     }
 
     private static func isChatSwitchFixtureDirectoryComponent(_ component: String) -> Bool {

@@ -6887,7 +6887,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let snapshot = await domainWorkspaceAuthorityClient.snapshot()
         let records = snapshot.workspaces.compactMap { authoritative -> WorkspaceLeakCleanupRecord? in
             let metadata = authoritative.document.metadata
-            guard Self.isLeakedTestFixture(metadata) else { return nil }
+            guard let fixtureIdentity = Self.leakedTestFixtureIdentity(metadata) else { return nil }
             guard let workspace = try? Self.decodeDomainWorkspaceProjection(
                 documentBytes: authoritative.document.documentBytes,
                 fileURL: authoritative.document.fileURL
@@ -6905,11 +6905,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             return WorkspaceLeakCleanupRecord(
                 workspace: workspace,
                 fileURL: authoritative.document.fileURL,
-                evidence: [
-                    "ephemeralFlag=true",
-                    "name matches Agent Mode Chat Switch <8 uppercase hex>",
-                    "repo path contains AgentModeChatSwitchActivationTests-<UUID>"
-                ],
+                evidence: fixtureIdentity.evidence,
                 deletionBlockReason: blockReason
             )
         }.sorted {
@@ -6999,12 +6995,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         return result
     }
 
-    private static func isLeakedTestFixture(_ metadata: DomainWorkspaceMetadata) -> Bool {
-        WorkspaceLeakedTestFixtureIdentity.matches(
+    private static func leakedTestFixtureIdentity(
+        _ metadata: DomainWorkspaceMetadata
+    ) -> WorkspaceLeakedTestFixtureIdentity.Match? {
+        WorkspaceLeakedTestFixtureIdentity.match(
             isEphemeral: metadata.isEphemeral,
             name: metadata.name,
             repoPaths: metadata.repoPaths
         )
+    }
+
+    private static func isLeakedTestFixture(_ metadata: DomainWorkspaceMetadata) -> Bool {
+        leakedTestFixtureIdentity(metadata) != nil
     }
 
     private static func artifactCleanupWarning(from outcome: DomainCommandOutcome) -> String? {
