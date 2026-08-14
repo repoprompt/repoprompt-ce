@@ -1167,15 +1167,39 @@ actor ACPAgentSessionController {
         stderrFramer.feed(data) { lineData in
             guard
                 let trimmed = trimmedASCIIWhitespace(lineData),
-                let text = String(data: trimmed, encoding: .utf8),
-                !text.isEmpty
+                let rawText = String(data: trimmed, encoding: .utf8),
+                !rawText.isEmpty
             else { return }
+            let text = Self.strippingANSIEscapeSequences(from: rawText)
+            guard !text.isEmpty else { return }
             stderrLineCount += 1
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
             recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
+            guard provider.shouldEmitStderrLine(text) else { return }
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
+    }
+
+    /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
+    /// `[2m…[0m` artifacts in the transcript.
+    private static func strippingANSIEscapeSequences(from text: String) -> String {
+        guard text.contains("\u{1B}") else { return text }
+        var result = ""
+        result.reserveCapacity(text.count)
+        var iterator = text.makeIterator()
+        while let character = iterator.next() {
+            guard character == "\u{1B}" else {
+                result.append(character)
+                continue
+            }
+            // Skip a CSI sequence: ESC [ parameters…final-byte (@–~).
+            guard let opener = iterator.next(), opener == "[" else { continue }
+            while let byte = iterator.next() {
+                if ("@" ... "~").contains(byte) { break }
+            }
+        }
+        return result
     }
 
     private func handleJSONLine(_ lineData: Data) {

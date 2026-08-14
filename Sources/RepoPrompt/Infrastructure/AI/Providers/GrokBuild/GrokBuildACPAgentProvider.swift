@@ -117,6 +117,14 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         GrokBuildACPEventNormalizer.normalize(payload)
     }
 
+    func shouldEmitStderrLine(_ line: String) -> Bool {
+        // grok's background workers (its own configured MCP servers, auth refresh, leader)
+        // log fatal-looking transport errors to stderr when THEY fail; the ACP session
+        // itself is unaffected and reports real failures over JSON-RPC. Suppress that
+        // noise; everything else still surfaces.
+        !line.contains("worker quit with fatal: Transport channel closed")
+    }
+
     func preferredAuthMethodID(context _: ACPAuthenticationContext) -> String? {
         // Never send ACP `authenticate`: Grok's own credential precedence (config.toml key →
         // ~/.grok/auth.json session token → XAI_API_KEY env) is authoritative, and a stored

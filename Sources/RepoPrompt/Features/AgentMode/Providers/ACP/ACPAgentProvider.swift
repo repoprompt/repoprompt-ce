@@ -242,4 +242,11 @@ extension ACPAgentProvider {
     }
 
     func cleanupLaunchArtifacts(for _: ACPLaunchConfiguration) async {}
+
+    /// Whether a provider's stderr line should be surfaced into the transcript as a system
+    /// event. Default surfaces everything; providers with known-noisy background logging
+    /// can suppress specific patterns (diagnostics still record every line).
+    func shouldEmitStderrLine(_: String) -> Bool {
+        true
+    }
 }

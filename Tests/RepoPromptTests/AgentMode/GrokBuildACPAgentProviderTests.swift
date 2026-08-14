@@ -278,3 +278,14 @@ extension GrokBuildACPAgentProviderTests {
         XCTAssertFalse(grokProvider.test_config.alwaysApproveTools)
     }
 }
+
+extension GrokBuildACPAgentProviderTests {
+    func testBackgroundWorkerStderrNoiseIsSuppressed() throws {
+        let (provider, _) = try makeProvider(config: GrokBuildAgentConfig())
+        XCTAssertFalse(provider.shouldEmitStderrLine(
+            "2026-08-14T13:48:59Z ERROR worker quit with fatal: Transport channel closed, when Auth(AuthorizationRequired)"
+        ))
+        XCTAssertTrue(provider.shouldEmitStderrLine("ERROR something genuinely useful failed"))
+        XCTAssertTrue(provider.shouldEmitStderrLine("warning: low disk space"))
+    }
+}
