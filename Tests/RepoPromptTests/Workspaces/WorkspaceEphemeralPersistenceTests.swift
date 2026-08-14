@@ -63,6 +63,89 @@ import XCTest
             )
         }
 
+        func testExplicitSaveAPIsRejectEphemeralWorkspaceWithoutSideEffects() async throws {
+            let manager = makeManager(windowID: -772)
+            await manager.awaitInitialized()
+            let workspace = manager.createEphemeralWorkspace(
+                name: "Explicit Save Rejection",
+                repoPaths: []
+            )
+            let workspaceFile = manager.workspaceFileURL(for: workspace)
+            let alternateRoot = storageRoot.appendingPathComponent(
+                "ExplicitSaveAlternateRoot",
+                isDirectory: true
+            )
+
+            do {
+                _ = try await manager.saveWorkspaceToFileAsync(workspace)
+                XCTFail("Explicit async save must reject an ephemeral workspace")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "Ephemeral workspaces cannot be persisted.")
+            }
+            do {
+                _ = try await manager.saveWorkspaceToFileAsync(
+                    workspace,
+                    baseRoot: alternateRoot
+                )
+                XCTFail("Explicit base-root save must reject an ephemeral workspace")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "Ephemeral workspaces cannot be persisted.")
+            }
+            XCTAssertThrowsError(try manager.saveWorkspaceToFile(workspace)) { error in
+                XCTAssertEqual(error.localizedDescription, "Ephemeral workspaces cannot be persisted.")
+            }
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFile.path))
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: workspaceFile.deletingLastPathComponent().path)
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: alternateRoot.path))
+        }
+
+        func testBulkDeleteRemovesLocalEphemeralWorkspaceMissingFromRuntimeCatalog() async throws {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "local-ephemeral-bulk-delete-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -773,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -773
+                )
+            )
+            await manager.awaitInitialized()
+            let workspace = manager.createEphemeralWorkspace(
+                name: "Local Temporary Workspace",
+                repoPaths: []
+            )
+            let before = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(before.workspaces.contains {
+                $0.document.workspaceID == workspace.id
+            })
+            XCTAssertNotNil(manager.workspace(withID: workspace.id))
+
+            let result = await manager.deleteWorkspacesAsync(workspaceIDs: [workspace.id])
+
+            XCTAssertEqual(result.deletedWorkspaceIDs, [workspace.id])
+            XCTAssertTrue(result.alreadyAbsentWorkspaceIDs.isEmpty)
+            XCTAssertTrue(result.skippedReasonsByWorkspaceID.isEmpty)
+            XCTAssertTrue(result.failedReasonsByWorkspaceID.isEmpty)
+            XCTAssertNil(manager.workspace(withID: workspace.id))
+            let after = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(after.workspaces.contains {
+                $0.document.workspaceID == workspace.id
+            })
+        }
+
         func testAuthorityProjectionPreservesActiveLocalEphemeralWorkspace() async {
             let manager = makeManager(windowID: -771)
             await manager.awaitInitialized()

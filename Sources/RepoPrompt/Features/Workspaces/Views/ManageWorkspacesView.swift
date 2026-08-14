@@ -721,7 +721,7 @@ struct ManageWorkspacesView: View {
         return VStack(alignment: .leading, spacing: 14) {
             Text("Delete \(selectedItems.count) \(selectedItems.count == 1 ? "Workspace" : "Workspaces")?")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 21, weight: .semibold))
-            Text("This removes the approved records from the authoritative runtime catalog. Saved workspace artifacts are then cleaned up on a best-effort basis; any files that could not be removed will be reported. Catalog removal cannot be undone.")
+            Text("This deletes the selected workspaces. Persisted records are removed from the authoritative runtime catalog; local temporary workspaces are discarded from this app session. Saved artifacts are then cleaned up on a best-effort basis, and any files that could not be removed will be reported. This cannot be undone.")
                 .font(fontPreset.subheadlineFont)
                 .foregroundColor(.secondary)
             ScrollView {
@@ -809,7 +809,7 @@ struct ManageWorkspacesView: View {
             return requestFailureReason
         }
         var sections = [
-            "Removed \(result.deletedWorkspaceIDs.count) \(result.deletedWorkspaceIDs.count == 1 ? "record" : "records") from the authoritative runtime catalog. \(result.alreadyAbsentWorkspaceIDs.count) were already absent."
+            "Deleted \(result.deletedWorkspaceIDs.count) \(result.deletedWorkspaceIDs.count == 1 ? "workspace" : "workspaces"). \(result.alreadyAbsentWorkspaceIDs.count) were already absent."
         ]
         sections.append(contentsOf: formattedReasonGroups(
             title: "Protected or skipped",

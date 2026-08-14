@@ -2001,17 +2001,22 @@ final class TabContextRoutingTests: XCTestCase {
 
         let activeTabID = UUID()
         let tabID = UUID()
-        let workspace = window.workspaceManager.createWorkspace(
+        let workspace = WorkspaceModel(
             name: "Selection Tool Persistence \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
-            ephemeral: true
+            composeTabs: [
+                ComposeTabState(id: activeTabID, name: "Active"),
+                ComposeTabState(id: tabID, name: "Agent")
+            ],
+            activeComposeTabID: activeTabID
         )
+        window.workspaceManager.workspaces.append(workspace)
+        let initialSavedURL = try await window.workspaceManager.saveWorkspaceToFileAsync(
+            workspace,
+            source: .directUnknown
+        )
+        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: initialSavedURL)
         let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
-        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-            ComposeTabState(id: activeTabID, name: "Active"),
-            ComposeTabState(id: tabID, name: "Agent")
-        ]
-        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = activeTabID
         await window.workspaceManager.switchWorkspace(
             to: window.workspaceManager.workspaces[workspaceIndex],
             saveState: false,

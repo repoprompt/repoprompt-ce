@@ -15,16 +15,22 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertTrue(registered.document.metadata.isEphemeral)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
 
-        let created = await runtime.workspaceStore.execute(.init(
+        let createEnvelope = DomainWorkspaceCommandEnvelope(
             operationID: UUID(),
             expectedCatalogRevision: 0,
             expectedWorkspaceRevision: 0,
             origin: .standalone,
             command: .createWorkspace(document)
-        ))
+        )
+        let created = await runtime.workspaceStore.execute(createEnvelope)
         XCTAssertEqual(created.disposition, .invalid)
         XCTAssertEqual(created.errorCode, .invalidDocument)
         XCTAssertEqual(created.diagnostic, "ephemeral_workspace_not_persistable")
+
+        let replayedCreate = await runtime.workspaceStore.execute(createEnvelope)
+        XCTAssertEqual(replayedCreate.disposition, .deduplicated)
+        XCTAssertEqual(replayedCreate.errorCode, .invalidDocument)
+        XCTAssertEqual(replayedCreate.diagnostic, "ephemeral_workspace_not_persistable")
 
         let replaced = await runtime.workspaceStore.execute(.init(
             operationID: UUID(),

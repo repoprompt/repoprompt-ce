@@ -316,9 +316,15 @@ struct DomainWorkspaceAuthorityOperationError: LocalizedError {
 
 private enum WorkspaceDirectWriteError: LocalizedError {
     case domainAuthorityRequired
+    case ephemeralWorkspace
 
     var errorDescription: String? {
-        "Runtime-owned workspaces must be written through the domain workspace authority."
+        switch self {
+        case .domainAuthorityRequired:
+            "Runtime-owned workspaces must be written through the domain workspace authority."
+        case .ephemeralWorkspace:
+            "Ephemeral workspaces cannot be persisted."
+        }
     }
 }
 
@@ -6941,7 +6947,29 @@ class WorkspaceManagerViewModel: ObservableObject {
         })
         for workspaceID in deletionClaim.lease.workspaceIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
             guard let authoritative = snapshotsByID[workspaceID] else {
-                result.alreadyAbsentWorkspaceIDs.append(workspaceID)
+                guard let localWorkspace = workspace(withID: workspaceID),
+                      localWorkspace.isEphemeral
+                else {
+                    result.alreadyAbsentWorkspaceIDs.append(workspaceID)
+                    continue
+                }
+                if leakedTestFixtureWorkspaceIDs.contains(workspaceID),
+                   !Self.isLeakedTestFixture(localWorkspace)
+                {
+                    result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace no longer matches the reviewed test-fixture evidence."
+                    continue
+                }
+                if localWorkspace.isSystemWorkspace {
+                    result.skippedReasonsByWorkspaceID[workspaceID] = "System workspaces cannot be deleted."
+                    continue
+                }
+                let protectedTabs = localWorkspace.composeTabs + localWorkspace.stashedTabs.map(\.tab)
+                if protectedTabs.contains(where: { $0.activeAgentSessionID != nil || $0.isPinned }) {
+                    result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace contains an active or pinned agent session."
+                    continue
+                }
+                await finalizeWorkspaceDeletion(localWorkspace, saveLegacyIndex: false)
+                result.deletedWorkspaceIDs.append(workspaceID)
                 continue
             }
             let metadata = authoritative.document.metadata
@@ -7007,6 +7035,14 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private static func isLeakedTestFixture(_ metadata: DomainWorkspaceMetadata) -> Bool {
         leakedTestFixtureIdentity(metadata) != nil
+    }
+
+    private static func isLeakedTestFixture(_ workspace: WorkspaceModel) -> Bool {
+        WorkspaceLeakedTestFixtureIdentity.matches(
+            isEphemeral: workspace.isEphemeral,
+            name: workspace.name,
+            repoPaths: workspace.repoPaths
+        )
     }
 
     private static func artifactCleanupWarning(from outcome: DomainCommandOutcome) -> String? {
@@ -8720,6 +8756,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func scheduleSave(workspaceID: UUID, fileURL: URL, source: WorkspaceSaveSource) {
+        guard workspace(withID: workspaceID)?.isEphemeral != true else { return }
         Task {
             await saveWorkspaceAsync(
                 workspaceID: workspaceID,
@@ -8742,10 +8779,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         remainingRetryCount: Int
     ) async throws -> DomainAuthoritySaveResult {
         guard !workspace.isEphemeral else {
-            return DomainAuthoritySaveResult(
-                savedStateVersion: stateVersionByWorkspaceID[workspace.id, default: 0],
-                fileURL: targetURL
-            )
+            throw WorkspaceDirectWriteError.ephemeralWorkspace
         }
         guard let domainWorkspaceAuthorityClient else {
             throw NSError(
@@ -8784,10 +8818,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }.value
         let workspaceToSave = mergeResult.workspace
         guard self.workspace(withID: workspaceToSave.id)?.isEphemeral != true else {
-            return DomainAuthoritySaveResult(
-                savedStateVersion: capturedStateVersion,
-                fileURL: targetURL
-            )
+            throw WorkspaceDirectWriteError.ephemeralWorkspace
         }
 
         #if DEBUG
@@ -8887,7 +8918,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .directUnknown
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
-        guard !workspace.isEphemeral else { return targetURL }
+        guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         if domainWorkspaceAuthorityClient != nil {
             let result = try await persistWorkspaceThroughDomainAuthority(
                 workspace,
@@ -8952,7 +8983,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         metadata: WorkspaceSavePayloadMetadata? = nil
     ) async throws -> URL {
         let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
-        guard !workspace.isEphemeral else { return finalURL }
+        guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             WorkspaceSaveTracer.event(
                 "workspaceSave.direct.denied",
@@ -8981,7 +9012,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
         let finalURL = workspaceFileURL(for: workspace)
-        guard !workspace.isEphemeral else { return finalURL }
+        guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             throw NSError(
                 domain: "RepoPrompt.DomainWorkspaceAuthority",

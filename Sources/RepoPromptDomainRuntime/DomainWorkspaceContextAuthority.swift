@@ -475,7 +475,9 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
-            if case let .createWorkspace(document) = envelope.command {
+            if prior.disposition == .applied,
+               case let .createWorkspace(document) = envelope.command
+            {
                 do {
                     catalogRevision = try await max(
                         catalogRevision,
@@ -505,7 +507,9 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
-            if case let .createWorkspace(document) = envelope.command {
+            if prior.disposition == .applied,
+               case let .createWorkspace(document) = envelope.command
+            {
                 do {
                     catalogRevision = try await max(
                         catalogRevision,
