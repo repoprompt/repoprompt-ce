@@ -47,7 +47,7 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
     func testLaunchUsesGrokAgentStdio() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig())
         let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
-        XCTAssertEqual(launch.arguments, ["agent", "stdio"])
+        XCTAssertEqual(launch.arguments, ["agent", "--no-leader", "stdio"])
         XCTAssertNil(launch.cleanupArtifact)
     }
 
@@ -62,13 +62,13 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
         let launch = try provider.makeLaunchConfiguration(
             for: makeRequest(workspacePath: directory.path, autoApprove: true)
         )
-        XCTAssertEqual(launch.arguments, ["agent", "--always-approve", "stdio"])
+        XCTAssertEqual(launch.arguments, ["agent", "--always-approve", "--no-leader", "stdio"])
     }
 
     func testConfigFullAccessAppendsAlwaysApproveForHeadless() throws {
         let (provider, directory) = try makeProvider(config: GrokBuildAgentConfig(alwaysApproveTools: true))
         let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
-        XCTAssertEqual(launch.arguments, ["agent", "--always-approve", "stdio"])
+        XCTAssertEqual(launch.arguments, ["agent", "--always-approve", "--no-leader", "stdio"])
     }
 
     func testAlwaysApproveIsNotDuplicatedWhenBothSourcesSet() throws {

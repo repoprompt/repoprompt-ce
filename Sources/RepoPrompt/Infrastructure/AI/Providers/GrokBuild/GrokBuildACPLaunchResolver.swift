@@ -9,10 +9,14 @@ enum GrokBuildACPLaunchCandidate: Equatable {
 
     /// Approval/model flags belong to the parent `grok agent` command (confirmed against
     /// grok 1.0.3: `grok agent stdio` accepts only `--debug`/`--debug-file`/`--leader-socket`),
-    /// so full-access launches become `["agent", "--always-approve", "stdio"]`. The resolver
-    /// deliberately caches only the executable, never per-request arguments.
+    /// so full-access launches become `["agent", "--no-leader", "--always-approve", "stdio"]`.
+    /// `--no-leader` is mandatory: in leader mode (grok 1.0.4 default) the shared leader
+    /// process spawns MCP servers, which breaks the ACP expected-PID ancestry check that
+    /// admits the injected RepoPrompt MCP connection — the server must be a direct child
+    /// of the ACP session process. The resolver deliberately caches only the executable,
+    /// never per-request arguments.
     var launchArguments: [String] {
-        ["agent", "stdio"]
+        ["agent", "--no-leader", "stdio"]
     }
 
     var helpArguments: [String] {

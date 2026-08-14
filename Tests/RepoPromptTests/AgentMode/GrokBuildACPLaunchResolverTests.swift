@@ -19,7 +19,7 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
 
         XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
-        XCTAssertEqual(launch.arguments, ["agent", "stdio"])
+        XCTAssertEqual(launch.arguments, ["agent", "--no-leader", "stdio"])
         XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, launch.command)
     }
 
