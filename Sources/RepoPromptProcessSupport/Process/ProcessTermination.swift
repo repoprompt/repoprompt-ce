@@ -4,13 +4,13 @@ import Foundation
 
 /// Detailed child termination outcome preserving the exited-vs-signaled
 /// distinction that the normalized `Int32` APIs collapse into `128 + signal`.
-enum ProcessExitStatus: Equatable {
+package enum ProcessExitStatus: Equatable {
     case exited(code: Int32)
     case uncaughtSignal(signal: Int32)
 
     /// Matches the historical normalization used by `waitForTermination` and
     /// `terminateAndReap`: exit code as-is, uncaught signals as `128 + signal`.
-    var normalizedExitCode: Int32 {
+    package var normalizedExitCode: Int32 {
         switch self {
         case let .exited(code):
             code
@@ -21,7 +21,7 @@ enum ProcessExitStatus: Equatable {
 
     /// `Process.terminationStatus` parity: the exit code for normal exits and
     /// the raw signal number for uncaught signals.
-    var terminationStatus: Int32 {
+    package var terminationStatus: Int32 {
         switch self {
         case let .exited(code):
             code
@@ -31,7 +31,7 @@ enum ProcessExitStatus: Equatable {
     }
 
     /// `Process.terminationReason` parity.
-    var terminationReason: Process.TerminationReason {
+    package var terminationReason: Process.TerminationReason {
         switch self {
         case .exited:
             .exit
@@ -41,11 +41,11 @@ enum ProcessExitStatus: Equatable {
     }
 }
 
-enum ProcessTerminationError: Error, Equatable, LocalizedError {
+package enum ProcessTerminationError: Error, Equatable, LocalizedError {
     case childOwnershipLost(pid: pid_t)
     case waitFailed(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .childOwnershipLost(pid):
             "waitpid reported ECHILD for sole-reaper child \(pid)"
@@ -251,7 +251,7 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
     }
 }
 
-enum ProcessTermination {
+package enum ProcessTermination {
     private struct TerminationTiming {
         let cooperativeWaitTimeout: TimeInterval
         let sigtermGrace: TimeInterval
@@ -269,19 +269,19 @@ enum ProcessTermination {
     private static let appTerminationCooperativeWaitTimeout: TimeInterval = 0.75
     private static let terminationModeLock = NSLock()
     private static var appTerminationFastPathEnabled = false
-    static func beginAppTerminationFastPath() {
+    package static func beginAppTerminationFastPath() {
         terminationModeLock.lock()
         appTerminationFastPathEnabled = true
         terminationModeLock.unlock()
     }
 
-    static func resetAppTerminationFastPath() {
+    package static func resetAppTerminationFastPath() {
         terminationModeLock.lock()
         appTerminationFastPathEnabled = false
         terminationModeLock.unlock()
     }
 
-    static func cooperativeCancellationWaitTimeout() -> TimeInterval {
+    package static func cooperativeCancellationWaitTimeout() -> TimeInterval {
         currentTiming().cooperativeWaitTimeout
     }
 
@@ -330,7 +330,7 @@ enum ProcessTermination {
     /// are neither a normal exit nor an uncaught signal (for example a stopped
     /// child) fall back to `.exited(code: rawStatus)`, matching the historical
     /// normalized fallback of returning the raw status unchanged.
-    static func decodeWaitStatus(_ rawStatus: Int32) -> ProcessExitStatus {
+    package static func decodeWaitStatus(_ rawStatus: Int32) -> ProcessExitStatus {
         if waitStatusExited(rawStatus) { return .exited(code: waitStatusExitCode(rawStatus)) }
         if waitStatusSignaled(rawStatus) { return .uncaughtSignal(signal: waitStatusSignal(rawStatus)) }
         return .exited(code: rawStatus)
@@ -354,7 +354,7 @@ enum ProcessTermination {
     }
 
     @discardableResult
-    static func signalProcessGroupOnly(
+    package static func signalProcessGroupOnly(
         processGroupID: pid_t,
         signal: Int32,
         logger: (String) -> Void = { _ in }
@@ -369,7 +369,7 @@ enum ProcessTermination {
     }
 
     @discardableResult
-    static func signalProcessGroupOrPID(
+    package static func signalProcessGroupOrPID(
         pid: pid_t,
         processGroupID: pid_t?,
         signal: Int32,
@@ -525,7 +525,7 @@ enum ProcessTermination {
     /// `beforeReap` runs synchronously after a non-destructive terminal probe
     /// and before the sole destructive wait. The completion must return promptly
     /// so unrelated child exits can be processed.
-    static func observeChildStatus(
+    package static func observeChildStatus(
         pid: pid_t,
         beforeReap: @escaping @Sendable () -> Void = {},
         completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
@@ -540,7 +540,7 @@ enum ProcessTermination {
     /// Checks child terminal state without consuming the status owned by the
     /// sole reaper. ECHILD also closes PID signaling because the child status
     /// has already been consumed by an observer or ownership was lost.
-    static func childIsTerminalOrAlreadyReaped(_ pid: pid_t) -> Bool {
+    package static func childIsTerminalOrAlreadyReaped(_ pid: pid_t) -> Bool {
         while true {
             var info = siginfo_t()
             let result = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
@@ -555,7 +555,7 @@ enum ProcessTermination {
     }
 
     /// Async convenience wrapper over the callback-based sole-reaper primitive.
-    static func reapChildStatus(
+    package static func reapChildStatus(
         pid: pid_t,
         beforeReap: @escaping @Sendable () -> Void = {}
     ) async throws -> ProcessExitStatus {
@@ -569,7 +569,7 @@ enum ProcessTermination {
     /// Applies bounded TERM-to-KILL cleanup using process-group signaling only.
     /// The API intentionally accepts no PID and never calls waitpid, so it is
     /// safe both while another owner is reaping the direct child and after reap.
-    static func terminateProcessGroup(
+    package static func terminateProcessGroup(
         processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,
         sigkillGrace: TimeInterval? = nil,
@@ -612,7 +612,7 @@ enum ProcessTermination {
 
     /// Cleans descendants after the direct child has already been reaped.
     /// Retained as the explicit call-site vocabulary for sole-reaper lifecycles.
-    static func terminateProcessGroupAfterRootReap(
+    package static func terminateProcessGroupAfterRootReap(
         processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,
         sigkillGrace: TimeInterval? = nil,
@@ -629,7 +629,7 @@ enum ProcessTermination {
     /// Applies TERM-to-KILL policy to a child whose sole destructive reap is
     /// already owned by `ChildProcessExitObserver`. No code in this path calls
     /// `waitpid`; descendant cleanup starts only after observation settles.
-    static func terminateObservedProcessFamily(
+    package static func terminateObservedProcessFamily(
         observer: ChildProcessExitObserver,
         processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,
@@ -677,7 +677,7 @@ enum ProcessTermination {
         )
     }
 
-    static func waitForTermination(
+    package static func waitForTermination(
         pid: pid_t,
         processGroupID: pid_t?,
         timeout: TimeInterval?,
@@ -695,7 +695,7 @@ enum ProcessTermination {
     /// Detailed variant of `waitForTermination` that preserves exited-vs-signaled
     /// semantics. Identical waiting, cancellation, timeout, and escalation
     /// behavior; only the result representation differs.
-    static func waitForTerminationStatus(
+    package static func waitForTerminationStatus(
         pid: pid_t,
         processGroupID: pid_t?,
         timeout: TimeInterval?,
@@ -787,7 +787,7 @@ enum ProcessTermination {
         }
     }
 
-    static func terminateAndReap(
+    package static func terminateAndReap(
         pid: pid_t,
         processGroupID: pid_t?,
         sigtermGrace: TimeInterval? = nil,

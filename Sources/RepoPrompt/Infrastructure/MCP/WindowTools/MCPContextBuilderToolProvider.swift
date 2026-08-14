@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptProcessSupport
 
 /// Carries existing non-Sendable UI snapshot/DTO values through the provider's @Sendable timeline
 /// wrappers without broadening their conformances. Each operation stores once and is fully awaited

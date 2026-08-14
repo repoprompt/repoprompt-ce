@@ -1,14 +1,14 @@
 import Foundation
 
-enum CLINativePathDefaults {
-    static let homebrewBins: [String] = [
+package enum CLINativePathDefaults {
+    package static let homebrewBins: [String] = [
         "/usr/local/bin",
         "/usr/local/sbin",
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin"
     ]
 
-    static let systemBins: [String] = orderedUnique(
+    package static let systemBins: [String] = orderedUnique(
         homebrewBins + [
             "/usr/bin",
             "/bin",
@@ -17,7 +17,7 @@ enum CLINativePathDefaults {
         ]
     )
 
-    static let nodePackageManagerBins: [String] = [
+    package static let nodePackageManagerBins: [String] = [
         "~/.volta/bin",
         "~/.local/share/pnpm",
         "~/.yarn/bin",
@@ -25,7 +25,7 @@ enum CLINativePathDefaults {
         "~/.npm-global/bin"
     ]
 
-    static let versionManagerShimBins: [String] = [
+    package static let versionManagerShimBins: [String] = [
         "~/.config/mise/shims",
         "~/.asdf/shims",
         "~/.nodenv/shims",
@@ -33,7 +33,7 @@ enum CLINativePathDefaults {
         "~/.rbenv/shims"
     ]
 
-    static let userToolBins: [String] = [
+    package static let userToolBins: [String] = [
         "~/.local/bin",
         "~/bin",
         "~/go/bin",
@@ -41,14 +41,14 @@ enum CLINativePathDefaults {
         "~/.bun/bin"
     ]
 
-    static let defaultAdditionalPaths: [String] = orderedUnique(
+    package static let defaultAdditionalPaths: [String] = orderedUnique(
         systemBins +
             nodePackageManagerBins +
             versionManagerShimBins +
             userToolBins
     )
 
-    static let loginShellFallbackCandidates: [String] = orderedUnique(
+    package static let loginShellFallbackCandidates: [String] = orderedUnique(
         homebrewBins +
             nodePackageManagerBins +
             versionManagerShimBins +

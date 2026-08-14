@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 struct ACPLaunchEnvironment: Equatable {
     let environment: [String: String]

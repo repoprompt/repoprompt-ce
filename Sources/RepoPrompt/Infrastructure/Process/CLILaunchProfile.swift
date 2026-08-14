@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcessSupport
 
 struct CLILaunchProfile: Equatable {
     let commandName: String

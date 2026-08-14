@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcessSupport
 import XCTest
 
 final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {

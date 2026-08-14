@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptProcessSupport
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift

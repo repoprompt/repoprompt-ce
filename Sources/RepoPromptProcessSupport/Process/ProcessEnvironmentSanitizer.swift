@@ -6,10 +6,10 @@ import Foundation
 /// migrated in later phases so security detection and spawn-time scrubbing cannot
 /// drift on dynamic-loader environment keys. Sanitization treats all `DYLD_` and
 /// `__XPC_DYLD_` variables as dynamic-loader state.
-enum ProcessEnvironmentSanitizer {
-    static let dynamicLoaderInsertLibrariesKey = "DYLD_INSERT_LIBRARIES"
+package enum ProcessEnvironmentSanitizer {
+    package static let dynamicLoaderInsertLibrariesKey = "DYLD_INSERT_LIBRARIES"
 
-    static let dynamicLoaderKeys: Set<String> = [
+    package static let dynamicLoaderKeys: Set<String> = [
         dynamicLoaderInsertLibrariesKey,
         "DYLD_LIBRARY_PATH",
         "DYLD_FRAMEWORK_PATH",
@@ -23,7 +23,7 @@ enum ProcessEnvironmentSanitizer {
         "__XPC_DYLD_"
     ]
 
-    static func sanitizedForChildLaunch(
+    package static func sanitizedForChildLaunch(
         _ environment: [String: String],
         additionalRemovedKeys: Set<String> = []
     ) -> [String: String] {
@@ -32,7 +32,7 @@ enum ProcessEnvironmentSanitizer {
         }
     }
 
-    static func isDynamicLoaderKey(_ key: String) -> Bool {
+    package static func isDynamicLoaderKey(_ key: String) -> Bool {
         if dynamicLoaderKeys.contains(key) {
             return true
         }

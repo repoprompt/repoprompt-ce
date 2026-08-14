@@ -160,13 +160,14 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
         "RepoPromptMCP",
+        "RepoPromptProcessSupport",
         "RepoPromptShared",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
     if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
-            "RepoPromptDomainRuntime, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptDomainRuntime, RepoPromptMCP, RepoPromptProcessSupport, and RepoPromptShared"
         )
 
     domain_runtime = targets["RepoPromptDomainRuntime"]

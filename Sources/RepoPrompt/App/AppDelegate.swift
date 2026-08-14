@@ -2,6 +2,7 @@ import Cocoa
 import Combine
 import Darwin
 import Logging
+import RepoPromptProcessSupport
 import Sparkle
 import SwiftUI
 
