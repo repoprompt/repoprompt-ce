@@ -192,9 +192,8 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         ])
         let gate = ProvisionerSuspensionGate()
         let provisionedRuntime = ProvisionedRuntimeRecorder()
-        let expectedSkillRoot = directory.appendingPathComponent("global-skills", isDirectory: true)
+        let expectedSkillRoot = AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills
         var options = makeAgentModeOptions()
-        options.skillExtraRootsProvider = { [expectedSkillRoot] }
         // Park the provisioner so the ordering can be observed: nothing downstream may happen while
         // it is suspended.
         options.repoPromptMCPProvisioner = { runtime in

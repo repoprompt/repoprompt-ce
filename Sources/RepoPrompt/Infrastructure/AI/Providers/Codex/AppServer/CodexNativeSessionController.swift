@@ -567,9 +567,7 @@ final class CodexNativeSessionController {
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
-        var skillExtraRootsProvider: () -> [URL] = {
-            [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
-        }
+        var skillExtraRootsProvider: () -> [URL] = { [] }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
@@ -629,7 +627,10 @@ final class CodexNativeSessionController {
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider
+                computerUseEnabledProvider: computerUseEnabledProvider,
+                skillExtraRootsProvider: {
+                    [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
+                }
             )
         }
     }
@@ -1293,11 +1294,13 @@ final class CodexNativeSessionController {
             await ensureInboundStreamsStarted()
 
             let skillExtraRoots = options.skillExtraRootsProvider().map(\.standardizedFileURL.path)
-            _ = try await performRequest(
-                method: "skills/extraRoots/set",
-                params: ["extraRoots": skillExtraRoots],
-                timeout: options.requestTimeout
-            )
+            if !skillExtraRoots.isEmpty {
+                _ = try await performRequest(
+                    method: "skills/extraRoots/set",
+                    params: ["extraRoots": skillExtraRoots],
+                    timeout: options.requestTimeout
+                )
+            }
 
             if let resumeThreadID {
                 let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {

@@ -776,6 +776,23 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         }
     }
 
+    func testStandardCodexProviderDoesNotRegisterAgentModeSkillRoots() async throws {
+        let provider = CodexCLIProvider(
+            defaultRequestTimeout: 5,
+            testRequestTimeout: 5,
+            maxRetries: 0,
+            appServerReadyHook: {}
+        )
+        let options = provider.interactiveSessionOptions(excludeServers: [], requestTimeout: 5)
+        let (controller, recordURL) = try await makeController(options: options)
+
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Chat")
+        await controller.shutdown()
+
+        XCTAssertEqual(try recordedRequests(for: "skills/extraRoots/set", at: recordURL).count, 0)
+        XCTAssertEqual(try recordedRequests(for: "thread/start", at: recordURL).count, 1)
+    }
+
     func testSchemaAlignedThreadRequestsOmitUndeclaredFieldsAndAcceptMissingGoal() async throws {
         let (startController, startRecordURL) = try await makeController(options: makeOptions())
         _ = try await startController.startOrResume(
