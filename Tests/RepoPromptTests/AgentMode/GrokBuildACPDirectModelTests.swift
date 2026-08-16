@@ -193,6 +193,46 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertEqual(mutations.count, 1)
         XCTAssertEqual(mutations.first?.params["modelId"] as? String, "grok-4.6-low", "an exact advertised base stays selectable as that base")
         XCTAssertNil(mutations.first?.params["_meta"])
+        let after = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        XCTAssertEqual(after?.currentModelRaw, "grok-4.6-low")
+        XCTAssertEqual(
+            after?.currentEffortRaw,
+            "high",
+            "a model-only request confirms nothing about effort — the last confirmed effort is preserved"
+        )
+
+        // Re-selecting the same effort-free base is a complete no-op.
+        try await fixture.controller.setSessionModel("grok-4.6-low")
+        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_model").count, 1)
+    }
+
+    func testWarmedRegistryCannotAuthorizeEffortSelection() async throws {
+        // Warm the registry with a full snapshot first.
+        let warmFixture = try makeFixture(shape: "grok_direct")
+        try await bootstrap(warmFixture.controller)
+        XCTAssertNotNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild))
+
+        // A new session advertising NO model metadata: validation falls back to the warmed
+        // registry, which must never authorize an effort mutation — the provider may have
+        // removed the effort since, and grok silently ignores unknown efforts while still
+        // acknowledging the base.
+        let coldFixture = try makeFixture(shape: "grok_bare")
+        try await bootstrap(coldFixture.controller)
+
+        do {
+            try await coldFixture.controller.setSessionModel("grok-4.5-low")
+            XCTFail("expected warmed-only effort selection to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("live session model set"), "unexpected error: \(error)")
+        }
+        do {
+            // Bare picks resolve to the (stale) advertised default — also an effort mutation.
+            try await coldFixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected warmed-only default-effort selection to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("live session model set"), "unexpected error: \(error)")
+        }
+        XCTAssertTrue(recordedRequests(at: coldFixture.recordURL, method: "session/set_model").isEmpty)
     }
 
     func testLegacyProviderRecordWithoutEffortDecodes() throws {
