@@ -279,6 +279,93 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         )
     }
 
+    func testValidPlusMalformedDoubleSelectionLeavesEffortUnknown() async throws {
+        // One valid selected mode plus a malformed selected entry (no id): cardinality is
+        // counted over ALL selected entries, so this must not confirm anything.
+        let fixture = try makeFixture(shape: "grok_direct", doubleSelect: true)
+        try await bootstrap(fixture.controller)
+
+        XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw)
+    }
+
+    func testModeIdValueCrossCollisionLeavesEffortUnknown() async throws {
+        // The selected id "high" matches one pair's id (→ high) and another pair's id
+        // (→ low): ambiguous, so no effort authority may be recorded.
+        let fixture = try makeFixture(shape: "grok_direct", crossCollision: true)
+        try await bootstrap(fixture.controller)
+
+        XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw)
+    }
+
+    func testPreferredModelRawResolvesNonDefaultActiveEffortToVariant() {
+        let base = AgentModelOption(
+            rawValue: "grok-4.6",
+            displayName: "Grok 4.6",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false,
+            supportedReasoningEfforts: [.low, .medium, .high, .xhigh],
+            defaultReasoningEffort: .high
+        )
+        let lowVariant = AgentModelOption(
+            rawValue: "grok-4.6-low",
+            displayName: "Grok 4.6 Low",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false,
+            effortVariant: AgentModelEffortVariant(baseModelRaw: "grok-4.6", reasoningEffort: .low)
+        )
+        let highVariant = AgentModelOption(
+            rawValue: "grok-4.6-high",
+            displayName: "Grok 4.6 High",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false,
+            effortVariant: AgentModelEffortVariant(baseModelRaw: "grok-4.6", reasoningEffort: .high)
+        )
+        let options = [base, lowVariant, highVariant]
+
+        // Confirmed non-default active effort → the provenanced variant.
+        XCTAssertEqual(
+            ACPDiscoveredSessionModels(options: options, currentModelRaw: "grok-4.6", currentEffortRaw: "low").preferredModelRaw,
+            "grok-4.6-low"
+        )
+        // Default effort → the bare base alias.
+        XCTAssertEqual(
+            ACPDiscoveredSessionModels(options: options, currentModelRaw: "grok-4.6", currentEffortRaw: "high").preferredModelRaw,
+            "grok-4.6"
+        )
+        // Unknown effort → base.
+        XCTAssertEqual(
+            ACPDiscoveredSessionModels(options: options, currentModelRaw: "grok-4.6").preferredModelRaw,
+            "grok-4.6"
+        )
+    }
+
+    func testStoreMergeKeepsVariantProvenanceOnlyOnAgreement() throws {
+        let variantOption = AgentModelOption(
+            rawValue: "grok-4.6-low",
+            displayName: "Grok 4.6 Low",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false,
+            effortVariant: AgentModelEffortVariant(baseModelRaw: "grok-4.6", reasoningEffort: .low)
+        )
+        let realBase = AgentModelOption(
+            rawValue: "grok-4.6-low",
+            displayName: "Grok 4.6 Low Edition",
+            description: nil,
+            isPlaceholderDefault: false,
+            isProviderDefault: false
+        )
+        let snapshot = ACPDiscoveredSessionModels(options: [variantOption, realBase], currentModelRaw: nil)
+        let record = try XCTUnwrap(ACPDynamicModelStore.canonicalProviderRecord(from: snapshot, providerID: .grokBuild))
+        let restored = try XCTUnwrap(ACPDynamicModelStore.snapshot(from: record))
+        let merged = restored.options.first { $0.rawValue == "grok-4.6-low" }
+        XCTAssertNotNil(merged)
+        XCTAssertNil(merged?.effortVariant, "disagreeing provenance must not stick to the merged record")
+    }
+
     func testLegacyProviderRecordWithoutEffortDecodes() throws {
         // Records persisted before effort support lack currentEffortRaw; decoding must not
         // break existing stores.
@@ -595,7 +682,9 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         setModelAck: String = "ok",
         sessionEffort: String = "high",
         default45Effort: String = "high",
-        lowModeID: String = "low"
+        lowModeID: String = "low",
+        doubleSelect: Bool = false,
+        crossCollision: Bool = false
     ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
@@ -607,6 +696,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "ACP_SESSION_EFFORT": sessionEffort,
             "ACP_45_DEFAULT_EFFORT": default45Effort,
             "ACP_LOW_MODE_ID": lowModeID,
+            "ACP_DOUBLE_SELECT": doubleSelect ? "1" : "0",
+            "ACP_CROSS_COLLISION": crossCollision ? "1" : "0",
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -675,6 +766,12 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                                    {"id": "high", "value": "high", "label": "High Effort", "default": True},
                                    {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
                                    {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False}
+                               ] if os.environ.get("ACP_CROSS_COLLISION") != "1" else [
+                                   {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
+                                   {"id": "high", "value": "high", "label": "High Effort", "default": True},
+                                   {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                   # Cross-collision: this pair's id is another pair's value.
+                                   {"id": "high", "value": "low", "label": "Low Effort", "default": False}
                                ]}},
                     {"modelId": "grok-4.5", "name": "Grok 4.5",
                      "_meta": {"supportsReasoningEffort": True,
@@ -693,11 +790,15 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             if session_effort == "none":
                 return {}
             modes = ["xhigh", "high", "medium", "low"]
-            return {"x.ai/sessionConfig": {"options": [
+            options = [
                 {"id": low_mode_id if m == "low" else m,
                  "category": "mode", "label": m, "selected": m == session_effort}
                 for m in modes
-            ]}}
+            ]
+            if os.environ.get("ACP_DOUBLE_SELECT") == "1":
+                # A malformed second selected entry: cardinality must still fail closed.
+                options.append({"category": "mode", "label": "broken", "selected": True})
+            return {"x.ai/sessionConfig": {"options": options}}
 
         def modern_model_selector(value=None):
             return {

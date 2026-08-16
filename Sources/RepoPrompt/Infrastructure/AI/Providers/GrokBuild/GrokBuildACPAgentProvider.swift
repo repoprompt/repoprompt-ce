@@ -293,31 +293,30 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         // The session's ACTIVE effort comes from the session config's selected mode entry
         // (`_meta["x.ai/sessionConfig"].options`, category "mode") — never from a model's
         // advertised default, which would silently promote defaults to confirmed state.
-        // Exactly one mode may be selected, and its id resolves through the CURRENT model's
-        // advertised id→value pairs (the wire separates them; they are not assumed equal).
-        // Anything ambiguous or unadvertised leaves the active effort unknown.
+        // Cardinality is fail-closed: exactly one mode entry may be selected (a malformed
+        // selected entry still counts), its id must be present, and it must resolve to
+        // exactly one effort through the CURRENT model's advertised id→value pairs (an id
+        // colliding with another pair's value is ambiguous → unknown).
         let sessionConfig = (sessionResponse["_meta"] as? [String: Any])?["x.ai/sessionConfig"] as? [String: Any]
         let sessionOptions = sessionConfig?["options"] as? [[String: Any]] ?? []
-        let selectedModeIDs = sessionOptions.compactMap { option -> String? in
-            guard (option["category"] as? String) == "mode",
-                  (option["selected"] as? Bool) == true,
-                  let id = (option["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !id.isEmpty
-            else { return nil }
-            return id
+        let selectedModeEntries = sessionOptions.filter {
+            ($0["category"] as? String) == "mode" && ($0["selected"] as? Bool) == true
         }
         let currentEffortRaw: String? = {
-            guard selectedModeIDs.count == 1, let selectedID = selectedModeIDs.first,
+            guard selectedModeEntries.count == 1,
+                  let selectedID = (selectedModeEntries[0]["id"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !selectedID.isEmpty,
                   let currentRaw,
                   let pairs = effortPairsByModelRaw[currentRaw]
             else { return nil }
-            for pair in pairs
-                where pair.id.caseInsensitiveCompare(selectedID) == .orderedSame
-                || pair.effort.rawValue.caseInsensitiveCompare(selectedID) == .orderedSame
-            {
-                return pair.effort.rawValue
+            let matches = pairs.filter {
+                $0.id.caseInsensitiveCompare(selectedID) == .orderedSame
+                    || $0.effort.rawValue.caseInsensitiveCompare(selectedID) == .orderedSame
             }
-            return nil
+            let distinctEfforts = Set(matches.map { $0.effort.rawValue.lowercased() })
+            guard distinctEfforts.count == 1 else { return nil }
+            return matches.first?.effort.rawValue
         }()
 
         return .valid(ACPDiscoveredSessionModels(

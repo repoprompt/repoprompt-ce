@@ -34,8 +34,23 @@ struct ACPDiscoveredSessionModels: Equatable {
     }
 
     var preferredModelRaw: String? {
-        option(matching: currentModelRaw)?.rawValue
-            ?? Self.normalizedRawModel(currentModelRaw)
+        if let current = option(matching: currentModelRaw) {
+            // A confirmed non-default active effort resolves to its provenanced variant
+            // (`grok-4.6` at low → `grok-4.6-low`); a default effort stays the bare base
+            // alias, and nil/unresolvable effort falls back to the base.
+            if let effortRaw = currentEffortRaw,
+               let effort = CodexReasoningEffort.parse(effortRaw),
+               effort != current.defaultReasoningEffort,
+               let variant = options.first(where: {
+                   $0.effortVariant?.reasoningEffort == effort
+                       && $0.effortVariant?.baseModelRaw.caseInsensitiveCompare(current.rawValue) == .orderedSame
+               })
+            {
+                return variant.rawValue
+            }
+            return current.rawValue
+        }
+        return Self.normalizedRawModel(currentModelRaw)
             ?? options.first(where: \.isProviderDefault)?.rawValue
             ?? options.first?.rawValue
     }

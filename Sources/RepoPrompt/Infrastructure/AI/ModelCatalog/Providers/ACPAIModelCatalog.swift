@@ -222,7 +222,9 @@ enum ACPDynamicModelStore {
             isProviderDefault: existing.isProviderDefault || candidate.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
-            effortVariant: metadataRecord.effortVariant ?? fallbackRecord.effortVariant
+            // Variant provenance is semantic identity, not metadata: keep it only when both
+            // records agree, so a real base (nil) never inherits stale variant provenance.
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
         )
     }
 
