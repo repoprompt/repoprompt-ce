@@ -1100,12 +1100,25 @@ enum ToolResultDTOs {
         }
 
         struct OracleLaneDTO: Codable, Equatable {
+            struct ExecutionProfileDTO: Codable, Equatable {
+                let providerID: String
+                let modelID: String
+                let effectiveReasoningEffort: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case providerID = "provider_id"
+                    case modelID = "model_id"
+                    case effectiveReasoningEffort = "effective_reasoning_effort"
+                }
+            }
+
             let laneIndex: Int
             let role: String
             let chatID: String
             let providerID: String?
             let modelID: String
             let status: String
+            let executionProfile: ExecutionProfileDTO?
             let response: String?
             let error: OracleLaneErrorDTO?
 
@@ -1116,6 +1129,7 @@ enum ToolResultDTOs {
                 case providerID = "provider_id"
                 case modelID = "model_id"
                 case status
+                case executionProfile = "execution_profile"
                 case response
                 case error
             }
@@ -1124,6 +1138,75 @@ enum ToolResultDTOs {
         struct OracleWarningDTO: Codable, Equatable {
             let code: String
             let message: String
+        }
+
+        struct OracleSynthesisDTO: Codable, Equatable {
+            struct ModelDTO: Codable, Equatable {
+                let providerID: String
+                let modelID: String
+                let effectiveReasoningEffort: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case providerID = "provider_id"
+                    case modelID = "model_id"
+                    case effectiveReasoningEffort = "effective_reasoning_effort"
+                }
+            }
+
+            let status: String
+            let response: String?
+            let model: ModelDTO?
+            let sourceLaneIndices: [Int]
+            let warning: String?
+            let skippedReason: String?
+            let error: String?
+
+            /// Pre-fix skipped replies carried their reason in `error`.
+            var resolvedSkippedReason: String? {
+                skippedReason ?? (status == ContextBuilderOracleSynthesisStatus.skipped.rawValue ? error : nil)
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case status
+                case response
+                case model
+                case sourceLaneIndices = "source_lane_indices"
+                case warning
+                case skippedReason = "skipped_reason"
+                case error
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                status = try container.decode(String.self, forKey: .status)
+                response = try container.decodeIfPresent(String.self, forKey: .response)
+                model = try container.decodeIfPresent(ModelDTO.self, forKey: .model)
+                sourceLaneIndices = try container.decode([Int].self, forKey: .sourceLaneIndices)
+                warning = try container.decodeIfPresent(String.self, forKey: .warning)
+
+                let decodedSkippedReason = try container.decodeIfPresent(String.self, forKey: .skippedReason)
+                let decodedError = try container.decodeIfPresent(String.self, forKey: .error)
+                if status == ContextBuilderOracleSynthesisStatus.skipped.rawValue {
+                    skippedReason = decodedSkippedReason ?? decodedError
+                    error = nil
+                } else {
+                    skippedReason = decodedSkippedReason
+                    error = decodedError
+                }
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(status, forKey: .status)
+                try container.encodeIfPresent(response, forKey: .response)
+                try container.encodeIfPresent(model, forKey: .model)
+                try container.encode(sourceLaneIndices, forKey: .sourceLaneIndices)
+                try container.encodeIfPresent(warning, forKey: .warning)
+                try container.encodeIfPresent(resolvedSkippedReason, forKey: .skippedReason)
+                if status != ContextBuilderOracleSynthesisStatus.skipped.rawValue {
+                    try container.encodeIfPresent(error, forKey: .error)
+                }
+            }
         }
 
         let chatID: String?
@@ -1136,6 +1219,7 @@ enum ToolResultDTOs {
         let oracleCount: Int?
         let oracleResults: [OracleLaneDTO]?
         let warnings: [OracleWarningDTO]?
+        let synthesis: OracleSynthesisDTO?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
@@ -1149,6 +1233,7 @@ enum ToolResultDTOs {
             case oracleCount = "oracle_count"
             case oracleResults = "oracle_results"
             case warnings
+            case synthesis
         }
 
         init(
@@ -1161,7 +1246,8 @@ enum ToolResultDTOs {
             status: String? = nil,
             oracleCount: Int? = nil,
             oracleResults: [OracleLaneDTO]? = nil,
-            warnings: [OracleWarningDTO]? = nil
+            warnings: [OracleWarningDTO]? = nil,
+            synthesis: OracleSynthesisDTO? = nil
         ) {
             self.chatID = chatID
             self.mode = mode
@@ -1173,6 +1259,7 @@ enum ToolResultDTOs {
             self.oracleCount = oracleCount
             self.oracleResults = oracleResults
             self.warnings = warnings
+            self.synthesis = synthesis
         }
 
         init(from decoder: Decoder) throws {
@@ -1191,6 +1278,7 @@ enum ToolResultDTOs {
             oracleCount = try container.decodeIfPresent(Int.self, forKey: .oracleCount)
             oracleResults = try container.decodeIfPresent([OracleLaneDTO].self, forKey: .oracleResults)
             warnings = try container.decodeIfPresent([OracleWarningDTO].self, forKey: .warnings)
+            synthesis = try container.decodeIfPresent(OracleSynthesisDTO.self, forKey: .synthesis)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1205,6 +1293,7 @@ enum ToolResultDTOs {
             try container.encodeIfPresent(oracleCount, forKey: .oracleCount)
             try container.encodeIfPresent(oracleResults, forKey: .oracleResults)
             try container.encodeIfPresent(warnings, forKey: .warnings)
+            try container.encodeIfPresent(synthesis, forKey: .synthesis)
         }
     }
 

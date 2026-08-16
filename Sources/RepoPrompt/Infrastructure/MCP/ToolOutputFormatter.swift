@@ -4341,7 +4341,7 @@ extension ToolOutputFormatter {
                     "## Generated Response"
                 }
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
+                if let groupBlock = formatOracleGroup(value: planObj, heading: heading, preferSynthesis: true) {
                     blocks.append(.text(separator + groupBlock))
                 } else {
                     blocks.append(.text("\(separator)\(heading)\n"))
@@ -4353,7 +4353,11 @@ extension ToolOutputFormatter {
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
+                if let groupBlock = formatOracleGroup(
+                    value: reviewObj,
+                    heading: "## Code Review",
+                    preferSynthesis: true
+                ) {
                     blocks.append(.text(separator + groupBlock))
                 } else {
                     blocks.append(.text("\(separator)## Code Review\n"))
@@ -4383,7 +4387,11 @@ extension ToolOutputFormatter {
         return formatGeneric(value: value)
     }
 
-    private static func formatOracleGroup(value: Value, heading: String) -> String? {
+    private static func formatOracleGroup(
+        value: Value,
+        heading: String,
+        preferSynthesis: Bool = false
+    ) -> String? {
         guard let dto = value.decode(ToolResultDTOs.ChatSendDTO.self),
               let count = dto.oracleCount,
               let results = dto.oracleResults,
@@ -4403,25 +4411,56 @@ extension ToolOutputFormatter {
         if let groupID = dto.oracleGroupID {
             lines.append("- Oracle group: `\(groupID)`")
         }
-        for lane in ordered {
-            let label = OracleRosterContract.displayLabel(laneIndex: lane.laneIndex)
-            lines.append("")
-            lines.append("### \(label)")
-            lines.append("- Status: \(lane.status)")
-            lines.append("- Model: `\(lane.modelID)`")
-            lines.append("- Chat: `\(lane.chatID)`")
-            if let response = lane.response, !response.isEmpty {
+        if preferSynthesis, let synthesis = dto.synthesis {
+            if synthesis.status == ContextBuilderOracleSynthesisStatus.completed.rawValue,
+               let response = synthesis.response,
+               !response.isEmpty
+            {
+                lines.append("")
+                lines.append("### Synthesized Response")
+                if let modelID = synthesis.model?.modelID {
+                    lines.append("- Model: `\(modelID)`")
+                }
+                lines.append("- Source lanes: \(synthesis.sourceLaneIndices.map(String.init).joined(separator: ", "))")
+                if let warning = synthesis.warning, !warning.isEmpty {
+                    lines.append("- Warning: \(warning)")
+                }
                 lines.append("")
                 lines.append(response)
-            }
-            if let partial = lane.error?.partialResponse, !partial.isEmpty {
                 lines.append("")
-                lines.append(partial)
-            }
-            if let error = lane.error {
+                lines.append("### Oracle Lanes")
+            } else if synthesis.status == ContextBuilderOracleSynthesisStatus.skipped.rawValue {
                 lines.append("")
-                lines.append("Error [\(error.code)]: \(error.message)")
+                let reason = synthesis.resolvedSkippedReason
+                lines.append("- Synthesis skipped" + (reason.map { ": \($0)" } ?? ""))
+            } else if let error = synthesis.error, !error.isEmpty {
+                lines.append("")
+                lines.append("- Synthesis \(synthesis.status): \(error)")
             }
+        }
+        let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
+            let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
+            case .completed: .completed
+            case .failed, .cancelled: .failed
+            case nil: .unavailable
+            }
+            return OracleLaneMarkdownPayload.Lane(
+                laneIndex: lane.laneIndex,
+                chatID: lane.chatID,
+                providerID: lane.executionProfile?.providerID ?? lane.providerID,
+                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
+                status: status,
+                response: lane.response,
+                partialResponse: lane.error?.partialResponse,
+                errorCode: lane.error?.code,
+                errorMessage: lane.error?.message
+            )
+        })
+        let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
+        if !laneMarkdown.isEmpty {
+            lines.append("")
+            lines.append(laneMarkdown)
         }
         if let warnings = dto.warnings {
             for warning in warnings {

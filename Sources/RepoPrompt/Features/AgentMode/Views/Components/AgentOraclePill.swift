@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Oracle Pill
@@ -117,6 +118,10 @@ enum AgentOraclePillLogic {
         return sessions.first(where: {
             $0.oracleGroupID == groupID && $0.oracleLaneIndex == 0
         }) ?? latest
+    }
+
+    static func canCopyAll(_ session: ChatSession) -> Bool {
+        session.oracleGroupID != nil
     }
 
     static func aggregateOracleCount(configuredAdditionalCount: Int, sessions: [ChatSession]) -> Int {
@@ -241,7 +246,14 @@ struct AgentOraclePill: View {
         let actionPolicy: ChatTranscriptActionPolicy
     }
 
+    private enum CopyAllFeedback: String {
+        case copying = "Copying…"
+        case copied = "Copied!"
+        case failed = "Copy Failed"
+    }
+
     @State private var presentedPopover: PopoverPresentation?
+    @State private var copyAllFeedback: CopyAllFeedback?
     @State private var autoScrollEnabled = false
     @State private var openRequestGeneration: UInt64 = 0
     @State private var showRosterConfiguration = false
@@ -479,6 +491,16 @@ struct AgentOraclePill: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if let session = presentedSession(for: presentation),
+                   AgentOraclePillLogic.canCopyAll(session)
+                {
+                    Button(copyAllFeedback?.rawValue ?? "Copy All") {
+                        copyAllLanes(containing: session)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(copyAllFeedback == .copying)
+                }
             }
 
             if let presented = presentedSession(for: presentation) {
@@ -526,6 +548,27 @@ struct AgentOraclePill: View {
         }
         .padding(14)
         .frame(width: popoverWidth)
+    }
+
+    private func copyAllLanes(containing session: ChatSession) {
+        copyAllFeedback = .copying
+        Task { @MainActor in
+            let feedback: CopyAllFeedback
+            do {
+                let payload = try await oracleViewModel.oracleGroupCopyPayload(containing: session)
+                let markdown = OracleLaneMarkdownFormatter.format(payload)
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                feedback = pasteboard.setString(markdown, forType: .string) ? .copied : .failed
+            } catch {
+                feedback = .failed
+            }
+            copyAllFeedback = feedback
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if copyAllFeedback == feedback {
+                copyAllFeedback = nil
+            }
+        }
     }
 
     private func reconcilePresentedSession() {
