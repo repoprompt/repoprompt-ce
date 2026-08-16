@@ -61,7 +61,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.rowSplit.fileRows.first?.metrics, .unknown)
         XCTAssertEqual(coordinator.model?.totalSelectedDisplayTokens, 0)
         XCTAssertTrue(coordinator.isLoading)
-        XCTAssertFalse(coordinator.canMutateDisplayedModel)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
 
         await resolver.releaseNext()
         let expectedMetrics = AgentContextExportRow.Metrics.known(
@@ -730,7 +730,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
     }
 
     @MainActor
-    func testPreservedSameIdentityRefreshKeepsDisplayedRowsWithoutMutation() async {
+    func testPreservedSameIdentityRefreshKeepsDisplayedRowsMutable() async {
         let resolver = GatedModelResolver()
         let coordinator = AgentSelectedFilesModelCoordinator { request in
             await resolver.resolve(request)
@@ -753,7 +753,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.model?.source.promptText, "Stable.swift")
         XCTAssertEqual(coordinator.rowSplit.rows.count, 1)
         XCTAssertTrue(coordinator.isLoading)
-        XCTAssertFalse(coordinator.canMutateDisplayedModel)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
         XCTAssertTrue(coordinator.displayedModelMatches(request.identity))
         XCTAssertFalse(coordinator.completedModelMatches(request.identity))
 

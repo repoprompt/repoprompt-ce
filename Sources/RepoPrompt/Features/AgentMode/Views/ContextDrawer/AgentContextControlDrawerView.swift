@@ -23,6 +23,7 @@ struct AgentContextControlDrawerView: View {
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let oracleViewModel: OracleViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    @ObservedObject var fileBrowseModel: AgentContextFileBrowseModel
     let windowID: Int
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
@@ -385,7 +386,8 @@ struct AgentContextControlDrawerView: View {
                 detailStore: detailStore,
                 modelCoordinator: modelCoordinator,
                 exportContext: exportContext,
-                isSwitchBlankingRows: isSwitchBlankingSelectedFiles
+                isSwitchBlankingRows: isSwitchBlankingSelectedFiles,
+                browseModel: fileBrowseModel
             )
         case .builder:
             AgentContextDrawerBuilderTab(

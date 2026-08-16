@@ -413,6 +413,8 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             return .skippedLoaded
         }
 
+        let canMutatePreservedDisplayedModel = preserveDisplayedModel
+            && completedDisplayedModelMatches(request.identity)
         cancelActiveRefresh(reason: "startReplacement", fields: refreshFields)
 
         let shouldClearLoadedModel = loadedIdentity != request.identity
@@ -430,7 +432,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             model: shouldClearDisplayedModel ? nil : state.model,
             rowSplit: shouldClearDisplayedModel ? .empty : state.rowSplit,
             isLoading: true,
-            canMutateDisplayedModel: false
+            canMutateDisplayedModel: canMutatePreservedDisplayedModel
         )
         debugStats.resolverStarts += 1
         refreshFields["shouldClearLoadedModel"] = String(shouldClearLoadedModel)
@@ -477,7 +479,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                         model: publishedFileRowsModel,
                         rowSplit: fileRowsSplit,
                         isLoading: true,
-                        canMutateDisplayedModel: false
+                        canMutateDisplayedModel: canMutatePreservedDisplayedModel
                     )
                     displayedIdentity = request.identity
                     recordVisibleFileMetricsSnapshot(

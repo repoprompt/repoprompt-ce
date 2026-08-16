@@ -46,6 +46,12 @@ enum WorkspacePreResolvedFullFileMutationMode {
     case remove
 }
 
+enum WorkspacePreResolvedSelectionTargetState: Equatable {
+    case full
+    case codemapOnly
+    case unselected
+}
+
 struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
     static let `default` = Self()
 
@@ -353,6 +359,50 @@ struct WorkspaceSelectionMutationService {
             manualCodemapPaths: base.manualCodemapPaths.filter { !selectedSet.contains($0) },
             slices: slices,
             codemapAutoEnabled: base.codemapAutoEnabled
+        )
+    }
+
+    /// Sets store-revalidated files to one exclusive selection representation for Context Composer browse toggles.
+    /// MCP Git artifact mutations use `mutatePreResolvedFullFilePaths` because they have different representation semantics.
+    func setPreResolvedFilePaths(
+        base: StoredSelection,
+        absolutePaths: [String],
+        targetState: WorkspacePreResolvedSelectionTargetState
+    ) -> StoredSelection {
+        let identities = StoredSelectionPathNormalization.standardizedPaths(absolutePaths)
+        guard !identities.isEmpty else { return base }
+
+        let identitySet = Set(identities)
+        var selectedPaths = StoredSelectionPathNormalization.standardizedPaths(base.selectedPaths)
+        var manualCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(base.manualCodemapPaths)
+        var slices = StoredSelectionPathNormalization.standardizedSlices(base.slices)
+
+        switch targetState {
+        case .full:
+            var selectedSet = Set(selectedPaths)
+            for identity in identities where selectedSet.insert(identity).inserted {
+                selectedPaths.append(identity)
+            }
+            manualCodemapPaths.removeAll { identitySet.contains($0) }
+            slices = slices.filter { !identitySet.contains($0.key) }
+        case .codemapOnly:
+            selectedPaths.removeAll { identitySet.contains($0) }
+            slices = slices.filter { !identitySet.contains($0.key) }
+            var manualCodemapSet = Set(manualCodemapPaths)
+            for identity in identities where manualCodemapSet.insert(identity).inserted {
+                manualCodemapPaths.append(identity)
+            }
+        case .unselected:
+            selectedPaths.removeAll { identitySet.contains($0) }
+            manualCodemapPaths.removeAll { identitySet.contains($0) }
+            slices = slices.filter { !identitySet.contains($0.key) }
+        }
+
+        return StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: targetState == .codemapOnly ? false : base.codemapAutoEnabled
         )
     }
 
@@ -776,7 +826,7 @@ struct WorkspaceSelectionMutationService {
         for key in preflight {
             let raw = rawLookup[key] ?? key
             if let file = resolved[key] {
-                if supportsCodemap(file) {
+                if Self.supportsCodemap(file) {
                     if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
                 } else {
                     await unavailable.append("codemap unavailable: \(displayPath(for: file, rootScope: rootScope))")
@@ -795,7 +845,7 @@ struct WorkspaceSelectionMutationService {
                         var supported = 0
                         var unsupported = 0
                         for file in folder.files {
-                            if supportsCodemap(file) {
+                            if Self.supportsCodemap(file) {
                                 if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
                                 supported += 1
                             } else {
@@ -1272,7 +1322,7 @@ struct WorkspaceSelectionMutationService {
         return mutated
     }
 
-    private func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
+    static func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
         let ext = (file.name as NSString).pathExtension.lowercased()
         guard !ext.isEmpty else { return false }
         return SyntaxManager.supportsCodeMap(fileExtension: ext)

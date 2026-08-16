@@ -131,8 +131,14 @@ actor TokenCalculationService {
     /// Compute tokens from raw text using a cheap UTF-8 byte count plus a safety multiplier.
     @inline(__always)
     static func estimateTokens(for text: String) -> Int {
-        let bytes = text.utf8.count
-        return Int((Double(bytes) / 4.0) * 1.05)
+        estimateTokens(utf8ByteCount: text.utf8.count)
+    }
+
+    /// Compute tokens from a known nonnegative UTF-8 byte count using the canonical heuristic.
+    @inline(__always)
+    static func estimateTokens(utf8ByteCount: Int) -> Int {
+        precondition(utf8ByteCount >= 0, "UTF-8 byte count must be nonnegative")
+        return Int((Double(utf8ByteCount) / 4.0) * 1.05)
     }
 
     /// Middle-truncate text that exceeds `maxTokens`, keeping equal halves from head and tail

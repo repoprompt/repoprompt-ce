@@ -52,6 +52,28 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertNil(projection.projectedLogicalDisplayPath(forPhysicalPath: "/repo/project/Sources/App.swift"))
     }
 
+    func testProjectedLogicalPathComponentsMapsPhysicalRootItself() throws {
+        let logicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/repo/project")
+        let physicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/tmp/worktrees/project-agent")
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: logicalRoot,
+                    physicalRoot: physicalRoot,
+                    binding: Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "wt-1")
+                )
+            ]
+        )
+
+        let components = try XCTUnwrap(
+            projection.projectedLogicalPathComponents(forPhysicalPath: physicalRoot.standardizedFullPath)
+        )
+
+        XCTAssertEqual(components.root, logicalRoot)
+        XCTAssertEqual(components.relativePath, "")
+    }
+
     func testSingleBoundRootDoesNotStealUnboundRootAlias() {
         let logicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/repo/project")
         let docsRoot = WorkspaceRootRef(id: UUID(), name: "Docs", fullPath: "/repo/docs")
@@ -113,6 +135,10 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertEqual(namespace.rootBindings[0].lookupRoot.id, storeRoot.id)
         XCTAssertEqual(Set(namespace.rootBindings[0].clientRoots.map(\.id)), Set([firstLogical.id, secondLogical.id]))
         XCTAssertEqual(namespace.rootBindings[0].preferredClientRoot.id, firstLogical.id)
+        XCTAssertEqual(
+            projection.projectedLogicalPathComponents(forPhysicalPath: physicalPath + "/Sources/App.swift")?.root.id,
+            firstLogical.id
+        )
     }
 
     func testExactFileNamespaceRetainsUnavailableNestedWorktreeBinding() {
