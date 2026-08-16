@@ -226,12 +226,12 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             let supportsEffort = (meta?["supportsReasoningEffort"] as? Bool) == true
             let effortEntries = supportsEffort ? (meta?["reasoningEfforts"] as? [[String: Any]] ?? []) : []
             var supportedEfforts: [CodexReasoningEffort] = []
-            var wireDefaultEffort: CodexReasoningEffort?
             // Every structurally valid pair is retained for ambiguity resolution — including
             // ones whose value doesn't parse. Dropping an unparsed pair would let a selected
             // mode id that actually names an UNKNOWN effort match a different pair by value
             // and be recorded as confirmed authority.
             var effortPairs: [(id: String, valueRaw: String, effort: CodexReasoningEffort?)] = []
+            var listDefaults: [CodexReasoningEffort] = []
             for effortEntry in effortEntries {
                 guard let valueRaw = (effortEntry["value"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !valueRaw.isEmpty
@@ -242,15 +242,20 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                 }
                 guard let effort else { continue }
                 supportedEfforts.append(effort)
-                if wireDefaultEffort == nil, (effortEntry["default"] as? Bool) == true {
-                    wireDefaultEffort = effort
+                if (effortEntry["default"] as? Bool) == true {
+                    listDefaults.append(effort)
                 }
             }
             effortPairsByModelRaw[rawID] = effortPairs
             let declaredDefault = supportsEffort
                 ? CodexReasoningEffort.parse(meta?["reasoningEffort"] as? String)
                 : nil
-            let defaultEffort = [declaredDefault, wireDefaultEffort]
+            // The list default must be UNAMBIGUOUS: conflicting `default: true` entries
+            // cancel out instead of being resolved by array order (grok 1.0.4 ships two on
+            // grok-4.6). The declared per-model value wins when it parses into the list.
+            let distinctListDefaults = Set(listDefaults.map(\.rawValue))
+            let unambiguousListDefault = distinctListDefaults.count == 1 ? listDefaults.first : nil
+            let defaultEffort = [declaredDefault, unambiguousListDefault]
                 .compactMap(\.self)
                 .first(where: { supportedEfforts.contains($0) })
 

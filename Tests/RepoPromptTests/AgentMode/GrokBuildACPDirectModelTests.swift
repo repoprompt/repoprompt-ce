@@ -185,6 +185,50 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertNil(snapshot?.currentEffortRaw, "ambiguous ack: effort authority invalidated too")
     }
 
+    func testBareSelectionRejectedWhenDefaultUnknown() async throws {
+        // Effort-capable with an untrusted declared default (ultra) and NO list default:
+        // a bare pick has nothing to resolve to and must be rejected before any RPC —
+        // silently keeping the active effort is not an option.
+        let fixture = try makeFixture(shape: "grok_direct", default45Effort: "ultra", listDefault45: "none")
+        try await bootstrap(fixture.controller)
+
+        XCTAssertNil(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.options
+                .first { $0.rawValue == "grok-4.5" }?.defaultReasoningEffort
+        )
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected bare pick without an authoritative default to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("no authoritative default"), "unexpected error: \(error)")
+        }
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/set_model").isEmpty)
+
+        // An explicit variant remains selectable.
+        try await fixture.controller.setSessionModel("grok-4.5-low")
+        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_model").count, 1)
+    }
+
+    func testBareSelectionRejectedWhenListDefaultsConflict() async throws {
+        // Two distinct `default: true` entries cancel out; with the declared value also
+        // untrusted, the model has no authoritative default and bare picks are rejected.
+        let fixture = try makeFixture(shape: "grok_direct", default45Effort: "ultra", listDefault45: "multi")
+        try await bootstrap(fixture.controller)
+
+        XCTAssertNil(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.options
+                .first { $0.rawValue == "grok-4.5" }?.defaultReasoningEffort,
+            "conflicting list defaults cancel out"
+        )
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected bare pick with conflicting defaults to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("no authoritative default"), "unexpected error: \(error)")
+        }
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/set_model").isEmpty)
+    }
+
     func testVariantNeverShadowsAdvertisedBaseWithEffortTokenSuffix() async throws {
         let fixture = try makeFixture(shape: "grok_collision")
         try await bootstrap(fixture.controller)
@@ -793,7 +837,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         lowModeID: String = "low",
         doubleSelect: Bool = false,
         crossCollision: Bool = false,
-        ultraIDCollision: Bool = false
+        ultraIDCollision: Bool = false,
+        listDefault45: String = "single"
     ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
@@ -808,6 +853,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "ACP_DOUBLE_SELECT": doubleSelect ? "1" : "0",
             "ACP_CROSS_COLLISION": crossCollision ? "1" : "0",
             "ACP_ULTRA_ID_COLLISION": ultraIDCollision ? "1" : "0",
+            "ACP_45_LIST_DEFAULT": listDefault45,
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -840,6 +886,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         session_effort = os.environ.get("ACP_SESSION_EFFORT", "high")
         effort_default_override = os.environ.get("ACP_45_DEFAULT_EFFORT", "high")
         low_mode_id = os.environ.get("ACP_LOW_MODE_ID", "low")
+        list_default_45 = os.environ.get("ACP_45_LIST_DEFAULT", "single")
         session_id = "grok-direct-session"
         current_model = "grok-4.6"
         modern_current_model = "model-a"
@@ -903,8 +950,10 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                      "_meta": {"supportsReasoningEffort": True,
                                "reasoningEffort": effort_default_override,
                                "reasoningEfforts": [
-                                   {"id": "high", "value": "high", "label": "High Effort", "default": True},
-                                   {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                   {"id": "high", "value": "high", "label": "High Effort",
+                                    "default": list_default_45 in ("single", "multi")},
+                                   {"id": "medium", "value": "medium", "label": "Medium Effort",
+                                    "default": list_default_45 == "multi"},
                                    {"id": "low", "value": "low", "label": "Low Effort", "default": False}
                                ]}}
                 ]

@@ -700,6 +700,17 @@ actor ACPAgentSessionController {
                     throw ControllerError.requestFailed("Grok Build model '\(model)' is not in the discovered model set. Refresh Grok Build models and retry.")
                 }
                 let baseModel = decomposition.base.rawValue
+                // "Effort-capable but default unknown" is not "effort-free": a bare pick on
+                // such a model could silently keep whatever effort is active. Require an
+                // explicit variant instead of guessing.
+                if decomposition.explicitEffort == nil,
+                   !decomposition.base.supportedReasoningEfforts.isEmpty,
+                   decomposition.base.defaultReasoningEffort == nil
+                {
+                    throw ControllerError.requestFailed(
+                        "Grok Build model '\(baseModel)' advertises reasoning efforts but no authoritative default; choose an explicit effort (e.g. \(baseModel)-high)."
+                    )
+                }
                 let resolvedEffort = decomposition.explicitEffort ?? decomposition.base.defaultReasoningEffort
                 // Fail closed on unadvertised efforts before any RPC: grok silently ignores
                 // unknown efforts while still acknowledging the base model, so an effort
