@@ -133,6 +133,14 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "skills/extraRoots/set",
+      "alwaysSent": [
+        "extraRoots"
+      ],
+      "responseSchema": "v2/SkillsExtraRootsSetResponse.json"
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "thread/start",
       "alwaysSent": [
         "approvalPolicy",
