@@ -13,6 +13,12 @@ enum MCPToolExecutionHandlerPhase: String, Equatable {
     case fileActionsPostMutationCatalog = "file_actions.post_mutation_catalog"
     case fileActionsPostMutationSelection = "file_actions.post_mutation_selection"
     case fileActionsReplyConstruction = "file_actions.reply_construction"
+    case readFileRequestResolution = "read_file.request_resolution"
+    case readFileContentRead = "read_file.content_read"
+    case readFileAutoSelection = "read_file.auto_selection"
+    case getFileTreeRequestResolution = "get_file_tree.request_resolution"
+    case getFileTreeIngressWait = "get_file_tree.ingress_wait"
+    case getFileTreeConstruction = "get_file_tree.construction"
     // Graph-first get_code_structure execution stages.
     case getCodeStructureSeedResolution = "get_code_structure.seed_resolution"
     case getCodeStructureGraphSnapshot = "get_code_structure.graph_snapshot"

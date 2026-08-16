@@ -2427,6 +2427,162 @@ import XCTest
             }
         }
 
+        func testReadFileDeadlineReportsProductionContentReadPhase() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let providerGate = MCPExecutionIgnoringCancellationGate()
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let store = fixture.contextA.window.workspaceFileContextStore
+                let rootID = fixture.contextA.rootID
+                let relativePath = "HandlerPhaseRead-\(UUID().uuidString).swift"
+                let fileURL = fixture.contextA.rootURL.appendingPathComponent(relativePath)
+                let windowID = fixture.contextA.window.windowID
+                var originTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                _ = try await store.createFile(
+                    rootID: rootID,
+                    relativePath: relativePath,
+                    content: String(repeating: "let handlerPhaseRead = true\n", count: 4096)
+                )
+                await store.clearSearchDecodedContentCache()
+                try await store.setSearchContentReadChunkHandlerForTesting(rootID: rootID) { path in
+                    guard path == relativePath else { return }
+                    await providerGate.enterAndWait()
+                }
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+
+                do {
+                    let endpoint = try fixture.endpointA()
+                    let activeOriginTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: [
+                                "path": fileURL.path,
+                                "context_id": fixture.contextA.tabID.uuidString,
+                                "_rawJSON": true
+                            ]
+                        )
+                    }
+                    originTask = activeOriginTask
+                    try await clock.waitForSleeperCount(1)
+                    try await providerGate.waitUntilEntered(count: 1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+
+                    let phaseArrived = await Self.waitUntil {
+                        recorder.snapshot().contains {
+                            $0.toolName == MCPWindowToolName.readFile
+                                && $0.phase == .deadlineExpired
+                                && $0.handlerPhase?.phase == .readFileContentRead
+                        }
+                    }
+                    XCTAssertTrue(phaseArrived)
+                    let deadlineEvent = try XCTUnwrap(recorder.snapshot().first {
+                        $0.toolName == MCPWindowToolName.readFile && $0.phase == .deadlineExpired
+                    })
+                    XCTAssertEqual(deadlineEvent.handlerPhase?.phase, .readFileContentRead)
+                    XCTAssertEqual(deadlineEvent.handlerPhase?.transition, .started)
+
+                    await providerGate.release()
+                    try await store.setSearchContentReadChunkHandlerForTesting(rootID: rootID, nil)
+                    let timeoutPayload = try await Self.toolResultObject(activeOriginTask.value)
+                    originTask = nil
+                    XCTAssertEqual(timeoutPayload["code"] as? String, "tool_execution_timeout")
+                    await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    originTask?.cancel()
+                    await providerGate.release()
+                    try? await store.setSearchContentReadChunkHandlerForTesting(rootID: rootID, nil)
+                    if let originTask { _ = try? await originTask.value }
+                    await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testFileTreeDeadlineReportsProductionIngressPhase() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let providerGate = MCPExecutionIgnoringCancellationGate()
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let store = fixture.contextA.window.workspaceFileContextStore
+                let rootID = fixture.contextA.rootID
+                let windowID = fixture.contextA.window.windowID
+                var originTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                    guard observedRootID == rootID else { return }
+                    await providerGate.enterAndWait()
+                }
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+
+                do {
+                    let endpoint = try fixture.endpointA()
+                    let activeOriginTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.getFileTree,
+                            arguments: [
+                                "type": "files",
+                                "context_id": fixture.contextA.tabID.uuidString,
+                                "_rawJSON": true
+                            ]
+                        )
+                    }
+                    originTask = activeOriginTask
+                    try await clock.waitForSleeperCount(1)
+                    try await providerGate.waitUntilEntered(count: 1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+
+                    let phaseArrived = await Self.waitUntil {
+                        recorder.snapshot().contains {
+                            $0.toolName == MCPWindowToolName.getFileTree
+                                && $0.phase == .deadlineExpired
+                                && $0.handlerPhase?.phase == .getFileTreeIngressWait
+                        }
+                    }
+                    XCTAssertTrue(phaseArrived)
+                    let deadlineEvent = try XCTUnwrap(recorder.snapshot().first {
+                        $0.toolName == MCPWindowToolName.getFileTree && $0.phase == .deadlineExpired
+                    })
+                    XCTAssertEqual(deadlineEvent.handlerPhase?.phase, .getFileTreeIngressWait)
+                    XCTAssertEqual(deadlineEvent.handlerPhase?.transition, .started)
+
+                    await providerGate.release()
+                    await store.setScopedIngressBarrierWillFlushHandler(nil)
+                    let timeoutPayload = try await Self.toolResultObject(activeOriginTask.value)
+                    originTask = nil
+                    XCTAssertEqual(timeoutPayload["code"] as? String, "tool_execution_timeout")
+                    await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    originTask?.cancel()
+                    await providerGate.release()
+                    await store.setScopedIngressBarrierWillFlushHandler(nil)
+                    if let originTask { _ = try? await originTask.value }
+                    await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testDetachedCodeStructureTimeoutRecoversBeforeLateProviderDrains() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
