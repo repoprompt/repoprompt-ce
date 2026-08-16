@@ -192,6 +192,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         ])
         let gate = ProvisionerSuspensionGate()
         let provisionedRuntime = ProvisionedRuntimeRecorder()
+        let expectedSkillRoot = AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills
         var options = makeAgentModeOptions()
         // Park the provisioner so the ordering can be observed: nothing downstream may happen while
         // it is suspended.
@@ -229,7 +230,13 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         let processRunning = await client.debugIsProcessRunning()
         XCTAssertTrue(processRunning, "a successful provisioner lets the app-server process start")
         XCTAssertEqual(registrar.registeredClientNames, [expectedClientName], "the launched process registers its expected-agent PID")
-        XCTAssertEqual(requests.methods, ["thread/start"], "the only controller request after a successful start is thread/start")
+        XCTAssertEqual(
+            requests.methods,
+            ["skills/extraRoots/set", "thread/start"],
+            "global skill roots must be registered before the thread starts"
+        )
+        let skillRootParams = try XCTUnwrap(requests.params(for: "skills/extraRoots/set"))
+        XCTAssertEqual(skillRootParams["extraRoots"] as? [String], [expectedSkillRoot.path])
 
         let runtime = try XCTUnwrap(provisionedRuntime.runtime)
         XCTAssertEqual(runtime.source, .externalOverride)
@@ -343,7 +350,7 @@ private final class CallCounter: @unchecked Sendable {
 /// returns a canned `thread/start` result so a session can bind without a real app-server response.
 private final class RecordedRequests: @unchecked Sendable {
     private let lock = NSLock()
-    private var recorded: [String] = []
+    private var recorded: [(method: String, params: [String: Any]?)] = []
     private let threadStartResult: [String: Any]
 
     init(threadStartResult: [String: Any] = [:]) {
@@ -351,9 +358,9 @@ private final class RecordedRequests: @unchecked Sendable {
     }
 
     var executor: @Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any] {
-        { [self] method, _, _ in
+        { [self] method, params, _ in
             lock.lock()
-            recorded.append(method)
+            recorded.append((method: method, params: params))
             lock.unlock()
             return method == "thread/start" ? threadStartResult : [:]
         }
@@ -362,7 +369,13 @@ private final class RecordedRequests: @unchecked Sendable {
     var methods: [String] {
         lock.lock()
         defer { lock.unlock() }
-        return recorded
+        return recorded.map(\.method)
+    }
+
+    func params(for method: String) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded.first { $0.method == method }?.params
     }
 }
 
