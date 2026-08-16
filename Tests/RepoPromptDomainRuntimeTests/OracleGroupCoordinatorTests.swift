@@ -48,17 +48,41 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         ])
     }
 
+    func testSuccessfulExecutionProfileIsPersistedWithoutChangingRosterIdentity() async throws {
+        let profile = try OracleExecutionProfile(
+            providerID: "codex",
+            modelID: "gpt-5.6-sol",
+            effectiveReasoningEffort: "high"
+        )
+        let fixture = try makeFixture(count: 2) { lane in
+            OracleLaneExecutionResponse(response: "lane-\(lane)", executionProfile: profile)
+        }
+        let result = try await OracleGroupCoordinator().execute(
+            group: fixture.group,
+            turnID: OracleTurnID(),
+            input: fixture.input,
+            plans: fixture.plans
+        )
+
+        XCTAssertEqual(result.oracleResults.map(\.modelID), Array(repeating: "duplicate-model", count: 2))
+        XCTAssertEqual(result.oracleResults.map(\.executionProfile), Array(repeating: profile, count: 2))
+    }
+
     func testAuxiliaryFailureAndEmptyResponseAreStructured() async throws {
+        let profile = try OracleExecutionProfile(providerID: "runtime", modelID: "resolved")
         let fixture = try makeFixture(count: 5) { lane in
             if lane == 2 {
                 throw OracleLaneFailure(
                     code: "fixture_failure",
                     message: "lane failed",
-                    partialResponse: "partial"
+                    partialResponse: "partial",
+                    executionProfile: profile
                 )
             }
-            if lane == 4 { return OracleLaneExecutionResponse(response: "  \n") }
-            return OracleLaneExecutionResponse(response: "lane-\(lane)")
+            if lane == 4 {
+                return OracleLaneExecutionResponse(response: "  \n", executionProfile: profile)
+            }
+            return OracleLaneExecutionResponse(response: "lane-\(lane)", executionProfile: profile)
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
@@ -70,7 +94,27 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.status, .partialFailure)
         XCTAssertEqual(result.oracleResults[2].error?.code, "fixture_failure")
         XCTAssertEqual(result.oracleResults[2].error?.partialResponse, "partial")
+        XCTAssertEqual(result.oracleResults[2].executionProfile, profile)
         XCTAssertEqual(result.oracleResults[4].error?.code, "empty_response")
+        XCTAssertEqual(result.oracleResults[4].executionProfile, profile)
+    }
+
+    func testTypedCancellationPreservesResolvedExecutionProfile() async throws {
+        let profile = try OracleExecutionProfile(providerID: "runtime", modelID: "resolved")
+        let fixture = try makeFixture(count: 2) { lane in
+            if lane == 1 { throw OracleLaneCancellation(executionProfile: profile) }
+            return OracleLaneExecutionResponse(response: "primary", executionProfile: profile)
+        }
+        let result = try await OracleGroupCoordinator().execute(
+            group: fixture.group,
+            turnID: OracleTurnID(),
+            input: fixture.input,
+            plans: fixture.plans
+        )
+
+        XCTAssertEqual(result.status, .partialFailure)
+        XCTAssertEqual(result.oracleResults[1].status, .cancelled)
+        XCTAssertEqual(result.oracleResults[1].executionProfile, profile)
     }
 
     func testPrimaryFailureMakesGroupFailed() async throws {

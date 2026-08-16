@@ -20,6 +20,42 @@ enum AppOracleGroupRouting {
     static func usesGroup(additionalModelRaws: [String]) -> Bool {
         !additionalModelRaws.isEmpty
     }
+
+    static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
+        try? OracleExecutionProfile(
+            providerID: providerID(for: model),
+            modelID: model.modelName,
+            effectiveReasoningEffort: model.defaultReasoningEffort
+        )
+    }
+
+    private static func providerID(for model: AIModel) -> String {
+        if case let .customProvider(_, provider, _) = model {
+            return provider
+        }
+        return providerID(for: model.providerType)
+    }
+
+    private static func providerID(for provider: AIProviderType) -> String {
+        switch provider {
+        case .anthropic: "anthropic"
+        case .openAI: "openAI"
+        case .ollama: "ollama"
+        case .azure: "azure"
+        case .openRouter: "openRouter"
+        case .gemini: "gemini"
+        case .deepseek: "deepseek"
+        case .customProvider: "customProvider"
+        case .fireworks: "fireworks"
+        case .grok: "grok"
+        case .groq: "groq"
+        case .zAI: "zAI"
+        case .claudeCode: "claudeCode"
+        case .codex: "codex"
+        case .openCode: "openCode"
+        case .cursor: "cursor"
+        }
+    }
 }
 
 extension OracleViewModel {
@@ -32,10 +68,12 @@ extension OracleViewModel {
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext? = nil,
         frozenInput: OracleInput? = nil,
-        callbacks: AppOracleGroupExecutionCallbacks? = nil
+        callbacks: AppOracleGroupExecutionCallbacks? = nil,
+        capturedProfile: AgentModelsSettingsProfile? = nil
     ) async throws -> [String: Value] {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
-        let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        let profile = capturedProfile
+            ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
         let usesConfiguredGroup = AppOracleGroupRouting.usesGroup(
             additionalModelRaws: profile.additionalOracleModelRaws
         )
@@ -396,6 +434,7 @@ extension OracleViewModel {
             ) ?? "Oracle lane model is not configured."
             throw OracleLaneFailure(code: "model_unavailable", message: message)
         }
+        let executionProfile = AppOracleGroupRouting.executionProfile(for: resolvedModel)
         let laneContext: OracleSendTabContext? = if member.laneID.index == 0 {
             tabContext
         } else if let tabContext {
@@ -426,20 +465,25 @@ extension OracleViewModel {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
             }
             await executionContext.emitDelta(response)
-            return OracleLaneExecutionResponse(response: response)
+            return OracleLaneExecutionResponse(
+                response: response,
+                executionProfile: executionProfile
+            )
         } catch let failure as OracleLaneFailure {
             throw OracleLaneFailure(
                 code: failure.code,
                 message: failure.message,
-                partialResponse: failure.partialResponse ?? partialResponse
+                partialResponse: failure.partialResponse ?? partialResponse,
+                executionProfile: failure.executionProfile ?? executionProfile
             )
         } catch is CancellationError {
             await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
-            throw CancellationError()
+            throw OracleLaneCancellation(executionProfile: executionProfile)
         } catch {
             throw OracleLaneFailure(
                 message: error.localizedDescription,
-                partialResponse: partialResponse
+                partialResponse: partialResponse,
+                executionProfile: executionProfile
             )
         }
     }
@@ -515,6 +559,23 @@ extension OracleViewModel {
 
     static func oracleLabel(laneIndex: Int) -> String {
         OracleRosterContract.displayLabel(laneIndex: laneIndex)
+    }
+
+    @MainActor
+    func oracleGroupCopyPayload(containing session: ChatSession) async throws -> OracleLaneMarkdownPayload {
+        guard let rawGroupID = session.oracleGroupID,
+              let tabID = session.composeTabID
+        else {
+            throw OracleGroupLanePayloadLoader.LoadError.mismatchedProjection
+        }
+        return try await OracleGroupLanePayloadLoader.load(
+            groupID: OracleGroupID(rawValue: rawGroupID),
+            owner: Self.oracleGroupOwner(workspaceID: session.workspaceID, tabID: tabID),
+            selectedSessionID: session.id,
+            sessions: sessions,
+            liveMessages: messagesSnapshot(for:),
+            store: AppDomainRuntimeComposition.shared.oracleConversationStore
+        )
     }
 
     private static func backgroundOracleContext(_ context: OracleSendTabContext) -> OracleSendTabContext {

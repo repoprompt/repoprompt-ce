@@ -12,6 +12,9 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendabl
     case invalidPublicChatID
     case modelOverrideOnContinuation
     case invalidLaneResult(Int)
+    case invalidExecutionProfile
+    case invalidSynthesisRecord
+    case synthesisAlreadyRecorded
     case invalidGroupResult
     case invalidFrozenPackReference
     case invalidFrozenPack
@@ -39,6 +42,12 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendabl
             "Oracle model overrides are valid only when starting a new conversation."
         case let .invalidLaneResult(index):
             "Oracle lane \(index) has an invalid role, status, or payload."
+        case .invalidExecutionProfile:
+            "Oracle execution profiles require non-empty provider and model identifiers and a non-empty effort when supplied."
+        case .invalidSynthesisRecord:
+            "Oracle synthesis requires an ordered completed-lane set, a non-empty response, and an exact terminal turn."
+        case .synthesisAlreadyRecorded:
+            "Oracle synthesis cannot overwrite a different record on the same turn."
         case .invalidGroupResult:
             "Oracle group results require one ordered outcome for every declared lane."
         case .invalidFrozenPackReference:
@@ -412,6 +421,46 @@ package struct OracleLaneError: Codable, Equatable, Sendable {
     }
 }
 
+package struct OracleExecutionProfile: Codable, Equatable, Sendable {
+    package let providerID: String
+    package let modelID: String
+    package let effectiveReasoningEffort: String?
+
+    package init(
+        providerID: String,
+        modelID: String,
+        effectiveReasoningEffort: String? = nil
+    ) throws {
+        let providerID = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effort = effectiveReasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !providerID.isEmpty,
+              (try? OracleRosterContract.normalizedModelID(modelID)) != nil,
+              effort.map({ !$0.isEmpty }) ?? true
+        else {
+            throw OracleGroupContractError.invalidExecutionProfile
+        }
+        self.providerID = providerID
+        self.modelID = modelID
+        self.effectiveReasoningEffort = effort
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case providerID = "provider_id"
+        case modelID = "model_id"
+        case effectiveReasoningEffort = "effective_reasoning_effort"
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            providerID: container.decode(String.self, forKey: .providerID),
+            modelID: container.decode(String.self, forKey: .modelID),
+            effectiveReasoningEffort: container.decodeIfPresent(String.self, forKey: .effectiveReasoningEffort)
+        )
+    }
+}
+
 package struct OracleLaneResult: Codable, Equatable, Sendable {
     package let laneIndex: Int
     package let role: OracleLaneRole
@@ -419,6 +468,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
     package let providerID: String?
     package let modelID: String
     package let status: OracleLaneResultStatus
+    package let executionProfile: OracleExecutionProfile?
     package let response: String?
     package let error: OracleLaneError?
 
@@ -428,6 +478,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         providerID: String?,
         modelID: String,
         status: OracleLaneResultStatus,
+        executionProfile: OracleExecutionProfile? = nil,
         response: String? = nil,
         error: OracleLaneError? = nil
     ) throws {
@@ -448,6 +499,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         self.providerID = providerID?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
         self.status = status
+        self.executionProfile = executionProfile
         self.response = response
         self.error = error
     }
@@ -459,6 +511,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         case providerID = "provider_id"
         case modelID = "model_id"
         case status
+        case executionProfile = "execution_profile"
         case response
         case error
     }
@@ -471,6 +524,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         let providerID = try container.decodeIfPresent(String.self, forKey: .providerID)
         let modelID = try container.decode(String.self, forKey: .modelID)
         let status = try container.decode(OracleLaneResultStatus.self, forKey: .status)
+        let executionProfile = try container.decodeIfPresent(OracleExecutionProfile.self, forKey: .executionProfile)
         let response = try container.decodeIfPresent(String.self, forKey: .response)
         let error = try container.decodeIfPresent(OracleLaneError.self, forKey: .error)
         try Self.validate(
@@ -489,6 +543,7 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
         self.providerID = providerID?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
         self.status = status
+        self.executionProfile = executionProfile
         self.response = response
         self.error = error
     }
@@ -652,6 +707,16 @@ package enum OracleGroupMCPCodec {
             "status": .string(result.status.rawValue)
         ]
         if let providerID = result.providerID { fields["provider_id"] = .string(providerID) }
+        if let profile = result.executionProfile {
+            var profileFields: [String: Value] = [
+                "provider_id": .string(profile.providerID),
+                "model_id": .string(profile.modelID)
+            ]
+            if let effort = profile.effectiveReasoningEffort {
+                profileFields["effective_reasoning_effort"] = .string(effort)
+            }
+            fields["execution_profile"] = .object(profileFields)
+        }
         if let response = result.response { fields["response"] = .string(response) }
         if let error = result.error {
             var errorFields: [String: Value] = [
@@ -729,6 +794,51 @@ package enum OracleTurnState: String, Codable, Sendable {
     case terminal
 }
 
+package struct OracleSynthesisRecord: Codable, Equatable, Sendable {
+    package let model: OracleExecutionProfile
+    package let sourceLaneIndices: [Int]
+    package let response: String
+    package let finishedAt: Date
+
+    package init(
+        model: OracleExecutionProfile,
+        sourceLaneIndices: [Int],
+        response: String,
+        finishedAt: Date
+    ) throws {
+        let response = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sourceLaneIndices.count >= 2,
+              sourceLaneIndices == sourceLaneIndices.sorted(),
+              Set(sourceLaneIndices).count == sourceLaneIndices.count,
+              sourceLaneIndices.allSatisfy({ $0 >= 0 }),
+              !response.isEmpty
+        else {
+            throw OracleGroupContractError.invalidSynthesisRecord
+        }
+        self.model = model
+        self.sourceLaneIndices = sourceLaneIndices
+        self.response = response
+        self.finishedAt = finishedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case model
+        case sourceLaneIndices = "source_lane_indices"
+        case response
+        case finishedAt = "finished_at"
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            model: container.decode(OracleExecutionProfile.self, forKey: .model),
+            sourceLaneIndices: container.decode([Int].self, forKey: .sourceLaneIndices),
+            response: container.decode(String.self, forKey: .response),
+            finishedAt: container.decode(Date.self, forKey: .finishedAt)
+        )
+    }
+}
+
 package struct OracleTurnRecord: Codable, Equatable, Sendable {
     package let id: OracleTurnID
     package let input: OracleInput
@@ -736,6 +846,7 @@ package struct OracleTurnRecord: Codable, Equatable, Sendable {
     package let startedAt: Date
     package let finishedAt: Date?
     package let results: [OracleLaneResult]
+    package let synthesis: OracleSynthesisRecord?
 
     package init(
         id: OracleTurnID = OracleTurnID(),
@@ -743,7 +854,8 @@ package struct OracleTurnRecord: Codable, Equatable, Sendable {
         state: OracleTurnState,
         startedAt: Date,
         finishedAt: Date? = nil,
-        results: [OracleLaneResult] = []
+        results: [OracleLaneResult] = [],
+        synthesis: OracleSynthesisRecord? = nil
     ) {
         self.id = id
         self.input = input
@@ -751,6 +863,7 @@ package struct OracleTurnRecord: Codable, Equatable, Sendable {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.results = results
+        self.synthesis = synthesis
     }
 }
 
@@ -782,7 +895,9 @@ package struct OracleGroupDocument: Codable, Equatable, Sendable {
     ) throws {
         guard group.size == roster.count,
               members.count == group.size,
-              members.map(\.laneID.index) == Array(members.indices)
+              members.map(\.laneID.index) == Array(members.indices),
+              Set(turns.map(\.id)).count == turns.count,
+              turns.allSatisfy(Self.hasValidSynthesis)
         else {
             throw OracleGroupContractError.invalidGroupResult
         }
@@ -796,6 +911,46 @@ package struct OracleGroupDocument: Codable, Equatable, Sendable {
         self.roster = roster
         self.members = members
         self.turns = turns
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case group
+        case owner
+        case name
+        case revision
+        case createdAt
+        case updatedAt
+        case roster
+        case members
+        case turns
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            schemaVersion: container.decode(Int.self, forKey: .schemaVersion),
+            group: container.decode(OracleGroupDescriptor.self, forKey: .group),
+            owner: container.decode(OracleConversationOwner.self, forKey: .owner),
+            name: container.decode(String.self, forKey: .name),
+            revision: container.decode(UInt64.self, forKey: .revision),
+            createdAt: container.decode(Date.self, forKey: .createdAt),
+            updatedAt: container.decode(Date.self, forKey: .updatedAt),
+            roster: container.decode(OracleRoster.self, forKey: .roster),
+            members: container.decode([OracleGroupMember].self, forKey: .members),
+            turns: container.decodeIfPresent([OracleTurnRecord].self, forKey: .turns) ?? []
+        )
+    }
+
+    private static func hasValidSynthesis(_ turn: OracleTurnRecord) -> Bool {
+        guard let synthesis = turn.synthesis else { return true }
+        guard turn.state == .terminal,
+              let finishedAt = turn.finishedAt,
+              synthesis.finishedAt >= finishedAt
+        else { return false }
+        return synthesis.sourceLaneIndices == turn.results.compactMap { result in
+            result.status == .completed ? result.laneIndex : nil
+        }
     }
 }
 
@@ -858,6 +1013,53 @@ package extension OracleGroupDocument {
         return try settling(
             OracleGroupResult(groupID: group.id, status: .failed, oracleResults: results),
             finishedAt: finishedAt
+        )
+    }
+
+    func recordingSynthesis(
+        _ synthesis: OracleSynthesisRecord,
+        for turnID: OracleTurnID
+    ) throws -> Self {
+        guard let turnIndex = turns.firstIndex(where: { $0.id == turnID }) else {
+            throw OracleGroupContractError.invalidSynthesisRecord
+        }
+        let turn = turns[turnIndex]
+        let completedLaneIndices = turn.results.compactMap { result in
+            result.status == .completed ? result.laneIndex : nil
+        }
+        guard turn.state == .terminal,
+              let turnFinishedAt = turn.finishedAt,
+              synthesis.finishedAt >= turnFinishedAt,
+              synthesis.sourceLaneIndices == completedLaneIndices
+        else {
+            throw OracleGroupContractError.invalidSynthesisRecord
+        }
+        if turn.synthesis == synthesis { return self }
+        guard turn.synthesis == nil else {
+            throw OracleGroupContractError.synthesisAlreadyRecorded
+        }
+
+        var updatedTurns = turns
+        updatedTurns[turnIndex] = OracleTurnRecord(
+            id: turn.id,
+            input: turn.input,
+            state: turn.state,
+            startedAt: turn.startedAt,
+            finishedAt: turn.finishedAt,
+            results: turn.results,
+            synthesis: synthesis
+        )
+        return try Self(
+            schemaVersion: schemaVersion,
+            group: group,
+            owner: owner,
+            name: name,
+            revision: revision &+ 1,
+            createdAt: createdAt,
+            updatedAt: max(updatedAt, synthesis.finishedAt),
+            roster: roster,
+            members: members,
+            turns: updatedTurns
         )
     }
 }

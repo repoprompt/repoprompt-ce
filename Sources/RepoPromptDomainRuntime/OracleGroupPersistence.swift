@@ -921,6 +921,9 @@ private struct OracleStorageFiles: @unchecked Sendable {
         else {
             throw OraclePersistenceError.invalidDocument("immutable_group_identity_changed")
         }
+        if isSynthesisOnlyTransition(from: current.turns, to: next.turns) {
+            return
+        }
         if current.turns.last?.state == .prepared {
             guard next.turns.count == current.turns.count,
                   Array(next.turns.dropLast()) == Array(current.turns.dropLast()),
@@ -939,6 +942,32 @@ private struct OracleStorageFiles: @unchecked Sendable {
                 throw OraclePersistenceError.invalidDocument("invalid_prepare_transition")
             }
         }
+    }
+
+    private func isSynthesisOnlyTransition(
+        from currentTurns: [OracleTurnRecord],
+        to nextTurns: [OracleTurnRecord]
+    ) -> Bool {
+        guard currentTurns.count == nextTurns.count else { return false }
+        var additions = 0
+        for (current, next) in zip(currentTurns, nextTurns) {
+            guard current.id == next.id,
+                  current.input == next.input,
+                  current.state == next.state,
+                  current.startedAt == next.startedAt,
+                  current.finishedAt == next.finishedAt,
+                  current.results == next.results
+            else { return false }
+            switch (current.synthesis, next.synthesis) {
+            case (nil, .some):
+                additions += 1
+            case let (currentSynthesis, nextSynthesis) where currentSynthesis == nextSynthesis:
+                continue
+            default:
+                return false
+            }
+        }
+        return additions == 1
     }
 
     func validate(_ conversation: OracleSingleConversationDocument) throws {

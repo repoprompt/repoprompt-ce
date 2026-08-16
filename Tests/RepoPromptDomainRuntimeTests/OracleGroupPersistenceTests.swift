@@ -45,6 +45,29 @@ final class OracleGroupPersistenceTests: XCTestCase {
         }
     }
 
+    func testTerminalSynthesisIsAcceptedAsEvidencePreservingCASRevision() async throws {
+        let fixture = makeStore(profile: "terminal-synthesis")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let prepared = try makeGroup(count: 2, seed: "synthesis")
+        try await fixture.store.create(prepared)
+        let terminal = try terminalDocument(from: prepared)
+        try await fixture.store.save(terminal, expectedRevision: prepared.revision)
+
+        let turn = try XCTUnwrap(terminal.turns.last)
+        let synthesis = try OracleSynthesisRecord(
+            model: OracleExecutionProfile(providerID: "fixture", modelID: "model-0"),
+            sourceLaneIndices: [0, 1],
+            response: "combined response",
+            finishedAt: try XCTUnwrap(turn.finishedAt).addingTimeInterval(1)
+        )
+        let synthesized = try terminal.recordingSynthesis(synthesis, for: turn.id)
+        try await fixture.store.save(synthesized, expectedRevision: terminal.revision)
+
+        let loaded = try await fixture.store.load(groupID: terminal.group.id, owner: terminal.owner)
+        XCTAssertEqual(loaded, synthesized)
+        XCTAssertEqual(loaded?.turns.last?.synthesis, synthesis)
+    }
+
     func testInterruptedAggregatePublicationRecoversDocumentAndCompleteIndex() async throws {
         let fixture = makeStore(profile: "recovery")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
