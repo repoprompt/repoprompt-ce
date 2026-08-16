@@ -61,7 +61,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.rowSplit.fileRows.first?.metrics, .unknown)
         XCTAssertEqual(coordinator.model?.totalSelectedDisplayTokens, 0)
         XCTAssertTrue(coordinator.isLoading)
-        XCTAssertFalse(coordinator.canMutateDisplayedModel)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
 
         await resolver.releaseNext()
         let expectedMetrics = AgentContextExportRow.Metrics.known(
@@ -730,7 +730,7 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
     }
 
     @MainActor
-    func testPreservedSameIdentityRefreshKeepsDisplayedRowsWithoutMutation() async {
+    func testPreservedSameIdentityRefreshKeepsDisplayedRowsMutable() async {
         let resolver = GatedModelResolver()
         let coordinator = AgentSelectedFilesModelCoordinator { request in
             await resolver.resolve(request)
@@ -753,13 +753,63 @@ final class AgentSelectedFilesModelCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.model?.source.promptText, "Stable.swift")
         XCTAssertEqual(coordinator.rowSplit.rows.count, 1)
         XCTAssertTrue(coordinator.isLoading)
-        XCTAssertFalse(coordinator.canMutateDisplayedModel)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
         XCTAssertTrue(coordinator.displayedModelMatches(request.identity))
         XCTAssertFalse(coordinator.completedModelMatches(request.identity))
 
         await resolver.releaseNext("Stable.swift")
         let didReload = await waitUntilModel(promptText: "Stable.swift", in: coordinator)
         XCTAssertTrue(didReload)
+    }
+
+    @MainActor
+    func testPreservedSelectionChangeRefreshKeepsDisplayedRowsMutable() async {
+        let resolver = GatedModelResolver()
+        let coordinator = AgentSelectedFilesModelCoordinator { request in
+            await resolver.resolve(request)
+        }
+        let loadedRequest = makeRequest(name: "Selection.swift")
+        let changedSource = AgentContextExportSource(
+            tabID: loadedRequest.source.tabID,
+            promptText: loadedRequest.source.promptText,
+            selection: StoredSelection(selectedPaths: ["Sources/Selection.swift", "Sources/Added.swift"]),
+            selectedMetaPromptIDs: loadedRequest.source.selectedMetaPromptIDs,
+            tabName: loadedRequest.source.tabName,
+            activeAgentSessionID: loadedRequest.source.activeAgentSessionID,
+            worktreeBindings: loadedRequest.source.worktreeBindings
+        )
+        let changedRequest = AgentSelectedFilesModelRequest(
+            identity: AgentSelectedFilesModelIdentity(
+                exportContextIdentity: changedSource.exportContextIdentity,
+                filePathDisplay: loadedRequest.filePathDisplay,
+                codeMapUsage: loadedRequest.codeMapUsage
+            ),
+            source: changedSource,
+            store: loadedRequest.store,
+            filePathDisplay: loadedRequest.filePathDisplay,
+            codeMapUsage: loadedRequest.codeMapUsage,
+            entryMetricsSnapshot: nil
+        )
+
+        XCTAssertEqual(coordinator.refreshIfNeeded(loadedRequest), .started)
+        let didStartInitialLoad = await resolver.waitUntilStartCount("Selection.swift", count: 1)
+        XCTAssertTrue(didStartInitialLoad)
+        await resolver.releaseNext("Selection.swift")
+        let didLoadInitialModel = await waitUntilModel(promptText: "Selection.swift", in: coordinator)
+        XCTAssertTrue(didLoadInitialModel)
+
+        XCTAssertEqual(
+            coordinator.refreshIfNeeded(changedRequest, force: true, preserveDisplayedModel: true),
+            .started
+        )
+        let didStartSelectionRefresh = await resolver.waitUntilStartCount("Selection.swift", count: 2)
+        XCTAssertTrue(didStartSelectionRefresh)
+        XCTAssertTrue(coordinator.isLoading)
+        XCTAssertTrue(coordinator.canMutateDisplayedModel)
+
+        await resolver.releaseNext("Selection.swift")
+        let didLoadChangedModel = await waitUntilModel(promptText: "Selection.swift", in: coordinator)
+        XCTAssertTrue(didLoadChangedModel)
     }
 
     @MainActor

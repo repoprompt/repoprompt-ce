@@ -327,9 +327,11 @@ struct WorkspaceRootBindingProjection: Equatable {
     }
 
     func boundRoot(containingPhysicalAbsolutePath path: String) -> BoundRoot? {
-        replacementsByLogicalRootPath.values
-            .filter { path == $0.physicalRoot.standardizedFullPath || path.hasPrefix($0.physicalRoot.standardizedFullPath + "/") }
-            .max { $0.physicalRoot.standardizedFullPath.count < $1.physicalRoot.standardizedFullPath.count }
+        let matches = boundRootsForMetadata.filter {
+            path == $0.physicalRoot.standardizedFullPath || path.hasPrefix($0.physicalRoot.standardizedFullPath + "/")
+        }
+        guard let longestRootPathLength = matches.map(\.physicalRoot.standardizedFullPath.count).max() else { return nil }
+        return matches.first { $0.physicalRoot.standardizedFullPath.count == longestRootPathLength }
     }
 
     private func pathIsUnderAnyPhysicalRoot(_ path: String) -> Bool {
