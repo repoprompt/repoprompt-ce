@@ -288,6 +288,26 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw)
     }
 
+    func testSelectedIdNamingUnknownEffortLeavesEffortUnknown() async throws {
+        // The selected id "high" names a pair whose value is the unknown "ultra" AND
+        // matches another pair by value (eff-high→high). Dropping the unparsed pair would
+        // misrecord "high" as confirmed authority; instead the effort stays unknown and a
+        // corrective selection re-sends.
+        let fixture = try makeFixture(shape: "grok_direct", ultraIDCollision: true)
+        try await bootstrap(fixture.controller)
+
+        XCTAssertNil(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw,
+            "an id naming an unparsed value must never resolve to a different pair's effort"
+        )
+        try await fixture.controller.setSessionModel("grok-4.6-high")
+        XCTAssertEqual(
+            recordedRequests(at: fixture.recordURL, method: "session/set_model").count,
+            1,
+            "unknown current effort must not suppress the selection"
+        )
+    }
+
     func testModeIdValueCrossCollisionLeavesEffortUnknown() async throws {
         // The selected id "high" matches one pair through its VALUE (eff-high→high) and
         // another through its ID (high→low): two distinct efforts, ambiguous → unknown.
@@ -772,7 +792,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         default45Effort: String = "high",
         lowModeID: String = "low",
         doubleSelect: Bool = false,
-        crossCollision: Bool = false
+        crossCollision: Bool = false,
+        ultraIDCollision: Bool = false
     ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
@@ -786,6 +807,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "ACP_LOW_MODE_ID": lowModeID,
             "ACP_DOUBLE_SELECT": doubleSelect ? "1" : "0",
             "ACP_CROSS_COLLISION": crossCollision ? "1" : "0",
+            "ACP_ULTRA_ID_COLLISION": ultraIDCollision ? "1" : "0",
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -849,20 +871,34 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                      "_meta": {"totalContextTokens": 500000,
                                "supportsReasoningEffort": True,
                                "reasoningEffort": "high",
-                               "reasoningEfforts": [
-                                   {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
-                                   {"id": "high", "value": "high", "label": "High Effort", "default": True},
-                                   {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
-                                   {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False}
-                               ] if os.environ.get("ACP_CROSS_COLLISION") != "1" else [
-                                   {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
-                                   # True id/value cross-collision: the selected id "high"
-                                   # matches this pair by VALUE…
-                                   {"id": "eff-high", "value": "high", "label": "High Effort", "default": True},
-                                   {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
-                                   # …and this pair by ID — two distinct efforts, ambiguous.
-                                   {"id": "high", "value": "low", "label": "Low Effort", "default": False}
-                               ]}},
+                               "reasoningEfforts": (
+                                   [
+                                       {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
+                                       # True id/value cross-collision: the selected id
+                                       # "high" matches this pair by VALUE…
+                                       {"id": "eff-high", "value": "high", "label": "High Effort", "default": True},
+                                       {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                       # …and this pair by ID — two distinct efforts, ambiguous.
+                                       {"id": "high", "value": "low", "label": "Low Effort", "default": False}
+                                   ] if os.environ.get("ACP_CROSS_COLLISION") == "1" else
+                                   [
+                                       {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
+                                       # The selected id "high" names THIS pair (id match),
+                                       # whose value is the unknown "ultra"…
+                                       {"id": "high", "value": "ultra", "label": "High Effort", "default": True},
+                                       {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                       {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False},
+                                       # …but ALSO matches this pair by value. Dropping the
+                                       # unparsed pair would misrecord "high" as confirmed.
+                                       {"id": "eff-high", "value": "high", "label": "Eff High", "default": False}
+                                   ] if os.environ.get("ACP_ULTRA_ID_COLLISION") == "1" else
+                                   [
+                                       {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
+                                       {"id": "high", "value": "high", "label": "High Effort", "default": True},
+                                       {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                       {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False}
+                                   ]
+                               )}},
                     {"modelId": "grok-4.5", "name": "Grok 4.5",
                      "_meta": {"supportsReasoningEffort": True,
                                "reasoningEffort": effort_default_override,

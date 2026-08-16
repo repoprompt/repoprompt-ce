@@ -197,10 +197,10 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         var options: [AgentModelOption] = []
         var variants: [AgentModelOption] = []
         var seen = Set<String>()
-        // Per-model advertised effort id→value pairs, retained for resolving the session
-        // config's selected mode: the wire exposes `id` and `value` separately and nothing
-        // guarantees they are equal.
-        var effortPairsByModelRaw: [String: [(id: String, effort: CodexReasoningEffort)]] = [:]
+        // Per-model advertised effort pairs (normalized id, normalized value, optional
+        // parsed effort), retained for resolving the session config's selected mode: the
+        // wire exposes `id` and `value` separately and nothing guarantees they are equal.
+        var effortPairsByModelRaw: [String: [(id: String, valueRaw: String, effort: CodexReasoningEffort?)]] = [:]
         for entry in available {
             guard let rawID = (entry["modelId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !rawID.isEmpty
@@ -227,13 +227,21 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             let effortEntries = supportsEffort ? (meta?["reasoningEfforts"] as? [[String: Any]] ?? []) : []
             var supportedEfforts: [CodexReasoningEffort] = []
             var wireDefaultEffort: CodexReasoningEffort?
-            var effortPairs: [(id: String, effort: CodexReasoningEffort)] = []
+            // Every structurally valid pair is retained for ambiguity resolution — including
+            // ones whose value doesn't parse. Dropping an unparsed pair would let a selected
+            // mode id that actually names an UNKNOWN effort match a different pair by value
+            // and be recorded as confirmed authority.
+            var effortPairs: [(id: String, valueRaw: String, effort: CodexReasoningEffort?)] = []
             for effortEntry in effortEntries {
-                guard let effort = CodexReasoningEffort.parse(effortEntry["value"] as? String) else { continue }
-                supportedEfforts.append(effort)
+                guard let valueRaw = (effortEntry["value"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !valueRaw.isEmpty
+                else { continue }
+                let effort = CodexReasoningEffort.parse(valueRaw)
                 if let id = (effortEntry["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
-                    effortPairs.append((id: id, effort: effort))
+                    effortPairs.append((id: id, valueRaw: valueRaw.lowercased(), effort: effort))
                 }
+                guard let effort else { continue }
+                supportedEfforts.append(effort)
                 if wireDefaultEffort == nil, (effortEntry["default"] as? Bool) == true {
                     wireDefaultEffort = effort
                 }
@@ -313,11 +321,16 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             else { return nil }
             let matches = pairs.filter {
                 $0.id.caseInsensitiveCompare(selectedID) == .orderedSame
-                    || $0.effort.rawValue.caseInsensitiveCompare(selectedID) == .orderedSame
+                    || $0.valueRaw.caseInsensitiveCompare(selectedID) == .orderedSame
             }
-            let distinctEfforts = Set(matches.map { $0.effort.rawValue.lowercased() })
+            // Confirm only when every matching pair parses and all agree; an unparsed or
+            // disagreeing match means the selected id may name an unknown effort.
+            guard !matches.isEmpty,
+                  matches.allSatisfy({ $0.effort != nil })
+            else { return nil }
+            let distinctEfforts = Set(matches.compactMap(\.effort).map(\.rawValue))
             guard distinctEfforts.count == 1 else { return nil }
-            return matches.first?.effort.rawValue
+            return matches.first?.effort?.rawValue
         }()
 
         return .valid(ACPDiscoveredSessionModels(
