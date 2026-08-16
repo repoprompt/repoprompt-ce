@@ -23,6 +23,15 @@ enum ACPSupportResult: Equatable {
 struct ACPDiscoveredSessionModels: Equatable {
     let options: [AgentModelOption]
     let currentModelRaw: String?
+    /// The session's active reasoning effort (e.g. Grok's `_meta.reasoningEffort`), when the
+    /// provider advertises one. Lets the controller skip redundant effort mutations.
+    var currentEffortRaw: String?
+
+    init(options: [AgentModelOption], currentModelRaw: String?, currentEffortRaw: String? = nil) {
+        self.options = options
+        self.currentModelRaw = currentModelRaw
+        self.currentEffortRaw = currentEffortRaw
+    }
 
     var preferredModelRaw: String? {
         option(matching: currentModelRaw)?.rawValue
@@ -194,6 +203,10 @@ enum ACPProviderModelSnapshotResult: Equatable {
 struct ACPDirectModelSelectionRequest {
     let method: String
     let params: [String: Any]
+    /// The model id the provider's acknowledgement must echo before the controller updates
+    /// local model authority. For effort-compound selections this is the BASE model id —
+    /// the wire confirms the model, not the effort suffix.
+    var expectedConfirmationModelRaw: String
 }
 
 /// Bounded capability for ACP providers that advertise session models outside the

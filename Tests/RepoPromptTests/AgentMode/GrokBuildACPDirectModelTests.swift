@@ -21,9 +21,123 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         try await bootstrap(fixture.controller)
 
         let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
-        // The registry canonicalizes ordering; membership is the contract.
-        XCTAssertEqual(Set(snapshot?.options.map(\.rawValue) ?? []), ["grok-4.6", "grok-4.5"])
+        // The registry canonicalizes ordering; membership is the contract. Options carry the
+        // two base models plus every advertised effort variant (4.6 adds xhigh).
+        XCTAssertEqual(Set(snapshot?.options.map(\.rawValue) ?? []), [
+            "grok-4.6", "grok-4.5",
+            "grok-4.6-xhigh", "grok-4.6-high", "grok-4.6-medium", "grok-4.6-low",
+            "grok-4.5-high", "grok-4.5-medium", "grok-4.5-low"
+        ])
         XCTAssertEqual(snapshot?.currentModelRaw, "grok-4.6")
+        XCTAssertEqual(snapshot?.currentEffortRaw, "high")
+
+        let base46 = snapshot?.options.first { $0.rawValue == "grok-4.6" }
+        XCTAssertEqual(
+            base46?.supportedReasoningEfforts,
+            [.low, .medium, .high, .xhigh],
+            "the dynamic store canonicalizes effort lists into displayOrder"
+        )
+        XCTAssertEqual(base46?.defaultReasoningEffort, .high)
+        let base45 = snapshot?.options.first { $0.rawValue == "grok-4.5" }
+        XCTAssertEqual(base45?.supportedReasoningEfforts, [.low, .medium, .high])
+    }
+
+    func testEffortVariantSelectionSendsModelAndEffortMeta() async throws {
+        let fixture = try makeFixture(shape: "grok_direct")
+        try await bootstrap(fixture.controller)
+
+        try await fixture.controller.setSessionModel("grok-4.5-low")
+
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 1)
+        XCTAssertEqual(mutations.first?.params["modelId"] as? String, "grok-4.5")
+        XCTAssertEqual(
+            (mutations.first?.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+            "low",
+            "effort rides the camelCase _meta.reasoningEffort key (live-verified grok 1.0.4)"
+        )
+        let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        XCTAssertEqual(snapshot?.currentModelRaw, "grok-4.5")
+        XCTAssertEqual(snapshot?.currentEffortRaw, "low")
+    }
+
+    func testIdenticalModelAndEffortSkipsRPC() async throws {
+        let fixture = try makeFixture(shape: "grok_direct")
+        try await bootstrap(fixture.controller)
+
+        try await fixture.controller.setSessionModel("grok-4.5-low")
+        try await fixture.controller.setSessionModel("grok-4.5-low")
+        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_model").count, 1)
+    }
+
+    func testBareSelectionAfterVariantResetsToDefaultEffort() async throws {
+        let fixture = try makeFixture(shape: "grok_direct")
+        try await bootstrap(fixture.controller)
+
+        try await fixture.controller.setSessionModel("grok-4.5-low")
+        try await fixture.controller.setSessionModel("grok-4.5")
+
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 2, "bare-after-variant must re-send to reset effort")
+        XCTAssertEqual(
+            (mutations.last?.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+            "high",
+            "the bare pick resolves to the model's advertised default effort"
+        )
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw,
+            "high"
+        )
+    }
+
+    func testUnadvertisedEffortIsRejectedBeforeRPC() async throws {
+        let fixture = try makeFixture(shape: "grok_direct")
+        try await bootstrap(fixture.controller)
+
+        do {
+            // grok-4.5 does not advertise xhigh — the compound is not a snapshot member.
+            try await fixture.controller.setSessionModel("grok-4.5-xhigh")
+            XCTFail("expected unadvertised effort to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("grok-4.5-xhigh"), "unexpected error: \(error)")
+        }
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/set_model").isEmpty)
+    }
+
+    func testEffortVariantReuseKeysOnCompoundSelection() async throws {
+        // Controllers key reuse on the requested model string; different efforts must never
+        // share a process silently.
+        let workspace = try makeTestDirectory(name: "GrokBuildEffortReuse")
+        func makeController(_ model: String?) throws -> ACPAgentSessionController {
+            try ACPAgentSessionController(
+                provider: GrokDirectFakeACPProvider(commandPath: "/bin/echo", environment: [:]),
+                runRequest: ACPRunRequest(
+                    agentKind: .grokBuild,
+                    modelString: model,
+                    workspacePath: workspace.path,
+                    resumeSessionID: nil,
+                    attachments: [],
+                    taskLabelKind: nil
+                )
+            )
+        }
+        let low = try makeController("grok-4.6-low")
+        let sameEffort = await low.isCompatibleWith(request: ACPRunRequest(
+            agentKind: .grokBuild, modelString: "grok-4.6-low",
+            workspacePath: workspace.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        ))
+        let otherEffort = await low.isCompatibleWith(request: ACPRunRequest(
+            agentKind: .grokBuild, modelString: "grok-4.6-xhigh",
+            workspacePath: workspace.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        ))
+        let bare = await low.isCompatibleWith(request: ACPRunRequest(
+            agentKind: .grokBuild, modelString: "grok-4.6",
+            workspacePath: workspace.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil
+        ))
+        XCTAssertTrue(sameEffort)
+        XCTAssertFalse(otherEffort, "effort change must force a fresh controller")
+        XCTAssertFalse(bare, "compound → bare transition must force a fresh controller")
+        await low.shutdown()
     }
 
     func testDirectSetModelSendsExactProviderRequest() async throws {
@@ -344,12 +458,29 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             send(payload)
 
         def grok_models():
+            # Mirrors the live grok 1.0.4 wire: 4.6 supports xhigh/high/medium/low with
+            # current effort high; 4.5 supports high/medium/low.
             return {
                 "currentModelId": current_model,
                 "availableModels": [
                     {"modelId": "grok-4.6", "name": "Grok 4.6", "description": "Frontier",
-                     "_meta": {"totalContextTokens": 500000}},
-                    {"modelId": "grok-4.5", "name": "Grok 4.5"}
+                     "_meta": {"totalContextTokens": 500000,
+                               "supportsReasoningEffort": True,
+                               "reasoningEffort": "high",
+                               "reasoningEfforts": [
+                                   {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
+                                   {"id": "high", "value": "high", "label": "High Effort", "default": True},
+                                   {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                   {"id": "low", "value": "low", "label": "Low Effort", "default": False}
+                               ]}},
+                    {"modelId": "grok-4.5", "name": "Grok 4.5",
+                     "_meta": {"supportsReasoningEffort": True,
+                               "reasoningEffort": "high",
+                               "reasoningEfforts": [
+                                   {"id": "high", "value": "high", "label": "High Effort", "default": True},
+                                   {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
+                                   {"id": "low", "value": "low", "label": "Low Effort", "default": False}
+                               ]}}
                 ]
             }
 

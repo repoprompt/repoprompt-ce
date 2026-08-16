@@ -13,7 +13,22 @@ struct ACPDynamicModelRecord: Codable, Hashable {
 struct ACPDynamicProviderRecord: Codable, Hashable {
     let providerID: String
     let currentModelRaw: String?
+    /// Active reasoning effort for providers with direct effort authority (e.g. Grok).
+    /// Optional so records persisted before effort support decode unchanged.
+    var currentEffortRaw: String? = nil
     let options: [ACPDynamicModelRecord]
+
+    init(
+        providerID: String,
+        currentModelRaw: String?,
+        currentEffortRaw: String? = nil,
+        options: [ACPDynamicModelRecord]
+    ) {
+        self.providerID = providerID
+        self.currentModelRaw = currentModelRaw
+        self.currentEffortRaw = currentEffortRaw
+        self.options = options
+    }
 }
 
 enum ACPDynamicModelStore {
@@ -81,6 +96,7 @@ enum ACPDynamicModelStore {
         return ACPDynamicProviderRecord(
             providerID: providerID.rawValue,
             currentModelRaw: normalizedCurrentModelRaw(snapshot.currentModelRaw, options: options),
+            currentEffortRaw: snapshot.currentEffortRaw,
             options: options
         )
     }
@@ -89,7 +105,11 @@ enum ACPDynamicModelStore {
         let options = record.options.compactMap(modelOption(from:))
         guard !options.isEmpty else { return nil }
         let currentModelRaw = normalizedCurrentModelRaw(record.currentModelRaw, options: record.options)
-        return ACPDiscoveredSessionModels(options: options, currentModelRaw: currentModelRaw)
+        return ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: currentModelRaw,
+            currentEffortRaw: record.currentEffortRaw
+        )
     }
 
     private static func loadProviderRecords(defaults: UserDefaults) -> [ACPDynamicProviderRecord] {

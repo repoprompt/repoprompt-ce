@@ -683,8 +683,23 @@ actor ACPAgentSessionController {
                 else {
                     throw ControllerError.requestFailed("Grok Build ACP runtime does not advertise model switching.")
                 }
-                let canonicalModel = try canonicalDirectSessionModelValue(model)
-                if discoveredSessionModels?.currentModelRaw == canonicalModel {
+                let matchedOption = try canonicalDirectSessionModelOption(model)
+                // Effort-compound selections (`grok-4.6-low`) decompose into the base model
+                // plus a reasoning effort. Bare raws resolve to the model's advertised
+                // default effort so a bare pick after a variant pick resets effort instead
+                // of silently keeping the previous one. Variant options always decompose
+                // back to their base here; a literal future model id ending in an effort
+                // token would need snapshot-aware disambiguation.
+                let requestedSpecifier = GrokBuildModelSpecifier(raw: matchedOption.rawValue)
+                let baseModel = requestedSpecifier.baseModel
+                let resolvedEffort = requestedSpecifier.reasoningEffort ?? matchedOption.defaultReasoningEffort
+                let canonicalModel = GrokBuildModelSpecifier(
+                    baseModel: baseModel,
+                    reasoningEffort: resolvedEffort
+                ).compoundRaw
+                if discoveredSessionModels?.currentModelRaw == baseModel,
+                   normalizedDirectEffort(discoveredSessionModels?.currentEffortRaw) == normalizedDirectEffort(resolvedEffort?.rawValue)
+                {
                     return
                 }
                 let selectionRequest = directProvider.makeDirectModelSelectionRequest(
@@ -694,9 +709,9 @@ actor ACPAgentSessionController {
                 // A rejected direct selection preserves the session's current model. Grok
                 // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
                 // the Err variant is a failure even though the RPC itself succeeded. Fail
-                // closed: only an `Ok` echoing the requested model may update local model
-                // authority — missing, malformed, or mismatched acknowledgements leave the
-                // session's real current model unknown, so local state must not move.
+                // closed: only an `Ok` echoing the requested base model may update local
+                // model authority — missing, malformed, or mismatched acknowledgements leave
+                // the session's real current model unknown, so local state must not move.
                 let selectionResponse = try await sendRequestResponse(
                     method: selectionRequest.method,
                     params: selectionRequest.params
@@ -707,7 +722,7 @@ actor ACPAgentSessionController {
                 }
                 guard let confirmedModel = modelOutcome?["Ok"] as? String,
                       confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-                      .caseInsensitiveCompare(canonicalModel) == .orderedSame
+                      .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
                 else {
                     throw ControllerError.protocolViolation(
                         "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
@@ -725,7 +740,11 @@ actor ACPAgentSessionController {
                         isProviderDefault: false
                     ))
                 }
-                let updated = ACPDiscoveredSessionModels(options: updatedOptions, currentModelRaw: canonicalModel)
+                let updated = ACPDiscoveredSessionModels(
+                    options: updatedOptions,
+                    currentModelRaw: baseModel,
+                    currentEffortRaw: resolvedEffort?.rawValue
+                )
                 discoveredSessionModels = updated
                 _ = AgentACPModelRegistry.shared.updateDiscoveredModels(updated, for: provider.providerID)
                 return
@@ -768,19 +787,26 @@ actor ACPAgentSessionController {
     /// Validation for direct (non-configOptions) model selection: exact/case-insensitive
     /// match against the live session snapshot first, then the warmed persisted registry
     /// (a `session/load` response may legitimately omit model metadata on some providers).
-    private func canonicalDirectSessionModelValue(_ requestedValue: String) throws -> String {
+    private func canonicalDirectSessionModelOption(_ requestedValue: String) throws -> AgentModelOption {
         if let live = discoveredSessionModels {
             if let match = live.option(matching: requestedValue) {
-                return match.rawValue
+                return match
             }
             throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
         }
         if let warmed = AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID),
            let match = warmed.option(matching: requestedValue)
         {
-            return match.rawValue
+            return match
         }
         throw ControllerError.requestFailed("Grok Build model '\(requestedValue)' is not in the discovered model set. Refresh Grok Build models and retry.")
+    }
+
+    private func normalizedDirectEffort(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed.lowercased()
     }
 
     func setSessionMode(_ modeID: String) async throws {
