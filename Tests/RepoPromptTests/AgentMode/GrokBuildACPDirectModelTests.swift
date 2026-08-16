@@ -170,7 +170,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         )
     }
 
-    func testCompoundSelectionMismatchPreservesModelAndEffortState() async throws {
+    func testCompoundSelectionMismatchInvalidatesModelAndEffortAuthority() async throws {
         let fixture = try makeFixture(shape: "grok_direct", setModelAck: "mismatch")
         try await bootstrap(fixture.controller)
 
@@ -181,8 +181,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
         }
         let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
-        XCTAssertEqual(snapshot?.currentModelRaw, "grok-4.6")
-        XCTAssertEqual(snapshot?.currentEffortRaw, "high", "a failed compound selection must preserve effort authority too")
+        XCTAssertNil(snapshot?.currentModelRaw, "ambiguous ack: model authority invalidated, not preserved or moved")
+        XCTAssertNil(snapshot?.currentEffortRaw, "ambiguous ack: effort authority invalidated too")
     }
 
     func testVariantNeverShadowsAdvertisedBaseWithEffortTokenSuffix() async throws {
@@ -289,8 +289,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
     }
 
     func testModeIdValueCrossCollisionLeavesEffortUnknown() async throws {
-        // The selected id "high" matches one pair's id (→ high) and another pair's id
-        // (→ low): ambiguous, so no effort authority may be recorded.
+        // The selected id "high" matches one pair through its VALUE (eff-high→high) and
+        // another through its ID (high→low): two distinct efforts, ambiguous → unknown.
         let fixture = try makeFixture(shape: "grok_direct", crossCollision: true)
         try await bootstrap(fixture.controller)
 
@@ -491,10 +491,13 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
         }
-        XCTAssertEqual(
-            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
-            "grok-4.6"
+        let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        XCTAssertNil(
+            snapshot?.currentModelRaw,
+            "an ambiguous ack leaves server state unknowable — current-model authority is invalidated"
         )
+        XCTAssertNil(snapshot?.currentEffortRaw)
+        XCTAssertFalse(snapshot?.options.isEmpty ?? true, "the advertised options remain live")
     }
 
     func testMalformedModelAckFailsClosed() async throws {
@@ -507,9 +510,9 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
         }
-        XCTAssertEqual(
+        XCTAssertNil(
             AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
-            "grok-4.6"
+            "an ambiguous ack invalidates current-model authority"
         )
     }
 
@@ -524,10 +527,35 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
         }
+        XCTAssertNil(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "an Ok naming another model confirms nothing — authority is invalidated, not moved"
+        )
+    }
+
+    func testAmbiguousAckDoesNotSuppressCorrectiveReselection() async throws {
+        // After an ambiguous ack invalidates authority, re-selecting even the PREVIOUSLY
+        // current model must send a fresh RPC — stale state may never short-circuit it.
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "mismatch")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5-low")
+            XCTFail("expected mismatched Ok to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw)
+
+        // The mismatch fixture's Ok names grok-4.6, which IS the expected base for this
+        // corrective selection, so it confirms and re-establishes authority.
+        try await fixture.controller.setSessionModel("grok-4.6")
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 2, "the corrective selection must not be suppressed")
+        XCTAssertEqual(mutations.last?.params["modelId"] as? String, "grok-4.6")
         XCTAssertEqual(
             AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
-            "grok-4.6",
-            "an Ok naming another model must not be treated as confirmation"
+            "grok-4.6"
         )
     }
 
@@ -768,9 +796,11 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                                    {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False}
                                ] if os.environ.get("ACP_CROSS_COLLISION") != "1" else [
                                    {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
-                                   {"id": "high", "value": "high", "label": "High Effort", "default": True},
+                                   # True id/value cross-collision: the selected id "high"
+                                   # matches this pair by VALUE…
+                                   {"id": "eff-high", "value": "high", "label": "High Effort", "default": True},
                                    {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
-                                   # Cross-collision: this pair's id is another pair's value.
+                                   # …and this pair by ID — two distinct efforts, ambiguous.
                                    {"id": "high", "value": "low", "label": "Low Effort", "default": False}
                                ]}},
                     {"modelId": "grok-4.5", "name": "Grok 4.5",

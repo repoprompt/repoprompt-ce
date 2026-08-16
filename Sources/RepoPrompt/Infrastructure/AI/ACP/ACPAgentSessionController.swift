@@ -749,12 +749,28 @@ actor ACPAgentSessionController {
                 )
                 let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
                 if let modelError = modelOutcome?["Err"] {
+                    // An explicit Err is a confirmed rejection: the session's current model
+                    // is untouched, so local authority stays valid.
                     throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
                 }
                 guard let confirmedModel = modelOutcome?["Ok"] as? String,
                       confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
                       .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
                 else {
+                    // Ambiguous post-send outcome: the server may or may not have applied
+                    // anything, and neither the requested nor the prior model is confirmed.
+                    // Invalidate current model/effort authority so stale state can never
+                    // short-circuit a corrective selection; the advertised options remain
+                    // live and valid.
+                    if let current = discoveredSessionModels {
+                        let cleared = ACPDiscoveredSessionModels(
+                            options: current.options,
+                            currentModelRaw: nil,
+                            currentEffortRaw: nil
+                        )
+                        discoveredSessionModels = cleared
+                        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(cleared, for: provider.providerID)
+                    }
                     throw ControllerError.protocolViolation(
                         "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
                     )
