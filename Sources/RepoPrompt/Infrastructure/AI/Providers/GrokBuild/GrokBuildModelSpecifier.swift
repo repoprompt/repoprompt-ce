@@ -1,48 +1,21 @@
 import Foundation
 
-/// Splits a Grok Build model selection into its base model id and optional reasoning effort.
+/// A structured Grok Build model selection: base model id plus optional reasoning effort.
 ///
 /// Compound raw values follow the Codex suffix convention: `grok-4.6-low` is the base model
-/// `grok-4.6` at `.low` effort. Bare raws (`grok-4.6`) carry no effort and resolve to the
-/// provider default. Suffix stripping is deliberately conservative: a raw that matches a
-/// discovered model id exactly is always treated as that model, so a future Grok model whose
-/// id ends in an effort token (`…-high`) can never be misparsed.
+/// `grok-4.6` at `.low` effort. Compound raws are ONLY ever produced by the SessionModelState
+/// parser's variant synthesis and are decomposed against the advertised option set — raw
+/// strings are never re-parsed by suffix guessing at lower layers, so a future Grok model
+/// whose id ends in an effort token (`…-high`) stays selectable as that base.
 ///
 /// Wire contract (live-verified against grok 1.0.4): `availableModels[].\_meta` carries
-/// `supportsReasoningEffort`, `reasoningEffort` (current/default), and `reasoningEfforts`
+/// `supportsReasoningEffort`, `reasoningEffort` (per-model default), and `reasoningEfforts`
 /// ([{id, value, label, description, default}]). Effort rides `session/set_model` via
 /// `_meta.reasoningEffort`; unknown efforts are silently ignored by the server, so callers
 /// must validate against the advertised per-model list before sending.
 struct GrokBuildModelSpecifier: Equatable {
     let baseModel: String
     let reasoningEffort: CodexReasoningEffort?
-
-    init(baseModel: String, reasoningEffort: CodexReasoningEffort?) {
-        self.baseModel = baseModel
-        self.reasoningEffort = reasoningEffort
-    }
-
-    init(raw: String, knownBaseModels: Set<String> = []) {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let exactBase = knownBaseModels.first {
-            $0.caseInsensitiveCompare(trimmed) == .orderedSame
-        }
-        if let exactBase {
-            self.init(baseModel: exactBase, reasoningEffort: nil)
-            return
-        }
-        // Longest suffix first so `-xhigh` wins over `-high`.
-        for suffix in ["-xhigh", "-medium", "-high", "-low"] {
-            guard trimmed.lowercased().hasSuffix(suffix),
-                  trimmed.count > suffix.count
-            else { continue }
-            let base = String(trimmed.dropLast(suffix.count))
-            guard let effort = CodexReasoningEffort.parse(String(suffix.dropFirst())) else { continue }
-            self.init(baseModel: base, reasoningEffort: effort)
-            return
-        }
-        self.init(baseModel: trimmed, reasoningEffort: nil)
-    }
 
     var compoundRaw: String {
         guard let reasoningEffort else { return baseModel }
@@ -53,5 +26,27 @@ struct GrokBuildModelSpecifier: Equatable {
     /// advertised default when the selection is bare.
     func resolvedEffort(defaultEffort: CodexReasoningEffort?) -> CodexReasoningEffort? {
         reasoningEffort ?? defaultEffort
+    }
+
+    /// Decomposes a snapshot member into its base option and explicit effort, using the
+    /// variant provenance recorded at synthesis time (`AgentModelOption.effortVariant`) —
+    /// raw strings are never re-parsed by suffix guessing, so an advertised base whose id
+    /// ends in an effort token stays selectable as that base. Returns nil when `raw`
+    /// matches no option, or when a variant's recorded base is absent from the snapshot.
+    static func decompose(
+        raw: String,
+        options: [AgentModelOption]
+    ) -> (base: AgentModelOption, explicitEffort: CodexReasoningEffort?)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let matched = options.first(where: {
+            $0.rawValue.caseInsensitiveCompare(trimmed) == .orderedSame
+        }) else { return nil }
+        guard let variant = matched.effortVariant else {
+            return (matched, nil)
+        }
+        guard let base = options.first(where: {
+            $0.rawValue.caseInsensitiveCompare(variant.baseModelRaw) == .orderedSame
+        }) else { return nil }
+        return (base, variant.reasoningEffort)
     }
 }

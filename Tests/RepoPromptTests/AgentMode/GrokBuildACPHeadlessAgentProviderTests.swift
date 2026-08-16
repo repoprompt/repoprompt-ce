@@ -256,7 +256,15 @@ extension EnvForwardingGrokProvider: ACPDirectSessionModelProvider {
         inner.parseDirectSessionModelSnapshot(from: sessionResponse)
     }
 
-    func makeDirectModelSelectionRequest(sessionID: String, modelRaw: String) -> ACPDirectModelSelectionRequest {
-        inner.makeDirectModelSelectionRequest(sessionID: sessionID, modelRaw: modelRaw)
+    func makeDirectModelSelectionRequest(
+        sessionID: String,
+        baseModelRaw: String,
+        reasoningEffortRaw: String?
+    ) -> ACPDirectModelSelectionRequest {
+        inner.makeDirectModelSelectionRequest(
+            sessionID: sessionID,
+            baseModelRaw: baseModelRaw,
+            reasoningEffortRaw: reasoningEffortRaw
+        )
     }
 }

@@ -104,6 +104,113 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/set_model").isEmpty)
     }
 
+    func testSessionEffortComesFromSessionConfigNotModelDefault() async throws {
+        // The session's active effort (low) differs from every model's advertised default
+        // (high): the snapshot must report the session value, and a bare pick must resolve
+        // to the DEFAULT and re-send rather than short-circuiting on the model's value.
+        let fixture = try makeFixture(shape: "grok_direct", sessionEffort: "low")
+        try await bootstrap(fixture.controller)
+
+        let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        XCTAssertEqual(snapshot?.currentEffortRaw, "low", "session config is the only current-effort authority")
+        XCTAssertEqual(snapshot?.options.first { $0.rawValue == "grok-4.6" }?.defaultReasoningEffort, .high)
+
+        try await fixture.controller.setSessionModel("grok-4.6")
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 1, "bare pick at non-default session effort must reset to the default")
+        XCTAssertEqual(
+            (mutations.first?.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+            "high"
+        )
+    }
+
+    func testMissingSessionConfigLeavesEffortUnknown() async throws {
+        let fixture = try makeFixture(shape: "grok_direct", sessionEffort: "none")
+        try await bootstrap(fixture.controller)
+
+        XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw)
+        // Unknown current effort must not be inferred from the default: a bare pick of the
+        // current model still sends the explicit default effort.
+        try await fixture.controller.setSessionModel("grok-4.6")
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 1)
+        XCTAssertEqual(
+            (mutations.first?.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+            "high"
+        )
+    }
+
+    func testUnadvertisedDeclaredDefaultFallsBackToAdvertisedListDefault() async throws {
+        // grok-4.5 declares default "ultra", which is not in its advertised list: the
+        // declared value must not be trusted, no ultra variant may exist, and the default
+        // falls back to the advertised list's own default entry (high), so anything sent
+        // stays within the advertised set.
+        let fixture = try makeFixture(shape: "grok_direct", default45Effort: "ultra")
+        try await bootstrap(fixture.controller)
+
+        let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        let base45 = snapshot?.options.first { $0.rawValue == "grok-4.5" }
+        XCTAssertEqual(base45?.defaultReasoningEffort, .high, "unadvertised declared default falls back to the list default")
+        XCTAssertFalse(snapshot?.options.contains { $0.rawValue == "grok-4.5-ultra" } ?? true)
+
+        try await fixture.controller.setSessionModel("grok-4.5")
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 1)
+        XCTAssertEqual(mutations.first?.params["modelId"] as? String, "grok-4.5")
+        XCTAssertEqual(
+            (mutations.first?.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+            "high",
+            "only advertised efforts may leave the client"
+        )
+    }
+
+    func testCompoundSelectionMismatchPreservesModelAndEffortState() async throws {
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "mismatch")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5-low")
+            XCTFail("expected mismatched Ok to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        XCTAssertEqual(snapshot?.currentModelRaw, "grok-4.6")
+        XCTAssertEqual(snapshot?.currentEffortRaw, "high", "a failed compound selection must preserve effort authority too")
+    }
+
+    func testVariantNeverShadowsAdvertisedBaseWithEffortTokenSuffix() async throws {
+        let fixture = try makeFixture(shape: "grok_collision")
+        try await bootstrap(fixture.controller)
+
+        let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        let collisionRaws = snapshot?.options.filter { $0.rawValue == "grok-4.6-low" } ?? []
+        XCTAssertEqual(collisionRaws.count, 1, "the synthesized variant must yield to the real base")
+        XCTAssertTrue(collisionRaws.first?.supportedReasoningEfforts.isEmpty == true, "the surviving option is the no-effort base")
+
+        try await fixture.controller.setSessionModel("grok-4.6-low")
+        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+        XCTAssertEqual(mutations.count, 1)
+        XCTAssertEqual(mutations.first?.params["modelId"] as? String, "grok-4.6-low", "an exact advertised base stays selectable as that base")
+        XCTAssertNil(mutations.first?.params["_meta"])
+    }
+
+    func testLegacyProviderRecordWithoutEffortDecodes() throws {
+        // Records persisted before effort support lack currentEffortRaw; decoding must not
+        // break existing stores.
+        let legacy = """
+        {"providerID":"grokBuild","currentModelRaw":"grok-4.6","options":[
+          {"rawValue":"grok-4.6","displayName":"Grok 4.6","description":null,
+           "isPlaceholderDefault":false,"isProviderDefault":false,
+           "supportedReasoningEfforts":[],"defaultReasoningEffort":null}
+        ]}
+        """
+        let record = try JSONDecoder().decode(ACPDynamicProviderRecord.self, from: Data(legacy.utf8))
+        let snapshot = try XCTUnwrap(ACPDynamicModelStore.snapshot(from: record))
+        XCTAssertEqual(snapshot.currentModelRaw, "grok-4.6")
+        XCTAssertNil(snapshot.currentEffortRaw)
+    }
+
     func testEffortVariantReuseKeysOnCompoundSelection() async throws {
         // Controllers key reuse on the requested model string; different efforts must never
         // share a process silently.
@@ -399,7 +506,12 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         }
     }
 
-    private func makeFixture(shape: String, setModelAck: String = "ok") throws -> Fixture {
+    private func makeFixture(
+        shape: String,
+        setModelAck: String = "ok",
+        sessionEffort: String = "high",
+        default45Effort: String = "high"
+    ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
@@ -407,6 +519,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "ACP_RECORD_PATH": recordURL.path,
             "ACP_SHAPE": shape,
             "ACP_SET_MODEL_ACK": setModelAck,
+            "ACP_SESSION_EFFORT": sessionEffort,
+            "ACP_45_DEFAULT_EFFORT": default45Effort,
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -436,6 +550,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         record_path = os.environ.get("ACP_RECORD_PATH")
         shape = os.environ.get("ACP_SHAPE", "grok_direct")
         set_model_ack = os.environ.get("ACP_SET_MODEL_ACK", "ok")
+        session_effort = os.environ.get("ACP_SESSION_EFFORT", "high")
+        effort_default_override = os.environ.get("ACP_45_DEFAULT_EFFORT", "high")
         session_id = "grok-direct-session"
         current_model = "grok-4.6"
         modern_current_model = "model-a"
@@ -475,7 +591,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                                ]}},
                     {"modelId": "grok-4.5", "name": "Grok 4.5",
                      "_meta": {"supportsReasoningEffort": True,
-                               "reasoningEffort": "high",
+                               "reasoningEffort": effort_default_override,
                                "reasoningEfforts": [
                                    {"id": "high", "value": "high", "label": "High Effort", "default": True},
                                    {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
@@ -483,6 +599,17 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                                ]}}
                 ]
             }
+
+        def session_config_meta():
+            # Mirrors grok 1.0.4's `_meta["x.ai/sessionConfig"]`: the session's ACTIVE
+            # effort is the selected category-"mode" entry.
+            if session_effort == "none":
+                return {}
+            modes = ["xhigh", "high", "medium", "low"]
+            return {"x.ai/sessionConfig": {"options": [
+                {"id": m, "category": "mode", "label": m, "selected": m == session_effort}
+                for m in modes
+            ]}}
 
         def modern_model_selector(value=None):
             return {
@@ -499,7 +626,13 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
 
         def session_result():
             if shape == "grok_direct":
-                return {"sessionId": session_id, "models": grok_models()}
+                return {"sessionId": session_id, "models": grok_models(), "_meta": session_config_meta()}
+            if shape == "grok_collision":
+                # A real advertised base id that ends in an effort token: variant synthesis
+                # must never shadow it.
+                models = grok_models()
+                models["availableModels"].append({"modelId": "grok-4.6-low", "name": "Grok 4.6 Low Edition"})
+                return {"sessionId": session_id, "models": models, "_meta": session_config_meta()}
             if shape == "grok_direct_malformed":
                 return {"sessionId": session_id, "models": {"currentModelId": "x", "availableModels": "nope"}}
             if shape == "grok_dual":
@@ -541,6 +674,9 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                 respond(request_id, session_result())
             elif method == "session/set_model":
                 requested = params.get("modelId")
+                valid_ids = [m["modelId"] for m in grok_models()["availableModels"]]
+                if shape == "grok_collision":
+                    valid_ids.append("grok-4.6-low")
                 if set_model_ack == "missing":
                     respond(request_id, {})
                 elif set_model_ack == "malformed":
@@ -549,7 +685,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                     respond(request_id, {"_meta": {"model": {"Ok": "grok-4.6"}}})
                 elif set_model_ack == "err":
                     respond(request_id, {"_meta": {"model": {"Err": {"message": "model unavailable"}}}})
-                elif requested in ("grok-4.5", "grok-4.6"):
+                elif requested in valid_ids:
                     current_model = requested
                     respond(request_id, {"_meta": {"model": {"Ok": requested}}})
                 else:
@@ -649,7 +785,15 @@ private struct GrokDirectFakeACPProvider: ACPAgentProvider, ACPDirectSessionMode
         directDelegate.parseDirectSessionModelSnapshot(from: sessionResponse)
     }
 
-    func makeDirectModelSelectionRequest(sessionID: String, modelRaw: String) -> ACPDirectModelSelectionRequest {
-        directDelegate.makeDirectModelSelectionRequest(sessionID: sessionID, modelRaw: modelRaw)
+    func makeDirectModelSelectionRequest(
+        sessionID: String,
+        baseModelRaw: String,
+        reasoningEffortRaw: String?
+    ) -> ACPDirectModelSelectionRequest {
+        directDelegate.makeDirectModelSelectionRequest(
+            sessionID: sessionID,
+            baseModelRaw: baseModelRaw,
+            reasoningEffortRaw: reasoningEffortRaw
+        )
     }
 }

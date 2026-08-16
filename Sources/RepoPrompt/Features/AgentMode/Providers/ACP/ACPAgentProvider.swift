@@ -221,9 +221,14 @@ protocol ACPDirectSessionModelProvider: Sendable {
         from sessionResponse: [String: Any]
     ) -> ACPProviderModelSnapshotResult
 
+    /// Builds the provider's selection RPC from STRUCTURED parts. The controller
+    /// decomposes and validates the selection against the advertised snapshot; the
+    /// provider owns wire names (`session/set_model`, `_meta.reasoningEffort`, …)
+    /// and never re-parses compound strings.
     func makeDirectModelSelectionRequest(
         sessionID: String,
-        modelRaw: String
+        baseModelRaw: String,
+        reasoningEffortRaw: String?
     ) -> ACPDirectModelSelectionRequest
 }
 

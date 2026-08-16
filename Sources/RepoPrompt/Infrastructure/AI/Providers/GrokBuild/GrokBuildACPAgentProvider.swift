@@ -212,9 +212,12 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             let description = nonEmpty(entry["description"] as? String)
 
             // `_meta.reasoningEfforts` (live-verified grok 1.0.4): each base model advertises
-            // its supported efforts + current default. Variants surface as compound raws
-            // (`grok-4.6-low`) so the shared catalog/menu/validation machinery treats them
-            // as ordinary options.
+            // its supported efforts + per-model default. Effort metadata is honored only
+            // when the model opts in, and a default outside the advertised list is dropped
+            // rather than trusted — grok silently ignores unknown efforts, so nothing
+            // unadvertised may ever leave the client. Variants surface as compound raws
+            // (`grok-4.6-low`); a variant whose compound would collide with a real
+            // advertised base id is skipped so the base stays unambiguous.
             let meta = entry["_meta"] as? [String: Any]
             let supportsEffort = (meta?["supportsReasoningEffort"] as? Bool) == true
             let effortEntries = supportsEffort ? (meta?["reasoningEfforts"] as? [[String: Any]] ?? []) : []
@@ -227,8 +230,12 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                     wireDefaultEffort = effort
                 }
             }
-            let currentEffort = CodexReasoningEffort.parse(meta?["reasoningEffort"] as? String)
-            let defaultEffort = currentEffort ?? wireDefaultEffort
+            let declaredDefault = supportsEffort
+                ? CodexReasoningEffort.parse(meta?["reasoningEffort"] as? String)
+                : nil
+            let defaultEffort = [declaredDefault, wireDefaultEffort]
+                .compactMap(\.self)
+                .first(where: { supportedEfforts.contains($0) })
 
             options.append(
                 AgentModelOption(
@@ -243,14 +250,20 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             )
 
             for effort in supportedEfforts {
-                let specifier = GrokBuildModelSpecifier(baseModel: rawID, reasoningEffort: effort)
+                let compound = "\(rawID)-\(effort.rawValue)"
+                let collidesWithBase = available.contains {
+                    guard let otherID = ($0["modelId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+                    return otherID.caseInsensitiveCompare(compound) == .orderedSame
+                }
+                if collidesWithBase { continue }
                 variants.append(
                     AgentModelOption(
-                        rawValue: specifier.compoundRaw,
+                        rawValue: compound,
                         displayName: "\(displayName) \(effort.displayName)",
                         description: description,
                         isPlaceholderDefault: false,
-                        isProviderDefault: false
+                        isProviderDefault: false,
+                        effortVariant: AgentModelEffortVariant(baseModelRaw: rawID, reasoningEffort: effort)
                     )
                 )
             }
@@ -268,13 +281,14 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         } else {
             nil
         }
-        let currentEffortRaw: String? = if let currentRaw,
-                                           let currentOption = options.first(where: { $0.rawValue == currentRaw })
-        {
-            currentOption.defaultReasoningEffort?.rawValue
-        } else {
-            nil
-        }
+        // The session's ACTIVE effort comes from the session config's selected mode entry
+        // (`_meta["x.ai/sessionConfig"].options`, category "mode") — never from a model's
+        // advertised default, which would silently promote defaults to confirmed state.
+        let sessionConfig = (sessionResponse["_meta"] as? [String: Any])?["x.ai/sessionConfig"] as? [String: Any]
+        let sessionOptions = sessionConfig?["options"] as? [[String: Any]] ?? []
+        let currentEffortRaw = sessionOptions.first(where: {
+            ($0["category"] as? String) == "mode" && ($0["selected"] as? Bool) == true
+        }).flatMap { ($0["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
 
         return .valid(ACPDiscoveredSessionModels(
             options: options,
@@ -285,20 +299,20 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
 
     func makeDirectModelSelectionRequest(
         sessionID: String,
-        modelRaw: String
+        baseModelRaw: String,
+        reasoningEffortRaw: String?
     ) -> ACPDirectModelSelectionRequest {
         // Verified against grok 1.0.4: session/set_model takes {sessionId, modelId} plus an
         // optional camelCase `_meta.reasoningEffort`, and responds with
         // {"_meta": {"model": {"Ok": "<modelId>"}}} — the Ok echoes the BASE model id only.
-        let specifier = GrokBuildModelSpecifier(raw: modelRaw)
-        var params: [String: Any] = ["sessionId": sessionID, "modelId": specifier.baseModel]
-        if let effort = specifier.reasoningEffort {
+        var params: [String: Any] = ["sessionId": sessionID, "modelId": baseModelRaw]
+        if let effort = CodexReasoningEffort.parse(reasoningEffortRaw) {
             params["_meta"] = ["reasoningEffort": effort.rawValue]
         }
         return ACPDirectModelSelectionRequest(
             method: "session/set_model",
             params: params,
-            expectedConfirmationModelRaw: specifier.baseModel
+            expectedConfirmationModelRaw: baseModelRaw
         )
     }
 }

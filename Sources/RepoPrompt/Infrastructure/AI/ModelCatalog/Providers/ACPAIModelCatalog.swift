@@ -8,6 +8,9 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     let isProviderDefault: Bool
     let supportedReasoningEfforts: [String]
     let defaultReasoningEffort: String?
+    /// Variant provenance for synthesized effort options. Optional so records persisted
+    /// before effort support decode unchanged.
+    var effortVariant: AgentModelEffortVariant? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
@@ -148,7 +151,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: option.isPlaceholderDefault,
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue
+            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
+            effortVariant: option.effortVariant
         )
     }
 
@@ -165,7 +169,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: record.isPlaceholderDefault,
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort)
+            defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
+            effortVariant: record.effortVariant
         )
     }
 
@@ -216,7 +221,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: existing.isPlaceholderDefault || candidate.isPlaceholderDefault,
             isProviderDefault: existing.isProviderDefault || candidate.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort
+            defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
+            effortVariant: metadataRecord.effortVariant ?? fallbackRecord.effortVariant
         )
     }
 
