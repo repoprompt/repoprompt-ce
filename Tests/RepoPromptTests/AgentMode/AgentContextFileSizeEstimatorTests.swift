@@ -21,6 +21,35 @@ final class AgentContextFileSizeEstimatorTests: XCTestCase {
         XCTAssertEqual(snapshot.paths, [file.standardizedFullPath, file.standardizedFullPath])
     }
 
+    func testOlderGenerationDoesNotCancelNewerReadOrRollBackAuthority() async {
+        let reader = BlockingMetadataReader()
+        let file = makeFile(path: "/workspace/Generation.swift")
+        let estimator = AgentContextFileSizeEstimator { path in
+            try await reader.read(path: path)
+        }
+        let currentTask = Task {
+            await estimator.estimate(for: file, rootGeneration: 8)
+        }
+        while await reader.paths.isEmpty {
+            await Task.yield()
+        }
+
+        let staleTask = Task {
+            await estimator.estimate(for: file, rootGeneration: 7)
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await reader.release()
+        let current = await currentTask.value
+        let stale = await staleTask.value
+        let paths = await reader.paths
+
+        XCTAssertEqual(current.estimate, .known(TokenCalculationService.estimateTokens(utf8ByteCount: 100)))
+        XCTAssertEqual(stale.estimate, .notRequested)
+        XCTAssertEqual(paths, [file.standardizedFullPath])
+    }
+
     func testMissingDirectoryNegativeAndMetadataErrorAreUnavailable() async throws {
         let directory = try makeTestDirectory(name: "ContextBrowseMetadataDirectory")
         let missing = makeFile(path: directory.appendingPathComponent("Missing.swift").path)

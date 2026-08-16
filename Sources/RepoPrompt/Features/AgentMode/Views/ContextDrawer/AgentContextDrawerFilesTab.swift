@@ -8,6 +8,13 @@ func presentedSelectedContextCount(
     return authoritativeRowCount
 }
 
+func agentContextFilesShouldResetModel(
+    previousIdentity: AgentSelectedFilesModelIdentity,
+    currentIdentity: AgentSelectedFilesModelIdentity
+) -> Bool {
+    !previousIdentity.hasSameMutationRoute(as: currentIdentity)
+}
+
 func agentContextFilesCanMutateCurrentModel(
     isSwitchBlankingRows: Bool,
     isSwitchingComposeTab: Bool,
@@ -55,6 +62,7 @@ struct AgentContextDrawerFilesTab: View {
     @ObservedObject var browseModel: AgentContextFileBrowseModel
     @ObservedObject private var fontScale = FontScaleManager.shared
     @StateObject private var previewCoordinator = AgentSelectedFilePreviewLoadCoordinator()
+    @State private var browseEntryTask: Task<Void, Never>?
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -225,9 +233,13 @@ struct AgentContextDrawerFilesTab: View {
             browseModel.applySelectionChange(change, exportRows: modelCoordinator.rowSplit.rows)
             handleSelectionChange(change, isVisible: true)
         }
-        .onChange(of: exportContext.modelRequestIdentity) { _, _ in
+        .onChange(of: exportContext.modelRequestIdentity) { previousIdentity, currentIdentity in
             guard !isSwitchBlankingRows else { return }
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+            guard agentContextFilesShouldResetModel(
+                previousIdentity: previousIdentity,
+                currentIdentity: currentIdentity
+            ) else { return }
             resetOrRefresh(isVisible: true)
         }
         .onChange(of: currentMutationRouteProof) { _, proof in
@@ -531,6 +543,8 @@ struct AgentContextDrawerFilesTab: View {
     }
 
     private func terminateBrowseSession() {
+        browseEntryTask?.cancel()
+        browseEntryTask = nil
         browseModel.end()
     }
 
@@ -546,7 +560,8 @@ struct AgentContextDrawerFilesTab: View {
         )
         let exportRows = modelCoordinator.rowSplit.rows
         let codeMapsGloballyDisabled = exportContext.promptManager.codeMapsGloballyDisabled
-        Task {
+        browseEntryTask?.cancel()
+        browseEntryTask = Task {
             await browseModel.begin(
                 target: target,
                 lookupContext: lookupContext,

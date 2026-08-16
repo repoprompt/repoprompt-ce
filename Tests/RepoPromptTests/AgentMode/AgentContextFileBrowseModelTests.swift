@@ -32,6 +32,26 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
     }
 
     @MainActor
+    func testCanceledDeferredBeginDoesNotReactivateEndedSession() async throws {
+        let harness = try await makeHarness(files: ["One.swift"])
+        let deferredEntry = Task { @MainActor in
+            await harness.model.begin(
+                target: harness.target,
+                lookupContext: .visibleWorkspace,
+                exportRows: [],
+                codeMapsGloballyDisabled: false
+            )
+        }
+
+        harness.model.end()
+        deferredEntry.cancel()
+        await deferredEntry.value
+
+        XCTAssertEqual(harness.model.phase, .inactive)
+        XCTAssertNil(harness.model.capturedIdentity)
+    }
+
+    @MainActor
     func testSelectionProjectionUsesSliceFullManualPrecedenceAndExactAutoMapPredicate() async throws {
         let harness = try await makeHarness(files: ["Full.swift", "Slice.swift", "Manual.swift", "Auto.swift"])
         let paths = harness.paths
@@ -56,6 +76,9 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
         )
         let files = try await loadRootFiles(harness)
 
+        XCTAssertTrue(files.values.allSatisfy {
+            StoredSelectionPathNormalization.standardizedPath($0.standardizedFullPath) == $0.standardizedFullPath
+        })
         XCTAssertEqual(try harness.model.heldMode(for: XCTUnwrap(files["Full.swift"])), .full)
         XCTAssertEqual(try harness.model.heldMode(for: XCTUnwrap(files["Slice.swift"])), .slice)
         XCTAssertEqual(try harness.model.heldMode(for: XCTUnwrap(files["Manual.swift"])), .codemap)
@@ -669,6 +692,19 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
             harness.model.containerDisplayMembership(for: other),
             AgentContextFileBrowseContainerMembership.none
         )
+
+        harness.model.updateAuthoritativeSelection(StoredSelection(), exportRows: [])
+        XCTAssertEqual(
+            harness.model.membership(for: rootNode),
+            AgentContextFileBrowseContainerMembership.none
+        )
+        XCTAssertEqual(
+            harness.model.containerDisplayMembership(for: nested),
+            AgentContextFileBrowseContainerMembership.none
+        )
+        harness.model.updateAuthoritativeSelection(selection, exportRows: [])
+        XCTAssertEqual(harness.model.membership(for: rootNode), .mixed)
+        XCTAssertEqual(harness.model.containerDisplayMembership(for: nested), .mixed)
     }
 
     @MainActor
@@ -709,6 +745,42 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
         )
         XCTAssertTrue(harness.model.expandedNodeIDs.isEmpty)
         XCTAssertNil(folderNode(in: harness, named: "Nested"))
+    }
+
+    @MainActor
+    func testTenThousandNestedFileExpansionLatencyRemainsBounded() async throws {
+        let files = (0 ..< 10000).map { "Nested/File\($0).swift" }
+        let harness = try await makeHarness(files: files)
+        await harness.model.begin(
+            target: harness.target,
+            lookupContext: .visibleWorkspace,
+            exportRows: [],
+            codeMapsGloballyDisabled: false
+        )
+        let rootNode = AgentContextFileBrowseNodeID.root(harness.root.id)
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+
+        harness.model.toggleExpansion(rootNode)
+        await eventually(attempts: 100_000) { harness.model.membership(for: rootNode) != nil }
+
+        let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+        XCTAssertEqual(harness.model.rows.count, 2)
+        XCTAssertLessThan(elapsedMilliseconds, 350, "Cold large-root expansion regressed")
+
+        let nestedNode = try XCTUnwrap(folderNode(in: harness, named: "Nested"))
+        harness.model.toggleExpansion(nestedNode)
+        await eventually(attempts: 100_000) { harness.model.membership(for: nestedNode) != nil }
+        harness.model.toggleExpansion(nestedNode)
+        XCTAssertEqual(harness.model.rows.count, 2)
+        let selectedPath = try XCTUnwrap(harness.paths["Nested/File9999.swift"])
+        let selectionStartedAt = DispatchTime.now().uptimeNanoseconds
+        harness.model.updateAuthoritativeSelection(StoredSelection(selectedPaths: [selectedPath]), exportRows: [])
+        let selectionElapsedMilliseconds = Double(
+            DispatchTime.now().uptimeNanoseconds - selectionStartedAt
+        ) / 1_000_000
+        XCTAssertLessThan(selectionElapsedMilliseconds, 20, "Large-root selection update regressed")
+        XCTAssertEqual(harness.model.membership(for: rootNode), .mixed)
+        XCTAssertEqual(harness.model.membership(for: nestedNode), .mixed)
     }
 
     @MainActor

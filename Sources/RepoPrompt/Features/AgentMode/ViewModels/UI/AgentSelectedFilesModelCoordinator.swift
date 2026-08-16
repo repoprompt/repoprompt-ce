@@ -4,6 +4,14 @@ struct AgentSelectedFilesModelIdentity: Equatable, Hashable {
     let exportContextIdentity: AgentContextExportIdentity
     let filePathDisplay: FilePathDisplay
     let codeMapUsage: CodeMapUsage
+
+    func hasSameMutationRoute(as other: AgentSelectedFilesModelIdentity) -> Bool {
+        exportContextIdentity.tabID == other.exportContextIdentity.tabID
+            && exportContextIdentity.activeAgentSessionID == other.exportContextIdentity.activeAgentSessionID
+            && exportContextIdentity.worktreeBindingFingerprint == other.exportContextIdentity.worktreeBindingFingerprint
+            && filePathDisplay == other.filePathDisplay
+            && codeMapUsage == other.codeMapUsage
+    }
 }
 
 struct AgentSelectedFilesModelRequest {
@@ -271,6 +279,11 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         return completedDisplayedModelMatches(displayedIdentity)
     }
 
+    private func displayedModelCanMutateDuringRefresh(to identity: AgentSelectedFilesModelIdentity) -> Bool {
+        guard displayedModelIsMutable, let displayedIdentity else { return false }
+        return displayedIdentity.hasSameMutationRoute(as: identity)
+    }
+
     private var refreshTask: Task<Void, Never>?
     private let cachedModelLimit = 5
     private var cachedModels: [AgentSelectedFilesModelIdentity: AgentContextExportModel] = [:]
@@ -414,7 +427,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         }
 
         let canMutatePreservedDisplayedModel = preserveDisplayedModel
-            && completedDisplayedModelMatches(request.identity)
+            && displayedModelCanMutateDuringRefresh(to: request.identity)
         cancelActiveRefresh(reason: "startReplacement", fields: refreshFields)
 
         let shouldClearLoadedModel = loadedIdentity != request.identity

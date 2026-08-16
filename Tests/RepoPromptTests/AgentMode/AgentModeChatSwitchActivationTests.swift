@@ -291,6 +291,55 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         ))
     }
 
+    func testFilesTabRequestIdentityResetSkipsSelectionOnlyChanges() {
+        let tabID = UUID()
+        func identity(
+            selection: StoredSelection,
+            tabID: UUID,
+            codeMapUsage: CodeMapUsage = .none
+        ) -> AgentSelectedFilesModelIdentity {
+            AgentSelectedFilesModelIdentity(
+                exportContextIdentity: AgentContextExportIdentity(
+                    tabID: tabID,
+                    selection: selection,
+                    activeAgentSessionID: nil,
+                    worktreeBindingFingerprint: ""
+                ),
+                filePathDisplay: .relative,
+                codeMapUsage: codeMapUsage
+            )
+        }
+
+        let previousIdentity = identity(
+            selection: StoredSelection(selectedPaths: ["Sources/Existing.swift"]),
+            tabID: tabID
+        )
+        let changedSelectionIdentity = identity(
+            selection: StoredSelection(selectedPaths: ["Sources/Existing.swift", "Sources/Added.swift"]),
+            tabID: tabID
+        )
+
+        XCTAssertFalse(agentContextFilesShouldResetModel(
+            previousIdentity: previousIdentity,
+            currentIdentity: changedSelectionIdentity
+        ))
+        XCTAssertTrue(agentContextFilesShouldResetModel(
+            previousIdentity: previousIdentity,
+            currentIdentity: identity(
+                selection: previousIdentity.exportContextIdentity.selection,
+                tabID: tabID,
+                codeMapUsage: .complete
+            )
+        ))
+        XCTAssertTrue(agentContextFilesShouldResetModel(
+            previousIdentity: previousIdentity,
+            currentIdentity: identity(
+                selection: previousIdentity.exportContextIdentity.selection,
+                tabID: UUID()
+            )
+        ))
+    }
+
     func testFilesTabRouteProofUsesPureActiveIdentityAndDisplayedLookupContext() {
         let identity = WorkspaceSelectionIdentity(workspaceID: UUID(), tabID: UUID())
         let lookupContext = WorkspaceLookupContext(

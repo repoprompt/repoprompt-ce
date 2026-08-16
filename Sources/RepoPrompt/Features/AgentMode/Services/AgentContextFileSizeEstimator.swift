@@ -122,6 +122,7 @@ actor AgentContextFileSizeEstimator {
         for request: AgentContextFileSizeEstimateRequest
     ) async -> CachedEstimate? {
         let key = Self.cacheKey(for: request)
+        guard currentGenerationByRootID[key.rootID] == key.rootGeneration else { return nil }
         if let cached = cache[key] { return cached }
         let task: Task<CachedEstimate?, Never>
         if let pending = pendingReadTasks[key] {
@@ -205,7 +206,9 @@ actor AgentContextFileSizeEstimator {
     }
 
     private func invalidateRootIfNeeded(rootID: UUID, generation: UInt64) {
-        guard currentGenerationByRootID[rootID] != generation else { return }
+        if let currentGeneration = currentGenerationByRootID[rootID] {
+            guard generation > currentGeneration else { return }
+        }
         currentGenerationByRootID[rootID] = generation
         cache = cache.filter { $0.key.rootID != rootID }
         for (key, task) in pendingReadTasks where key.rootID == rootID {

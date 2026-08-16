@@ -162,6 +162,11 @@ final class AgentContextFileBrowseModel: ObservableObject {
         let task: Task<Void, Never>
     }
 
+    private struct ContainerFileContribution {
+        let fileID: UUID
+        let supportsCodemap: Bool
+    }
+
     private struct ContainerAggregate {
         var totalFileCount = 0
         var selectableFileCount = 0
@@ -219,8 +224,8 @@ final class AgentContextFileBrowseModel: ObservableObject {
     private var hierarchyByContainer: [AgentContextFileBrowseNodeID: AgentContextFileBrowseHierarchy] = [:]
     private var containerAggregates: [AgentContextFileBrowseNodeID: ContainerAggregate] = [:]
     private var containerIDsByFileID: [UUID: Set<AgentContextFileBrowseNodeID>] = [:]
+    private var containerFileContributionByPath: [String: ContainerFileContribution] = [:]
     private var filesByID: [UUID: AgentContextFileBrowseFile] = [:]
-    private var fileIDByPath: [String: UUID] = [:]
     private var foldersByID: [UUID: AgentContextFileBrowseFolder] = [:]
     private var tokenEstimatesByFileID: [UUID: AgentContextFileBrowseTokenEstimate] = [:]
     private var estimateOwnerByFileID: [UUID: AgentContextFileBrowseNodeID] = [:]
@@ -260,6 +265,7 @@ final class AgentContextFileBrowseModel: ObservableObject {
         exportRows: [AgentContextExportRow],
         codeMapsGloballyDisabled: Bool
     ) async {
+        guard !Task.isCancelled else { return }
         end()
         pendingExpansionRestorePaths = if let retainedExpansion,
                                           retainedExpansion.identity == target.identity,
@@ -352,8 +358,8 @@ final class AgentContextFileBrowseModel: ObservableObject {
         hierarchyByContainer = [:]
         containerAggregates = [:]
         containerIDsByFileID = [:]
+        containerFileContributionByPath = [:]
         filesByID = [:]
-        fileIDByPath = [:]
         foldersByID = [:]
         tokenEstimatesByFileID = [:]
         estimateOwnerByFileID = [:]
@@ -427,7 +433,7 @@ final class AgentContextFileBrowseModel: ObservableObject {
     }
 
     func fileStatus(for file: AgentContextFileBrowseFile) -> AgentContextFileBrowseFileStatus {
-        let path = Self.normalizedPath(file.standardizedFullPath)
+        let path = file.standardizedFullPath
         let heldMode = heldModesByPath[path]
         let eligibility: AgentContextFileBrowseToggleEligibility = if !routeIsCurrent() {
             .disabled(.routeUnavailable)
@@ -601,7 +607,7 @@ final class AgentContextFileBrowseModel: ObservableObject {
             hierarchy.descendantFiles
         } else {
             selectableDescendants(from: hierarchy.descendantFiles).filter {
-                heldModesByPath[Self.normalizedPath($0.standardizedFullPath)] == nil
+                heldModesByPath[$0.standardizedFullPath] == nil
             }
         }
         guard !files.isEmpty else { return false }
@@ -664,8 +670,9 @@ final class AgentContextFileBrowseModel: ObservableObject {
         for path in sliced {
             projection[path] = .slice
         }
-        updateSelectionAggregates(from: heldModesByPath, to: projection)
+        let previousProjection = heldModesByPath
         heldModesByPath = projection
+        updateSelectionAggregates(from: previousProjection, to: projection)
         selectedAncestorDirectoryPaths = Self.ancestorDirectoryPaths(of: projection.keys)
 
         automaticCodemapPaths = Set(exportRows.compactMap { row -> String? in
@@ -680,24 +687,20 @@ final class AgentContextFileBrowseModel: ObservableObject {
         from previous: [String: AgentContextFileBrowseHeldMode],
         to current: [String: AgentContextFileBrowseHeldMode]
     ) {
-        let changedPaths = Set(previous.keys).union(current.keys).filter {
-            (previous[$0] != nil) != (current[$0] != nil)
-        }
+        let changedPaths = Set(previous.keys).symmetricDifference(Set(current.keys))
         for path in changedPaths {
-            guard let fileID = fileIDByPath[path], let file = filesByID[fileID] else { continue }
-            let wasSelected = previous[path] != nil
-            let isSelected = current[path] != nil
-            for containerID in containerIDsByFileID[fileID] ?? [] {
+            guard let contribution = containerFileContributionByPath[path] else { continue }
+            for containerID in containerIDsByFileID[contribution.fileID] ?? [] {
                 guard var aggregate = containerAggregates[containerID] else { continue }
                 applySelectionContribution(
-                    file: file,
-                    isSelected: wasSelected,
+                    supportsCodemap: contribution.supportsCodemap,
+                    isSelected: previous[path] != nil,
                     multiplier: -1,
                     to: &aggregate
                 )
                 applySelectionContribution(
-                    file: file,
-                    isSelected: isSelected,
+                    supportsCodemap: contribution.supportsCodemap,
+                    isSelected: current[path] != nil,
                     multiplier: 1,
                     to: &aggregate
                 )
@@ -707,14 +710,14 @@ final class AgentContextFileBrowseModel: ObservableObject {
     }
 
     private func applySelectionContribution(
-        file: AgentContextFileBrowseFile,
+        supportsCodemap: Bool,
         isSelected: Bool,
         multiplier: Int,
         to aggregate: inout ContainerAggregate
     ) {
         let isSelectable = addMode == .full
             || isSelected
-            || (file.supportsCodemap && !codeMapsGloballyDisabled)
+            || (supportsCodemap && !codeMapsGloballyDisabled)
         aggregate.selectableFileCount += isSelectable ? multiplier : 0
         aggregate.selectedFileCount += isSelected && isSelectable ? multiplier : 0
         aggregate.unsupportedFileCount += isSelectable ? 0 : multiplier
@@ -725,7 +728,7 @@ final class AgentContextFileBrowseModel: ObservableObject {
     ) -> [AgentContextFileBrowseFile] {
         guard addMode == .codemapOnly else { return files }
         return files.filter {
-            heldModesByPath[Self.normalizedPath($0.standardizedFullPath)] != nil
+            heldModesByPath[$0.standardizedFullPath] != nil
                 || ($0.supportsCodemap && !codeMapsGloballyDisabled)
         }
     }
@@ -733,23 +736,33 @@ final class AgentContextFileBrowseModel: ObservableObject {
     private func rebuildContainerAggregates() {
         var aggregates: [AgentContextFileBrowseNodeID: ContainerAggregate] = [:]
         var containerIDs: [UUID: Set<AgentContextFileBrowseNodeID>] = [:]
+        var contributionsByPath: [String: ContainerFileContribution] = [:]
         for (nodeID, hierarchy) in hierarchyByContainer {
             var aggregate = ContainerAggregate()
             for file in hierarchy.descendantFiles {
                 containerIDs[file.id, default: []].insert(nodeID)
+                contributionsByPath[file.standardizedFullPath] = ContainerFileContribution(
+                    fileID: file.id,
+                    supportsCodemap: file.supportsCodemap
+                )
                 accumulate(file: file, into: &aggregate)
             }
             aggregates[nodeID] = aggregate
         }
         containerAggregates = aggregates
         containerIDsByFileID = containerIDs
+        containerFileContributionByPath = contributionsByPath
     }
 
     private func accumulate(file: AgentContextFileBrowseFile, into aggregate: inout ContainerAggregate) {
-        let path = Self.normalizedPath(file.standardizedFullPath)
-        let isSelected = heldModesByPath[path] != nil
+        let path = file.standardizedFullPath
         aggregate.totalFileCount += 1
-        applySelectionContribution(file: file, isSelected: isSelected, multiplier: 1, to: &aggregate)
+        applySelectionContribution(
+            supportsCodemap: file.supportsCodemap,
+            isSelected: heldModesByPath[path] != nil,
+            multiplier: 1,
+            to: &aggregate
+        )
         aggregate.inFlightFileCount += inFlightPaths.contains(path) ? 1 : 0
         Self.applyEstimate(tokenEstimatesByFileID[file.id], multiplier: 1, to: &aggregate)
     }
@@ -1018,9 +1031,9 @@ final class AgentContextFileBrowseModel: ObservableObject {
         targetState: WorkspacePreResolvedSelectionTargetState
     ) {
         guard let session, let sessionCatalogGeneration else { return }
-        let normalizedPaths = Set(files.map { Self.normalizedPath($0.standardizedFullPath) })
-        guard inFlightPaths.isDisjoint(with: normalizedPaths) else { return }
-        inFlightPaths.formUnion(normalizedPaths)
+        let paths = Set(files.map(\.standardizedFullPath))
+        guard inFlightPaths.isDisjoint(with: paths) else { return }
+        inFlightPaths.formUnion(paths)
         updateInFlightAggregates(for: files, multiplier: 1)
         mutationQueue.append(MutationRequest(
             generation: session.generation,
@@ -1146,7 +1159,7 @@ final class AgentContextFileBrowseModel: ObservableObject {
         guard isCurrentSession(generation) else { return }
         updateInFlightAggregates(for: files, multiplier: -1)
         for file in files {
-            inFlightPaths.remove(Self.normalizedPath(file.standardizedFullPath))
+            inFlightPaths.remove(file.standardizedFullPath)
         }
     }
 
@@ -1300,7 +1313,6 @@ final class AgentContextFileBrowseModel: ObservableObject {
         expandedNodeIDs.subtract(containerNodeIDs)
         foldersByID = foldersByID.filter { $0.value.rootID != rootID }
         filesByID = filesByID.filter { $0.value.rootID != rootID }
-        fileIDByPath = fileIDByPath.filter { !fileIDs.contains($0.value) }
         for fileID in fileIDs {
             tokenEstimatesByFileID[fileID] = nil
             estimateOwnerByFileID[fileID] = nil
@@ -1315,13 +1327,12 @@ final class AgentContextFileBrowseModel: ObservableObject {
         for folder in hierarchy.folders {
             foldersByID[folder.id] = folder
         }
-        indexSearchFiles(hierarchy.descendantFiles)
+        indexSearchFiles(hierarchy.files)
     }
 
     private func indexSearchFiles(_ files: [AgentContextFileBrowseFile]) {
         for file in files {
             filesByID[file.id] = file
-            fileIDByPath[Self.normalizedPath(file.standardizedFullPath)] = file.id
         }
     }
 
