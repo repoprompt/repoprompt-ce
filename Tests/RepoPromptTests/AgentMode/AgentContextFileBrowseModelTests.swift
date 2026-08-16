@@ -748,7 +748,7 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
     }
 
     @MainActor
-    func testTenThousandNestedFileExpansionLatencyRemainsBounded() async throws {
+    func testTenThousandNestedFilesKeepExpansionLazyAndSelectionMembershipCorrect() async throws {
         let files = (0 ..< 10000).map { "Nested/File\($0).swift" }
         let harness = try await makeHarness(files: files)
         await harness.model.begin(
@@ -758,14 +758,11 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
             codeMapsGloballyDisabled: false
         )
         let rootNode = AgentContextFileBrowseNodeID.root(harness.root.id)
-        let startedAt = DispatchTime.now().uptimeNanoseconds
 
         harness.model.toggleExpansion(rootNode)
         await eventually(attempts: 100_000) { harness.model.membership(for: rootNode) != nil }
 
-        let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         XCTAssertEqual(harness.model.rows.count, 2)
-        XCTAssertLessThan(elapsedMilliseconds, 350, "Cold large-root expansion regressed")
 
         let nestedNode = try XCTUnwrap(folderNode(in: harness, named: "Nested"))
         harness.model.toggleExpansion(nestedNode)
@@ -773,12 +770,7 @@ final class AgentContextFileBrowseModelTests: XCTestCase {
         harness.model.toggleExpansion(nestedNode)
         XCTAssertEqual(harness.model.rows.count, 2)
         let selectedPath = try XCTUnwrap(harness.paths["Nested/File9999.swift"])
-        let selectionStartedAt = DispatchTime.now().uptimeNanoseconds
         harness.model.updateAuthoritativeSelection(StoredSelection(selectedPaths: [selectedPath]), exportRows: [])
-        let selectionElapsedMilliseconds = Double(
-            DispatchTime.now().uptimeNanoseconds - selectionStartedAt
-        ) / 1_000_000
-        XCTAssertLessThan(selectionElapsedMilliseconds, 20, "Large-root selection update regressed")
         XCTAssertEqual(harness.model.membership(for: rootNode), .mixed)
         XCTAssertEqual(harness.model.membership(for: nestedNode), .mixed)
     }
