@@ -221,7 +221,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     private func executeCreate(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let context = try await resolveRepositoryContext(args: args)
         let bindAfterCreate = parseBool(args["bind"]) ?? false
-        let sessionID = bindAfterCreate ? try await resolveBindingSessionID(args: args) : nil
+        let bindingRequest = bindAfterCreate ? try await resolveBindingRequest(args: args) : nil
+        let sessionID = bindingRequest?.sessionID
 
         if let sessionID {
             try validateLiveSession(sessionID, in: dependencies.execution.requireTargetWindow())
@@ -304,7 +305,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     context: context,
                     visualIdentity: identity,
                     args: args,
-                    source: "manage_worktree.create"
+                    source: "manage_worktree.create",
+                    invocation: bindingRequest?.invocation
                 )
                 bindingDTO = bindingResult.binding
                 previousDTO = bindingResult.previous
@@ -339,7 +341,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             visibleRoots: context.visibleRoots,
             requireExplicit: true
         )
-        let sessionID = try await resolveBindingSessionID(args: args)
+        let bindingRequest = try await resolveBindingRequest(args: args)
+        let sessionID = bindingRequest.sessionID
         try validateLiveSession(sessionID, in: dependencies.execution.requireTargetWindow())
         let repositoryRoot = try await logicalRoot(for: context)
         let worktreeRoot = try await logicalRoot(for: worktree, context: context)
@@ -355,7 +358,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             context: context,
             visualIdentity: identity,
             args: args,
-            source: op == .select ? "manage_worktree.select" : "manage_worktree.bind"
+            source: op == .select ? "manage_worktree.select" : "manage_worktree.bind",
+            invocation: bindingRequest.invocation
         )
         let dto = try await worktreeDTO(worktree, visualIdentity: identity, includeStatus: parseBool(args["include_status"]) ?? false)
         return ToolResultDTOs.ManageWorktreeReplyDTO(
@@ -369,7 +373,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func executeUnbind(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let sessionID = try await resolveBindingSessionID(args: args)
+        let bindingRequest = try await resolveBindingRequest(args: args)
+        let sessionID = bindingRequest.sessionID
         let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let existing = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
@@ -412,7 +417,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             _ = try await agentModeVM.transitionWorktreeBindings(
                 remaining,
                 forSessionID: sessionID,
-                intent: .externalManagement
+                intent: .externalManagement,
+                invocation: bindingRequest.invocation
             )
         }
 
@@ -432,7 +438,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         context: RepositoryContext,
         visualIdentity: WorktreeVisualIdentity,
         args: [String: Value],
-        source: String
+        source: String,
+        invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?
     ) async throws -> (binding: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO, previous: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?) {
         let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
@@ -471,7 +478,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         _ = try await agentModeVM.transitionWorktreeBindings(
             desiredBindings,
             forSessionID: sessionID,
-            intent: .externalManagement
+            intent: .externalManagement,
+            invocation: invocation
         )
         let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
         return (bindingDTO(binding), previousDTO)
@@ -482,23 +490,57 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         try agentModeVM.requireLiveAgentSession(sessionID)
     }
 
-    private func resolveBindingSessionID(args: [String: Value]) async throws -> UUID {
+    private struct BindingRequest {
+        let sessionID: UUID
+        let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?
+    }
+
+    private func resolveBindingRequest(args: [String: Value]) async throws -> BindingRequest {
+        let metadata = await dependencies.context.captureRequestMetadata()
+        let explicitSessionID: UUID?
         if let raw = trimmedString(args["session_id"]) {
             guard let uuid = UUID(uuidString: raw) else {
                 throw MCPError.invalidParams("session_id must be a UUID. Received: \(raw)")
             }
-            return uuid
+            explicitSessionID = uuid
+        } else {
+            explicitSessionID = nil
         }
 
-        let metadata = await dependencies.context.captureRequestMetadata()
-        let resolved = try dependencies.context.resolveTabContextSnapshot(
-            metadata,
-            MCPWindowToolName.manageWorktree
-        )
-        guard let sessionID = resolved.snapshot.activeAgentSessionID else {
+        let resolved: MCPServerViewModel.ResolvedTabContextSnapshot? = if explicitSessionID == nil {
+            try dependencies.context.resolveTabContextSnapshot(
+                metadata,
+                MCPWindowToolName.manageWorktree
+            )
+        } else {
+            try? dependencies.context.resolveTabContextSnapshot(
+                metadata,
+                MCPWindowToolName.manageWorktree
+            )
+        }
+        guard let sessionID = explicitSessionID ?? resolved?.snapshot.activeAgentSessionID else {
             throw MCPError.invalidParams("session_id is required because current MCP routing does not resolve an active Agent session.")
         }
-        return sessionID
+
+        let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if metadata.runPurpose == .agentModeRun,
+                                                                                           MCPClientIdentity.matches(
+                                                                                               metadata.clientName,
+                                                                                               AgentProviderKind.codexMCPClientID
+                                                                                           ),
+                                                                                           let connectionID = metadata.connectionID,
+                                                                                           let invokingSessionID = resolved?.snapshot.activeAgentSessionID,
+                                                                                           let runID = resolved?.snapshot.runID
+        {
+            .init(
+                connectionID: connectionID,
+                sessionID: invokingSessionID,
+                runID: runID,
+                provider: .codexExec
+            )
+        } else {
+            nil
+        }
+        return BindingRequest(sessionID: sessionID, invocation: invocation)
     }
 
     // MARK: - Repository and worktree resolution

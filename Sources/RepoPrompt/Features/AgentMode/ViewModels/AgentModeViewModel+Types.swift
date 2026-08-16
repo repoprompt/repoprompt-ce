@@ -950,6 +950,15 @@ extension AgentModeViewModel {
         case blocked(String)
     }
 
+    /// Exact routed provider request that initiated an external binding mutation.
+    /// This is transient execution identity, never durable binding authority.
+    struct WorktreeBindingMutationInvocationIdentity: Equatable {
+        let connectionID: UUID
+        let sessionID: UUID
+        let runID: UUID
+        let provider: AgentProviderKind
+    }
+
     enum WorktreeBindingTransitionIntent {
         case initialSend
         case userExecutionLocationChange(confirmation: ExecutionLocationChangeConfirmation?)

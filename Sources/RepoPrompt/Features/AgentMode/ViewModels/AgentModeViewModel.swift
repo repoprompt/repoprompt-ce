@@ -6636,6 +6636,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ desiredBindings: [AgentSessionWorktreeBinding],
         forSessionID sessionID: UUID,
         intent: WorktreeBindingTransitionIntent,
+        invocation: WorktreeBindingMutationInvocationIdentity? = nil,
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> [AgentSessionWorktreeBinding] {
@@ -6654,6 +6655,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
         let changedDuringActiveRun = session.runState.isActive
+        let preservesInvokingCodexController = shouldPreserveInvokingCodexController(
+            for: session,
+            intent: intent,
+            invocation: invocation,
+            destinationChanged: previousDestination != nextDestination
+        )
 
         if changedDuringActiveRun, previousDestination != nextDestination {
             switch intent {
@@ -6728,7 +6735,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 if !changedDuringActiveRun {
                     await stageResumeRecoveryHandoffIfNeeded(for: session)
                 }
-                await invalidateProviderContextForExecutionLocationChange(session)
+                if !preservesInvokingCodexController {
+                    await invalidateProviderContextForExecutionLocationChange(session)
+                }
                 guard sessions[session.tabID] === session,
                       session.activeAgentSessionID == sessionID,
                       session.worktreeBindings == previousBindings,
@@ -6876,6 +6885,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw error
         }
+    }
+
+    /// Preserves only the exact Codex process currently executing an externally routed
+    /// binding mutation. The existing controller workspace-path key forces replacement
+    /// before the next turn can run at the newly committed execution destination.
+    private func shouldPreserveInvokingCodexController(
+        for session: TabSession,
+        intent: WorktreeBindingTransitionIntent,
+        invocation: WorktreeBindingMutationInvocationIdentity?,
+        destinationChanged: Bool
+    ) -> Bool {
+        guard destinationChanged,
+              case .externalManagement = intent,
+              let invocation,
+              invocation.provider == .codexExec,
+              invocation.sessionID == session.activeAgentSessionID,
+              invocation.runID == session.runID,
+              session.selectedAgent == .codexExec,
+              session.codexController != nil
+        else {
+            return false
+        }
+        return true
     }
 
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
