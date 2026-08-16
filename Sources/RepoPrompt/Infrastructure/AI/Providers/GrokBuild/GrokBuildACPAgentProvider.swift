@@ -277,11 +277,8 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                 )
             }
         }
-        options.append(contentsOf: variants)
-        guard !options.isEmpty else {
-            return .malformed(reason: "Grok `models.availableModels` contains no usable models.")
-        }
-
+        // currentModelId is provider authority: match it against advertised BASE options
+        // only, never the client-synthesized variants appended below.
         let currentRaw: String? = if let current = (models["currentModelId"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !current.isEmpty
@@ -289,6 +286,10 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             options.first(where: { $0.rawValue.caseInsensitiveCompare(current) == .orderedSame })?.rawValue
         } else {
             nil
+        }
+        options.append(contentsOf: variants)
+        guard !options.isEmpty else {
+            return .malformed(reason: "Grok `models.availableModels` contains no usable models.")
         }
         // The session's ACTIVE effort comes from the session config's selected mode entry
         // (`_meta["x.ai/sessionConfig"].options`, category "mode") — never from a model's

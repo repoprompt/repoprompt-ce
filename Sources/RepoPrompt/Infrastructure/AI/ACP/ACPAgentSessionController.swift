@@ -743,34 +743,39 @@ actor ACPAgentSessionController {
                 // closed: only an `Ok` echoing the requested base model may update local
                 // model authority — missing, malformed, or mismatched acknowledgements leave
                 // the session's real current model unknown, so local state must not move.
-                let selectionResponse = try await sendRequestResponse(
-                    method: selectionRequest.method,
-                    params: selectionRequest.params
-                )
+                let selectionResponse: RequestResponse
+                do {
+                    selectionResponse = try await sendRequestResponse(
+                        method: selectionRequest.method,
+                        params: selectionRequest.params
+                    )
+                } catch {
+                    // A throw here (timeout, EOF, cancellation, decode failure) is also an
+                    // ambiguous post-dispatch outcome: the request may have been applied.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw error
+                }
                 let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
-                if let modelError = modelOutcome?["Err"] {
-                    // An explicit Err is a confirmed rejection: the session's current model
+                let hasOk = modelOutcome?.keys.contains("Ok") == true
+                let hasErr = modelOutcome?.keys.contains("Err") == true
+                if hasErr, !hasOk {
+                    // An exclusive Err is a confirmed rejection: the session's current model
                     // is untouched, so local authority stays valid.
+                    let modelError = modelOutcome?["Err"] ?? "unknown"
                     throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
                 }
-                guard let confirmedModel = modelOutcome?["Ok"] as? String,
+                guard !hasErr,
+                      hasOk,
+                      let confirmedModel = modelOutcome?["Ok"] as? String,
                       confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
                       .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
                 else {
-                    // Ambiguous post-send outcome: the server may or may not have applied
-                    // anything, and neither the requested nor the prior model is confirmed.
-                    // Invalidate current model/effort authority so stale state can never
-                    // short-circuit a corrective selection; the advertised options remain
-                    // live and valid.
-                    if let current = discoveredSessionModels {
-                        let cleared = ACPDiscoveredSessionModels(
-                            options: current.options,
-                            currentModelRaw: nil,
-                            currentEffortRaw: nil
-                        )
-                        discoveredSessionModels = cleared
-                        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(cleared, for: provider.providerID)
-                    }
+                    // Ambiguous post-send outcome (missing/malformed/mixed/mismatched ack):
+                    // the server may or may not have applied anything, and neither the
+                    // requested nor the prior model is confirmed. Invalidate current
+                    // model/effort authority so stale state can never short-circuit a
+                    // corrective selection; the advertised options remain live and valid.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
                     throw ControllerError.protocolViolation(
                         "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
                     )
@@ -855,6 +860,24 @@ actor ACPAgentSessionController {
               !trimmed.isEmpty
         else { return nil }
         return trimmed.lowercased()
+    }
+
+    /// Clears current model/effort authority after an ambiguous `session/set_model` outcome
+    /// (post-dispatch throw, or a missing/malformed/mixed/mismatched acknowledgement). The
+    /// advertised options stay — they came from the live session or warmed registry and are
+    /// still the valid advertisement — but nothing about the session's current model or
+    /// effort is confirmed anymore. Works for warmed-only sessions too (discoveredSessionModels
+    /// may be nil there), and never promotes warmed data to live authority.
+    private func invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: [AgentModelOption]) {
+        let options = discoveredSessionModels?.options ?? snapshotOptions
+        guard !options.isEmpty else { return }
+        let cleared = ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: nil,
+            currentEffortRaw: nil
+        )
+        discoveredSessionModels = cleared
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(cleared, for: provider.providerID)
     }
 
     func setSessionMode(_ modeID: String) async throws {

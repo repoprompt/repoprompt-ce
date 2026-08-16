@@ -559,6 +559,66 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         )
     }
 
+    func testMixedOkAndErrAckInvalidatesAuthority() async throws {
+        // Both branches present is ambiguous under the {"Ok"}|{"Err"} contract — it must
+        // NOT take the confirmed-rejection path and preserve state.
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "mixed")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected mixed acknowledgement to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw)
+    }
+
+    func testPostDispatchThrowInvalidatesAuthority() async throws {
+        // The server dying mid-request is an ambiguous post-dispatch outcome: the mutation
+        // may have been applied. Authority must be invalidated, not preserved.
+        let fixture = try makeFixture(shape: "grok_direct", setModelAck: "close")
+        try await bootstrap(fixture.controller)
+
+        do {
+            try await fixture.controller.setSessionModel("grok-4.5")
+            XCTFail("expected a post-dispatch failure to throw")
+        } catch {
+            // Any transport-level error is acceptable here.
+        }
+        XCTAssertNil(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "a post-dispatch throw invalidates current-model authority"
+        )
+    }
+
+    func testWarmedOnlyAmbiguousAckInvalidatesRegistryAuthority() async throws {
+        // Warm the registry (collision shape carries an effort-free base so the model-only
+        // mutation below is legal without live authority).
+        let warmFixture = try makeFixture(shape: "grok_collision")
+        try await bootstrap(warmFixture.controller)
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "grok-4.6"
+        )
+
+        // A metadata-free session validating against the warmed registry: an ambiguous ack
+        // must still invalidate the registry's current authority.
+        let coldFixture = try makeFixture(shape: "grok_bare", setModelAck: "mismatch")
+        try await bootstrap(coldFixture.controller)
+
+        do {
+            try await coldFixture.controller.setSessionModel("grok-4.6-low")
+            XCTFail("expected mismatched Ok to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not confirm"), "unexpected error: \(error)")
+        }
+        XCTAssertNil(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentModelRaw,
+            "warmed-only sessions invalidate registry authority on ambiguous acks too"
+        )
+    }
+
     func testMalformedSessionModelStateDoesNotPersistAndSelectionFails() async throws {
         let fixture = try makeFixture(shape: "grok_direct_malformed")
         try await bootstrap(fixture.controller)
@@ -904,6 +964,12 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                     respond(request_id, {"_meta": {"model": {"Ok": "grok-4.6"}}})
                 elif set_model_ack == "err":
                     respond(request_id, {"_meta": {"model": {"Err": {"message": "model unavailable"}}}})
+                elif set_model_ack == "mixed":
+                    # Both branches present: ambiguous under the {"Ok"}|{"Err"} contract.
+                    respond(request_id, {"_meta": {"model": {"Ok": "grok-4.5", "Err": {"message": "confused"}}}})
+                elif set_model_ack == "close":
+                    # Post-dispatch ambiguity: the server dies without answering.
+                    sys.exit(0)
                 elif requested in valid_ids:
                     current_model = requested
                     respond(request_id, {"_meta": {"model": {"Ok": requested}}})
