@@ -42,6 +42,30 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         XCTAssertEqual(base45?.supportedReasoningEfforts, [.low, .medium, .high])
     }
 
+    func testEveryAcceptedEffortSendsBaseModelIdAndEffortMeta() async throws {
+        // Table-driven positive wire coverage for the accepted efforts beyond the live
+        // fixture's default list: none, minimal, max, ultra.
+        for effort in ["none", "minimal", "max", "ultra"] {
+            let fixture = try makeFixture(shape: "grok_direct", extra46Effort: effort)
+            try await bootstrap(fixture.controller)
+
+            try await fixture.controller.setSessionModel("grok-4.6-\(effort)")
+            let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_model")
+            XCTAssertEqual(mutations.count, 1, "effort \(effort): selection must dispatch")
+            XCTAssertEqual(
+                mutations.first?.params["modelId"] as? String,
+                "grok-4.6",
+                "effort \(effort): modelId is the literal base id"
+            )
+            XCTAssertEqual(
+                (mutations.first?.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+                effort,
+                "effort \(effort): _meta.reasoningEffort equals the advertised effort"
+            )
+            await fixture.controller.shutdown()
+        }
+    }
+
     func testEffortVariantSelectionSendsModelAndEffortMeta() async throws {
         let fixture = try makeFixture(shape: "grok_direct")
         try await bootstrap(fixture.controller)
@@ -131,7 +155,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
     }
 
     func testMissingSessionConfigLeavesEffortUnknown() async throws {
-        let fixture = try makeFixture(shape: "grok_direct", sessionEffort: "none")
+        let fixture = try makeFixture(shape: "grok_direct", sessionEffort: "absent")
         try await bootstrap(fixture.controller)
 
         XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw)
@@ -838,7 +862,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         doubleSelect: Bool = false,
         crossCollision: Bool = false,
         ultraIDCollision: Bool = false,
-        listDefault45: String = "single"
+        listDefault45: String = "single",
+        extra46Effort: String = ""
     ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
@@ -854,6 +879,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "ACP_CROSS_COLLISION": crossCollision ? "1" : "0",
             "ACP_ULTRA_ID_COLLISION": ultraIDCollision ? "1" : "0",
             "ACP_45_LIST_DEFAULT": listDefault45,
+            "ACP_46_EXTRA_EFFORT": extra46Effort,
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -887,6 +913,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         effort_default_override = os.environ.get("ACP_45_DEFAULT_EFFORT", "high")
         low_mode_id = os.environ.get("ACP_LOW_MODE_ID", "low")
         list_default_45 = os.environ.get("ACP_45_LIST_DEFAULT", "single")
+        extra_46_effort = os.environ.get("ACP_46_EXTRA_EFFORT", "")
         session_id = "grok-direct-session"
         current_model = "grok-4.6"
         modern_current_model = "model-a"
@@ -944,8 +971,10 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                                        {"id": "high", "value": "high", "label": "High Effort", "default": True},
                                        {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
                                        {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False}
-                                   ]
-                               )}},
+                                       ]
+                               ) + ([{"id": extra_46_effort, "value": extra_46_effort,
+                                      "label": extra_46_effort, "default": False}]
+                                    if extra_46_effort else [])}},
                     {"modelId": "grok-4.5", "name": "Grok 4.5",
                      "_meta": {"supportsReasoningEffort": True,
                                "reasoningEffort": effort_default_override,
@@ -962,7 +991,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         def session_config_meta():
             # Mirrors grok 1.0.4's `_meta["x.ai/sessionConfig"]`: the session's ACTIVE
             # effort is the selected category-"mode" entry.
-            if session_effort == "none":
+            if session_effort == "absent":
                 return {}
             modes = ["xhigh", "high", "medium", "low"]
             options = [
