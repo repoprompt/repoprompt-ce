@@ -586,7 +586,8 @@ final class CodexCLIProvider: AIProvider {
                     case .toolCall, .toolResult, .commandExecutionRunning:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
-                    case .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
+                    case .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system,
+                         .hookInventoryDiagnostic, .hookLifecycleDiagnostic:
                         continue
                     }
                 }
@@ -762,7 +763,8 @@ final class CodexCLIProvider: AIProvider {
                     case .toolCall, .toolResult, .commandExecutionRunning:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
-                    case .reasoningDelta, .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
+                    case .reasoningDelta, .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system,
+                         .hookInventoryDiagnostic, .hookLifecycleDiagnostic:
                         continue
                     }
                 }
@@ -1161,6 +1163,8 @@ final class CodexCLIProvider: AIProvider {
                 return "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
                 return "Failed to decode Codex app-server JSON response."
+            case .uncertainMutation:
+                return clientError.localizedDescription
             }
         }
         let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)

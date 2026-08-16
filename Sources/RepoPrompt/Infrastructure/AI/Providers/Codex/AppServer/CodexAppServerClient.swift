@@ -202,6 +202,7 @@ actor CodexAppServerClient {
         case executableUnavailable(String)
         case transportWriteFailed(message: String, errno: Int32?)
         case transportReadSetupFailed(message: String, errno: Int32?)
+        case uncertainMutation(method: String)
 
         var errorDescription: String? {
             switch self {
@@ -221,6 +222,8 @@ actor CodexAppServerClient {
                 message
             case let .transportReadSetupFailed(message, _):
                 message
+            case let .uncertainMutation(method):
+                "Codex \(method) may have partially succeeded. RepoPrompt terminated the authoritative app-server transport and did not retry the mutation."
             }
         }
 
@@ -283,6 +286,7 @@ actor CodexAppServerClient {
     private struct PendingRequestMetadata {
         let method: String
         let transportGeneration: UInt64
+        let isMutation: Bool
     }
 
     private struct ExitObservation {
@@ -832,10 +836,15 @@ actor CodexAppServerClient {
         }
         timeoutTasks.removeAll()
         let requests = pendingRequests
+        let requestMetadata = pendingRequestMetadata
         pendingRequests.removeAll()
         pendingRequestMetadata.removeAll()
-        for continuation in requests.values {
-            continuation.resume(throwing: requestFailure)
+        for (requestID, continuation) in requests {
+            if let metadata = requestMetadata[requestID], metadata.isMutation {
+                continuation.resume(throwing: ClientError.uncertainMutation(method: metadata.method))
+            } else {
+                continuation.resume(throwing: requestFailure)
+            }
         }
 
         let notifContinuations = notificationContinuations
@@ -1025,10 +1034,15 @@ actor CodexAppServerClient {
         }
         timeoutTasks.removeAll()
         let requests = pendingRequests
+        let requestMetadata = pendingRequestMetadata
         pendingRequests.removeAll()
         pendingRequestMetadata.removeAll()
-        for continuation in requests.values {
-            continuation.resume(throwing: ClientError.processNotRunning)
+        for (requestID, continuation) in requests {
+            if let metadata = requestMetadata[requestID], metadata.isMutation {
+                continuation.resume(throwing: ClientError.uncertainMutation(method: metadata.method))
+            } else {
+                continuation.resume(throwing: ClientError.processNotRunning)
+            }
         }
         for continuation in notificationContinuations.values {
             continuation.finish()
@@ -1131,7 +1145,8 @@ actor CodexAppServerClient {
             method: method,
             params: params,
             timeout: timeout,
-            useDefaultTimeout: true
+            useDefaultTimeout: true,
+            isMutation: false
         )
     }
 
@@ -1139,7 +1154,8 @@ actor CodexAppServerClient {
         method: String,
         params: [String: Any]?,
         timeout: TimeInterval?,
-        useDefaultTimeout: Bool
+        useDefaultTimeout: Bool,
+        isMutation: Bool = false
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard let activeTransport, !didTerminateTransport else {
@@ -1160,13 +1176,14 @@ actor CodexAppServerClient {
                 pendingRequests[requestID] = continuation
                 pendingRequestMetadata[requestID] = PendingRequestMetadata(
                     method: method,
-                    transportGeneration: generation
+                    transportGeneration: generation,
+                    isMutation: isMutation
                 )
                 if let deadline {
                     scheduleTimeout(for: requestID, after: deadline)
                 }
                 if Task.isCancelled {
-                    cancelPendingRequestIfPresent(id: requestID)
+                    Task { await self.cancelPendingRequestIfPresent(id: requestID) }
                     return
                 }
                 do {
@@ -1178,6 +1195,20 @@ actor CodexAppServerClient {
         } onCancel: {
             Task { await self.cancelPendingRequestIfPresent(id: requestID) }
         }
+    }
+
+    func mutatingRequest(
+        method: String,
+        params: [String: Any],
+        timeout: TimeInterval?
+    ) async throws -> [String: Any] {
+        try await request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            useDefaultTimeout: true,
+            isMutation: true
+        )
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) throws {
@@ -1652,8 +1683,12 @@ actor CodexAppServerClient {
             let idString = String(describing: idValue)
             if let result = json["result"] as? [String: Any] {
                 if let continuation = pendingRequests.removeValue(forKey: idString) {
-                    pendingRequestMetadata.removeValue(forKey: idString)
+                    let metadata = pendingRequestMetadata.removeValue(forKey: idString)
                     cancelTimeout(for: idString)
+                    guard metadata?.transportGeneration == activeTransport?.generation else {
+                        continuation.resume(throwing: ClientError.invalidResponse)
+                        return
+                    }
                     if config.enableDebugLogging {
                         print("[CodexAppServer] Response for request \(idString)")
                     }
@@ -1666,6 +1701,10 @@ actor CodexAppServerClient {
             {
                 let metadata = pendingRequestMetadata.removeValue(forKey: idString)
                 cancelTimeout(for: idString)
+                guard metadata?.transportGeneration == activeTransport?.generation else {
+                    continuation.resume(throwing: ClientError.invalidResponse)
+                    return
+                }
                 guard let failure = Self.requestFailure(
                     method: metadata?.method ?? "<unknown>",
                     errorObject: error
@@ -2019,11 +2058,25 @@ actor CodexAppServerClient {
 
     private func timeoutRequest(id: String, after timeout: TimeInterval) async {
         timeoutTasks.removeValue(forKey: id)
-        guard let continuation = pendingRequests.removeValue(forKey: id) else {
+        guard let continuation = pendingRequests[id] else {
             pendingRequestMetadata.removeValue(forKey: id)
             return
         }
-        let metadata = pendingRequestMetadata.removeValue(forKey: id)
+        let metadata = pendingRequestMetadata[id]
+        if let metadata, metadata.isMutation,
+           metadata.transportGeneration == activeTransport?.generation
+        {
+            let task = beginTransportTermination(
+                flushStdout: false,
+                expectedGeneration: metadata.transportGeneration,
+                requestFailure: .uncertainMutation(method: metadata.method),
+                reason: .timeout(method: metadata.method, requestID: id)
+            )
+            await task?.value
+            return
+        }
+        pendingRequests.removeValue(forKey: id)
+        pendingRequestMetadata.removeValue(forKey: id)
         if let metadata,
            Self.shouldPoisonTransportOnTimeout(method: metadata.method)
         {
@@ -2046,8 +2099,20 @@ actor CodexAppServerClient {
         timeoutTasks.removeValue(forKey: requestID)?.cancel()
     }
 
-    private func cancelPendingRequestIfPresent(id: String) {
+    private func cancelPendingRequestIfPresent(id: String) async {
         timeoutTasks.removeValue(forKey: id)?.cancel()
+        if let metadata = pendingRequestMetadata[id], metadata.isMutation,
+           metadata.transportGeneration == activeTransport?.generation
+        {
+            let task = beginTransportTermination(
+                flushStdout: false,
+                expectedGeneration: metadata.transportGeneration,
+                requestFailure: .uncertainMutation(method: metadata.method),
+                reason: .livenessCheckFailed(method: metadata.method)
+            )
+            await task?.value
+            return
+        }
         pendingRequestMetadata.removeValue(forKey: id)
         if let continuation = pendingRequests.removeValue(forKey: id) {
             continuation.resume(throwing: CancellationError())

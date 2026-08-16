@@ -829,6 +829,7 @@ struct AgentApprovalDetail: Identifiable, Hashable {
 enum AgentApprovalKind: String, Hashable {
     case commandExecution
     case fileChange
+    case codexHookReview
 }
 
 enum AgentApprovalDecision: Hashable {
@@ -841,6 +842,7 @@ enum AgentApprovalDecision: Hashable {
 
 enum AgentApprovalRequestID: Hashable {
     case codex(CodexAppServerRequestID)
+    case codexHookReview(UUID)
     case claudeControl(String)
     case acp(String)
 
@@ -848,6 +850,8 @@ enum AgentApprovalRequestID: Hashable {
         switch self {
         case let .codex(id):
             id.displayValue
+        case let .codexHookReview(id):
+            id.uuidString
         case let .claudeControl(id):
             id
         case let .acp(id):
@@ -995,10 +999,12 @@ struct AgentApprovalRequest: Identifiable, Hashable {
             "Command Approval"
         case .fileChange:
             "File Change Approval"
+        case .codexHookReview:
+            "Codex Project Hook Review"
         }
     }
 
     var supportsAlwaysAllow: Bool {
-        true
+        kind != .codexHookReview
     }
 }

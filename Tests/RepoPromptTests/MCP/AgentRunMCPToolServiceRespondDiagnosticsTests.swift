@@ -72,6 +72,11 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
                 "provider file change",
                 { fixture.installProviderApproval(kind: .fileChange) },
                 "response must be one of: accept, accept_for_session, decline, cancel."
+            ),
+            (
+                "Codex hook review",
+                { fixture.installCodexHookReview() },
+                "response must be one of: accept, decline, cancel."
             )
         ]
 
@@ -88,6 +93,23 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
             )
             XCTAssertEqual(fixture.currentPendingInteractionID, interactionID, label)
         }
+    }
+
+    func testCodexHookReviewRejectsSessionWideApprovalWithoutMutation() async throws {
+        let fixture = try await ControlledApprovalSessionFixture.make()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        let interactionID = fixture.installCodexHookReview()
+        let pendingApproval = try XCTUnwrap(fixture.session.pendingApproval)
+
+        await assertInvalidParams(
+            service: fixture.service,
+            sessionID: fixture.sessionID,
+            interactionID: interactionID,
+            arguments: ["response": .string("accept_for_session")],
+            expectedMessage: "accept_for_session is not supported for this approval interaction.",
+            label: "Codex hook review"
+        )
+        XCTAssertEqual(fixture.session.pendingApproval, pendingApproval)
     }
 
     func testApprovalRespondWithStaleInteractionIDReportsCurrentSafeIdentityWithoutMutation() async throws {
@@ -251,6 +273,21 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
                 grantRoot: privacySentinels ? "SCOPE_SENTINEL" : nil,
                 proposedExecpolicyAmendmentJSON: privacySentinels ? "AMENDMENT_SENTINEL" : nil,
                 details: privacySentinels ? [.init(label: "OPTION_SENTINEL", value: "RESPONSE_SENTINEL")] : []
+            )
+            return id
+        }
+
+        @discardableResult
+        func installCodexHookReview() -> UUID {
+            let id = UUID()
+            session.pendingApproval = AgentApprovalRequest(
+                id: id,
+                requestID: .codexHookReview(id),
+                method: "hooks/review",
+                kind: .codexHookReview,
+                threadID: "",
+                turnID: "",
+                itemID: "fingerprint"
             )
             return id
         }

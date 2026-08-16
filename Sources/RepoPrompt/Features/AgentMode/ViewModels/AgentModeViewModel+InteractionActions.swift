@@ -9,7 +9,7 @@ extension AgentModeViewModel {
             return
         }
         switch request.requestID {
-        case .codex:
+        case .codex, .codexHookReview:
             codexCoordinator.submitApprovalDecision(session: session, decision: decision)
         case .claudeControl:
             claudeCoordinator.submitApprovalDecision(session: session, decision: decision)

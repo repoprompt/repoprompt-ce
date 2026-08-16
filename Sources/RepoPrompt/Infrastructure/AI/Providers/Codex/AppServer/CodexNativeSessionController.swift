@@ -110,11 +110,16 @@ protocol CodexSessionControlling: AnyObject {
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
+    func respondToHookReview(interactionID: UUID, decision: AgentApprovalDecision) async -> Bool
 }
 
 extension CodexSessionControlling {
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Codex runtime has no local API for \(action.rawValue) cleanup of conversations.")
+    }
+
+    func respondToHookReview(interactionID _: UUID, decision _: AgentApprovalDecision) async -> Bool {
+        false
     }
 }
 
@@ -416,6 +421,8 @@ final class CodexNativeSessionController {
         case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?)
         case commandExecutionRunning(CommandExecutionRunningUpdate)
         case livenessActivity(LivenessActivity)
+        case hookInventoryDiagnostic(CodexHookInventoryDiagnostic)
+        case hookLifecycleDiagnostic(CodexHookLifecycleDiagnostic)
         case errorNotification(ErrorNotification)
         case error(String)
         case system(String)
@@ -568,6 +575,7 @@ final class CodexNativeSessionController {
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
         var skillExtraRootsProvider: () -> [URL] = { [] }
+        var hookCompatibilityGateEnabled = false
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
@@ -597,7 +605,8 @@ final class CodexNativeSessionController {
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            hookCompatibilityGateEnabled: Bool = false
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -630,7 +639,8 @@ final class CodexNativeSessionController {
                 computerUseEnabledProvider: computerUseEnabledProvider,
                 skillExtraRootsProvider: {
                     [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
-                }
+                },
+                hookCompatibilityGateEnabled: hookCompatibilityGateEnabled
             )
         }
     }
@@ -676,6 +686,11 @@ final class CodexNativeSessionController {
     private struct LifecycleAuthorityObservation: Equatable {
         let lineage: LifecycleAuthorityReconciliationLineage
         let kind: LifecycleAuthorityObservationKind
+    }
+
+    private struct PendingHookReview {
+        let interactionID: UUID
+        let continuation: AsyncStream<CodexHookReviewDecision>.Continuation
     }
 
     private let client: CodexAppServerClient
@@ -729,6 +744,9 @@ final class CodexNativeSessionController {
     private var serverRequestTask: Task<Void, Never>?
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private let eventsContinuationLock = NSLock()
+    private let hookGateLock = NSLock()
+    private var activeHookGateID: UUID?
+    private var pendingHookReview: PendingHookReview?
     private let eventHandlingMutex = AsyncMutex()
     private let eventsStream: AsyncStream<Event>
     /// Protected by `eventsContinuationLock`.
@@ -853,6 +871,17 @@ final class CodexNativeSessionController {
             timeout: timeout,
             useDefaultTimeout: useDefaultTimeout
         )
+    }
+
+    private func performMutatingRequest(
+        method: String,
+        params: [String: Any],
+        timeout: TimeInterval?
+    ) async throws -> [String: Any] {
+        if let requestExecutor {
+            return try await requestExecutor(method, params, timeout)
+        }
+        return try await client.mutatingRequest(method: method, params: params, timeout: timeout)
     }
 
     func cleanupConversation(
@@ -1302,6 +1331,11 @@ final class CodexNativeSessionController {
                 )
             }
 
+            if options.hookCompatibilityGateEnabled {
+                try await performHookCompatibilityGate(runtime: runtime)
+                try Task.checkCancellation()
+            }
+
             if let resumeThreadID {
                 let desiredMemoryMode: ThreadMemoryMode? = await MainActor.run {
                     guard let memoriesEnabledProvider = options.memoriesEnabledProvider else { return nil }
@@ -1417,6 +1451,166 @@ final class CodexNativeSessionController {
             }
             throw error
         }
+    }
+
+    private func performHookCompatibilityGate(runtime: CodexRuntimeAuthority.Runtime) async throws {
+        let cwd = try exactHookInventoryCWD()
+        let gateID = UUID()
+        let installedGate = hookGateLock.withLock {
+            guard activeHookGateID == nil else { return false }
+            activeHookGateID = gateID
+            return true
+        }
+        guard installedGate else {
+            throw CodexSessionControllerError.invalidLifecycleState("already running a hook compatibility gate")
+        }
+        defer { retireHookGate(gateID) }
+
+        let dependencies = CodexHookGateDependencies(
+            read: { [weak self] method, params, timeout in
+                guard let self else { throw CodexSessionControllerError.invalidLifecycleState("no longer active") }
+                return try await performRequest(method: method, params: params, timeout: timeout)
+            },
+            write: { [weak self] method, params, timeout in
+                guard let self else { throw CodexSessionControllerError.invalidLifecycleState("no longer active") }
+                return try await performMutatingRequest(method: method, params: params, timeout: timeout)
+            },
+            review: { [weak self] review in
+                guard let self else { return .cancel }
+                return await requestHookReview(review, gateID: gateID)
+            },
+            emitInventory: { [weak self] diagnostic in
+                await self?.emit(.hookInventoryDiagnostic(diagnostic))
+            },
+            terminateUncertainWrite: { [weak self] in
+                guard let self else { throw CodexSessionControllerError.invalidLifecycleState("no longer active") }
+                await client.stop()
+                try ensureHookGateIdentity(gateID)
+            },
+            assertAuthority: { [weak self] in
+                guard let self else { throw CodexSessionControllerError.invalidLifecycleState("no longer active") }
+                try ensureHookGateAuthority(gateID)
+            }
+        )
+        try await CodexHookCompatibilityGate.run(
+            cwd: cwd,
+            managedConfigURL: runtime.statePaths.codexHome.appendingPathComponent("config.toml"),
+            timeout: options.requestTimeout,
+            dependencies: dependencies
+        )
+        try ensureHookGateAuthority(gateID)
+    }
+
+    private func exactHookInventoryCWD() throws -> String {
+        let candidate = workspacePaths.executionDirectory
+            ?? workspacePaths.processLaunchDirectory
+            ?? CLIProcessConfiguration.resolvedWorkingDirectory(nil)
+        let path = URL(fileURLWithPath: candidate).standardized.path
+        var isDirectory: ObjCBool = false
+        guard path.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            throw CodexHookGateError.malformedInventory("Codex hook inventory requires one existing absolute execution cwd.")
+        }
+        return path
+    }
+
+    private func ensureHookGateIdentity(_ gateID: UUID) throws {
+        let ownsGate = hookGateLock.withLock { activeHookGateID == gateID }
+        guard ownsGate else {
+            throw CodexSessionControllerError.invalidLifecycleState("superseded during hook review")
+        }
+    }
+
+    private func ensureHookGateAuthority(_ gateID: UUID) throws {
+        try ensureHookGateIdentity(gateID)
+        let isBinding = withEventsStateLock { lifecycleState == .binding }
+        guard isBinding else {
+            throw CodexSessionControllerError.invalidLifecycleState("superseded during hook review")
+        }
+        // Identity is checked before cancellation so a stale controller cannot finalize a newer run.
+        try Task.checkCancellation()
+    }
+
+    private func retireHookGate(_ gateID: UUID) {
+        let pending = hookGateLock.withLock { () -> PendingHookReview? in
+            if activeHookGateID == gateID { activeHookGateID = nil }
+            let pending = pendingHookReview
+            if pending != nil { pendingHookReview = nil }
+            return pending
+        }
+        pending?.continuation.yield(.cancel)
+        pending?.continuation.finish()
+    }
+
+    private func requestHookReview(
+        _ review: CodexHookReview,
+        gateID: UUID
+    ) async -> CodexHookReviewDecision {
+        do { try ensureHookGateAuthority(gateID) } catch { return .cancel }
+        let pair = AsyncStream<CodexHookReviewDecision>.makeStream()
+        let installedReview = hookGateLock.withLock {
+            guard activeHookGateID == gateID, pendingHookReview == nil else { return false }
+            pendingHookReview = PendingHookReview(
+                interactionID: review.interactionID,
+                continuation: pair.continuation
+            )
+            return true
+        }
+        guard installedReview else {
+            pair.continuation.finish()
+            return .cancel
+        }
+
+        let details = review.hooks.enumerated().map { index, hook in
+            let matcher = hook.matcher?.prefix(512) ?? "all matching events"
+            let command = hook.command?.prefix(1024) ?? "<non-command handler>"
+            return AgentApprovalDetail(
+                label: "Hook \(index + 1): \(hook.eventName.rawValue)",
+                value: "source: \(hook.sourcePath)\nhandler: \(hook.handlerType.rawValue)\nmatcher: \(matcher)\ncommand: \(command)\nhash: \(hook.currentHash)",
+                isCode: true
+            )
+        }
+        await emit(.approvalRequest(.init(
+            id: review.interactionID,
+            requestID: .codexHookReview(review.interactionID),
+            method: "hooks/review",
+            kind: .codexHookReview,
+            threadID: "",
+            turnID: "",
+            itemID: review.inventoryFingerprint,
+            reason: "Trust all \(review.hooks.count) current enabled project hook definitions for \(review.cwd), or cancel this agent start.",
+            cwd: review.cwd,
+            details: details
+        )))
+
+        return await withTaskCancellationHandler {
+            var iterator = pair.stream.makeAsyncIterator()
+            return await iterator.next() ?? .cancel
+        } onCancel: {
+            Task { [weak self] in
+                _ = await self?.respondToHookReview(interactionID: review.interactionID, decision: .cancel)
+            }
+        }
+    }
+
+    func respondToHookReview(interactionID: UUID, decision: AgentApprovalDecision) async -> Bool {
+        let resolved: CodexHookReviewDecision = switch decision {
+        case .accept: .trustAll
+        case .decline: .decline
+        case .cancel, .acceptForSession, .acceptWithExecpolicyAmendment: .cancel
+        }
+        guard let pending = hookGateLock.withLock({ () -> PendingHookReview? in
+            guard let pending = pendingHookReview, pending.interactionID == interactionID else { return nil }
+            pendingHookReview = nil
+            return pending
+        }) else {
+            return false
+        }
+        pending.continuation.yield(resolved)
+        pending.continuation.finish()
+        return true
     }
 
     private func setThreadMemoryMode(_ mode: ThreadMemoryMode, threadID: String) async throws {
@@ -1970,6 +2164,10 @@ final class CodexNativeSessionController {
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
             }
+        }
+        let pendingHookReviewID = hookGateLock.withLock { pendingHookReview?.interactionID }
+        if let pendingHookReviewID {
+            _ = await respondToHookReview(interactionID: pendingHookReviewID, decision: .cancel)
         }
         notificationTask?.cancel()
         notificationTask = nil
@@ -3112,6 +3310,21 @@ final class CodexNativeSessionController {
         case "thread/tokenUsage/updated":
             if let usage = parseTokenUsage(from: params) {
                 await emit(.tokenUsage(usage))
+            }
+        case "hook/started", "hook/completed":
+            do {
+                let diagnostic = try CodexHookLifecycleDiagnostic.decode(
+                    method: notification.method,
+                    params: params
+                )
+                await emit(.hookLifecycleDiagnostic(diagnostic))
+            } catch {
+                await emit(.errorNotification(.init(
+                    message: error.localizedDescription,
+                    willRetry: false,
+                    threadID: Self.notificationThreadID(from: params),
+                    turnID: Self.notificationTurnID(from: params)
+                )))
             }
         case "error":
             if let errorNotification = Self.parseErrorNotification(from: params) {
@@ -4989,6 +5202,10 @@ final class CodexNativeSessionController {
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
         case let .livenessActivity(activity):
             "livenessActivity kind=\(activity.kind.rawValue) method=\(activity.method) threadID=\(activity.threadID ?? "nil") turnID=\(activity.turnID ?? "nil") itemID=\(activity.itemID ?? "nil")"
+        case let .hookInventoryDiagnostic(diagnostic):
+            "hookInventoryDiagnostic cwds=\(diagnostic.cwds.count) hooks=\(diagnostic.hookCount) review=\(diagnostic.reviewRequiredCount)"
+        case let .hookLifecycleDiagnostic(diagnostic):
+            "hookLifecycleDiagnostic runID=\(diagnostic.runID) status=\(diagnostic.status.rawValue)"
         case let .errorNotification(notification):
             "errorNotification willRetry=\(notification.willRetry.map(String.init(describing:)) ?? "nil") message=\(debugPreview(notification.message))"
         case let .error(message):

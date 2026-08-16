@@ -41,8 +41,10 @@ The initial projection covers:
   variants, sandbox-policy variants, and detection of newly required upstream fields;
 - incoming parameter and response paths RPCE reads, with explicit required, optional, conditional,
   and nullable semantics, including adopted discriminated item variants;
-- core lifecycle, transcript, progress, plan, diff, status, usage, and canonical command-execution
-  notifications, including terminal interaction;
+- core lifecycle, transcript, progress, plan, diff, status, usage, canonical command-execution,
+  and typed hook lifecycle notifications, including terminal interaction;
+- project-hook inventory plus exact-file, version-fenced user-config reads and batch writes used by
+  the pre-thread compatibility gate;
 - canonical v2 server requests for user input, auth refresh, MCP elicitation, permissions, dynamic
   tools, and command/file approvals;
 - server-response fields and enum values RPCE emits for those canonical requests;
@@ -52,7 +54,7 @@ The versioned contract is fail-closed: missing or unknown keys are errors. Metho
 local `$ref`, `allOf`, `oneOf`, and `anyOf` composition and accepts both single-value `enum`
 and `const` discriminators, so upstream organizational refactors do not create false removals.
 
-The hardened 0.147.0 baseline checks 42 methods, 186 parameter paths, and 78 response paths. A failure names
+The hardened 0.147.0 baseline checks 48 methods, 233 parameter paths, and 109 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
