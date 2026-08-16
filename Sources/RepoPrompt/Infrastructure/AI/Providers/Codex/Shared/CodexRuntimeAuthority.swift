@@ -18,6 +18,7 @@ enum CodexRuntimeAuthority {
     struct StatePaths: Equatable {
         let codexHome: URL
         let sqliteHome: URL
+        let logDirectory: URL
 
         var environment: [String: String] {
             [
@@ -36,6 +37,8 @@ enum CodexRuntimeAuthority {
         func prepareState(fileManager: FileManager = .default) throws {
             try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: statePaths.logDirectory, withIntermediateDirectories: true)
+            try CodexRuntimeAuthority.validateManagedStatePaths(statePaths, fileManager: fileManager)
         }
 
         var redactedDiagnosticSummary: String {
@@ -219,8 +222,37 @@ enum CodexRuntimeAuthority {
             .appendingPathComponent(buildChannel, isDirectory: true)
         return StatePaths(
             codexHome: root.appendingPathComponent("home", isDirectory: true),
-            sqliteHome: root.appendingPathComponent("sqlite", isDirectory: true)
+            sqliteHome: root.appendingPathComponent("sqlite", isDirectory: true),
+            logDirectory: root.appendingPathComponent("log", isDirectory: true)
         )
+    }
+
+    private static func validateManagedStatePaths(
+        _ paths: StatePaths,
+        fileManager: FileManager
+    ) throws {
+        let root = paths.codexHome.deletingLastPathComponent().standardizedFileURL
+        let ownedAncestors = [
+            root.deletingLastPathComponent().deletingLastPathComponent(),
+            root.deletingLastPathComponent(),
+            root
+        ]
+        for directory in ownedAncestors {
+            let attributes = try fileManager.attributesOfItem(atPath: directory.path)
+            guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+        for candidate in [paths.codexHome, paths.sqliteHome, paths.logDirectory] {
+            let standardized = candidate.standardizedFileURL
+            guard standardized.deletingLastPathComponent() == root else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+            let attributes = try fileManager.attributesOfItem(atPath: standardized.path)
+            guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
     }
 
     static func resolve(
@@ -421,6 +453,6 @@ enum CodexRuntimeAuthority {
         func redact(_ path: String) -> String {
             path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : "<application-support>/" + URL(fileURLWithPath: path).lastPathComponent
         }
-        return "CODEX_HOME=\(redact(paths.codexHome.path)), CODEX_SQLITE_HOME=\(redact(paths.sqliteHome.path))"
+        return "CODEX_HOME=\(redact(paths.codexHome.path)), CODEX_SQLITE_HOME=\(redact(paths.sqliteHome.path)), log_dir=\(redact(paths.logDirectory.path))"
     }
 }

@@ -14,6 +14,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
     private var streamTask: Task<Void, Never>?
+    private var preparedRuntime: CodexRuntimeAuthority.Runtime?
     private var codexItemInvocationIDs: [String: UUID] = [:]
 
     private var enableDebugLogging: Bool {
@@ -42,7 +43,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         selectedModelString: String?,
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         brokenServers: Set<String>,
-        fullAccess: Bool = false
+        fullAccess: Bool = false,
+        statePaths: CodexRuntimeAuthority.StatePaths = CodexRuntimeAuthority.statePaths()
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
         let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString)
@@ -71,6 +73,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
         // Add exec subcommand and its arguments.
         args.append("exec")
+        args.append(contentsOf: CodexOverrides.managedStateArgs(statePaths))
         args.append(contentsOf: modelCLIArgs.configArgs)
         args.append(contentsOf: toolOverrideArgs)
         args.append(contentsOf: serverOverrideArgs)
@@ -120,6 +123,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
         do {
             try runtime.prepareState()
+            try CodexManagedInstructionsProjection.projectBeforeLaunch(
+                managedHome: runtime.statePaths.codexHome
+            )
         } catch {
             throw AIProviderError.invalidConfiguration(
                 detail: "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
@@ -132,6 +138,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         )
         processConfig.ensureAdditionalPaths(config.additionalPathHints)
         runner = CLIProcessRunner(config: processConfig)
+        preparedRuntime = runtime
 
         // Verify MCP server is running
         if enableDebugLogging {
@@ -267,6 +274,20 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     }
 
                                     let expectedPIDRunID = context.runID
+                                    guard let runtime = self.preparedRuntime else {
+                                        throw AIProviderError.invalidConfiguration(
+                                            detail: "RepoPrompt could not start Codex: its runtime launch authority expired."
+                                        )
+                                    }
+                                    do {
+                                        try CodexManagedInstructionsProjection.projectBeforeLaunch(
+                                            managedHome: runtime.statePaths.codexHome
+                                        )
+                                    } catch {
+                                        throw AIProviderError.invalidConfiguration(
+                                            detail: "RepoPrompt could not project ordinary global Codex instructions safely (\(error.localizedDescription))."
+                                        )
+                                    }
                                     let stream = try await runner.runStreaming(
                                         args: args,
                                         stdin: combinedPrompt,

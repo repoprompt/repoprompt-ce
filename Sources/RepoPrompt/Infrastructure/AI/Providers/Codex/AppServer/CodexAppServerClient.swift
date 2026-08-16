@@ -1396,12 +1396,15 @@ actor CodexAppServerClient {
             ),
             featurePolicy: config.processFeaturePolicy
         )
-        let args = processOverrides + ["app-server"]
+        let args = processOverrides + CodexOverrides.managedStateArgs(runtime.statePaths) + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
         )
         let spawned: SpawnedProcess
         do {
+            try CodexManagedInstructionsProjection.projectBeforeLaunch(
+                managedHome: runtime.statePaths.codexHome
+            )
             try await processSpawnPreparation()
             try Task.checkCancellation()
             try ensureStartupAuthority(startupAuthority)

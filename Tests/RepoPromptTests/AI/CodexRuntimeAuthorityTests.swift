@@ -36,14 +36,17 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertEqual(runtime.source, .bundled(target: "aarch64-apple-darwin"))
         XCTAssertTrue(runtime.statePaths.codexHome.path.hasPrefix(support.path))
         XCTAssertTrue(runtime.statePaths.sqliteHome.path.hasPrefix(support.path))
+        XCTAssertTrue(runtime.statePaths.logDirectory.path.hasPrefix(support.path))
         XCTAssertNotEqual(runtime.statePaths.codexHome.path, ("~/.codex" as NSString).expandingTildeInPath)
         XCTAssertEqual(runtime.statePaths.environment["CODEX_HOME"], runtime.statePaths.codexHome.path)
         XCTAssertEqual(runtime.statePaths.environment["CODEX_SQLITE_HOME"], runtime.statePaths.sqliteHome.path)
         try runtime.prepareState()
         XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.statePaths.codexHome.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.statePaths.sqliteHome.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.statePaths.logDirectory.path))
         XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("provenance=bundled:aarch64-apple-darwin"))
         XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("version=0.147.0"))
+        XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("log_dir="))
         XCTAssertFalse(runtime.redactedDiagnosticSummary.contains(temporaryDirectory.path))
     }
 
