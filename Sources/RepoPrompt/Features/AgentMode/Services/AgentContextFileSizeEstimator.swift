@@ -46,7 +46,6 @@ actor AgentContextFileSizeEstimator {
     private var pendingReadTasks: [CacheKey: Task<CachedEstimate?, Never>] = [:]
     private var activeReadPermitIDs: Set<UUID> = []
     private var queuedReadPermits: [QueuedReadPermit] = []
-    private var canceledReadPermitIDs: Set<UUID> = []
 
     init(
         maximumConcurrentReads: Int = 16,
@@ -109,6 +108,10 @@ actor AgentContextFileSizeEstimator {
         }
     }
 
+    func readPermitStateCountForTesting() -> Int {
+        activeReadPermitIDs.count + queuedReadPermits.count
+    }
+
     func pruneCaches(retainingRootIDs: Set<UUID>) {
         cache = cache.filter { retainingRootIDs.contains($0.key.rootID) }
         currentGenerationByRootID = currentGenerationByRootID.filter { retainingRootIDs.contains($0.key) }
@@ -168,7 +171,7 @@ actor AgentContextFileSizeEstimator {
     private func acquireReadPermit(id: UUID) async -> Bool {
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                if canceledReadPermitIDs.remove(id) != nil || Task.isCancelled {
+                if Task.isCancelled {
                     continuation.resume(returning: false)
                 } else if activeReadPermitIDs.count < maximumConcurrentReads {
                     activeReadPermitIDs.insert(id)
@@ -183,26 +186,18 @@ actor AgentContextFileSizeEstimator {
     }
 
     private func cancelReadPermit(id: UUID) {
-        if let index = queuedReadPermits.firstIndex(where: { $0.id == id }) {
-            let queued = queuedReadPermits.remove(at: index)
-            queued.continuation.resume(returning: false)
-        } else if !activeReadPermitIDs.contains(id) {
-            canceledReadPermitIDs.insert(id)
-        }
+        guard let index = queuedReadPermits.firstIndex(where: { $0.id == id }) else { return }
+        let queued = queuedReadPermits.remove(at: index)
+        queued.continuation.resume(returning: false)
     }
 
     private func releaseReadPermit(id: UUID) {
-        guard activeReadPermitIDs.remove(id) != nil else { return }
-        while !queuedReadPermits.isEmpty {
-            let next = queuedReadPermits.removeFirst()
-            if canceledReadPermitIDs.remove(next.id) != nil {
-                next.continuation.resume(returning: false)
-                continue
-            }
-            activeReadPermitIDs.insert(next.id)
-            next.continuation.resume(returning: true)
-            break
-        }
+        guard activeReadPermitIDs.remove(id) != nil,
+              !queuedReadPermits.isEmpty
+        else { return }
+        let next = queuedReadPermits.removeFirst()
+        activeReadPermitIDs.insert(next.id)
+        next.continuation.resume(returning: true)
     }
 
     private func invalidateRootIfNeeded(rootID: UUID, generation: UInt64) {

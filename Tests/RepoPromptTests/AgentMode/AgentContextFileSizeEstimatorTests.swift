@@ -180,6 +180,30 @@ final class AgentContextFileSizeEstimatorTests: XCTestCase {
         XCTAssertEqual(paths, [first.standardizedFullPath])
     }
 
+    func testPreCanceledReadLeavesNoPermitState() async {
+        let estimator = AgentContextFileSizeEstimator(maximumConcurrentReads: 1) { _ in
+            AgentContextFileMetadataSnapshot(byteCount: 100, modificationDate: nil, isRegularFile: true)
+        }
+        let task = Task {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            return await estimator.estimate(
+                for: self.makeFile(path: "/workspace/PreCanceled.swift"),
+                rootGeneration: 1
+            )
+        }
+
+        task.cancel()
+        _ = await task.value
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        let retainedPermitStateCount = await estimator.readPermitStateCountForTesting()
+        XCTAssertEqual(retainedPermitStateCount, 0)
+    }
+
     func testPruneCachesRetainsOnlyCurrentRoots() async {
         let tracker = MetadataReadTracker(byteCount: 100)
         let retained = makeFile(path: "/workspace/Retained.swift")
