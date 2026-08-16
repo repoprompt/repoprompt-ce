@@ -2,9 +2,11 @@ import Foundation
 
 package struct OracleLaneExecutionResponse: Equatable, Sendable {
     package let response: String
+    package let executionProfile: OracleExecutionProfile?
 
-    package init(response: String) {
+    package init(response: String, executionProfile: OracleExecutionProfile? = nil) {
         self.response = response
+        self.executionProfile = executionProfile
     }
 }
 
@@ -12,14 +14,29 @@ package struct OracleLaneFailure: Error, LocalizedError, Equatable, Sendable {
     package let code: String
     package let message: String
     package let partialResponse: String?
+    package let executionProfile: OracleExecutionProfile?
 
-    package init(code: String = "provider_error", message: String, partialResponse: String? = nil) {
+    package init(
+        code: String = "provider_error",
+        message: String,
+        partialResponse: String? = nil,
+        executionProfile: OracleExecutionProfile? = nil
+    ) {
         self.code = code
         self.message = message
         self.partialResponse = partialResponse
+        self.executionProfile = executionProfile
     }
 
     package var errorDescription: String? { message }
+}
+
+package struct OracleLaneCancellation: Error, Equatable, Sendable {
+    package let executionProfile: OracleExecutionProfile?
+
+    package init(executionProfile: OracleExecutionProfile? = nil) {
+        self.executionProfile = executionProfile
+    }
 }
 
 package struct OracleLaneExecutionContext: Sendable {
@@ -172,6 +189,16 @@ package struct OracleGroupCoordinator: Sendable {
                 input: input,
                 deltaHandler: { text in await gate.delta(text) }
             ))
+        } catch let cancellation as OracleLaneCancellation {
+            return try OracleLaneResult(
+                laneIndex: plan.lane.laneID.index,
+                chatID: plan.publicChatID,
+                providerID: plan.lane.model.providerID,
+                modelID: plan.lane.model.modelID,
+                status: .cancelled,
+                executionProfile: cancellation.executionProfile,
+                error: OracleLaneError(code: "cancelled", message: "Oracle lane was cancelled.")
+            )
         } catch is CancellationError {
             return try OracleLaneResult(
                 laneIndex: plan.lane.laneID.index,
@@ -188,6 +215,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .failed,
+                executionProfile: failure.executionProfile,
                 error: OracleLaneError(
                     code: failure.code,
                     message: failure.message,
@@ -215,6 +243,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .failed,
+                executionProfile: response.executionProfile,
                 error: OracleLaneError(
                     code: "empty_response",
                     message: "Oracle lane returned an empty response."
@@ -227,6 +256,7 @@ package struct OracleGroupCoordinator: Sendable {
             providerID: plan.lane.model.providerID,
             modelID: plan.lane.model.modelID,
             status: .completed,
+            executionProfile: response.executionProfile,
             response: response.response
         )
     }

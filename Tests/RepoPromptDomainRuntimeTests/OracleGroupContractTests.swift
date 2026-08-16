@@ -126,7 +126,121 @@ final class OracleGroupContractTests: XCTestCase {
         XCTAssertEqual(result.oracleCount, 2)
         XCTAssertEqual(result.primary.role, .primary)
         XCTAssertEqual(result.oracleResults[1].role, .additional)
+        XCTAssertTrue(result.oracleResults.allSatisfy { $0.executionProfile == nil })
         XCTAssertEqual(try JSONDecoder().decode(OracleGroupResult.self, from: JSONEncoder().encode(result)), result)
+    }
+
+    func testExecutionProfileRoundTripsAndUsesCanonicalMCPShape() throws {
+        let profile = try OracleExecutionProfile(
+            providerID: " codex ",
+            modelID: " gpt-5.6-sol ",
+            effectiveReasoningEffort: " high "
+        )
+        let result = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: nil,
+            modelID: "configured-raw",
+            status: .completed,
+            executionProfile: profile,
+            response: "answer"
+        )
+
+        XCTAssertEqual(profile.providerID, "codex")
+        XCTAssertEqual(profile.modelID, "gpt-5.6-sol")
+        XCTAssertEqual(profile.effectiveReasoningEffort, "high")
+        XCTAssertEqual(try JSONDecoder().decode(
+            OracleLaneResult.self,
+            from: JSONEncoder().encode(result)
+        ), result)
+
+        guard case let .object(lane) = OracleGroupMCPCodec.laneValue(result),
+              case let .object(encodedProfile)? = lane["execution_profile"]
+        else {
+            return XCTFail("missing execution profile")
+        }
+        XCTAssertEqual(encodedProfile["provider_id"], .string("codex"))
+        XCTAssertEqual(encodedProfile["model_id"], .string("gpt-5.6-sol"))
+        XCTAssertEqual(encodedProfile["effective_reasoning_effort"], .string("high"))
+    }
+
+    func testSynthesisRecordsExactCompletedLaneSetAndIsIdempotent() throws {
+        let roster = try OracleRoster(primaryModelID: "primary", additionalModelIDs: ["secondary"])
+        let group = try OracleGroupDescriptor(size: roster.count)
+        let members = try roster.orderedModels.enumerated().map { index, model in
+            try OracleGroupMember(
+                laneID: OracleLaneID(index: index),
+                publicChatID: "chat-\(index)",
+                model: model
+            )
+        }
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let prepared = try OracleGroupDocument(
+            group: group,
+            owner: OracleConversationOwner(kind: "test", identifier: "synthesis"),
+            name: "Synthesis",
+            revision: 1,
+            createdAt: startedAt,
+            updatedAt: startedAt,
+            roster: roster,
+            members: members,
+            turns: [OracleTurnRecord(
+                input: OracleInput(mode: .plan, userMessage: "Plan"),
+                state: .prepared,
+                startedAt: startedAt
+            )]
+        )
+        let laneResults = try members.map { member in
+            try OracleLaneResult(
+                laneIndex: member.laneID.index,
+                chatID: member.publicChatID,
+                providerID: member.model.providerID,
+                modelID: member.model.modelID,
+                status: .completed,
+                response: "lane-\(member.laneID.index)"
+            )
+        }
+        let terminal = try prepared.settling(
+            OracleGroupResult(groupID: group.id, status: .completed, oracleResults: laneResults),
+            finishedAt: startedAt.addingTimeInterval(1)
+        )
+        let turnID = try XCTUnwrap(terminal.turns.last?.id)
+        let model = try OracleExecutionProfile(providerID: "codex", modelID: "gpt-5.6-sol")
+        let synthesis = try OracleSynthesisRecord(
+            model: model,
+            sourceLaneIndices: [0, 1],
+            response: "combined",
+            finishedAt: startedAt.addingTimeInterval(2)
+        )
+
+        let recorded = try terminal.recordingSynthesis(synthesis, for: turnID)
+        XCTAssertEqual(recorded.revision, terminal.revision + 1)
+        XCTAssertEqual(recorded.turns.last?.results, terminal.turns.last?.results)
+        XCTAssertEqual(recorded.turns.last?.synthesis, synthesis)
+        XCTAssertEqual(try recorded.recordingSynthesis(synthesis, for: turnID), recorded)
+        XCTAssertEqual(
+            try JSONDecoder().decode(OracleGroupDocument.self, from: JSONEncoder().encode(recorded)),
+            recorded
+        )
+
+        let wrongSources = try OracleSynthesisRecord(
+            model: model,
+            sourceLaneIndices: [0, 2],
+            response: "combined",
+            finishedAt: startedAt.addingTimeInterval(2)
+        )
+        XCTAssertThrowsError(try terminal.recordingSynthesis(wrongSources, for: turnID)) {
+            XCTAssertEqual($0 as? OracleGroupContractError, .invalidSynthesisRecord)
+        }
+        let overwrite = try OracleSynthesisRecord(
+            model: model,
+            sourceLaneIndices: [0, 1],
+            response: "different",
+            finishedAt: startedAt.addingTimeInterval(2)
+        )
+        XCTAssertThrowsError(try recorded.recordingSynthesis(overwrite, for: turnID)) {
+            XCTAssertEqual($0 as? OracleGroupContractError, .synthesisAlreadyRecorded)
+        }
     }
 
     func testPartialFailureFixtureRetainsFailedAndCancelledLanesInOrder() throws {

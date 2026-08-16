@@ -109,6 +109,29 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
         XCTAssertTrue(AppOracleGroupRouting.usesGroup(additionalModelRaws: ["secondary-model"]))
     }
 
+    func testResolvedExecutionProfileCapturesRuntimeModelAndEffectiveEffort() throws {
+        let codex = AIModel.codexCustom(name: "gpt-5.6-sol-high")
+        let codexProfile = try XCTUnwrap(AppOracleGroupRouting.executionProfile(for: codex))
+        XCTAssertEqual(codexProfile.providerID, "codex")
+        XCTAssertEqual(codexProfile.modelID, codex.modelName)
+        XCTAssertEqual(codexProfile.effectiveReasoningEffort, "high")
+
+        let thinkingProfile = try XCTUnwrap(
+            AppOracleGroupRouting.executionProfile(for: .claude4SonnetThinkingMax)
+        )
+        XCTAssertEqual(thinkingProfile.providerID, "anthropic")
+        XCTAssertEqual(thinkingProfile.modelID, "claude-sonnet-4-5-20250929-thinking-max")
+        XCTAssertNil(thinkingProfile.effectiveReasoningEffort)
+
+        let customProfile = try XCTUnwrap(AppOracleGroupRouting.executionProfile(for: .customProvider(
+            name: "Custom",
+            provider: "acme-runtime",
+            model: "acme-model"
+        )))
+        XCTAssertEqual(customProfile.providerID, "acme-runtime")
+        XCTAssertEqual(customProfile.modelID, "acme-model")
+    }
+
     @MainActor
     func testCanonicalGroupReplyPreservesOrderAndRoutesTopLevelFieldsToPrimary() throws {
         let groupID = try OracleGroupID(rawValue: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-0000000000A4")))
@@ -315,6 +338,74 @@ final class OracleHeadlessRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testCancelInvocationDoesNotCancelSuccessorOnSameTab() async throws {
+        let tabID = UUID()
+        let invocationIDs = [UUID(), UUID()]
+        let streamIDs = [UUID(), UUID()]
+        var nextStreamIndex = 0
+        let controller = MultiOracleHeadlessTestStreamController()
+        let installed = expectation(description: "both invocation streams installed")
+        installed.expectedFulfillmentCount = 2
+        let progressed = expectation(description: "both invocation streams produced output")
+        progressed.expectedFulfillmentCount = 2
+
+        let runtime = OracleHeadlessRuntime(
+            sendPrompt: { _, _ in
+                let streamID = streamIDs[nextStreamIndex]
+                nextStreamIndex += 1
+                let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                    Task {
+                        await controller.install(continuation, for: streamID)
+                        await MainActor.run { installed.fulfill() }
+                    }
+                    continuation.yield(ChatStreamOutput(text: "partial", reasoning: nil, tokens: ChatTokenInfo()))
+                }
+                return (streamID, stream)
+            },
+            cancelStream: { streamID in
+                await controller.cancelAndFinish(streamID)
+            },
+            cleanupConversation: { _, _ in },
+            timeout: .seconds(2)
+        )
+        let first = Task { @MainActor in
+            try await runtime.execute(
+                message: AIMessage(systemPrompt: "system", userMessage: "first"),
+                model: .claude4Sonnet,
+                tabID: tabID,
+                invocationID: invocationIDs[0],
+                completionPolicy: .interactive,
+                onProgress: { _, _ in progressed.fulfill() }
+            )
+        }
+        let second = Task { @MainActor in
+            try await runtime.execute(
+                message: AIMessage(systemPrompt: "system", userMessage: "second"),
+                model: .claude4Sonnet,
+                tabID: tabID,
+                invocationID: invocationIDs[1],
+                completionPolicy: .interactive,
+                onProgress: { _, _ in progressed.fulfill() }
+            )
+        }
+
+        await fulfillment(of: [installed, progressed], timeout: 1)
+        await runtime.cancelStream(invocationID: invocationIDs[0])
+        let firstOutput = try await first.value
+        XCTAssertEqual(firstOutput.text, "partial")
+        XCTAssertTrue(runtime.hasActiveStream(for: tabID))
+        let cancellationsAfterFirst = await controller.cancelledStreamIDs()
+        XCTAssertEqual(cancellationsAfterFirst, [streamIDs[0]])
+
+        await controller.finish(streamIDs[1])
+        let secondOutput = try await second.value
+        XCTAssertEqual(secondOutput.text, "partial")
+        XCTAssertFalse(runtime.hasActiveStream(for: tabID))
+        let finalCancellations = await controller.cancelledStreamIDs()
+        XCTAssertEqual(finalCancellations, [streamIDs[0]])
+    }
+
+    @MainActor
     func testCancelAllCountsConcurrentPendingStreamsForSameTab() async throws {
         let tabID = UUID()
         let streamIDs = [UUID(), UUID()]
@@ -465,6 +556,10 @@ private actor MultiOracleHeadlessTestStreamController {
 
     func cancelAndFinish(_ streamID: ChatStreamID) {
         cancellations.append(streamID)
+        continuations.removeValue(forKey: streamID)?.finish()
+    }
+
+    func finish(_ streamID: ChatStreamID) {
         continuations.removeValue(forKey: streamID)?.finish()
     }
 
