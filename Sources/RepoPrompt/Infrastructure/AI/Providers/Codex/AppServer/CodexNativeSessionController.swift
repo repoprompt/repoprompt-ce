@@ -1473,6 +1473,8 @@ final class CodexNativeSessionController {
             },
             write: { [weak self] method, params, timeout in
                 guard let self else { throw CodexSessionControllerError.invalidLifecycleState("no longer active") }
+                try CodexRuntimeAuthority.validateManagedState(runtime.statePaths)
+                try ensureHookGateAuthority(gateID)
                 return try await performMutatingRequest(method: method, params: params, timeout: timeout)
             },
             review: { [weak self] review in

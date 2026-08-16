@@ -123,6 +123,44 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         )
     }
 
+    func testManagedStateValidationRejectsSymlinkedSensitiveLeavesAndPreservesDestinations() throws {
+        let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let paths = CodexRuntimeAuthority.statePaths(
+            applicationSupportURL: support,
+            buildChannel: .debug
+        )
+        try CodexRuntimeAuthority.prepareManagedState(paths)
+        let sessions = paths.codexHome.appendingPathComponent("sessions", isDirectory: true)
+        let shellSnapshots = paths.codexHome.appendingPathComponent("shell_snapshots", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: shellSnapshots, withIntermediateDirectories: true)
+        let foreign = temporaryDirectory.appendingPathComponent("ForeignState", isDirectory: true)
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+
+        let sensitiveLeaves = [
+            paths.codexHome.appendingPathComponent("auth.json"),
+            paths.codexHome.appendingPathComponent("config.toml"),
+            paths.codexHome.appendingPathComponent("session_index.jsonl"),
+            sessions.appendingPathComponent("rollout.jsonl"),
+            shellSnapshots.appendingPathComponent("snapshot.sh"),
+            paths.sqliteHome.appendingPathComponent("state.sqlite"),
+            paths.logDirectory.appendingPathComponent("codex.log")
+        ]
+        for (index, leaf) in sensitiveLeaves.enumerated() {
+            let destination = foreign.appendingPathComponent("state-\(index)")
+            try "preserve-\(index)".write(to: destination, atomically: true, encoding: .utf8)
+            try FileManager.default.createSymbolicLink(at: leaf, withDestinationURL: destination)
+
+            XCTAssertThrowsError(try CodexRuntimeAuthority.validateManagedState(paths))
+            XCTAssertEqual(
+                try String(contentsOf: destination, encoding: .utf8),
+                "preserve-\(index)"
+            )
+            try FileManager.default.removeItem(at: leaf)
+        }
+    }
+
     func testBundledRuntimeResolvesIntelPackageIndependently() throws {
         let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
         _ = try makePackage(in: resources, target: "aarch64-apple-darwin")

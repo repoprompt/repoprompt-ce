@@ -7283,10 +7283,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
         case let .hookInventoryDiagnostic(diagnostic):
             guard session.runState.isActive else { return }
-            let status = diagnostic.isZeroInventory
-                ? "No Codex project hooks were discovered for this execution directory."
-                : "Codex inventoried \(diagnostic.hookCount) project hook definition(s)."
-            setRunningStatus(status, source: .transport, session: session, urgent: true)
+            setRunningStatus(
+                diagnostic.statusSummary,
+                source: .transport,
+                session: session,
+                urgent: true
+            )
             viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
         case let .hookLifecycleDiagnostic(diagnostic):
             guard session.runState.isActive else { return }

@@ -258,7 +258,7 @@ enum CodexRuntimeAuthority {
                 throw CocoaError(.fileReadInvalidFileName)
             }
         }
-        try validateManagedStatePaths(paths)
+        try validateManagedState(paths, fileManager: fileManager)
     }
 
     private static func managedStateDirectories(_ paths: StatePaths) throws -> [URL] {
@@ -291,10 +291,68 @@ enum CodexRuntimeAuthority {
         return [repoPromptRoot, codexRoot, channelRoot, codexHome, sqliteHome, logDirectory]
     }
 
-    private static func validateManagedStatePaths(_ paths: StatePaths) throws {
+    static func validateManagedState(
+        _ paths: StatePaths,
+        fileManager: FileManager = .default
+    ) throws {
         for directory in try managedStateDirectories(paths) {
             guard try nodeType(at: directory) == mode_t(S_IFDIR) else {
                 throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+        let sensitiveFiles = [
+            paths.codexHome.appendingPathComponent("auth.json"),
+            paths.codexHome.appendingPathComponent("config.toml"),
+            paths.codexHome.appendingPathComponent("session_index.jsonl")
+        ]
+        for file in sensitiveFiles {
+            guard try nodeType(at: file) != mode_t(S_IFLNK) else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+
+        let sensitiveTrees = [
+            paths.codexHome.appendingPathComponent("sessions", isDirectory: true),
+            paths.codexHome.appendingPathComponent("shell_snapshots", isDirectory: true),
+            paths.sqliteHome,
+            paths.logDirectory
+        ]
+        for root in sensitiveTrees {
+            try rejectSymbolicLinks(in: root, fileManager: fileManager)
+        }
+    }
+
+    private static func rejectSymbolicLinks(
+        in root: URL,
+        fileManager: FileManager
+    ) throws {
+        switch try nodeType(at: root) {
+        case nil:
+            return
+        case mode_t(S_IFDIR):
+            break
+        default:
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+
+        var pendingDirectories = [root]
+        while let directory = pendingDirectories.popLast() {
+            let children = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            for child in children {
+                switch try nodeType(at: child) {
+                case mode_t(S_IFLNK):
+                    throw CocoaError(.fileReadInvalidFileName)
+                case mode_t(S_IFDIR):
+                    pendingDirectories.append(child)
+                case nil:
+                    continue
+                default:
+                    break
+                }
             }
         }
     }

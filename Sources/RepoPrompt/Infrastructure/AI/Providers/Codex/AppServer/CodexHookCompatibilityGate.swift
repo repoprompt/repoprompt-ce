@@ -33,7 +33,7 @@ struct CodexHookInventory: Equatable {
     }
 
     enum HandlerType: String, Codable { case command, prompt, agent }
-    enum Source: String, Codable {
+    enum Source: String, Codable, Hashable {
         case system, user, project, mdm, sessionFlags, plugin, cloudRequirements
         case cloudManagedConfig, legacyManagedConfigFile, legacyManagedConfigMdm, unknown
     }
@@ -231,11 +231,17 @@ enum CodexHookCompatibilityGate {
         let normalizedCWD = URL(fileURLWithPath: cwd).standardized.path
         let initial = try await inventory(cwd: normalizedCWD, timeout: timeout, dependencies: dependencies)
         try dependencies.assertAuthority()
+        let sourceCounts = initial.records
+            .flatMap(\.hooks)
+            .reduce(into: [CodexHookInventory.Source: Int]()) { counts, hook in
+                counts[hook.source, default: 0] += 1
+            }
         await dependencies.emitInventory(.init(
             cwds: initial.records.map(\.cwd),
             hookCount: initial.hookCount,
             warningCount: initial.records.reduce(0) { $0 + $1.warnings.count },
-            reviewRequiredCount: initial.reviewHooks.count
+            reviewRequiredCount: initial.reviewHooks.count,
+            sourceCounts: sourceCounts
         ))
         try dependencies.assertAuthority()
         guard !initial.reviewHooks.isEmpty else { return }
@@ -382,9 +388,26 @@ struct CodexHookInventoryDiagnostic: Equatable {
     let hookCount: Int
     let warningCount: Int
     let reviewRequiredCount: Int
+    let sourceCounts: [CodexHookInventory.Source: Int]
 
     var isZeroInventory: Bool {
         hookCount == 0
+    }
+
+    var statusSummary: String {
+        if isZeroInventory {
+            if warningCount == 0 {
+                return "No Codex hook definitions were discovered for this execution directory."
+            }
+            return "Codex discovered no hook definitions and reported \(warningCount) inventory warning(s); review the Codex configuration before relying on hooks."
+        }
+        let sources = sourceCounts
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { "\($0.key.rawValue)=\($0.value)" }
+            .joined(separator: ", ")
+        let sourceSuffix = sources.isEmpty ? "" : " (\(sources))"
+        let warningSuffix = warningCount == 0 ? "" : " Codex also reported \(warningCount) inventory warning(s)."
+        return "Codex inventoried \(hookCount) hook definition(s)\(sourceSuffix).\(warningSuffix)"
     }
 }
 

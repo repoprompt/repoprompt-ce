@@ -30,6 +30,33 @@ final class CodexHookCompatibilityGateTests: XCTestCase {
 
         XCTAssertEqual(diagnostics.values.count, 1)
         XCTAssertEqual(diagnostics.values.first?.isZeroInventory, true)
+        XCTAssertEqual(diagnostics.values.first?.warningCount, 0)
+        XCTAssertEqual(diagnostics.values.first?.sourceCounts, [:])
+        XCTAssertEqual(
+            diagnostics.values.first?.statusSummary,
+            "No Codex hook definitions were discovered for this execution directory."
+        )
+    }
+
+    func testZeroInventoryWarningsRemainVisibleWithoutLeakingRawDetails() async throws {
+        let diagnostics = LockedValues<CodexHookInventoryDiagnostic>()
+        let dependencies = dependencies(
+            read: { _, _, _ in self.inventory(hooks: [], warnings: ["private warning contents"]) },
+            review: { _ in .cancel },
+            emit: { diagnostics.append($0) }
+        )
+
+        try await CodexHookCompatibilityGate.run(
+            cwd: cwd,
+            managedConfigURL: configURL,
+            timeout: 1,
+            dependencies: dependencies
+        )
+
+        let diagnostic = try XCTUnwrap(diagnostics.values.first)
+        XCTAssertEqual(diagnostic.warningCount, 1)
+        XCTAssertTrue(diagnostic.statusSummary.contains("1 inventory warning"))
+        XCTAssertFalse(diagnostic.statusSummary.contains("private warning contents"))
     }
 
     func testPinnedSchemaRejectsUnknownTrustAndPerCwdErrors() throws {
@@ -313,12 +340,20 @@ final class CodexHookCompatibilityGateTests: XCTestCase {
         )
     }
 
-    private func inventory(hooks: [[String: Any]], errors: [[String: Any]] = []) -> [String: Any] {
-        ["data": [inventoryRecord(hooks: hooks, errors: errors)]]
+    private func inventory(
+        hooks: [[String: Any]],
+        warnings: [String] = [],
+        errors: [[String: Any]] = []
+    ) -> [String: Any] {
+        ["data": [inventoryRecord(hooks: hooks, warnings: warnings, errors: errors)]]
     }
 
-    private func inventoryRecord(hooks: [[String: Any]], errors: [[String: Any]] = []) -> [String: Any] {
-        ["cwd": cwd, "hooks": hooks, "warnings": [], "errors": errors]
+    private func inventoryRecord(
+        hooks: [[String: Any]],
+        warnings: [String] = [],
+        errors: [[String: Any]] = []
+    ) -> [String: Any] {
+        ["cwd": cwd, "hooks": hooks, "warnings": warnings, "errors": errors]
     }
 
     private func projectHook(hash: String, trust: String) -> [String: Any] {
