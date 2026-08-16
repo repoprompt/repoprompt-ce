@@ -58,16 +58,22 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         )
         let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
         XCTAssertEqual(snapshot?.currentModelRaw, "grok-4.5")
-        XCTAssertEqual(snapshot?.currentEffortRaw, "low")
+        XCTAssertNil(
+            snapshot?.currentEffortRaw,
+            "the Ok confirms only the base model — an applied effort stays unconfirmed until a fresh session config parse"
+        )
     }
 
-    func testIdenticalModelAndEffortSkipsRPC() async throws {
+    func testUnconfirmedEffortNeverSuppressesIdenticalRepeatSelection() async throws {
         let fixture = try makeFixture(shape: "grok_direct")
         try await bootstrap(fixture.controller)
 
         try await fixture.controller.setSessionModel("grok-4.5-low")
         try await fixture.controller.setSessionModel("grok-4.5-low")
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_model").count, 1)
+        // The effort is never confirmed by the wire, so the repeat pick re-sends rather than
+        // trusting a locally recorded effort. The redundant RPC is harmless; a wrongly
+        // suppressed mutation is not.
+        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_model").count, 2)
     }
 
     func testBareSelectionAfterVariantResetsToDefaultEffort() async throws {
@@ -84,9 +90,9 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "high",
             "the bare pick resolves to the model's advertised default effort"
         )
-        XCTAssertEqual(
+        XCTAssertNil(
             AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw,
-            "high"
+            "effort authority is cleared until the next session config parse confirms it"
         )
     }
 
@@ -233,6 +239,44 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("live session model set"), "unexpected error: \(error)")
         }
         XCTAssertTrue(recordedRequests(at: coldFixture.recordURL, method: "session/set_model").isEmpty)
+    }
+
+    func testModelOnlyMutationDoesNotPromoteWarmedSnapshotToLiveAuthority() async throws {
+        // Warm with the collision shape (it carries an effort-free base, so a model-only
+        // selection is legal even without live authority).
+        let warmFixture = try makeFixture(shape: "grok_collision")
+        try await bootstrap(warmFixture.controller)
+
+        let coldFixture = try makeFixture(shape: "grok_bare")
+        try await bootstrap(coldFixture.controller)
+
+        // Model-only selection via warmed data: allowed (the Ok echoes the base id).
+        try await coldFixture.controller.setSessionModel("grok-4.6-low")
+        XCTAssertEqual(recordedRequests(at: coldFixture.recordURL, method: "session/set_model").count, 1)
+
+        // The warmed options now sit in discoveredSessionModels, but they must NOT have
+        // acquired live authority: an effort-bearing selection still fails before any RPC.
+        do {
+            try await coldFixture.controller.setSessionModel("grok-4.5-low")
+            XCTFail("expected effort selection after warmed-only mutation to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("live session model set"), "unexpected error: \(error)")
+        }
+        XCTAssertEqual(recordedRequests(at: coldFixture.recordURL, method: "session/set_model").count, 1)
+    }
+
+    func testSessionModeIdResolvesThroughAdvertisedIdValuePairs() async throws {
+        // The wire separates reasoningEfforts[].id from .value; the session config selects
+        // by id. Here grok-4.6's low entry has id "eff-low" / value "low" and the session
+        // selects "eff-low" — the recorded active effort must be the canonical value.
+        let fixture = try makeFixture(shape: "grok_direct", sessionEffort: "low", lowModeID: "eff-low")
+        try await bootstrap(fixture.controller)
+
+        XCTAssertEqual(
+            AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.currentEffortRaw,
+            "low",
+            "the selected mode id resolves to its canonical value through the advertised pairs"
+        )
     }
 
     func testLegacyProviderRecordWithoutEffortDecodes() throws {
@@ -550,7 +594,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         shape: String,
         setModelAck: String = "ok",
         sessionEffort: String = "high",
-        default45Effort: String = "high"
+        default45Effort: String = "high",
+        lowModeID: String = "low"
     ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "GrokBuildACPDirectModelTests")
         let scriptURL = try makeFakeGrokACPServerScript(in: workspace)
@@ -561,6 +606,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             "ACP_SET_MODEL_ACK": setModelAck,
             "ACP_SESSION_EFFORT": sessionEffort,
             "ACP_45_DEFAULT_EFFORT": default45Effort,
+            "ACP_LOW_MODE_ID": lowModeID,
             "PATH": "/usr/bin:/bin"
         ]
         let request = ACPRunRequest(
@@ -592,6 +638,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
         set_model_ack = os.environ.get("ACP_SET_MODEL_ACK", "ok")
         session_effort = os.environ.get("ACP_SESSION_EFFORT", "high")
         effort_default_override = os.environ.get("ACP_45_DEFAULT_EFFORT", "high")
+        low_mode_id = os.environ.get("ACP_LOW_MODE_ID", "low")
         session_id = "grok-direct-session"
         current_model = "grok-4.6"
         modern_current_model = "model-a"
@@ -627,7 +674,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                                    {"id": "xhigh", "value": "xhigh", "label": "Extra High Effort", "default": False},
                                    {"id": "high", "value": "high", "label": "High Effort", "default": True},
                                    {"id": "medium", "value": "medium", "label": "Medium Effort", "default": False},
-                                   {"id": "low", "value": "low", "label": "Low Effort", "default": False}
+                                   {"id": low_mode_id, "value": "low", "label": "Low Effort", "default": False}
                                ]}},
                     {"modelId": "grok-4.5", "name": "Grok 4.5",
                      "_meta": {"supportsReasoningEffort": True,
@@ -647,7 +694,8 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
                 return {}
             modes = ["xhigh", "high", "medium", "low"]
             return {"x.ai/sessionConfig": {"options": [
-                {"id": m, "category": "mode", "label": m, "selected": m == session_effort}
+                {"id": low_mode_id if m == "low" else m,
+                 "category": "mode", "label": m, "selected": m == session_effort}
                 for m in modes
             ]}}
 
@@ -715,7 +763,7 @@ final class GrokBuildACPDirectModelTests: XCTestCase {
             elif method == "session/set_model":
                 requested = params.get("modelId")
                 valid_ids = [m["modelId"] for m in grok_models()["availableModels"]]
-                if shape == "grok_collision":
+                if shape in ("grok_collision", "grok_bare"):
                     valid_ids.append("grok-4.6-low")
                 if set_model_ack == "missing":
                     respond(request_id, {})

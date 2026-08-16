@@ -197,6 +197,10 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         var options: [AgentModelOption] = []
         var variants: [AgentModelOption] = []
         var seen = Set<String>()
+        // Per-model advertised effort id→value pairs, retained for resolving the session
+        // config's selected mode: the wire exposes `id` and `value` separately and nothing
+        // guarantees they are equal.
+        var effortPairsByModelRaw: [String: [(id: String, effort: CodexReasoningEffort)]] = [:]
         for entry in available {
             guard let rawID = (entry["modelId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !rawID.isEmpty
@@ -223,13 +227,18 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             let effortEntries = supportsEffort ? (meta?["reasoningEfforts"] as? [[String: Any]] ?? []) : []
             var supportedEfforts: [CodexReasoningEffort] = []
             var wireDefaultEffort: CodexReasoningEffort?
+            var effortPairs: [(id: String, effort: CodexReasoningEffort)] = []
             for effortEntry in effortEntries {
                 guard let effort = CodexReasoningEffort.parse(effortEntry["value"] as? String) else { continue }
                 supportedEfforts.append(effort)
+                if let id = (effortEntry["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+                    effortPairs.append((id: id, effort: effort))
+                }
                 if wireDefaultEffort == nil, (effortEntry["default"] as? Bool) == true {
                     wireDefaultEffort = effort
                 }
             }
+            effortPairsByModelRaw[rawID] = effortPairs
             let declaredDefault = supportsEffort
                 ? CodexReasoningEffort.parse(meta?["reasoningEffort"] as? String)
                 : nil
@@ -284,11 +293,32 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         // The session's ACTIVE effort comes from the session config's selected mode entry
         // (`_meta["x.ai/sessionConfig"].options`, category "mode") — never from a model's
         // advertised default, which would silently promote defaults to confirmed state.
+        // Exactly one mode may be selected, and its id resolves through the CURRENT model's
+        // advertised id→value pairs (the wire separates them; they are not assumed equal).
+        // Anything ambiguous or unadvertised leaves the active effort unknown.
         let sessionConfig = (sessionResponse["_meta"] as? [String: Any])?["x.ai/sessionConfig"] as? [String: Any]
         let sessionOptions = sessionConfig?["options"] as? [[String: Any]] ?? []
-        let currentEffortRaw = sessionOptions.first(where: {
-            ($0["category"] as? String) == "mode" && ($0["selected"] as? Bool) == true
-        }).flatMap { ($0["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let selectedModeIDs = sessionOptions.compactMap { option -> String? in
+            guard (option["category"] as? String) == "mode",
+                  (option["selected"] as? Bool) == true,
+                  let id = (option["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !id.isEmpty
+            else { return nil }
+            return id
+        }
+        let currentEffortRaw: String? = {
+            guard selectedModeIDs.count == 1, let selectedID = selectedModeIDs.first,
+                  let currentRaw,
+                  let pairs = effortPairsByModelRaw[currentRaw]
+            else { return nil }
+            for pair in pairs
+                where pair.id.caseInsensitiveCompare(selectedID) == .orderedSame
+                || pair.effort.rawValue.caseInsensitiveCompare(selectedID) == .orderedSame
+            {
+                return pair.effort.rawValue
+            }
+            return nil
+        }()
 
         return .valid(ACPDiscoveredSessionModels(
             options: options,

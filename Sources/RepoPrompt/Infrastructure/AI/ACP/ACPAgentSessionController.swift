@@ -273,6 +273,10 @@ actor ACPAgentSessionController {
     /// advertised no modern `configOptions` model selector, so model application flows
     /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
     private var sessionModelDirectSelectionSupported = false
+    /// True only when `discoveredSessionModels` was parsed from THIS session's live
+    /// session/new|load response. Post-mutation state updates never promote warmed
+    /// registry data to live authority — effort-bearing selections require this.
+    private var sessionModelSnapshotHasLiveAuthority = false
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
@@ -761,13 +765,15 @@ actor ACPAgentSessionController {
                 let updatedOptions = discoveredSessionModels?.options
                     ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
                     ?? []
-                // Model-only requests carry no effort authority: the Ok confirms the base
-                // but says nothing about the session mode, so preserve the last confirmed
-                // effort rather than clearing it.
+                // The Ok confirms only the base model. An effort-bearing mutation leaves
+                // the session's active effort UNCONFIRMED (grok applies advertised efforts
+                // but never echoes them), so record it as unknown until a fresh session
+                // config parse confirms it; a model-only request preserves the last
+                // confirmed effort.
                 let updated = ACPDiscoveredSessionModels(
                     options: updatedOptions,
                     currentModelRaw: baseModel,
-                    currentEffortRaw: resolvedEffort?.rawValue ?? discoveredSessionModels?.currentEffortRaw
+                    currentEffortRaw: resolvedEffort == nil ? discoveredSessionModels?.currentEffortRaw : nil
                 )
                 discoveredSessionModels = updated
                 _ = AgentACPModelRegistry.shared.updateDiscoveredModels(updated, for: provider.providerID)
@@ -816,7 +822,7 @@ actor ACPAgentSessionController {
     ) throws -> (option: AgentModelOption, options: [AgentModelOption], matchedLiveSnapshot: Bool) {
         if let live = discoveredSessionModels {
             if let match = live.option(matching: requestedValue) {
-                return (match, live.options, true)
+                return (match, live.options, sessionModelSnapshotHasLiveAuthority)
             }
             throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
         }
@@ -1153,6 +1159,7 @@ actor ACPAgentSessionController {
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
         sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -2079,6 +2086,7 @@ actor ACPAgentSessionController {
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
         sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -2482,6 +2490,7 @@ actor ACPAgentSessionController {
         }
 
         discoveredSessionModels = parsed
+        sessionModelSnapshotHasLiveAuthority = parsed != nil
         guard let parsed else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
     }
