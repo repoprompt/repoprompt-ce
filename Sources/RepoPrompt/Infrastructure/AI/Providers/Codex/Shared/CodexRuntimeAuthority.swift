@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
@@ -9,6 +10,19 @@ enum CodexRuntimeAuthority {
     static let bundledVersion = Version(major: 0, minor: 147, patch: 0)
     static let minimumExternalVersion = bundledVersion
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
+
+    enum BuildChannel: String, CaseIterable {
+        case debug = "Debug"
+        case release = "Release"
+
+        static var current: BuildChannel {
+            #if DEBUG
+                .debug
+            #else
+                .release
+            #endif
+        }
+    }
 
     enum Source: Equatable {
         case bundled(target: String)
@@ -35,10 +49,7 @@ enum CodexRuntimeAuthority {
         let statePaths: StatePaths
 
         func prepareState(fileManager: FileManager = .default) throws {
-            try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: statePaths.logDirectory, withIntermediateDirectories: true)
-            try CodexRuntimeAuthority.validateManagedStatePaths(statePaths, fileManager: fileManager)
+            try CodexRuntimeAuthority.prepareManagedState(statePaths, fileManager: fileManager)
         }
 
         var redactedDiagnosticSummary: String {
@@ -209,17 +220,15 @@ enum CodexRuntimeAuthority {
         #endif
     }
 
-    static func statePaths(applicationSupportURL: URL? = nil) -> StatePaths {
+    static func statePaths(
+        applicationSupportURL: URL? = nil,
+        buildChannel: BuildChannel = .current
+    ) -> StatePaths {
         let support = applicationSupportURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        #if DEBUG
-            let buildChannel = "Debug"
-        #else
-            let buildChannel = "Release"
-        #endif
         let root = support
             .appendingPathComponent("RepoPrompt CE", isDirectory: true)
             .appendingPathComponent("Codex", isDirectory: true)
-            .appendingPathComponent(buildChannel, isDirectory: true)
+            .appendingPathComponent(buildChannel.rawValue, isDirectory: true)
         return StatePaths(
             codexHome: root.appendingPathComponent("home", isDirectory: true),
             sqliteHome: root.appendingPathComponent("sqlite", isDirectory: true),
@@ -227,32 +236,78 @@ enum CodexRuntimeAuthority {
         )
     }
 
-    private static func validateManagedStatePaths(
+    static func prepareManagedState(
         _ paths: StatePaths,
-        fileManager: FileManager
+        fileManager: FileManager = .default
     ) throws {
-        let root = paths.codexHome.deletingLastPathComponent().standardizedFileURL
-        let ownedAncestors = [
-            root.deletingLastPathComponent().deletingLastPathComponent(),
-            root.deletingLastPathComponent(),
-            root
-        ]
-        for directory in ownedAncestors {
-            let attributes = try fileManager.attributesOfItem(atPath: directory.path)
-            guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+        let directories = try managedStateDirectories(paths)
+        for directory in directories {
+            switch try nodeType(at: directory) {
+            case nil:
+                let parent = directory.deletingLastPathComponent()
+                guard try nodeType(at: parent) == mode_t(S_IFDIR) else {
+                    throw CocoaError(.fileReadInvalidFileName)
+                }
+                try fileManager.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: false
+                )
+            case mode_t(S_IFDIR):
+                break
+            default:
                 throw CocoaError(.fileReadInvalidFileName)
             }
         }
-        for candidate in [paths.codexHome, paths.sqliteHome, paths.logDirectory] {
-            let standardized = candidate.standardizedFileURL
-            guard standardized.deletingLastPathComponent() == root else {
-                throw CocoaError(.fileReadInvalidFileName)
-            }
-            let attributes = try fileManager.attributesOfItem(atPath: standardized.path)
-            guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+        try validateManagedStatePaths(paths)
+    }
+
+    private static func managedStateDirectories(_ paths: StatePaths) throws -> [URL] {
+        let codexHome = paths.codexHome.standardizedFileURL
+        let sqliteHome = paths.sqliteHome.standardizedFileURL
+        let logDirectory = paths.logDirectory.standardizedFileURL
+        guard codexHome == paths.codexHome,
+              sqliteHome == paths.sqliteHome,
+              logDirectory == paths.logDirectory,
+              codexHome.isFileURL,
+              codexHome.path.hasPrefix("/")
+        else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+
+        let channelRoot = codexHome.deletingLastPathComponent()
+        guard codexHome == channelRoot.appendingPathComponent("home", isDirectory: true),
+              sqliteHome == channelRoot.appendingPathComponent("sqlite", isDirectory: true),
+              logDirectory == channelRoot.appendingPathComponent("log", isDirectory: true),
+              channelRoot.lastPathComponent == BuildChannel.debug.rawValue
+              || channelRoot.lastPathComponent == BuildChannel.release.rawValue,
+              channelRoot.deletingLastPathComponent().lastPathComponent == "Codex",
+              channelRoot.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "RepoPrompt CE"
+        else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+
+        let codexRoot = channelRoot.deletingLastPathComponent()
+        let repoPromptRoot = codexRoot.deletingLastPathComponent()
+        return [repoPromptRoot, codexRoot, channelRoot, codexHome, sqliteHome, logDirectory]
+    }
+
+    private static func validateManagedStatePaths(_ paths: StatePaths) throws {
+        for directory in try managedStateDirectories(paths) {
+            guard try nodeType(at: directory) == mode_t(S_IFDIR) else {
                 throw CocoaError(.fileReadInvalidFileName)
             }
         }
+    }
+
+    private static func nodeType(at url: URL) throws -> mode_t? {
+        var status = stat()
+        if lstat(url.path, &status) == 0 {
+            return status.st_mode & mode_t(S_IFMT)
+        }
+        guard errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return nil
     }
 
     static func resolve(

@@ -101,13 +101,6 @@ enum CodexOverrides {
         ]
     }
 
-    static func managedStateConfigMap(_ statePaths: CodexRuntimeAuthority.StatePaths) -> [String: Any] {
-        [
-            "sqlite_home": statePaths.sqliteHome.path,
-            "log_dir": statePaths.logDirectory.path
-        ]
-    }
-
     static func appServerConfigMap(
         toolPolicy: ToolPolicy,
         featurePolicy: FeaturePolicy = .defaultDisabled

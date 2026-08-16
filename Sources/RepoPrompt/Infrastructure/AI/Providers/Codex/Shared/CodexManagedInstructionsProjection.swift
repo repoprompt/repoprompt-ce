@@ -1,12 +1,16 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 /// Projects Codex's effective ordinary user-global instructions into RepoPrompt's isolated home.
-/// The projection is one-way and only replaces or removes files whose ownership is proven by the sidecar.
+/// The projection is one-way and only replaces or removes regular files whose ownership is
+/// proven by the sidecar. A pending receipt makes interrupted updates recoverable without
+/// deleting the last known-good owned projection before every conflict has been validated.
 enum CodexManagedInstructionsProjection {
     static let overrideName = "AGENTS.override.md"
     static let fallbackName = "AGENTS.md"
     static let sidecarName = ".repoprompt-global-instructions.json"
+    private static let owner = "com.repoprompt.ce.codex-global-instructions"
     private static let lock = NSLock()
 
     enum ProjectionError: LocalizedError, Equatable {
@@ -22,6 +26,19 @@ enum CodexManagedInstructionsProjection {
                 message
             }
         }
+
+        var privacyBoundedDiagnostic: String {
+            switch self {
+            case .invalidSource:
+                "Projection is blocked because an instruction path is missing, unreadable, non-regular, or uses a symbolic link. RepoPrompt preserved all files."
+            case .foreignTarget:
+                "Projection is blocked by a managed-home instruction file that RepoPrompt does not own. Move or rename that file, then reconnect Codex."
+            case .invalidSidecar:
+                "Projection ownership metadata is foreign, modified, malformed, or uses a symbolic link. RepoPrompt preserved it; remove it only after reviewing the managed home."
+            case .modifiedProjection:
+                "A RepoPrompt-owned instruction projection was modified outside RepoPrompt. It was preserved; review the managed home before reconnecting Codex."
+            }
+        }
     }
 
     enum State: Equatable {
@@ -30,84 +47,177 @@ enum CodexManagedInstructionsProjection {
         case conflict(message: String)
     }
 
+    struct Diagnostic: Equatable {
+        enum Status: Equatable {
+            case current(sourceName: String)
+            case absent
+            case conflict
+            case error
+        }
+
+        let status: Status
+        let message: String
+    }
+
+    enum MutationCheckpoint: Equatable {
+        case afterPendingReceipt
+        case afterTargetWrite
+        case afterPreviousTargetRemoval
+        case afterOwnedTargetRemoval
+    }
+
     private struct Receipt: Codable, Equatable {
         enum Phase: String, Codable { case pending, committed }
+        enum Operation: String, Codable { case project, remove }
 
         let schemaVersion: Int
         let owner: String
         let sourceName: String
         let targetName: String
+        let previousTargetName: String?
         let previousTargetHash: String?
         let projectedHash: String
         let phase: Phase
+        let operation: Operation?
+
+        var effectiveOperation: Operation {
+            operation ?? .project
+        }
+    }
+
+    private struct FileIdentity: Equatable {
+        let device: UInt64
+        let inode: UInt64
+        let size: Int64
+        let modificationSeconds: Int
+        let modificationNanoseconds: Int
+
+        init(_ status: stat) {
+            device = UInt64(status.st_dev)
+            inode = UInt64(status.st_ino)
+            size = status.st_size
+            modificationSeconds = status.st_mtimespec.tv_sec
+            modificationNanoseconds = status.st_mtimespec.tv_nsec
+        }
     }
 
     static func projectBeforeLaunch(
         managedHome: URL,
         ordinaryHome: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex", isDirectory: true),
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        checkpoint: ((MutationCheckpoint) throws -> Void)? = nil
     ) throws -> State {
         lock.lock()
         defer { lock.unlock() }
 
-        try fileManager.createDirectory(at: managedHome, withIntermediateDirectories: true)
-        try requireDirectoryWithoutSymbolicLink(managedHome, label: "managed Codex home", fileManager: fileManager)
-        try requireDirectoryWithoutSymbolicLink(ordinaryHome, label: "ordinary Codex home", allowMissing: true, fileManager: fileManager)
+        try prepareManagedHome(managedHome, fileManager: fileManager)
+        try requireDirectoryChainWithoutSymbolicLink(
+            ordinaryHome,
+            label: "ordinary Codex home",
+            allowMissing: true,
+            ancestorDepth: 1
+        )
 
-        let selection = try effectiveSource(in: ordinaryHome, fileManager: fileManager)
         let sidecar = managedHome.appendingPathComponent(sidecarName, isDirectory: false)
-        let existingReceipt = try loadReceipt(at: sidecar, fileManager: fileManager)
-
-        guard let selection else {
-            try removeOwnedProjectionIfPresent(
+        var receipt = try loadReceipt(at: sidecar)
+        if let pending = receipt, pending.phase == .pending {
+            receipt = try recoverInterruptedProjection(
+                pending,
                 managedHome: managedHome,
                 sidecar: sidecar,
-                receipt: existingReceipt,
                 fileManager: fileManager
             )
+        }
+
+        let selection = try effectiveSource(in: ordinaryHome)
+        let hashes = try targetHashes(in: managedHome)
+        if let receipt {
+            try validateCommittedReceipt(receipt, hashes: hashes)
+        } else if !hashes.isEmpty {
+            throw ProjectionError.foreignTarget(
+                "Preserving managed-home instruction files without a RepoPrompt ownership receipt."
+            )
+        }
+
+        guard let selection else {
+            if let receipt {
+                let pendingRemoval = Receipt(
+                    schemaVersion: 2,
+                    owner: owner,
+                    sourceName: receipt.sourceName,
+                    targetName: receipt.targetName,
+                    previousTargetName: receipt.targetName,
+                    previousTargetHash: receipt.projectedHash,
+                    projectedHash: receipt.projectedHash,
+                    phase: .pending,
+                    operation: .remove
+                )
+                try writeReceipt(pendingRemoval, to: sidecar)
+                let target = managedHome.appendingPathComponent(receipt.targetName)
+                try removeRegularFile(target, expectedHash: receipt.projectedHash, fileManager: fileManager)
+                try checkpoint?(.afterOwnedTargetRemoval)
+                try removeRegularSidecarIfPresent(sidecar, fileManager: fileManager)
+            }
             return .absent(managedHome: managedHome)
         }
 
-        let target = managedHome.appendingPathComponent(selection.name, isDirectory: false)
-        let otherName = selection.name == overrideName ? fallbackName : overrideName
-        let otherTarget = managedHome.appendingPathComponent(otherName, isDirectory: false)
-        try removeOwnedTargetIfNeeded(otherTarget, sidecar: sidecar, receipt: existingReceipt, fileManager: fileManager)
-
-        let sourceData = try Data(contentsOf: selection.url, options: .mappedIfSafe)
+        let sourceData = try readStableRegularFile(selection.url, label: "ordinary \(selection.name)")
         let sourceHash = digest(sourceData)
-        let previousHash = try verifyOwnershipForReplacement(
-            target: target,
-            sidecar: sidecar,
-            receipt: existingReceipt,
-            nextHash: sourceHash,
-            fileManager: fileManager
-        )
+        let target = managedHome.appendingPathComponent(selection.name, isDirectory: false)
+
+        if let receipt,
+           receipt.targetName == selection.name,
+           receipt.projectedHash == sourceHash
+        {
+            return .projected(source: selection.url, target: target)
+        }
+
+        let previousTargetName = receipt?.targetName
+        let previousTargetHash = receipt?.projectedHash
+        if previousTargetName != selection.name, hashes[selection.name] != nil {
+            throw ProjectionError.foreignTarget(
+                "Preserving a managed-home instruction target that is not owned by the current receipt."
+            )
+        }
 
         let pending = Receipt(
-            schemaVersion: 1,
-            owner: "com.repoprompt.ce.codex-global-instructions",
+            schemaVersion: 2,
+            owner: owner,
             sourceName: selection.name,
             targetName: selection.name,
-            previousTargetHash: previousHash,
+            previousTargetName: previousTargetName,
+            previousTargetHash: previousTargetHash,
             projectedHash: sourceHash,
-            phase: .pending
+            phase: .pending,
+            operation: .project
         )
         try writeReceipt(pending, to: sidecar)
+        try checkpoint?(.afterPendingReceipt)
+
         try sourceData.write(to: target, options: .atomic)
-        try requireRegularFile(target, label: "managed instruction projection", fileManager: fileManager)
-        try writeReceipt(
-            Receipt(
-                schemaVersion: pending.schemaVersion,
-                owner: pending.owner,
-                sourceName: pending.sourceName,
-                targetName: pending.targetName,
-                previousTargetHash: nil,
-                projectedHash: pending.projectedHash,
-                phase: .committed
-            ),
-            to: sidecar
-        )
+        try requireRegularFile(target, label: "managed instruction projection")
+        guard try hashOfRegularFile(target) == sourceHash else {
+            throw ProjectionError.modifiedProjection(
+                "Managed instruction projection changed while it was being written."
+            )
+        }
+        try checkpoint?(.afterTargetWrite)
+
+        if let previousTargetName,
+           previousTargetName != selection.name,
+           let previousTargetHash
+        {
+            let previousTarget = managedHome.appendingPathComponent(previousTargetName)
+            try removeRegularFile(
+                previousTarget,
+                expectedHash: previousTargetHash,
+                fileManager: fileManager
+            )
+            try checkpoint?(.afterPreviousTargetRemoval)
+        }
+
+        try writeReceipt(committedReceipt(name: selection.name, hash: sourceHash), to: sidecar)
         return .projected(source: selection.url, target: target)
     }
 
@@ -117,156 +227,459 @@ enum CodexManagedInstructionsProjection {
             .appendingPathComponent(".codex", isDirectory: true),
         fileManager: FileManager = .default
     ) -> State {
-        do {
-            let selection = try effectiveSource(in: ordinaryHome, fileManager: fileManager)
-            let receipt = try loadReceipt(
-                at: managedHome.appendingPathComponent(sidecarName),
-                fileManager: fileManager
+        let diagnostic = diagnostic(
+            managedHome: managedHome,
+            ordinaryHome: ordinaryHome,
+            fileManager: fileManager
+        )
+        switch diagnostic.status {
+        case let .current(sourceName):
+            return .projected(
+                source: ordinaryHome.appendingPathComponent(sourceName),
+                target: managedHome.appendingPathComponent(sourceName)
             )
-            guard let selection else { return .absent(managedHome: managedHome) }
-            let target = managedHome.appendingPathComponent(selection.name)
-            guard let receipt, receipt.phase == .committed,
-                  receipt.sourceName == selection.name,
-                  receipt.targetName == selection.name,
-                  try hashOfRegularFile(target, fileManager: fileManager) == receipt.projectedHash
-            else {
-                return .conflict(message: "Global instruction projection is not current.")
-            }
-            return .projected(source: selection.url, target: target)
-        } catch {
-            return .conflict(message: error.localizedDescription)
+        case .absent:
+            return .absent(managedHome: managedHome)
+        case .conflict, .error:
+            return .conflict(message: diagnostic.message)
         }
     }
 
-    private static func effectiveSource(
-        in ordinaryHome: URL,
-        fileManager: FileManager
-    ) throws -> (name: String, url: URL)? {
+    static func diagnostic(
+        managedHome: URL,
+        ordinaryHome: URL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true),
+        fileManager: FileManager = .default
+    ) -> Diagnostic {
+        do {
+            try requireDirectoryChainWithoutSymbolicLink(
+                ordinaryHome,
+                label: "ordinary Codex home",
+                allowMissing: true,
+                ancestorDepth: 1
+            )
+            let selection = try effectiveSource(in: ordinaryHome)
+            if try nodeType(at: managedHome) == nil {
+                try requireDirectoryChainWithoutSymbolicLink(
+                    managedHome,
+                    label: "managed Codex home",
+                    allowMissing: true,
+                    ancestorDepth: 3
+                )
+                return Diagnostic(
+                    status: .absent,
+                    message: selection == nil
+                        ? "No ordinary global Codex instruction file is present."
+                        : "Global instructions are available and will be projected before the next Codex launch."
+                )
+            }
+            try requireDirectoryChainWithoutSymbolicLink(
+                managedHome,
+                label: "managed Codex home",
+                ancestorDepth: 3
+            )
+
+            let sidecar = managedHome.appendingPathComponent(sidecarName)
+            let receipt = try loadReceipt(at: sidecar)
+            let hashes = try targetHashes(in: managedHome)
+            if let receipt, receipt.phase == .pending {
+                return Diagnostic(
+                    status: .conflict,
+                    message: "A previous instruction projection was interrupted. RepoPrompt preserved its recoverable state and will reconcile it before the next Codex launch."
+                )
+            }
+
+            guard let selection else {
+                if receipt == nil, hashes.isEmpty {
+                    return Diagnostic(
+                        status: .absent,
+                        message: "No ordinary global Codex instruction file is present."
+                    )
+                }
+                return Diagnostic(
+                    status: .conflict,
+                    message: "No ordinary global instruction source is present, but projection state remains in the managed home. RepoPrompt will reconcile it before launch."
+                )
+            }
+
+            guard let receipt else {
+                return Diagnostic(
+                    status: hashes.isEmpty ? .absent : .conflict,
+                    message: hashes.isEmpty
+                        ? "Global instructions are available and will be projected before the next Codex launch."
+                        : "A managed-home instruction file is not owned by RepoPrompt and was preserved."
+                )
+            }
+            try validateCommittedReceipt(receipt, hashes: hashes)
+            let sourceData = try readStableRegularFile(selection.url, label: "ordinary \(selection.name)")
+            guard receipt.sourceName == selection.name,
+                  receipt.targetName == selection.name,
+                  receipt.projectedHash == digest(sourceData)
+            else {
+                return Diagnostic(
+                    status: .conflict,
+                    message: "The ordinary global instruction source changed after the last projection. RepoPrompt will refresh it before the next Codex launch."
+                )
+            }
+            return Diagnostic(
+                status: .current(sourceName: selection.name),
+                message: "The effective ordinary global \(selection.name) is currently projected as a RepoPrompt-owned regular file."
+            )
+        } catch {
+            return diagnostic(for: error)
+        }
+    }
+
+    static func diagnostic(for error: Error) -> Diagnostic {
+        if let projectionError = error as? ProjectionError {
+            return Diagnostic(status: .conflict, message: projectionError.privacyBoundedDiagnostic)
+        }
+        return Diagnostic(
+            status: .error,
+            message: "RepoPrompt could not inspect the global-instruction projection. Check managed-home permissions, then reconnect Codex."
+        )
+    }
+
+    private static func effectiveSource(in ordinaryHome: URL) throws -> (name: String, url: URL)? {
+        guard try nodeType(at: ordinaryHome) != nil else { return nil }
         for name in [overrideName, fallbackName] {
             let candidate = ordinaryHome.appendingPathComponent(name, isDirectory: false)
-            guard fileManager.fileExists(atPath: candidate.path) else { continue }
-            try requireRegularFile(candidate, label: "ordinary \(name)", fileManager: fileManager)
+            guard try nodeType(at: candidate) != nil else { continue }
+            try requireRegularFile(candidate, label: "ordinary \(name)")
             return (name, candidate)
         }
         return nil
     }
 
-    private static func verifyOwnershipForReplacement(
-        target: URL,
-        sidecar: URL,
-        receipt: Receipt?,
-        nextHash: String,
-        fileManager: FileManager
-    ) throws -> String? {
-        guard fileManager.fileExists(atPath: target.path) else {
-            if let receipt, receipt.targetName == target.lastPathComponent,
-               receipt.phase == .pending, receipt.previousTargetHash != nil
-            {
-                throw ProjectionError.modifiedProjection("Owned projection disappeared during an interrupted update: \(target.path)")
-            }
-            return nil
-        }
-        guard let receipt else {
-            throw ProjectionError.foreignTarget("Preserving foreign managed-home file without RepoPrompt ownership receipt: \(target.path)")
-        }
-        guard receipt.targetName == target.lastPathComponent else {
-            throw ProjectionError.foreignTarget("Projection receipt does not own \(target.path)")
-        }
-        let actual = try hashOfRegularFile(target, fileManager: fileManager)
-        let allowed = receipt.phase == .committed
-            ? [receipt.projectedHash]
-            : [receipt.previousTargetHash, receipt.projectedHash].compactMap(\.self)
-        guard allowed.contains(actual) else {
-            throw ProjectionError.modifiedProjection("Preserving modified managed instruction projection: \(target.path)")
-        }
-        _ = sidecar
-        return actual == nextHash ? actual : actual
-    }
-
-    private static func removeOwnedProjectionIfPresent(
+    private static func recoverInterruptedProjection(
+        _ receipt: Receipt,
         managedHome: URL,
         sidecar: URL,
-        receipt: Receipt?,
         fileManager: FileManager
-    ) throws {
-        guard let receipt else { return }
-        let target = managedHome.appendingPathComponent(receipt.targetName)
-        try removeOwnedTargetIfNeeded(target, sidecar: sidecar, receipt: receipt, fileManager: fileManager)
-        if fileManager.fileExists(atPath: sidecar.path) { try fileManager.removeItem(at: sidecar) }
+    ) throws -> Receipt? {
+        let hashes = try targetHashes(in: managedHome)
+        if receipt.effectiveOperation == .remove {
+            guard Set(hashes.keys).isSubset(of: Set([receipt.targetName])) else {
+                throw ProjectionError.foreignTarget(
+                    "Preserving an instruction file outside the interrupted removal receipt."
+                )
+            }
+            if let actualHash = hashes[receipt.targetName] {
+                guard actualHash == receipt.projectedHash else {
+                    throw ProjectionError.modifiedProjection(
+                        "The projection changed during interrupted removal."
+                    )
+                }
+                try removeRegularFile(
+                    managedHome.appendingPathComponent(receipt.targetName),
+                    expectedHash: receipt.projectedHash,
+                    fileManager: fileManager
+                )
+            }
+            try removeRegularSidecarIfPresent(sidecar, fileManager: fileManager)
+            return nil
+        }
+
+        let previousName = receipt.previousTargetName
+            ?? (receipt.previousTargetHash == nil ? nil : receipt.targetName)
+        let ownedNames = Set([receipt.targetName, previousName].compactMap(\.self))
+        guard Set(hashes.keys).isSubset(of: ownedNames) else {
+            throw ProjectionError.foreignTarget(
+                "Preserving an instruction file outside the interrupted projection receipt."
+            )
+        }
+
+        let currentHash = hashes[receipt.targetName]
+        if currentHash == receipt.projectedHash {
+            if let previousName,
+               previousName != receipt.targetName,
+               let previousHash = receipt.previousTargetHash,
+               let actualPreviousHash = hashes[previousName]
+            {
+                guard actualPreviousHash == previousHash else {
+                    throw ProjectionError.modifiedProjection(
+                        "The previous projection changed during interrupted source switching."
+                    )
+                }
+                try removeRegularFile(
+                    managedHome.appendingPathComponent(previousName),
+                    expectedHash: previousHash,
+                    fileManager: fileManager
+                )
+            }
+            let committed = committedReceipt(name: receipt.targetName, hash: receipt.projectedHash)
+            try writeReceipt(committed, to: sidecar)
+            return committed
+        }
+
+        if previousName == receipt.targetName,
+           let previousHash = receipt.previousTargetHash,
+           currentHash == previousHash
+        {
+            let committed = committedReceipt(name: receipt.targetName, hash: previousHash)
+            try writeReceipt(committed, to: sidecar)
+            return committed
+        }
+
+        if let previousName,
+           previousName != receipt.targetName,
+           let previousHash = receipt.previousTargetHash,
+           currentHash == nil,
+           hashes[previousName] == previousHash
+        {
+            let committed = committedReceipt(name: previousName, hash: previousHash)
+            try writeReceipt(committed, to: sidecar)
+            return committed
+        }
+
+        if previousName == nil, currentHash == nil, hashes.isEmpty {
+            try removeRegularSidecarIfPresent(sidecar, fileManager: fileManager)
+            return nil
+        }
+
+        throw ProjectionError.modifiedProjection(
+            "The interrupted instruction projection no longer matches its ownership receipt."
+        )
     }
 
-    private static func removeOwnedTargetIfNeeded(
-        _ target: URL,
-        sidecar: URL,
-        receipt: Receipt?,
-        fileManager: FileManager
+    private static func validateCommittedReceipt(
+        _ receipt: Receipt,
+        hashes: [String: String]
     ) throws {
-        guard fileManager.fileExists(atPath: target.path) else { return }
-        guard let receipt, receipt.targetName == target.lastPathComponent else {
-            throw ProjectionError.foreignTarget("Preserving foreign managed-home file: \(target.path)")
+        guard receipt.phase == .committed else {
+            throw ProjectionError.invalidSidecar("Expected a committed projection receipt.")
         }
-        let actual = try hashOfRegularFile(target, fileManager: fileManager)
-        let allowed = receipt.phase == .committed
-            ? [receipt.projectedHash]
-            : [receipt.previousTargetHash, receipt.projectedHash].compactMap(\.self)
-        guard allowed.contains(actual) else {
-            throw ProjectionError.modifiedProjection("Preserving modified managed instruction projection: \(target.path)")
+        guard hashes[receipt.targetName] == receipt.projectedHash else {
+            throw ProjectionError.modifiedProjection(
+                "The owned instruction projection is missing or modified."
+            )
         }
-        try fileManager.removeItem(at: target)
-        _ = sidecar
+        guard Set(hashes.keys) == Set([receipt.targetName]) else {
+            throw ProjectionError.foreignTarget(
+                "Preserving an additional managed-home instruction file not owned by the receipt."
+            )
+        }
     }
 
-    private static func loadReceipt(at url: URL, fileManager: FileManager) throws -> Receipt? {
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        try requireRegularFile(url, label: "projection receipt", fileManager: fileManager)
+    private static func targetHashes(in managedHome: URL) throws -> [String: String] {
+        var hashes: [String: String] = [:]
+        for name in [overrideName, fallbackName] {
+            let target = managedHome.appendingPathComponent(name)
+            guard try nodeType(at: target) != nil else { continue }
+            do {
+                hashes[name] = try hashOfRegularFile(target)
+            } catch {
+                throw ProjectionError.foreignTarget(
+                    "Preserving a non-regular or symbolic-link managed-home instruction target."
+                )
+            }
+        }
+        return hashes
+    }
+
+    private static func committedReceipt(name: String, hash: String) -> Receipt {
+        Receipt(
+            schemaVersion: 2,
+            owner: owner,
+            sourceName: name,
+            targetName: name,
+            previousTargetName: nil,
+            previousTargetHash: nil,
+            projectedHash: hash,
+            phase: .committed,
+            operation: .project
+        )
+    }
+
+    private static func loadReceipt(at url: URL) throws -> Receipt? {
+        guard try nodeType(at: url) != nil else { return nil }
+        do {
+            try requireRegularFile(url, label: "projection receipt")
+        } catch {
+            throw ProjectionError.invalidSidecar(
+                "The RepoPrompt projection receipt is not a regular file."
+            )
+        }
         let receipt: Receipt
-        do { receipt = try JSONDecoder().decode(Receipt.self, from: Data(contentsOf: url)) }
-        catch { throw ProjectionError.invalidSidecar("Invalid RepoPrompt projection receipt at \(url.path)") }
-        guard receipt.schemaVersion == 1,
-              receipt.owner == "com.repoprompt.ce.codex-global-instructions",
+        do {
+            receipt = try JSONDecoder().decode(
+                Receipt.self,
+                from: readStableRegularFile(url, label: "projection receipt")
+            )
+        } catch let error as ProjectionError {
+            throw error
+        } catch {
+            throw ProjectionError.invalidSidecar("Invalid RepoPrompt projection receipt.")
+        }
+        let validPreviousName = receipt.previousTargetName.map {
+            [overrideName, fallbackName].contains($0)
+        } ?? true
+        let validPreviousHash = receipt.previousTargetHash.map(isValidHash) ?? true
+        guard [1, 2].contains(receipt.schemaVersion),
+              receipt.owner == owner,
               [overrideName, fallbackName].contains(receipt.sourceName),
               receipt.sourceName == receipt.targetName,
-              receipt.projectedHash.count == 64,
-              receipt.projectedHash.allSatisfy(\.isHexDigit)
-        else { throw ProjectionError.invalidSidecar("Unrecognized RepoPrompt projection receipt at \(url.path)") }
+              validPreviousName,
+              validPreviousHash,
+              isValidHash(receipt.projectedHash),
+              receipt.phase == .pending || (receipt.previousTargetName == nil && receipt.previousTargetHash == nil),
+              receipt.phase == .pending || receipt.effectiveOperation == .project
+        else {
+            throw ProjectionError.invalidSidecar("Unrecognized RepoPrompt projection receipt.")
+        }
         return receipt
     }
 
     private static func writeReceipt(_ receipt: Receipt, to url: URL) throws {
+        if try nodeType(at: url) != nil {
+            do {
+                try requireRegularFile(url, label: "projection receipt")
+            } catch {
+                throw ProjectionError.invalidSidecar(
+                    "Preserving a non-regular or symbolic-link projection receipt."
+                )
+            }
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(receipt).write(to: url, options: .atomic)
+        do {
+            try requireRegularFile(url, label: "projection receipt")
+        } catch {
+            throw ProjectionError.invalidSidecar("Projection receipt write did not produce a regular file.")
+        }
     }
 
-    private static func hashOfRegularFile(_ url: URL, fileManager: FileManager) throws -> String {
-        try requireRegularFile(url, label: "managed instruction projection", fileManager: fileManager)
-        return try digest(Data(contentsOf: url, options: .mappedIfSafe))
+    private static func prepareManagedHome(_ managedHome: URL, fileManager: FileManager) throws {
+        let parent = managedHome.deletingLastPathComponent()
+        try requireDirectoryChainWithoutSymbolicLink(
+            parent,
+            label: "managed Codex state parent",
+            ancestorDepth: 2
+        )
+        switch try nodeType(at: managedHome) {
+        case nil:
+            try fileManager.createDirectory(at: managedHome, withIntermediateDirectories: false)
+        case mode_t(S_IFDIR):
+            break
+        default:
+            throw ProjectionError.invalidSource(
+                "The managed Codex home must be a real directory."
+            )
+        }
+        try requireDirectoryChainWithoutSymbolicLink(
+            managedHome,
+            label: "managed Codex home",
+            ancestorDepth: 3
+        )
+    }
+
+    private static func removeRegularFile(
+        _ url: URL,
+        expectedHash: String,
+        fileManager: FileManager
+    ) throws {
+        guard try hashOfRegularFile(url) == expectedHash else {
+            throw ProjectionError.modifiedProjection(
+                "Preserving a modified managed instruction projection."
+            )
+        }
+        try fileManager.removeItem(at: url)
+    }
+
+    private static func removeRegularSidecarIfPresent(
+        _ sidecar: URL,
+        fileManager: FileManager
+    ) throws {
+        guard try nodeType(at: sidecar) != nil else { return }
+        do {
+            try requireRegularFile(sidecar, label: "projection receipt")
+        } catch {
+            throw ProjectionError.invalidSidecar(
+                "Preserving a non-regular or symbolic-link projection receipt."
+            )
+        }
+        try fileManager.removeItem(at: sidecar)
+    }
+
+    private static func hashOfRegularFile(_ url: URL) throws -> String {
+        try digest(readStableRegularFile(url, label: "managed instruction projection"))
+    }
+
+    private static func readStableRegularFile(_ url: URL, label: String) throws -> Data {
+        let before = try requireRegularFile(url, label: label)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let after = try requireRegularFile(url, label: label)
+        guard FileIdentity(before) == FileIdentity(after), Int64(data.count) == after.st_size else {
+            throw ProjectionError.invalidSource(
+                "The \(label) changed while RepoPrompt was reading it."
+            )
+        }
+        return data
     }
 
     private static func digest(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func requireRegularFile(_ url: URL, label: String, fileManager: FileManager) throws {
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular else {
-            throw ProjectionError.invalidSource("The \(label) must be a regular file: \(url.path)")
+    private static func isValidHash(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy { character in
+            character.isNumber || (character >= "a" && character <= "f")
         }
     }
 
-    private static func requireDirectoryWithoutSymbolicLink(
+    @discardableResult
+    private static func requireRegularFile(_ url: URL, label: String) throws -> stat {
+        guard let status = try lstatStatus(at: url),
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+        else {
+            throw ProjectionError.invalidSource(
+                "The \(label) must be a regular file and not a symbolic link."
+            )
+        }
+        return status
+    }
+
+    private static func requireDirectoryChainWithoutSymbolicLink(
         _ url: URL,
         label: String,
         allowMissing: Bool = false,
-        fileManager: FileManager
+        ancestorDepth: Int
     ) throws {
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            if allowMissing { return }
-            throw ProjectionError.invalidSource("Missing \(label): \(url.path)")
+        var candidate = url.standardizedFileURL
+        for depth in 0 ... ancestorDepth {
+            guard let status = try lstatStatus(at: candidate) else {
+                if allowMissing {
+                    candidate.deleteLastPathComponent()
+                    continue
+                }
+                throw ProjectionError.invalidSource("Missing \(label).")
+            }
+            guard status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                throw ProjectionError.invalidSource(
+                    "The \(label) and its RepoPrompt-owned ancestors must be real directories."
+                )
+            }
+            candidate.deleteLastPathComponent()
         }
-        guard isDirectory.boolValue,
-              try (fileManager.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType) == .typeDirectory
-        else { throw ProjectionError.invalidSource("The \(label) must be a real directory: \(url.path)") }
+    }
+
+    private static func nodeType(at url: URL) throws -> mode_t? {
+        try lstatStatus(at: url)?.st_mode.mapType
+    }
+
+    private static func lstatStatus(at url: URL) throws -> stat? {
+        var status = stat()
+        if lstat(url.path, &status) == 0 { return status }
+        guard errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return nil
+    }
+}
+
+private extension mode_t {
+    var mapType: mode_t {
+        self & mode_t(S_IFMT)
     }
 }

@@ -21,6 +21,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
     func testBundledRuntimeResolvesRequestedArchitectureAndOwnedState() throws {
         let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
         let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         let armExecutable = try makePackage(in: resources, target: "aarch64-apple-darwin")
         _ = try makePackage(in: resources, target: "x86_64-apple-darwin")
 
@@ -48,6 +49,78 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("version=0.147.0"))
         XCTAssertTrue(runtime.redactedDiagnosticSummary.contains("log_dir="))
         XCTAssertFalse(runtime.redactedDiagnosticSummary.contains(temporaryDirectory.path))
+    }
+
+    func testManagedStatePathsDifferentiateDebugAndReleaseChannels() {
+        let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
+        let debug = CodexRuntimeAuthority.statePaths(
+            applicationSupportURL: support,
+            buildChannel: .debug
+        )
+        let release = CodexRuntimeAuthority.statePaths(
+            applicationSupportURL: support,
+            buildChannel: .release
+        )
+
+        XCTAssertEqual(
+            debug.codexHome.path,
+            support.appendingPathComponent("RepoPrompt CE/Codex/Debug/home").path
+        )
+        XCTAssertEqual(
+            release.codexHome.path,
+            support.appendingPathComponent("RepoPrompt CE/Codex/Release/home").path
+        )
+        XCTAssertNotEqual(debug.codexHome, release.codexHome)
+        XCTAssertEqual(
+            CodexRuntimeAuthority.statePaths(applicationSupportURL: support).codexHome,
+            CodexRuntimeAuthority.statePaths(
+                applicationSupportURL: support,
+                buildChannel: .current
+            ).codexHome
+        )
+    }
+
+    func testManagedStatePreparationRejectsSymlinkedOwnedAncestorWithoutWritingOutside() throws {
+        let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
+        let foreign = temporaryDirectory.appendingPathComponent("Foreign", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: support.appendingPathComponent("RepoPrompt CE"),
+            withDestinationURL: foreign
+        )
+        let paths = CodexRuntimeAuthority.statePaths(
+            applicationSupportURL: support,
+            buildChannel: .debug
+        )
+
+        XCTAssertThrowsError(try CodexRuntimeAuthority.prepareManagedState(paths))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: foreign.appendingPathComponent("Codex").path))
+    }
+
+    func testManagedStatePreparationRejectsSymlinkedStateDirectoryAndPreservesDestination() throws {
+        let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let paths = CodexRuntimeAuthority.statePaths(
+            applicationSupportURL: support,
+            buildChannel: .debug
+        )
+        try CodexRuntimeAuthority.prepareManagedState(paths)
+        try FileManager.default.removeItem(at: paths.codexHome)
+        let foreign = temporaryDirectory.appendingPathComponent("ForeignHome", isDirectory: true)
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+        try "preserve".write(
+            to: foreign.appendingPathComponent("sentinel"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.createSymbolicLink(at: paths.codexHome, withDestinationURL: foreign)
+
+        XCTAssertThrowsError(try CodexRuntimeAuthority.prepareManagedState(paths))
+        XCTAssertEqual(
+            try String(contentsOf: foreign.appendingPathComponent("sentinel"), encoding: .utf8),
+            "preserve"
+        )
     }
 
     func testBundledRuntimeResolvesIntelPackageIndependently() throws {

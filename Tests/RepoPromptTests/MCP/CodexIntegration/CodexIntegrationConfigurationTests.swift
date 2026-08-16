@@ -82,8 +82,6 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             "-c",
             "log_dir=\"/tmp/managed log\""
         ])
-        XCTAssertEqual(CodexOverrides.managedStateConfigMap(statePaths)["sqlite_home"] as? String, "/tmp/managed sqlite")
-        XCTAssertEqual(CodexOverrides.managedStateConfigMap(statePaths)["log_dir"] as? String, "/tmp/managed log")
     }
 
     func testManagedStateOverridesEscapeTOMLStrings() {
