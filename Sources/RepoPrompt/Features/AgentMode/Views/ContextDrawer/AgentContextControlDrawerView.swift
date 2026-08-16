@@ -26,7 +26,7 @@ struct AgentContextControlDrawerView: View {
     let windowID: Int
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
-    let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
+    let contextWorktreeBindings: AgentContextWorktreeBindingsProjection
 
     @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
     @State private var hoveredTab: AgentContextDrawerUIStore.Tab?
@@ -45,7 +45,7 @@ struct AgentContextControlDrawerView: View {
             selectionCoordinator: selectionCoordinator,
             currentTabID: currentTabID,
             activeAgentSessionID: activeAgentSessionID,
-            worktreeBindingsProvider: worktreeBindingsProvider
+            contextWorktreeBindings: contextWorktreeBindings
         )
     }
 
@@ -67,6 +67,10 @@ struct AgentContextControlDrawerView: View {
 
     private var isSwitchBlankingSelectedFiles: Bool {
         hasPendingSwitchKeyChange || selectedFilesBlankingIdentity != nil
+    }
+
+    private var selectedFilesBlankingTargetsCurrentRequest: Bool {
+        !hasPendingSwitchKeyChange && selectedFilesBlankingIdentity == exportContext.modelRequestIdentity
     }
 
     private var isSwitchBlankingTokenEstimate: Bool {
@@ -348,7 +352,7 @@ struct AgentContextControlDrawerView: View {
             for: tokenBlankingSelection,
             scheduleRefreshIfNeeded: false
         )
-        guard snapshot.isComplete, !snapshot.isStale, !snapshot.refreshPending else { return }
+        guard snapshot.hasUsablePublishedSelection else { return }
         self.tokenBlankingSelection = nil
     }
 
@@ -385,7 +389,8 @@ struct AgentContextControlDrawerView: View {
                 detailStore: detailStore,
                 modelCoordinator: modelCoordinator,
                 exportContext: exportContext,
-                isSwitchBlankingRows: isSwitchBlankingSelectedFiles
+                isSwitchBlankingRows: isSwitchBlankingSelectedFiles,
+                blankingTargetsCurrentRequest: selectedFilesBlankingTargetsCurrentRequest
             )
         case .builder:
             AgentContextDrawerBuilderTab(

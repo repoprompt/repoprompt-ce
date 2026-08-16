@@ -7041,6 +7041,38 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testBulkPathLookupMaterializesStoreBackedFilesWithSingleRootPublication() async throws {
+        let root = try makeTemporaryRoot(name: "BulkLookupProjection")
+        let firstURL = root.appendingPathComponent("Sources/First.swift")
+        let secondURL = root.appendingPathComponent("Sources/Nested/Second.swift")
+        try write("let first = true\n", to: firstURL)
+        try write("let second = true\n", to: secondURL)
+
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+        let workspace = WorkspaceModel(name: "BulkLookupProjection", repoPaths: [root.path])
+        manager.registerPreloadedWorkspaceRoot(rootRecord)
+        _ = try manager.attachRootShell(for: rootRecord, workspaceID: workspace.id)
+
+        var rootPublicationCount = 0
+        manager.onRootFoldersChanged = { rootPublicationCount += 1 }
+
+        let resolved = await manager.findFiles(
+            atPaths: [firstURL.path, secondURL.path],
+            profile: .mcpSelection
+        )
+        await Task.yield()
+
+        XCTAssertEqual(Set(resolved.keys), Set([firstURL.path, secondURL.path]))
+        XCTAssertNotNil(manager.findFileByFullPath(firstURL.path))
+        XCTAssertNotNil(manager.findFileByFullPath(secondURL.path))
+        XCTAssertEqual(rootPublicationCount, 1)
+
+        await manager.unloadAllRootFolders()
+    }
+
+    @MainActor
     func testStoreBackedRootShellProjectionsPreserveIdentityWithoutMaterializingDescendants() async throws {
         do {
             let caseLabel = "testAttachRootShellFromPreloadedStoreRecordDoesNotMaterializeDescendants"

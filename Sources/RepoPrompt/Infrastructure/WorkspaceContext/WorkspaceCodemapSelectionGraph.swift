@@ -1214,17 +1214,11 @@ actor WorkspaceCodemapSelectionGraph {
                 references[name, default: []].append(fileID)
             }
         }
-        for name in changedDefinitionNames {
-            definitions[name]?.sort { fileIDPrecedes($0, $1, nodes: nodes) }
-        }
         let changedReferenceNames = changedIDs.reduce(into: Set<String>()) { names, fileID in
             if let old = base?.nodesByFileID[fileID] {
                 names.formUnion(old.contribution.sortedUniqueReferences)
             }
             if let new = nodes[fileID] { names.formUnion(new.contribution.sortedUniqueReferences) }
-        }
-        for name in changedReferenceNames {
-            references[name]?.sort { fileIDPrecedes($0, $1, nodes: nodes) }
         }
 
         var affectedSources = changedIDs
@@ -1290,7 +1284,6 @@ actor WorkspaceCodemapSelectionGraph {
                 outgoing[source, default: []].append(evidence)
                 reverse[target, default: []].append(evidence)
             }
-            outgoing[source]?.sort { edgePrecedes($0, $1, nodes: nodes) }
             unresolved[source]?.sort {
                 if $0.referencedName != $1.referencedName {
                     return utf8Precedes($0.referencedName, $1.referencedName)
@@ -1299,8 +1292,48 @@ actor WorkspaceCodemapSelectionGraph {
             }
         }
         let affectedTargets = Set(affectedSources.flatMap { outgoing[$0]?.map(\.targetFileID) ?? [] })
+
+        // Rank only files that participate in affected sorts. A sparse delta in a
+        // large graph must not introduce an O(V log V) whole-graph ordering pass.
+        var orderingFileIDs = Set<UUID>()
+        for name in changedDefinitionNames {
+            orderingFileIDs.formUnion(definitions[name] ?? [])
+        }
+        for name in changedReferenceNames {
+            orderingFileIDs.formUnion(references[name] ?? [])
+        }
+        for source in affectedSources {
+            for edge in outgoing[source] ?? [] {
+                orderingFileIDs.insert(edge.sourceFileID)
+                orderingFileIDs.insert(edge.targetFileID)
+            }
+        }
+        // Sorting an affected target's reverse adjacency also compares retained
+        // edges from unaffected sources. Include the complete lists being sorted,
+        // not only the edges rebuilt for this delta.
         for target in affectedTargets {
-            reverse[target]?.sort { edgePrecedes($0, $1, nodes: nodes) }
+            for edge in reverse[target] ?? [] {
+                orderingFileIDs.insert(edge.sourceFileID)
+                orderingFileIDs.insert(edge.targetFileID)
+            }
+        }
+        guard let fileOrdering = WorkspaceCodemapCandidateFileOrdering(
+            nodes: nodes,
+            participatingFileIDs: orderingFileIDs
+        ) else {
+            return .cancelled
+        }
+        for name in changedDefinitionNames {
+            definitions[name]?.sort { fileOrdering.precedes($0, $1, nodes: nodes) }
+        }
+        for name in changedReferenceNames {
+            references[name]?.sort { fileOrdering.precedes($0, $1, nodes: nodes) }
+        }
+        for source in affectedSources {
+            outgoing[source]?.sort { edgePrecedes($0, $1, nodes: nodes, fileOrdering: fileOrdering) }
+        }
+        for target in affectedTargets {
+            reverse[target]?.sort { edgePrecedes($0, $1, nodes: nodes, fileOrdering: fileOrdering) }
         }
 
         guard let postingCount = checkedAdd(checkedCount(definitions.values), checkedCount(references.values)),
@@ -1478,15 +1511,75 @@ actor WorkspaceCodemapSelectionGraph {
     private static func edgePrecedes(
         _ lhs: WorkspaceCodemapGraphEdgeEvidence,
         _ rhs: WorkspaceCodemapGraphEdgeEvidence,
-        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode]
+        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode],
+        fileOrdering: WorkspaceCodemapCandidateFileOrdering? = nil
     ) -> Bool {
-        if lhs.sourceFileID != rhs.sourceFileID { return fileIDPrecedes(lhs.sourceFileID, rhs.sourceFileID, nodes: nodes) }
-        if lhs.targetFileID != rhs.targetFileID { return fileIDPrecedes(lhs.targetFileID, rhs.targetFileID, nodes: nodes) }
+        if lhs.sourceFileID != rhs.sourceFileID {
+            return fileOrdering?.precedes(lhs.sourceFileID, rhs.sourceFileID, nodes: nodes)
+                ?? fileIDPrecedes(lhs.sourceFileID, rhs.sourceFileID, nodes: nodes)
+        }
+        if lhs.targetFileID != rhs.targetFileID {
+            return fileOrdering?.precedes(lhs.targetFileID, rhs.targetFileID, nodes: nodes)
+                ?? fileIDPrecedes(lhs.targetFileID, rhs.targetFileID, nodes: nodes)
+        }
         return lhs.matchedNames.lexicographicallyPrecedes(rhs.matchedNames, by: utf8Precedes)
     }
 
     private static func utf8Precedes(_ lhs: String, _ rhs: String) -> Bool {
         lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
+    }
+}
+
+/// Candidate-local rank table that pays the UTF-8 path comparison cost once.
+/// Posting and edge sorts then compare integers instead of repeatedly traversing
+/// the same path bytes and rebuilding UUID string tie breakers.
+private struct WorkspaceCodemapCandidateFileOrdering {
+    private struct Key {
+        let fileID: UUID
+        let pathBytes: [UInt8]
+        let uuidString: String
+    }
+
+    private let rankByFileID: [UUID: Int]
+
+    init?(
+        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode],
+        participatingFileIDs: Set<UUID>
+    ) {
+        var keys: [Key] = []
+        keys.reserveCapacity(participatingFileIDs.count)
+        for fileID in participatingFileIDs {
+            guard !Task.isCancelled else { return nil }
+            guard let node = nodes[fileID] else { continue }
+            keys.append(Key(
+                fileID: fileID,
+                pathBytes: Array(node.standardizedRelativePath.utf8),
+                uuidString: fileID.uuidString
+            ))
+        }
+        keys.sort { lhs, rhs in
+            if lhs.pathBytes != rhs.pathBytes {
+                return lhs.pathBytes.lexicographicallyPrecedes(rhs.pathBytes)
+            }
+            return lhs.uuidString < rhs.uuidString
+        }
+        guard !Task.isCancelled else { return nil }
+        rankByFileID = Dictionary(uniqueKeysWithValues: keys.enumerated().map { ($0.element.fileID, $0.offset) })
+    }
+
+    func precedes(
+        _ lhs: UUID,
+        _ rhs: UUID,
+        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode]
+    ) -> Bool {
+        if let leftRank = rankByFileID[lhs], let rightRank = rankByFileID[rhs] {
+            return leftRank < rightRank
+        }
+        assertionFailure("Selection graph sort referenced a file missing from the candidate ordering")
+        let left = nodes[lhs]?.standardizedRelativePath ?? ""
+        let right = nodes[rhs]?.standardizedRelativePath ?? ""
+        if left != right { return left.utf8.lexicographicallyPrecedes(right.utf8) }
+        return lhs.uuidString < rhs.uuidString
     }
 }
 

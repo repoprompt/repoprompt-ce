@@ -1,6 +1,16 @@
 import Foundation
 
 enum AgentSelectedFilesDiagnostics {
+    @TaskLocal static var correlationFields: [String: String] = [:]
+
+    static var isEnabled: Bool {
+        #if DEBUG
+            AgentModePerfDiagnostics.isEnabled
+        #else
+            false
+        #endif
+    }
+
     static func timestampMSIfEnabled() -> Double? {
         #if DEBUG
             AgentModePerfDiagnostics.timestampMSIfEnabled()
@@ -20,26 +30,30 @@ enum AgentSelectedFilesDiagnostics {
 
     static func event(
         _ name: String,
-        fields: [String: String] = [:],
+        fields: @autoclosure () -> [String: String] = [:],
         includeStack: Bool = false
     ) {
         #if DEBUG
-            guard AgentModePerfDiagnostics.isEnabled else { return }
-            var fields = fields
+            guard isEnabled else { return }
+            var mergedFields = correlationFields
+            mergedFields.merge(fields()) { _, new in new }
             if includeStack {
-                fields["stack"] = compactCallStack()
+                mergedFields["stack"] = compactCallStack()
             }
-            AgentModePerfDiagnostics.event("selectedFiles.\(name)", fields: fields)
+            AgentModePerfDiagnostics.event("selectedFiles.\(name)", fields: mergedFields)
         #endif
     }
 
     static func durationEvent(
         _ name: String,
         startMS: Double?,
-        fields: [String: String] = [:]
+        fields: @autoclosure () -> [String: String] = [:]
     ) {
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent("selectedFiles.\(name)", startMS: startMS, fields: fields)
+            guard isEnabled, startMS != nil else { return }
+            var mergedFields = correlationFields
+            mergedFields.merge(fields()) { _, new in new }
+            AgentModePerfDiagnostics.durationEvent("selectedFiles.\(name)", startMS: startMS, fields: mergedFields)
         #endif
     }
 
@@ -51,24 +65,26 @@ enum AgentSelectedFilesDiagnostics {
         #endif
     }
 
-    static func selectionFields(_ selection: StoredSelection) -> [String: String] {
-        #if DEBUG
-            let nonEmptySlices = selection.slices.filter { !$0.value.isEmpty }
-            let sliceRanges = nonEmptySlices.values.reduce(0) { $0 + $1.count }
-            return [
-                "selectedPaths": String(selection.selectedPaths.count),
-                "manualCodemapPaths": String(selection.manualCodemapPaths.count),
-                "sliceFiles": String(nonEmptySlices.count),
-                "sliceRanges": String(sliceRanges),
-                "codemapAutoEnabled": String(selection.codemapAutoEnabled)
-            ]
-        #else
+    #if DEBUG
+        static func selectionFields(
+            _ selection: StoredSelection,
+            diagnosticsEnabled: Bool = isEnabled,
+            signatureBuilder: (StoredSelection) -> [String: String] = {
+                WorkspaceSelectionDebugSignature.unprefixedFields(for: $0)
+            }
+        ) -> [String: String] {
+            guard diagnosticsEnabled else { return [:] }
+            return signatureBuilder(selection)
+        }
+    #else
+        static func selectionFields(_: StoredSelection) -> [String: String] {
             [:]
-        #endif
-    }
+        }
+    #endif
 
     static func sourceFields(_ source: AgentContextExportSource) -> [String: String] {
         #if DEBUG
+            guard isEnabled else { return [:] }
             var fields = selectionFields(source.selection)
             fields["tabID"] = shortID(source.tabID)
             fields["activeAgentSessionID"] = shortID(source.activeAgentSessionID)
@@ -83,10 +99,54 @@ enum AgentSelectedFilesDiagnostics {
 
     static func requestFields(_ request: AgentSelectedFilesModelRequest) -> [String: String] {
         #if DEBUG
+            guard isEnabled else { return [:] }
             var fields = sourceFields(request.source)
             fields["filePathDisplay"] = String(describing: request.filePathDisplay)
             fields["codeMapUsage"] = String(describing: request.codeMapUsage)
             return fields
+        #else
+            [:]
+        #endif
+    }
+
+    static func identityChangeFields(
+        from previous: AgentSelectedFilesModelIdentity?,
+        to next: AgentSelectedFilesModelIdentity
+    ) -> [String: String] {
+        #if DEBUG
+            guard isEnabled else { return [:] }
+            guard let previous else { return ["hasPreviousIdentity": "false"] }
+            let previousExport = previous.exportContextIdentity
+            let nextExport = next.exportContextIdentity
+            return [
+                "hasPreviousIdentity": "true",
+                "selectionChanged": String(previousExport.selection != nextExport.selection),
+                "tabChanged": String(previousExport.tabID != nextExport.tabID),
+                "sessionChanged": String(previousExport.activeAgentSessionID != nextExport.activeAgentSessionID),
+                "bindingChanged": String(
+                    previousExport.worktreeBindingFingerprint != nextExport.worktreeBindingFingerprint
+                ),
+                "filePathDisplayChanged": String(previous.filePathDisplay != next.filePathDisplay),
+                "codeMapUsageChanged": String(previous.codeMapUsage != next.codeMapUsage)
+            ]
+        #else
+            [:]
+        #endif
+    }
+
+    static func planningMetricsFields(
+        _ metrics: WorkspaceCodemapPresentationPlanningMetrics
+    ) -> [String: String] {
+        #if DEBUG
+            guard isEnabled else { return [:] }
+            return [
+                "rootCount": String(metrics.rootCount),
+                "fileEnumerationRequests": String(metrics.fileEnumerationRequestCount),
+                "examinedFiles": String(metrics.examinedFileCount),
+                "supportedCandidates": String(metrics.supportedCandidateCount),
+                "requestedFiles": String(metrics.requestedFileCount),
+                "completeRootSet": String(metrics.completeRootSet)
+            ]
         #else
             [:]
         #endif

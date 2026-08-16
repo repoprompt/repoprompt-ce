@@ -12,6 +12,29 @@ struct AgentExecutionLocationProps: Equatable {
     let disabledReason: String?
 }
 
+/// Immutable UI projection of the active Agent session's canonical worktree bindings.
+/// Identity checks fail closed so a stale render snapshot can never attach bindings to
+/// a different tab or session. Core routing remains the authority that hydrates and
+/// mutates the `TabSession`; SwiftUI only consumes this projection.
+struct AgentContextWorktreeBindingsProjection: Equatable {
+    let tabID: UUID?
+    let activeAgentSessionID: UUID?
+    let bindings: [AgentSessionWorktreeBinding]
+
+    static let empty = AgentContextWorktreeBindingsProjection(
+        tabID: nil,
+        activeAgentSessionID: nil,
+        bindings: []
+    )
+
+    func bindings(for sessionID: UUID, tabID requestedTabID: UUID?) -> [AgentSessionWorktreeBinding] {
+        guard activeAgentSessionID == sessionID,
+              tabID == requestedTabID
+        else { return [] }
+        return bindings
+    }
+}
+
 struct AgentStatusPillsSnapshot: Equatable {
     let currentTabID: UUID?
     let selectedWorkflow: AgentWorkflowDefinition?
@@ -23,6 +46,7 @@ struct AgentStatusPillsSnapshot: Equatable {
     let interviewFirst: Bool
     let executionLocation: AgentExecutionLocationProps?
     let activeAgentSessionID: UUID?
+    let contextWorktreeBindings: AgentContextWorktreeBindingsProjection
     let activeRunID: UUID?
 
     static let empty = AgentStatusPillsSnapshot(
@@ -36,6 +60,7 @@ struct AgentStatusPillsSnapshot: Equatable {
         interviewFirst: false,
         executionLocation: nil,
         activeAgentSessionID: nil,
+        contextWorktreeBindings: .empty,
         activeRunID: nil
     )
 }

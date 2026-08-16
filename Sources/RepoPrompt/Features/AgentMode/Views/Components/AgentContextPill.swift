@@ -13,7 +13,7 @@ struct AgentContextPill: View {
     @ObservedObject var runtimeVM: AgentRuntimeSidebarViewModel
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
-    let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
+    let contextWorktreeBindings: AgentContextWorktreeBindingsProjection
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @State private var contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
@@ -57,7 +57,9 @@ struct AgentContextPill: View {
                 selectionSnapshot: selectionSnapshot,
                 composeTabs: promptManager.currentComposeTabs,
                 explicitActiveAgentSessionID: activeAgentSessionID,
-                worktreeBindingsProvider: worktreeBindingsProvider
+                worktreeBindingsProvider: { sessionID, tabID in
+                    contextWorktreeBindings.bindings(for: sessionID, tabID: tabID)
+                }
             )
         ).selection
     }

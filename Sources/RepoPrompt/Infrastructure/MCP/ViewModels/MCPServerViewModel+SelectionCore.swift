@@ -110,13 +110,53 @@ extension MCPServerViewModel {
         if let frozenLookupContext = context.frozenLookupContext {
             return frozenLookupContext
         }
+        let worktreeBindingState = await authoritativeWorktreeBindingState(for: context)
         return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
             source: AgentWorkspaceLookupContextSource(
                 activeAgentSessionID: context.activeAgentSessionID,
-                worktreeBindingState: context.worktreeBindingState
+                worktreeBindingState: worktreeBindingState
             ),
             store: promptVM.workspaceFileContextStore
         )
+    }
+
+    /// Resolves the binding authority needed by generic selection/read projections.
+    /// Persisted inactive Agent tabs may begin unhydrated; treating that transient
+    /// state as final made `workspace_context` and related tools fail closed forever.
+    /// Revalidation after the await prevents a restored or superseded session from
+    /// redirecting a request to a stale worktree.
+    @MainActor
+    private func authoritativeWorktreeBindingState(
+        for context: TabContextSnapshot
+    ) async -> AgentSessionWorktreeBindingState {
+        guard let sessionID = context.activeAgentSessionID else { return .notApplicable }
+
+        var state = context.worktreeBindingState
+        if state == .unhydrated,
+           context.runID == nil,
+           let agentWorktreeBindingStateProvider
+        {
+            state = agentWorktreeBindingStateProvider(sessionID, context.tabID)
+        }
+        guard state == .unhydrated,
+              let agentWorktreeBindingStateResolver
+        else { return state }
+
+        let hydratedState = await agentWorktreeBindingStateResolver(sessionID, context.tabID)
+        if context.runID == nil,
+           let workspaceID = context.workspaceID
+        {
+            guard let liveTab = workspaceManager?.composeTab(
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+            ), liveTab.activeAgentSessionID == sessionID
+            else { return .unavailable }
+        }
+        if let agentWorktreeBindingStateProvider,
+           agentWorktreeBindingStateProvider(sessionID, context.tabID) != hydratedState
+        {
+            return .unavailable
+        }
+        return hydratedState
     }
 
     @MainActor

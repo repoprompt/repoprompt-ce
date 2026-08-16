@@ -4,6 +4,49 @@ import RepoPromptCodeMapCore
 import XCTest
 
 final class WorkspaceCodemapSelectionGraphIncrementalTests: XCTestCase {
+    func testCandidateRankOrderingPreservesExactUTF8PathAndUUIDDeterminism() async throws {
+        let fixture = try GraphFixture(seed: 80)
+        let definitions: [(UUID, String)] = [
+            (uuid("98000000-0000-0000-0000-000000000004"), "Sources/é.swift"),
+            (uuid("98000000-0000-0000-0000-000000000003"), "Sources/a.swift"),
+            (uuid("98000000-0000-0000-0000-000000000002"), "Sources/A.swift"),
+            (uuid("98000000-0000-0000-0000-000000000001"), "Sources/a/Child.swift")
+        ]
+        let definitionSlots = try definitions.map { fileID, path in
+            try fixture.slot(fileID: fileID, path: path, definitions: ["Shared"])
+        }
+        let referenceID = uuid("98000000-0000-0000-0000-000000000005")
+        let reference = try fixture.slot(
+            fileID: referenceID,
+            path: "Sources/Reference.swift",
+            references: ["Shared"]
+        )
+        let slots = definitionSlots + [reference]
+        let graph = WorkspaceCodemapSelectionGraph(
+            rootEpoch: fixture.rootEpoch,
+            repositoryAuthority: fixture.authority
+        )
+        let generation = WorkspaceCodemapSelectionGraphContributionGeneration(rawValue: 1)
+        let checkpoint = try fixture.checkpoint(
+            slots: slots,
+            coverage: fixture.coverage(slots: slots, complete: true),
+            generation: generation
+        )
+
+        guard case .committed = await graph.apply(.resync(checkpoint: checkpoint, generation: generation)) else {
+            return XCTFail("Expected deterministic ordering checkpoint commit.")
+        }
+        let snapshot = try await readySnapshot(graph.latestSnapshot()).snapshot
+        let expected = definitions.sorted { lhs, rhs in
+            if lhs.1 != rhs.1 {
+                return lhs.1.utf8.lexicographicallyPrecedes(rhs.1.utf8)
+            }
+            return lhs.0.uuidString < rhs.0.uuidString
+        }.map(\.0)
+        XCTAssertEqual(snapshot.definitionPostings["Shared"], expected)
+        XCTAssertEqual(snapshot.outgoingEdgesBySource[referenceID]?.map(\.targetFileID), expected)
+    }
+
     func testIncrementalDefinitionFanoutAndPartialUnresolvedEvidence() async throws {
         let fixture = try GraphFixture(seed: 1)
         let definitionID = uuid("91000000-0000-0000-0000-000000000001")
@@ -97,6 +140,67 @@ final class WorkspaceCodemapSelectionGraphIncrementalTests: XCTestCase {
         XCTAssertEqual(diagnostics.totalAffectedSourceCount, 8)
         XCTAssertNotNil(diagnostics.lastApplyDurationMilliseconds)
         XCTAssertEqual(diagnostics.observedToAppliedGenerationLag, 0)
+    }
+
+    func testIncrementalReverseEdgeOrderingIncludesRetainedUnaffectedSources() async throws {
+        let fixture = try GraphFixture(seed: 13)
+        let targetID = uuid("9D000000-0000-0000-0000-000000000001")
+        let rebuiltSourceID = uuid("9D000000-0000-0000-0000-000000000002")
+        let retainedSourceID = uuid("9D000000-0000-0000-0000-000000000003")
+        let target = try fixture.slot(
+            fileID: targetID,
+            path: "Sources/Target.swift",
+            definitions: ["Target"]
+        )
+        let rebuiltSource = try fixture.slot(
+            fileID: rebuiltSourceID,
+            path: "Sources/A.swift",
+            references: ["Target"]
+        )
+        let retainedSource = try fixture.slot(
+            fileID: retainedSourceID,
+            path: "Sources/B.swift",
+            references: ["Target"]
+        )
+        let graph = WorkspaceCodemapSelectionGraph(
+            rootEpoch: fixture.rootEpoch,
+            repositoryAuthority: fixture.authority
+        )
+        let firstGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(rawValue: 1)
+        let initialSlots = [target, rebuiltSource, retainedSource]
+        let initialCoverage = try fixture.coverage(slots: initialSlots, complete: true)
+        let checkpoint = try fixture.checkpoint(
+            slots: initialSlots,
+            coverage: initialCoverage,
+            generation: firstGeneration
+        )
+        guard case .committed = await graph.apply(
+            .resync(checkpoint: checkpoint, generation: firstGeneration)
+        ) else { return XCTFail("Expected initial checkpoint commit.") }
+
+        let updatedSource = try fixture.slot(
+            fileID: rebuiltSourceID,
+            path: "Sources/A.swift",
+            requestGeneration: 2,
+            references: ["Target"]
+        )
+        let secondGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(rawValue: 2)
+        let updatedCoverage = try fixture.coverage(
+            slots: [target, updatedSource, retainedSource],
+            complete: true
+        )
+        guard case .committed = await graph.apply(.diff(
+            changedSlots: [updatedSource],
+            removed: [],
+            coverage: updatedCoverage,
+            generation: secondGeneration
+        )) else { return XCTFail("Expected the single-source diff to commit.") }
+
+        let snapshot = try await readySnapshot(graph.latestSnapshot())
+        XCTAssertEqual(
+            snapshot.snapshot.reverseEdgesByTarget[targetID]?.map(\.sourceFileID),
+            [rebuiltSourceID, retainedSourceID]
+        )
     }
 
     func testDestructiveRemovalFencesAtomicallyAndReceiptsRevalidateCumulatively() async throws {

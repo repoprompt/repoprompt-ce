@@ -2,8 +2,11 @@ import Foundation
 
 extension AgentModeViewModel {
     func makeStatusPillsSnapshot() -> AgentStatusPillsSnapshot {
-        AgentStatusPillsSnapshot(
-            currentTabID: currentTabID,
+        let tabID = currentTabID
+        let session = activeSession
+        let activeAgentSessionID = session?.activeAgentSessionID
+        return AgentStatusPillsSnapshot(
+            currentTabID: tabID,
             selectedWorkflow: selectedWorkflow,
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
             selectedAgent: selectedAgent,
@@ -11,9 +14,14 @@ extension AgentModeViewModel {
             runState: runState,
             autoEditEnabled: autoEditEnabled,
             interviewFirst: interviewFirst,
-            executionLocation: executionLocationProps(tabID: currentTabID),
-            activeAgentSessionID: activeSession?.activeAgentSessionID,
-            activeRunID: activeSession?.runID
+            executionLocation: executionLocationProps(tabID: tabID),
+            activeAgentSessionID: activeAgentSessionID,
+            contextWorktreeBindings: AgentContextWorktreeBindingsProjection(
+                tabID: tabID,
+                activeAgentSessionID: activeAgentSessionID,
+                bindings: activeAgentSessionID == nil ? [] : session?.worktreeBindings ?? []
+            ),
+            activeRunID: session?.runID
         )
     }
 

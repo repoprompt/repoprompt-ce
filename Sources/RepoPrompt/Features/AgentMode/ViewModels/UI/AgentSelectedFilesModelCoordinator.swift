@@ -47,9 +47,8 @@ enum AgentSelectedFilesRequestMetricsSnapshotResolver {
         guard !source.hasWorktreeBindings,
               source.activeAgentSessionID == nil,
               source.tabID == activeComposeTabID,
-              published.isComplete,
+              published.hasUsablePublishedSelection,
               !published.isStale,
-              !published.refreshPending,
               published.codeMapUsage == codeMapUsage,
               published.filePathDisplay == filePathDisplay
         else { return nil }
@@ -369,6 +368,10 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         refreshFields["loadedMatch"] = String(loadedIdentity == request.identity)
         refreshFields["loadingMatch"] = String(loadingIdentity == request.identity)
         refreshFields["hasRefreshTask"] = String(refreshTask != nil)
+        let previousIdentity = loadingIdentity ?? displayedIdentity ?? loadedIdentity
+        refreshFields.merge(
+            AgentSelectedFilesDiagnostics.identityChangeFields(from: previousIdentity, to: request.identity)
+        ) { _, new in new }
         AgentSelectedFilesDiagnostics.event("coordinator.refresh.request", fields: refreshFields, includeStack: true)
 
         if !force, loadingIdentity == request.identity {
@@ -437,6 +440,15 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         refreshFields["shouldClearDisplayedModel"] = String(shouldClearDisplayedModel)
         refreshFields["refreshID"] = AgentSelectedFilesDiagnostics.shortID(refreshID)
         AgentSelectedFilesDiagnostics.event("coordinator.resolve.start", fields: refreshFields)
+        let resolverCorrelationFields = [
+            "refreshID": AgentSelectedFilesDiagnostics.shortID(refreshID),
+            "selectionSignature": refreshFields["selectionSignature"] ?? "none",
+            "tabID": refreshFields["tabID"] ?? "nil",
+            "activeAgentSessionID": refreshFields["activeAgentSessionID"] ?? "nil",
+            "bindingFingerprint": refreshFields["bindingFingerprint"] ?? "none",
+            "filePathDisplay": refreshFields["filePathDisplay"] ?? "unknown",
+            "codeMapUsage": refreshFields["codeMapUsage"] ?? "unknown"
+        ]
 
         refreshTask = Task { [weak self, resolver] in
             let resolveStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
@@ -489,7 +501,11 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             } : nil
             let resolvedModel: AgentContextExportModel
             do {
-                resolvedModel = try await resolver(request, interimFileRowsHandler)
+                resolvedModel = try await AgentSelectedFilesDiagnostics.$correlationFields.withValue(
+                    resolverCorrelationFields
+                ) {
+                    try await resolver(request, interimFileRowsHandler)
+                }
             } catch is CancellationError {
                 AgentSelectedFilesDiagnostics.event(
                     "coordinator.resolve.cancelled",

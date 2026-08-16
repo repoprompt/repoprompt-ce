@@ -21,10 +21,37 @@ struct AgentContextExportViewContext {
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
-    let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
+    let contextWorktreeBindings: AgentContextWorktreeBindingsProjection
     private let lookupContextProvider: LookupContextProvider
     private let completeGitDiffResolver: CompleteGitDiffResolver
 
+    init(
+        promptManager: PromptViewModel,
+        selectionCoordinator: WorkspaceSelectionCoordinator?,
+        currentTabID: UUID?,
+        activeAgentSessionID: UUID?,
+        contextWorktreeBindings: AgentContextWorktreeBindingsProjection,
+        lookupContextProvider: @escaping LookupContextProvider = { source, store in
+            await AgentContextExportResolver.lookupContext(source: source, store: store)
+        },
+        completeGitDiffResolver: @escaping CompleteGitDiffResolver = { rootPath, compareIntent in
+            await AgentContextExportViewContext.resolveCompleteGitDiff(
+                rootPath: rootPath,
+                compareIntent: compareIntent
+            )
+        }
+    ) {
+        self.promptManager = promptManager
+        self.selectionCoordinator = selectionCoordinator
+        self.currentTabID = currentTabID
+        self.activeAgentSessionID = activeAgentSessionID
+        self.contextWorktreeBindings = contextWorktreeBindings
+        self.lookupContextProvider = lookupContextProvider
+        self.completeGitDiffResolver = completeGitDiffResolver
+    }
+
+    /// Test and compatibility initializer that freezes a provider result once.
+    /// Production views pass the existing status-pill projection directly.
     init(
         promptManager: PromptViewModel,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
@@ -41,13 +68,22 @@ struct AgentContextExportViewContext {
             )
         }
     ) {
-        self.promptManager = promptManager
-        self.selectionCoordinator = selectionCoordinator
-        self.currentTabID = currentTabID
-        self.activeAgentSessionID = activeAgentSessionID
-        self.worktreeBindingsProvider = worktreeBindingsProvider
-        self.lookupContextProvider = lookupContextProvider
-        self.completeGitDiffResolver = completeGitDiffResolver
+        let bindings = activeAgentSessionID.map {
+            worktreeBindingsProvider?($0, currentTabID) ?? []
+        } ?? []
+        self.init(
+            promptManager: promptManager,
+            selectionCoordinator: selectionCoordinator,
+            currentTabID: currentTabID,
+            activeAgentSessionID: activeAgentSessionID,
+            contextWorktreeBindings: AgentContextWorktreeBindingsProjection(
+                tabID: currentTabID,
+                activeAgentSessionID: activeAgentSessionID,
+                bindings: bindings
+            ),
+            lookupContextProvider: lookupContextProvider,
+            completeGitDiffResolver: completeGitDiffResolver
+        )
     }
 
     var selectionSummary: AgentContextSelectionSummary {
@@ -103,7 +139,7 @@ struct AgentContextExportViewContext {
                 composeTabs: promptManager.currentComposeTabs,
                 explicitActiveAgentSessionID: activeAgentSessionID,
                 worktreeBindingsProvider: { sessionID, tabID in
-                    worktreeBindingsProvider?(sessionID, tabID) ?? []
+                    contextWorktreeBindings.bindings(for: sessionID, tabID: tabID)
                 }
             )
         )

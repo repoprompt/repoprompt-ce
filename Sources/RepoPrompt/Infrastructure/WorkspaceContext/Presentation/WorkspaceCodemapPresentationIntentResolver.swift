@@ -1,18 +1,40 @@
 import Foundation
 
+struct WorkspaceCodemapPresentationPlanningMetrics: Equatable {
+    let rootCount: Int
+    let fileEnumerationRequestCount: Int
+    let examinedFileCount: Int
+    let supportedCandidateCount: Int
+    let requestedFileCount: Int
+    let completeRootSet: Bool
+}
+
 enum WorkspaceCodemapPresentationIntentResolver {
     static func plan(
         codeMapUsage: CodeMapUsage,
         selection: StoredSelection,
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
-        profile: PathLocateProfile
+        profile: PathLocateProfile,
+        planningMetricsHandler: (@Sendable (WorkspaceCodemapPresentationPlanningMetrics) -> Void)? = nil
     ) async -> WorkspaceCodemapOperationPresentationPlan {
         guard codeMapUsage != .none else {
+            planningMetricsHandler?(
+                WorkspaceCodemapPresentationPlanningMetrics(
+                    rootCount: 0,
+                    fileEnumerationRequestCount: 0,
+                    examinedFileCount: 0,
+                    supportedCandidateCount: 0,
+                    requestedFileCount: 0,
+                    completeRootSet: false
+                )
+            )
             return WorkspaceCodemapOperationPresentationPlan(intent: .none, preflightIssues: [])
         }
 
         let roots = await store.rootRefs(scope: rootScope)
+        var fileEnumerationRequestCount = 0
+        var examinedFileCount = 0
         let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
         var sourceFilesByID: [UUID: WorkspaceFileRecord] = [:]
         let sourcePaths: [String] = switch codeMapUsage {
@@ -38,8 +60,10 @@ enum WorkspaceCodemapPresentationIntentResolver {
                 sourceFilesByID[file.id] = file
             } else if let folder = result.folder {
                 let prefix = folder.standardizedRelativePath
-                for file in await store.files(inRoot: folder.rootID)
-                    where prefix.isEmpty
+                let files = await store.files(inRoot: folder.rootID)
+                fileEnumerationRequestCount += 1
+                examinedFileCount += files.count
+                for file in files where prefix.isEmpty
                     || file.standardizedRelativePath == prefix
                     || file.standardizedRelativePath.hasPrefix(prefix + "/")
                 {
@@ -61,7 +85,10 @@ enum WorkspaceCodemapPresentationIntentResolver {
             completeRootSet = true
             var completeFiles: [WorkspaceFileRecord] = []
             for root in roots {
-                await completeFiles.append(contentsOf: store.files(inRoot: root.id).filter { file in
+                let files = await store.files(inRoot: root.id)
+                fileEnumerationRequestCount += 1
+                examinedFileCount += files.count
+                completeFiles.append(contentsOf: files.filter { file in
                     let fileExtension = (file.name as NSString).pathExtension.lowercased()
                     return !fileExtension.isEmpty
                         && SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
@@ -85,6 +112,16 @@ enum WorkspaceCodemapPresentationIntentResolver {
             return lhs.id.uuidString < rhs.id.uuidString
         }
         let fileIDs = orderedFiles.map(\.id)
+        planningMetricsHandler?(
+            WorkspaceCodemapPresentationPlanningMetrics(
+                rootCount: roots.count,
+                fileEnumerationRequestCount: fileEnumerationRequestCount,
+                examinedFileCount: examinedFileCount,
+                supportedCandidateCount: completeRootSet ? requestedFiles.count : 0,
+                requestedFileCount: fileIDs.count,
+                completeRootSet: completeRootSet
+            )
+        )
         let intent: WorkspaceCodemapOperationPresentationIntent = if codeMapUsage == .auto,
                                                                      selection.codemapAutoEnabled
         {

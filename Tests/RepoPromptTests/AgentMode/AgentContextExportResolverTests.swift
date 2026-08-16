@@ -516,6 +516,215 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         #endif
     }
 
+    func testCompleteCodemapPlanningReportsBoundedRootEnumerationMetrics() async throws {
+        #if DEBUG
+            let firstRoot = try makeTemporaryRoot(name: "AgentExportCompletePlanningFirst")
+            let secondRoot = try makeTemporaryRoot(name: "AgentExportCompletePlanningSecond")
+            let supportedPerRoot = 24
+            let unsupportedPerRoot = 6
+            for root in [firstRoot, secondRoot] {
+                for index in 0 ..< supportedPerRoot {
+                    try write(
+                        "struct Supported\(index) {}",
+                        to: root.appendingPathComponent("Sources/Supported\(index).swift")
+                    )
+                }
+                for index in 0 ..< unsupportedPerRoot {
+                    try write(
+                        "unsupported \(index)",
+                        to: root.appendingPathComponent("Assets/Unsupported\(index).txt")
+                    )
+                }
+            }
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: firstRoot.path)
+            _ = try await store.loadRoot(path: secondRoot.path)
+            await store.resetFilesInRootRequestCountForTesting()
+            let metricsRecorder = AgentExportLockedPlanningMetricsRecorder()
+
+            let plan = await AgentContextExportResolver.codemapPresentationPlan(
+                codeMapUsage: .complete,
+                selection: StoredSelection(codemapAutoEnabled: false),
+                store: store,
+                rootScope: .allLoaded,
+                profile: .uiAssisted,
+                planningMetricsHandler: { metricsRecorder.record($0) }
+            )
+
+            let metrics = try XCTUnwrap(metricsRecorder.value)
+            let fileEnumerationRequests = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(metrics.rootCount, 2)
+            XCTAssertEqual(metrics.fileEnumerationRequestCount, 2)
+            XCTAssertEqual(metrics.examinedFileCount, 2 * (supportedPerRoot + unsupportedPerRoot))
+            XCTAssertEqual(metrics.supportedCandidateCount, 2 * supportedPerRoot)
+            XCTAssertEqual(metrics.requestedFileCount, 2 * supportedPerRoot)
+            XCTAssertTrue(metrics.completeRootSet)
+            XCTAssertEqual(fileEnumerationRequests, 2)
+            guard case let .exact(fileIDs, completeRootSet) = plan.intent else {
+                return XCTFail("Expected exact complete-root presentation intent")
+            }
+            XCTAssertTrue(completeRootSet)
+            XCTAssertEqual(fileIDs.count, 2 * supportedPerRoot)
+        #endif
+    }
+
+    func testPresentationAttemptDiagnosticsReportSingleCurrentAttempt() async throws {
+        let store = WorkspaceFileContextStore()
+        let attemptCount = AgentExportLockedCounter()
+        let retrySources = AgentExportLockedRetrySourceRecorder()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            structureAttemptDidBegin: { _ in attemptCount.increment() },
+            presentationRetryScheduled: { _, source, _ in retrySources.append(source) }
+        )
+
+        let presentation = try await coordinator.withPresentation(
+            prepareAttempt: {
+                WorkspaceCodemapPresentationAttempt(
+                    context: (),
+                    intent: .none,
+                    rootScope: .allLoaded,
+                    logicalRootDisplayNamesByRootID: [:],
+                    requestedCodemapCount: 0
+                )
+            },
+            operation: { _, presentation in presentation }
+        )
+
+        XCTAssertEqual(attemptCount.value, 1)
+        XCTAssertTrue(retrySources.values.isEmpty)
+        XCTAssertTrue(presentation.orderedEntries.isEmpty)
+        XCTAssertEqual(presentation.coverage, .complete)
+        XCTAssertTrue(presentation.issues.isEmpty)
+    }
+
+    func testEmptyCompleteSkipsDiscardedPreliminaryProjection() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AgentExportEmptyCompletePreliminary")
+            try write("struct CompleteCandidate {}", to: root.appendingPathComponent("Sources/Candidate.swift"))
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            await store.resetFilesInRootRequestCountForTesting()
+            let preliminaryProjectionCount = AgentExportLockedCounter()
+            let source = AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review",
+                selection: StoredSelection(codemapAutoEnabled: false),
+                selectedMetaPromptIDs: [],
+                tabName: "Agent Tab",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            )
+
+            do {
+                _ = try await AgentContextExportResolver.resolveModel(
+                    source: source,
+                    store: store,
+                    filePathDisplay: .relative,
+                    codeMapUsage: .complete,
+                    presentationWillBeginForTesting: { () async throws(CancellationError) in
+                        throw CancellationError()
+                    },
+                    phaseDidBeginForTesting: { phase in
+                        if phase == .preliminaryProjection {
+                            preliminaryProjectionCount.increment()
+                        }
+                    }
+                )
+                XCTFail("Expected presentation cancellation")
+            } catch is CancellationError {}
+
+            let fileEnumerationRequests = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(preliminaryProjectionCount.value, 0)
+            XCTAssertEqual(fileEnumerationRequests, 0)
+        #endif
+    }
+
+    func testCompleteWithExplicitRowsStillPublishesInterimProjection() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportCompleteInterim")
+        let selectedURL = root.appendingPathComponent("Sources/Selected.swift")
+        try write("struct Selected {}", to: selectedURL)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let preliminaryProjectionCount = AgentExportLockedCounter()
+        let interimModels = AgentExportLockedModelRecorder()
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: [selectedURL.path], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+
+        do {
+            _ = try await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .complete,
+                interimFileRowsHandler: { interimModels.append($0) },
+                presentationWillBeginForTesting: { () async throws(CancellationError) in
+                    throw CancellationError()
+                },
+                phaseDidBeginForTesting: { phase in
+                    if phase == .preliminaryProjection {
+                        preliminaryProjectionCount.increment()
+                    }
+                }
+            )
+            XCTFail("Expected presentation cancellation")
+        } catch is CancellationError {}
+
+        XCTAssertEqual(preliminaryProjectionCount.value, 1)
+        XCTAssertEqual(interimModels.values.count, 1)
+        XCTAssertEqual(interimModels.values.first?.rows.map(\.displayPath), ["Sources/Selected.swift"])
+        let interimPresentation = try XCTUnwrap(interimModels.values.first?.codemapPresentation)
+        XCTAssertTrue(interimPresentation.orderedEntries.isEmpty)
+        XCTAssertEqual(interimPresentation.coverage, .complete)
+        XCTAssertTrue(interimPresentation.issues.isEmpty)
+    }
+
+    func testSelectedWithoutInterimHandlerSkipsDiscardedPreliminaryProjection() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportSelectedPreliminary")
+        let selectedURL = root.appendingPathComponent("Sources/Selected.swift")
+        try write("struct Selected {}", to: selectedURL)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let preliminaryProjectionCount = AgentExportLockedCounter()
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: [selectedURL.path], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+
+        do {
+            _ = try await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .selected,
+                presentationWillBeginForTesting: { () async throws(CancellationError) in
+                    throw CancellationError()
+                },
+                phaseDidBeginForTesting: { phase in
+                    if phase == .preliminaryProjection {
+                        preliminaryProjectionCount.increment()
+                    }
+                }
+            )
+            XCTFail("Expected presentation cancellation")
+        } catch is CancellationError {}
+
+        XCTAssertEqual(preliminaryProjectionCount.value, 0)
+    }
+
     func testWorktreeExportUsesPhysicalContentWhileDisplayingLogicalPath() async throws {
         let fixture = try await makeBoundFixture()
         let source = makeSource(
@@ -981,6 +1190,8 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
                 },
                 phaseDidBeginForTesting: { phase in
                     switch phase {
+                    case .preliminaryProjection:
+                        break
                     case .codemapFileRecords:
                         codemapFileRecordCount.increment()
                     case .metricsAssembly:
@@ -1082,6 +1293,8 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
             _ = await store.cancelCodemapArtifactDemand(ready.ticket)
         }
         let revalidationCount = AgentExportLockedCounter()
+        let presentationAttemptCount = AgentExportLockedCounter()
+        let retrySources = AgentExportLockedRetrySourceRecorder()
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,
             policy: WorkspaceCodemapPresentationRequestPolicy(
@@ -1094,7 +1307,9 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
                     await store.unloadRoot(id: physicalRootID)
                     try? FileManager.default.removeItem(at: worktreeRoot)
                 }
-            }
+            },
+            structureAttemptDidBegin: { _ in presentationAttemptCount.increment() },
+            presentationRetryScheduled: { _, source, _ in retrySources.append(source) }
         )
 
         let model = try await AgentContextExportResolver.resolveModel(
@@ -1113,6 +1328,8 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
             return XCTFail("Revoked complete export must publish typed incomplete coverage")
         }
         XCTAssertEqual(revalidationCount.value, 1)
+        XCTAssertEqual(presentationAttemptCount.value, 2)
+        XCTAssertEqual(retrySources.values, [.publicationRevalidation])
     }
 
     func testRevokedCodemapReloadFallsBackToFreshAuthoritativeFullContent() async throws {
@@ -2297,6 +2514,65 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
     }
 
     @MainActor
+    func testExportViewContextFreezesWorktreeBindingProjectionOutsideRenderGetters() {
+        let tabID = UUID()
+        let sessionID = UUID()
+        let logicalRoot = URL(fileURLWithPath: "/repo/base")
+        let worktreeRoot = URL(fileURLWithPath: "/repo/worktree")
+        let store = WorkspaceFileContextStore()
+        let promptManager = makePrompt(store: store, windowID: 41008)
+        promptManager.loadComposeTabsFromWorkspace(
+            WorkspaceModel(
+                name: "Frozen binding projection",
+                repoPaths: [logicalRoot.path],
+                ephemeralFlag: true,
+                composeTabs: [
+                    ComposeTabState(
+                        id: tabID,
+                        name: "Agent",
+                        activeAgentSessionID: sessionID,
+                        selection: StoredSelection(
+                            selectedPaths: ["Sources/App.swift"],
+                            codemapAutoEnabled: false
+                        )
+                    )
+                ],
+                activeComposeTabID: tabID
+            ),
+            syncPromptText: true
+        )
+        let binding = makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)
+        var providerCallCount = 0
+        let exportContext = AgentContextExportViewContext(
+            promptManager: promptManager,
+            selectionCoordinator: nil,
+            currentTabID: tabID,
+            activeAgentSessionID: sessionID,
+            worktreeBindingsProvider: { requestedSessionID, requestedTabID in
+                providerCallCount += 1
+                return requestedSessionID == sessionID && requestedTabID == tabID ? [binding] : []
+            }
+        )
+
+        XCTAssertEqual(providerCallCount, 1, "The authority is projected once at the UI boundary.")
+        for _ in 0 ..< 20 {
+            XCTAssertEqual(exportContext.makeExportSource(flushPendingUI: false).worktreeBindings, [binding])
+            _ = exportContext.modelRequestIdentity
+            _ = exportContext.selectionSummary
+        }
+        XCTAssertEqual(providerCallCount, 1, "SwiftUI-derived getters must not call back into routing authority.")
+
+        let mismatched = AgentContextWorktreeBindingsProjection(
+            tabID: tabID,
+            activeAgentSessionID: sessionID,
+            bindings: [binding]
+        )
+        XCTAssertEqual(mismatched.bindings(for: sessionID, tabID: tabID), [binding])
+        XCTAssertTrue(mismatched.bindings(for: UUID(), tabID: tabID).isEmpty)
+        XCTAssertTrue(mismatched.bindings(for: sessionID, tabID: UUID()).isEmpty)
+    }
+
+    @MainActor
     func testClipboardUsesGitStateCapturedBeforeDelayedLookup() async throws {
         let gitFixture = try ReviewGitRepositoryFixture(name: "AgentExportGitSnapshotOriginal")
         let originalRoot = try gitFixture.makeRepository(
@@ -2908,6 +3184,40 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
 
 private enum AgentExportTestError: Error {
     case unexpectedRuntimeAccess
+}
+
+private final class AgentExportLockedRetrySourceRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sources: [WorkspaceCodemapPresentationRetrySource] = []
+
+    var values: [WorkspaceCodemapPresentationRetrySource] {
+        lock.lock()
+        defer { lock.unlock() }
+        return sources
+    }
+
+    func append(_ source: WorkspaceCodemapPresentationRetrySource) {
+        lock.lock()
+        sources.append(source)
+        lock.unlock()
+    }
+}
+
+private final class AgentExportLockedPlanningMetricsRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var metrics: WorkspaceCodemapPresentationPlanningMetrics?
+
+    var value: WorkspaceCodemapPresentationPlanningMetrics? {
+        lock.lock()
+        defer { lock.unlock() }
+        return metrics
+    }
+
+    func record(_ metrics: WorkspaceCodemapPresentationPlanningMetrics) {
+        lock.lock()
+        self.metrics = metrics
+        lock.unlock()
+    }
 }
 
 private final class AgentExportLockedCounter: @unchecked Sendable {

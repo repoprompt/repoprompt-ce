@@ -44,6 +44,8 @@ class TokenCountingViewModel: ObservableObject {
         String(format: "%.2fk", Double(totalFileTokensDisplay) / 1000.0)
     }
 
+    /// Emits after published totals and scheduler bookkeeping describe the same settled state.
+    /// Consumers may synchronously inspect `latestPublishedTokenSnapshot` from this callback.
     let tokenCalculationCompletedPublisher = PassthroughSubject<Void, Never>()
 
     // MARK: - Dirty Flags
@@ -317,7 +319,7 @@ class TokenCountingViewModel: ObservableObject {
         let needsHeavy = !kindsToProcess.intersection(heavyDirtyKinds).isEmpty
         updateTokenCountTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            if needsHeavy {
+            let didPublish: Bool = if needsHeavy {
                 await performTokenCountOffMainThread()
             } else {
                 await recalculateLight(kinds: kindsToProcess)
@@ -325,6 +327,9 @@ class TokenCountingViewModel: ObservableObject {
             guard tokenCountSchedulerGeneration == generation else { return }
             updateTokenCountTask = nil
             scheduleTokenCountUpdateIfNeeded()
+            if didPublish {
+                tokenCalculationCompletedPublisher.send()
+            }
         }
     }
 
@@ -386,8 +391,18 @@ class TokenCountingViewModel: ObservableObject {
         let codeMapUsage: CodeMapUsage?
         let filePathDisplay: FilePathDisplay?
         let isComplete: Bool
+        /// True when the published totals describe the caller's expected selection.
+        /// This remains true while a newer recount for that same selection is pending.
+        let selectionMatchesExpected: Bool
         let isStale: Bool
         let refreshPending: Bool
+
+        /// A complete result for the expected selection remains displayable while a
+        /// newer recount is pending. Freshness and usability are intentionally
+        /// separate so refresh scheduling cannot blank an otherwise valid result.
+        var hasUsablePublishedSelection: Bool {
+            isComplete && selectionMatchesExpected
+        }
     }
 
     func latestPublishedTokenSnapshot(
@@ -413,6 +428,7 @@ class TokenCountingViewModel: ObservableObject {
             codeMapUsage: lastPublishedCodeMapUsage,
             filePathDisplay: lastPublishedFilePathDisplay,
             isComplete: isComplete,
+            selectionMatchesExpected: selectionMatches,
             isStale: isStale,
             refreshPending: !isComplete || isStale || tokenUpdateDebounceTask != nil || updateTokenCountTask != nil
         )
@@ -441,6 +457,7 @@ class TokenCountingViewModel: ObservableObject {
                 "suspendDepth": "\(automaticRecountSuspendDepth)",
                 "debouncePending": "\(tokenUpdateDebounceTask != nil)",
                 "updatePending": "\(updateTokenCountTask != nil)",
+                "schedulerGeneration": "\(tokenCountSchedulerGeneration)",
                 "immediateInProgress": "\(isImmediateRecountInProgress)",
                 "didComputeBaseline": "\(didComputeBaseline)",
                 "totalTokens": "\(totalTokenCount)",
@@ -486,9 +503,12 @@ class TokenCountingViewModel: ObservableObject {
         updateTokenCountTask = nil
         pendingDirty = []
         isImmediateRecountInProgress = true
-        await performTokenCountOffMainThread()
+        let didPublish = await performTokenCountOffMainThread()
         isImmediateRecountInProgress = false
         scheduleTokenCountUpdateIfNeeded()
+        if didPublish {
+            tokenCalculationCompletedPublisher.send()
+        }
         #if DEBUG
             var endFields = debugTokenRecountStateFields()
             endFields["outcome"] = Task.isCancelled ? "cancelled" : "completed"
@@ -560,7 +580,7 @@ class TokenCountingViewModel: ObservableObject {
     // MARK: - Token Calculation
 
     /// Heavy path (rebuild baseline and everything else).
-    private func performTokenCountOffMainThread() async {
+    private func performTokenCountOffMainThread() async -> Bool {
         #if DEBUG
             debugTokenCalculationStartCount += 1
             await debugBeforeTokenCalculationForTesting?()
@@ -581,7 +601,7 @@ class TokenCountingViewModel: ObservableObject {
                     ]
                 )
             #endif
-            return
+            return false
         }
 
         let copySnapshot = resolveCopyContextSnapshot()
@@ -591,10 +611,17 @@ class TokenCountingViewModel: ObservableObject {
         #endif
         let selectionAtStart = expectedSelectionForPublishedSnapshot(copySnapshot)
         #if DEBUG
-            var selectionFields = debugSelectionFields(selectionAtStart)
-            selectionFields["includeFiles"] = "\(includeFiles)"
-            selectionFields["duration"] = selectionSnapshotStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.selectionSnapshot", fields: selectionFields)
+            PromptTokenRecountDiagnostics.event(
+                "tokenRecount.calculate.selectionSnapshot",
+                fields: PromptTokenRecountDiagnostics.fieldsIfEnabled {
+                    var fields = debugSelectionFields(selectionAtStart)
+                    fields["includeFiles"] = "\(includeFiles)"
+                    fields["duration"] = selectionSnapshotStartMS.map {
+                        PromptTokenRecountDiagnostics.formatElapsedMS(since: $0)
+                    } ?? "notMeasured"
+                    return fields
+                }
+            )
         #endif
         let includeUserPrompt = copySnapshot.includeUserPrompt
         let includeMetaPrompts = copySnapshot.includeMetaPrompts
@@ -625,7 +652,7 @@ class TokenCountingViewModel: ObservableObject {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "allFiles", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
             #endif
-            return
+            return false
         }
         // Derive and publish the set of detected languages from store-owned file records.
         let detectedExts = allFileRecords.map { (($0.name as NSString).pathExtension).lowercased() }
@@ -665,7 +692,7 @@ class TokenCountingViewModel: ObservableObject {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "fileTree", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
             #endif
-            return
+            return false
         }
         let accountingRequest = PromptContextAccountingRequest(
             selection: accountingSelection,
@@ -680,16 +707,38 @@ class TokenCountingViewModel: ObservableObject {
         )
         #if DEBUG
             let accountingStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.accounting.begin")
+            let accountingCorrelationFields = PromptTokenRecountDiagnostics.fieldsIfEnabled {
+                var fields = debugSelectionFields(accountingSelection)
+                fields["schedulerGeneration"] = "\(tokenCountSchedulerGeneration)"
+                fields["codeMapUsage"] = "\(accountingCodeMapUsage)"
+                return fields
+            }
+            PromptTokenRecountDiagnostics.event(
+                "tokenRecount.calculate.accounting.begin",
+                fields: accountingCorrelationFields
+            )
         #endif
         let accountingResult: PromptContextAccountingResult
         do {
-            accountingResult = try await promptContextAccountingService.withPromptStats(
-                request: accountingRequest,
-                store: store,
-                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
-                fileTreePresentationRequest: fileTreePresentationRequest
-            ) { $0 }
+            #if DEBUG
+                accountingResult = try await PromptTokenRecountDiagnostics.$correlationFields.withValue(
+                    accountingCorrelationFields
+                ) {
+                    try await promptContextAccountingService.withPromptStats(
+                        request: accountingRequest,
+                        store: store,
+                        lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                        fileTreePresentationRequest: fileTreePresentationRequest
+                    ) { $0 }
+                }
+            #else
+                accountingResult = try await promptContextAccountingService.withPromptStats(
+                    request: accountingRequest,
+                    store: store,
+                    lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                    fileTreePresentationRequest: fileTreePresentationRequest
+                ) { $0 }
+            #endif
         } catch {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event(
@@ -702,7 +751,7 @@ class TokenCountingViewModel: ObservableObject {
                     ]
                 )
             #endif
-            return
+            return false
         }
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
@@ -721,7 +770,7 @@ class TokenCountingViewModel: ObservableObject {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "accounting", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
             #endif
-            return
+            return false
         }
 
         let predominantLanguage = predominantLanguage(
@@ -778,7 +827,7 @@ class TokenCountingViewModel: ObservableObject {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "gitDiff", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
             #endif
-            return
+            return false
         }
         #if DEBUG
             let consistencyStartMS = PromptTokenRecountDiagnostics.start()
@@ -791,7 +840,7 @@ class TokenCountingViewModel: ObservableObject {
                 )
             #endif
             markDirty(.selection)
-            return
+            return false
         }
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
@@ -869,7 +918,6 @@ class TokenCountingViewModel: ObservableObject {
             )
         #endif
 
-        tokenCalculationCompletedPublisher.send()
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.calculate.end",
@@ -879,6 +927,7 @@ class TokenCountingViewModel: ObservableObject {
                 ]
             )
         #endif
+        return true
     }
 
     private func remapStoreFileTokenInfo(
@@ -897,13 +946,12 @@ class TokenCountingViewModel: ObservableObject {
     }
 
     /// Light path (prompt text and/or meta instructions and/or git diff only).
-    private func recalculateLight(kinds: DirtyKind) async {
+    private func recalculateLight(kinds: DirtyKind) async -> Bool {
         guard didComputeBaseline,
               let promptSource = getPromptText?(),
               let instructionsSource = getSelectedInstructionsText?()
         else {
-            await performTokenCountOffMainThread()
-            return
+            return await performTokenCountOffMainThread()
         }
 
         let copySnapshot = resolveCopyContextSnapshot()
@@ -988,7 +1036,7 @@ class TokenCountingViewModel: ObservableObject {
         lastDuplicatePromptTokens = duplicatePromptTokens
         lastInstructionsTokens = instructionsTokens
 
-        tokenCalculationCompletedPublisher.send()
+        return true
     }
 
     // MARK: - File Tree Properties
