@@ -11830,14 +11830,19 @@ actor ServerNetworkManager {
                                         switch self.codeStructureSettlementRegistry.admit(
                                             windowID: windowID,
                                             connectionID: connectionID,
-                                            invocationID: invocationID
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            now: executionWatchdogEnvironment.now(),
+                                            handlerPhase: {
+                                                handlerPhaseRecorder.snapshot()?.phase.rawValue
+                                            }
                                         ) {
                                         case let .admitted(slot):
                                             settlementAdmission = (.detachAndSettle, slot)
-                                        case let .busy(reason):
+                                        case let .busy(context):
                                             throw MCPToolExecutionDispatchError.structureSettlementBusy(
                                                 windowID: windowID,
-                                                reason: reason
+                                                context: context
                                             )
                                         }
                                     } else {
@@ -12181,24 +12186,45 @@ actor ServerNetworkManager {
                                         outcome = "executionContractMissing"
                                         shouldForceDisconnect = false
                                         errorMetadata = [:]
-                                    case let MCPToolExecutionDispatchError.structureSettlementBusy(windowID, reason):
+                                    case let MCPToolExecutionDispatchError.structureSettlementBusy(windowID, busyContext):
                                         code = "tool_execution_structure_settlement_busy"
-                                        let abandoned = reason == .abandoned
-                                        message = abandoned
-                                            ? "A prior canceled MCP operation for window \(windowID) is still settling. Retry after it drains."
-                                            : "A prior timed-out MCP operation for window \(windowID) is still settling. Retry after it drains."
+                                        let limitReached = busyContext.reason == .releasedProviderLimitReached
+                                        let abandoned = busyContext.reason == .abandoned
+                                        if limitReached {
+                                            message = "Window \(windowID) reached its limit of one released cancellation-ignoring structure provider. Wait for it to settle or restart RepoPrompt CE."
+                                        } else if abandoned {
+                                            message = "A prior canceled MCP operation for window \(windowID) is still settling. Retry after the bounded recovery wait."
+                                        } else {
+                                            message = "A prior timed-out MCP operation for window \(windowID) is still settling. Retry after the bounded recovery wait."
+                                        }
                                         outcome = "executionStructureSettlementBusy"
                                         shouldForceDisconnect = false
-                                        errorMetadata = [
-                                            "retryable": .bool(true),
-                                            "retry_after_ms": .int(250),
+
+                                        var busyMetadata: [String: Value] = [
+                                            "retryable": .bool(!limitReached),
                                             "busy_reason": .string(
-                                                abandoned
+                                                limitReached
+                                                    ? "released_provider_limit_reached"
+                                                    : abandoned
                                                     ? "abandoned_settlement_in_progress"
                                                     : "detached_settlement_in_progress"
                                             ),
-                                            "settlement": .string("busy")
+                                            "settlement": .string("busy"),
+                                            "origin_tool": .string(busyContext.originToolName),
+                                            "origin_invocation_id": .string(busyContext.originInvocationID.uuidString),
+                                            "origin_connection_id": .string(busyContext.originConnectionID.uuidString),
+                                            "detached_age_ms": .double(busyContext.detachedAge.mcpMilliseconds),
+                                            "last_handler_phase": .string(busyContext.handlerPhase ?? "unreported"),
+                                            "released_provider_count": .int(busyContext.releasedProviderCount)
                                         ]
+                                        if let recoveryAfter = busyContext.recoveryAfter {
+                                            let recoveryAfterMilliseconds = max(
+                                                0,
+                                                Int(recoveryAfter.mcpMilliseconds.rounded(.up))
+                                            )
+                                            busyMetadata["retry_after_ms"] = .int(recoveryAfterMilliseconds)
+                                        }
+                                        errorMetadata = busyMetadata
                                     case MCPToolExecutionDispatchError.structureSettlementWindowUnresolved:
                                         code = "tool_execution_structure_settlement_window_unresolved"
                                         message = "\(toolName) requires a resolved window before its settlement policy can be selected."

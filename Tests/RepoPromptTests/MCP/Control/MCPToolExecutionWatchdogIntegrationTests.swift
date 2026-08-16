@@ -2357,7 +2357,7 @@ import XCTest
                     let readPayload = try Self.toolResultObject(readResponse)
                     XCTAssertEqual(readPayload["code"] as? String, "tool_execution_structure_settlement_busy")
                     XCTAssertEqual(readPayload["retryable"] as? Bool, true)
-                    XCTAssertEqual((readPayload["retry_after_ms"] as? NSNumber)?.intValue, 250)
+                    XCTAssertEqual((readPayload["retry_after_ms"] as? NSNumber)?.intValue, 30000)
                     XCTAssertEqual(readPayload["busy_reason"] as? String, "abandoned_settlement_in_progress")
                     XCTAssertEqual(readPayload["settlement"] as? String, "busy")
                     XCTAssertTrue((readPayload["error"] as? String)?.contains("prior canceled MCP operation") == true)
@@ -2427,11 +2427,12 @@ import XCTest
             }
         }
 
-        func testDetachedCodeStructureTimeoutKeepsConnectionUsableAndDrainsLateProvider() async throws {
+        func testDetachedCodeStructureTimeoutRecoversBeforeLateProviderDrains() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
                 let provider = MCPCodeStructureSettlementProviderProbe()
+                let repeatedEscapeGate = MCPExecutionIgnoringCancellationGate()
                 let recorder = MCPExecutionTraceRecorder()
                 let manager = fixture.networkManager
                 let windowID = fixture.contextA.window.windowID
@@ -2447,7 +2448,8 @@ import XCTest
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
                 await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
                 await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.getCodeStructure) {
-                    try await provider.run()
+                    await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
+                    return try await provider.run()
                 }
 
                 do {
@@ -2508,8 +2510,15 @@ import XCTest
                     )
                     XCTAssertEqual(limiter?.activePermitCount, 0)
 
-                    // Every detach-disposition tool is fenced for this window until the detached
-                    // provider drains, while unrelated MCP traffic remains usable.
+                    let detachEvents = recorder.snapshot().filter {
+                        $0.connectionID == endpoint.connectionID
+                            && $0.toolName == MCPWindowToolName.getCodeStructure
+                            && $0.phase == .detachedForSettlement
+                    }
+                    XCTAssertEqual(detachEvents.count, 1)
+                    let detachedEvent = try XCTUnwrap(detachEvents.first)
+
+                    // The affected window remains fenced until the registry's recovery horizon expires.
                     let readResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.readFile,
                         arguments: [
@@ -2521,8 +2530,26 @@ import XCTest
                     let readPayload = try Self.toolResultObject(readResponse)
                     XCTAssertEqual(readPayload["code"] as? String, "tool_execution_structure_settlement_busy")
                     XCTAssertEqual(readPayload["retryable"] as? Bool, true)
+                    XCTAssertEqual((readPayload["retry_after_ms"] as? NSNumber)?.intValue, 29000)
+                    XCTAssertEqual((readPayload["detached_age_ms"] as? NSNumber)?.intValue, 1000)
+                    XCTAssertEqual(readPayload["origin_tool"] as? String, MCPWindowToolName.getCodeStructure)
+                    XCTAssertEqual(readPayload["origin_invocation_id"] as? String, detachedEvent.invocationID.uuidString)
+                    XCTAssertEqual(readPayload["origin_connection_id"] as? String, endpoint.connectionID.uuidString)
+                    XCTAssertEqual(
+                        readPayload["last_handler_phase"] as? String,
+                        MCPToolExecutionHandlerPhase.getCodeStructureGraphTraversal.rawValue
+                    )
                     XCTAssertTrue((readPayload["error"] as? String)?.contains("prior timed-out MCP operation") == true)
-                    XCTAssertFalse((readPayload["error"] as? String)?.contains("timed-out read_file") == true)
+
+                    // The settlement fence is window-scoped; unrelated MCP traffic stays usable.
+                    let siblingResponse = try await fixture.endpointB().callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextB.fileURL.path,
+                            "context_id": fixture.contextB.tabID.uuidString
+                        ]
+                    )
+                    XCTAssertTrue(try Self.toolResultText(siblingResponse).contains(fixture.contextB.sentinel))
                     _ = try await endpoint.callTool(
                         name: MCPWindowToolName.manageSelection,
                         arguments: [
@@ -2533,7 +2560,6 @@ import XCTest
                     let readSleepersDrained = await Self.waitUntil { await clock.sleeperCount() == 0 }
                     XCTAssertTrue(readSleepersDrained)
 
-                    // Busy is introduced only after the eligible call actually detached.
                     let busyResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.getCodeStructure,
                         arguments: arguments
@@ -2541,20 +2567,86 @@ import XCTest
                     let busyPayload = try Self.toolResultObject(busyResponse)
                     XCTAssertEqual(busyPayload["code"] as? String, "tool_execution_structure_settlement_busy")
                     XCTAssertEqual(busyPayload["retryable"] as? Bool, true)
-                    XCTAssertEqual((busyPayload["retry_after_ms"] as? NSNumber)?.intValue, 250)
+                    XCTAssertEqual((busyPayload["retry_after_ms"] as? NSNumber)?.intValue, 29000)
                     XCTAssertEqual(busyPayload["busy_reason"] as? String, "detached_settlement_in_progress")
                     XCTAssertEqual(busyPayload["settlement"] as? String, "busy")
-                    XCTAssertTrue((busyPayload["error"] as? String)?.contains("prior timed-out") == true)
-                    let enteredCountBeforeDrain = await provider.enteredCount()
-                    XCTAssertEqual(enteredCountBeforeDrain, 2)
 
-                    let detachEvents = recorder.snapshot().filter {
-                        $0.connectionID == endpoint.connectionID
-                            && $0.toolName == MCPWindowToolName.getCodeStructure
-                            && $0.phase == .detachedForSettlement
+                    // A fresh client succeeds when the recovery horizon expires while the original
+                    // provider remains blocked.
+                    try await clock.advanceWithoutSleepers(by: .seconds(29))
+                    let recoveredEndpoint = try await fixture.makeAdditionalEndpoint(label: "issue-818-recovery")
+                    let recoveredResponse = try await recoveredEndpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString
+                        ]
+                    )
+                    XCTAssertTrue(try Self.toolResultText(recoveredResponse).contains(fixture.contextA.sentinel))
+                    let enteredCountAtRecovery = await provider.enteredCount()
+                    let recoveredSnapshot = await manager.debugCodeStructureSettlementSnapshot(windowID: windowID)
+                    XCTAssertEqual(enteredCountAtRecovery, 2)
+                    XCTAssertEqual(
+                        recoveredSnapshot,
+                        .init(activeCount: 1, detachedCount: 1, releasedCount: 1)
+                    )
+
+                    // A second escaped provider exhausts the window-scoped recovery budget.
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.getCodeStructure) {
+                        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
+                        await repeatedEscapeGate.enterAndWait()
+                        return .null
                     }
-                    XCTAssertEqual(detachEvents.count, 1)
-                    let detachedEvent = try XCTUnwrap(detachEvents.first)
+                    let repeatedEscape = Task {
+                        try await recoveredEndpoint.callTool(
+                            name: MCPWindowToolName.getCodeStructure,
+                            arguments: arguments
+                        )
+                    }
+                    try await clock.waitForSleeperCount(1)
+                    try await repeatedEscapeGate.waitUntilEntered(count: 1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+                    try await clock.waitForSleeperCount(1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+                    let repeatedEscapePayload = try await Self.toolResultObject(repeatedEscape.value)
+                    XCTAssertEqual(repeatedEscapePayload["code"] as? String, "tool_execution_timeout")
+                    XCTAssertEqual(repeatedEscapePayload["settlement"] as? String, "detached")
+
+                    try await clock.advanceWithoutSleepers(by: MCPCodeStructureSettlementRegistry.recoveryHorizon)
+                    let terminalResponse = try await recoveredEndpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString,
+                            "_rawJSON": true
+                        ]
+                    )
+                    let terminalPayload = try Self.toolResultObject(terminalResponse)
+                    XCTAssertEqual(terminalPayload["code"] as? String, "tool_execution_structure_settlement_busy")
+                    XCTAssertEqual(terminalPayload["retryable"] as? Bool, false)
+                    XCTAssertNil(terminalPayload["retry_after_ms"])
+                    XCTAssertEqual(terminalPayload["busy_reason"] as? String, "released_provider_limit_reached")
+                    XCTAssertEqual(terminalPayload["origin_tool"] as? String, MCPWindowToolName.getCodeStructure)
+                    XCTAssertEqual(
+                        terminalPayload["origin_connection_id"] as? String,
+                        recoveredEndpoint.connectionID.uuidString
+                    )
+                    XCTAssertEqual((terminalPayload["detached_age_ms"] as? NSNumber)?.intValue, 30000)
+                    XCTAssertEqual(
+                        terminalPayload["last_handler_phase"] as? String,
+                        MCPToolExecutionHandlerPhase.getCodeStructureGraphTraversal.rawValue
+                    )
+                    XCTAssertTrue((terminalPayload["error"] as? String)?.contains("restart RepoPrompt CE") == true)
+
+                    let siblingAtLimitResponse = try await fixture.endpointB().callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextB.fileURL.path,
+                            "context_id": fixture.contextB.tabID.uuidString
+                        ]
+                    )
+                    XCTAssertTrue(try Self.toolResultText(siblingAtLimitResponse).contains(fixture.contextB.sentinel))
+
                     XCTAssertTrue(detachedEvent.isAlwaysEmitted)
                     XCTAssertEqual(detachedEvent.cleanupDisposition, .detachAndSettle)
                     XCTAssertEqual(detachedEvent.cancellationOrigin, .watchdogDeadline)
@@ -2574,6 +2666,7 @@ import XCTest
                         .count { $0.eventName == "MCP.ToolCall.HandlerResultReady" }
 
                     await provider.releaseFirst()
+                    await repeatedEscapeGate.release()
                     await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
                     let lateTraceArrived = await Self.waitUntil {
                         recorder.snapshot().contains {
@@ -2631,6 +2724,10 @@ import XCTest
                     XCTAssertEqual(sleeperCountAfterDrain, 0)
 
                     // A fresh generation is admitted after drain and completes normally.
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.getCodeStructure) {
+                        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
+                        return try await provider.run()
+                    }
                     let postDrainResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.getCodeStructure,
                         arguments: arguments
@@ -2652,6 +2749,7 @@ import XCTest
                     try await fixture.assertCleanedUp()
                 } catch {
                     await provider.releaseFirst()
+                    await repeatedEscapeGate.release()
                     firstResponseTask?.cancel()
                     if let firstResponseTask { _ = try? await firstResponseTask.value }
                     _ = EditFlowPerf.debugCaptureSnapshot(finish: true)

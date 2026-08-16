@@ -4,20 +4,36 @@ import Foundation
 ///
 /// The fenced tools are `get_code_structure`, `read_file`, and `get_file_tree`. Every admitted
 /// provider receives an invocation-scoped lease. Completion, cleanup-grace expiry, and external
-/// cancellation transition that lease under this registry's single lock. Once any lease becomes
-/// detaching, detached, abandoned, or force-disconnecting, later same-window detach-disposition
-/// calls receive typed busy until every unsettled lease clears.
+/// cancellation transition that lease under this registry's single lock. A blocking lease fences
+/// later same-window detach-disposition calls for a bounded recovery horizon. After that horizon,
+/// one still-running provider may remain tracked without blocking; its exact lease still owns completion.
 package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
+    package static let recoveryHorizon = Duration.seconds(30)
+    package static let releasedProviderLimit = 1
+
     package init() {}
+
     package enum BusyReason: Equatable, Sendable {
         case detached
         case abandoned
         case settling
+        case releasedProviderLimitReached
+    }
+
+    package struct BusyContext: Equatable, Sendable {
+        package let reason: BusyReason
+        package let originToolName: String
+        package let originInvocationID: UUID
+        package let originConnectionID: UUID
+        package let detachedAge: Duration
+        package let recoveryAfter: Duration?
+        package let handlerPhase: String?
+        package let releasedProviderCount: Int
     }
 
     package enum Admission: Sendable {
         case admitted(Slot)
-        case busy(BusyReason)
+        case busy(BusyContext)
     }
 
     package enum CompletionDirective: Equatable, Sendable {
@@ -57,10 +73,12 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     package struct Snapshot: Equatable, Sendable {
         package let activeCount: Int
         package let detachedCount: Int
+        package let releasedCount: Int
 
-        package init(activeCount: Int, detachedCount: Int) {
+        package init(activeCount: Int, detachedCount: Int, releasedCount: Int = 0) {
             self.activeCount = activeCount
             self.detachedCount = detachedCount
+            self.releasedCount = releasedCount
         }
     }
 
@@ -95,11 +113,12 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             ) ?? .ignored
         }
 
-        package func resolveGraceExpiry() -> GraceExpiryDirective {
+        package func resolveGraceExpiry(now: Duration) -> GraceExpiryDirective {
             registry?.resolveGraceExpiry(
                 windowID: windowID,
                 leaseID: leaseID,
-                invocationID: invocationID
+                invocationID: invocationID,
+                now: now
             ) ?? .settled
         }
 
@@ -111,11 +130,12 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             ) ?? .notActivated
         }
 
-        package func cancel() -> CancellationDirective {
+        package func cancel(now: Duration) -> CancellationDirective {
             registry?.cancel(
                 windowID: windowID,
                 leaseID: leaseID,
-                invocationID: invocationID
+                invocationID: invocationID,
+                now: now
             ) ?? .settled
         }
 
@@ -151,7 +171,28 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         let leaseID: UUID
         let connectionID: UUID
         let invocationID: UUID
+        let toolName: String
+        let handlerPhase: @Sendable () -> String?
         var state: State
+        var blockingSince: Duration?
+        var isReleased: Bool
+
+        var blocksAdmission: Bool {
+            state.blocksAdmission && !isReleased
+        }
+    }
+
+    private struct BusyCandidate {
+        let reason: BusyReason
+        let entry: Entry
+        let detachedAge: Duration
+        let recoveryAfter: Duration?
+        let releasedProviderCount: Int
+    }
+
+    private enum AdmissionDecision {
+        case admitted(Slot)
+        case busy(BusyCandidate)
     }
 
     private let lock = NSLock()
@@ -161,27 +202,80 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     package func admit(
         windowID: Int,
         connectionID: UUID,
-        invocationID: UUID
+        invocationID: UUID,
+        toolName: String,
+        now: Duration,
+        handlerPhase: @escaping @Sendable () -> String?
     ) -> Admission {
-        lock.withLock {
-            let entries = entriesByWindowID[windowID, default: [:]]
-            if entries.values.contains(where: \.state.blocksAdmission) {
-                return .busy(Self.busyReason(for: entries.values))
+        let decision: AdmissionDecision = lock.withLock {
+            var entries = entriesByWindowID[windowID, default: [:]]
+            let blockingEntries = entries.values.filter(\.blocksAdmission)
+            if !blockingEntries.isEmpty {
+                let releasedProviderCount = entries.values.count(where: \.isReleased)
+                let origin = Self.oldestEntry(in: blockingEntries)
+                let blockingSince = origin.blockingSince
+                precondition(blockingSince != nil, "Blocking settlement entry requires an origin timestamp")
+                let age = Self.elapsed(since: blockingSince!, now: now)
+
+                guard releasedProviderCount + blockingEntries.count <= Self.releasedProviderLimit else {
+                    return .busy(BusyCandidate(
+                        reason: .releasedProviderLimitReached,
+                        entry: origin,
+                        detachedAge: age,
+                        recoveryAfter: nil,
+                        releasedProviderCount: releasedProviderCount
+                    ))
+                }
+
+                let recoveryAfter = max(.zero, Self.recoveryHorizon - age)
+                guard recoveryAfter == .zero else {
+                    return .busy(BusyCandidate(
+                        reason: Self.busyReason(for: blockingEntries),
+                        entry: origin,
+                        detachedAge: age,
+                        recoveryAfter: recoveryAfter,
+                        releasedProviderCount: releasedProviderCount
+                    ))
+                }
+
+                entries[origin.leaseID]?.isReleased = true
+                entriesByWindowID[windowID] = entries
             }
 
             let leaseID = UUID()
-            entriesByWindowID[windowID, default: [:]][leaseID] = Entry(
+            entries[leaseID] = Entry(
                 leaseID: leaseID,
                 connectionID: connectionID,
                 invocationID: invocationID,
-                state: .reserved
+                toolName: toolName,
+                handlerPhase: handlerPhase,
+                state: .reserved,
+                blockingSince: nil,
+                isReleased: false
             )
+            entriesByWindowID[windowID] = entries
             return .admitted(Slot(
                 registry: self,
                 windowID: windowID,
                 leaseID: leaseID,
                 connectionID: connectionID,
                 invocationID: invocationID
+            ))
+        }
+
+        switch decision {
+        case let .admitted(slot):
+            return .admitted(slot)
+        case let .busy(candidate):
+            return .busy(BusyContext(
+                reason: candidate.reason,
+                originToolName: candidate.entry.toolName,
+                originInvocationID: candidate.entry.invocationID,
+                originConnectionID: candidate.entry.connectionID,
+                detachedAge: candidate.detachedAge,
+                recoveryAfter: candidate.recoveryAfter,
+                handlerPhase: candidate.entry.handlerPhase(),
+                releasedProviderCount: candidate.releasedProviderCount
             ))
         }
     }
@@ -191,7 +285,8 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             let entries = entriesByWindowID[windowID, default: [:]]
             return Snapshot(
                 activeCount: entries.count,
-                detachedCount: entries.values.count { $0.state.isZombie }
+                detachedCount: entries.values.count { $0.state.isZombie },
+                releasedCount: entries.values.count(where: \.isReleased)
             )
         }
     }
@@ -235,7 +330,8 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     private func resolveGraceExpiry(
         windowID: Int,
         leaseID: UUID,
-        invocationID: UUID
+        invocationID: UUID,
+        now: Duration
     ) -> GraceExpiryDirective {
         lock.withLock {
             guard var entries = entriesByWindowID[windowID],
@@ -246,8 +342,9 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             switch entry.state {
             case .reserved:
                 let otherUnsettled = entries.values.contains {
-                    $0.leaseID != leaseID && $0.state.blocksAdmission
+                    $0.leaseID != leaseID && $0.blocksAdmission
                 }
+                entry.blockingSince = now
                 if otherUnsettled {
                     entry.state = .forceDisconnecting
                     entries[leaseID] = entry
@@ -301,7 +398,8 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     private func cancel(
         windowID: Int,
         leaseID: UUID,
-        invocationID: UUID
+        invocationID: UUID,
+        now: Duration
     ) -> CancellationDirective {
         let result: (CancellationDirective, [CheckedContinuation<Void, Never>]) = lock.withLock {
             guard var entries = entriesByWindowID[windowID],
@@ -312,6 +410,7 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             switch entry.state {
             case .reserved:
                 entry.state = .abandoned
+                entry.blockingSince = now
                 entries[leaseID] = entry
                 entriesByWindowID[windowID] = entries
                 return (.abandoned(nil), [])
@@ -410,9 +509,7 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         return []
     }
 
-    private static func busyReason(
-        for entries: Dictionary<UUID, Entry>.Values
-    ) -> BusyReason {
+    private static func busyReason(for entries: [Entry]) -> BusyReason {
         if entries.contains(where: {
             if case .abandoned = $0.state { return true }
             return false
@@ -423,6 +520,26 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
             return .detached
         }
         return .settling
+    }
+
+    private static func oldestEntry(in entries: [Entry]) -> Entry {
+        precondition(!entries.isEmpty, "Busy settlement context requires an originating entry")
+        return entries.min { lhs, rhs in
+            let lhsBlockingSince = lhs.blockingSince
+            let rhsBlockingSince = rhs.blockingSince
+            precondition(
+                lhsBlockingSince != nil && rhsBlockingSince != nil,
+                "Blocking settlement entries require origin timestamps"
+            )
+            if lhsBlockingSince == rhsBlockingSince {
+                return lhs.invocationID.uuidString < rhs.invocationID.uuidString
+            }
+            return lhsBlockingSince! < rhsBlockingSince!
+        }!
+    }
+
+    private static func elapsed(since start: Duration, now: Duration) -> Duration {
+        max(.zero, now - start)
     }
 
     #if DEBUG

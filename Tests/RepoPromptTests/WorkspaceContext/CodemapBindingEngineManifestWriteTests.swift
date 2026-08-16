@@ -198,11 +198,14 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         guard case let .admitted(settlementSlot) = settlementRegistry.admit(
             windowID: settlementWindowID,
             connectionID: UUID(),
-            invocationID: UUID()
+            invocationID: UUID(),
+            toolName: "get_code_structure",
+            now: .zero,
+            handlerPhase: { nil }
         ) else {
             return XCTFail("Expected read-only settlement lease")
         }
-        XCTAssertEqual(settlementSlot.resolveGraceExpiry(), .detach)
+        XCTAssertEqual(settlementSlot.resolveGraceExpiry(now: .zero), .detach)
         XCTAssertEqual(settlementSlot.activateDetach(), .activated)
         defer { _ = settlementSlot.recordCompletion(.cancellation) }
 
