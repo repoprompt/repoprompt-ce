@@ -1850,6 +1850,32 @@ final class WindowRoutingService: Service {
         )
     }
 
+    private func ensureWorkingDirsRootProjectionIsLoaded(
+        _ target: ResolvedBindTarget,
+        requestedRoots: [String]
+    ) async throws {
+        let window = try resolveWindowForBinding(windowID: target.windowID)
+        let lookupContext = try await window.mcpServer.resolveFileToolLookupContext(
+            tabID: target.tabID,
+            workspaceID: target.workspaceID
+        )
+        let scopedRoots = await window.promptManager.workspaceFileContextStore
+            .rootRefs(scope: lookupContext.rootScope)
+        let loadedRoots = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? scopedRoots
+        let loadedRootPaths = Set(loadedRoots.map(\.standardizedFullPath))
+        let missingRoots = WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet(requestedRoots)
+            .filter { !loadedRootPaths.contains($0) }
+        guard missingRoots.isEmpty else {
+            throw MCPError.invalidRequest(
+                "working_dirs matched workspace '\(target.workspaceName)', but its active tab '\(target.tabName)' " +
+                    "(context_id \(target.tabID.uuidString)) in window \(target.windowID) does not have the requested " +
+                    "root projection loaded. Missing roots: \(missingRoots.joined(separator: ", ")). " +
+                    "The existing MCP binding was not changed. Activate a tab whose file tree contains those roots, " +
+                    "then bind again with the same working_dirs."
+            )
+        }
+    }
+
     private func listBindContextWindows(
         filterWindowID: Int?,
         currentWindowID: Int?,
@@ -2028,6 +2054,10 @@ final class WindowRoutingService: Service {
                                 normalizedWorkingDirs: target.normalizedWorkingDirs
                             )
                         }
+                        try await ensureWorkingDirsRootProjectionIsLoaded(
+                            tabTarget,
+                            requestedRoots: target.normalizedWorkingDirs
+                        )
                         let unchanged = previousBinding.bindingKind == "tab_context"
                             && previousBinding.windowID == tabTarget.windowID
                             && previousBinding.contextID == tabTarget.tabID
