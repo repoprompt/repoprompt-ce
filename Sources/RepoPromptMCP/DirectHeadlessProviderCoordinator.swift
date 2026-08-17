@@ -244,7 +244,7 @@ actor DirectHeadlessProviderCoordinator {
             guard let self else { return }
             let report = await DomainAgentRunExecutionCore.execute {
                 do {
-                    let text = try await runProviderOnce(
+                    let text = try await self.runProviderOnce(
                         message: message,
                         providerID: descriptor.id,
                         model: args["model"]?.stringValue,
