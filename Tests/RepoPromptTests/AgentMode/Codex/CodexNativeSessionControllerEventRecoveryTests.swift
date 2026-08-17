@@ -5,6 +5,50 @@ import XCTest
 final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
     private static let webSearchAliases = ["search", "web_search", "web_search_request", "google_web_search", "search_web"]
 
+    func testPersistedWaitAgentCallRemainsBlockingUntilOutputOrNewSession() throws {
+        let rolloutURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-wait-agent-liveness-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: rolloutURL) }
+
+        let sessionMeta = #"{"type":"session_meta","payload":{}}"#
+        let waitCall = #"{"type":"response_item","payload":{"type":"function_call","name":"wait_agent","call_id":"call-1","arguments":"{}"}}"#
+        let waitOutput = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":""}}"#
+
+        try ([sessionMeta, waitCall].joined(separator: "\n") + "\n").write(
+            to: rolloutURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(
+            CodexNativeSessionController.test_persistedOutstandingBlockingNativeToolCallNames(
+                fromRolloutPath: rolloutURL.path
+            ),
+            ["wait_agent"]
+        )
+
+        try ([sessionMeta, waitCall, waitOutput].joined(separator: "\n") + "\n").write(
+            to: rolloutURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            CodexNativeSessionController.test_persistedOutstandingBlockingNativeToolCallNames(
+                fromRolloutPath: rolloutURL.path
+            ).isEmpty
+        )
+
+        try ([sessionMeta, waitCall, sessionMeta].joined(separator: "\n") + "\n").write(
+            to: rolloutURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            CodexNativeSessionController.test_persistedOutstandingBlockingNativeToolCallNames(
+                fromRolloutPath: rolloutURL.path
+            ).isEmpty
+        )
+    }
+
     func testExternalToolNameNormalizationRejectsOversizedInputBeforeCanonicalization() {
         let oversizedName = String(repeating: "x", count: AgentToolNamePolicy.maximumUTF8Length + 1)
 

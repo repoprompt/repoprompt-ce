@@ -3885,6 +3885,33 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return .skipped
                 }
 
+                let blockingNativeToolNames = await probeController.outstandingBlockingNativeToolCallNames()
+                guard codexWatchdogAttemptRemainsCurrent(
+                    session: session,
+                    controller: probeController,
+                    expectedRunID: expectedRunID,
+                    expectedRunAttemptID: expectedRunAttemptID,
+                    expectedProgressGeneration: expectedProgressGeneration,
+                    checkpoint: "after-blocking-native-tool-probe"
+                ) else {
+                    return .skipped
+                }
+                if !blockingNativeToolNames.isEmpty {
+                    recordCodexWatchdogProgress(for: session)
+                    recordCodexWatchdogTransition(
+                        "toolExempt",
+                        session: session,
+                        fields: [
+                            "reasonCount": String(blockingNativeToolNames.count),
+                            "source": "persisted-native-call"
+                        ]
+                    )
+                    logCodex(
+                        "[AgentModeVM][CodexWatchdog] suppressing watchdog for tab \(session.tabID) while blocking native tool calls remain active names=\(blockingNativeToolNames.joined(separator: ","))"
+                    )
+                    return .skipped
+                }
+
                 reconcileTerminalNativeToolItems(snapshot, session: session)
                 if probeCorroboratesOpenNativeTool(snapshot, session: session) {
                     recordCodexWatchdogProgress(for: session)
