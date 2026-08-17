@@ -1859,6 +1859,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.cursor))
         }
 
+        if isGrokBuildConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1923,6 +1927,7 @@ public class APISettingsViewModel: ObservableObject {
         case .customProvider: "custom"
         case .azure: "azure"
         case .cursor: "cursor"
+        case .grokBuild: "grok_build"
         case .ollama: "ollama"
         case .claudeCode: "claude_code"
         case .codex: "codex"
@@ -2001,6 +2006,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .cursor:
                 break
+            case .grokBuild:
+                break
             }
 
             await updateAvailableModels()
@@ -2060,6 +2067,8 @@ public class APISettingsViewModel: ObservableObject {
         case .openCode:
             break
         case .cursor:
+            break
+        case .grokBuild:
             break
         }
         await updateAvailableModels()

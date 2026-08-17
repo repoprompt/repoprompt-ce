@@ -319,6 +319,10 @@ enum ACPAIModelCatalog {
         cursorModelOptionsFromStore().map { .cursorCustom(name: $0.rawValue) }
     }
 
+    static func grokBuildModelsFromStore() -> [AIModel] {
+        grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
@@ -335,6 +339,13 @@ enum ACPAIModelCatalog {
             return discovered
         }
         return cursorModelOptionsFromStore()
+            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func grokBuildModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return grokBuildModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 
@@ -362,6 +373,13 @@ enum ACPAIModelCatalog {
         let discovered = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options ?? []
         guard !discovered.isEmpty else { return [fallback] }
         return [fallback] + discovered.filter { !isCursorAutoOption($0) }
+    }
+
+    private static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
+        AgentModelCatalog.options(
+            for: .grokBuild,
+            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        )
     }
 
     private static func isCursorAutoOption(_ option: AgentModelOption) -> Bool {
