@@ -23,10 +23,34 @@ enum ACPSupportResult: Equatable {
 struct ACPDiscoveredSessionModels: Equatable {
     let options: [AgentModelOption]
     let currentModelRaw: String?
+    /// The session's active reasoning effort (e.g. Grok's `_meta.reasoningEffort`), when the
+    /// provider advertises one. Lets the controller skip redundant effort mutations.
+    var currentEffortRaw: String?
+
+    init(options: [AgentModelOption], currentModelRaw: String?, currentEffortRaw: String? = nil) {
+        self.options = options
+        self.currentModelRaw = currentModelRaw
+        self.currentEffortRaw = currentEffortRaw
+    }
 
     var preferredModelRaw: String? {
-        option(matching: currentModelRaw)?.rawValue
-            ?? Self.normalizedRawModel(currentModelRaw)
+        if let current = option(matching: currentModelRaw) {
+            // A confirmed non-default active effort resolves to its provenanced variant
+            // (`grok-4.6` at low → `grok-4.6-low`); a default effort stays the bare base
+            // alias, and nil/unresolvable effort falls back to the base.
+            if let effortRaw = currentEffortRaw,
+               let effort = CodexReasoningEffort.parse(effortRaw),
+               effort != current.defaultReasoningEffort,
+               let variant = options.first(where: {
+                   $0.effortVariant?.reasoningEffort == effort
+                       && $0.effortVariant?.baseModelRaw.caseInsensitiveCompare(current.rawValue) == .orderedSame
+               })
+            {
+                return variant.rawValue
+            }
+            return current.rawValue
+        }
+        return Self.normalizedRawModel(currentModelRaw)
             ?? options.first(where: \.isProviderDefault)?.rawValue
             ?? options.first?.rawValue
     }
@@ -194,6 +218,10 @@ enum ACPProviderModelSnapshotResult: Equatable {
 struct ACPDirectModelSelectionRequest {
     let method: String
     let params: [String: Any]
+    /// The model id the provider's acknowledgement must echo before the controller updates
+    /// local model authority. For effort-compound selections this is the BASE model id —
+    /// the wire confirms the model, not the effort suffix.
+    var expectedConfirmationModelRaw: String
 }
 
 /// Bounded capability for ACP providers that advertise session models outside the
@@ -208,9 +236,14 @@ protocol ACPDirectSessionModelProvider: Sendable {
         from sessionResponse: [String: Any]
     ) -> ACPProviderModelSnapshotResult
 
+    /// Builds the provider's selection RPC from STRUCTURED parts. The controller
+    /// decomposes and validates the selection against the advertised snapshot; the
+    /// provider owns wire names (`session/set_model`, `_meta.reasoningEffort`, …)
+    /// and never re-parses compound strings.
     func makeDirectModelSelectionRequest(
         sessionID: String,
-        modelRaw: String
+        baseModelRaw: String,
+        reasoningEffortRaw: String?
     ) -> ACPDirectModelSelectionRequest
 }
 

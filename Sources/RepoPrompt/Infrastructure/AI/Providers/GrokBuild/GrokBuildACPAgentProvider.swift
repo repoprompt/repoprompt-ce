@@ -4,6 +4,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
     private let config: GrokBuildAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: GrokBuildACPLaunchResolver
+    let directEffortWireState = GrokBuildDirectEffortWireState()
 
     #if DEBUG
         var test_config: GrokBuildAgentConfig {
@@ -171,81 +172,5 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
             .appendingPathComponent("RepoPromptGrokBuildACPPreflight", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
         return url.standardizedFileURL.path
-    }
-}
-
-// MARK: - ACPDirectSessionModelProvider
-
-extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
-    /// Parses Grok's top-level `models` (`SessionModelState`) from a `session/new` or
-    /// `session/load` response. Verified against grok 1.0.3: the response carries
-    /// `{sessionId, models: {currentModelId, availableModels: [{modelId, name, description?,
-    /// _meta?}]}, _meta}` and no modern `configOptions`.
-    func parseDirectSessionModelSnapshot(
-        from sessionResponse: [String: Any]
-    ) -> ACPProviderModelSnapshotResult {
-        guard let modelsValue = sessionResponse["models"] else {
-            return .absent
-        }
-        guard let models = modelsValue as? [String: Any] else {
-            return .malformed(reason: "Grok `models` metadata is not an object.")
-        }
-        guard let available = models["availableModels"] as? [[String: Any]] else {
-            return .malformed(reason: "Grok `models.availableModels` is missing or not an array.")
-        }
-
-        var options: [AgentModelOption] = []
-        var seen = Set<String>()
-        for entry in available {
-            guard let rawID = (entry["modelId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !rawID.isEmpty
-            else {
-                continue
-            }
-            guard seen.insert(rawID).inserted else { continue }
-            func nonEmpty(_ value: String?) -> String? {
-                guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
-                return trimmed
-            }
-            let displayName = nonEmpty(entry["name"] as? String) ?? rawID
-            let description = nonEmpty(entry["description"] as? String)
-            // `_meta` (totalContextTokens, reasoningEfforts, …) has no AgentModelOption
-            // contract in v1 and is intentionally dropped.
-            options.append(
-                AgentModelOption(
-                    rawValue: rawID,
-                    displayName: displayName,
-                    description: description,
-                    isPlaceholderDefault: false,
-                    isProviderDefault: false
-                )
-            )
-        }
-        guard !options.isEmpty else {
-            return .malformed(reason: "Grok `models.availableModels` contains no usable models.")
-        }
-
-        let currentRaw: String? = if let current = (models["currentModelId"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !current.isEmpty
-        {
-            options.first(where: { $0.rawValue.caseInsensitiveCompare(current) == .orderedSame })?.rawValue
-        } else {
-            nil
-        }
-
-        return .valid(ACPDiscoveredSessionModels(options: options, currentModelRaw: currentRaw))
-    }
-
-    func makeDirectModelSelectionRequest(
-        sessionID: String,
-        modelRaw: String
-    ) -> ACPDirectModelSelectionRequest {
-        // Verified against grok 1.0.3: session/set_model takes {sessionId, modelId} and
-        // responds with {"_meta": {"model": {"Ok": "<modelId>"}}}.
-        ACPDirectModelSelectionRequest(
-            method: "session/set_model",
-            params: ["sessionId": sessionID, "modelId": modelRaw]
-        )
     }
 }

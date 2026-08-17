@@ -257,10 +257,32 @@ final class GrokBuildACPAgentProviderTests: XCTestCase {
 
     func testDirectModelSelectionRequestShape() throws {
         let (provider, _) = try makeProvider(config: GrokBuildAgentConfig())
-        let request = provider.makeDirectModelSelectionRequest(sessionID: "s1", modelRaw: "grok-4.5")
+        let request = provider.makeDirectModelSelectionRequest(
+            sessionID: "s1",
+            baseModelRaw: "grok-4.5",
+            reasoningEffortRaw: nil
+        )
         XCTAssertEqual(request.method, "session/set_model")
         XCTAssertEqual(request.params["sessionId"] as? String, "s1")
         XCTAssertEqual(request.params["modelId"] as? String, "grok-4.5")
+        XCTAssertNil(request.params["_meta"])
+        XCTAssertEqual(request.expectedConfirmationModelRaw, "grok-4.5")
+    }
+
+    func testDirectModelSelectionRequestCarriesEffortMeta() throws {
+        let (provider, _) = try makeProvider(config: GrokBuildAgentConfig())
+        let request = provider.makeDirectModelSelectionRequest(
+            sessionID: "s1",
+            baseModelRaw: "grok-4.5",
+            reasoningEffortRaw: "low"
+        )
+        XCTAssertEqual(request.params["modelId"] as? String, "grok-4.5")
+        XCTAssertEqual(
+            (request.params["_meta"] as? [String: Any])?["reasoningEffort"] as? String,
+            "low"
+        )
+        // The wire confirms the base model id, never the effort.
+        XCTAssertEqual(request.expectedConfirmationModelRaw, "grok-4.5")
     }
 }
 

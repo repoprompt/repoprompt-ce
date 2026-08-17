@@ -1935,6 +1935,72 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertNotNil(session.lastTerminalCommitRevision)
     }
 
+    func testOutstandingNativeWaitAgentCallSuppressesIdleRecovery() async {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            outstandingBlockingNativeToolNames: ["wait_agent"]
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        let attemptedTerminalSettlement = await viewModel.test_codexCoordinator
+            .test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertFalse(attemptedTerminalSettlement)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 0)
+        XCTAssertGreaterThan(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertNil(session.codexWatchdogState.lastAmbiguousProbeKind)
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
+    func testProgressDuringBlockingNativeToolProbeSupersedesStaleResult() async throws {
+        let blockingToolProbeGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            outstandingBlockingNativeToolNames: ["wait_agent"],
+            blockingNativeToolReadGate: blockingToolProbeGate
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        let recoveryTask = Task {
+            await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+        }
+        try await waitUntil {
+            blockingToolProbeGate.isWaitingSync()
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("fresh provider progress"),
+            session: session
+        )
+        let progressGenerationAfterEvent = session.codexWatchdogState.progressGeneration
+        blockingToolProbeGate.release()
+
+        let attemptedTerminalSettlement = await recoveryTask.value
+        XCTAssertFalse(attemptedTerminalSettlement)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(controller.shutdownCountSync(), 0)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 0)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, progressGenerationAfterEvent)
+
+        session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
+    }
+
     func testWatchdogFlushesCachedExplicitErrorWhenProbeFindsNoActiveTurn() async throws {
         let controller = LivenessFakeCodexController(
             snapshot: .idle,
@@ -3277,6 +3343,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     private let snapshotReadGate: LivenessSnapshotReadGate?
     private let postReattachSnapshotReadGate: LivenessSnapshotReadGate?
     private let shutdownGate: LivenessSnapshotReadGate?
+    private let outstandingBlockingNativeToolNames: [String]
+    private let blockingNativeToolReadGate: LivenessSnapshotReadGate?
     private var pendingTurnFailure: CodexNativeSessionController.TurnFailure?
 
     init(
@@ -3298,6 +3366,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         snapshotReadGate: LivenessSnapshotReadGate? = nil,
         postReattachSnapshotReadGate: LivenessSnapshotReadGate? = nil,
         shutdownGate: LivenessSnapshotReadGate? = nil,
+        outstandingBlockingNativeToolNames: [String] = [],
+        blockingNativeToolReadGate: LivenessSnapshotReadGate? = nil,
         pendingTurnFailure: CodexNativeSessionController.TurnFailure? = nil
     ) {
         snapshotStatuses = if let snapshotSequence, !snapshotSequence.isEmpty {
@@ -3321,6 +3391,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         self.snapshotReadGate = snapshotReadGate
         self.postReattachSnapshotReadGate = postReattachSnapshotReadGate
         self.shutdownGate = shutdownGate
+        self.outstandingBlockingNativeToolNames = outstandingBlockingNativeToolNames
+        self.blockingNativeToolReadGate = blockingNativeToolReadGate
         self.pendingTurnFailure = pendingTurnFailure
     }
 
@@ -3433,6 +3505,13 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
             activeToolItems: includeTurns ? activeToolItems : [],
             hasAuthoritativeActiveTurnItems: includeTurns && hasAuthoritativeActiveTurnItems
         )
+    }
+
+    func outstandingBlockingNativeToolCallNames() async -> [String] {
+        if let blockingNativeToolReadGate {
+            await blockingNativeToolReadGate.wait()
+        }
+        return outstandingBlockingNativeToolNames
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}

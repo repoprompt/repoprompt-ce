@@ -273,6 +273,10 @@ actor ACPAgentSessionController {
     /// advertised no modern `configOptions` model selector, so model application flows
     /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
     private var sessionModelDirectSelectionSupported = false
+    /// True only when `discoveredSessionModels` was parsed from THIS session's live
+    /// session/new|load response. Post-mutation state updates never promote warmed
+    /// registry data to live authority — effort-bearing selections require this.
+    private var sessionModelSnapshotHasLiveAuthority = false
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
@@ -683,49 +687,126 @@ actor ACPAgentSessionController {
                 else {
                     throw ControllerError.requestFailed("Grok Build ACP runtime does not advertise model switching.")
                 }
-                let canonicalModel = try canonicalDirectSessionModelValue(model)
-                if discoveredSessionModels?.currentModelRaw == canonicalModel {
+                let (matchedOption, snapshotOptions, matchedLiveSnapshot) = try canonicalDirectSessionModelOption(model)
+                // Effort-compound selections (`grok-4.6-low`) decompose against the
+                // advertised option set — never by suffix guessing — into the base option
+                // plus an explicit effort. Bare raws resolve to the model's advertised
+                // default effort so a bare pick after a variant pick resets effort instead
+                // of silently keeping the previous one.
+                guard let decomposition = GrokBuildModelSpecifier.decompose(
+                    raw: matchedOption.rawValue,
+                    options: snapshotOptions
+                ) else {
+                    throw ControllerError.requestFailed("Grok Build model '\(model)' is not in the discovered model set. Refresh Grok Build models and retry.")
+                }
+                let baseModel = decomposition.base.rawValue
+                // "Effort-capable but default unknown" is not "effort-free": a bare pick on
+                // such a model could silently keep whatever effort is active. Require an
+                // explicit variant instead of guessing.
+                if decomposition.explicitEffort == nil,
+                   !decomposition.base.supportedReasoningEfforts.isEmpty,
+                   decomposition.base.defaultReasoningEffort == nil
+                {
+                    throw ControllerError.requestFailed(
+                        "Grok Build model '\(baseModel)' advertises reasoning efforts but no authoritative default; choose an explicit effort (e.g. \(baseModel)-high)."
+                    )
+                }
+                let resolvedEffort = decomposition.explicitEffort ?? decomposition.base.defaultReasoningEffort
+                // Fail closed on unadvertised efforts before any RPC: grok silently ignores
+                // unknown efforts while still acknowledging the base model, so an effort
+                // outside the base option's advertised list must never leave the client.
+                // Effort authority must also come from the LIVE session: a warmed-registry
+                // fallback can carry efforts the provider has since removed, and the wire
+                // would still Ok the base. Model-only requests may use the warmed snapshot
+                // because the echoed base id confirms them.
+                if let resolvedEffort {
+                    guard decomposition.base.supportedReasoningEfforts.contains(resolvedEffort) else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build model '\(baseModel)' does not advertise reasoning effort '\(resolvedEffort.rawValue)'."
+                        )
+                    }
+                    guard matchedLiveSnapshot else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build effort selection requires the live session model set. Refresh Grok Build models and retry."
+                        )
+                    }
+                }
+                let canonicalModel = GrokBuildModelSpecifier(
+                    baseModel: baseModel,
+                    reasoningEffort: resolvedEffort
+                ).compoundRaw
+                // A nil resolved effort means "no effort mutation requested" (effort-free
+                // model), not "no active effort" — it always no-ops when the base matches.
+                let effortAlreadyMatches = resolvedEffort.map {
+                    normalizedDirectEffort(discoveredSessionModels?.currentEffortRaw) == normalizedDirectEffort($0.rawValue)
+                } ?? true
+                if discoveredSessionModels?.currentModelRaw == baseModel, effortAlreadyMatches {
                     return
                 }
                 let selectionRequest = directProvider.makeDirectModelSelectionRequest(
                     sessionID: sessionID,
-                    modelRaw: canonicalModel
+                    baseModelRaw: baseModel,
+                    reasoningEffortRaw: resolvedEffort?.rawValue
                 )
                 // A rejected direct selection preserves the session's current model. Grok
                 // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
                 // the Err variant is a failure even though the RPC itself succeeded. Fail
-                // closed: only an `Ok` echoing the requested model may update local model
-                // authority — missing, malformed, or mismatched acknowledgements leave the
-                // session's real current model unknown, so local state must not move.
-                let selectionResponse = try await sendRequestResponse(
-                    method: selectionRequest.method,
-                    params: selectionRequest.params
-                )
+                // closed: only an `Ok` echoing the requested base model may update local
+                // model authority — missing, malformed, or mismatched acknowledgements leave
+                // the session's real current model unknown, so local state must not move.
+                let selectionResponse: RequestResponse
+                do {
+                    selectionResponse = try await sendRequestResponse(
+                        method: selectionRequest.method,
+                        params: selectionRequest.params
+                    )
+                } catch {
+                    // A throw here (timeout, EOF, cancellation, decode failure) is also an
+                    // ambiguous post-dispatch outcome: the request may have been applied.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw error
+                }
                 let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
-                if let modelError = modelOutcome?["Err"] {
+                let hasOk = modelOutcome?.keys.contains("Ok") == true
+                let hasErr = modelOutcome?.keys.contains("Err") == true
+                if hasErr, !hasOk {
+                    // An exclusive Err is a confirmed rejection: the session's current model
+                    // is untouched, so local authority stays valid.
+                    let modelError = modelOutcome?["Err"] ?? "unknown"
                     throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
                 }
-                guard let confirmedModel = modelOutcome?["Ok"] as? String,
+                guard !hasErr,
+                      hasOk,
+                      let confirmedModel = modelOutcome?["Ok"] as? String,
                       confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-                      .caseInsensitiveCompare(canonicalModel) == .orderedSame
+                      .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
                 else {
+                    // Ambiguous post-send outcome (missing/malformed/mixed/mismatched ack):
+                    // the server may or may not have applied anything, and neither the
+                    // requested nor the prior model is confirmed. Invalidate current
+                    // model/effort authority so stale state can never short-circuit a
+                    // corrective selection; the advertised options remain live and valid.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
                     throw ControllerError.protocolViolation(
                         "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
                     )
                 }
-                var updatedOptions = discoveredSessionModels?.options
+                // The selection was already validated as a snapshot member; never append
+                // recovery options here — an appended compound would lack effortVariant
+                // provenance and later read back as a real base.
+                let updatedOptions = discoveredSessionModels?.options
                     ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
                     ?? []
-                if !updatedOptions.contains(where: { $0.rawValue == canonicalModel }) {
-                    updatedOptions.append(AgentModelOption(
-                        rawValue: canonicalModel,
-                        displayName: canonicalModel,
-                        description: nil,
-                        isPlaceholderDefault: false,
-                        isProviderDefault: false
-                    ))
-                }
-                let updated = ACPDiscoveredSessionModels(options: updatedOptions, currentModelRaw: canonicalModel)
+                // The Ok confirms only the base model. An effort-bearing mutation leaves
+                // the session's active effort UNCONFIRMED (grok applies advertised efforts
+                // but never echoes them), so record it as unknown until a fresh session
+                // config parse confirms it; a model-only request preserves the last
+                // confirmed effort.
+                let updated = ACPDiscoveredSessionModels(
+                    options: updatedOptions,
+                    currentModelRaw: baseModel,
+                    currentEffortRaw: resolvedEffort == nil ? discoveredSessionModels?.currentEffortRaw : nil
+                )
                 discoveredSessionModels = updated
                 _ = AgentACPModelRegistry.shared.updateDiscoveredModels(updated, for: provider.providerID)
                 return
@@ -768,19 +849,46 @@ actor ACPAgentSessionController {
     /// Validation for direct (non-configOptions) model selection: exact/case-insensitive
     /// match against the live session snapshot first, then the warmed persisted registry
     /// (a `session/load` response may legitimately omit model metadata on some providers).
-    private func canonicalDirectSessionModelValue(_ requestedValue: String) throws -> String {
+    private func canonicalDirectSessionModelOption(
+        _ requestedValue: String
+    ) throws -> (option: AgentModelOption, options: [AgentModelOption], matchedLiveSnapshot: Bool) {
         if let live = discoveredSessionModels {
             if let match = live.option(matching: requestedValue) {
-                return match.rawValue
+                return (match, live.options, sessionModelSnapshotHasLiveAuthority)
             }
             throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
         }
         if let warmed = AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID),
            let match = warmed.option(matching: requestedValue)
         {
-            return match.rawValue
+            return (match, warmed.options, false)
         }
         throw ControllerError.requestFailed("Grok Build model '\(requestedValue)' is not in the discovered model set. Refresh Grok Build models and retry.")
+    }
+
+    private func normalizedDirectEffort(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed.lowercased()
+    }
+
+    /// Clears current model/effort authority after an ambiguous `session/set_model` outcome
+    /// (post-dispatch throw, or a missing/malformed/mixed/mismatched acknowledgement). The
+    /// advertised options stay — they came from the live session or warmed registry and are
+    /// still the valid advertisement — but nothing about the session's current model or
+    /// effort is confirmed anymore. Works for warmed-only sessions too (discoveredSessionModels
+    /// may be nil there), and never promotes warmed data to live authority.
+    private func invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: [AgentModelOption]) {
+        let options = discoveredSessionModels?.options ?? snapshotOptions
+        guard !options.isEmpty else { return }
+        let cleared = ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: nil,
+            currentEffortRaw: nil
+        )
+        discoveredSessionModels = cleared
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(cleared, for: provider.providerID)
     }
 
     func setSessionMode(_ modeID: String) async throws {
@@ -1101,6 +1209,7 @@ actor ACPAgentSessionController {
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
         sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -2027,6 +2136,7 @@ actor ACPAgentSessionController {
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
         sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -2430,6 +2540,7 @@ actor ACPAgentSessionController {
         }
 
         discoveredSessionModels = parsed
+        sessionModelSnapshotHasLiveAuthority = parsed != nil
         guard let parsed else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
     }
