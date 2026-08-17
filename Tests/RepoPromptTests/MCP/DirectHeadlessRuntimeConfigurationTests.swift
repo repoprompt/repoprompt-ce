@@ -636,12 +636,21 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 "context_builder.external_process"
             ])
         )
-        let preparedConversationCarrier = try await prepared.childLaunchCoordinator.prepare(
+        let contextBuilderArguments: [String: MCP.Value] = [
+            "instructions": .string("Report the working directory.")
+        ]
+        let contextBuilderPlan = try await prepared.childLaunchCoordinator.resolvePlan(
             toolName: "context_builder",
-            arguments: ["instructions": .string("Report the working directory.")],
+            arguments: contextBuilderArguments,
             securityContext: contextBuilderSecurity
         )
-        let conversationCarrier = try XCTUnwrap(preparedConversationCarrier)
+        let preparedConversationCarriers = try await prepared.childLaunchCoordinator.prepare(
+            plan: contextBuilderPlan,
+            toolName: "context_builder",
+            arguments: contextBuilderArguments,
+            securityContext: contextBuilderSecurity
+        )
+        let conversationCarrier = try XCTUnwrap(preparedConversationCarriers.singleCarrier)
         XCTAssertEqual(conversationCarrier.runID, sessionID)
         let callbackPrincipal = DomainClientPrincipal(
             principalID: UUID(),
@@ -667,6 +676,10 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             invocationID: UUID()
         )
         XCTAssertEqual(callbackSecurity.authorizedCanonicalRoots, [fixture.alternateWorktree.path])
+        await prepared.childLaunchCoordinator.revoke(
+            plan: contextBuilderPlan,
+            bundle: preparedConversationCarriers
+        )
 
         let rejectedSessionID = UUID()
         _ = try await prepared.context.prepareSessionRootOverlay(

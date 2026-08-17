@@ -52,7 +52,6 @@ actor DirectHeadlessOracleAdapter {
     private let provider: DirectHeadlessProviderCoordinator
     private let coordinator = OracleGroupCoordinator()
     private var plansByInvocationID: [UUID: InvocationPlan] = [:]
-    private var invocationIDsByRunID: [UUID: UUID] = [:]
     private var isShuttingDown = false
 
     init(
@@ -78,15 +77,18 @@ actor DirectHeadlessOracleAdapter {
         let plan = try await makeInvocationPlan(
             toolName: toolName,
             arguments: arguments,
-            invocationID: securityContext.invocationID
+            invocationID: securityContext.invocationID,
+            runID: securityContext.principal.runID ?? UUID()
         )
         plansByInvocationID[plan.invocationID] = plan
-        invocationIDsByRunID[plan.runID] = plan.invocationID
         return plan.childLaunchPlan
     }
 
-    func discardPreparedInvocation(runID: UUID) {
-        guard let invocationID = invocationIDsByRunID.removeValue(forKey: runID) else { return }
+    func discardPreparedInvocation(plan: DomainChildLaunchPlan) {
+        let launchIDs = plan.lanes.map(\.launchID)
+        guard let invocationID = plansByInvocationID.first(where: {
+            $0.value.runID == plan.runID && $0.value.childLaunchPlan.lanes.map(\.launchID) == launchIDs
+        })?.key else { return }
         plansByInvocationID.removeValue(forKey: invocationID)
     }
 
@@ -135,7 +137,6 @@ actor DirectHeadlessOracleAdapter {
     func shutdown() {
         isShuttingDown = true
         plansByInvocationID.removeAll()
-        invocationIDsByRunID.removeAll()
     }
 
     private func consumePlan(
@@ -147,21 +148,22 @@ actor DirectHeadlessOracleAdapter {
         if let invocationID = request.securityContext?.invocationID,
            let plan = plansByInvocationID.removeValue(forKey: invocationID)
         {
-            invocationIDsByRunID.removeValue(forKey: plan.runID)
             return plan
         }
         guard request.securityContext == nil else { throw AdapterError.missingPreparedInvocation }
         return try await makeInvocationPlan(
             toolName: toolName,
             arguments: arguments,
-            invocationID: UUID()
+            invocationID: UUID(),
+            runID: UUID()
         )
     }
 
     private func makeInvocationPlan(
         toolName: String,
         arguments: [String: Value],
-        invocationID: UUID
+        invocationID: UUID,
+        runID: UUID
     ) async throws -> InvocationPlan {
         if arguments["provider"] != nil { throw AdapterError.unsupportedProviderOverride }
         let route: OracleConversationRoute
@@ -220,7 +222,6 @@ actor DirectHeadlessOracleAdapter {
             resolvedStartRoster = nil
         }
 
-        let runID = UUID()
         switch route {
         case let .start(primaryModelOverride):
             let roster = if let resolvedStartRoster {

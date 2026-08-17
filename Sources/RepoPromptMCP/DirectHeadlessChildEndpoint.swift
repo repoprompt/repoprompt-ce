@@ -351,7 +351,7 @@ actor DirectHeadlessChildLaunchCoordinator {
                 }
             }
         }
-        await oracleAdapter?.discardPreparedInvocation(runID: plan.runID)
+        await oracleAdapter?.discardPreparedInvocation(plan: plan)
     }
 
     nonisolated static func resolvedRunID(
