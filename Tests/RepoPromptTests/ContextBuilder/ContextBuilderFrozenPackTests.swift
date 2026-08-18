@@ -5,9 +5,22 @@ import XCTest
 
 final class ContextBuilderFrozenPackTests: XCTestCase {
     func testCanonicalPackBytesAreStableAndReviewPromptIsAdviserOnly() throws {
+        let evidenceGuidance = "Cite each important factual claim with one or more tool-ready `path:start-end` references drawn from the frozen Context Builder evidence. Label each cited claim as a direct observation or an inference. For an inference, identify and cite the supporting observations. Ground important recommendations in those cited claims."
+        let reviewGuidance = """
+        Review the frozen package independently. Check the task's exact requirements against observed evidence.
+        Treat command and test output as stronger evidence than claims of success, and flag unresolved errors or failed verification.
+        Report concrete correctness, regression, state-safety, and test gaps with file references. Do not synthesize other Oracle answers.
+
+        \(evidenceGuidance)
+        """
         let prompt = ContextBuilderFrozenOraclePack.prompt(for: .review, prompt: "Review this change")
-        XCTAssertTrue(prompt.contains("Review this change"))
-        XCTAssertTrue(prompt.contains("Review the frozen package independently"))
+        XCTAssertEqual(prompt, "Review this change\n\n" + reviewGuidance)
+        XCTAssertTrue(prompt.contains("path:start-end"))
+        XCTAssertTrue(prompt.contains("direct observation"))
+        XCTAssertTrue(prompt.contains("inference"))
+        XCTAssertTrue(prompt.contains("Ground important recommendations in those cited claims"))
+        XCTAssertTrue(prompt.contains("exact requirements against observed evidence"))
+        XCTAssertTrue(prompt.contains("command and test output as stronger evidence than claims of success"))
         XCTAssertTrue(prompt.contains("Do not synthesize other Oracle answers"))
 
         let message = AIMessage(systemPrompt: "system", userMessage: prompt)
@@ -18,10 +31,22 @@ final class ContextBuilderFrozenPackTests: XCTestCase {
         XCTAssertEqual(try OracleFrozenContextPack.decodeCanonical(first).content, content)
     }
 
-    func testNonReviewPromptIsUnchanged() {
+    func testPlanPromptIncludesEvidenceGuidance() {
+        let expected = "Make a plan\n\nCite each important factual claim with one or more tool-ready `path:start-end` references drawn from the frozen Context Builder evidence. Label each cited claim as a direct observation or an inference. For an inference, identify and cite the supporting observations. Ground important recommendations in those cited claims."
+        let prompt = ContextBuilderFrozenOraclePack.prompt(for: .plan, prompt: "Make a plan")
+
+        XCTAssertEqual(prompt, expected)
+        XCTAssertTrue(prompt.contains("path:start-end"))
+        XCTAssertTrue(prompt.contains("direct observation"))
+        XCTAssertTrue(prompt.contains("inference"))
+        XCTAssertTrue(prompt.contains("Ground important recommendations in those cited claims"))
+        XCTAssertFalse(prompt.contains("Review the frozen package independently"))
+    }
+
+    func testChatPromptIsUnchanged() {
         XCTAssertEqual(
-            ContextBuilderFrozenOraclePack.prompt(for: .plan, prompt: "Make a plan"),
-            "Make a plan"
+            ContextBuilderFrozenOraclePack.prompt(for: .chat, prompt: "Answer this question\n"),
+            "Answer this question\n"
         )
     }
 

@@ -97,7 +97,17 @@ struct ContextBuilderOracleGroupState {
 }
 
 struct ContextBuilderFrozenOraclePack {
-    static let reviewAdviserInstructions = "Review the frozen package independently. Report concrete correctness, regression, state-safety, and test gaps with file references. Do not synthesize other Oracle answers."
+    static let evidenceCitationInstructions = "Cite each important factual claim with one or more tool-ready `path:start-end` references drawn from the frozen Context Builder evidence. Label each cited claim as a direct observation or an inference. For an inference, identify and cite the supporting observations. Ground important recommendations in those cited claims."
+
+    static var reviewAdviserInstructions: String {
+        """
+        Review the frozen package independently. Check the task's exact requirements against observed evidence.
+        Treat command and test output as stronger evidence than claims of success, and flag unresolved errors or failed verification.
+        Report concrete correctness, regression, state-safety, and test gaps with file references. Do not synthesize other Oracle answers.
+
+        \(evidenceCitationInstructions)
+        """
+    }
 
     let message: AIMessage
     let input: OracleInput
@@ -140,8 +150,14 @@ struct ContextBuilderFrozenOraclePack {
     }
 
     static func prompt(for mode: HeadlessMode, prompt: String) -> String {
-        guard mode == .review else { return prompt }
-        return prompt + "\n\n" + reviewAdviserInstructions
+        switch mode {
+        case .plan:
+            prompt + "\n\n" + evidenceCitationInstructions
+        case .review:
+            prompt + "\n\n" + reviewAdviserInstructions
+        case .chat:
+            prompt
+        }
     }
 
     static func render(_ message: AIMessage) -> String {
