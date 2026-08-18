@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-package enum OraclePersistenceError: Error, LocalizedError, Equatable, Sendable {
+package enum OraclePersistenceError: Error, LocalizedError, Equatable {
     case alreadyExists
     case notFound
     case revisionConflict(expected: UInt64, actual: UInt64)
@@ -39,17 +39,16 @@ package enum OraclePersistenceError: Error, LocalizedError, Equatable, Sendable 
     }
 }
 
-package enum OraclePersistenceMutationPhase: Sendable {
+package enum OraclePersistenceMutationPhase {
     case journalPersisted(UUID)
     case writeApplied(UUID, Int)
 }
 
-package enum OracleStoredConversation: Sendable {
-    case single(OracleSingleConversationDocument)
+package enum OracleStoredConversation {
     case group(OracleGroupDocument)
 }
 
-package struct OracleArtifactReservation: Sendable {
+package struct OracleArtifactReservation {
     package let id: UUID
     package let artifactID: String
 }
@@ -79,7 +78,7 @@ private final class OracleArtifactReservationRegistry: @unchecked Sendable {
     }
 }
 
-package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConversationStore, OracleArtifactStore {
+package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactStore {
     package typealias MutationObserver = @Sendable (OraclePersistenceMutationPhase) throws -> Void
 
     private let root: URL
@@ -140,8 +139,8 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 }
                 index = index.replacing(entries: index.entries + newEntries)
                 try files.commit([
-                    .write(relativePath: files.relative(groupURL), data: try files.encode(group)),
-                    .write(relativePath: files.relative(files.indexURL), data: try files.encode(index))
+                    .write(relativePath: files.relative(groupURL), data: files.encode(group)),
+                    .write(relativePath: files.relative(files.indexURL), data: files.encode(index))
                 ])
             }
         }
@@ -211,7 +210,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 try files.commit([
                     .write(
                         relativePath: files.relative(files.groupURL(group.group.id)),
-                        data: try files.encode(group)
+                        data: files.encode(group)
                     )
                 ])
             }
@@ -266,7 +265,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 try files.commit([
                     .write(
                         relativePath: files.relative(files.groupURL(groupID)),
-                        data: try files.encode(renamed)
+                        data: files.encode(renamed)
                     )
                 ])
             }
@@ -366,7 +365,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         var claims: [OracleGroupClaim] = []
         defer { claims.forEach { $0.release() } }
         for group in groups {
-            claims.append(try await claimManager.acquire(
+            try await claims.append(claimManager.acquire(
                 group: group,
                 owner: group.owner,
                 invocationID: UUID(),
@@ -402,148 +401,6 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
         }
     }
 
-    package func create(_ conversation: OracleSingleConversationDocument) async throws {
-        #if DEBUG
-            try consumeForcedSaveFailure()
-        #endif
-        try await perform { files in
-            try files.withMutationLock {
-                try files.recoverTransactions()
-                try files.validate(conversation)
-                guard conversation.turns.last?.state == .prepared else {
-                    throw OraclePersistenceError.invalidDocument("single_must_start_prepared")
-                }
-                let url = files.singleURL(owner: conversation.owner, publicChatID: conversation.publicChatID)
-                guard !files.exists(url) else { throw OraclePersistenceError.alreadyExists }
-                try files.commit([.write(relativePath: files.relative(url), data: try files.encode(conversation))])
-            }
-        }
-    }
-
-    package func load(
-        publicChatID: String,
-        owner: OracleConversationOwner
-    ) async throws -> OracleSingleConversationDocument? {
-        try await perform { files in
-            try files.withMutationLock {
-                try files.recoverTransactions()
-                let url = files.singleURL(owner: owner, publicChatID: publicChatID)
-                guard files.exists(url) else { return nil }
-                let conversation = try files.decode(
-                    OracleSingleConversationDocument.self,
-                    from: try Data(contentsOf: url)
-                )
-                try files.validate(conversation)
-                guard conversation.owner == owner else { throw OraclePersistenceError.ownerMismatch }
-                return conversation
-            }
-        }
-    }
-
-    package func save(
-        _ conversation: OracleSingleConversationDocument,
-        expectedRevision: UInt64
-    ) async throws {
-        #if DEBUG
-            try consumeForcedSaveFailure()
-        #endif
-        try await perform { files in
-            try files.withMutationLock {
-                try files.recoverTransactions()
-                let url = files.singleURL(
-                    owner: conversation.owner,
-                    publicChatID: conversation.publicChatID
-                )
-                guard files.exists(url) else { throw OraclePersistenceError.notFound }
-                let current = try files.decode(
-                    OracleSingleConversationDocument.self,
-                    from: try Data(contentsOf: url)
-                )
-                guard current.revision == expectedRevision else {
-                    throw OraclePersistenceError.revisionConflict(
-                        expected: expectedRevision,
-                        actual: current.revision
-                    )
-                }
-                guard conversation.revision == expectedRevision &+ 1,
-                      conversation.owner == current.owner,
-                      conversation.publicChatID == current.publicChatID,
-                      conversation.model == current.model,
-                      conversation.createdAt == current.createdAt,
-                      conversation.updatedAt >= current.updatedAt
-                else {
-                    throw OraclePersistenceError.invalidDocument("invalid_single_transition")
-                }
-                try files.validate(conversation)
-                if current.turns.last?.state == .prepared {
-                    guard conversation.turns.count == current.turns.count,
-                          Array(conversation.turns.dropLast()) == Array(current.turns.dropLast()),
-                          conversation.turns.last?.id == current.turns.last?.id,
-                          conversation.turns.last?.input == current.turns.last?.input,
-                          conversation.turns.last?.startedAt == current.turns.last?.startedAt,
-                          conversation.turns.last?.state == .terminal
-                    else {
-                        throw OraclePersistenceError.invalidDocument("invalid_single_terminal_transition")
-                    }
-                } else {
-                    guard conversation.turns.count == current.turns.count + 1,
-                          Array(conversation.turns.dropLast()) == current.turns,
-                          conversation.turns.last?.state == .prepared
-                    else {
-                        throw OraclePersistenceError.invalidDocument("invalid_single_prepare_transition")
-                    }
-                }
-                try files.commit([.write(relativePath: files.relative(url), data: try files.encode(conversation))])
-            }
-        }
-    }
-
-    package func delete(
-        publicChatID: String,
-        owner: OracleConversationOwner,
-        expectedRevision: UInt64
-    ) async throws {
-        let claim = try await claimManager.acquireSingle(publicChatID: publicChatID, owner: owner)
-        defer { claim.release() }
-        try await perform { files in
-            try files.withMutationLock {
-                try files.recoverTransactions()
-                let url = files.singleURL(owner: owner, publicChatID: publicChatID)
-                guard files.exists(url) else { throw OraclePersistenceError.notFound }
-                let current = try files.decode(
-                    OracleSingleConversationDocument.self,
-                    from: try Data(contentsOf: url)
-                )
-                guard current.owner == owner else { throw OraclePersistenceError.ownerMismatch }
-                guard current.revision == expectedRevision else {
-                    throw OraclePersistenceError.revisionConflict(
-                        expected: expectedRevision,
-                        actual: current.revision
-                    )
-                }
-                try files.validate(current)
-                let groups = try files.loadAndValidateAllGroups()
-                let singles = try files.loadAndValidateAllSingles()
-                let retainedSingles = singles.filter {
-                    $0.owner != owner || $0.publicChatID != publicChatID
-                }
-                let retainedArtifacts = Set(
-                    groups.flatMap(files.referencedArtifactIDs)
-                        + retainedSingles.flatMap(files.referencedArtifactIDs)
-                ).union(self.artifactReservations.artifactIDs())
-                let removedArtifacts = Set(files.referencedArtifactIDs(current))
-                    .subtracting(retainedArtifacts)
-                var writes: [OracleTransactionWrite] = [
-                    .remove(relativePath: files.relative(url))
-                ]
-                writes.append(contentsOf: removedArtifacts.map {
-                    .remove(relativePath: files.relative(files.artifactURL($0)))
-                })
-                try files.commit(writes)
-            }
-        }
-    }
-
     package func storeArtifact(_ data: Data) async throws -> String {
         let digest = DomainContentDigest.sha256(data)
         return try await perform { files in
@@ -551,7 +408,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 try files.recoverTransactions()
                 let url = files.artifactURL(digest)
                 if files.exists(url) {
-                    guard DomainContentDigest.sha256(try Data(contentsOf: url)) == digest else {
+                    guard try DomainContentDigest.sha256(Data(contentsOf: url)) == digest else {
                         throw OraclePersistenceError.artifactDigestMismatch(digest)
                     }
                 } else {
@@ -596,9 +453,8 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
             try files.withMutationLock {
                 try files.recoverTransactions()
                 guard !self.artifactReservations.contains(id) else { return }
-                let referenced = Set(
-                    try files.loadAndValidateAllGroups().flatMap(files.referencedArtifactIDs)
-                        + files.loadAndValidateAllSingles().flatMap(files.referencedArtifactIDs)
+                let referenced = try Set(
+                    files.loadAndValidateAllGroups().flatMap(files.referencedArtifactIDs)
                 )
                 guard !referenced.contains(id), files.exists(files.artifactURL(id)) else { return }
                 try files.commit([.remove(relativePath: files.relative(files.artifactURL(id)))])
@@ -615,10 +471,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
                 let groups = try files.loadAndValidateAllGroups()
                     .filter { $0.owner == owner }
                     .map { ($0.updatedAt, OracleStoredConversation.group($0)) }
-                let singles = try files.loadAndValidateAllSingles()
-                    .filter { $0.owner == owner }
-                    .map { ($0.updatedAt, OracleStoredConversation.single($0)) }
-                return (groups + singles).max { lhs, rhs in lhs.0 < rhs.0 }?.1
+                return groups.max { lhs, rhs in lhs.0 < rhs.0 }?.1
             }
         }
     }
@@ -645,14 +498,14 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleSingleConve
     }
 }
 
-private struct OracleMemberIndexEntry: Codable, Equatable, Sendable {
+private struct OracleMemberIndexEntry: Codable, Equatable {
     let owner: OracleConversationOwner
     let publicChatID: String
     let groupID: OracleGroupID
     let laneIndex: Int
 }
 
-private struct OracleMemberIndexDocument: Codable, Sendable {
+private struct OracleMemberIndexDocument: Codable {
     static let currentVersion = 1
 
     let version: Int
@@ -677,7 +530,7 @@ private struct OracleMemberIndexDocument: Codable, Sendable {
     }
 }
 
-private struct OracleTransactionWrite: Codable, Sendable {
+private struct OracleTransactionWrite: Codable {
     let relativePath: String
     let data: Data?
 
@@ -690,7 +543,7 @@ private struct OracleTransactionWrite: Codable, Sendable {
     }
 }
 
-private struct OracleTransactionJournal: Codable, Sendable {
+private struct OracleTransactionJournal: Codable {
     static let currentVersion = 1
 
     let version: Int
@@ -709,11 +562,22 @@ private struct OracleStorageFiles: @unchecked Sendable {
     let cancellation: DomainBlockingCancellation
     let mutationObserver: DomainOracleConversationStore.MutationObserver
 
-    var indexURL: URL { root.appendingPathComponent("index.json") }
-    private var groupsDirectory: URL { root.appendingPathComponent("groups", isDirectory: true) }
-    private var singlesDirectory: URL { root.appendingPathComponent("singles", isDirectory: true) }
-    private var artifactsDirectory: URL { root.appendingPathComponent("artifacts", isDirectory: true) }
-    private var transactionsDirectory: URL { root.appendingPathComponent("transactions", isDirectory: true) }
+    var indexURL: URL {
+        root.appendingPathComponent("index.json")
+    }
+
+    private var groupsDirectory: URL {
+        root.appendingPathComponent("groups", isDirectory: true)
+    }
+
+    private var artifactsDirectory: URL {
+        root.appendingPathComponent("artifacts", isDirectory: true)
+    }
+
+    private var transactionsDirectory: URL {
+        root.appendingPathComponent("transactions", isDirectory: true)
+    }
+
     private var mutationLockURL: URL {
         root.appendingPathComponent("locks", isDirectory: true).appendingPathComponent("mutation.lock")
     }
@@ -728,19 +592,24 @@ private struct OracleStorageFiles: @unchecked Sendable {
         JSONDecoder()
     }
 
-    func encode<T: Encodable>(_ value: T) throws -> Data { try encoder.encode(value) }
-    func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T { try decoder.decode(type, from: data) }
-    func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+    func encode(_ value: some Encodable) throws -> Data {
+        try encoder.encode(value)
+    }
+
+    func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        try decoder.decode(type, from: data)
+    }
+
+    func exists(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
 
     func groupURL(_ id: OracleGroupID) -> URL {
         groupsDirectory.appendingPathComponent("\(id.rawValue.uuidString).json")
     }
 
-    func artifactURL(_ id: String) -> URL { artifactsDirectory.appendingPathComponent("\(id).blob") }
-
-    func singleURL(owner: OracleConversationOwner, publicChatID: String) -> URL {
-        let key = "\(owner.kind)\u{0}\(owner.identifier)\u{0}\(publicChatID)"
-        return singlesDirectory.appendingPathComponent("\(DomainContentDigest.sha256(Data(key.utf8))).json")
+    func artifactURL(_ id: String) -> URL {
+        artifactsDirectory.appendingPathComponent("\(id).blob")
     }
 
     func relative(_ url: URL) -> String {
@@ -755,7 +624,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
         let operationID = UUID()
         let journal = OracleTransactionJournal(operationID: operationID, writes: writes)
         let journalURL = transactionsDirectory.appendingPathComponent("\(operationID.uuidString).json")
-        try DomainPersistenceLock.atomicWrite(try encode(journal), to: journalURL)
+        try DomainPersistenceLock.atomicWrite(encode(journal), to: journalURL)
         try mutationObserver(.journalPersisted(operationID))
         try apply(journal)
         try FileManager.default.removeItem(at: journalURL)
@@ -798,7 +667,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
         else {
             throw OraclePersistenceError.invalidDocument("invalid_transaction_path")
         }
-        let allowed = ["groups/", "singles/", "artifacts/", "index.json"]
+        let allowed = ["groups/", "artifacts/", "index.json"]
         guard allowed.contains(where: { relativePath == $0 || relativePath.hasPrefix($0) }) else {
             throw OraclePersistenceError.invalidDocument("invalid_transaction_path")
         }
@@ -834,19 +703,6 @@ private struct OracleStorageFiles: @unchecked Sendable {
             try validateIndex(for: group)
         }
         return groups
-    }
-
-    func loadAndValidateAllSingles() throws -> [OracleSingleConversationDocument] {
-        guard exists(singlesDirectory) else { return [] }
-        let urls = try FileManager.default.contentsOfDirectory(
-            at: singlesDirectory,
-            includingPropertiesForKeys: nil
-        ).filter { $0.pathExtension == "json" }
-        let singles = try urls.map {
-            try decode(OracleSingleConversationDocument.self, from: Data(contentsOf: $0))
-        }
-        for single in singles { try validate(single) }
-        return singles
     }
 
     func validatePreparedCreate(_ group: OracleGroupDocument) throws {
@@ -916,13 +772,10 @@ private struct OracleStorageFiles: @unchecked Sendable {
               next.createdAt == current.createdAt,
               next.roster == current.roster,
               next.members.map({ ($0.laneID, $0.memberID, $0.publicChatID, $0.model) })
-                .elementsEqual(current.members.map({ ($0.laneID, $0.memberID, $0.publicChatID, $0.model) }), by: ==),
+              .elementsEqual(current.members.map { ($0.laneID, $0.memberID, $0.publicChatID, $0.model) }, by: ==),
               next.updatedAt >= current.updatedAt
         else {
             throw OraclePersistenceError.invalidDocument("immutable_group_identity_changed")
-        }
-        if isSynthesisOnlyTransition(from: current.turns, to: next.turns) {
-            return
         }
         if current.turns.last?.state == .prepared {
             guard next.turns.count == current.turns.count,
@@ -940,66 +793,6 @@ private struct OracleStorageFiles: @unchecked Sendable {
                   next.turns.last?.state == .prepared
             else {
                 throw OraclePersistenceError.invalidDocument("invalid_prepare_transition")
-            }
-        }
-    }
-
-    private func isSynthesisOnlyTransition(
-        from currentTurns: [OracleTurnRecord],
-        to nextTurns: [OracleTurnRecord]
-    ) -> Bool {
-        guard currentTurns.count == nextTurns.count else { return false }
-        var additions = 0
-        for (current, next) in zip(currentTurns, nextTurns) {
-            guard current.id == next.id,
-                  current.input == next.input,
-                  current.state == next.state,
-                  current.startedAt == next.startedAt,
-                  current.finishedAt == next.finishedAt,
-                  current.results == next.results
-            else { return false }
-            switch (current.synthesis, next.synthesis) {
-            case (nil, .some):
-                additions += 1
-            case let (currentSynthesis, nextSynthesis) where currentSynthesis == nextSynthesis:
-                continue
-            default:
-                return false
-            }
-        }
-        return additions == 1
-    }
-
-    func validate(_ conversation: OracleSingleConversationDocument) throws {
-        guard conversation.schemaVersion == OracleSingleConversationDocument.currentSchemaVersion else {
-            throw OraclePersistenceError.futureSchema(conversation.schemaVersion)
-        }
-        guard conversation.revision > 0,
-              !conversation.publicChatID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              Set(conversation.turns.map(\.id)).count == conversation.turns.count
-        else {
-            throw OraclePersistenceError.invalidDocument("invalid_single")
-        }
-        for (index, turn) in conversation.turns.enumerated() {
-            try validateInput(turn.input)
-            switch turn.state {
-            case .prepared:
-                guard index == conversation.turns.count - 1,
-                      turn.finishedAt == nil,
-                      turn.results.isEmpty
-                else {
-                    throw OraclePersistenceError.invalidDocument("invalid_single_prepared_turn")
-                }
-            case .terminal:
-                guard turn.finishedAt != nil,
-                      turn.results.count == 1,
-                      turn.results[0].laneIndex == 0,
-                      turn.results[0].chatID == conversation.publicChatID,
-                      turn.results[0].modelID == conversation.model.modelID,
-                      turn.results[0].providerID == conversation.model.providerID
-                else {
-                    throw OraclePersistenceError.invalidDocument("invalid_single_terminal_turn")
-                }
             }
         }
     }
@@ -1056,14 +849,12 @@ private struct OracleStorageFiles: @unchecked Sendable {
         var index = try loadIndex()
         index = index.replacing(entries: index.entries.filter { !removedIDs.contains($0.groupID) })
         let retained = allGroups.filter { !removedIDs.contains($0.group.id) }
-        let retainedSingles = try loadAndValidateAllSingles()
         let retainedArtifacts = Set(
             retained.flatMap(referencedArtifactIDs)
-                + retainedSingles.flatMap(referencedArtifactIDs)
         ).union(reservedArtifacts)
         let removedArtifacts = Set(removed.flatMap(referencedArtifactIDs)).subtracting(retainedArtifacts)
         var writes = removed.map { OracleTransactionWrite.remove(relativePath: relative(groupURL($0.group.id))) }
-        writes.append(.write(relativePath: relative(indexURL), data: try encode(index)))
+        try writes.append(.write(relativePath: relative(indexURL), data: encode(index)))
         writes.append(contentsOf: removedArtifacts.map {
             .remove(relativePath: relative(artifactURL($0)))
         })
@@ -1072,10 +863,6 @@ private struct OracleStorageFiles: @unchecked Sendable {
 
     func referencedArtifactIDs(_ group: OracleGroupDocument) -> [String] {
         referencedArtifactIDs(group.turns)
-    }
-
-    func referencedArtifactIDs(_ conversation: OracleSingleConversationDocument) -> [String] {
-        referencedArtifactIDs(conversation.turns)
     }
 
     private func referencedArtifactIDs(_ turns: [OracleTurnRecord]) -> [String] {

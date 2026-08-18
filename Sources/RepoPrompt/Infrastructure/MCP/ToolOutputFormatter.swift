@@ -4341,7 +4341,7 @@ extension ToolOutputFormatter {
                     "## Generated Response"
                 }
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                if let groupBlock = formatOracleGroup(value: planObj, heading: heading, preferSynthesis: true) {
+                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
                     blocks.append(.text(separator + groupBlock))
                 } else {
                     blocks.append(.text("\(separator)\(heading)\n"))
@@ -4353,11 +4353,7 @@ extension ToolOutputFormatter {
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                if let groupBlock = formatOracleGroup(
-                    value: reviewObj,
-                    heading: "## Code Review",
-                    preferSynthesis: true
-                ) {
+                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
                     blocks.append(.text(separator + groupBlock))
                 } else {
                     blocks.append(.text("\(separator)## Code Review\n"))
@@ -4389,8 +4385,7 @@ extension ToolOutputFormatter {
 
     private static func formatOracleGroup(
         value: Value,
-        heading: String,
-        preferSynthesis: Bool = false
+        heading: String
     ) -> String? {
         guard let dto = value.decode(ToolResultDTOs.ChatSendDTO.self),
               let count = dto.oracleCount,
@@ -4410,33 +4405,6 @@ extension ToolOutputFormatter {
         }
         if let groupID = dto.oracleGroupID {
             lines.append("- Oracle group: `\(groupID)`")
-        }
-        if preferSynthesis, let synthesis = dto.synthesis {
-            if synthesis.status == ContextBuilderOracleSynthesisStatus.completed.rawValue,
-               let response = synthesis.response,
-               !response.isEmpty
-            {
-                lines.append("")
-                lines.append("### Synthesized Response")
-                if let modelID = synthesis.model?.modelID {
-                    lines.append("- Model: `\(modelID)`")
-                }
-                lines.append("- Source lanes: \(synthesis.sourceLaneIndices.map(String.init).joined(separator: ", "))")
-                if let warning = synthesis.warning, !warning.isEmpty {
-                    lines.append("- Warning: \(warning)")
-                }
-                lines.append("")
-                lines.append(response)
-                lines.append("")
-                lines.append("### Oracle Lanes")
-            } else if synthesis.status == ContextBuilderOracleSynthesisStatus.skipped.rawValue {
-                lines.append("")
-                let reason = synthesis.resolvedSkippedReason
-                lines.append("- Synthesis skipped" + (reason.map { ": \($0)" } ?? ""))
-            } else if let error = synthesis.error, !error.isEmpty {
-                lines.append("")
-                lines.append("- Synthesis \(synthesis.status): \(error)")
-            }
         }
         let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
             let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {

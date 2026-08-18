@@ -52,8 +52,7 @@ struct ContextBuilderCallCard: View {
         contextBuilderCardSubtitle(
             contextBuilderAgentVM: contextBuilderAgentVM,
             fallbackStatus: nil,
-            phase: phase,
-            tabID: context.tabID
+            phase: phase
         )
     }
 
@@ -194,68 +193,40 @@ struct ContextBuilderResultCard: View {
         contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: dto)
     }
 
-    private var synthesisSummary: ContextBuilderSynthesisTerminalSummary? {
-        contextBuilderSynthesisTerminalSummary(for: dto)
-    }
-
     private var summary: String {
         if isActiveResultCard {
-            let base = contextBuilderCardSubtitle(
+            return contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 fallbackStatus: dto?.status,
-                phase: phase,
-                tabID: context.tabID
+                phase: phase
             )
-            return phase == .completed
-                ? contextBuilderStatusLabel(base, synthesisSummary: synthesisSummary)
-                : base
         }
-        return contextBuilderStatusLabel(
-            contextBuilderFinalStatusLabel(dto?.status),
-            synthesisSummary: synthesisSummary
-        )
+        return contextBuilderFinalStatusLabel(dto?.status)
     }
 
     private var status: ToolCardStatus {
         if phase == .running || phase == .generatingPlan { return .running }
         if item.toolIsError == true { return .failure }
 
-        let baseStatus: ToolCardStatus = if let dto {
+        if let dto {
             switch dto.status?.lowercased() {
-            case "error": .failure
-            case "partial", "warning": .warning
+            case "error": return .failure
+            case "partial", "warning": return .warning
             case "running", "in_progress", "pending", "success", "completed":
-                .success
-            default:
-                ToolResultStatusResolver.resolve(
-                    toolIsError: item.toolIsError,
-                    raw: item.toolResultJSON,
-                    fallback: .neutral
-                )
+                return .success
+            default: break
             }
-        } else {
-            ToolResultStatusResolver.resolve(
-                toolIsError: item.toolIsError,
-                raw: item.toolResultJSON,
-                fallback: .neutral
-            )
         }
-        return contextBuilderStatusApplyingSynthesisDegradation(
-            baseStatus,
-            synthesisSummary: synthesisSummary
-        )
-    }
-
-    private var fallbackOracleLanes: [ContextBuilderOracleLaneSummary] {
-        contextBuilderOracleLaneSummaries(
-            for: contextBuilderAgentVM.currentFollowUpOracleLanes(for: context.tabID)
+        return ToolResultStatusResolver.resolve(
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON,
+            fallback: .neutral
         )
     }
 
     private var isExpandable: Bool {
         if phase == .completed {
-            let hasOwnedFallback = isActiveResultCard && !fallbackOracleLanes.isEmpty
-            return dto != nil || hasOwnedFallback || context.oracleOpenContext != nil
+            return dto != nil || context.oracleOpenContext != nil
         }
         return true
     }
@@ -315,8 +286,6 @@ struct ContextBuilderResultCard: View {
             } else {
                 ContextBuilderCompletedSummaryView(
                     dto: dto,
-                    fallbackOracleLanes: fallbackOracleLanes,
-                    allowsFallbackOracleLanes: isActiveResultCard,
                     oracleOpenContext: context.oracleOpenContext
                 )
             }
@@ -437,10 +406,6 @@ private struct ContextBuilderPlanProgressView: View {
     let oracleOpenContext: AgentOracleOpenContext?
     let onCancelPlan: () -> Void
 
-    private var isSynthesizing: Bool {
-        contextBuilderAgentVM.isSynthesizingOracleResponses(for: tabID)
-    }
-
     private var isReasoningOnly: Bool {
         let response = contextBuilderAgentVM.backgroundPlanResponsePreviewText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -453,12 +418,6 @@ private struct ContextBuilderPlanProgressView: View {
 
     private var followUpChatID: String? {
         contextBuilderAgentVM.currentFollowUpOracleChatID(for: tabID)
-    }
-
-    private var oracleLanes: [ContextBuilderOracleLaneSummary] {
-        contextBuilderOracleLaneSummaries(
-            for: contextBuilderAgentVM.currentFollowUpOracleLanes(for: tabID)
-        )
     }
 
     private func openOraclePreview() {
@@ -475,31 +434,17 @@ private struct ContextBuilderPlanProgressView: View {
                 ProgressView()
                     .controlSize(.mini)
                     .scaleEffect(0.7)
-                if isSynthesizing {
-                    Image(systemName: "wand.and.stars")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.purple)
-                }
+                Text("Generating \(followUpLabel)...")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
 
-                Text(
-                    isSynthesizing
-                        ? "Synthesizing \(followUpLabel)..."
-                        : "Generating \(followUpLabel)..."
-                )
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-
-                if isReasoningOnly, !isSynthesizing {
+                if isReasoningOnly {
                     Image(systemName: "brain")
                         .font(.system(size: 10))
                         .foregroundStyle(.purple)
                 }
 
                 Spacer()
-            }
-
-            if !oracleLanes.isEmpty {
-                ContextBuilderOracleLaneRows(lanes: oracleLanes)
             }
 
             HStack(spacing: 8) {
@@ -530,8 +475,6 @@ private struct ContextBuilderPlanProgressView: View {
 
 private struct ContextBuilderCompletedSummaryView: View {
     let dto: ToolResultDTOs.ContextBuilderDTO?
-    let fallbackOracleLanes: [ContextBuilderOracleLaneSummary]
-    let allowsFallbackOracleLanes: Bool
     let oracleOpenContext: AgentOracleOpenContext?
 
     private var followUpChatID: String? {
@@ -560,15 +503,7 @@ private struct ContextBuilderCompletedSummaryView: View {
     }
 
     private var oracleLanes: [ContextBuilderOracleLaneSummary] {
-        contextBuilderCompletedOracleLaneSummaries(
-            dto: dto,
-            fallback: fallbackOracleLanes,
-            allowsFallback: allowsFallbackOracleLanes
-        )
-    }
-
-    private var synthesisSummary: ContextBuilderSynthesisTerminalSummary? {
-        contextBuilderSynthesisTerminalSummary(for: dto)
+        contextBuilderOracleLaneSummaries(for: dto)
     }
 
     private func openOraclePreview() {
@@ -606,20 +541,6 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let synthesisSummary {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(synthesisSummary.headline)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    if let detail = synthesisSummary.detail {
-                        Text(detail)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(3)
-                    }
-                }
-            }
-
             Button("Open Oracle", action: openOraclePreview)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -646,87 +567,6 @@ func contextBuilderOraclePopoverUserInfo(
         chatID: chatID,
         presentation: .generatedAnswerReadOnly
     )
-}
-
-struct ContextBuilderSynthesisTerminalSummary: Equatable {
-    let headline: String
-    let detail: String?
-    let collapsedSuffix: String
-    let isDegraded: Bool
-}
-
-func contextBuilderSynthesisTerminalSummary(
-    for dto: ToolResultDTOs.ContextBuilderDTO?
-) -> ContextBuilderSynthesisTerminalSummary? {
-    guard let dto,
-          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
-    else { return nil }
-
-    let synthesis = switch branch {
-    case .review: dto.review?.synthesis
-    case .plan: dto.plan?.synthesis
-    }
-    guard let synthesis else { return nil }
-
-    switch synthesis.status {
-    case ContextBuilderOracleSynthesisStatus.completed.rawValue:
-        let modelSuffix = nonEmptyContextBuilderValue(synthesis.model?.modelID).map { " • \($0)" } ?? ""
-        if let warning = nonEmptyContextBuilderValue(synthesis.warning) {
-            return ContextBuilderSynthesisTerminalSummary(
-                headline: "Synthesis: completed\(modelSuffix)",
-                detail: "Warning: \(warning)",
-                collapsedSuffix: "synthesis completed (warning)",
-                isDegraded: true
-            )
-        }
-        return ContextBuilderSynthesisTerminalSummary(
-            headline: "Synthesis: completed\(modelSuffix)",
-            detail: nil,
-            collapsedSuffix: "synthesis completed",
-            isDegraded: false
-        )
-    case ContextBuilderOracleSynthesisStatus.skipped.rawValue:
-        return ContextBuilderSynthesisTerminalSummary(
-            headline: "Synthesis: skipped",
-            detail: nonEmptyContextBuilderValue(synthesis.resolvedSkippedReason),
-            collapsedSuffix: "synthesis skipped",
-            isDegraded: false
-        )
-    case ContextBuilderOracleSynthesisStatus.failed.rawValue:
-        return ContextBuilderSynthesisTerminalSummary(
-            headline: "Synthesis: failed",
-            detail: nonEmptyContextBuilderValue(synthesis.error),
-            collapsedSuffix: "synthesis failed",
-            isDegraded: true
-        )
-    default:
-        return ContextBuilderSynthesisTerminalSummary(
-            headline: "Synthesis: \(synthesis.status)",
-            detail: nonEmptyContextBuilderValue(synthesis.error)
-                ?? nonEmptyContextBuilderValue(synthesis.resolvedSkippedReason),
-            collapsedSuffix: "synthesis \(synthesis.status)",
-            isDegraded: false
-        )
-    }
-}
-
-func contextBuilderGeneratingSubtitle(followUpLabel: String, isSynthesizing: Bool) -> String {
-    "\(isSynthesizing ? "synthesizing" : "generating") \(followUpLabel)"
-}
-
-func contextBuilderStatusLabel(
-    _ base: String,
-    synthesisSummary: ContextBuilderSynthesisTerminalSummary?
-) -> String {
-    guard let synthesisSummary else { return base }
-    return "\(base) • \(synthesisSummary.collapsedSuffix)"
-}
-
-func contextBuilderStatusApplyingSynthesisDegradation(
-    _ base: ToolCardStatus,
-    synthesisSummary: ContextBuilderSynthesisTerminalSummary?
-) -> ToolCardStatus {
-    base == .success && synthesisSummary?.isDegraded == true ? .warning : base
 }
 
 struct ContextBuilderOracleLaneSummary: Equatable {
@@ -762,21 +602,6 @@ private struct ContextBuilderOracleLaneRows: View {
 }
 
 func contextBuilderOracleLaneSummaries(
-    for lanes: [RepoPromptOracleLaneProgress]
-) -> [ContextBuilderOracleLaneSummary] {
-    lanes.map { lane in
-        ContextBuilderOracleLaneSummary(
-            laneIndex: lane.laneIndex,
-            label: OracleRosterContract.displayLabel(laneIndex: lane.laneIndex),
-            chatID: nil,
-            modelID: lane.modelID,
-            effectiveReasoningEffort: nil,
-            status: lane.status
-        )
-    }
-}
-
-func contextBuilderOracleLaneSummaries(
     for dto: ToolResultDTOs.ContextBuilderDTO?
 ) -> [ContextBuilderOracleLaneSummary] {
     guard let dto,
@@ -803,21 +628,9 @@ func contextBuilderOracleLaneSummaries(
             chatID: lane.chatID,
             modelID: lane.executionProfile?.modelID ?? lane.modelID,
             effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
-            status: lane.status == OracleLaneResultStatus.completed.rawValue
-                ? ContextBuilderOracleLaneDisplayStatus.done.rawValue
-                : ContextBuilderOracleLaneDisplayStatus.failed.rawValue
+            status: lane.status == OracleLaneResultStatus.completed.rawValue ? "done" : "failed"
         )
     }
-}
-
-func contextBuilderCompletedOracleLaneSummaries(
-    dto: ToolResultDTOs.ContextBuilderDTO?,
-    fallback: [ContextBuilderOracleLaneSummary],
-    allowsFallback: Bool
-) -> [ContextBuilderOracleLaneSummary] {
-    let terminal = contextBuilderOracleLaneSummaries(for: dto)
-    if !terminal.isEmpty { return terminal }
-    return allowsFallback ? fallback : []
 }
 
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
@@ -914,8 +727,7 @@ private func contextBuilderCardDetailLine(
 private func contextBuilderCardSubtitle(
     contextBuilderAgentVM: ContextBuilderAgentViewModel,
     fallbackStatus: String?,
-    phase: ContextBuilderCardPhase,
-    tabID: UUID?
+    phase: ContextBuilderCardPhase
 ) -> String {
     var parts: [String] = []
     switch phase {
@@ -925,10 +737,7 @@ private func contextBuilderCardSubtitle(
             parts.append("\(contextBuilderAgentVM.toolCallCount) tools")
         }
     case .generatingPlan:
-        parts.append(contextBuilderGeneratingSubtitle(
-            followUpLabel: contextBuilderFollowUpLabel(contextBuilderAgentVM: contextBuilderAgentVM),
-            isSynthesizing: contextBuilderAgentVM.isSynthesizingOracleResponses(for: tabID)
-        ))
+        parts.append("generating \(contextBuilderFollowUpLabel(contextBuilderAgentVM: contextBuilderAgentVM))")
     case .completed:
         if let fallbackStatus = nonEmptyContextBuilderValue(fallbackStatus) {
             let normalized = fallbackStatus.lowercased()

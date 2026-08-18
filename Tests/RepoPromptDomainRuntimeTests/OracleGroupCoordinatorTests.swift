@@ -3,19 +3,8 @@ import Foundation
 import XCTest
 
 final class OracleGroupCoordinatorTests: XCTestCase {
-    func testRejectsSingleAndNoncontiguousLanePlans() async throws {
+    func testRejectsNoncontiguousLanePlans() async throws {
         let fixture = try makeFixture(count: 2)
-        let one = [fixture.plans[0]]
-        await XCTAssertOracleThrowsErrorAsync {
-            _ = try await OracleGroupCoordinator().execute(
-                group: try OracleGroupDescriptor(id: fixture.group.id, size: 2),
-                turnID: OracleTurnID(),
-                input: fixture.input,
-                plans: one
-            )
-        } verify: {
-            XCTAssertEqual($0 as? OracleGroupCoordinatorError, .singleLaneBypassRequired)
-        }
 
         await XCTAssertOracleThrowsErrorAsync {
             _ = try await OracleGroupCoordinator().execute(
@@ -201,7 +190,7 @@ final class OracleGroupCoordinatorTests: XCTestCase {
 
         for lane in 0 ..< 5 {
             let laneEvents = eventsAtReturn.filter { $0.laneID?.index == lane }
-            XCTAssertEqual(laneEvents.filter { $0.kind == .laneSettled }.count, 1)
+            XCTAssertEqual(laneEvents.count(where: { $0.kind == .laneSettled }), 1)
             XCTAssertEqual(laneEvents.compactMap(\.sequence), Array(0 ..< UInt64(laneEvents.count)))
         }
     }
@@ -234,11 +223,13 @@ private actor OracleProgressRecorder {
         recorded.append(event)
     }
 
-    func events() -> [OracleProgressEvent] { recorded }
+    func events() -> [OracleProgressEvent] {
+        recorded
+    }
 }
 
-private func XCTAssertOracleThrowsErrorAsync<T>(
-    _ expression: () async throws -> T,
+private func XCTAssertOracleThrowsErrorAsync(
+    _ expression: () async throws -> some Any,
     verify: (Error) -> Void
 ) async {
     do {

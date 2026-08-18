@@ -50,6 +50,13 @@ actor DirectHeadlessProviderCoordinator {
         var task: Task<Void, Never>?
     }
 
+    private struct Conversation {
+        let id: UUID
+        let providerID: String
+        var messages: [(role: String, text: String)]
+        var updatedAt: Date
+    }
+
     private let runtime: MCPDomainRuntime
     private let context: DirectHeadlessDomainContext
     private let settingsStore: DomainDirectSettingsStore
@@ -57,6 +64,7 @@ actor DirectHeadlessProviderCoordinator {
     private let beginEpoch: BeginEpoch
     private var agents: [UUID: AgentRecord] = [:]
     private var providerTasks: [UUID: Task<String, Error>] = [:]
+    private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
 
     init(
@@ -244,7 +252,7 @@ actor DirectHeadlessProviderCoordinator {
             guard let self else { return }
             let report = await DomainAgentRunExecutionCore.execute {
                 do {
-                    let text = try await self.runProviderOnce(
+                    let text = try await runProviderOnce(
                         message: message,
                         providerID: descriptor.id,
                         model: args["model"]?.stringValue,
@@ -367,6 +375,81 @@ actor DirectHeadlessProviderCoordinator {
             reason: .instructionDelivered
         )
         return current.toValue()
+    }
+
+    func createConversation(
+        providerID: String?,
+        message: String,
+        model: String?,
+        request: DomainPhysicalToolRequest
+    ) async throws -> (UUID, String) {
+        let descriptor = try resolveProvider(providerID)
+        let text = try await runProviderOnce(
+            message: message,
+            providerID: descriptor.id,
+            model: model,
+            request: request,
+            purpose: .oracle
+        )
+        let id = UUID()
+        conversations[id] = Conversation(
+            id: id,
+            providerID: descriptor.id,
+            messages: [("user", message), ("assistant", text)],
+            updatedAt: Date()
+        )
+        return (id, text)
+    }
+
+    func continueConversation(
+        id: UUID,
+        message: String,
+        model: String?,
+        request: DomainPhysicalToolRequest
+    ) async throws -> String {
+        guard var conversation = conversations[id] else {
+            throw MCPError.invalidParams("unknown chat_id")
+        }
+        let history = conversation.messages.map { "\($0.role): \($0.text)" }.joined(separator: "\n\n")
+        let prompt = history + "\n\nuser: " + message
+        let text = try await runProviderOnce(
+            message: prompt,
+            providerID: conversation.providerID,
+            model: model,
+            request: request,
+            purpose: .oracle
+        )
+        conversation.messages.append(("user", message))
+        conversation.messages.append(("assistant", text))
+        conversation.updatedAt = Date()
+        conversations[id] = conversation
+        return text
+    }
+
+    func conversationLog(id: UUID?, limit: Int) throws -> Value {
+        let conversation: Conversation
+        if let id {
+            guard let found = conversations[id] else {
+                throw MCPError.invalidParams("unknown chat_id")
+            }
+            conversation = found
+        } else {
+            guard let latest = conversations.values.max(by: { $0.updatedAt < $1.updatedAt }) else {
+                return .object(["messages": .array([])])
+            }
+            conversation = latest
+        }
+        let messages = conversation.messages.suffix(max(1, min(limit, 50))).map {
+            Value.object(["role": .string($0.role), "text": .string($0.text)])
+        }
+        return .object([
+            "chat_id": .string(conversation.id.uuidString),
+            "messages": .array(Array(messages))
+        ])
+    }
+
+    func latestConversationUpdatedAt() -> Date? {
+        conversations.values.map(\.updatedAt).max()
     }
 
     func shutdown() async {
