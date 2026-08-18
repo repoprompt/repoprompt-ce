@@ -43,31 +43,6 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
         XCTAssertTrue(markdown.contains("Error [provider_failed]: provider exploded"), markdown)
     }
 
-    func testToolOutputFormatterAdaptsExecutionProfileAndExcludesSynthesis() throws {
-        let value: Value = .object([
-            "chat_id": .string("chat-0"),
-            "response": .string("primary answer"),
-            "oracle_group_id": .string(UUID().uuidString),
-            "status": .string("completed"),
-            "oracle_count": .int(2),
-            "oracle_results": .array([
-                laneValue(index: 0, response: "primary answer"),
-                laneValue(index: 1, response: "adviser answer")
-            ]),
-            "synthesis": .object([
-                "status": .string("completed"),
-                "response": .string("must not be copied"),
-                "source_lane_indices": .array([.int(0), .int(1)])
-            ])
-        ])
-
-        let markdown = try onlyText(ToolOutputFormatter.formatAskOracle(args: [:], value: value, emitResources: false))
-        XCTAssertTrue(markdown.contains("- Provider: `runtime-provider-0`"), markdown)
-        XCTAssertTrue(markdown.contains("- Model: `runtime-model-0`"), markdown)
-        XCTAssertTrue(markdown.contains("- Effective effort: `high`"), markdown)
-        XCTAssertFalse(markdown.contains("must not be copied"), markdown)
-    }
-
     func testTerminalPayloadUsesDurableResultsAndExactExecutionProfile() throws {
         let startedAt = Date(timeIntervalSince1970: 1000)
         let fixture = try makeGroup(startedAt: startedAt, terminal: true)

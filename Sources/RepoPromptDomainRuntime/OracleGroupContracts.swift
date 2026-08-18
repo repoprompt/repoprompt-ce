@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 
-package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendable {
+package enum OracleGroupContractError: Error, LocalizedError, Equatable {
     case invalidLaneIndex(Int)
     case invalidModelIdentifier
     case modelIdentifierTooLong(Int)
@@ -13,8 +13,6 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendabl
     case modelOverrideOnContinuation
     case invalidLaneResult(Int)
     case invalidExecutionProfile
-    case invalidSynthesisRecord
-    case synthesisAlreadyRecorded
     case invalidGroupResult
     case invalidFrozenPackReference
     case invalidFrozenPack
@@ -44,10 +42,6 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable, Sendabl
             "Oracle lane \(index) has an invalid role, status, or payload."
         case .invalidExecutionProfile:
             "Oracle execution profiles require non-empty provider and model identifiers and a non-empty effort when supplied."
-        case .invalidSynthesisRecord:
-            "Oracle synthesis requires an ordered completed-lane set, a non-empty response, and an exact terminal turn."
-        case .synthesisAlreadyRecorded:
-            "Oracle synthesis cannot overwrite a different record on the same turn."
         case .invalidGroupResult:
             "Oracle group results require one ordered outcome for every declared lane."
         case .invalidFrozenPackReference:
@@ -121,7 +115,7 @@ package enum OracleRosterSettingsDescriptor {
     )
 }
 
-package struct OracleLaneID: Hashable, Codable, Sendable, Comparable {
+package struct OracleLaneID: Hashable, Codable, Comparable {
     package let index: Int
 
     package init(index: Int) throws {
@@ -134,7 +128,7 @@ package struct OracleLaneID: Hashable, Codable, Sendable, Comparable {
     }
 }
 
-package struct OracleModelReference: Hashable, Codable, Sendable {
+package struct OracleModelReference: Hashable, Codable {
     package let providerID: String?
     package let modelID: String
 
@@ -150,7 +144,7 @@ package struct OracleModelReference: Hashable, Codable, Sendable {
     }
 }
 
-package struct OracleRoster: Codable, Equatable, Sendable {
+package struct OracleRoster: Codable, Equatable {
     package let primary: OracleModelReference
     package let additional: [OracleModelReference]
 
@@ -180,12 +174,16 @@ package struct OracleRoster: Codable, Equatable, Sendable {
         [primary] + additional
     }
 
-    package var count: Int { orderedModels.count }
+    package var count: Int {
+        orderedModels.count
+    }
 }
 
-package struct OracleGroupID: Hashable, Codable, Sendable {
+package struct OracleGroupID: Hashable, Codable {
     package let rawValue: UUID
-    package init(rawValue: UUID = UUID()) { self.rawValue = rawValue }
+    package init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
 
     package init(from decoder: Decoder) throws {
         rawValue = try decoder.singleValueContainer().decode(UUID.self)
@@ -197,9 +195,11 @@ package struct OracleGroupID: Hashable, Codable, Sendable {
     }
 }
 
-package struct OracleMemberID: Hashable, Codable, Sendable {
+package struct OracleMemberID: Hashable, Codable {
     package let rawValue: UUID
-    package init(rawValue: UUID = UUID()) { self.rawValue = rawValue }
+    package init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
 
     package init(from decoder: Decoder) throws {
         rawValue = try decoder.singleValueContainer().decode(UUID.self)
@@ -211,9 +211,11 @@ package struct OracleMemberID: Hashable, Codable, Sendable {
     }
 }
 
-package struct OracleTurnID: Hashable, Codable, Sendable {
+package struct OracleTurnID: Hashable, Codable {
     package let rawValue: UUID
-    package init(rawValue: UUID = UUID()) { self.rawValue = rawValue }
+    package init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
 
     package init(from decoder: Decoder) throws {
         rawValue = try decoder.singleValueContainer().decode(UUID.self)
@@ -225,7 +227,7 @@ package struct OracleTurnID: Hashable, Codable, Sendable {
     }
 }
 
-package struct OracleConversationOwner: Hashable, Codable, Sendable {
+package struct OracleConversationOwner: Hashable, Codable {
     package let kind: String
     package let identifier: String
 
@@ -240,7 +242,7 @@ package struct OracleConversationOwner: Hashable, Codable, Sendable {
     }
 }
 
-package struct OracleGroupDescriptor: Hashable, Codable, Sendable {
+package struct OracleGroupDescriptor: Hashable, Codable {
     package let id: OracleGroupID
     package let size: Int
 
@@ -253,7 +255,7 @@ package struct OracleGroupDescriptor: Hashable, Codable, Sendable {
     }
 }
 
-package struct OracleLaneDescriptor: Hashable, Codable, Sendable {
+package struct OracleLaneDescriptor: Hashable, Codable {
     package let group: OracleGroupDescriptor
     package let laneID: OracleLaneID
     package let model: OracleModelReference
@@ -266,18 +268,18 @@ package struct OracleLaneDescriptor: Hashable, Codable, Sendable {
     }
 }
 
-package enum OracleMode: String, Codable, Sendable {
+package enum OracleMode: String, Codable {
     case chat
     case plan
     case review
 }
 
-package enum OracleContentReference: Codable, Equatable, Sendable {
+package enum OracleContentReference: Codable, Equatable {
     case inline(String)
     case durableArtifact(id: String)
 }
 
-package struct OracleEvidenceReference: Codable, Equatable, Sendable {
+package struct OracleEvidenceReference: Codable, Equatable {
     package let path: String
     package let contentDigest: String?
 
@@ -287,7 +289,7 @@ package struct OracleEvidenceReference: Codable, Equatable, Sendable {
     }
 }
 
-package struct OracleContextEnvelope: Codable, Equatable, Sendable {
+package struct OracleContextEnvelope: Codable, Equatable {
     package let content: OracleContentReference
     package let sha256: String
     package let provenance: [OracleEvidenceReference]
@@ -303,7 +305,7 @@ package struct OracleContextEnvelope: Codable, Equatable, Sendable {
     }
 }
 
-package struct OracleFrozenPackReference: Codable, Equatable, Hashable, Sendable {
+package struct OracleFrozenPackReference: Codable, Equatable, Hashable {
     package static let prefix = "oracle-pack:sha256:"
 
     package let artifactID: String
@@ -324,7 +326,9 @@ package struct OracleFrozenPackReference: Codable, Equatable, Hashable, Sendable
         try self.init(artifactID: String(rawValue.dropFirst(Self.prefix.count)))
     }
 
-    package var rawValue: String { Self.prefix + artifactID }
+    package var rawValue: String {
+        Self.prefix + artifactID
+    }
 
     package init(from decoder: Decoder) throws {
         try self.init(rawValue: decoder.singleValueContainer().decode(String.self))
@@ -338,7 +342,7 @@ package struct OracleFrozenPackReference: Codable, Equatable, Hashable, Sendable
 
 /// Versioned provider-neutral Context Builder output consumed by app and direct group adapters.
 /// The encoded bytes are canonical only when produced by `canonicalData()`.
-package struct OracleFrozenContextPack: Codable, Equatable, Sendable {
+package struct OracleFrozenContextPack: Codable, Equatable {
     package static let currentSchemaVersion = 1
 
     package let schemaVersion: Int
@@ -378,7 +382,7 @@ package struct OracleFrozenContextPack: Codable, Equatable, Sendable {
     }
 }
 
-package struct OracleInput: Codable, Equatable, Sendable {
+package struct OracleInput: Codable, Equatable {
     package let mode: OracleMode
     package let userMessage: String
     package let context: OracleContextEnvelope?
@@ -392,18 +396,18 @@ package struct OracleInput: Codable, Equatable, Sendable {
     }
 }
 
-package enum OracleLaneRole: String, Codable, Sendable {
+package enum OracleLaneRole: String, Codable {
     case primary
     case additional
 }
 
-package enum OracleLaneResultStatus: String, Codable, Sendable {
+package enum OracleLaneResultStatus: String, Codable {
     case completed
     case failed
     case cancelled
 }
 
-package struct OracleLaneError: Codable, Equatable, Sendable {
+package struct OracleLaneError: Codable, Equatable {
     package let code: String
     package let message: String
     package let partialResponse: String?
@@ -421,7 +425,7 @@ package struct OracleLaneError: Codable, Equatable, Sendable {
     }
 }
 
-package struct OracleExecutionProfile: Codable, Equatable, Sendable {
+package struct OracleExecutionProfile: Codable, Equatable {
     package let providerID: String
     package let modelID: String
     package let effectiveReasoningEffort: String?
@@ -461,7 +465,7 @@ package struct OracleExecutionProfile: Codable, Equatable, Sendable {
     }
 }
 
-package struct OracleLaneResult: Codable, Equatable, Sendable {
+package struct OracleLaneResult: Codable, Equatable {
     package let laneIndex: Int
     package let role: OracleLaneRole
     package let chatID: String
@@ -586,13 +590,13 @@ package struct OracleLaneResult: Codable, Equatable, Sendable {
     }
 }
 
-package enum OracleGroupStatus: String, Codable, Sendable {
+package enum OracleGroupStatus: String, Codable {
     case completed
     case partialFailure = "partial_failure"
     case failed
 }
 
-package struct OracleGroupWarning: Codable, Equatable, Sendable {
+package struct OracleGroupWarning: Codable, Equatable {
     package let code: String
     package let message: String
 
@@ -603,7 +607,7 @@ package struct OracleGroupWarning: Codable, Equatable, Sendable {
 }
 
 /// Canonical ordered N>1 result. App and direct adapters append their existing Primary projection.
-package struct OracleGroupResult: Codable, Equatable, Sendable {
+package struct OracleGroupResult: Codable, Equatable {
     package let groupID: OracleGroupID
     package let status: OracleGroupStatus
     package let oracleResults: [OracleLaneResult]
@@ -622,8 +626,13 @@ package struct OracleGroupResult: Codable, Equatable, Sendable {
         self.warnings = warnings
     }
 
-    package var oracleCount: Int { oracleResults.count }
-    package var primary: OracleLaneResult { oracleResults[0] }
+    package var oracleCount: Int {
+        oracleResults.count
+    }
+
+    package var primary: OracleLaneResult {
+        oracleResults[0]
+    }
 
     private enum CodingKeys: String, CodingKey {
         case groupID = "oracle_group_id"
@@ -732,7 +741,7 @@ package enum OracleGroupMCPCodec {
     }
 }
 
-package enum OracleProgressKind: String, Codable, Sendable {
+package enum OracleProgressKind: String, Codable {
     case groupPrepared = "group_prepared"
     case laneStarted = "lane_started"
     case laneDelta = "lane_delta"
@@ -740,7 +749,7 @@ package enum OracleProgressKind: String, Codable, Sendable {
     case groupSettled = "group_settled"
 }
 
-package struct OracleProgressEvent: Codable, Equatable, Sendable {
+package struct OracleProgressEvent: Codable, Equatable {
     package let kind: OracleProgressKind
     package let groupID: OracleGroupID
     package let turnID: OracleTurnID
@@ -765,7 +774,7 @@ package struct OracleProgressEvent: Codable, Equatable, Sendable {
     }
 }
 
-package struct OracleGroupMember: Codable, Equatable, Sendable {
+package struct OracleGroupMember: Codable, Equatable {
     package let laneID: OracleLaneID
     package let memberID: OracleMemberID
     package let publicChatID: String
@@ -789,64 +798,18 @@ package struct OracleGroupMember: Codable, Equatable, Sendable {
     }
 }
 
-package enum OracleTurnState: String, Codable, Sendable {
+package enum OracleTurnState: String, Codable {
     case prepared
     case terminal
 }
 
-package struct OracleSynthesisRecord: Codable, Equatable, Sendable {
-    package let model: OracleExecutionProfile
-    package let sourceLaneIndices: [Int]
-    package let response: String
-    package let finishedAt: Date
-
-    package init(
-        model: OracleExecutionProfile,
-        sourceLaneIndices: [Int],
-        response: String,
-        finishedAt: Date
-    ) throws {
-        let response = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard sourceLaneIndices.count >= 2,
-              sourceLaneIndices == sourceLaneIndices.sorted(),
-              Set(sourceLaneIndices).count == sourceLaneIndices.count,
-              sourceLaneIndices.allSatisfy({ $0 >= 0 }),
-              !response.isEmpty
-        else {
-            throw OracleGroupContractError.invalidSynthesisRecord
-        }
-        self.model = model
-        self.sourceLaneIndices = sourceLaneIndices
-        self.response = response
-        self.finishedAt = finishedAt
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case model
-        case sourceLaneIndices = "source_lane_indices"
-        case response
-        case finishedAt = "finished_at"
-    }
-
-    package init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            model: container.decode(OracleExecutionProfile.self, forKey: .model),
-            sourceLaneIndices: container.decode([Int].self, forKey: .sourceLaneIndices),
-            response: container.decode(String.self, forKey: .response),
-            finishedAt: container.decode(Date.self, forKey: .finishedAt)
-        )
-    }
-}
-
-package struct OracleTurnRecord: Codable, Equatable, Sendable {
+package struct OracleTurnRecord: Codable, Equatable {
     package let id: OracleTurnID
     package let input: OracleInput
     package let state: OracleTurnState
     package let startedAt: Date
     package let finishedAt: Date?
     package let results: [OracleLaneResult]
-    package let synthesis: OracleSynthesisRecord?
 
     package init(
         id: OracleTurnID = OracleTurnID(),
@@ -854,8 +817,7 @@ package struct OracleTurnRecord: Codable, Equatable, Sendable {
         state: OracleTurnState,
         startedAt: Date,
         finishedAt: Date? = nil,
-        results: [OracleLaneResult] = [],
-        synthesis: OracleSynthesisRecord? = nil
+        results: [OracleLaneResult] = []
     ) {
         self.id = id
         self.input = input
@@ -863,11 +825,10 @@ package struct OracleTurnRecord: Codable, Equatable, Sendable {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.results = results
-        self.synthesis = synthesis
     }
 }
 
-package struct OracleGroupDocument: Codable, Equatable, Sendable {
+package struct OracleGroupDocument: Codable, Equatable {
     package static let currentSchemaVersion = 1
 
     package let schemaVersion: Int
@@ -896,8 +857,7 @@ package struct OracleGroupDocument: Codable, Equatable, Sendable {
         guard group.size == roster.count,
               members.count == group.size,
               members.map(\.laneID.index) == Array(members.indices),
-              Set(turns.map(\.id)).count == turns.count,
-              turns.allSatisfy(Self.hasValidSynthesis)
+              Set(turns.map(\.id)).count == turns.count
         else {
             throw OracleGroupContractError.invalidGroupResult
         }
@@ -941,20 +901,9 @@ package struct OracleGroupDocument: Codable, Equatable, Sendable {
             turns: container.decodeIfPresent([OracleTurnRecord].self, forKey: .turns) ?? []
         )
     }
-
-    private static func hasValidSynthesis(_ turn: OracleTurnRecord) -> Bool {
-        guard let synthesis = turn.synthesis else { return true }
-        guard turn.state == .terminal,
-              let finishedAt = turn.finishedAt,
-              synthesis.finishedAt >= finishedAt
-        else { return false }
-        return synthesis.sourceLaneIndices == turn.results.compactMap { result in
-            result.status == .completed ? result.laneIndex : nil
-        }
-    }
 }
 
-package struct OracleMemberLookup: Codable, Equatable, Sendable {
+package struct OracleMemberLookup: Codable, Equatable {
     package let publicChatID: String
 
     package init(publicChatID: String) throws {
@@ -1015,91 +964,6 @@ package extension OracleGroupDocument {
             finishedAt: finishedAt
         )
     }
-
-    func recordingSynthesis(
-        _ synthesis: OracleSynthesisRecord,
-        for turnID: OracleTurnID
-    ) throws -> Self {
-        guard let turnIndex = turns.firstIndex(where: { $0.id == turnID }) else {
-            throw OracleGroupContractError.invalidSynthesisRecord
-        }
-        let turn = turns[turnIndex]
-        let completedLaneIndices = turn.results.compactMap { result in
-            result.status == .completed ? result.laneIndex : nil
-        }
-        guard turn.state == .terminal,
-              let turnFinishedAt = turn.finishedAt,
-              synthesis.finishedAt >= turnFinishedAt,
-              synthesis.sourceLaneIndices == completedLaneIndices
-        else {
-            throw OracleGroupContractError.invalidSynthesisRecord
-        }
-        if turn.synthesis == synthesis { return self }
-        guard turn.synthesis == nil else {
-            throw OracleGroupContractError.synthesisAlreadyRecorded
-        }
-
-        var updatedTurns = turns
-        updatedTurns[turnIndex] = OracleTurnRecord(
-            id: turn.id,
-            input: turn.input,
-            state: turn.state,
-            startedAt: turn.startedAt,
-            finishedAt: turn.finishedAt,
-            results: turn.results,
-            synthesis: synthesis
-        )
-        return try Self(
-            schemaVersion: schemaVersion,
-            group: group,
-            owner: owner,
-            name: name,
-            revision: revision &+ 1,
-            createdAt: createdAt,
-            updatedAt: max(updatedAt, synthesis.finishedAt),
-            roster: roster,
-            members: members,
-            turns: updatedTurns
-        )
-    }
-}
-
-package struct OracleSingleConversationDocument: Codable, Equatable, Sendable {
-    package static let currentSchemaVersion = 1
-
-    package let schemaVersion: Int
-    package let publicChatID: String
-    package let owner: OracleConversationOwner
-    package let model: OracleModelReference
-    package let providerConversationID: String?
-    package let revision: UInt64
-    package let createdAt: Date
-    package let updatedAt: Date
-    package let turns: [OracleTurnRecord]
-
-    package init(
-        schemaVersion: Int = Self.currentSchemaVersion,
-        publicChatID: String,
-        owner: OracleConversationOwner,
-        model: OracleModelReference,
-        providerConversationID: String? = nil,
-        revision: UInt64,
-        createdAt: Date,
-        updatedAt: Date,
-        turns: [OracleTurnRecord] = []
-    ) throws {
-        let publicChatID = publicChatID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !publicChatID.isEmpty else { throw OracleGroupContractError.invalidPublicChatID }
-        self.schemaVersion = schemaVersion
-        self.publicChatID = publicChatID
-        self.owner = owner
-        self.model = model
-        self.providerConversationID = providerConversationID
-        self.revision = revision
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-        self.turns = turns
-    }
 }
 
 package protocol OracleGroupStore: Sendable {
@@ -1118,14 +982,7 @@ package protocol OracleArtifactStore: Sendable {
     func loadArtifact(id: String) async throws -> Data
 }
 
-package protocol OracleSingleConversationStore: Sendable {
-    func create(_ conversation: OracleSingleConversationDocument) async throws
-    func load(publicChatID: String, owner: OracleConversationOwner) async throws -> OracleSingleConversationDocument?
-    func save(_ conversation: OracleSingleConversationDocument, expectedRevision: UInt64) async throws
-    func delete(publicChatID: String, owner: OracleConversationOwner, expectedRevision: UInt64) async throws
-}
-
-package enum OracleConversationRoute: Equatable, Sendable {
+package enum OracleConversationRoute: Equatable {
     case start(primaryModelOverride: String?)
     case continuation(chatID: String)
 
@@ -1146,7 +1003,7 @@ package enum OracleConversationRoute: Equatable, Sendable {
     }
 }
 
-package struct OracleRosterResolutionRequest: Codable, Equatable, Sendable {
+package struct OracleRosterResolutionRequest: Codable, Equatable {
     package let primaryModelOverride: String?
     package let newChat: Bool
 

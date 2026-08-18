@@ -6,168 +6,6 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class DirectHeadlessOracleGroupTests: XCTestCase {
-    func testSingleOracleUsesConfiguredPrimaryFlatShapeOneCallPerTurnAndColdContinuation() async throws {
-        let fixture = try Fixture(name: "single")
-        defer { fixture.cleanup() }
-        let service = fixture.service()
-        let prepared = try await service.prepareRuntime()
-        addTeardownBlock { await service.teardown(prepared) }
-        _ = try await prepared.settingsStore.set(
-            key: OracleRosterContract.primarySettingKey,
-            value: .string("configured-primary")
-        )
-        let backend = DirectHeadlessConversationBackend(
-            providerCoordinator: prepared.providerCoordinator,
-            oracleAdapter: prepared.oracleAdapter
-        )
-
-        let started = try await invoke(
-            prepared: prepared,
-            backend: backend,
-            toolName: "ask_oracle",
-            arguments: ["message": .string("first question")]
-        )
-        XCTAssertEqual(Set(started.keys), ["backend", "chat_id", "response"])
-        XCTAssertEqual(started["backend"] as? String, "headless")
-        XCTAssertEqual(started["response"] as? String, "response-0-configured-primary")
-        let chatID = try XCTUnwrap(started["chat_id"] as? String)
-        XCTAssertEqual(try fixture.calls().map(\.model), ["configured-primary"])
-
-        let coldService = fixture.service()
-        let cold = try await coldService.prepareRuntime()
-        addTeardownBlock { await coldService.teardown(cold) }
-        let coldBackend = DirectHeadlessConversationBackend(
-            providerCoordinator: cold.providerCoordinator,
-            oracleAdapter: cold.oracleAdapter
-        )
-        let continued = try await invoke(
-            prepared: cold,
-            backend: coldBackend,
-            toolName: "oracle_send",
-            arguments: ["chat_id": .string(chatID), "message": .string("second question")]
-        )
-        XCTAssertEqual(Set(continued.keys), ["backend", "chat_id", "response"])
-        XCTAssertEqual(continued["chat_id"] as? String, chatID)
-        XCTAssertEqual(try fixture.calls().map(\.model), ["configured-primary", "configured-primary"])
-
-        let log = try await cold.oracleAdapter.log(chatID: chatID, limit: 8)
-        let logObject = try Self.object(log)
-        let messages = try XCTUnwrap(logObject["messages"] as? [[String: Any]])
-        XCTAssertEqual(messages.compactMap { $0["role"] as? String }, ["user", "assistant", "user", "assistant"])
-        XCTAssertEqual(messages.compactMap { $0["text"] as? String }.first, "first question")
-    }
-
-    func testSuccessfulProviderResponseIsNotSettledFailedWhenTerminalSaveThrows() async throws {
-        let fixture = try Fixture(name: "persist-after-success")
-        defer { fixture.cleanup() }
-        let service = fixture.service()
-        let prepared = try await service.prepareRuntime()
-        addTeardownBlock { await service.teardown(prepared) }
-        try await Self.setRoster(prepared, primary: "configured-primary", additional: [])
-        let backend = DirectHeadlessConversationBackend(
-            providerCoordinator: prepared.providerCoordinator,
-            oracleAdapter: prepared.oracleAdapter
-        )
-        let task = Task {
-            try await invoke(
-                prepared: prepared,
-                backend: backend,
-                toolName: "ask_oracle",
-                arguments: ["message": .string("keep provider success")]
-            )
-        }
-        let deadline = ContinuousClock.now + .seconds(5)
-        while try fixture.calls().isEmpty, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertFalse(try fixture.calls().isEmpty, "Expected the provider to run before the terminal save")
-        await prepared.oracleStore.failNextSaves(1)
-        do {
-            _ = try await task.value
-            XCTFail("Expected the terminal save to fail")
-        } catch {
-            XCTAssertTrue(
-                String(describing: error).contains("debug_forced_save_failure"),
-                String(describing: error)
-            )
-        }
-        let owner = try OracleConversationOwner(
-            kind: "direct-headless",
-            identifier: fixture.profileName
-        )
-        guard case let .single(conversation)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
-            return XCTFail("Expected the prepared conversation to remain durable")
-        }
-        XCTAssertEqual(conversation.turns.last?.state, .prepared)
-        XCTAssertEqual(conversation.turns.last?.results ?? [], [])
-    }
-
-    func testConcurrentSingleContinuationCannotOverwriteActivePreparedTurn() async throws {
-        let fixture = try Fixture(name: "single-claim")
-        defer { fixture.cleanup() }
-        let service = fixture.service()
-        let prepared = try await service.prepareRuntime()
-        addTeardownBlock { await service.teardown(prepared) }
-        try await Self.setRoster(prepared, primary: "cancel-0", additional: [])
-        let backend = DirectHeadlessConversationBackend(
-            providerCoordinator: prepared.providerCoordinator,
-            oracleAdapter: prepared.oracleAdapter
-        )
-        let task = Task {
-            try await invoke(
-                prepared: prepared,
-                backend: backend,
-                toolName: "ask_oracle",
-                arguments: ["message": .string("active single")]
-            )
-        }
-        let deadline = ContinuousClock.now + .seconds(5)
-        while try fixture.calls().isEmpty, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        let owner = try OracleConversationOwner(
-            kind: "direct-headless",
-            identifier: fixture.profileName
-        )
-        guard case let .single(single)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
-            task.cancel()
-            return XCTFail("Expected an active prepared single conversation")
-        }
-        do {
-            _ = try await invoke(
-                prepared: prepared,
-                backend: backend,
-                toolName: "oracle_send",
-                arguments: [
-                    "chat_id": .string(single.publicChatID),
-                    "message": .string("must be rejected")
-                ]
-            )
-            XCTFail("Expected the live single claim to reject the continuation")
-        } catch {
-            XCTAssertEqual(error as? OracleGroupClaimError, .conflict)
-        }
-        let stillPrepared = try await prepared.oracleStore.load(
-            publicChatID: single.publicChatID,
-            owner: owner
-        )
-        XCTAssertEqual(stillPrepared?.revision, single.revision)
-        XCTAssertEqual(stillPrepared?.turns.last?.state, .prepared)
-        task.cancel()
-        do {
-            _ = try await task.value
-            XCTFail("Expected structural cancellation")
-        } catch is CancellationError {
-            // Expected.
-        }
-        let terminal = try await prepared.oracleStore.load(
-            publicChatID: single.publicChatID,
-            owner: owner
-        )
-        XCTAssertEqual(terminal?.turns.last?.state, .terminal)
-        XCTAssertEqual(terminal?.turns.last?.results.first?.status, .cancelled)
-    }
-
     func testTwoAndFiveOracleStartsUsePhysicalLaneCarriersAndReturnLaneOrder() async throws {
         let fixture = try Fixture(name: "ordering")
         defer { fixture.cleanup() }
@@ -207,6 +45,78 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(calls.count, 7)
         XCTAssertEqual(Set(calls.map(\.lane)), Set(0 ... 4))
         XCTAssertTrue(calls.allSatisfy { $0.groupID != nil && $0.claimID != nil && $0.launchID != nil })
+    }
+
+    func testSingleOracleUsesDirectConversationWithoutDurableGroup() async throws {
+        let fixture = try Fixture(name: "single-direct")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+
+        let started = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("single turn")]
+        )
+        let chatID = try XCTUnwrap(started["chat_id"] as? String)
+        XCTAssertEqual(started["response"] as? String, "response-0-default")
+
+        let continued = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "oracle_send",
+            arguments: [
+                "chat_id": .string(chatID),
+                "message": .string("follow-up")
+            ]
+        )
+        XCTAssertEqual(continued["chat_id"] as? String, chatID)
+        XCTAssertEqual(continued["response"] as? String, "response-0-default")
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        let stored = try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
+        XCTAssertNil(stored)
+
+        let context = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "context_builder",
+            arguments: ["instructions": .string("raw context instructions")]
+        )
+        XCTAssertEqual(context["response"] as? String, "response-0-default")
+    }
+
+    func testOracleLogWithoutChatIDReturnsNewestDirectOrGroupConversation() async throws {
+        let fixture = try Fixture(name: "latest-log")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        _ = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("group turn")]
+        )
+        try await Self.setRoster(prepared, primary: "default", additional: [])
+        let direct = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("direct turn")]
+        )
+        let log = try await prepared.oracleAdapter.log(chatID: nil, limit: 8)
+        XCTAssertEqual(try Self.object(log)["chat_id"] as? String, direct["chat_id"] as? String)
     }
 
     func testGroupContinuationThroughAdditionalMemberColdLoadsSiblingsAndLogsIdentity() async throws {
@@ -311,38 +221,6 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(after?.turns, before.turns)
     }
 
-    func testSingleStartRejectsMismatchedCarrierBeforeProviderDispatch() async throws {
-        let fixture = try Fixture(name: "single-carrier")
-        defer { fixture.cleanup() }
-        let service = fixture.service()
-        let prepared = try await service.prepareRuntime()
-        addTeardownBlock { await service.teardown(prepared) }
-        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
-        let backend = DirectHeadlessConversationBackend(
-            providerCoordinator: prepared.providerCoordinator,
-            oracleAdapter: prepared.oracleAdapter
-        )
-
-        do {
-            _ = try await invoke(
-                prepared: prepared,
-                backend: backend,
-                toolName: "ask_oracle",
-                arguments: ["message": .string("single turn")],
-                mismatchedBundle: true
-            )
-            XCTFail("Expected carrier mismatch")
-        } catch {
-            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .childCarrierMismatch)
-        }
-        let owner = try OracleConversationOwner(
-            kind: "direct-headless",
-            identifier: fixture.profileName
-        )
-        let conversation = try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
-        XCTAssertNil(conversation)
-    }
-
     func testPartialAndPrimaryFailuresRemainOrderedStructuredResults() async throws {
         let fixture = try Fixture(name: "failures")
         defer { fixture.cleanup() }
@@ -401,22 +279,6 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("context_pack_required"), error.localizedDescription)
         }
         XCTAssertEqual(try fixture.calls().count, 0)
-
-        _ = try await prepared.settingsStore.set(
-            key: OracleRosterContract.additionalSettingKey,
-            value: .stringArray([])
-        )
-        let singleContext = try await invoke(
-            prepared: prepared,
-            backend: backend,
-            toolName: "context_builder",
-            arguments: ["instructions": .string("raw single instructions")]
-        )
-        XCTAssertEqual(Set(singleContext.keys), ["backend", "chat_id", "response"])
-        _ = try await prepared.settingsStore.set(
-            key: OracleRosterContract.additionalSettingKey,
-            value: .stringArray(["lane-1"])
-        )
 
         let started = try await invoke(
             prepared: prepared,

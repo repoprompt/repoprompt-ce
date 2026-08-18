@@ -698,23 +698,94 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     }
 
     func startOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        try await .mcp(oracleAdapter.start(arguments: request.mcpArguments(), request: request))
+        let args = try request.mcpArguments()
+        guard let message = args["message"]?.stringValue, !message.isEmpty else {
+            throw MCPError.invalidParams("ask_oracle requires message")
+        }
+        switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .group:
+            return try await .mcp(oracleAdapter.start(arguments: args, request: request))
+        case .direct:
+            let (id, response) = try await providerCoordinator.createConversation(
+                providerID: args["provider"]?.stringValue,
+                message: message,
+                model: args["model"]?.stringValue,
+                request: request
+            )
+            return try .object([
+                "chat_id": .string(id.uuidString),
+                "response": .string(response),
+                "backend": .string("headless")
+            ])
+        }
     }
 
     func continueOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        try await .mcp(oracleAdapter.continue(arguments: request.mcpArguments(), request: request))
+        let args = try request.mcpArguments()
+        guard let chatID = args["chat_id"]?.stringValue,
+              let message = args["message"]?.stringValue,
+              !message.isEmpty
+        else {
+            throw MCPError.invalidParams("oracle_send requires chat_id and message")
+        }
+        switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .group:
+            return try await .mcp(oracleAdapter.continue(arguments: args, request: request))
+        case .direct:
+            guard let id = UUID(uuidString: chatID) else {
+                throw MCPError.invalidParams("oracle_send requires a valid chat_id")
+            }
+            let response = try await providerCoordinator.continueConversation(
+                id: id,
+                message: message,
+                model: args["model"]?.stringValue,
+                request: request
+            )
+            return try .object([
+                "chat_id": .string(id.uuidString),
+                "response": .string(response),
+                "backend": .string("headless")
+            ])
+        }
     }
 
     func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
-        return try await .mcp(oracleAdapter.log(
-            chatID: args["chat_id"]?.stringValue,
-            limit: args["limit"]?.intValue ?? 8
-        ))
+        let chatID = args["chat_id"]?.stringValue
+        let limit = args["limit"]?.intValue ?? 8
+        if let chatID {
+            if try await oracleAdapter.isGroupChat(chatID: chatID) {
+                return try await .mcp(oracleAdapter.log(chatID: chatID, limit: limit))
+            }
+            guard let id = UUID(uuidString: chatID) else {
+                throw MCPError.invalidParams("unknown chat_id")
+            }
+            return try await .mcp(providerCoordinator.conversationLog(id: id, limit: limit))
+        }
+        return try await .mcp(oracleAdapter.log(chatID: nil, limit: limit))
     }
 
     func buildContext(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        try await .mcp(oracleAdapter.buildContext(arguments: request.mcpArguments(), request: request))
+        let args = try request.mcpArguments()
+        switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .group:
+            return try await .mcp(oracleAdapter.buildContext(arguments: args, request: request))
+        case .direct:
+            guard let instructions = args["instructions"]?.stringValue, !instructions.isEmpty else {
+                throw MCPError.invalidParams("context_builder requires instructions")
+            }
+            let (id, response) = try await providerCoordinator.createConversation(
+                providerID: args["provider"]?.stringValue,
+                message: instructions,
+                model: args["model"]?.stringValue,
+                request: request
+            )
+            return try .object([
+                "chat_id": .string(id.uuidString),
+                "response": .string(response),
+                "backend": .string("headless")
+            ])
+        }
     }
 
     func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {

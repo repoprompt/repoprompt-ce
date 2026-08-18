@@ -45,29 +45,6 @@ final class OracleGroupPersistenceTests: XCTestCase {
         }
     }
 
-    func testTerminalSynthesisIsAcceptedAsEvidencePreservingCASRevision() async throws {
-        let fixture = makeStore(profile: "terminal-synthesis")
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let prepared = try makeGroup(count: 2, seed: "synthesis")
-        try await fixture.store.create(prepared)
-        let terminal = try terminalDocument(from: prepared)
-        try await fixture.store.save(terminal, expectedRevision: prepared.revision)
-
-        let turn = try XCTUnwrap(terminal.turns.last)
-        let synthesis = try OracleSynthesisRecord(
-            model: OracleExecutionProfile(providerID: "fixture", modelID: "model-0"),
-            sourceLaneIndices: [0, 1],
-            response: "combined response",
-            finishedAt: try XCTUnwrap(turn.finishedAt).addingTimeInterval(1)
-        )
-        let synthesized = try terminal.recordingSynthesis(synthesis, for: turn.id)
-        try await fixture.store.save(synthesized, expectedRevision: terminal.revision)
-
-        let loaded = try await fixture.store.load(groupID: terminal.group.id, owner: terminal.owner)
-        XCTAssertEqual(loaded, synthesized)
-        XCTAssertEqual(loaded?.turns.last?.synthesis, synthesis)
-    }
-
     func testInterruptedAggregatePublicationRecoversDocumentAndCompleteIndex() async throws {
         let fixture = makeStore(profile: "recovery")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -110,7 +87,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
                 seed: "group-\(index)",
                 owner: owner,
                 artifactID: artifactID,
-                timestamp: Date(timeIntervalSince1970: TimeInterval(1_000 + index))
+                timestamp: Date(timeIntervalSince1970: TimeInterval(1000 + index))
             )
             groups.append(group)
             try await fixture.store.create(group)
@@ -277,7 +254,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
         }
     }
 
-    func testArtifactReservationSurvivesFinalGroupAndSingleReferenceDeletion() async throws {
+    func testArtifactReservationSurvivesFinalGroupReferenceDeletion() async throws {
         let fixture = makeStore(profile: "reserved-deletion")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let owner = try OracleConversationOwner(kind: "workspace", identifier: "reserved-deletion")
@@ -299,23 +276,6 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let retainedGroupArtifact = try await fixture.store.loadArtifact(id: groupReservation.artifactID)
         XCTAssertEqual(retainedGroupArtifact, groupData)
         try await fixture.store.releaseArtifactReservation(groupReservation, removeIfUnreferenced: true)
-
-        let singleData = Data("reserved-single".utf8)
-        let singleReservation = try await fixture.store.reserveArtifact(singleData)
-        let single = try makeSingle(
-            chatID: "reserved-single",
-            owner: owner,
-            artifactID: singleReservation.artifactID
-        )
-        try await fixture.store.create(single)
-        try await fixture.store.delete(
-            publicChatID: single.publicChatID,
-            owner: owner,
-            expectedRevision: single.revision
-        )
-        let retainedSingleArtifact = try await fixture.store.loadArtifact(id: singleReservation.artifactID)
-        XCTAssertEqual(retainedSingleArtifact, singleData)
-        try await fixture.store.releaseArtifactReservation(singleReservation, removeIfUnreferenced: true)
     }
 
     func testDestructiveGroupOperationsRespectActiveClaim() async throws {
@@ -371,54 +331,6 @@ final class OracleGroupPersistenceTests: XCTestCase {
         XCTAssertNil(deletedGroup)
     }
 
-    func testSingleDeletionRespectsActiveClaim() async throws {
-        let fixture = makeStore(profile: "claimed-single-deletion")
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let owner = try OracleConversationOwner(kind: "direct", identifier: "claimed-single-deletion")
-        let artifactID = try await fixture.store.storeArtifact(Data("claimed-single".utf8))
-        let single = try makeSingle(
-            chatID: "claimed-single",
-            owner: owner,
-            artifactID: artifactID
-        )
-        try await fixture.store.create(single)
-        let claimManager = OracleGroupClaimManager(
-            persistence: fixture.persistence,
-            identity: makeIdentity()
-        )
-        let claim = try await claimManager.acquireSingle(
-            publicChatID: single.publicChatID,
-            owner: single.owner
-        )
-
-        await XCTAssertOraclePersistenceThrowsErrorAsync {
-            try await fixture.store.delete(
-                publicChatID: single.publicChatID,
-                owner: single.owner,
-                expectedRevision: single.revision
-            )
-        } verify: {
-            XCTAssertEqual($0 as? OracleGroupClaimError, .conflict)
-        }
-        let retained = try await fixture.store.load(
-            publicChatID: single.publicChatID,
-            owner: single.owner
-        )
-        XCTAssertNotNil(retained)
-
-        claim.release()
-        try await fixture.store.delete(
-            publicChatID: single.publicChatID,
-            owner: single.owner,
-            expectedRevision: single.revision
-        )
-        let deleted = try await fixture.store.load(
-            publicChatID: single.publicChatID,
-            owner: single.owner
-        )
-        XCTAssertNil(deleted)
-    }
-
     func testUnreadableGroupFailsRetentionClosedWithoutDeletingValidGroup() async throws {
         let fixture = makeStore(profile: "fail-closed")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -436,148 +348,6 @@ final class OracleGroupPersistenceTests: XCTestCase {
         try FileManager.default.removeItem(at: corruptURL)
         let validAfterFailure = try await fixture.store.load(groupID: valid.group.id, owner: valid.owner)
         XCTAssertNotNil(validAfterFailure)
-    }
-
-    func testDurableSingleUsesIndependentCASRecord() async throws {
-        let fixture = makeStore(profile: "single")
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let owner = try OracleConversationOwner(kind: "direct", identifier: "route")
-        let model = try OracleModelReference(providerID: "codex", modelID: "primary")
-        let createdAt = Date(timeIntervalSince1970: 1_000)
-        let input = try OracleInput(mode: .chat, userMessage: "single message")
-        let preparedTurn = OracleTurnRecord(
-            input: input,
-            state: .prepared,
-            startedAt: createdAt
-        )
-        let single = try OracleSingleConversationDocument(
-            publicChatID: "single-chat",
-            owner: owner,
-            model: model,
-            revision: 1,
-            createdAt: createdAt,
-            updatedAt: createdAt,
-            turns: [preparedTurn]
-        )
-        try await fixture.store.create(single)
-        let loadedSingle = try await fixture.store.load(
-            publicChatID: single.publicChatID,
-            owner: owner
-        )
-        XCTAssertEqual(loadedSingle, single)
-
-        let singleResult = try OracleLaneResult(
-            laneIndex: 0,
-            chatID: single.publicChatID,
-            providerID: model.providerID,
-            modelID: model.modelID,
-            status: .completed,
-            response: "single response"
-        )
-        let terminalTurn = OracleTurnRecord(
-            id: preparedTurn.id,
-            input: input,
-            state: .terminal,
-            startedAt: createdAt,
-            finishedAt: createdAt.addingTimeInterval(1),
-            results: [singleResult]
-        )
-        let saved = try OracleSingleConversationDocument(
-            publicChatID: single.publicChatID,
-            owner: owner,
-            model: model,
-            providerConversationID: "provider-chat",
-            revision: 2,
-            createdAt: createdAt,
-            updatedAt: createdAt.addingTimeInterval(1),
-            turns: [terminalTurn]
-        )
-        try await fixture.store.save(saved, expectedRevision: 1)
-        let loadedSaved = try await fixture.store.load(
-            publicChatID: single.publicChatID,
-            owner: owner
-        )
-        XCTAssertEqual(loadedSaved, saved)
-        try await fixture.store.delete(
-            publicChatID: single.publicChatID,
-            owner: owner,
-            expectedRevision: 2
-        )
-        let deletedSingle = try await fixture.store.load(
-            publicChatID: single.publicChatID,
-            owner: owner
-        )
-        XCTAssertNil(deletedSingle)
-    }
-
-    func testSharedArtifactsRemainUntilLastGroupOrSingleReferenceIsDeleted() async throws {
-        let fixture = makeStore(profile: "shared-artifacts")
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let owner = try OracleConversationOwner(kind: "workspace", identifier: "shared-artifacts")
-
-        let groupFirstArtifact = try await fixture.store.storeArtifact(Data("group-first".utf8))
-        let groupFirst = try makeGroup(
-            count: 2,
-            seed: "group-first",
-            owner: owner,
-            artifactID: groupFirstArtifact
-        )
-        let groupFirstSingle = try makeSingle(
-            chatID: "group-first-single",
-            owner: owner,
-            artifactID: groupFirstArtifact
-        )
-        try await fixture.store.create(groupFirst)
-        try await fixture.store.create(groupFirstSingle)
-        try await fixture.store.delete(
-            groupID: groupFirst.group.id,
-            owner: owner,
-            expectedRevision: groupFirst.revision
-        )
-        let retainedAfterGroupDelete = try await fixture.store.loadArtifact(id: groupFirstArtifact)
-        XCTAssertEqual(retainedAfterGroupDelete, Data("group-first".utf8))
-        try await fixture.store.delete(
-            publicChatID: groupFirstSingle.publicChatID,
-            owner: owner,
-            expectedRevision: groupFirstSingle.revision
-        )
-        await XCTAssertOraclePersistenceThrowsErrorAsync {
-            try await fixture.store.loadArtifact(id: groupFirstArtifact)
-        } verify: {
-            XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(groupFirstArtifact))
-        }
-
-        let singleFirstArtifact = try await fixture.store.storeArtifact(Data("single-first".utf8))
-        let singleFirst = try makeSingle(
-            chatID: "single-first-single",
-            owner: owner,
-            artifactID: singleFirstArtifact
-        )
-        let singleFirstGroup = try makeGroup(
-            count: 2,
-            seed: "single-first",
-            owner: owner,
-            artifactID: singleFirstArtifact
-        )
-        try await fixture.store.create(singleFirst)
-        try await fixture.store.create(singleFirstGroup)
-        try await fixture.store.delete(
-            publicChatID: singleFirst.publicChatID,
-            owner: owner,
-            expectedRevision: singleFirst.revision
-        )
-        let retainedAfterSingleDelete = try await fixture.store.loadArtifact(id: singleFirstArtifact)
-        XCTAssertEqual(retainedAfterSingleDelete, Data("single-first".utf8))
-        try await fixture.store.delete(
-            groupID: singleFirstGroup.group.id,
-            owner: owner,
-            expectedRevision: singleFirstGroup.revision
-        )
-        await XCTAssertOraclePersistenceThrowsErrorAsync {
-            try await fixture.store.loadArtifact(id: singleFirstArtifact)
-        } verify: {
-            XCTAssertEqual($0 as? OraclePersistenceError, .artifactMissing(singleFirstArtifact))
-        }
     }
 
     private func makeStore(
@@ -619,7 +389,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
         seed: String,
         owner: OracleConversationOwner? = nil,
         artifactID: String? = nil,
-        timestamp: Date = Date(timeIntervalSince1970: 1_000)
+        timestamp: Date = Date(timeIntervalSince1970: 1000)
     ) throws -> OracleGroupDocument {
         let owner = try owner ?? OracleConversationOwner(kind: "workspace", identifier: seed)
         let models = try (0 ..< count).map {
@@ -648,8 +418,8 @@ final class OracleGroupPersistenceTests: XCTestCase {
                 sha256: DomainContentDigest.sha256(Data(inline.utf8))
             )
         }
-        let turn = OracleTurnRecord(
-            input: try OracleInput(mode: .chat, userMessage: "message-\(seed)", context: context),
+        let turn = try OracleTurnRecord(
+            input: OracleInput(mode: .chat, userMessage: "message-\(seed)", context: context),
             state: .prepared,
             startedAt: timestamp
         )
@@ -698,36 +468,10 @@ final class OracleGroupPersistenceTests: XCTestCase {
             turns: Array(prepared.turns.dropLast()) + [terminal]
         )
     }
-
-    private func makeSingle(
-        chatID: String,
-        owner: OracleConversationOwner,
-        artifactID: String
-    ) throws -> OracleSingleConversationDocument {
-        let timestamp = Date(timeIntervalSince1970: 1_000)
-        let model = try OracleModelReference(providerID: "fixture", modelID: "single-model")
-        let context = OracleContextEnvelope(
-            content: .durableArtifact(id: artifactID),
-            sha256: artifactID
-        )
-        return try OracleSingleConversationDocument(
-            publicChatID: chatID,
-            owner: owner,
-            model: model,
-            revision: 1,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-            turns: [OracleTurnRecord(
-                input: OracleInput(mode: .chat, userMessage: "single-message", context: context),
-                state: .prepared,
-                startedAt: timestamp
-            )]
-        )
-    }
 }
 
-private func XCTAssertOraclePersistenceThrowsErrorAsync<T>(
-    _ expression: () async throws -> T,
+private func XCTAssertOraclePersistenceThrowsErrorAsync(
+    _ expression: () async throws -> some Any,
     verify: (Error) -> Void
 ) async {
     do {

@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import os
 
-package enum OracleGroupClaimError: Error, LocalizedError, Equatable, Sendable {
+package enum OracleGroupClaimError: Error, LocalizedError, Equatable {
     case ownerMismatch
     case conflict
     case unavailable(Int32)
@@ -69,29 +69,7 @@ package final class OracleGroupClaim: @unchecked Sendable {
     }
 }
 
-package final class OracleSingleConversationClaim: @unchecked Sendable {
-    private let descriptor: OSAllocatedUnfairLock<Int32?>
-
-    fileprivate init(descriptor: Int32) {
-        self.descriptor = OSAllocatedUnfairLock(initialState: descriptor)
-    }
-
-    package func release() {
-        let descriptor = descriptor.withLock { value -> Int32? in
-            defer { value = nil }
-            return value
-        }
-        guard let descriptor else { return }
-        flock(descriptor, LOCK_UN)
-        close(descriptor)
-    }
-
-    deinit {
-        release()
-    }
-}
-
-package struct OracleGroupClaimManager: Sendable {
+package struct OracleGroupClaimManager {
     private struct ClaimRecord: Codable {
         let claimID: UUID
         let groupID: OracleGroupID
@@ -190,32 +168,6 @@ package struct OracleGroupClaimManager: Sendable {
                 close(descriptor)
                 throw error
             }
-        }
-    }
-
-    package func acquireSingle(
-        publicChatID: String,
-        owner: OracleConversationOwner
-    ) async throws -> OracleSingleConversationClaim {
-        let key = DomainContentDigest.sha256(
-            Data("\(owner.kind)\u{0}\(owner.identifier)\u{0}\(publicChatID)".utf8)
-        )
-        let directory = claimsDirectory
-        return try await DomainBlockingIO.run { cancellation in
-            try cancellation.check()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let url = directory.appendingPathComponent("single-\(key).lock")
-            let descriptor = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
-            guard descriptor >= 0 else { throw OracleGroupClaimError.unavailable(errno) }
-            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-                let errorNumber = errno
-                close(descriptor)
-                if errorNumber == EWOULDBLOCK || errorNumber == EAGAIN {
-                    throw OracleGroupClaimError.conflict
-                }
-                throw OracleGroupClaimError.unavailable(errorNumber)
-            }
-            return OracleSingleConversationClaim(descriptor: descriptor)
         }
     }
 }

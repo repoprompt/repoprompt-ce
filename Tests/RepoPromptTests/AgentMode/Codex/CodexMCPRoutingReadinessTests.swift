@@ -637,9 +637,11 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
             ComposeTabState(id: tabID, name: "Restored Codex")
         ]
         window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
-        await window.workspaceManager.restoreWorkspaceState(
-            window.workspaceManager.workspaces[workspaceIndex]
+        let reloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+            window.workspaceManager.workspaces[workspaceIndex],
+            reason: "codexRoutingAdmissionTab"
         )
+        XCTAssertEqual(reloadResult, .switched)
         XCTAssertEqual(
             window.workspaceManager.resolveComposeTabRoutingSnapshot(
                 for: tabID,
