@@ -86,23 +86,48 @@ struct ContextBuilderAssistantOutputAccumulator {
     }
 
     private func leadingNewlineCount(in text: String) -> Int {
+        // Iterate UTF-8 bytes to avoid grapheme-cluster decoding on potentially
+        // malformed bridged NSString values from LLM streaming chunks.
+        // CRLF (\r
+) is treated as a single newline, matching Swift's grapheme cluster behaviour.
         var count = 0
-        for character in text {
-            guard character.isNewline else { break }
-            count += 1
+        let bytes = Array(text.utf8)
+        var i = 0
+        while i < bytes.count {
+            let byte = bytes[i]
+            if byte == 0x0A { // LF
+                count += 1
+                i += 1
+            } else if byte == 0x0D { // CR
+                count += 1
+                i += 1
+                if i < bytes.count, bytes[i] == 0x0A { i += 1 } // skip LF in CRLF
+            } else {
+                break
+            }
             if count >= 2 { break }
         }
         return count
     }
 
     private mutating func updateTrailingNewlineCount(with text: String) {
+        // Iterate UTF-8 bytes in reverse, treating \r\n as one newline.
+        let bytes = Array(text.utf8)
         var suffixCount = 0
-        for character in text.reversed() {
-            guard character.isNewline else {
+        var i = bytes.count - 1
+        while i >= 0 {
+            let byte = bytes[i]
+            if byte == 0x0A { // LF — check for preceding CR
+                if i > 0, bytes[i - 1] == 0x0D { i -= 1 } // consume CR of CRLF
+                suffixCount += 1
+                i -= 1
+            } else if byte == 0x0D { // lone CR
+                suffixCount += 1
+                i -= 1
+            } else {
                 trailingNewlineCountCapped = suffixCount
                 return
             }
-            suffixCount += 1
             if suffixCount >= 2 {
                 trailingNewlineCountCapped = 2
                 return
@@ -119,8 +144,48 @@ struct ContextBuilderAssistantOutputAccumulator {
     }
 
     private mutating func processPreviewCharacters(in text: String) {
-        for character in text {
-            if character.isWhitespace {
+        // Iterate UTF-8 bytes to classify characters safely, avoiding grapheme-cluster
+        // decoding on potentially malformed bridged NSString values from LLM stream chunks.
+        // We reconstruct each Unicode scalar from its raw bytes and validate it before use.
+        // Note: multi-scalar grapheme clusters (e.g. emoji with skin-tone modifiers) are
+        // emitted as individual scalars in the preview — an acceptable approximation.
+        let bytes = Array(text.utf8)
+        var i = 0
+        while i < bytes.count {
+            let byte = bytes[i]
+
+            // Determine scalar byte width from the leading UTF-8 byte
+            let width: Int
+            if byte < 0x80 {
+                width = 1
+            } else if byte & 0xE0 == 0xC0 {
+                width = 2
+            } else if byte & 0xF0 == 0xE0 {
+                width = 3
+            } else if byte & 0xF8 == 0xF0 {
+                width = 4
+            } else {
+                // Continuation byte or invalid leading byte — skip
+                i += 1
+                continue
+            }
+
+            // Ensure we have all bytes for this scalar; truncated tail means end of chunk
+            guard i + width <= bytes.count else { break }
+
+            let scalarBytes = Array(bytes[i ..< i + width])
+            i += width
+
+            // Construct a String from these UTF-8 bytes; skip if the sequence is invalid
+            guard let scalarString = String(bytes: scalarBytes, encoding: .utf8),
+                  let scalar = scalarString.unicodeScalars.first
+            else { continue }
+
+            // Classify ASCII whitespace: tab (0x09), LF (0x0A), VT (0x0B), FF (0x0C),
+            // CR (0x0D), space (0x20). Do NOT treat all bytes ≤ 0x20 as whitespace.
+            let isWhitespace = byte == 0x09 || byte == 0x0A || byte == 0x0B
+                            || byte == 0x0C || byte == 0x0D || byte == 0x20
+            if isWhitespace {
                 if hasNormalizedContent {
                     pendingNormalizedWhitespace = true
                 }
@@ -131,7 +196,7 @@ struct ContextBuilderAssistantOutputAccumulator {
                 appendNormalizedPreviewCharacter(" ")
             }
             pendingNormalizedWhitespace = false
-            appendNormalizedPreviewCharacter(character)
+            appendNormalizedPreviewCharacter(Character(scalar))
             hasNormalizedContent = true
         }
     }
