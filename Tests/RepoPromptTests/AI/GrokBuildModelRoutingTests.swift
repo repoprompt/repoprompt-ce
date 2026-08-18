@@ -82,6 +82,80 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
+    func testNonAgentAdapterMapsNonSuccessfulStopsToIncomplete() {
+        let incompleteStopReasons = [
+            "max_tokens",
+            "max_turn_requests",
+            "cancelled",
+            "refusal",
+            "future_reason"
+        ]
+        for stopReason in incompleteStopReasons {
+            let normalized = GrokBuildCLIProvider.test_normalizedTerminalResult(
+                AIStreamResult(
+                    type: "message_stop",
+                    text: nil,
+                    promptTokens: 11,
+                    completionTokens: 7,
+                    providerSessionID: "session-1",
+                    stopReason: stopReason,
+                    contextUsedTokens: 13
+                )
+            )
+
+            XCTAssertEqual(normalized.type, AIStreamResult.incompleteType, stopReason)
+            XCTAssertEqual(normalized.stopReason, stopReason, stopReason)
+            XCTAssertEqual(normalized.promptTokens, 11, stopReason)
+            XCTAssertEqual(normalized.completionTokens, 7, stopReason)
+            XCTAssertEqual(normalized.providerSessionID, "session-1", stopReason)
+            XCTAssertEqual(normalized.contextUsedTokens, 13, stopReason)
+        }
+    }
+
+    func testNonAgentAdapterKeepsSuccessfulStopsCompleted() {
+        let successfulStopReasons = [
+            "end_turn",
+            "stop",
+            "stop_sequence",
+            "completed",
+            "complete"
+        ]
+        for stopReason in successfulStopReasons {
+            let normalized = GrokBuildCLIProvider.test_normalizedTerminalResult(
+                AIStreamResult(
+                    type: "message_stop",
+                    text: nil,
+                    stopReason: stopReason
+                )
+            )
+
+            XCTAssertEqual(normalized.type, "message_stop", stopReason)
+            XCTAssertEqual(normalized.stopReason, stopReason, stopReason)
+        }
+
+        let missingReason = GrokBuildCLIProvider.test_normalizedTerminalResult(
+            AIStreamResult(type: "message_stop", text: nil)
+        )
+        XCTAssertEqual(missingReason.type, "message_stop")
+    }
+
+    func testNonAgentCompletionPrefersAuthoritativeFinalContent() {
+        XCTAssertEqual(
+            GrokBuildCLIProvider.test_resolvedCompletionText(
+                streamedParts: ["draft ", "answer"],
+                finalContent: "final answer"
+            ),
+            "final answer"
+        )
+        XCTAssertEqual(
+            GrokBuildCLIProvider.test_resolvedCompletionText(
+                streamedParts: ["streamed ", "answer"],
+                finalContent: nil
+            ),
+            "streamed answer"
+        )
+    }
+
     @MainActor
     func testDropdownDisplaysGrokBuildCatalogName() {
         let model = AIModel.grokBuildCustom(name: "grok-4.6")
