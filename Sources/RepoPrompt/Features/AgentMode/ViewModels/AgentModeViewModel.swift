@@ -1660,7 +1660,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 memoriesEnabledProvider: { CodexMemories.isEnabled },
-                computerUseEnabledProvider: { computerUseEnabled }
+                computerUseEnabledProvider: { computerUseEnabled },
+                hookCompatibilityGateEnabled: true
             )
             return CodexNativeSessionController(
                 client: client,
@@ -5899,7 +5900,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, includeAliases: Bool = true) -> [String] {
-        var labels = ["accept", "accept_for_session"]
+        var labels = ["accept"]
+        if approval.supportsAlwaysAllow {
+            labels.append("accept_for_session")
+        }
         if approval.kind == .commandExecution {
             labels.append("accept_with_amendment")
         }
@@ -8520,6 +8524,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case "accept", "approve":
                 decision = .accept
             case "accept_for_session", "always_allow", "approve_for_session":
+                guard approval.supportsAlwaysAllow else {
+                    throw MCPError.invalidParams("accept_for_session is not supported for this approval interaction.")
+                }
                 decision = .acceptForSession
             case "accept_with_amendment", "amend":
                 guard approval.kind == .commandExecution else {

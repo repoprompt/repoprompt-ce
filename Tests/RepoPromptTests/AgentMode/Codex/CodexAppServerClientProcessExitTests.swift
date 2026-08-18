@@ -439,6 +439,89 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await client.stop()
     }
 
+    func testMutatingRequestTimeoutTerminatesTransportAndIsUncertainWithoutRetry() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makePersistentServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoredMethods: ["config/batchWrite"]
+        )
+        let client = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        try await client.startIfNeeded()
+
+        do {
+            _ = try await client.mutatingRequest(
+                method: "config/batchWrite",
+                params: ["edits": []],
+                timeout: 0.05
+            )
+            XCTFail("The ignored mutation must be uncertain")
+        } catch let CodexAppServerClient.ClientError.uncertainMutation(method) {
+            XCTAssertEqual(method, "config/batchWrite")
+        }
+        let isRunning = await client.debugIsProcessRunning()
+        XCTAssertFalse(isRunning)
+        await client.stop()
+    }
+
+    func testMutatingRequestCancellationTerminatesTransportAndIsUncertain() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makePersistentServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoredMethods: ["config/batchWrite"]
+        )
+        let client = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        try await client.startIfNeeded()
+        let request = Task {
+            try await client.mutatingRequest(
+                method: "config/batchWrite",
+                params: ["edits": []],
+                timeout: 5
+            )
+        }
+        try await waitForRecordedMethod("config/batchWrite", at: recordURL)
+        request.cancel()
+        do {
+            _ = try await request.value
+            XCTFail("Cancelled mutation must be uncertain")
+        } catch let CodexAppServerClient.ClientError.uncertainMutation(method) {
+            XCTAssertEqual(method, "config/batchWrite")
+        }
+        let isRunning = await client.debugIsProcessRunning()
+        XCTAssertFalse(isRunning)
+        await client.stop()
+    }
+
+    func testTransportLossSettlesPendingMutationAsUncertain() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makePersistentServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoredMethods: ["config/batchWrite"]
+        )
+        let client = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        try await client.startIfNeeded()
+        let request = Task {
+            try await client.mutatingRequest(
+                method: "config/batchWrite",
+                params: ["edits": []],
+                timeout: 5
+            )
+        }
+        try await waitForRecordedMethod("config/batchWrite", at: recordURL)
+        await client.stop()
+        do {
+            _ = try await request.value
+            XCTFail("Transport loss must make the mutation uncertain")
+        } catch let CodexAppServerClient.ClientError.uncertainMutation(method) {
+            XCTAssertEqual(method, "config/batchWrite")
+        }
+    }
+
     func testStaleObservedExitCannotMutateReplacementGeneration() async throws {
         let directory = try makeTemporaryDirectory()
         let recordURL = directory.appendingPathComponent("requests.jsonl")

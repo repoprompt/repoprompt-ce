@@ -3529,6 +3529,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return true
     }
 
+    private func codexStartupStillCurrent(
+        session: AgentTabSession,
+        expectedRunID: UUID?,
+        expectedRunAttemptID: UUID?,
+        expectedController: (any CodexSessionControlling)?
+    ) -> Bool {
+        guard session.runID == expectedRunID,
+              session.activeRunAttemptID == expectedRunAttemptID,
+              let expectedController,
+              let activeController = session.codexController,
+              Self.sameCodexControllerInstance(activeController, expectedController)
+        else {
+            logCodex("[AgentModeVM][CodexStartup] ignoring stale session-start settlement for tab \(session.tabID)")
+            return false
+        }
+        return true
+    }
+
     private func applyCodexNativeSessionStartResult(
         _ startResult: CodexNativeSessionStartResult,
         to session: AgentTabSession,
@@ -5187,9 +5205,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             logCodex("[AgentModeVM][CodexReconnect] skipping repeated timed-out resume target for tab \(session.tabID) and starting a fresh thread")
         }
         let existingRef = shouldSkipTimedOutResumeTarget ? nil : resumeCandidate
+        let expectedStartupRunID = session.runID
+        let expectedStartupRunAttemptID = session.activeRunAttemptID
+        let expectedStartupController = session.codexController
         do {
             var startResult = try await startCodexNativeSession(
-                controller: session.codexController,
+                controller: expectedStartupController,
                 existingRef: existingRef,
                 baseInstructions: basePrompt,
                 model: selection.model,
@@ -5197,6 +5218,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 serviceTier: selection.serviceTier,
                 allowMissingRolloutFallback: allowMissingRolloutFallback
             )
+            guard codexStartupStillCurrent(
+                session: session,
+                expectedRunID: expectedStartupRunID,
+                expectedRunAttemptID: expectedStartupRunAttemptID,
+                expectedController: expectedStartupController
+            ) else { return }
             if shouldSkipTimedOutResumeTarget, startResult.fallbackReason == nil {
                 startResult = CodexNativeSessionStartResult(
                     sessionRef: startResult.sessionRef,
@@ -5211,6 +5238,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
         } catch {
+            guard codexStartupStillCurrent(
+                session: session,
+                expectedRunID: expectedStartupRunID,
+                expectedRunAttemptID: expectedStartupRunAttemptID,
+                expectedController: expectedStartupController
+            ) else { return }
             var effectiveError: Error = error
             if session.runState.isActive,
                let runID = session.runID,
@@ -5219,7 +5252,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             {
                 setRunningStatus("Refreshing Codex authentication…", source: .reconnect, session: session, urgent: true)
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                switch await authRecovery.refreshManagedAccount() {
+                let authRecoveryResult = await authRecovery.refreshManagedAccount()
+                guard codexStartupStillCurrent(
+                    session: session,
+                    expectedRunID: expectedStartupRunID,
+                    expectedRunAttemptID: expectedStartupRunAttemptID,
+                    expectedController: expectedStartupController
+                ) else { return }
+                switch authRecoveryResult {
                 case let .requiresUserLogin(guidance):
                     _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required-during-start")
                     effectiveError = AIProviderError.invalidConfiguration(detail: guidance)
@@ -5248,6 +5288,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             serviceTier: selection.serviceTier,
                             allowMissingRolloutFallback: allowMissingRolloutFallback
                         )
+                        guard codexStartupStillCurrent(
+                            session: session,
+                            expectedRunID: expectedStartupRunID,
+                            expectedRunAttemptID: expectedStartupRunAttemptID,
+                            expectedController: recoveredController
+                        ) else { return }
                         if shouldSkipTimedOutResumeTarget, recoveredStartResult.fallbackReason == nil {
                             recoveredStartResult = CodexNativeSessionStartResult(
                                 sessionRef: recoveredStartResult.sessionRef,
@@ -5263,6 +5309,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
                         return
                     } catch {
+                        guard codexStartupStillCurrent(
+                            session: session,
+                            expectedRunID: expectedStartupRunID,
+                            expectedRunAttemptID: expectedStartupRunAttemptID,
+                            expectedController: recoveredController
+                        ) else { return }
                         effectiveError = error
                     }
                 }
@@ -5300,6 +5352,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         serviceTier: selection.serviceTier,
                         allowMissingRolloutFallback: false
                     )
+                    guard codexStartupStillCurrent(
+                        session: session,
+                        expectedRunID: expectedStartupRunID,
+                        expectedRunAttemptID: expectedStartupRunAttemptID,
+                        expectedController: freshController
+                    ) else { return }
                     if retryResult.fallbackReason == nil {
                         retryResult = CodexNativeSessionStartResult(
                             sessionRef: retryResult.sessionRef,
@@ -5315,6 +5373,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
                     return
                 } catch {
+                    guard codexStartupStillCurrent(
+                        session: session,
+                        expectedRunID: expectedStartupRunID,
+                        expectedRunAttemptID: expectedStartupRunAttemptID,
+                        expectedController: freshController
+                    ) else { return }
                     let invalidatedTimedOutController = CodexAppServerClient.isTimeoutError(error)
                         ? invalidateCodexControllerForReconnect(
                             session: session,
@@ -6701,6 +6765,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             (nil, payload.scope.turnID, payload.scope.itemID)
         case let .livenessActivity(activity):
             (activity.threadID, activity.turnID, activity.itemID)
+        case let .hookLifecycleDiagnostic(diagnostic):
+            (diagnostic.threadID, diagnostic.turnID, nil)
         case let .errorNotification(notification):
             (notification.threadID, notification.turnID, notification.itemID)
         default:
@@ -7242,6 +7308,28 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        case let .hookInventoryDiagnostic(diagnostic):
+            guard session.runState.isActive else { return }
+            setRunningStatus(
+                diagnostic.statusSummary,
+                source: .transport,
+                session: session,
+                urgent: true
+            )
+            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        case let .hookLifecycleDiagnostic(diagnostic):
+            guard session.runState.isActive else { return }
+            if diagnostic.reportedRuntimeFailure {
+                let detail = diagnostic.statusMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let suffix = detail?.isEmpty == false ? ": \(detail!)" : ""
+                setRunningStatus(
+                    "Codex hook \(diagnostic.eventName.rawValue) reported \(diagnostic.status.rawValue)\(suffix)",
+                    source: .transport,
+                    session: session,
+                    urgent: true
+                )
+                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+            }
         case let .errorNotification(notification):
             let willRetry: Bool
             if let structuredWillRetry = notification.willRetry {
@@ -8629,6 +8717,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .turnCompleted: "turnCompleted"
             case .contextCompacted: "contextCompacted"
             case .livenessActivity: "livenessActivity"
+            case .hookInventoryDiagnostic: "hookInventoryDiagnostic"
+            case .hookLifecycleDiagnostic: "hookLifecycleDiagnostic"
             case .errorNotification: "errorNotification"
             case .error: "error"
             case .system: "system"
@@ -8674,6 +8764,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "contextCompacted turnID=\(turnID ?? "nil")"
         case let .livenessActivity(activity):
             "livenessActivity kind=\(activity.kind.rawValue) method=\(activity.method) activeFlags=\(activity.activeFlags.joined(separator: ","))"
+        case let .hookInventoryDiagnostic(diagnostic):
+            "hookInventoryDiagnostic hooks=\(diagnostic.hookCount) review=\(diagnostic.reviewRequiredCount)"
+        case let .hookLifecycleDiagnostic(diagnostic):
+            "hookLifecycleDiagnostic event=\(diagnostic.eventName.rawValue) status=\(diagnostic.status.rawValue)"
         case let .errorNotification(notification):
             "errorNotification willRetry=\(notification.willRetry.map(String.init(describing:)) ?? "nil") message=\(notification.message)"
         case let .error(message):
@@ -9012,11 +9106,37 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        guard case let .codex(requestID) = request.requestID else {
+        switch request.requestID {
+        case let .codex(requestID):
+            Task { [controller] in
+                guard let activeController = session.codexController,
+                      Self.sameCodexControllerInstance(activeController, controller)
+                else { return }
+                await controller.respondToServerRequest(id: requestID, result: result)
+            }
+        case let .codexHookReview(interactionID):
+            let boundedDecision: AgentApprovalDecision = decision == .accept ? .accept :
+                (decision == .decline ? .decline : .cancel)
+            let expectedRunID = session.runID
+            let expectedRunAttemptID = session.activeRunAttemptID
+            Task { [controller] in
+                guard session.runID == expectedRunID,
+                      session.activeRunAttemptID == expectedRunAttemptID,
+                      let activeController = session.codexController,
+                      Self.sameCodexControllerInstance(activeController, controller)
+                else { return }
+                _ = await controller.respondToHookReview(
+                    interactionID: interactionID,
+                    decision: boundedDecision
+                )
+                guard session.runID == expectedRunID,
+                      session.activeRunAttemptID == expectedRunAttemptID,
+                      let activeController = session.codexController,
+                      Self.sameCodexControllerInstance(activeController, controller)
+                else { return }
+            }
+        default:
             return
-        }
-        Task { [controller] in
-            await controller.respondToServerRequest(id: requestID, result: result)
         }
     }
 

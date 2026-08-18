@@ -1482,6 +1482,137 @@
           "cancel"
         ]
       }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "hooks/list",
+      "alwaysSent": [
+        "cwds"
+      ],
+      "responseSchema": "v2/HooksListResponse.json",
+      "consumedResponse": [
+        { "path": "data", "presence": "required", "nullable": false },
+        { "path": "data[].cwd", "presence": "required", "nullable": false },
+        { "path": "data[].hooks", "presence": "required", "nullable": false },
+        { "path": "data[].warnings", "presence": "required", "nullable": false },
+        { "path": "data[].errors", "presence": "required", "nullable": false },
+        { "path": "data[].errors[].path", "presence": "required", "nullable": false },
+        { "path": "data[].errors[].message", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].key", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].eventName", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].handlerType", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].matcher", "presence": "optional", "nullable": true },
+        { "path": "data[].hooks[].command", "presence": "optional", "nullable": true },
+        { "path": "data[].hooks[].timeoutSec", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].statusMessage", "presence": "optional", "nullable": true },
+        { "path": "data[].hooks[].additionalContextLimit", "presence": "optional", "nullable": true },
+        { "path": "data[].hooks[].sourcePath", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].source", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].pluginId", "presence": "optional", "nullable": true },
+        { "path": "data[].hooks[].displayOrder", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].enabled", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].isManaged", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].currentHash", "presence": "required", "nullable": false },
+        { "path": "data[].hooks[].trustStatus", "presence": "required", "nullable": false }
+      ],
+      "consumedEnumValues": {
+        "data[].hooks[].eventName": ["preToolUse", "permissionRequest", "postToolUse", "preCompact", "postCompact", "sessionStart", "sessionEnd", "userPromptSubmit", "subagentStart", "subagentStop", "stop"],
+        "data[].hooks[].handlerType": ["command", "prompt", "agent"],
+        "data[].hooks[].source": ["system", "user", "project", "mdm", "sessionFlags", "plugin", "cloudRequirements", "cloudManagedConfig", "legacyManagedConfigFile", "legacyManagedConfigMdm", "unknown"],
+        "data[].hooks[].trustStatus": ["managed", "untrusted", "trusted", "modified"]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "config/read",
+      "alwaysSent": [
+        "includeLayers",
+        "cwd"
+      ],
+      "responseSchema": "v2/ConfigReadResponse.json",
+      "consumedResponse": [
+        { "path": "layers", "presence": "optional", "nullable": true },
+        { "path": "layers[].name.type", "presence": "conditional", "nullable": false },
+        { "path": "layers[].name.file", "presence": "conditional", "nullable": false },
+        { "path": "layers[].name.profile", "presence": "optional", "nullable": true },
+        { "path": "layers[].version", "presence": "conditional", "nullable": false }
+      ],
+      "consumedEnumValues": {
+        "layers[].name.type": ["mdm", "system", "enterpriseManaged", "user", "project", "sessionFlags", "legacyManagedConfigTomlFromFile", "legacyManagedConfigTomlFromMdm"]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "config/batchWrite",
+      "alwaysSent": [
+        "edits",
+        "edits[].keyPath",
+        "edits[].value",
+        "edits[].mergeStrategy",
+        "filePath",
+        "expectedVersion",
+        "reloadUserConfig"
+      ],
+      "enumValues": {
+        "edits[].mergeStrategy": ["upsert"]
+      },
+      "responseSchema": "v2/ConfigWriteResponse.json",
+      "consumedResponse": [
+        { "path": "status", "presence": "required", "nullable": false },
+        { "path": "version", "presence": "required", "nullable": false },
+        { "path": "filePath", "presence": "required", "nullable": false }
+      ],
+      "consumedEnumValues": {
+        "status": ["ok", "okOverridden"]
+      }
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "hook/started",
+      "consumedParams": [
+        { "path": "threadId", "presence": "required", "nullable": false },
+        { "path": "turnId", "presence": "optional", "nullable": true },
+        { "path": "run.id", "presence": "required", "nullable": false },
+        { "path": "run.eventName", "presence": "required", "nullable": false },
+        { "path": "run.handlerType", "presence": "required", "nullable": false },
+        { "path": "run.executionMode", "presence": "required", "nullable": false },
+        { "path": "run.scope", "presence": "required", "nullable": false },
+        { "path": "run.sourcePath", "presence": "required", "nullable": false },
+        { "path": "run.source", "presence": "optional", "nullable": false },
+        { "path": "run.displayOrder", "presence": "required", "nullable": false },
+        { "path": "run.status", "presence": "required", "nullable": false },
+        { "path": "run.statusMessage", "presence": "optional", "nullable": true },
+        { "path": "run.startedAt", "presence": "required", "nullable": false },
+        { "path": "run.completedAt", "presence": "optional", "nullable": true },
+        { "path": "run.durationMs", "presence": "optional", "nullable": true },
+        { "path": "run.entries", "presence": "required", "nullable": false },
+        { "path": "run.entries[].kind", "presence": "required", "nullable": false },
+        { "path": "run.entries[].text", "presence": "required", "nullable": false }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "hook/completed",
+      "consumedParams": [
+        { "path": "threadId", "presence": "required", "nullable": false },
+        { "path": "turnId", "presence": "optional", "nullable": true },
+        { "path": "run.id", "presence": "required", "nullable": false },
+        { "path": "run.eventName", "presence": "required", "nullable": false },
+        { "path": "run.handlerType", "presence": "required", "nullable": false },
+        { "path": "run.executionMode", "presence": "required", "nullable": false },
+        { "path": "run.scope", "presence": "required", "nullable": false },
+        { "path": "run.sourcePath", "presence": "required", "nullable": false },
+        { "path": "run.source", "presence": "optional", "nullable": false },
+        { "path": "run.displayOrder", "presence": "required", "nullable": false },
+        { "path": "run.status", "presence": "required", "nullable": false },
+        { "path": "run.statusMessage", "presence": "optional", "nullable": true },
+        { "path": "run.startedAt", "presence": "required", "nullable": false },
+        { "path": "run.completedAt", "presence": "optional", "nullable": true },
+        { "path": "run.durationMs", "presence": "optional", "nullable": true },
+        { "path": "run.entries", "presence": "required", "nullable": false },
+        { "path": "run.entries[].kind", "presence": "required", "nullable": false },
+        { "path": "run.entries[].text", "presence": "required", "nullable": false }
+      ]
     }
   ]
 }

@@ -100,6 +100,50 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testHookInventoryGatePrecedesFreshAndResumeThreadMutations() async throws {
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            memoriesEnabledProvider: { true },
+            hookCompatibilityGateEnabled: true
+        )
+
+        let (startController, startRecordURL) = try await makeController(options: options)
+        addTeardownBlock { await startController.shutdown() }
+        _ = try await startController.startOrResume(existing: nil, baseInstructions: "Agent")
+        try assertRequestOrder(
+            first: "hooks/list",
+            second: "thread/start",
+            at: startRecordURL,
+            label: "fresh pre-thread hook gate"
+        )
+
+        let (resumeController, resumeRecordURL) = try await makeController(options: options)
+        addTeardownBlock { await resumeController.shutdown() }
+        _ = try await resumeController.startOrResume(
+            existing: .init(
+                conversationID: "existing-thread",
+                rolloutPath: nil,
+                model: nil,
+                reasoningEffort: nil
+            ),
+            baseInstructions: "Agent"
+        )
+        try assertRequestOrder(
+            first: "hooks/list",
+            second: "thread/memoryMode/set",
+            at: resumeRecordURL,
+            label: "resume hook gate before memory mutation"
+        )
+        try assertRequestOrder(
+            first: "hooks/list",
+            second: "thread/resume",
+            at: resumeRecordURL,
+            label: "resume pre-thread hook gate"
+        )
+    }
+
     func testResumeFailsClosedWhenMemoryModeReconciliationIsRejected() async throws {
         let options = CodexNativeSessionController.Options.agentModeDefault(
             approvalPolicyProvider: { .never },
@@ -1192,6 +1236,9 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
                 continue
             if method == "thread/memoryMode/set" and reject_memory_mode_requests:
                 reject(request["id"], "memory mode rejected")
+            elif method == "hooks/list":
+                cwds = params.get("cwds") or []
+                respond(request["id"], {"data": [{"cwd": cwd, "hooks": [], "warnings": [], "errors": []} for cwd in cwds]})
             elif method == "thread/start":
                 respond(request["id"], {"thread": {"id": "fresh-thread", "status": "idle", "turns": []}})
             elif method == "thread/resume":

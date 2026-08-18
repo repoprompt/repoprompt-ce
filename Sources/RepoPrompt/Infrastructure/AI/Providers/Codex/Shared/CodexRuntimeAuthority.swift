@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
@@ -10,6 +11,19 @@ enum CodexRuntimeAuthority {
     static let minimumExternalVersion = bundledVersion
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
+    enum BuildChannel: String, CaseIterable {
+        case debug = "Debug"
+        case release = "Release"
+
+        static var current: BuildChannel {
+            #if DEBUG
+                .debug
+            #else
+                .release
+            #endif
+        }
+    }
+
     enum Source: Equatable {
         case bundled(target: String)
         case externalOverride
@@ -18,6 +32,7 @@ enum CodexRuntimeAuthority {
     struct StatePaths: Equatable {
         let codexHome: URL
         let sqliteHome: URL
+        let logDirectory: URL
 
         var environment: [String: String] {
             [
@@ -34,8 +49,7 @@ enum CodexRuntimeAuthority {
         let statePaths: StatePaths
 
         func prepareState(fileManager: FileManager = .default) throws {
-            try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+            try CodexRuntimeAuthority.prepareManagedState(statePaths, fileManager: fileManager)
         }
 
         var redactedDiagnosticSummary: String {
@@ -206,21 +220,152 @@ enum CodexRuntimeAuthority {
         #endif
     }
 
-    static func statePaths(applicationSupportURL: URL? = nil) -> StatePaths {
+    static func statePaths(
+        applicationSupportURL: URL? = nil,
+        buildChannel: BuildChannel = .current
+    ) -> StatePaths {
         let support = applicationSupportURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        #if DEBUG
-            let buildChannel = "Debug"
-        #else
-            let buildChannel = "Release"
-        #endif
         let root = support
             .appendingPathComponent("RepoPrompt CE", isDirectory: true)
             .appendingPathComponent("Codex", isDirectory: true)
-            .appendingPathComponent(buildChannel, isDirectory: true)
+            .appendingPathComponent(buildChannel.rawValue, isDirectory: true)
         return StatePaths(
             codexHome: root.appendingPathComponent("home", isDirectory: true),
-            sqliteHome: root.appendingPathComponent("sqlite", isDirectory: true)
+            sqliteHome: root.appendingPathComponent("sqlite", isDirectory: true),
+            logDirectory: root.appendingPathComponent("log", isDirectory: true)
         )
+    }
+
+    static func prepareManagedState(
+        _ paths: StatePaths,
+        fileManager: FileManager = .default
+    ) throws {
+        let directories = try managedStateDirectories(paths)
+        for directory in directories {
+            switch try nodeType(at: directory) {
+            case nil:
+                let parent = directory.deletingLastPathComponent()
+                guard try nodeType(at: parent) == mode_t(S_IFDIR) else {
+                    throw CocoaError(.fileReadInvalidFileName)
+                }
+                try fileManager.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: false
+                )
+            case mode_t(S_IFDIR):
+                break
+            default:
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+        try validateManagedState(paths, fileManager: fileManager)
+    }
+
+    private static func managedStateDirectories(_ paths: StatePaths) throws -> [URL] {
+        let codexHome = paths.codexHome.standardizedFileURL
+        let sqliteHome = paths.sqliteHome.standardizedFileURL
+        let logDirectory = paths.logDirectory.standardizedFileURL
+        guard codexHome == paths.codexHome,
+              sqliteHome == paths.sqliteHome,
+              logDirectory == paths.logDirectory,
+              codexHome.isFileURL,
+              codexHome.path.hasPrefix("/")
+        else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+
+        let channelRoot = codexHome.deletingLastPathComponent()
+        guard codexHome == channelRoot.appendingPathComponent("home", isDirectory: true),
+              sqliteHome == channelRoot.appendingPathComponent("sqlite", isDirectory: true),
+              logDirectory == channelRoot.appendingPathComponent("log", isDirectory: true),
+              channelRoot.lastPathComponent == BuildChannel.debug.rawValue
+              || channelRoot.lastPathComponent == BuildChannel.release.rawValue,
+              channelRoot.deletingLastPathComponent().lastPathComponent == "Codex",
+              channelRoot.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "RepoPrompt CE"
+        else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+
+        let codexRoot = channelRoot.deletingLastPathComponent()
+        let repoPromptRoot = codexRoot.deletingLastPathComponent()
+        return [repoPromptRoot, codexRoot, channelRoot, codexHome, sqliteHome, logDirectory]
+    }
+
+    static func validateManagedState(
+        _ paths: StatePaths,
+        fileManager: FileManager = .default
+    ) throws {
+        for directory in try managedStateDirectories(paths) {
+            guard try nodeType(at: directory) == mode_t(S_IFDIR) else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+        let sensitiveFiles = [
+            paths.codexHome.appendingPathComponent("auth.json"),
+            paths.codexHome.appendingPathComponent("config.toml"),
+            paths.codexHome.appendingPathComponent("session_index.jsonl")
+        ]
+        for file in sensitiveFiles {
+            guard try nodeType(at: file) != mode_t(S_IFLNK) else {
+                throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+
+        let sensitiveTrees = [
+            paths.codexHome.appendingPathComponent("sessions", isDirectory: true),
+            paths.codexHome.appendingPathComponent("shell_snapshots", isDirectory: true),
+            paths.sqliteHome,
+            paths.logDirectory
+        ]
+        for root in sensitiveTrees {
+            try rejectSymbolicLinks(in: root, fileManager: fileManager)
+        }
+    }
+
+    private static func rejectSymbolicLinks(
+        in root: URL,
+        fileManager: FileManager
+    ) throws {
+        switch try nodeType(at: root) {
+        case nil:
+            return
+        case mode_t(S_IFDIR):
+            break
+        default:
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+
+        var pendingDirectories = [root]
+        while let directory = pendingDirectories.popLast() {
+            let children = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            for child in children {
+                switch try nodeType(at: child) {
+                case mode_t(S_IFLNK):
+                    throw CocoaError(.fileReadInvalidFileName)
+                case mode_t(S_IFDIR):
+                    pendingDirectories.append(child)
+                case nil:
+                    continue
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private static func nodeType(at url: URL) throws -> mode_t? {
+        var status = stat()
+        if lstat(url.path, &status) == 0 {
+            return status.st_mode & mode_t(S_IFMT)
+        }
+        guard errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return nil
     }
 
     static func resolve(
@@ -421,6 +566,6 @@ enum CodexRuntimeAuthority {
         func redact(_ path: String) -> String {
             path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : "<application-support>/" + URL(fileURLWithPath: path).lastPathComponent
         }
-        return "CODEX_HOME=\(redact(paths.codexHome.path)), CODEX_SQLITE_HOME=\(redact(paths.sqliteHome.path))"
+        return "CODEX_HOME=\(redact(paths.codexHome.path)), CODEX_SQLITE_HOME=\(redact(paths.sqliteHome.path)), log_dir=\(redact(paths.logDirectory.path))"
     }
 }

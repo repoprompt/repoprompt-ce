@@ -61,6 +61,41 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(arguments.contains("--dangerously-bypass-approvals-and-sandbox"))
     }
 
+    func testManagedStateOverridesPinExecSQLiteAndLogPaths() {
+        let statePaths = CodexRuntimeAuthority.StatePaths(
+            codexHome: URL(fileURLWithPath: "/tmp/managed home"),
+            sqliteHome: URL(fileURLWithPath: "/tmp/managed sqlite"),
+            logDirectory: URL(fileURLWithPath: "/tmp/managed log")
+        )
+
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: [],
+            statePaths: statePaths
+        ).args
+
+        XCTAssertEqual(Array(arguments.prefix(5)), [
+            "exec",
+            "-c",
+            "sqlite_home=\"/tmp/managed sqlite\"",
+            "-c",
+            "log_dir=\"/tmp/managed log\""
+        ])
+    }
+
+    func testManagedStateOverridesEscapeTOMLStrings() {
+        let statePaths = CodexRuntimeAuthority.StatePaths(
+            codexHome: URL(fileURLWithPath: "/tmp/home"),
+            sqliteHome: URL(fileURLWithPath: "/tmp/sqlite\\\"value"),
+            logDirectory: URL(fileURLWithPath: "/tmp/log")
+        )
+        XCTAssertEqual(
+            CodexOverrides.managedStateArgs(statePaths)[1],
+            "sqlite_home=\"/tmp/sqlite\\\\\\\"value\""
+        )
+    }
+
     private func occurrences(of needle: String, in haystack: String) -> Int {
         guard !needle.isEmpty else { return 0 }
         return haystack.components(separatedBy: needle).count - 1

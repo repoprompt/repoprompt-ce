@@ -94,6 +94,13 @@ enum CodexOverrides {
         return args
     }
 
+    static func managedStateArgs(_ statePaths: CodexRuntimeAuthority.StatePaths) -> [String] {
+        [
+            "-c", "sqlite_home=\(tomlString(statePaths.sqliteHome.path))",
+            "-c", "log_dir=\(tomlString(statePaths.logDirectory.path))"
+        ]
+    }
+
     static func appServerConfigMap(
         toolPolicy: ToolPolicy,
         featurePolicy: FeaturePolicy = .defaultDisabled
@@ -181,6 +188,22 @@ enum CodexOverrides {
             config[key] = value
         }
         return config
+    }
+
+    private static func tomlString(_ value: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(value.count + 2)
+        for character in value {
+            switch character {
+            case "\\": escaped += "\\\\"
+            case "\"": escaped += "\\\""
+            case "\n": escaped += "\\n"
+            case "\r": escaped += "\\r"
+            case "\t": escaped += "\\t"
+            default: escaped.append(character)
+            }
+        }
+        return "\"\(escaped)\""
     }
 
     private static func webSearchMode(enabled: Bool) -> String {

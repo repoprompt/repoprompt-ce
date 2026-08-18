@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 struct CLIProvidersSettingsView: View {
     @ObservedObject var viewModel: APISettingsViewModel
     @ObservedObject var promptViewModel: PromptViewModel
@@ -13,6 +14,7 @@ struct CLIProvidersSettingsView: View {
     ///
     /// SEARCH-HELPER: Open Agent Permissions, Configure in Agent Permissions, A4 progressive disclosure
     var onNavigate: ((SettingsTab) -> Void)?
+    private let codexManagedHomeActions: CodexManagedHomeSettingsActions
 
     @StateObject private var providerPermissionsVM: AgentProviderPermissionsSettingsViewModel
 
@@ -23,7 +25,8 @@ struct CLIProvidersSettingsView: View {
         providerPermissionsViewModel: @MainActor @escaping () -> AgentProviderPermissionsSettingsViewModel,
         onAPIKeyUpdated: (() -> Void)? = nil,
         closeAction: (() -> Void)? = nil,
-        onNavigate: ((SettingsTab) -> Void)? = nil
+        onNavigate: ((SettingsTab) -> Void)? = nil,
+        codexManagedHomeActions: CodexManagedHomeSettingsActions = .live
     ) {
         self.viewModel = viewModel
         self.promptViewModel = promptViewModel
@@ -31,7 +34,9 @@ struct CLIProvidersSettingsView: View {
         self.onAPIKeyUpdated = onAPIKeyUpdated
         self.closeAction = closeAction
         self.onNavigate = onNavigate
+        self.codexManagedHomeActions = codexManagedHomeActions
         _providerPermissionsVM = StateObject(wrappedValue: providerPermissionsViewModel())
+        _codexManagedHomeSnapshot = State(initialValue: .load())
     }
 
     @State private var showAlert = false
@@ -44,6 +49,8 @@ struct CLIProvidersSettingsView: View {
     @State private var codexManagedDeviceCode: CodexManagedChatgptDeviceCode?
     @State private var didCopyCodexManagedDeviceCode = false
     @State private var showCodexSignOutConfirmation = false
+    @State private var codexManagedHomeSnapshot: CodexManagedHomeSettingsSnapshot
+    @State private var codexManagedHomeActionMessage: String?
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
     @State private var isLoadingGrokBuild = false
@@ -151,6 +158,7 @@ struct CLIProvidersSettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             Task {
+                refreshCodexManagedHomeSnapshot()
                 await viewModel.loadCompatibleBackendState()
                 await viewModel.refreshClaudeCodeBinaryStatus()
             }
@@ -1565,6 +1573,8 @@ struct CLIProvidersSettingsView: View {
             isExpanded: $isCodexExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
+                codexManagedHomeSection
+
                 // KYC note
                 HStack(spacing: 4) {
                     Text("ChatGPT may require identity verification (KYC) to access Codex.")
@@ -1739,6 +1749,134 @@ struct CLIProvidersSettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var codexManagedHomeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "externaldrive.fill")
+                    .foregroundColor(.secondary)
+                Text("Managed Codex Home")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+            }
+
+            Text(codexManagedHomeSnapshot.managedHome.path)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(7)
+                .background(Color.secondary.opacity(0.07))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+
+            HStack(spacing: 8) {
+                Button("Copy Full Path") {
+                    codexManagedHomeActionMessage = codexManagedHomeActions.copyFullPath(
+                        codexManagedHomeSnapshot.statePaths
+                    )
+                        ? "Full managed-home path copied."
+                        : "Could not copy the managed-home path. Try selecting and copying the path above."
+                }
+                .buttonStyle(CustomButtonStyle())
+
+                Button("Open in Finder") {
+                    openManagedCodexHomeInFinder()
+                }
+                .buttonStyle(CustomButtonStyle())
+
+                Button("Refresh Status") {
+                    refreshCodexManagedHomeSnapshot()
+                    codexManagedHomeActionMessage = nil
+                }
+                .buttonStyle(CustomButtonStyle())
+
+                Spacer()
+            }
+
+            HStack(alignment: .top, spacing: 7) {
+                Image(systemName: codexProjectionStatusIcon)
+                    .foregroundColor(codexProjectionStatusColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(codexProjectionStatusTitle)
+                        .font(.system(size: 11, weight: .medium))
+                    Text(codexManagedHomeSnapshot.projection.message)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if let codexManagedHomeActionMessage {
+                Text(codexManagedHomeActionMessage)
+                    .font(.caption)
+                    .foregroundColor(
+                        codexManagedHomeActionMessage.hasPrefix("Could not") ? .red : .secondary
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("RepoPrompt uses this isolated home. Project hooks are inventoried and reviewed before a thread starts. The effective ordinary global AGENTS.override.md or AGENTS.md is projected one-way as a RepoPrompt-owned regular file before launch.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Not shared or imported from ordinary ~/.codex: authentication, the whole Codex home or config, sessions and history, SQLite, logs, and ordinary global executable hooks.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var codexProjectionStatusTitle: String {
+        switch codexManagedHomeSnapshot.projection.status {
+        case .current: "Global instruction projection current"
+        case .absent: "Global instruction projection absent"
+        case .conflict: "Global instruction projection needs attention"
+        case .error: "Global instruction projection inspection failed"
+        }
+    }
+
+    private var codexProjectionStatusIcon: String {
+        switch codexManagedHomeSnapshot.projection.status {
+        case .current: "checkmark.circle.fill"
+        case .absent: "minus.circle"
+        case .conflict: "exclamationmark.triangle.fill"
+        case .error: "xmark.octagon.fill"
+        }
+    }
+
+    private var codexProjectionStatusColor: Color {
+        switch codexManagedHomeSnapshot.projection.status {
+        case .current: .green
+        case .absent: .secondary
+        case .conflict: .orange
+        case .error: .red
+        }
+    }
+
+    private func refreshCodexManagedHomeSnapshot() {
+        codexManagedHomeSnapshot = .load()
+    }
+
+    private func openManagedCodexHomeInFinder() {
+        do {
+            guard try codexManagedHomeActions.openInFinder(codexManagedHomeSnapshot.statePaths) else {
+                codexManagedHomeActionMessage = "Could not open the managed Codex home in Finder. The path remains selectable above."
+                refreshCodexManagedHomeSnapshot()
+                return
+            }
+            codexManagedHomeActionMessage = nil
+            refreshCodexManagedHomeSnapshot()
+        } catch {
+            codexManagedHomeActionMessage = "Could not safely prepare the managed Codex home. Check its permissions and remove symbolic links from RepoPrompt-owned path components."
+            refreshCodexManagedHomeSnapshot()
         }
     }
 
