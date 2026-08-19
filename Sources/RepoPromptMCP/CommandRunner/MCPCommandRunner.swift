@@ -377,24 +377,37 @@ actor MCPCommandRunner {
         var args = try MCPCommandParser.parseJSONArgs(jsonPayload)
 
         // Normalize context_builder instruction aliases (task, prompt, etc. -> instructions)
-        if name == "context_builder", var argsDict = args {
+        if name == "context_builder" {
+            var argsDict = args ?? [:]
             try MCPCommandParser.normalizeContextBuilderArgs(&argsDict)
 
-            // Validate required instructions parameter
             let hasInstructions: Bool = if case let .string(value) = argsDict["instructions"] {
                 !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             } else {
                 false
             }
+            let hasContextPackReference: Bool = if case let .string(value) = argsDict["context_pack_ref"] {
+                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } else {
+                false
+            }
 
-            guard hasInstructions else {
+            switch (hasInstructions, hasContextPackReference) {
+            case (true, false), (false, true):
+                break
+            case (true, true):
+                throw CommandParseError.invalidArgument(
+                    "context_builder accepts exactly one of instructions or context_pack_ref"
+                )
+            case (false, false):
                 throw CommandParseError.missingArgument(
                     """
-                    instructions (required)
+                    exactly one of instructions or context_pack_ref
 
                     Usage:
                       call context_builder {"task": "your task"}
                       call context_builder {"instructions": "...", "response_type": "plan"}
+                      call context_builder {"context_pack_ref": "oracle-pack:sha256:..."}
                     """
                 )
             }

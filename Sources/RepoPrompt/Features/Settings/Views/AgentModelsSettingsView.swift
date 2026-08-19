@@ -352,7 +352,7 @@ struct AgentModelsSettingsView: View {
         settingsCard {
             sectionHeader(
                 title: "Oracle Models",
-                subtitle: "The first Oracle is permanent. Add up to four independent Oracles for parallel ask_oracle, oracle_send, plan, and review responses."
+                subtitle: "Choose a primary Oracle and up to four additional models. Grouped requests run each model independently and keep results separate in roster order."
             )
 
             VStack(alignment: .leading, spacing: 12) {

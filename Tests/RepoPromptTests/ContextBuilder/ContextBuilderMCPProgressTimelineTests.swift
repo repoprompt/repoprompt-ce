@@ -1205,14 +1205,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
 
         XCTAssertEqual(noGroup, expected)
         XCTAssertEqual(singleOracle, expected)
-        XCTAssertFalse(noGroup.contains("competing candidates"))
-        XCTAssertFalse(singleOracle.contains("competing candidates"))
+        XCTAssertFalse(noGroup.contains("ordered, independent lane results"))
+        XCTAssertFalse(singleOracle.contains("ordered, independent lane results"))
     }
 
-    func testGeneratedResponseFollowUpHintAppendsMultiOracleCandidateGuidance() {
+    func testGeneratedResponseFollowUpHintKeepsMultiOracleResultsIndependent() {
         let continuation = "Continue this review conversation with ask_oracle(chat_id: \"chat-456\", new_chat: false)"
-        let adjudication = "The Oracle group contains multiple lane outcomes. Treat completed lane responses as competing candidates. Compare each candidate against the original task. Verify important or disputed claims with RepoPrompt tools (`read_file`, `file_search`, `git`, and `workspace_context`). Choose the best-supported candidate as the basis for your response, and retain useful details from other candidates only when you independently verify them. Treat majority agreement, model identity, response length, and Primary placement as non-evidence. Report unresolved disagreements. Return ONE final answer."
-        let expected = adjudication + "\n\nOptional later follow-up: " + continuation
+        let groupGuidance = "The Oracle group returned ordered, independent lane results. Check each result against the task and report unresolved disagreements."
+        let expected = groupGuidance + "\n\nOptional later follow-up: " + continuation
         let twoOracles = MCPContextBuilderToolProvider.generatedResponseFollowUpHint(
             modeLabel: "review",
             chatID: "chat-456",
@@ -1227,17 +1227,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         XCTAssertEqual(twoOracles, expected)
         XCTAssertEqual(fiveOracles, expected)
         for requiredText in [
-            "multiple lane outcomes",
-            "completed lane responses as competing candidates",
-            "original task",
-            "`read_file`",
-            "`file_search`",
-            "`git`",
-            "`workspace_context`",
-            "independently verify",
-            "majority agreement, model identity, response length, and Primary placement as non-evidence",
+            "ordered, independent lane results",
+            "Check each result against the task",
             "unresolved disagreements",
-            "ONE final answer",
             "Optional later follow-up:"
         ] {
             XCTAssertTrue(twoOracles.contains(requiredText), requiredText)
