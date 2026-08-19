@@ -54,14 +54,13 @@ enum AppOracleGroupRouting {
         case .codex: "codex"
         case .openCode: "openCode"
         case .cursor: "cursor"
+        case .grokBuild: "grokBuild"
         }
     }
 }
 
 extension OracleViewModel {
-    /// App-backed Oracle roster entry point. The empty-additional-roster branch is intentionally
-    /// a literal call into the pre-existing single-Oracle implementation: it performs no group
-    /// persistence, claim, preparation, projection, or coordinator work.
+    /// N=1 calls the existing single-Oracle path and bypasses all group state.
     @MainActor
     func tool_chatSendWithConfiguredRoster(
         args: [String: Value],
@@ -174,8 +173,7 @@ extension OracleViewModel {
                 member: OracleMemberLookup(publicChatID: requestedChatID),
                 owner: owner
             )
-            // A named legacy chat remains a literal single-chat continuation even while an
-            // N>1 roster is configured. Existing conversations are never silently promoted.
+            // A named single-chat continuation is never promoted into a group.
             if existingGroup == nil {
                 return try await tool_chatSend(args: args, promptVM: promptVM, tabContext: tabContext)
             }
@@ -400,11 +398,40 @@ extension OracleViewModel {
             await cancelOracleGroupLaneStreams(prepared.members)
         }
         let terminal = try prepared.settling(result)
-        try await Task.detached(priority: Task.currentPriority) {
-            try await store.save(terminal, expectedRevision: prepared.revision)
-        }.value
+        try await publishTerminalOracleGroup(
+            terminal,
+            expectedRevision: prepared.revision,
+            store: store
+        )
         try Task.checkCancellation()
         return Self.oracleGroupValue(result, mode: turn.input.mode.rawValue, tabContext: tabContext)
+    }
+
+    private func publishTerminalOracleGroup(
+        _ terminal: OracleGroupDocument,
+        expectedRevision: UInt64,
+        store: DomainOracleConversationStore
+    ) async throws {
+        try await Task.detached(priority: Task.currentPriority) {
+            do {
+                try await store.save(terminal, expectedRevision: expectedRevision)
+            } catch {
+                let publicationError = error
+                guard let current = try await store.load(
+                    groupID: terminal.group.id,
+                    owner: terminal.owner
+                ) else {
+                    throw publicationError
+                }
+                if current == terminal { return }
+                guard current.revision == expectedRevision,
+                      current.turns.last?.state == .prepared
+                else {
+                    throw publicationError
+                }
+                try await store.save(terminal, expectedRevision: expectedRevision)
+            }
+        }.value
     }
 
     @MainActor

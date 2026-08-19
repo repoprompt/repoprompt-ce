@@ -2,6 +2,12 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+protocol DirectHeadlessOracleStore: OracleGroupStore, OracleArtifactStore {
+    func loadMostRecentConversation(owner: OracleConversationOwner) async throws -> OracleStoredConversation?
+}
+
+extension DomainOracleConversationStore: DirectHeadlessOracleStore {}
+
 actor DirectHeadlessOracleAdapter {
     enum AdapterError: Error, LocalizedError, Equatable {
         case contextPackRequired
@@ -51,7 +57,7 @@ actor DirectHeadlessOracleAdapter {
 
     private let owner: OracleConversationOwner
     private let rosterResolver: DirectHeadlessOracleRosterResolver
-    private let store: DomainOracleConversationStore
+    private let store: any DirectHeadlessOracleStore
     private let claimManager: OracleGroupClaimManager
     private let provider: DirectHeadlessProviderCoordinator
     private let coordinator = OracleGroupCoordinator()
@@ -61,7 +67,7 @@ actor DirectHeadlessOracleAdapter {
     init(
         profileIdentifier: String,
         rosterResolver: DirectHeadlessOracleRosterResolver,
-        store: DomainOracleConversationStore,
+        store: any DirectHeadlessOracleStore,
         claimManager: OracleGroupClaimManager,
         provider: DirectHeadlessProviderCoordinator
     ) throws {
@@ -492,12 +498,36 @@ actor DirectHeadlessOracleAdapter {
             throw error
         }
         let terminal = try prepared.settling(result)
-        let store = store
-        try await Task.detached(priority: Task.currentPriority) {
-            try await store.save(terminal, expectedRevision: prepared.revision)
-        }.value
+        try await publishTerminalGroup(terminal, expectedRevision: prepared.revision)
         try Task.checkCancellation()
         return Self.groupValue(result)
+    }
+
+    private func publishTerminalGroup(
+        _ terminal: OracleGroupDocument,
+        expectedRevision: UInt64
+    ) async throws {
+        let store = store
+        try await Task.detached(priority: Task.currentPriority) {
+            do {
+                try await store.save(terminal, expectedRevision: expectedRevision)
+            } catch {
+                let publicationError = error
+                guard let current = try await store.load(
+                    groupID: terminal.group.id,
+                    owner: terminal.owner
+                ) else {
+                    throw publicationError
+                }
+                if current == terminal { return }
+                guard current.revision == expectedRevision,
+                      current.turns.last?.state == .prepared
+                else {
+                    throw publicationError
+                }
+                try await store.save(terminal, expectedRevision: expectedRevision)
+            }
+        }.value
     }
 
     private func settlePreparedGroupIfNeeded(

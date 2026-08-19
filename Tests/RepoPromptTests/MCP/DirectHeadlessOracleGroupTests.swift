@@ -243,6 +243,19 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         let partialLanes = try XCTUnwrap(partial["oracle_results"] as? [[String: Any]])
         XCTAssertEqual(partialLanes.compactMap { $0["lane_index"] as? Int }, [0, 1, 2])
         XCTAssertEqual(partialLanes[1]["status"] as? String, "failed")
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        guard case let .group(persistedPartial)? =
+            try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
+        else {
+            return XCTFail("missing persisted partial-failure group")
+        }
+        let persistedTurn = try XCTUnwrap(persistedPartial.turns.last)
+        XCTAssertEqual(persistedTurn.status, .partialFailure)
+        XCTAssertEqual(persistedTurn.warnings.map(\.code), ["lane_failures"])
+        XCTAssertEqual(persistedTurn.results.map(\.status), [.completed, .failed, .completed])
+        XCTAssertEqual(persistedTurn.results[0].response, "response-0-lane-0")
+        XCTAssertEqual(persistedTurn.results[1].error?.code, "provider_error")
+        XCTAssertEqual(persistedTurn.results[2].response, "response-2-lane-2")
 
         try await Self.setRoster(prepared, primary: "fail", additional: ["lane-1"])
         let failed = try await invoke(
@@ -253,6 +266,56 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         )
         XCTAssertEqual(failed["status"] as? String, "failed")
         XCTAssertNil(failed["response"] as? String)
+    }
+
+    func testTerminalSaveFailureRetriesCanonicalOutcomeWithoutSyntheticSettlement() async throws {
+        let fixture = try Fixture(name: "terminal-save")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let store = FailFirstTerminalSaveOracleStore(base: prepared.oracleStore)
+        let adapter = try DirectHeadlessOracleAdapter(
+            profileIdentifier: fixture.profileName,
+            rosterResolver: DirectHeadlessOracleRosterResolver(settingsStore: prepared.settingsStore),
+            store: store,
+            claimManager: OracleGroupClaimManager(
+                persistence: prepared.runtime.persistenceCoordinator,
+                identity: prepared.runtime.identity
+            ),
+            provider: prepared.providerCoordinator
+        )
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: adapter
+        )
+        await prepared.childLaunchCoordinator.configure(
+            runtime: prepared.runtime,
+            endpointDescriptor: prepared.childEndpoint.socketURL.path,
+            oracleAdapter: adapter
+        )
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+
+        let result = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            oracleAdapter: adapter,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("terminal publication")]
+        )
+        XCTAssertEqual(result["status"] as? String, "completed")
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        guard case let .group(group)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
+        else {
+            return XCTFail("missing persisted Oracle group")
+        }
+        let turn = try XCTUnwrap(group.turns.last)
+        XCTAssertEqual(turn.state, .terminal)
+        XCTAssertEqual(turn.results.map(\.status), [.completed, .completed])
+        XCTAssertEqual(turn.results[0].response, "response-0-lane-0")
+        XCTAssertEqual(turn.results[1].response, "response-1-lane-1")
+        let forcedFailureCount = await store.forcedFailureCount()
+        XCTAssertEqual(forcedFailureCount, 1)
     }
 
     func testRosterConflictAndRawContextBuilderGateFailBeforeProviderDispatch() async throws {
@@ -432,12 +495,13 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
     private func invoke(
         prepared: DirectHeadlessMCPService.PreparedRuntime,
         backend: DirectHeadlessConversationBackend,
+        oracleAdapter: DirectHeadlessOracleAdapter? = nil,
         toolName: String,
         arguments: [String: Value],
         mismatchedBundle: Bool = false
     ) async throws -> [String: Any] {
         let security = try await securityContext(prepared)
-        let plan = try await prepared.oracleAdapter.resolveChildLaunchPlan(
+        let plan = try await (oracleAdapter ?? prepared.oracleAdapter).resolveChildLaunchPlan(
             toolName: toolName,
             arguments: arguments,
             securityContext: security
@@ -531,6 +595,92 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 }
+
+private actor FailFirstTerminalSaveOracleStore: DirectHeadlessOracleStore {
+    private let base: DomainOracleConversationStore
+    private var terminalSaveFailures = 0
+
+    init(base: DomainOracleConversationStore) {
+        self.base = base
+    }
+
+    func create(_ group: OracleGroupDocument) async throws {
+        try await base.create(group)
+    }
+
+    func load(
+        member: OracleMemberLookup,
+        owner: OracleConversationOwner
+    ) async throws -> OracleGroupDocument? {
+        try await base.load(member: member, owner: owner)
+    }
+
+    func load(
+        groupID: OracleGroupID,
+        owner: OracleConversationOwner
+    ) async throws -> OracleGroupDocument? {
+        try await base.load(groupID: groupID, owner: owner)
+    }
+
+    func loadMostRecentConversation(owner: OracleConversationOwner) async throws -> OracleStoredConversation? {
+        try await base.loadMostRecentConversation(owner: owner)
+    }
+
+    func save(_ group: OracleGroupDocument, expectedRevision: UInt64) async throws {
+        if group.turns.last?.state == .terminal, terminalSaveFailures == 0 {
+            terminalSaveFailures += 1
+            throw ForcedTerminalSaveError()
+        }
+        try await base.save(group, expectedRevision: expectedRevision)
+    }
+
+    func rename(
+        groupID: OracleGroupID,
+        owner: OracleConversationOwner,
+        name: String,
+        expectedRevision: UInt64
+    ) async throws {
+        try await base.rename(
+            groupID: groupID,
+            owner: owner,
+            name: name,
+            expectedRevision: expectedRevision
+        )
+    }
+
+    func delete(
+        groupID: OracleGroupID,
+        owner: OracleConversationOwner,
+        expectedRevision: UInt64
+    ) async throws {
+        try await base.delete(groupID: groupID, owner: owner, expectedRevision: expectedRevision)
+    }
+
+    func retainMostRecentGroups(
+        _ maximumCount: Int,
+        owner: OracleConversationOwner
+    ) async throws -> [OracleGroupID] {
+        try await base.retainMostRecentGroups(maximumCount, owner: owner)
+    }
+
+    func recoverPreparedGroups(owner: OracleConversationOwner) async throws -> [OracleGroupDocument] {
+        try await base.recoverPreparedGroups(owner: owner)
+    }
+
+    func storeArtifact(_ data: Data) async throws -> String {
+        try await base.storeArtifact(data)
+    }
+
+    func loadArtifact(id: String) async throws -> Data {
+        try await base.loadArtifact(id: id)
+    }
+
+    func forcedFailureCount() -> Int {
+        terminalSaveFailures
+    }
+}
+
+private struct ForcedTerminalSaveError: Error {}
 
 private struct Fixture {
     struct Call {
