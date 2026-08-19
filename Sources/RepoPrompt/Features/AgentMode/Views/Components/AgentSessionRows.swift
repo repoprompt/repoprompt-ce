@@ -42,6 +42,7 @@ struct AgentSessionRow: View {
     let onDelete: () -> Void
     let onRename: (String) -> Void
     var onDismissAttention: (() -> Void)?
+    let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
 
     @State private var isHovered = false
     @State private var isPinHovered = false
@@ -311,6 +312,11 @@ struct AgentSessionRow: View {
                 Button(pinActionLabel, action: onTogglePin)
 
                 Button(renameActionLabel, action: beginRename)
+
+                Button(AgentSidebarSessionIDCopyAction.menuTitle) {
+                    sessionIDCopyAction.perform()
+                }
+                .disabled(!sessionIDCopyAction.isEnabled)
 
                 if let onStash {
                     Button(stashActionLabel, action: onStash)
@@ -752,6 +758,7 @@ struct AgentStashedSessionRow: View {
     let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onRestore: () -> Void
     let onDelete: () -> Void
+    let sessionIDCopyAction: AgentSidebarSessionIDCopyAction
 
     @State private var isHovered = false
     @State private var isRestoreHovered = false
@@ -897,6 +904,10 @@ struct AgentStashedSessionRow: View {
                 Button("Select chat", action: toggleSelection)
                 Divider()
                 Button(restoreActionLabel, action: onRestore)
+                Button(AgentSidebarSessionIDCopyAction.menuTitle) {
+                    sessionIDCopyAction.perform()
+                }
+                .disabled(!sessionIDCopyAction.isEnabled)
                 Divider()
                 Button(deleteActionLabel, role: .destructive, action: onDelete)
             }

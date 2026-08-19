@@ -525,7 +525,8 @@ struct AgentModeSessionsListView: View {
                                         guard agentModeVM.workspaceManager?.activeWorkspaceID == snapshot.workspaceID else { return }
                                         agentModeVM.renameSession(tabID: session.tabID, to: newName)
                                     },
-                                    onDismissAttention: dismissAttentionAction
+                                    onDismissAttention: dismissAttentionAction,
+                                    sessionIDCopyAction: .systemClipboard(sessionID: session.sessionID)
                                 )
                             }
                         }
@@ -1148,7 +1149,10 @@ struct ArchivedSessionsList: View {
                                 await promptManager.unstashTab(stashed.id)
                             }
                         },
-                        onDelete: { deleteArchived(stashed) }
+                        onDelete: { deleteArchived(stashed) },
+                        sessionIDCopyAction: .systemClipboard(
+                            sessionID: stashed.tab.activeAgentSessionID
+                        )
                     )
                 }
             }
