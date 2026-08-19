@@ -1291,11 +1291,8 @@ actor ACPAgentSessionController {
     }
 
     private func drainRemainingBytes(from handle: FileHandle, into channel: FileHandleChunkChannel?) {
-        while true {
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            channel?.yield(data)
-        }
+        guard let channel else { return }
+        while channel.readAndYield(using: { handle.availableData }) {}
     }
 
     // MARK: - Transport
@@ -1306,12 +1303,9 @@ actor ACPAgentSessionController {
         let stdoutChannel = FileHandleChunkChannel()
         self.stdoutChannel = stdoutChannel
         stdout.readabilityHandler = { readable in
-            let data = readable.availableData
-            if data.isEmpty {
+            if !stdoutChannel.readAndYield(using: { readable.availableData }) {
                 stdoutChannel.finish()
                 readable.readabilityHandler = nil
-            } else {
-                stdoutChannel.yield(data)
             }
         }
         stdoutConsumerTask = Task { [weak self] in
@@ -1324,12 +1318,9 @@ actor ACPAgentSessionController {
         let stderrChannel = FileHandleChunkChannel()
         self.stderrChannel = stderrChannel
         stderr.readabilityHandler = { readable in
-            let data = readable.availableData
-            if data.isEmpty {
+            if !stderrChannel.readAndYield(using: { readable.availableData }) {
                 stderrChannel.finish()
                 readable.readabilityHandler = nil
-            } else {
-                stderrChannel.yield(data)
             }
         }
         stderrConsumerTask = Task { [weak self] in
