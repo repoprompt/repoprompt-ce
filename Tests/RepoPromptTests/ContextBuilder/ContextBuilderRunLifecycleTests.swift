@@ -717,9 +717,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             tab.promptText = expectedPrompt
             XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: activeWorkspace.id))
             window.workspaceManager.promptViewModel.promptText = expectedPrompt
-            // Let the prompt publisher settle before binding the cleanup fixture. Otherwise
-            // its delayed pre-bind snapshot can be delivered to the newly bound run.
-            try await Task.sleep(for: .milliseconds(200))
+
             let connectionID = UUID()
             let runID = UUID()
             try window.mcpServer.bindTabForConnection(
