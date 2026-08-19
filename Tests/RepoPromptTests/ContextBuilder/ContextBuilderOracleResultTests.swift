@@ -10,12 +10,7 @@ final class ContextBuilderOracleResultTests: XCTestCase {
             lane(index: 1, status: "completed", response: "adviser answer"),
             lane(index: 2, status: "failed", error: "adviser failed")
         ]
-        let value: [String: Value] = [
-            "oracle_group_id": .string(groupID),
-            "status": .string("partial_failure"),
-            "oracle_count": .int(3),
-            "oracle_results": .array(lanes)
-        ]
+        let value = groupValue(groupID: groupID, status: "partial_failure", lanes: lanes)
         let reply = try ContextBuilderOracleGroupReply.decode(value)
         XCTAssertEqual(reply.orderedResults.map(\.laneIndex), [0, 1, 2])
         XCTAssertEqual(reply.result.primary.response, "primary answer")
@@ -69,17 +64,154 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         XCTAssertFalse(askOracleText.contains("Secondary Oracle"))
     }
 
-    func testDecodeRejectsRoleThatDoesNotMatchLaneIndex() {
-        let value: [String: Value] = [
-            "oracle_group_id": .string(UUID().uuidString),
-            "status": .string("completed"),
-            "oracle_count": .int(1),
-            "oracle_results": .array([
-                lane(index: 0, role: "additional", status: "completed", response: "answer")
+    func testDecodePreservesExecutionProfileAndWarnings() throws {
+        var primary = laneObject(index: 0, status: "completed", response: "primary")
+        primary["execution_profile"] = .object([
+            "provider_id": .string("provider"),
+            "model_id": .string("resolved-model"),
+            "effective_reasoning_effort": .string("high")
+        ])
+        let warnings: Value = .array([
+            .object([
+                "code": .string("lane_failures"),
+                "message": .string("One lane did not complete")
             ])
+        ])
+        let reply = try ContextBuilderOracleGroupReply.decode(groupValue(
+            status: "partial_failure",
+            lanes: [
+                .object(primary),
+                lane(index: 1, status: "failed", error: "failed")
+            ],
+            warnings: warnings
+        ))
+
+        XCTAssertEqual(reply.result.primary.executionProfile?.providerID, "provider")
+        XCTAssertEqual(reply.result.primary.executionProfile?.modelID, "resolved-model")
+        XCTAssertEqual(reply.result.primary.executionProfile?.effectiveReasoningEffort, "high")
+        XCTAssertEqual(reply.result.warnings.map(\.code), ["lane_failures"])
+        XCTAssertEqual(reply.result.warnings.map(\.message), ["One lane did not complete"])
+        XCTAssertNotNil(
+            reply.toMCPFields()["oracle_results"]?.arrayValue?[0]
+                .objectValue?["execution_profile"]
+        )
+    }
+
+    func testDecodeRejectsWrongTypedPresentOptionalLaneFields() {
+        let malformedFields: [(String, Value)] = [
+            ("provider_id", .int(7)),
+            ("execution_profile", .string("profile")),
+            ("error", .string("failed"))
         ]
+        for (field, malformedValue) in malformedFields {
+            var primary = laneObject(index: 0, status: "completed", response: "primary")
+            primary[field] = malformedValue
+            XCTAssertThrowsError(
+                try ContextBuilderOracleGroupReply.decode(groupValue(
+                    lanes: [.object(primary), lane(index: 1, status: "completed", response: "additional")]
+                )),
+                "Expected malformed \(field) to fail"
+            )
+        }
+
+        var failedAdditional = laneObject(index: 1, status: "failed", error: "failed")
+        failedAdditional["response"] = .bool(true)
+        XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(groupValue(
+            status: "partial_failure",
+            lanes: [
+                lane(index: 0, status: "completed", response: "primary"),
+                .object(failedAdditional)
+            ]
+        )))
+    }
+
+    func testDecodeRejectsWrongTypedNestedOptionalFields() {
+        for field in ["provider_id", "model_id"] {
+            var wrongRequiredProfileField = laneObject(
+                index: 0,
+                status: "completed",
+                response: "primary"
+            )
+            var profile: [String: Value] = [
+                "provider_id": .string("provider"),
+                "model_id": .string("resolved-model")
+            ]
+            profile[field] = .int(7)
+            wrongRequiredProfileField["execution_profile"] = .object(profile)
+            XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(groupValue(
+                lanes: [
+                    .object(wrongRequiredProfileField),
+                    lane(index: 1, status: "completed", response: "additional")
+                ]
+            )))
+        }
+
+        var wrongEffort = laneObject(index: 0, status: "completed", response: "primary")
+        wrongEffort["execution_profile"] = .object([
+            "provider_id": .string("provider"),
+            "model_id": .string("resolved-model"),
+            "effective_reasoning_effort": .bool(true)
+        ])
+        XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(groupValue(
+            lanes: [.object(wrongEffort), lane(index: 1, status: "completed", response: "additional")]
+        )))
+
+        var wrongPartial = laneObject(index: 1, status: "failed", error: "failed")
+        wrongPartial["error"] = .object([
+            "code": .string("provider_failed"),
+            "message": .string("failed"),
+            "partial_response": .int(7)
+        ])
+        XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(groupValue(
+            status: "partial_failure",
+            lanes: [lane(index: 0, status: "completed", response: "primary"), .object(wrongPartial)]
+        )))
+
+        var missingErrorMessage = laneObject(index: 1, status: "failed")
+        missingErrorMessage["error"] = .object(["code": .string("provider_failed")])
+        XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(groupValue(
+            status: "partial_failure",
+            lanes: [lane(index: 0, status: "completed", response: "primary"), .object(missingErrorMessage)]
+        )))
+    }
+
+    func testDecodeRejectsWrongTypedWarningsWhenPresent() {
+        XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(groupValue(
+            lanes: [
+                lane(index: 0, status: "completed", response: "primary"),
+                lane(index: 1, status: "completed", response: "additional")
+            ],
+            warnings: .string("warning")
+        )))
+    }
+
+    func testDecodeRejectsRoleThatDoesNotMatchLaneIndex() {
+        let value = groupValue(
+            lanes: [
+                lane(index: 0, role: "additional", status: "completed", response: "answer"),
+                lane(index: 1, status: "completed", response: "additional")
+            ]
+        )
 
         XCTAssertThrowsError(try ContextBuilderOracleGroupReply.decode(value))
+    }
+
+    private func groupValue(
+        groupID: String = UUID().uuidString,
+        status: String = "completed",
+        lanes: [Value],
+        warnings: Value? = nil
+    ) -> [String: Value] {
+        var value: [String: Value] = [
+            "oracle_group_id": .string(groupID),
+            "status": .string(status),
+            "oracle_count": .int(lanes.count),
+            "oracle_results": .array(lanes)
+        ]
+        if let warnings {
+            value["warnings"] = warnings
+        }
+        return value
     }
 
     private func lane(
@@ -89,6 +221,22 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         response: String? = nil,
         error: String? = nil
     ) -> Value {
+        .object(laneObject(
+            index: index,
+            role: role,
+            status: status,
+            response: response,
+            error: error
+        ))
+    }
+
+    private func laneObject(
+        index: Int,
+        role: String? = nil,
+        status: String,
+        response: String? = nil,
+        error: String? = nil
+    ) -> [String: Value] {
         var object: [String: Value] = [
             "lane_index": .int(index),
             "role": .string(role ?? (index == 0 ? "primary" : "additional")),
@@ -103,6 +251,6 @@ final class ContextBuilderOracleResultTests: XCTestCase {
                 "message": .string(error)
             ])
         }
-        return .object(object)
+        return object
     }
 }

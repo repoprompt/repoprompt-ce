@@ -4654,17 +4654,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
             let groupReply = try ContextBuilderOracleGroupReply.decode(value)
+            guard session.followUpOracleGroupState.matchesFinalResult(
+                groupReply.result,
+                generation: generation
+            ) else {
+                throw ChatToolError.internalError(
+                    "Context Builder Oracle group result did not match its prepared members"
+                )
+            }
             guard let primary = session.followUpOracleGroupState.members.first else {
                 throw ChatToolError.internalError("Context Builder Oracle group completed without Primary state")
             }
-            guard groupReply.result.primary.status == .completed,
-                  let primaryResponse = groupReply.result.primary.response
-            else {
-                let error = groupReply.result.primary.error
-                throw ChatToolError.internalError(
-                    error?.message ?? "Oracle did not complete successfully."
-                )
-            }
+            let primaryResult = groupReply.result.primary
+            let primaryResponse = primaryResult.response ?? primaryResult.error?.partialResponse
             try await oracleStore.releaseArtifactReservation(
                 frozenPack.reservation,
                 removeIfUnreferenced: false
@@ -4676,8 +4678,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard session.followUpOracleGroupState.generation == generation else {
                 throw CancellationError()
             }
-            let errors = groupReply.orderedResults.dropFirst().compactMap { result in
-                result.error.map { "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)" }
+            let errors = groupReply.orderedResults.compactMap { result in
+                result.error.map {
+                    "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)"
+                }
             }
             let reply = ChatSendReply(
                 chatId: primary.sessionID,
