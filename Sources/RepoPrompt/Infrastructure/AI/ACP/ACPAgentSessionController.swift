@@ -1210,17 +1210,29 @@ actor ACPAgentSessionController {
             transportSettled = await waitForProcessExitDuringTransportDrain()
             process.stdout.readabilityHandler = nil
             process.stderr.readabilityHandler = nil
-            drainRemainingBytes(from: process.stdout, into: stdoutChannel)
-            drainRemainingBytes(from: process.stderr, into: stderrChannel)
-            stdoutChannel?.finish()
-            stderrChannel?.finish()
-            await stdoutConsumerTask?.value
-            await stderrConsumerTask?.value
-            stdoutFramer.flush { lineData in
-                handleJSONLine(lineData)
-            }
-            stderrFramer.flush { lineData in
-                handleStderrLine(lineData)
+            if transportSettled {
+                drainRemainingBytes(from: process.stdout, into: stdoutChannel)
+                drainRemainingBytes(from: process.stderr, into: stderrChannel)
+                stdoutChannel?.finish()
+                stderrChannel?.finish()
+                await stdoutConsumerTask?.value
+                await stderrConsumerTask?.value
+                stdoutFramer.flush { lineData in
+                    handleJSONLine(lineData)
+                }
+                stderrFramer.flush { lineData in
+                    handleStderrLine(lineData)
+                }
+            } else {
+                stdoutChannel?.finish()
+                stderrChannel?.finish()
+                stdoutConsumerTask?.cancel()
+                stderrConsumerTask?.cancel()
+                processWaitTask?.cancel()
+                _ = await ProcessTermination.terminateAndReap(
+                    pid: process.pid,
+                    processGroupID: process.processGroupID
+                )
             }
         } else {
             stdoutChannel?.finish()
@@ -1292,7 +1304,11 @@ actor ACPAgentSessionController {
 
     private func drainRemainingBytes(from handle: FileHandle, into channel: FileHandleChunkChannel?) {
         guard let channel else { return }
-        while channel.readAndYield(using: { handle.availableData }) {}
+        while true {
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            channel.yield(data)
+        }
     }
 
     // MARK: - Transport
@@ -1303,9 +1319,12 @@ actor ACPAgentSessionController {
         let stdoutChannel = FileHandleChunkChannel()
         self.stdoutChannel = stdoutChannel
         stdout.readabilityHandler = { readable in
-            if !stdoutChannel.readAndYield(using: { readable.availableData }) {
+            let data = readable.availableData
+            if data.isEmpty {
                 stdoutChannel.finish()
                 readable.readabilityHandler = nil
+            } else {
+                stdoutChannel.yield(data)
             }
         }
         stdoutConsumerTask = Task { [weak self] in
@@ -1318,9 +1337,12 @@ actor ACPAgentSessionController {
         let stderrChannel = FileHandleChunkChannel()
         self.stderrChannel = stderrChannel
         stderr.readabilityHandler = { readable in
-            if !stderrChannel.readAndYield(using: { readable.availableData }) {
+            let data = readable.availableData
+            if data.isEmpty {
                 stderrChannel.finish()
                 readable.readabilityHandler = nil
+            } else {
+                stderrChannel.yield(data)
             }
         }
         stderrConsumerTask = Task { [weak self] in

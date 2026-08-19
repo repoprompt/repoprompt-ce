@@ -12,6 +12,11 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         case acceptForSession
     }
 
+    enum PromptCompletion {
+        case shutdownImmediately
+        case drainTransportBeforeShutdown
+    }
+
     typealias ProviderFactory = () async throws -> any ACPAgentProvider
     typealias RequestFactory = (_ message: AgentMessage, _ runID: UUID) -> ACPRunRequest
     typealias ControllerFactory = (
@@ -27,6 +32,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
     private let makeController: ControllerFactory
     private let beforePrompt: BeforePrompt
     private let approvalPolicy: ApprovalPolicy
+    private let promptCompletion: PromptCompletion
     private let lifecycle = ACPHeadlessProviderLifecycle()
 
     init(
@@ -35,7 +41,8 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         makeRequest: @escaping RequestFactory,
         makeController: @escaping ControllerFactory,
         beforePrompt: @escaping BeforePrompt = { _, _ in },
-        approvalPolicy: ApprovalPolicy
+        approvalPolicy: ApprovalPolicy,
+        promptCompletion: PromptCompletion = .shutdownImmediately
     ) {
         self.providerName = providerName
         self.makeProvider = makeProvider
@@ -43,6 +50,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         self.makeController = makeController
         self.beforePrompt = beforePrompt
         self.approvalPolicy = approvalPolicy
+        self.promptCompletion = promptCompletion
     }
 
     func streamAgentMessage(
@@ -137,9 +145,17 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             do {
                 _ = try await controller.bootstrap()
                 try await beforePrompt(controller, request)
-                await controller.prepareForPromptTransportDrain()
-                try await controller.prompt(message, request: request)
-                let transportSettled = await controller.shutdownAfterPromptTransportDrain()
+                let transportSettled: Bool
+                switch promptCompletion {
+                case .shutdownImmediately:
+                    try await controller.prompt(message, request: request)
+                    await controller.shutdown()
+                    transportSettled = true
+                case .drainTransportBeforeShutdown:
+                    await controller.prepareForPromptTransportDrain()
+                    try await controller.prompt(message, request: request)
+                    transportSettled = await controller.shutdownAfterPromptTransportDrain()
+                }
                 await transportSettlement.publish(transportSettled)
                 await forwardTask.value
             } catch {

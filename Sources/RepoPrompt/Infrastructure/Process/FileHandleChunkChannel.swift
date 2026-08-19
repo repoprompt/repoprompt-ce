@@ -13,7 +13,7 @@ import Foundation
 /// Related:
 /// - Producer:  ClaudeNativeProcessSessionController.startStdoutReader / startStderrReader
 /// - Consumer:  ClaudeNativeProcessSessionController.handleStdoutChunk / handleStderrChunk
-/// - Tests:     RepoPromptTests/AI/FileHandleChunkChannelTests.swift
+/// - Tests:     RepoPromptTests/Process/ProcessCoreTests.swift
 final class FileHandleChunkChannel: @unchecked Sendable {
     let stream: AsyncStream<Data>
     private let continuation: AsyncStream<Data>.Continuation
@@ -28,21 +28,6 @@ final class FileHandleChunkChannel: @unchecked Sendable {
             fatalError("FileHandleChunkChannel: failed to capture AsyncStream continuation")
         }
         continuation = captured
-    }
-
-    /// Reads one available chunk and enqueues it while holding the producer-order lock.
-    ///
-    /// Readability callbacks and shutdown drains for the same handle must both use this method so
-    /// a later read cannot overtake a callback that has already started its read-and-yield operation.
-    @discardableResult
-    func readAndYield(using read: () -> Data) -> Bool {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-
-        let data = read()
-        guard !data.isEmpty else { return false }
-        _ = continuation.yield(data)
-        return true
     }
 
     /// Enqueue a data chunk. Safe to call from any thread (including `readabilityHandler` dispatch queues).
