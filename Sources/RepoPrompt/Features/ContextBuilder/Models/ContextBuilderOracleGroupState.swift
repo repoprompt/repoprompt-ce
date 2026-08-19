@@ -16,13 +16,17 @@ struct ContextBuilderOracleGroupState {
     private(set) var turnID: OracleTurnID?
     private(set) var members: [ContextBuilderOracleMemberHandle] = []
     private var nextSequenceByLane: [OracleLaneID: UInt64] = [:]
+    private var groupPrepared = false
+    private var startedLanes: Set<OracleLaneID> = []
+    private var settledLanes: Set<OracleLaneID> = []
+    private var groupSettled = false
 
     mutating func beginRun() -> UInt64 {
         generation &+= 1
         groupID = nil
         turnID = nil
         members = []
-        nextSequenceByLane = [:]
+        resetLifecycle()
         return generation
     }
 
@@ -43,7 +47,7 @@ struct ContextBuilderOracleGroupState {
         self.groupID = groupID
         self.turnID = turnID
         self.members = members
-        nextSequenceByLane = [:]
+        resetLifecycle()
         return true
     }
 
@@ -53,28 +57,86 @@ struct ContextBuilderOracleGroupState {
     ) -> Bool {
         guard generation == expectedGeneration,
               event.groupID == groupID,
-              event.turnID == turnID
+              event.turnID == turnID,
+              !groupSettled
         else {
             return false
         }
-        guard let laneID = event.laneID else {
-            return event.sequence == nil
+
+        switch event.kind {
+        case .groupPrepared:
+            guard event.laneID == nil,
+                  event.sequence == nil,
+                  !groupPrepared,
+                  startedLanes.isEmpty
+            else {
+                return false
+            }
+            groupPrepared = true
+            return true
+
+        case .groupSettled:
+            guard event.laneID == nil,
+                  event.sequence == nil,
+                  groupPrepared,
+                  settledLanes.count == members.count
+            else {
+                return false
+            }
+            groupSettled = true
+            return true
+
+        case .laneStarted, .laneDelta, .laneSettled:
+            guard groupPrepared,
+                  let laneID = event.laneID,
+                  members.indices.contains(laneID.index),
+                  members[laneID.index].laneID == laneID,
+                  let sequence = event.sequence,
+                  sequence == nextSequenceByLane[laneID, default: 0]
+            else {
+                return false
+            }
+
+            let lifecycleValid = switch event.kind {
+            case .laneStarted:
+                !startedLanes.contains(laneID) && !settledLanes.contains(laneID)
+            case .laneDelta:
+                startedLanes.contains(laneID) && !settledLanes.contains(laneID)
+            case .laneSettled:
+                startedLanes.contains(laneID) && !settledLanes.contains(laneID)
+            case .groupPrepared, .groupSettled:
+                false
+            }
+            guard lifecycleValid else { return false }
+
+            nextSequenceByLane[laneID] = sequence &+ 1
+            if event.kind == .laneStarted {
+                startedLanes.insert(laneID)
+            } else if event.kind == .laneSettled {
+                settledLanes.insert(laneID)
+            }
+            return true
         }
-        guard members.indices.contains(laneID.index),
-              members[laneID.index].laneID == laneID,
-              let sequence = event.sequence,
-              sequence == nextSequenceByLane[laneID, default: 0]
-        else {
-            return false
-        }
-        nextSequenceByLane[laneID] = sequence &+ 1
-        return true
     }
 
     func acceptsLaneCallback(_ laneID: OracleLaneID, generation expectedGeneration: UInt64) -> Bool {
         generation == expectedGeneration
+            && !groupSettled
+            && !settledLanes.contains(laneID)
             && members.indices.contains(laneID.index)
             && members[laneID.index].laneID == laneID
+    }
+
+    func matchesFinalResult(
+        _ result: OracleGroupResult,
+        generation expectedGeneration: UInt64
+    ) -> Bool {
+        generation == expectedGeneration
+            && result.groupID == groupID
+            && result.oracleResults.count == members.count
+            && zip(result.oracleResults, members).allSatisfy { result, member in
+                result.laneIndex == member.laneID.index && result.chatID == member.chatID
+            }
     }
 
     mutating func invalidateAndTakeMembers() -> [ContextBuilderOracleMemberHandle] {
@@ -83,7 +145,7 @@ struct ContextBuilderOracleGroupState {
         groupID = nil
         turnID = nil
         members = []
-        nextSequenceByLane = [:]
+        resetLifecycle()
         return cancelledMembers
     }
 
@@ -92,7 +154,15 @@ struct ContextBuilderOracleGroupState {
         groupID = nil
         turnID = nil
         members = []
+        resetLifecycle()
+    }
+
+    private mutating func resetLifecycle() {
         nextSequenceByLane = [:]
+        groupPrepared = false
+        startedLanes = []
+        settledLanes = []
+        groupSettled = false
     }
 }
 
@@ -204,7 +274,19 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
         guard object["oracle_count"]?.intValue == results.count else {
             throw ChatToolError.internalError("Invalid Context Builder Oracle group count")
         }
-        let warnings = try (object["warnings"]?.arrayValue ?? []).map { value in
+        let warningValues: [Value]
+        if let value = object["warnings"] {
+            if value == .null {
+                warningValues = []
+            } else if let values = value.arrayValue {
+                warningValues = values
+            } else {
+                throw ChatToolError.internalError("Invalid Context Builder Oracle group warnings")
+            }
+        } else {
+            warningValues = []
+        }
+        let warnings = try warningValues.map { value in
             guard let warning = value.objectValue,
                   let code = warning["code"]?.stringValue,
                   let message = warning["message"]?.stringValue
@@ -237,27 +319,74 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
         guard role == expectedRole else {
             throw ChatToolError.internalError("Invalid Context Builder Oracle lane role")
         }
-        let error: OracleLaneError? = if let errorValue = lane["error"]?.objectValue,
-                                         let code = errorValue["code"]?.stringValue,
-                                         let message = errorValue["message"]?.stringValue
-        {
-            OracleLaneError(
-                code: code,
-                message: message,
-                partialResponse: errorValue["partial_response"]?.stringValue
+
+        let executionProfile: OracleExecutionProfile?
+        if let profile = try optionalObject(lane, key: "execution_profile") {
+            guard let providerID = profile["provider_id"]?.stringValue,
+                  let profileModelID = profile["model_id"]?.stringValue
+            else {
+                throw ChatToolError.internalError("Invalid Context Builder Oracle execution profile")
+            }
+            executionProfile = try OracleExecutionProfile(
+                providerID: providerID,
+                modelID: profileModelID,
+                effectiveReasoningEffort: optionalString(
+                    profile,
+                    key: "effective_reasoning_effort"
+                )
             )
         } else {
-            nil
+            executionProfile = nil
         }
+
+        let error: OracleLaneError?
+        if let errorValue = try optionalObject(lane, key: "error") {
+            guard let code = errorValue["code"]?.stringValue,
+                  let message = errorValue["message"]?.stringValue
+            else {
+                throw ChatToolError.internalError("Invalid Context Builder Oracle lane error")
+            }
+            error = try OracleLaneError(
+                code: code,
+                message: message,
+                partialResponse: optionalString(errorValue, key: "partial_response")
+            )
+        } else {
+            error = nil
+        }
+
         return try OracleLaneResult(
             laneIndex: laneIndex,
             chatID: chatID,
-            providerID: lane["provider_id"]?.stringValue,
+            providerID: optionalString(lane, key: "provider_id"),
             modelID: modelID,
             status: status,
-            response: lane["response"]?.stringValue,
+            executionProfile: executionProfile,
+            response: optionalString(lane, key: "response"),
             error: error
         )
+    }
+
+    private static func optionalString(
+        _ object: [String: Value],
+        key: String
+    ) throws -> String? {
+        guard let value = object[key], value != .null else { return nil }
+        guard let string = value.stringValue else {
+            throw ChatToolError.internalError("Invalid Context Builder Oracle \(key)")
+        }
+        return string
+    }
+
+    private static func optionalObject(
+        _ object: [String: Value],
+        key: String
+    ) throws -> [String: Value]? {
+        guard let value = object[key], value != .null else { return nil }
+        guard let nested = value.objectValue else {
+            throw ChatToolError.internalError("Invalid Context Builder Oracle \(key)")
+        }
+        return nested
     }
 }
 

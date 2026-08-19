@@ -414,16 +414,25 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
     }
 
     @MainActor
-    func testGroupIncompleteTerminationPreservesPartialResponsesAndReportsExecutionPhases() async throws {
+    func testGroupPrimaryFailureReturnsStructuredReplyWithoutAuxiliarySubstitution() async throws {
         #if DEBUG
-            let testModel = AIModel.customProviderUser(name: "oracle-group-incomplete-test")
+            let primaryModel = AIModel.customProviderUser(name: "oracle-group-primary-failure-test")
+            let auxiliaryModel = AIModel.customProviderUser(name: "oracle-group-auxiliary-success-test")
             try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(
-                [testModel.rawValue],
+                [auxiliaryModel.rawValue],
                 commit: false
             )
             let composition = makeComposition(
                 windowID: -184,
-                terminalOutcome: .incomplete(reason: "max_tokens")
+                streamOutputProvider: { model in
+                    if model.rawValue == primaryModel.rawValue {
+                        return (
+                            text: "primary partial",
+                            terminalOutcome: .incomplete(reason: "max_tokens")
+                        )
+                    }
+                    return (text: "auxiliary answer", terminalOutcome: .completed)
+                }
             )
             await composition.workspaceManager.awaitInitialized()
             let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
@@ -454,51 +463,62 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                     providerEventDisposition: nil,
                     teardownCompleted: nil,
                     resolveMCPFollowUpModel: { _ in
-                        (model: testModel, chatPresetID: nil, mcpControlInfo: nil)
+                        (model: primaryModel, chatPresetID: nil, mcpControlInfo: nil)
                     }
                 )
             )
             defer { viewModel.installRunTestHooks(nil) }
 
             let phaseRecorder = ContextBuilderStrictFinalizationPhaseRecorder()
-            do {
-                _ = try await viewModel.runMCPPlanOrQuestion(
-                    for: tabID,
-                    oracleViewModel: composition.oracleViewModel,
-                    mode: .plan,
-                    prompt: "Produce a grouped plan.",
-                    selection: StoredSelection(),
-                    reviewGitContext: .automaticOnly(),
-                    progressReporter: { phase in
-                        await phaseRecorder.record(phase)
-                    }
-                )
-                XCTFail("Expected incomplete primary termination to fail")
-            } catch let error as ChatToolError {
-                XCTAssertEqual(error.code, .internalError)
-                XCTAssertEqual(
-                    error.message,
-                    "The provider ended the response before successful completion (reason: max_tokens)."
-                )
-            }
-
+            let reply = try await viewModel.runMCPPlanOrQuestion(
+                for: tabID,
+                oracleViewModel: composition.oracleViewModel,
+                mode: .plan,
+                prompt: "Produce a grouped plan.",
+                selection: StoredSelection(),
+                reviewGitContext: .automaticOnly(),
+                progressReporter: { phase in
+                    await phaseRecorder.record(phase)
+                }
+            )
+            XCTAssertEqual(reply.oracleGroup?.result.status, .failed)
+            XCTAssertEqual(reply.response, "primary partial")
+            XCTAssertEqual(reply.oracleGroup?.orderedResults.map(\.laneIndex), [0, 1])
+            XCTAssertEqual(reply.oracleGroup?.orderedResults.map(\.status), [.failed, .completed])
+            XCTAssertEqual(
+                reply.oracleGroup?.orderedResults.map(\.response),
+                [nil, "auxiliary answer"]
+            )
+            XCTAssertEqual(
+                reply.oracleGroup?.orderedResults.map { $0.error?.partialResponse },
+                ["primary partial", nil]
+            )
+            XCTAssertEqual(reply.errors, [
+                "Oracle failed: The provider ended the response before successful completion (reason: max_tokens)."
+            ])
             let owner = try OracleViewModel.oracleGroupOwner(
                 workspaceID: workspace.id,
                 tabID: tabID
             )
-            guard case let .group(group)? = try await AppDomainRuntimeComposition.shared
-                .oracleConversationStore.loadMostRecentConversation(owner: owner)
-            else {
-                return XCTFail("Expected a persisted Oracle group")
-            }
-            let results = try XCTUnwrap(group.turns.last?.results)
-            XCTAssertEqual(results.map(\.status), [.failed, .failed])
-            XCTAssertEqual(results.map { $0.error?.partialResponse }, ["partial response", "partial response"])
-            XCTAssertEqual(viewModel.generatedPlanResponseText(for: tabID), "partial response")
+            let loadedGroup = try await AppDomainRuntimeComposition.shared
+                .oracleConversationStore.load(
+                    member: OracleMemberLookup(publicChatID: reply.shortId),
+                    owner: owner
+                )
+            let group = try XCTUnwrap(loadedGroup)
+            XCTAssertEqual(group.turns.last?.status, .failed)
+            XCTAssertEqual(group.turns.last?.results.map(\.status), [.failed, .completed])
+            XCTAssertEqual(
+                group.turns.last?.results.map { $0.error?.partialResponse },
+                ["primary partial", nil]
+            )
+
+            XCTAssertEqual(viewModel.generatedPlanResponseText(for: tabID), "primary partial")
             XCTAssertNotNil(viewModel.currentFollowUpOracleChatID(for: tabID))
-            guard case .error = viewModel.planStatus(for: tabID) else {
-                return XCTFail("Expected Context Builder error state with retained partial response")
+            guard case let .ready(_, previewText) = viewModel.planStatus(for: tabID) else {
+                return XCTFail("Expected Context Builder ready state with retained Primary partial response")
             }
+            XCTAssertEqual(previewText, "primary partial")
             let phases = await phaseRecorder.snapshot()
             XCTAssertEqual(phases, [
                 .modelResolution,
@@ -636,7 +656,11 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
         private func makeComposition(
             windowID: Int,
             terminalOutcome: ChatStreamTerminalOutcome? = nil,
-            responseTextProvider: (@Sendable () async -> String)? = nil
+            responseTextProvider: (@Sendable () async -> String)? = nil,
+            streamOutputProvider: (@Sendable (AIModel) async -> (
+                text: String,
+                terminalOutcome: ChatStreamTerminalOutcome?
+            ))? = nil
         ) -> WindowStateComposition {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -647,15 +671,21 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 aiQueriesServiceFactory: { keyManager in
                     AIQueriesService(
                         keyManager: keyManager,
-                        sendPromptOverride: { _, _ in
-                            let responseText = await responseTextProvider?() ?? "partial response"
+                        sendPromptOverride: { _, model in
+                            let output = await streamOutputProvider?(model)
+                            let responseText: String = if let output {
+                                output.text
+                            } else {
+                                await responseTextProvider?() ?? "partial response"
+                            }
+                            let selectedTerminalOutcome = output?.terminalOutcome ?? terminalOutcome
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
                                 continuation.yield(
                                     ChatStreamOutput(
                                         text: responseText,
                                         reasoning: nil,
                                         tokens: ChatTokenInfo(),
-                                        terminalOutcome: terminalOutcome
+                                        terminalOutcome: selectedTerminalOutcome
                                     )
                                 )
                                 continuation.finish()
