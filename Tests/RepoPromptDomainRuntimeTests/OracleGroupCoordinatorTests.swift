@@ -35,6 +35,7 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.oracleResults.compactMap(\.response), [
             "lane-0", "lane-1", "lane-2", "lane-3", "lane-4"
         ])
+        XCTAssertTrue(result.warnings.isEmpty)
     }
 
     func testSuccessfulExecutionProfileIsPersistedWithoutChangingRosterIdentity() async throws {
@@ -86,6 +87,10 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.oracleResults[2].executionProfile, profile)
         XCTAssertEqual(result.oracleResults[4].error?.code, "empty_response")
         XCTAssertEqual(result.oracleResults[4].executionProfile, profile)
+        XCTAssertEqual(
+            result.warnings,
+            [OracleGroupWarning(code: "lane_failures", message: "Two lanes did not complete")]
+        )
     }
 
     func testTypedCancellationPreservesResolvedExecutionProfile() async throws {
@@ -104,6 +109,10 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.status, .partialFailure)
         XCTAssertEqual(result.oracleResults[1].status, .cancelled)
         XCTAssertEqual(result.oracleResults[1].executionProfile, profile)
+        XCTAssertEqual(
+            result.warnings,
+            [OracleGroupWarning(code: "lane_failures", message: "One lane did not complete")]
+        )
     }
 
     func testPrimaryFailureMakesGroupFailed() async throws {
@@ -121,6 +130,7 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         XCTAssertEqual(result.status, .failed)
         XCTAssertEqual(result.primary.status, .failed)
         XCTAssertEqual(result.oracleResults[1].status, .completed)
+        XCTAssertTrue(result.warnings.isEmpty)
     }
 
     func testLateDetachedProgressIsSuppressedAfterTerminalReturn() async throws {

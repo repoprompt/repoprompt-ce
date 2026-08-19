@@ -151,10 +151,26 @@ package struct OracleGroupCoordinator: Sendable {
         } else {
             .partialFailure
         }
+        let incompleteAdditionalCount = ordered.dropFirst().count { $0.status != .completed }
+        let warnings: [OracleGroupWarning]
+        if status == .partialFailure {
+            let warningMessage: String
+            switch incompleteAdditionalCount {
+            case 1: warningMessage = "One lane did not complete"
+            case 2: warningMessage = "Two lanes did not complete"
+            case 3: warningMessage = "Three lanes did not complete"
+            case 4: warningMessage = "Four lanes did not complete"
+            default: warningMessage = "\(incompleteAdditionalCount) lanes did not complete"
+            }
+            warnings = [OracleGroupWarning(code: "lane_failures", message: warningMessage)]
+        } else {
+            warnings = []
+        }
         let result = try OracleGroupResult(
             groupID: group.id,
             status: status,
-            oracleResults: ordered
+            oracleResults: ordered,
+            warnings: warnings
         )
         await progress(OracleProgressEvent(
             kind: .groupSettled,

@@ -34,6 +34,8 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let loadedTerminal = try XCTUnwrap(terminalSnapshot)
         XCTAssertEqual(loadedTerminal.turns.last?.state, .terminal)
         XCTAssertEqual(loadedTerminal.turns.last?.results.count, 5)
+        XCTAssertEqual(loadedTerminal.turns.last?.status, .completed)
+        XCTAssertEqual(loadedTerminal.turns.last?.warnings, [])
 
         await XCTAssertOraclePersistenceThrowsErrorAsync {
             try await coldStore.save(terminal, expectedRevision: prepared.revision)
@@ -42,6 +44,173 @@ final class OracleGroupPersistenceTests: XCTestCase {
                 $0 as? OraclePersistenceError,
                 .revisionConflict(expected: prepared.revision, actual: terminal.revision)
             )
+        }
+    }
+
+    func testPartialFailureRoundTripRetainsCanonicalOutcome() async throws {
+        let fixture = makeStore(profile: "partial-round-trip")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let prepared = try makeGroup(count: 3, seed: "partial")
+        try await fixture.store.create(prepared)
+        let results = try prepared.members.map { member in
+            switch member.laneID.index {
+            case 0:
+                try OracleLaneResult(
+                    laneIndex: 0,
+                    chatID: member.publicChatID,
+                    providerID: member.model.providerID,
+                    modelID: member.model.modelID,
+                    status: .completed,
+                    response: "primary response"
+                )
+            case 1:
+                try OracleLaneResult(
+                    laneIndex: 1,
+                    chatID: member.publicChatID,
+                    providerID: member.model.providerID,
+                    modelID: member.model.modelID,
+                    status: .failed,
+                    error: OracleLaneError(
+                        code: "provider_error",
+                        message: "provider failed",
+                        partialResponse: "partial response"
+                    )
+                )
+            default:
+                try OracleLaneResult(
+                    laneIndex: 2,
+                    chatID: member.publicChatID,
+                    providerID: member.model.providerID,
+                    modelID: member.model.modelID,
+                    status: .cancelled,
+                    error: OracleLaneError(code: "cancelled", message: "cancelled")
+                )
+            }
+        }
+        let warning = OracleGroupWarning(code: "lane_failures", message: "Two lanes did not complete")
+        let result = try OracleGroupResult(
+            groupID: prepared.group.id,
+            status: .partialFailure,
+            oracleResults: results,
+            warnings: [warning]
+        )
+        let terminal = try prepared.settling(result)
+        try await fixture.store.save(terminal, expectedRevision: prepared.revision)
+
+        let loadedDocument = try await fixture.store.load(
+            groupID: prepared.group.id,
+            owner: prepared.owner
+        )
+        let loaded = try XCTUnwrap(loadedDocument)
+        let turn = try XCTUnwrap(loaded.turns.last)
+        XCTAssertEqual(turn.status, .partialFailure)
+        XCTAssertEqual(turn.warnings, [warning])
+        XCTAssertEqual(turn.results, results)
+    }
+
+    func testPreparedAndTerminalOutcomeShapeValidation() async throws {
+        let fixture = makeStore(profile: "outcome-validation")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let prepared = try makeGroup(count: 2, seed: "invalid-shapes")
+        let sourceTurn = try XCTUnwrap(prepared.turns.last)
+        let completedResults = try prepared.members.map { member in
+            try OracleLaneResult(
+                laneIndex: member.laneID.index,
+                chatID: member.publicChatID,
+                providerID: member.model.providerID,
+                modelID: member.model.modelID,
+                status: .completed,
+                response: "response-\(member.laneID.index)"
+            )
+        }
+        let warning = OracleGroupWarning(code: "lane_failures", message: "One lane did not complete")
+        let invalidPreparedTurn = OracleTurnRecord(
+            id: sourceTurn.id,
+            input: sourceTurn.input,
+            state: .prepared,
+            startedAt: sourceTurn.startedAt,
+            status: .partialFailure,
+            warnings: [warning],
+            results: completedResults
+        )
+        let invalidPrepared = try replacingLastTurn(in: prepared, with: invalidPreparedTurn)
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.create(invalidPrepared)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("invalid_prepared_turn"))
+        }
+
+        try await fixture.store.create(prepared)
+        let missingStatusTurn = OracleTurnRecord(
+            id: sourceTurn.id,
+            input: sourceTurn.input,
+            state: .terminal,
+            startedAt: sourceTurn.startedAt,
+            finishedAt: sourceTurn.startedAt.addingTimeInterval(1),
+            results: completedResults
+        )
+        let missingStatus = try replacingLastTurn(
+            in: prepared,
+            with: missingStatusTurn,
+            revision: prepared.revision + 1
+        )
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.save(missingStatus, expectedRevision: prepared.revision)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("invalid_terminal_turn"))
+        }
+
+        var mismatchedResults = completedResults
+        mismatchedResults[1] = try OracleLaneResult(
+            laneIndex: 1,
+            chatID: prepared.members[1].publicChatID,
+            providerID: prepared.members[1].model.providerID,
+            modelID: prepared.members[1].model.modelID,
+            status: .failed,
+            error: OracleLaneError(code: "provider_error", message: "failed")
+        )
+        let mismatchedTurn = OracleTurnRecord(
+            id: sourceTurn.id,
+            input: sourceTurn.input,
+            state: .terminal,
+            startedAt: sourceTurn.startedAt,
+            finishedAt: sourceTurn.startedAt.addingTimeInterval(1),
+            status: .completed,
+            results: mismatchedResults
+        )
+        let mismatched = try replacingLastTurn(
+            in: prepared,
+            with: mismatchedTurn,
+            revision: prepared.revision + 1
+        )
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.save(mismatched, expectedRevision: prepared.revision)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("invalid_terminal_outcome"))
+        }
+    }
+
+    func testSchemaVersionOneGroupIsRejectedWithoutMigration() async throws {
+        let fixture = makeStore(profile: "schema-version")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let current = try makeGroup(count: 2, seed: "schema")
+        let versionOne = try OracleGroupDocument(
+            schemaVersion: 1,
+            group: current.group,
+            owner: current.owner,
+            name: current.name,
+            revision: current.revision,
+            createdAt: current.createdAt,
+            updatedAt: current.updatedAt,
+            roster: current.roster,
+            members: current.members,
+            turns: current.turns
+        )
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.create(versionOne)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .futureSchema(1))
         }
     }
 
@@ -436,6 +605,25 @@ final class OracleGroupPersistenceTests: XCTestCase {
         )
     }
 
+    private func replacingLastTurn(
+        in document: OracleGroupDocument,
+        with turn: OracleTurnRecord,
+        revision: UInt64? = nil
+    ) throws -> OracleGroupDocument {
+        try OracleGroupDocument(
+            schemaVersion: document.schemaVersion,
+            group: document.group,
+            owner: document.owner,
+            name: document.name,
+            revision: revision ?? document.revision,
+            createdAt: document.createdAt,
+            updatedAt: turn.finishedAt ?? document.updatedAt,
+            roster: document.roster,
+            members: document.members,
+            turns: Array(document.turns.dropLast()) + [turn]
+        )
+    }
+
     private func terminalDocument(from prepared: OracleGroupDocument) throws -> OracleGroupDocument {
         let turn = try XCTUnwrap(prepared.turns.last)
         let results = try prepared.members.map { member in
@@ -454,6 +642,8 @@ final class OracleGroupPersistenceTests: XCTestCase {
             state: .terminal,
             startedAt: turn.startedAt,
             finishedAt: turn.startedAt.addingTimeInterval(1),
+            status: .completed,
+            warnings: [],
             results: results
         )
         return try OracleGroupDocument(
