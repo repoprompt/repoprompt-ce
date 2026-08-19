@@ -737,12 +737,15 @@ private struct OracleStorageFiles: @unchecked Sendable {
             case .prepared:
                 guard index == group.turns.count - 1,
                       turn.finishedAt == nil,
+                      turn.status == nil,
+                      turn.warnings.isEmpty,
                       turn.results.isEmpty
                 else {
                     throw OraclePersistenceError.invalidDocument("invalid_prepared_turn")
                 }
             case .terminal:
                 guard turn.finishedAt != nil,
+                      let status = turn.status,
                       turn.results.count == group.group.size,
                       turn.results.map(\.laneIndex) == Array(turn.results.indices)
                 else {
@@ -756,6 +759,16 @@ private struct OracleStorageFiles: @unchecked Sendable {
                     else {
                         throw OraclePersistenceError.invalidDocument("lane_result_identity_mismatch")
                     }
+                }
+                do {
+                    _ = try OracleGroupResult(
+                        groupID: group.group.id,
+                        status: status,
+                        oracleResults: turn.results,
+                        warnings: turn.warnings
+                    )
+                } catch {
+                    throw OraclePersistenceError.invalidDocument("invalid_terminal_outcome")
                 }
             }
         }

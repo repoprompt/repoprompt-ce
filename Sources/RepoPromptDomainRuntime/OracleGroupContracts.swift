@@ -96,7 +96,7 @@ package enum OracleRosterSettingsDescriptor {
         group: "models",
         valueKind: .string,
         defaultValue: .null,
-        description: "Preferred Oracle model raw identifier, if set.",
+        description: "Primary Oracle model identifier, if set.",
         optionsAvailable: true,
         allowsNull: true,
         maximumStringLength: OracleRosterContract.maximumModelIdentifierLength
@@ -107,7 +107,7 @@ package enum OracleRosterSettingsDescriptor {
         group: "models",
         valueKind: .stringArray,
         defaultValue: .stringArray([]),
-        description: "Ordered independent Oracle model raw identifiers after the permanent first Oracle (zero to four); duplicates are retained.",
+        description: "Ordered list of up to four additional Oracle model identifiers. Grouped requests run each model independently, preserve duplicates, and return results in roster order.",
         optionsAvailable: true,
         allowsNull: false,
         maximumArrayCount: OracleRosterContract.maximumAdditionalCount,
@@ -121,6 +121,11 @@ package struct OracleLaneID: Hashable, Codable, Comparable {
     package init(index: Int) throws {
         guard index >= 0 else { throw OracleGroupContractError.invalidLaneIndex(index) }
         self.index = index
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(index: container.decode(Int.self, forKey: .index))
     }
 
     package static func < (lhs: Self, rhs: Self) -> Bool {
@@ -142,6 +147,14 @@ package struct OracleModelReference: Hashable, Codable {
         }
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
     }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            providerID: container.decodeIfPresent(String.self, forKey: .providerID),
+            modelID: container.decode(String.self, forKey: .modelID)
+        )
+    }
 }
 
 package struct OracleRoster: Codable, Equatable {
@@ -155,6 +168,14 @@ package struct OracleRoster: Codable, Equatable {
         }
         self.primary = primary
         self.additional = additional
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            primary: container.decode(OracleModelReference.self, forKey: .primary),
+            additional: container.decode([OracleModelReference].self, forKey: .additional)
+        )
     }
 
     package init(
@@ -240,6 +261,14 @@ package struct OracleConversationOwner: Hashable, Codable {
         self.kind = kind
         self.identifier = identifier
     }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            kind: container.decode(String.self, forKey: .kind),
+            identifier: container.decode(String.self, forKey: .identifier)
+        )
+    }
 }
 
 package struct OracleGroupDescriptor: Hashable, Codable {
@@ -253,6 +282,14 @@ package struct OracleGroupDescriptor: Hashable, Codable {
         self.id = id
         self.size = size
     }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            id: container.decode(OracleGroupID.self, forKey: .id),
+            size: container.decode(Int.self, forKey: .size)
+        )
+    }
 }
 
 package struct OracleLaneDescriptor: Hashable, Codable {
@@ -265,6 +302,15 @@ package struct OracleLaneDescriptor: Hashable, Codable {
         self.group = group
         self.laneID = laneID
         self.model = model
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            group: container.decode(OracleGroupDescriptor.self, forKey: .group),
+            laneID: container.decode(OracleLaneID.self, forKey: .laneID),
+            model: container.decode(OracleModelReference.self, forKey: .model)
+        )
     }
 }
 
@@ -367,6 +413,16 @@ package struct OracleFrozenContextPack: Codable, Equatable {
         self.provenance = provenance
     }
 
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            schemaVersion: container.decode(Int.self, forKey: .schemaVersion),
+            mode: container.decode(OracleMode.self, forKey: .mode),
+            content: container.decode(String.self, forKey: .content),
+            provenance: container.decode([OracleEvidenceReference].self, forKey: .provenance)
+        )
+    }
+
     package func canonicalData() throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -393,6 +449,15 @@ package struct OracleInput: Codable, Equatable {
         self.mode = mode
         self.userMessage = message
         self.context = context
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            mode: container.decode(OracleMode.self, forKey: .mode),
+            userMessage: container.decode(String.self, forKey: .userMessage),
+            context: container.decodeIfPresent(OracleContextEnvelope.self, forKey: .context)
+        )
     }
 }
 
@@ -796,6 +861,17 @@ package struct OracleGroupMember: Codable, Equatable {
         self.model = model
         self.providerConversationID = providerConversationID
     }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            laneID: container.decode(OracleLaneID.self, forKey: .laneID),
+            memberID: container.decode(OracleMemberID.self, forKey: .memberID),
+            publicChatID: container.decode(String.self, forKey: .publicChatID),
+            model: container.decode(OracleModelReference.self, forKey: .model),
+            providerConversationID: container.decodeIfPresent(String.self, forKey: .providerConversationID)
+        )
+    }
 }
 
 package enum OracleTurnState: String, Codable {
@@ -809,6 +885,8 @@ package struct OracleTurnRecord: Codable, Equatable {
     package let state: OracleTurnState
     package let startedAt: Date
     package let finishedAt: Date?
+    package let status: OracleGroupStatus?
+    package let warnings: [OracleGroupWarning]
     package let results: [OracleLaneResult]
 
     package init(
@@ -817,6 +895,8 @@ package struct OracleTurnRecord: Codable, Equatable {
         state: OracleTurnState,
         startedAt: Date,
         finishedAt: Date? = nil,
+        status: OracleGroupStatus? = nil,
+        warnings: [OracleGroupWarning] = [],
         results: [OracleLaneResult] = []
     ) {
         self.id = id
@@ -824,12 +904,39 @@ package struct OracleTurnRecord: Codable, Equatable {
         self.state = state
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+        self.status = status
+        self.warnings = warnings
         self.results = results
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case input
+        case state
+        case startedAt
+        case finishedAt
+        case status
+        case warnings
+        case results
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decode(OracleTurnID.self, forKey: .id),
+            input: try container.decode(OracleInput.self, forKey: .input),
+            state: try container.decode(OracleTurnState.self, forKey: .state),
+            startedAt: try container.decode(Date.self, forKey: .startedAt),
+            finishedAt: try container.decodeIfPresent(Date.self, forKey: .finishedAt),
+            status: try container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
+            warnings: try container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
+            results: try container.decode([OracleLaneResult].self, forKey: .results)
+        )
     }
 }
 
 package struct OracleGroupDocument: Codable, Equatable {
-    package static let currentSchemaVersion = 1
+    package static let currentSchemaVersion = 2
 
     package let schemaVersion: Int
     package let group: OracleGroupDescriptor
@@ -911,6 +1018,11 @@ package struct OracleMemberLookup: Codable, Equatable {
         guard !value.isEmpty else { throw OracleGroupContractError.invalidPublicChatID }
         self.publicChatID = value
     }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(publicChatID: container.decode(String.self, forKey: .publicChatID))
+    }
 }
 
 package extension OracleGroupDocument {
@@ -927,6 +1039,8 @@ package extension OracleGroupDocument {
             state: .terminal,
             startedAt: turn.startedAt,
             finishedAt: finishedAt,
+            status: result.status,
+            warnings: result.warnings,
             results: result.oracleResults
         )
         return try Self(
