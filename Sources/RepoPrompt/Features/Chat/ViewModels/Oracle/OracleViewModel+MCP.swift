@@ -21,7 +21,7 @@ extension OracleViewModel {
     }
 
     enum OracleSendActivationPolicy: Equatable {
-        case legacyAutomatic
+        case foregroundWhenActive
         case background
     }
 
@@ -136,7 +136,7 @@ extension OracleViewModel {
             origin: OracleSendOrigin = .compatibility,
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
-            activationPolicy: OracleSendActivationPolicy = .legacyAutomatic,
+            activationPolicy: OracleSendActivationPolicy = .foregroundWhenActive,
             packaging: OracleSendPackagingContext
         ) {
             self.tabID = tabID
@@ -1153,7 +1153,7 @@ extension OracleViewModel {
         let shouldActivate: Bool
         if let tabContext {
             let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID) &&
-                tabContext.activationPolicy == .legacyAutomatic
+                tabContext.activationPolicy == .foregroundWhenActive
             let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabContext.tabID)
                 ?? currentSessionID.flatMap { currentID in
                     sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
