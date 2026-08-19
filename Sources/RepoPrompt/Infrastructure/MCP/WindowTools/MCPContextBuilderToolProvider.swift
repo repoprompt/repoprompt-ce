@@ -930,8 +930,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         let continuation = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(chatID)\", new_chat: false)"
         guard let oracleCount, oracleCount > 1 else { return continuation }
 
-        let adjudication = "The Oracle group contains multiple lane outcomes. Treat completed lane responses as competing candidates. Compare each candidate against the original task. Verify important or disputed claims with RepoPrompt tools (`read_file`, `file_search`, `git`, and `workspace_context`). Choose the best-supported candidate as the basis for your response, and retain useful details from other candidates only when you independently verify them. Treat majority agreement, model identity, response length, and Primary placement as non-evidence. Report unresolved disagreements. Return ONE final answer."
-        return adjudication + "\n\nOptional later follow-up: " + continuation
+        let groupGuidance = "The Oracle group returned ordered, independent lane results. Check each result against the task and report unresolved disagreements."
+        return groupGuidance + "\n\nOptional later follow-up: " + continuation
     }
 
     nonisolated static func responseDisposition(

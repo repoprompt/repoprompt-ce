@@ -267,12 +267,14 @@ struct MCPOracleToolService {
         }
 
         if exportResponse {
+            let groupResult = try Self.decodeOracleGroupResultForExport(result)
             let export = try await exportOracleResponse(OracleExportRequest(
                 sourceTool: askOracleToolName,
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? continuationChatID,
                 response: result["response"]?.stringValue,
+                groupResult: groupResult,
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -300,6 +302,24 @@ struct MCPOracleToolService {
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
+        let newChat = args["new_chat"]?.boolValue ?? false
+        let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
+        let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let route: OracleConversationRoute
+        do {
+            route = try OracleConversationRoute.resolve(
+                chatID: normalizedChatID,
+                newChat: newChat,
+                modelOverride: requestedModelOverride
+            )
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        let continuationChatID: String? = switch route {
+        case .start: nil
+        case let .continuation(chatID): chatID
+        }
 
         let connectionID = ServerNetworkManager.currentConnectionID
         let runPurpose: MCPRunPurpose = if let connectionID {
@@ -316,11 +336,8 @@ struct MCPOracleToolService {
         let resolvedContext = try resolveTabContextSnapshot(metadata)
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 
-        if runPurpose != .agentModeRun,
-           let chatIDString = args["chat_id"]?.stringValue,
-           !chatIDString.isEmpty
-        {
-            try rebindChatSessionIfNeeded(metadata, chatIDString)
+        if runPurpose != .agentModeRun, let continuationChatID {
+            try rebindChatSessionIfNeeded(metadata, continuationChatID)
         }
 
         let context = try await requireCurrentTabContext(oracleSendToolName)
@@ -368,6 +385,7 @@ struct MCPOracleToolService {
         }
 
         if exportResponse {
+            let groupResult = try Self.decodeOracleGroupResultForExport(result)
             let normalizedChatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             let export = try await exportOracleResponse(OracleExportRequest(
                 sourceTool: oracleSendToolName,
@@ -375,6 +393,7 @@ struct MCPOracleToolService {
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? ((normalizedChatID?.isEmpty == false) ? normalizedChatID : nil),
                 response: result["response"]?.stringValue,
+                groupResult: groupResult,
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -386,6 +405,18 @@ struct MCPOracleToolService {
     }
 
     // MARK: - Shared helpers
+
+    static func decodeOracleGroupResultForExport(_ result: [String: Value]) throws -> OracleGroupResult? {
+        guard result["oracle_group_id"] != nil else { return nil }
+        do {
+            let data = try JSONEncoder().encode(result)
+            return try JSONDecoder().decode(OracleGroupResult.self, from: data)
+        } catch {
+            throw MCPError.internalError(
+                "Oracle returned an invalid grouped result for export: \(error.localizedDescription)"
+            )
+        }
+    }
 
     private func parseExportResponseFlag(_ args: [String: Value]) throws -> Bool {
         guard let value = args["export_response"] else { return false }

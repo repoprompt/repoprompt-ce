@@ -2416,7 +2416,6 @@ extension ToolOutputFormatter {
             break
         }
 
-        // Build main section using our existing helper, preserving every grouped lane when present.
         let text = formatOracleGroup(value: value, heading: "## Chat Send ✅")
             ?? chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
