@@ -649,7 +649,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
         let composition = WindowStateCompositionFactory.make(
             windowID: Self.allocateFixtureWindowID(),
-            deferredInitialAgentSystemWorkspaceRefresh: true,
+            deferredInitialAgentSystemWorkspaceRefresh: false,
             sharedMCPService: MCPService()
         )
         await composition.workspaceManager.awaitInitialized()
