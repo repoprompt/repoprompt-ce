@@ -122,12 +122,14 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
 
             await controller.setExpectedMCPRunID(runID)
             let events = await controller.currentEventsStream()
+            let transportSettlement = ACPHeadlessTransportSettlement()
             let forwardTask = Task {
                 await Self.forwardEvents(
                     events,
                     controller: controller,
                     providerName: providerName,
                     approvalPolicy: approvalPolicy,
+                    transportSettlement: transportSettlement,
                     to: continuation
                 )
             }
@@ -135,11 +137,14 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             do {
                 _ = try await controller.bootstrap()
                 try await beforePrompt(controller, request)
+                await controller.prepareForPromptTransportDrain()
                 try await controller.prompt(message, request: request)
-                await controller.shutdown()
+                let transportSettled = await controller.shutdownAfterPromptTransportDrain()
+                await transportSettlement.publish(transportSettled)
                 await forwardTask.value
             } catch {
                 forwardTask.cancel()
+                await transportSettlement.publish(false)
                 await controller.shutdown()
                 throw await controller.normalizeError(error)
             }
@@ -155,13 +160,23 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         controller: ACPAgentSessionController,
         providerName: String,
         approvalPolicy: ApprovalPolicy,
+        transportSettlement: ACPHeadlessTransportSettlement,
         to continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
     ) async {
+        var terminalResult: AIStreamResult?
         var terminalError: String?
         for await event in events {
             switch event {
             case let .stream(result):
-                continuation.yield(result)
+                if result.type == "message_stop" || result.type == AIStreamResult.incompleteType {
+                    if terminalResult == nil {
+                        terminalResult = result
+                    } else {
+                        terminalError = "\(providerName) ACP emitted more than one terminal result."
+                    }
+                } else {
+                    continuation.yield(result)
+                }
             case let .terminal(state, errorText):
                 if state == .failed {
                     terminalError = errorText ?? "\(providerName) ACP run failed."
@@ -191,10 +206,74 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         if Task.isCancelled {
             return
         }
+        let transportSettled = await transportSettlement.wait()
         if let terminalError {
             continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: terminalError))
-        } else {
-            continuation.finish()
+            return
+        }
+        if let terminalResult {
+            continuation.yield(
+                transportSettled || terminalResult.type == AIStreamResult.incompleteType
+                    ? terminalResult
+                    : incompleteTransportTerminal(from: terminalResult)
+            )
+        } else if !transportSettled {
+            continuation.yield(
+                AIStreamResult(
+                    type: AIStreamResult.incompleteType,
+                    text: nil,
+                    stopReason: "transport_did_not_settle_before_shutdown"
+                )
+            )
+        }
+        continuation.finish()
+    }
+
+    private static func incompleteTransportTerminal(from result: AIStreamResult) -> AIStreamResult {
+        AIStreamResult(
+            type: AIStreamResult.incompleteType,
+            text: result.text,
+            reasoning: result.reasoning,
+            promptTokens: result.promptTokens,
+            completionTokens: result.completionTokens,
+            cost: result.cost,
+            toolName: result.toolName,
+            toolArgs: result.toolArgs,
+            toolOutput: result.toolOutput,
+            toolInvocationID: result.toolInvocationID,
+            toolResultJSON: result.toolResultJSON,
+            toolArgsJSON: result.toolArgsJSON,
+            toolIsError: result.toolIsError,
+            providerSessionID: result.providerSessionID,
+            stopReason: "transport_did_not_settle_before_shutdown",
+            modelContextWindow: result.modelContextWindow,
+            contextUsedTokens: result.contextUsedTokens,
+            contentMessageID: result.contentMessageID,
+            cleanupHandle: result.cleanupHandle
+        )
+    }
+}
+
+private actor ACPHeadlessTransportSettlement {
+    private var value: Bool?
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
+
+    func publish(_ value: Bool) {
+        guard self.value == nil else { return }
+        self.value = value
+        let waiters = waiters
+        self.waiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: value)
+        }
+    }
+
+    func wait() async -> Bool {
+        if let value {
+            return value
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
         }
     }
 }

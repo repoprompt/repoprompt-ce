@@ -239,6 +239,7 @@ actor ACPAgentSessionController {
     private var stdoutConsumerTask: Task<Void, Never>?
     private var stderrConsumerTask: Task<Void, Never>?
     private var processWaitTask: Task<Void, Never>?
+    private var isDrainingTransport = false
     private var stdoutFramer = LineFramer()
     private var stderrFramer = LineFramer()
     private var launchDescription: String?
@@ -1172,31 +1173,74 @@ actor ACPAgentSessionController {
         }
     }
 
+    func prepareForPromptTransportDrain() {
+        isDrainingTransport = true
+    }
+
     func shutdown() async {
+        _ = await shutdown(drainTransport: false)
+    }
+
+    /// Shuts down a completed one-shot prompt without discarding bytes that become
+    /// readable while the ACP process responds to stdin closure.
+    ///
+    /// Returns `true` only when the process settles cooperatively before the bounded
+    /// timeout. A forced termination still drains its pipes, but cannot prove that the
+    /// provider finished writing the response.
+    func shutdownAfterPromptTransportDrain() async -> Bool {
+        await shutdown(drainTransport: true)
+    }
+
+    private func shutdown(drainTransport: Bool) async -> Bool {
         #if DEBUG
             debugResumeConfigurationMutationPostcheck()
         #endif
-        guard state != .closed, state != .closing else { return }
+        guard state != .closed, state != .closing else { return false }
         state = .closing
+        isDrainingTransport = drainTransport
         log("Shutting down ACP controller")
 
         await cancelPrompt()
         failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
 
-        stdoutChannel?.finish()
-        stderrChannel?.finish()
-        stdoutConsumerTask?.cancel()
-        stderrConsumerTask?.cancel()
-        processWaitTask?.cancel()
-
-        if let process {
+        var transportSettled = !drainTransport
+        if drainTransport, let process {
+            process.stdin?.closeFile()
+            transportSettled = await waitForProcessExitDuringTransportDrain()
             process.stdout.readabilityHandler = nil
             process.stderr.readabilityHandler = nil
-            process.stdin?.closeFile()
-            _ = await ProcessTermination.terminateAndReap(pid: process.pid, processGroupID: process.processGroupID)
+            drainRemainingBytes(from: process.stdout, into: stdoutChannel)
+            drainRemainingBytes(from: process.stderr, into: stderrChannel)
+            stdoutChannel?.finish()
+            stderrChannel?.finish()
+            await stdoutConsumerTask?.value
+            await stderrConsumerTask?.value
+            stdoutFramer.flush { lineData in
+                handleJSONLine(lineData)
+            }
+            stderrFramer.flush { lineData in
+                handleStderrLine(lineData)
+            }
+        } else {
+            stdoutChannel?.finish()
+            stderrChannel?.finish()
+            stdoutConsumerTask?.cancel()
+            stderrConsumerTask?.cancel()
+            processWaitTask?.cancel()
+
+            if let process {
+                process.stdout.readabilityHandler = nil
+                process.stderr.readabilityHandler = nil
+                process.stdin?.closeFile()
+                _ = await ProcessTermination.terminateAndReap(
+                    pid: process.pid,
+                    processGroupID: process.processGroupID
+                )
+            }
         }
 
+        isDrainingTransport = false
         await clearExpectedAgentPIDIfNeeded()
         await cleanupLaunchArtifacts()
 
@@ -1219,6 +1263,39 @@ actor ACPAgentSessionController {
         suppressSessionLoadReplayUpdates = false
         state = .closed
         finishEventsIfNeeded()
+        return transportSettled
+    }
+
+    private func waitForProcessExitDuringTransportDrain() async -> Bool {
+        guard let processWaitTask else { return true }
+        let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await processWaitTask.value
+                return true
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                } catch {
+                    processWaitTask.cancel()
+                    return false
+                }
+                processWaitTask.cancel()
+                return false
+            }
+            let settled = await group.next() ?? false
+            group.cancelAll()
+            return settled
+        }
+    }
+
+    private func drainRemainingBytes(from handle: FileHandle, into channel: FileHandleChunkChannel?) {
+        while true {
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            channel?.yield(data)
+        }
     }
 
     // MARK: - Transport
@@ -1284,20 +1361,24 @@ actor ACPAgentSessionController {
 
     private func handleStderrChunk(_ data: Data) {
         stderrFramer.feed(data) { lineData in
-            guard
-                let trimmed = trimmedASCIIWhitespace(lineData),
-                let rawText = String(data: trimmed, encoding: .utf8),
-                !rawText.isEmpty
-            else { return }
-            let text = Self.strippingANSIEscapeSequences(from: rawText)
-            guard !text.isEmpty else { return }
-            stderrLineCount += 1
-            lastStderrPreview = Self.truncatedDiagnosticPreview(text)
-            recordActivePromptStderrLine(text)
-            diagnose(.stderrLine(text))
-            guard provider.shouldEmitStderrLine(text) else { return }
-            emit(.stream(AIStreamResult(type: "system", text: text)))
+            handleStderrLine(lineData)
         }
+    }
+
+    private func handleStderrLine(_ lineData: Data) {
+        guard
+            let trimmed = trimmedASCIIWhitespace(lineData),
+            let rawText = String(data: trimmed, encoding: .utf8),
+            !rawText.isEmpty
+        else { return }
+        let text = Self.strippingANSIEscapeSequences(from: rawText)
+        guard !text.isEmpty else { return }
+        stderrLineCount += 1
+        lastStderrPreview = Self.truncatedDiagnosticPreview(text)
+        recordActivePromptStderrLine(text)
+        diagnose(.stderrLine(text))
+        guard provider.shouldEmitStderrLine(text) else { return }
+        emit(.stream(AIStreamResult(type: "system", text: text)))
     }
 
     /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
@@ -1555,8 +1636,13 @@ actor ACPAgentSessionController {
     }
 
     private func handleProcessExit(_ exitCode: Int32, timedOut: Bool) async {
+        if isDrainingTransport, didEmitTerminal {
+            return
+        }
         guard state != .closing, state != .closed else {
-            finishEventsIfNeeded()
+            if !isDrainingTransport {
+                finishEventsIfNeeded()
+            }
             return
         }
 
