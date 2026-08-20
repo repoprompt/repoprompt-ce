@@ -55,6 +55,13 @@ struct AgentMCPStartWorktreeCoordinator {
         let repo: GitRepoDescriptor
         let visibleRoots: [WorkspaceRootRef]
         let logicalRoot: WorkspaceRootRef
+        let workspaceAuthority: WorkspaceAuthority
+    }
+
+    private struct WorkspaceAuthority: Equatable {
+        let workspaceID: UUID
+        let primaryRootPath: String
+        let rootPaths: Set<String>
     }
 
     private struct RepositoryCandidate {
@@ -181,6 +188,7 @@ struct AgentMCPStartWorktreeCoordinator {
                 let expectedOwnerBindingGeneration = await targetWindow.promptManager
                     .workspaceFileContextStore
                     .nextSessionWorktreeOwnershipGeneration(ownerID: targetSessionID)
+                try validateWorkspaceAuthority(context, targetWindow: targetWindow)
                 switch request.mode {
                 case .none:
                     throw MCPError.internalError("\(operationName) worktree preparation reached an unexpected empty worktree mode.")
@@ -205,7 +213,8 @@ struct AgentMCPStartWorktreeCoordinator {
                         context: context,
                         sessionID: targetSessionID,
                         expectedOwnerBindingGeneration: expectedOwnerBindingGeneration,
-                        startupContext: startupContext
+                        startupContext: startupContext,
+                        targetWindow: targetWindow
                     )
                     worktree = result.descriptor
                     initializationReceipt = result.initializationReceipt
@@ -221,6 +230,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     #endif
                 }
                 try Task.checkCancellation()
+                try validateWorkspaceAuthority(context, targetWindow: targetWindow)
                 let identity = try persistVisualIdentity(for: worktree, request: request)
                 let rootPrefix = try repositoryRelativeRootPrefix(
                     logicalRoot: context.logicalRoot,
@@ -289,6 +299,7 @@ struct AgentMCPStartWorktreeCoordinator {
                     startupContext,
                     initializationHintsByBindingID
                 )
+                try validateWorkspaceAuthority(context, targetWindow: targetWindow)
                 #if DEBUG
                     if WorktreeStartupBenchmarkDiagnostics.currentPendingStart != nil,
                        let correlationID = startupContext?.correlationID
@@ -422,12 +433,13 @@ struct AgentMCPStartWorktreeCoordinator {
     ) async throws -> RepositoryContext {
         let store = targetWindow.promptManager.workspaceFileContextStore
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
-        let declaredPrimaryRoot = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first
+        let workspaceAuthority = try workspaceAuthority(targetWindow: targetWindow)
+        let declaredPrimaryRoot = workspaceAuthority.primaryRootPath
         let discoveryRoots = Self.repositoryDiscoveryRoots(
             primaryRoot: declaredPrimaryRoot,
             visibleRoots: visibleRoots
         )
-        let declaredPrimaryPath = declaredPrimaryRoot.map(GitRepoRootAuthorization.canonicalPath)
+        let declaredPrimaryPath = GitRepoRootAuthorization.canonicalPath(declaredPrimaryRoot)
         var declaredPrimaryCandidate: RepositoryCandidate?
         var candidates: [RepositoryCandidate] = []
         var seen = Set<String>()
@@ -465,16 +477,12 @@ struct AgentMCPStartWorktreeCoordinator {
             }
         } else {
             let implicitCandidate: RepositoryCandidate
-            if declaredPrimaryPath != nil {
-                guard let declaredPrimaryCandidate else {
-                    throw MCPError.invalidParams(
-                        "The primary workspace root is not a Git repository for \(operationName) worktree binding. Select another loaded repository explicitly with worktree_repo_root."
-                    )
-                }
-                implicitCandidate = declaredPrimaryCandidate
-            } else {
-                implicitCandidate = defaultCandidate
+            guard let declaredPrimaryCandidate else {
+                throw MCPError.invalidParams(
+                    "The primary workspace root is not a Git repository for \(operationName) worktree binding. Select another loaded repository explicitly with worktree_repo_root."
+                )
             }
+            implicitCandidate = declaredPrimaryCandidate
             repo = implicitCandidate.repo
             explicitLogicalRoot = implicitCandidate.logicalRoot
         }
@@ -483,11 +491,14 @@ struct AgentMCPStartWorktreeCoordinator {
             explicitLogicalRoot: explicitLogicalRoot,
             visibleRoots: discoveryRoots
         )
-        return RepositoryContext(
+        let context = RepositoryContext(
             repo: repo,
             visibleRoots: visibleRoots,
-            logicalRoot: logicalRoot
+            logicalRoot: logicalRoot,
+            workspaceAuthority: workspaceAuthority
         )
+        try validateWorkspaceAuthority(context, targetWindow: targetWindow)
+        return context
     }
 
     private func createWorktree(
@@ -495,7 +506,8 @@ struct AgentMCPStartWorktreeCoordinator {
         context: RepositoryContext,
         sessionID: UUID,
         expectedOwnerBindingGeneration: UInt64,
-        startupContext: WorktreeStartupContext?
+        startupContext: WorktreeStartupContext?,
+        targetWindow: WindowState
     ) async throws -> GitWorktreeCreateResult {
         let existingWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         let mainRootPath = existingWorktrees.first(where: \.isMain)?.path ?? context.repo.rootPath
@@ -579,6 +591,7 @@ struct AgentMCPStartWorktreeCoordinator {
         } else {
             nil
         }
+        try validateWorkspaceAuthority(context, targetWindow: targetWindow)
         let result: GitWorktreeCreateResult
         #if DEBUG
             result = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {
@@ -616,6 +629,45 @@ struct AgentMCPStartWorktreeCoordinator {
             )
         #endif
         return result
+    }
+
+    private func workspaceAuthority(targetWindow: WindowState) throws -> WorkspaceAuthority {
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace,
+              let primaryRoot = workspace.repoPaths.first
+        else {
+            throw MCPError.invalidParams("An active saved workspace with at least one root is required for \(operationName) worktree binding.")
+        }
+        let canonicalRoots = try workspace.repoPaths.map { rootPath in
+            guard let standardized = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(rootPath) else {
+                throw MCPError.invalidParams("The active saved workspace contains an invalid root for \(operationName) worktree binding.")
+            }
+            return GitRepoRootAuthorization.canonicalPath(standardized)
+        }
+        let rootPaths = Set(canonicalRoots)
+        guard rootPaths.count == canonicalRoots.count else {
+            throw MCPError.invalidParams("The active saved workspace contains duplicate canonical roots for \(operationName) worktree binding.")
+        }
+        return WorkspaceAuthority(
+            workspaceID: workspace.id,
+            primaryRootPath: GitRepoRootAuthorization.canonicalPath(primaryRoot),
+            rootPaths: rootPaths
+        )
+    }
+
+    private func validateWorkspaceAuthority(
+        _ context: RepositoryContext,
+        targetWindow: WindowState
+    ) throws {
+        let currentAuthority = try workspaceAuthority(targetWindow: targetWindow)
+        guard currentAuthority == context.workspaceAuthority else {
+            throw MCPError.invalidParams("The active saved workspace changed while \(operationName) was preparing its worktree binding. Retry from the current workspace.")
+        }
+        let logicalRootPath = GitRepoRootAuthorization.canonicalPath(context.logicalRoot.standardizedFullPath)
+        guard currentAuthority.rootPaths.contains(logicalRootPath) else {
+            throw MCPError.invalidParams(
+                "The selected root '\(context.logicalRoot.name)' is no longer part of the active saved workspace for \(operationName) worktree binding."
+            )
+        }
     }
 
     private func repositoryRelativeRootPrefix(

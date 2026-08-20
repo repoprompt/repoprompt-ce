@@ -2873,6 +2873,48 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["in-flight prompt"])
     }
 
+    func testInvalidActiveBindingRequiresStopConfirmationAndCanBeRepairedToLocal() async throws {
+        let currentRoot = try makeTemporaryDirectory(named: "invalid-active-current-root")
+        let staleRoot = try makeTemporaryDirectory(named: "invalid-active-stale-root")
+        let staleWorktree = try makeTemporaryDirectory(named: "invalid-active-stale-worktree")
+        let viewModel = makeViewModel(workspacePath: currentRoot.path)
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.runState = .running
+        session.installRunID(UUID())
+        session.beginRunAttempt(source: "test")
+        session.providerSessionID = "provider-from-invalid-binding"
+        let staleBinding = makeBinding(
+            logicalRoot: staleRoot.path,
+            worktreeRoot: staleWorktree.path,
+            worktreeID: "wt_stale"
+        )
+        session.worktreeBindings = [staleBinding]
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let unconfirmed = await viewModel.selectExecutionLocation(.local, for: tabID)
+
+        XCTAssertEqual(unconfirmed, .confirmationRequired(.activeRunStop))
+        XCTAssertEqual(session.worktreeBindings, [staleBinding])
+        XCTAssertEqual(session.providerSessionID, "provider-from-invalid-binding")
+
+        let repaired = await viewModel.selectExecutionLocation(
+            .local,
+            for: tabID,
+            confirmedChange: .activeRunStop
+        )
+
+        XCTAssertEqual(repaired, .applied)
+        XCTAssertTrue(session.worktreeBindings.isEmpty)
+        XCTAssertNil(session.providerSessionID)
+        XCTAssertFalse(session.runState.isActive)
+    }
+
     func testExternalPrimaryRebindRejectsDuringActiveRunWithoutDroppingOldIdentity() async throws {
         let root = try makeTemporaryDirectory(named: "managed-active-root")
         let oldWorktree = try makeTemporaryDirectory(named: "managed-old-worktree")
@@ -3475,6 +3517,62 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(binding["id"]?.stringValue, storedBinding.id)
         XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount + 1)
         XCTAssertEqual(viewModel.sessions.count, initialSessionCount + 1)
+    }
+
+    func testCoordinatorRejectsLoadedSecondaryRootRemovedFromSavedWorkspaceBeforeCreate() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/stale-secondary-\(secondaryFixture.suffix)"
+        let destination = secondaryFixture.sandbox.appendingPathComponent(
+            "stale-secondary-worktree",
+            isDirectory: true
+        )
+        defer {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try? runGit(["worktree", "remove", "--force", destination.path], cwd: secondaryFixture.repo)
+            }
+        }
+
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspaceID })
+        window.workspaceManager.workspaces[workspaceIndex].repoPaths = [primaryFixture.repo.path]
+        let viewModel = window.agentModeViewModel
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: nil
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start",
+            vcsService: .shared,
+            gitTargetResolver: .init()
+        )
+        let request = try coordinator.parseRequest(args: [
+            "worktree_create": .bool(true),
+            "worktree_repo_root": .string(secondaryFixture.repo.path),
+            "worktree_branch": .string(branch),
+            "worktree_path": .string(destination.path),
+            "allow_external_worktree_path": .bool(true)
+        ])
+
+        do {
+            try await coordinator.prepare(
+                request: request,
+                target: target,
+                targetWindow: window
+            )
+            XCTFail("Expected a loaded root removed from the saved workspace to be rejected")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("saved workspace"), error.localizedDescription)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertTrue(viewModel.worktreeBindings(forAgentSessionID: sessionID).isEmpty)
+        let descriptors = try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo)
+        XCTAssertTrue(descriptors.allSatisfy(\.isMain))
     }
 
     func testSharedStartWorktreeCoordinatorHonorsPreCancelledCreateWithoutMutation() async throws {

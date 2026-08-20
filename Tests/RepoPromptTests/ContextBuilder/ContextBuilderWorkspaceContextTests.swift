@@ -442,6 +442,47 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(Set(nestedRoots.map(\.standardizedFullPath)), Set([logicalRoot.standardizedFileURL.path]))
     }
 
+    func testResolveWithoutBindingsUsesSelectedExecutionRootInsteadOfWorkspaceDirectory() async throws {
+        let selectedRoot = try makeTemporaryDirectory(name: "ContextBuilderSelectedExecution")
+        let secondaryRoot = try makeTemporaryDirectory(name: "ContextBuilderSecondaryExecution")
+        let activeWorkspaceDirectory = try makeTemporaryDirectory(name: "ContextBuilderActiveWorkspaceDirectory")
+        defer {
+            try? FileManager.default.removeItem(at: selectedRoot)
+            try? FileManager.default.removeItem(at: secondaryRoot)
+            try? FileManager.default.removeItem(at: activeWorkspaceDirectory)
+        }
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: selectedRoot.path, kind: .primaryWorkspace)
+        _ = try await store.loadRoot(path: secondaryRoot.path, kind: .primaryWorkspace)
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 51,
+            workspaceID: UUID(),
+            promptText: "Discover the selected workspace",
+            selection: StoredSelection(codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Selected execution root",
+            runID: UUID(),
+            activeAgentSessionID: UUID(),
+            worktreeBindings: [],
+            explicitlyBound: false
+        )
+
+        let context = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot,
+            workspaceRepoPaths: [selectedRoot.path, secondaryRoot.path],
+            workspaceDirectoryPath: activeWorkspaceDirectory.path,
+            store: store
+        )
+
+        guard case .deferred = context.reviewTargetResolution else {
+            return XCTFail("Expected empty initial selection to defer")
+        }
+        XCTAssertEqual(context.providerWorkspacePath, selectedRoot.standardizedFileURL.path)
+        XCTAssertNotEqual(context.providerWorkspacePath, activeWorkspaceDirectory.standardizedFileURL.path)
+    }
+
     func testTwoRootUnboundSliceElectsSelectedRepositoryAndIgnoresCrossRootAutoCodemap() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: "ContextBuilderTwoRootElection")
         defer { fixture.cleanup() }

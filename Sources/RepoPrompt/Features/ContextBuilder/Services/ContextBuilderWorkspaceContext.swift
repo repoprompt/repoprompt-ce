@@ -91,23 +91,25 @@ struct ContextBuilderWorkspaceContext {
             store: store
         )
 
-        let providerWorkspacePath: String
-        if let target = reviewTargetResolution.availableTarget {
-            providerWorkspacePath = target.primaryCheckout.checkoutRootPath
-        } else if !bindings.isEmpty {
-            guard let projected = try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+        let executionPath: String
+        do {
+            guard let resolvedExecutionPath = try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
                 bindings: bindings,
                 workspaceRootPaths: workspaceRepoPaths
             ) else {
                 throw ContextBuilderWorkspaceContextError.missingWorkspaceRoot
             }
-            providerWorkspacePath = projected
-        } else if workspaceRepoPaths.count == 1, let onlyRoot = workspaceRepoPaths.first {
-            providerWorkspacePath = onlyRoot
+            executionPath = resolvedExecutionPath
+        } catch let error as ContextBuilderWorkspaceContextError {
+            throw error
+        } catch {
+            throw ContextBuilderWorkspaceContextError.unavailableWorktreeProjection
+        }
+
+        let providerWorkspacePath: String = if let target = reviewTargetResolution.availableTarget {
+            target.primaryCheckout.checkoutRootPath
         } else {
-            // A neutral CWD is not Git authority. Nested Agent Context Builder Git calls use the
-            // frozen selected-repository target carried in the run-scoped tab snapshot.
-            providerWorkspacePath = workspaceDirectoryPath
+            executionPath
         }
 
         let context = ContextBuilderWorkspaceContext(

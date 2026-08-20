@@ -2059,7 +2059,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func primaryExecutionBinding(for session: TabSession) -> AgentSessionWorktreeBinding? {
-        Self.primaryExecutionBinding(in: session.worktreeBindings, workspaceRootPaths: workspaceRootPathsProvider())
+        do {
+            return try Self.primaryExecutionBinding(
+                in: session.worktreeBindings,
+                workspaceRootPaths: workspaceRootPathsProvider()
+            )
+        } catch {
+            // Indicators are presentation-only. Execution transitions resolve the same binding
+            // through the throwing path and preserve invalid state as a distinct destination.
+            return nil
+        }
     }
 
     func primaryExecutionWorktreeIndicator(forTabID tabID: UUID) -> AgentWorktreeIndicator? {
@@ -2076,8 +2085,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private static func primaryExecutionBinding(
         in bindings: [AgentSessionWorktreeBinding],
         workspaceRootPaths: [String]
-    ) -> AgentSessionWorktreeBinding? {
-        try? AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+    ) throws -> AgentSessionWorktreeBinding? {
+        try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
             in: bindings,
             workspaceRootPaths: workspaceRootPaths
         )
@@ -6549,11 +6558,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             return .blocked("This thread cannot change execution location right now.")
         }
-        let previousPrimary = primaryExecutionBinding(for: session)
+        let previousPrimary: AgentSessionWorktreeBinding?
+        let previousBindingsAreInvalid: Bool
+        do {
+            previousPrimary = try Self.primaryExecutionBinding(
+                in: session.worktreeBindings,
+                workspaceRootPaths: workspaceRootPathsProvider()
+            )
+            previousBindingsAreInvalid = false
+        } catch {
+            previousPrimary = nil
+            previousBindingsAreInvalid = true
+        }
         switch choice {
-        case .local where previousPrimary == nil:
+        case .local where previousPrimary == nil && !previousBindingsAreInvalid:
             return .unchanged
-        case let .existingWorktree(selection) where previousPrimary?.worktreeID == selection.worktreeID:
+        case let .existingWorktree(selection)
+            where !previousBindingsAreInvalid && previousPrimary?.worktreeID == selection.worktreeID:
             return .unchanged
         default:
             break
@@ -6578,7 +6599,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         do {
             let desiredBindings: [AgentSessionWorktreeBinding] = switch choice {
             case .local:
-                session.worktreeBindings.filter { $0.id != previousPrimary?.id }
+                previousBindingsAreInvalid
+                    ? []
+                    : session.worktreeBindings.filter { $0.id != previousPrimary?.id }
             case .newWorktree, .existingWorktree:
                 try await prepareStartedExecutionLocationBinding(
                     choice,
@@ -6720,20 +6743,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private struct ExecutionDestinationIdentity: Equatable {
-        let repositoryID: String?
-        let worktreeID: String?
-        let path: String?
+    private enum ExecutionDestinationIdentity: Equatable {
+        case local(path: String?)
+        case worktree(repositoryID: String?, worktreeID: String?, path: String?)
+        case invalid(bindings: [AgentSessionWorktreeBinding])
     }
 
     private func executionDestinationIdentity(in bindings: [AgentSessionWorktreeBinding]) -> ExecutionDestinationIdentity {
-        let binding = Self.primaryExecutionBinding(in: bindings, workspaceRootPaths: workspaceRootPathsProvider())
-        return ExecutionDestinationIdentity(
-            repositoryID: binding?.repositoryID,
-            worktreeID: binding?.worktreeID,
-            path: Self.standardizedWorkspacePath(binding?.worktreeRootPath)
-                ?? Self.standardizedWorkspacePath(workspacePathProvider())
-        )
+        do {
+            guard let binding = try Self.primaryExecutionBinding(
+                in: bindings,
+                workspaceRootPaths: workspaceRootPathsProvider()
+            ) else {
+                return .local(path: Self.standardizedWorkspacePath(workspacePathProvider()))
+            }
+            return .worktree(
+                repositoryID: binding.repositoryID,
+                worktreeID: binding.worktreeID,
+                path: Self.standardizedWorkspacePath(binding.worktreeRootPath)
+            )
+        } catch {
+            return .invalid(bindings: bindings)
+        }
     }
 
     private func executionLocationContext() async throws -> ExecutionLocationContext {
