@@ -257,7 +257,7 @@ extension View {
         _ text: String?,
         _ placement: TooltipPlacement = .top
     ) -> some View {
-        modifier(HoverTooltipModifier(tooltipContent: text.map(TooltipContent.init), placement: placement))
+        modifier(HoverTooltipModifier(tooltipContent: text.map { TooltipContent($0) }, placement: placement))
     }
 
     /// Adds a pure-SwiftUI hover tooltip with attributed text for small emphasis.
