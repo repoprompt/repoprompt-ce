@@ -631,6 +631,7 @@ struct AgentModeSessionsListView: View {
                                     hasMore: snapshot.hasMoreArchivedSessions,
                                     remainingCount: snapshot.remainingArchivedSessionCount,
                                     dateInfoByStashedTabID: snapshot.archivedDateInfoByStashedTabID,
+                                    sessionIDByStashedTabID: snapshot.archivedSessionIDByStashedTabID,
                                     workspaceID: snapshot.workspaceID,
                                     selectionState: selectionState,
                                     renderedOrder: snapshot.renderedSelectionOrder,
@@ -1085,6 +1086,7 @@ struct ArchivedSessionsList: View {
     let hasMore: Bool
     let remainingCount: Int
     let dateInfoByStashedTabID: [UUID: AgentModeViewModel.SidebarSessionDateInfo]
+    let sessionIDByStashedTabID: [UUID: UUID]
     let workspaceID: UUID?
     let selectionState: AgentSidebarSelectionState
     let renderedOrder: [AgentSidebarSelectionIdentity]
@@ -1151,7 +1153,7 @@ struct ArchivedSessionsList: View {
                         },
                         onDelete: { deleteArchived(stashed) },
                         sessionIDCopyAction: .systemClipboard(
-                            sessionID: stashed.tab.activeAgentSessionID
+                            sessionID: sessionIDByStashedTabID[stashed.id]
                         )
                     )
                 }

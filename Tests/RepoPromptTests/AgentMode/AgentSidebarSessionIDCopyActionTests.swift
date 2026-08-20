@@ -40,7 +40,7 @@ final class AgentSidebarSessionIDCopyActionTests: XCTestCase {
         XCTAssertEqual(writtenValues, ["sentinel"])
     }
 
-    func testActiveArchivedAndSubagentRowsUseSharedSessionIDCopyAction() throws {
+    func testRowsExposeInjectedSessionIDCopyAction() throws {
         let rootSessionID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
         let subagentSessionID = try XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222"))
         let archivedSessionID = try XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333"))
