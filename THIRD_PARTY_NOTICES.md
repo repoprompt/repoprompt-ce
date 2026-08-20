@@ -65,8 +65,8 @@ The adapted implementation has been substantially modified for RepoPrompt. The A
 
 The repository includes wildmatch material in:
 
-- `Sources/RepoPromptC/src/wildmatch/wildmatch.c`
-- `Sources/RepoPromptC/include/wildmatch.h`
+- `Packages/RepoPromptPortableRuntime/Sources/RepoPromptC/src/wildmatch/wildmatch.c`
+- `Packages/RepoPromptPortableRuntime/Sources/RepoPromptC/include/wildmatch.h`
 
 The source files state that the implementation is based on the fnmatch implementation from OpenBSD. The notice material below is reproduced from the checked-in files; no further external provenance is asserted here.
 

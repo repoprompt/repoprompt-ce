@@ -166,6 +166,8 @@ IMPLEMENTED_OPERATIONS = {
     "check-format-tools",
     "install-format-tools",
     "swift-build",
+    "portable-build",
+    "portable-test",
     "build",
     "package",
     "test",
@@ -211,6 +213,8 @@ Operation commands:
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor portable-build       # build Packages/RepoPromptPortableRuntime
+  ./conductor portable-test [--filter <filter>] [--test-product <product>]
   ./conductor build
   ./conductor package debug|release
   ./conductor test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -2841,7 +2845,7 @@ def job_consumes_unlaned_capacity(operation: str, lanes: Sequence[str]) -> bool:
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
+    if operation in {"swift-build", "portable-build", "portable-test", "build", "package", "test", "provider-test", "install-debug-cli"}:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
@@ -3199,7 +3203,7 @@ class OperationRegistry:
         if operation not in IMPLEMENTED_OPERATIONS:
             raise ConductorError(f"operation '{operation}' is not implemented")
 
-        if operation in {"test", "provider-test"}:
+        if operation in {"test", "provider-test", "portable-test"}:
             self._validate_xctest_stall_options(args)
 
         env = self._base_env(verbose, request)
@@ -3235,6 +3239,17 @@ class OperationRegistry:
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
             return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+        if operation == "portable-build":
+            return [
+                "swift", "build", "--disable-automatic-resolution"
+            ], ["build"], self.repo_root / "Packages" / "RepoPromptPortableRuntime", env, effective_timeout
+        if operation == "portable-test":
+            argv = ["swift", "test", "--disable-automatic-resolution"]
+            if args.get("testProduct"):
+                argv.extend(["--test-product", str(args["testProduct"])])
+            if args.get("filter"):
+                argv.extend(["--filter", str(args["filter"])])
+            return argv, ["build"], self.repo_root / "Packages" / "RepoPromptPortableRuntime", env, effective_timeout
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -4614,7 +4629,7 @@ class DaemonState:
 
     def _xctest_watchdog_enabled(self, job: Job) -> bool:
         return (
-            job.operation in {"test", "provider-test"}
+            job.operation in {"test", "provider-test", "portable-test"}
             and job.args.get("xctestStallSeconds") is not None
         )
 
@@ -8198,6 +8213,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "format-tools-status",
         "check-format-tools",
         "install-format-tools",
+        "portable-build",
     }:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
@@ -8210,7 +8226,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
-    elif operation in {"test", "provider-test"}:
+    elif operation in {"test", "provider-test", "portable-test"}:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         parser.add_argument("--filter")
         parser.add_argument("--test-product")

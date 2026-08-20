@@ -33,7 +33,7 @@ Route the affected surface without guessing a fix:
 - App lifecycle, launch, or composition: `Sources/RepoPrompt/App`
 - Cross-cutting file, process, security, MCP, or platform behavior: `Sources/RepoPrompt/Infrastructure/<Area>`
 - CLI-only behavior: `Sources/RepoPromptMCP`
-- Shared app/CLI MCP wire contract: `Sources/RepoPromptShared/MCP`
+- Shared app/CLI MCP wire contract: `Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP`
 - Provider catalog, codec, or translation behavior: `Packages/RepoPromptAgentProviders`
 
 ## Use CE-Specific Evidence

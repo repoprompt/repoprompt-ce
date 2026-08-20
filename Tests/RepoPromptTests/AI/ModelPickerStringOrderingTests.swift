@@ -3,6 +3,58 @@ import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 final class ModelPickerStringOrderingTests: XCTestCase {
+    func testDesktopProviderAndModelIdentitySnapshot() throws {
+        XCTAssertEqual(
+            AgentProviderKind.allCases.map { provider in
+                [
+                    provider.rawValue,
+                    provider.commandName,
+                    provider.mcpClientNameHint ?? "",
+                    String(provider.usesClaudeNativeRuntime),
+                    String(provider.requiresPrePromptAgentModeMCPRouting)
+                ].joined(separator: "|")
+            },
+            [
+                "claudeCode|claude|claude-code|true|true",
+                "codexExec|codex|codex-mcp-client|false|true",
+                "openCode|opencode|opencode|false|true",
+                "cursor|cursor-agent|cursor|false|false",
+                "grokBuild|grok|grok-shell-RepoPromptCE|false|false",
+                "claudeCodeGLM|claude|claude-code|true|true",
+                "kimiCode|claude|claude-code|true|true",
+                "customClaudeCompatible|claude|claude-code|true|true"
+            ]
+        )
+
+        let expectedRawValues = [
+            "gpt-5.1-codex-mini",
+            "gpt-5.6-sol-low", "gpt-5.6-sol-medium", "gpt-5.6-sol-high", "gpt-5.6-sol-xhigh", "gpt-5.6-sol-max", "gpt-5.6-sol-ultra",
+            "gpt-5.6-terra-low", "gpt-5.6-terra-medium", "gpt-5.6-terra-high", "gpt-5.6-terra-xhigh", "gpt-5.6-terra-max", "gpt-5.6-terra-ultra",
+            "gpt-5.6-luna-low", "gpt-5.6-luna-medium", "gpt-5.6-luna-high", "gpt-5.6-luna-xhigh", "gpt-5.6-luna-max",
+            "gpt-5.5-low", "gpt-5.5-medium", "gpt-5.5-high", "gpt-5.5-xhigh",
+            "gpt-5.3-codex-low", "gpt-5.3-codex-medium", "gpt-5.3-codex-high", "gpt-5.3-codex-xhigh",
+            "gpt-5.2-low", "gpt-5.2-medium", "gpt-5.2-high", "gpt-5.2-xhigh",
+            "gpt-5.4-low", "gpt-5.4-medium", "gpt-5.4-high", "gpt-5.4-xhigh",
+            "gpt-5.4-mini-low", "gpt-5.4-mini-medium", "gpt-5.4-mini-high",
+            "sonnet", "opus", "haiku", "opus[1m]",
+            "claude-fable-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+            "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5", "claude-haiku-4-5",
+            "glm-4.5-air", "glm-4.7", "glm-5.2", "glm-5.2[1m]", "glm-5-turbo", "glm-5.1",
+            "kimi-code", "custom-claude-compatible", "auto", "composer-2", "default"
+        ]
+        XCTAssertEqual(AgentModel.allCases.map(\.rawValue), expectedRawValues)
+        XCTAssertEqual(AgentModel.defaultModel.rawValue, "default")
+        XCTAssertEqual(
+            AgentModelDiscoveryTag.displayOrder.map(\.rawValue),
+            ["fast", "exploration", "balanced", "engineering", "complex", "pair", "extended_context"]
+        )
+
+        for model in AgentModel.allCases {
+            let encoded = try JSONEncoder().encode(model)
+            XCTAssertEqual(try JSONDecoder().decode(AgentModel.self, from: encoded), model, model.rawValue)
+        }
+    }
+
     func testScalarOrderingUsesAsciiFoldThenRawScalarTieBreak() {
         XCTAssertEqual(
             ModelPickerStringOrdering.compare("GPT-5", "gpt-5", caseInsensitiveASCII: true),

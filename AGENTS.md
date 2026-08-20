@@ -225,11 +225,11 @@ See `docs/architecture/source-layout.md` for the full ownership map and document
 - Bridging-header-sensitive support stays under `Sources/RepoPrompt/Support` and is owned by `RepoPromptApp` unless `Package.swift` is updated in the same change.
 - Reusable UI, diffing, regex, networking, process, security, and utility substrate should use the narrowest `Sources/RepoPrompt/Infrastructure/<Area>` owner.
 - App-integrated diagnostics belong under `Sources/RepoPrompt/Features/Diagnostics` and need a documented entry point/purpose.
-- App/CLI protocol code shared by both products belongs under `Sources/RepoPromptShared`.
+- App/CLI protocol code shared by both products belongs under `Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared`.
 - Test doubles, fixtures, parser inputs, sample projects, and XCTest-only helpers belong under `Tests/RepoPromptTests`, not `Sources/RepoPrompt`.
 - Do not recreate legacy top-level `Views`, `ViewModels`, `Services`, `Models`, `Utils`, or `Shared` buckets.
 - Do not put directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
-- Keep `MCPControlMessages.swift` single-sourced in `Sources/RepoPromptShared/MCP`.
+- Keep `MCPControlMessages.swift` single-sourced in `Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP`.
 
 ## Swift style workflow
 

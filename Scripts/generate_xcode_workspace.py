@@ -90,6 +90,16 @@ def _by_name_dependencies(target: dict) -> list[str]:
     ]
 
 
+def _dependency_names(target: dict) -> list[str]:
+    names: list[str] = []
+    for dependency in target.get("dependencies", []):
+        if dependency.get("byName"):
+            names.append(dependency["byName"][0])
+        elif dependency.get("product"):
+            names.append(dependency["product"][0])
+    return names
+
+
 def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if manifest.get("name") != "RepoPromptCE":
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
@@ -104,23 +114,25 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Executable product 'RepoPrompt' must remain mapped only to target 'RepoPrompt'"
         )
 
+    portable_dependencies = [
+        dependency["fileSystem"][0]
+        for dependency in manifest.get("dependencies", [])
+        if dependency.get("fileSystem")
+        and dependency["fileSystem"][0].get("identity") == "repopromptportableruntime"
+    ]
+    expected_portable_path = repo_root / "Packages/RepoPromptPortableRuntime"
+    if len(portable_dependencies) != 1 or Path(portable_dependencies[0]["path"]) != expected_portable_path:
+        raise GeneratorError(
+            "Package.swift must consume Packages/RepoPromptPortableRuntime as one local package"
+        )
+
     targets = _target_map(manifest)
     required_targets = (
         "RepoPrompt",
         "RepoPromptApp",
         "RepoPromptMCP",
-        "RepoPromptShared",
-        "RepoPromptC",
-        "CSwiftPCRE2",
         "RepoPromptWorkspaceCore",
-        "RepoPromptDomainRuntime",
-        "RepoPromptRegexCore",
-        "RepoPromptCodeMapCore",
-        "TreeSitterScannerSupport",
         "RepoPromptWorkspaceCoreTests",
-        "RepoPromptDomainRuntimeTests",
-        "RepoPromptRegexCoreTests",
-        "RepoPromptCodeMapCoreTests",
         "RepoPromptTests",
     )
     for name in required_targets:
@@ -156,49 +168,42 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         )
 
     expected_test_dependencies = {
+        "RepoPromptAgentRuntimeCore",
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
         "RepoPromptMCP",
+        "RepoPromptRuntimeModel",
         "RepoPromptShared",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
-    if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
+    if set(_dependency_names(repo_prompt_tests)) != expected_test_dependencies | {"Markdown"}:
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
-            "RepoPromptDomainRuntime, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptTests must depend on RepoPromptAgentRuntimeCore, RepoPromptApp, "
+            "RepoPromptCodeMapCore, RepoPromptDomainRuntime, RepoPromptMCP, "
+            "RepoPromptRuntimeModel, RepoPromptShared, and Markdown"
         )
 
-    domain_runtime = targets["RepoPromptDomainRuntime"]
-    if domain_runtime.get("type") != "regular":
-        raise GeneratorError("RepoPromptDomainRuntime must remain an internal regular target")
-    if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime":
-        raise GeneratorError("RepoPromptDomainRuntime target path drifted")
-    domain_runtime_products = {
-        (dependency["product"][0], dependency["product"][1])
-        for dependency in domain_runtime.get("dependencies", [])
+    portable_products = {
+        dependency["product"][0]
+        for dependency in repo_prompt_app.get("dependencies", [])
         if dependency.get("product")
+        and dependency["product"][1] == "RepoPromptPortableRuntime"
     }
-    if (
-        _by_name_dependencies(domain_runtime)
-        != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"]
-        or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
-        or len(domain_runtime.get("dependencies", [])) != 5
-    ):
+    expected_portable_products = {
+        "RepoPromptRuntimeModel",
+        "RepoPromptAgentRuntimeCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptCodeMapCore",
+        "RepoPromptRegexCore",
+        "RepoPromptShared",
+        "RepoPromptC",
+    }
+    if portable_products != expected_portable_products:
         raise GeneratorError(
-            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, "
-            "RepoPromptCodeMapCore, Logging, and pinned MCP"
+            "RepoPromptApp portable-runtime product dependencies drifted: "
+            f"{sorted(portable_products)}"
         )
-
-    domain_runtime_tests = targets["RepoPromptDomainRuntimeTests"]
-    if domain_runtime_tests.get("type") != "test":
-        raise GeneratorError("RepoPromptDomainRuntimeTests must remain a test target")
-    if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests":
-        raise GeneratorError("RepoPromptDomainRuntimeTests target path drifted")
-    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime"]:
-        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime")
-    if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
-        raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 
     unsafe_flags: list[list[str]] = []
     for setting in repo_prompt_app.get("settings", []):
@@ -215,30 +220,6 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     ):
         raise GeneratorError(
             "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
-        )
-
-    expected_resources = {("Fixtures", True), ("Goldens", True)}
-    test_targets_with_codemap_resources = []
-    for target in targets.values():
-        if target.get("type") != "test":
-            continue
-        resources = {
-            (resource.get("path"), "copy" in resource.get("rule", {}))
-            for resource in target.get("resources", [])
-        }
-        if expected_resources.issubset(resources):
-            test_targets_with_codemap_resources.append(target.get("name"))
-    if test_targets_with_codemap_resources != ["RepoPromptCodeMapCoreTests"]:
-        raise GeneratorError(
-            "RepoPromptCodeMapCoreTests must be the sole SwiftPM test target "
-            "that copies Fixtures and Goldens"
-        )
-
-    expected_scanners = ["src/javascript/scanner.c", "src/python/scanner.c"]
-    scanners = targets["TreeSitterScannerSupport"].get("sources")
-    if scanners != expected_scanners:
-        raise GeneratorError(
-            "TreeSitterScannerSupport must retain exactly the JavaScript and Python scanners"
         )
 
     required_paths = (

@@ -163,7 +163,7 @@
         "behavior": "source_declares_typed_invalid_params",
         "error_type": "ApplyEditsError.invalidParams",
         "source_evidence": {
-          "path": "Sources/RepoPromptDomainRuntime/ApplyEdits/ApplyEditsRequestBuilder.swift",
+          "path": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/ApplyEdits/ApplyEditsRequestBuilder.swift",
           "marker": "Provide exactly one of: `rewrite`, `replace`, or `edits`.",
           "type_marker": "ApplyEditsError.invalidParams"
         }
@@ -835,17 +835,17 @@
         "operations": ["issue", "redeem", "revoke"],
         "production_declaration_sites": [
           {
-            "path": "Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift",
+            "path": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift",
             "kind": "struct",
             "symbol": "DomainRunLaunchToken"
           },
           {
-            "path": "Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
+            "path": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
             "kind": "struct",
             "symbol": "DomainWorkspaceStore"
           },
           {
-            "path": "Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
+            "path": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
             "kind": "struct",
             "symbol": "DomainContextStore"
           }

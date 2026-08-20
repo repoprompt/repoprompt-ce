@@ -21,18 +21,169 @@ print_matches() {
   fi
 }
 
+portable_import_guard() {
+  local portable_sources="Packages/RepoPromptPortableRuntime/Sources"
+  local portable_manifest="Packages/RepoPromptPortableRuntime/Package.swift"
+  local forbidden_imports='^(import|@testable[[:space:]]+import)[[:space:]]+(AppKit|SwiftUI|Sparkle|RepoPromptServiceProtocol|RepoPromptServicePersistence|RepoPromptServiceHTTP|RepoPromptServerHost|RepoPromptServerOperations|RepoPromptMCPAdapter|RepoPromptApp|RepoPrompt|Hummingbird|HummingbirdTLS|NIOSSL|X509)([[:space:]]|$)'
+
+  [[ -d "$portable_sources" ]] || fail "portable source root missing: $portable_sources"
+  [[ -f "$portable_manifest" ]] || fail "portable manifest missing: $portable_manifest"
+  [[ -f "docs/architecture/portable-runtime-semantic-owners.md" ]] || \
+    fail "portable semantic-owner inventory missing"
+  [[ -f "docs/architecture/portable-runtime-prototype-extraction.md" ]] || \
+    fail "portable prototype extraction ledger missing"
+
+  print_matches \
+    "Desktop retains a dead test-only portable provider/model projection" \
+    grep -R -n -E 'portable(TurnSettingsSnapshot|SettingsID|ModelIdentifier|PermissionID)' Sources/RepoPrompt
+
+  [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/CanonicalSigning.swift" ]] || \
+    fail "transport signing/authentication belongs to future RepoPromptServiceProtocol"
+  [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/PortalDesktopSettingsDTOs.swift" ]] || \
+    fail "portal request/projection DTOs belong to future RepoPromptServiceProtocol"
+  [[ ! -e "$portable_sources/RepoPromptRuntimeModel/ServiceModel/PortalSessionDTOs.swift" ]] || \
+    fail "portal session request/projection DTOs belong to future RepoPromptServiceProtocol"
+  print_matches \
+    "RuntimeModel retains a Crypto, transport-auth, or portal DTO dependency" \
+    grep -R -n -E '^import[[:space:]]+(Crypto|CryptoKit)([[:space:]]|$)|CanonicalSigning|ServiceEventSigningKey|Portal[A-Z]|ConnectProviderRequest|ProviderAuthFlow|ProviderAuthentication(Status|State)|ProviderAuthTransaction' \
+      "$portable_sources/RepoPromptRuntimeModel"
+
+  print_matches \
+    "portable source imports a prohibited UI, root, wire, persistence, HTTP, TLS, or Server module" \
+    grep -R -n -E "$forbidden_imports" "$portable_sources"
+  print_matches \
+    "portable manifest/source resurrects the temporary Server graph" \
+    grep -R -n -E 'makeServerPackage|REPOPROMPT_SERVER_ONLY|RepoPromptHeadlessLaunchBridge' Package.swift "$portable_manifest" "$portable_sources"
+  [[ ! -e "Packages/RepoPromptServer" ]] || fail "PR 2 must not introduce the Server package graph"
+  print_matches \
+    "PR 2 contains premature proposal/application authority behavior" \
+    grep -R -n -E 'InMemoryAuthorityStore|AuthorityTransitionCommand|AuthorityTransitionReceipt|func[[:space:]]+apply\(' \
+      "$portable_sources/RepoPromptHeadlessRuntime" "$portable_sources/RepoPromptAuthorityAPI"
+  print_matches \
+    "portable source uses Bundle.module; package-owned semantics must be compiled Swift" \
+    grep -R -n -E 'Bundle\.module' "$portable_sources"
+  print_matches \
+    "root-consumed portable product retains package-only declarations" \
+    grep -R -n -E '^[[:space:]]*package[[:space:]]|@TaskLocal[[:space:]]+package[[:space:]]' \
+      "$portable_sources/RepoPromptShared" \
+      "$portable_sources/RepoPromptDomainRuntime" \
+      "$portable_sources/RepoPromptCodeMapCore" \
+      "$portable_sources/RepoPromptRegexCore"
+  print_matches \
+    "retired canonical workflow JSON remains in the repository" \
+    find . -path '*/.build' -prune -o -name 'canonical-workflows-v62.json' -print
+
+  local fixture_roots
+  fixture_roots="$(find . -path '*/.build' -prune -o -type d -path '*/Tests/Fixtures/AgentParity/v1' -print)"
+  if [[ "$fixture_roots" != "./Packages/RepoPromptPortableRuntime/Tests/Fixtures/AgentParity/v1" ]]; then
+    fail "AgentParity/v1 must have exactly one portable package owner"
+    printf '%s\n' "$fixture_roots" >&2
+  fi
+  if ! python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("Packages/RepoPromptPortableRuntime/Tests/Fixtures/AgentParity/v1")
+expected = {
+    "model-normalization.json",
+    "provider-matrix.json",
+    "provider-turn-semantics.json",
+    "transcript-presentation.json",
+    "turn-compilation.json",
+}
+assert {path.name for path in root.glob("*.json")} == expected
+for path in root.glob("*.json"):
+    value = json.loads(path.read_text())
+    assert value["schemaVersion"] == 2, path
+    assert value["prototypeCommit"] == "45c42d65e444884d1681f4504c10d25dcb7d858a", path
+    assert value["generatedFrom"].startswith("Packages/RepoPromptPortableRuntime/Sources/"), path
+assert json.loads((root / "provider-turn-semantics.json").read_text())["generatedFrom"] == \
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/ProviderTurnConfigurationAdapters.swift"
+PY
+  then
+    fail "AgentParity fixtures must carry exact prototype and nested source provenance"
+  fi
+
+  local agent_model_definitions provider_kind_definitions
+  agent_model_definitions="$(grep -R -l -E '^enum AgentModel:[[:space:]]+String' Sources/RepoPrompt --include='*.swift' || true)"
+  provider_kind_definitions="$(grep -R -l -E '^enum AgentProviderKind:[[:space:]]+String' Sources/RepoPrompt --include='*.swift' || true)"
+  if [[ "$agent_model_definitions" != "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel.swift" ]]; then
+    fail "Desktop AgentModel raw-value owner drifted"
+    printf '%s\n' "$agent_model_definitions" >&2
+  fi
+  if [[ "$provider_kind_definitions" != "Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift" ]]; then
+    fail "Desktop AgentProviderKind raw-value owner drifted"
+    printf '%s\n' "$provider_kind_definitions" >&2
+  fi
+
+  print_matches \
+    "root Desktop adapter imports a prohibited headless, wire, persistence, HTTP, or TLS module" \
+    grep -R -n -E '^import[[:space:]]+(RepoPromptHeadlessRuntime|RepoPromptServiceProtocol|RepoPromptServicePersistence|RepoPromptServiceHTTP|RepoPromptServerHost|RepoPromptServerOperations|RepoPromptMCPAdapter|Hummingbird|HummingbirdTLS|NIOSSL|X509)([[:space:]]|$)' \
+      Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection \
+      Sources/RepoPrompt/Features/AgentMode/Runtime/Providers \
+      Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings
+
+  print_matches \
+    "Desktop/root imports Server wire protocol after portable extraction" \
+    grep -R -n -E '^import[[:space:]]+RepoPromptServiceProtocol([[:space:]]|$)' Sources/RepoPrompt Sources/RepoPromptMCP
+  print_matches \
+    "Desktop/root imports portable headless authority instead of its established owners" \
+    grep -R -n -E '^import[[:space:]]+RepoPromptHeadlessRuntime([[:space:]]|$)' Sources/RepoPrompt Sources/RepoPromptMCP
+
+  local portable_workflow=".github/workflows/portable-runtime.yml"
+  if [[ ! -f "$portable_workflow" ]] || \
+     ! grep -q 'Packages/RepoPromptPortableRuntime/\*\*' "$portable_workflow" || \
+     ! grep -q 'AgentWorkflow\.swift' "$portable_workflow" || \
+     ! grep -q 'GlobalSettingsDocument\.swift' "$portable_workflow" || \
+     ! grep -q 'AgentRunSessionStore\.swift' "$portable_workflow" || \
+     ! grep -q 'test_contribution_preflight\.py' "$portable_workflow" || \
+     ! grep -q 'validate_portable_dependency_graph\.py' "$portable_workflow" || \
+     ! grep -q '^  root-compatibility:' "$portable_workflow" || \
+     ! grep -q 'swift build --product RepoPrompt --disable-automatic-resolution' "$portable_workflow" || \
+     ! grep -q 'swift build --product repoprompt-mcp --disable-automatic-resolution' "$portable_workflow"; then
+    fail "portable CI path ownership must cover Portable and every documented Desktop mapping owner"
+  fi
+  if grep -q 'Packages/RepoPromptServer/\*\*' "$portable_workflow"; then
+    fail "PR 2 portable CI must not claim a Server package graph that does not exist yet"
+  fi
+  if [[ -f "Packages/RepoPromptServer/Package.swift" ]] && \
+     ! grep -qF '.package(path: "../RepoPromptPortableRuntime")' "Packages/RepoPromptServer/Package.swift"; then
+    fail "RepoPromptServer must consume the sibling portable package through ../RepoPromptPortableRuntime"
+  fi
+
+  if ! python3 Scripts/validate_portable_dependency_graph.py; then
+    fail "portable package exact dependency graph drifted"
+  fi
+
+  if [[ "$failures" -ne 0 ]]; then
+    printf 'Portable import guard failed (%s issue%s).\n' "$failures" "$([[ "$failures" == 1 ]] && printf '' || printf 's')" >&2
+    return 1
+  fi
+  printf 'OK: portable import guard passed.\n'
+}
+
+if [[ "${1:-}" == "portable-imports" ]]; then
+  portable_import_guard
+  exit 0
+elif [[ "$#" -gt 0 ]]; then
+  printf 'usage: %s [portable-imports]\n' "$0" >&2
+  exit 64
+fi
+
+portable_import_guard
+
 # 0. Required layout roots/files should exist before negative scans run.
 required_dirs=(
   "Sources/RepoPromptExecutable"
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
-  "Sources/RepoPromptShared/MCP"
+  "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
-  "Sources/RepoPromptDomainRuntime"
+  "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime"
   "Tests/RepoPromptTests"
   "Tests/RepoPromptWorkspaceCoreTests"
-  "Tests/RepoPromptDomainRuntimeTests"
+  "Packages/RepoPromptPortableRuntime/Tests/RepoPromptDomainRuntimeTests"
 )
 for dir in "${required_dirs[@]}"; do
   if [[ ! -d "$dir" ]]; then
@@ -63,9 +214,9 @@ if [[ "$repo_prompt_entry_main_count" -ne 1 ]]; then
 fi
 
 shared_mcp_required_files=(
-  "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
-  "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
-  "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
+  "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
+  "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
+  "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
 )
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
@@ -78,11 +229,11 @@ if [[ -e "src/scanner.c" ]]; then
   fail "retired root src/scanner.c manifest-probe sentinel exists"
 fi
 tree_sitter_scanner_support_files=(
-  "Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h"
-  "Sources/TreeSitterScannerSupport/include/tree_sitter/array.h"
-  "Sources/TreeSitterScannerSupport/include/tree_sitter/parser.h"
-  "Sources/TreeSitterScannerSupport/src/javascript/scanner.c"
-  "Sources/TreeSitterScannerSupport/src/python/scanner.c"
+  "Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h"
+  "Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/array.h"
+  "Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/parser.h"
+  "Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/src/javascript/scanner.c"
+  "Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/src/python/scanner.c"
   "ThirdPartyLicenses/tree-sitter/scanner-support.sha256"
 )
 for file in "${tree_sitter_scanner_support_files[@]}"; do
@@ -93,13 +244,13 @@ for file in "${tree_sitter_scanner_support_files[@]}"; do
     fail "TreeSitterScannerSupport compatibility file must be tracked or pending addition: $file"
   fi
 done
-if [[ -d "Sources/TreeSitterScannerSupport" ]]; then
-  unexpected_tree_sitter_scanner_support_files="$(find Sources/TreeSitterScannerSupport -type f \
-    ! -path 'Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h' \
-    ! -path 'Sources/TreeSitterScannerSupport/include/tree_sitter/array.h' \
-    ! -path 'Sources/TreeSitterScannerSupport/include/tree_sitter/parser.h' \
-    ! -path 'Sources/TreeSitterScannerSupport/src/javascript/scanner.c' \
-    ! -path 'Sources/TreeSitterScannerSupport/src/python/scanner.c' \
+if [[ -d "Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport" ]]; then
+  unexpected_tree_sitter_scanner_support_files="$(find Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport -type f \
+    ! -path 'Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h' \
+    ! -path 'Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/array.h' \
+    ! -path 'Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/parser.h' \
+    ! -path 'Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/src/javascript/scanner.c' \
+    ! -path 'Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/src/python/scanner.c' \
     -print)"
   if [[ -n "$unexpected_tree_sitter_scanner_support_files" ]]; then
     fail "unexpected file found under narrow TreeSitterScannerSupport compatibility target"
@@ -111,11 +262,24 @@ if ! tree_sitter_scanner_support_checksum_output="$(shasum -a 256 -c ThirdPartyL
   printf '%s\n' "$tree_sitter_scanner_support_checksum_output" >&2
 fi
 
-if ! tree_sitter_dependency_manifest_output="$(python3 <<'PY'
+if ! portable_manifest_output="$(python3 <<'PY'
 import json
 import re
 import subprocess
 from pathlib import Path
+
+portable_root = Path("Packages/RepoPromptPortableRuntime")
+portable_manifest = (portable_root / "Package.swift").read_text()
+portable_resolved = json.loads((portable_root / "Package.resolved").read_text())
+portable_pins = {pin["identity"]: pin for pin in portable_resolved["pins"]}
+portable = json.loads(subprocess.check_output(
+    ["swift", "package", "--disable-sandbox", "--package-path", str(portable_root), "dump-package"],
+    text=True,
+))
+root = json.loads(subprocess.check_output(["swift", "package", "--disable-sandbox", "dump-package"], text=True))
+portable_targets = {target["name"]: target for target in portable["targets"]}
+root_targets = {target["name"]: target for target in root["targets"]}
+errors = []
 
 expected_packages = {
     "tree-sitter-c": ("https://github.com/tree-sitter/tree-sitter-c", "0.24.2", "b780e47fc780ddc8da13afa35a3f4ed5c157823d", "TreeSitterC"),
@@ -131,222 +295,136 @@ expected_packages = {
     "tree-sitter-cpp": ("https://github.com/tree-sitter/tree-sitter-cpp", "0.23.4", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02", "TreeSitterCPP"),
     "tree-sitter-php": ("https://github.com/tree-sitter/tree-sitter-php.git", "0.24.2", "5b5627faaa290d89eb3d01b9bf47c3bb9e797dea", "TreeSitterPHP"),
 }
-errors = []
-manifest_text = Path("Package.swift").read_text()
-resolved = json.loads(Path("Package.resolved").read_text())
-resolved_pins = {pin["identity"]: pin for pin in resolved["pins"]}
-package = json.loads(subprocess.check_output(["swift", "package", "dump-package"], text=True))
-targets = {target["name"]: target for target in package["targets"]}
-repo_prompt = targets.get("RepoPrompt", {})
-repo_prompt_app = targets.get("RepoPromptApp", {})
+
+moved_targets = {
+    "RepoPromptRuntimeModel", "RepoPromptAuthorityAPI", "RepoPromptShared",
+    "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore",
+    "RepoPromptDomainRuntime", "RepoPromptHeadlessRuntime", "RepoPromptCodeMapCore",
+    "RepoPromptRegexCore", "RepoPromptC", "CSwiftPCRE2",
+    "TreeSitterScannerSupport", "RepoPromptLinuxSupport",
+}
+missing = sorted(moved_targets - portable_targets.keys())
+if missing:
+    errors.append(f"Portable manifest missing targets: {', '.join(missing)}")
+unexpected_root = sorted(moved_targets & root_targets.keys())
+if unexpected_root:
+    errors.append(f"Root manifest still owns portable targets: {', '.join(unexpected_root)}")
+
+root_manifest = Path("Package.swift").read_text()
+if '.package(path: "Packages/RepoPromptPortableRuntime")' not in root_manifest:
+    errors.append("Root manifest missing local RepoPromptPortableRuntime dependency")
+for forbidden in ("makeServerPackage", "REPOPROMPT_SERVER_ONLY"):
+    if forbidden in root_manifest or forbidden in portable_manifest:
+        errors.append(f"Forbidden temporary Server graph marker present: {forbidden}")
+
+repo_prompt = root_targets.get("RepoPrompt", {})
+repo_prompt_app = root_targets.get("RepoPromptApp", {})
+if repo_prompt.get("type") != "executable" or repo_prompt.get("path") != "Sources/RepoPromptExecutable":
+    errors.append("RepoPrompt target must remain the thin executable entry")
 repo_prompt_dependencies = repo_prompt.get("dependencies", [])
-repo_prompt_app_dependencies = repo_prompt_app.get("dependencies", [])
-repo_prompt_app_products = {
-    (dependency["product"][0], dependency["product"][1])
-    for dependency in repo_prompt_app_dependencies
-    if "product" in dependency
-}
-repo_prompt_code_map_core = targets.get("RepoPromptCodeMapCore", {})
-repo_prompt_code_map_core_dependencies = repo_prompt_code_map_core.get("dependencies", [])
-repo_prompt_code_map_core_products = {
-    (dependency["product"][0], dependency["product"][1])
-    for dependency in repo_prompt_code_map_core_dependencies
-    if "product" in dependency
-}
-
-if repo_prompt.get("type") != "executable":
-    errors.append("RepoPrompt target must remain executable")
-if repo_prompt.get("path") != "Sources/RepoPromptExecutable":
-    errors.append("RepoPrompt target must remain the thin Sources/RepoPromptExecutable entry target")
-repo_prompt_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_dependencies if dependency.get("byName")]
-if len(repo_prompt_dependencies) != 1 or repo_prompt_by_name_dependencies != ["RepoPromptApp"]:
-    errors.append("RepoPrompt executable target must depend only on RepoPromptApp")
-if repo_prompt_app.get("type") != "regular":
-    errors.append("RepoPromptApp target must remain an internal library target")
-if repo_prompt_app.get("path") != "Sources/RepoPrompt":
-    errors.append("RepoPromptApp target must retain the Sources/RepoPrompt implementation path")
-
-workspace_core = targets.get("RepoPromptWorkspaceCore")
-if workspace_core is None:
-    errors.append("RepoPromptWorkspaceCore target missing")
-else:
-    if workspace_core.get("type") != "regular": errors.append("RepoPromptWorkspaceCore must remain an internal regular target")
-    if workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore": errors.append("RepoPromptWorkspaceCore target path drifted")
-    if workspace_core.get("dependencies", []): errors.append("RepoPromptWorkspaceCore must not declare target or package dependencies")
-    if workspace_core.get("settings", []): errors.append("RepoPromptWorkspaceCore must not declare compiler settings")
-
-workspace_core_tests = targets.get("RepoPromptWorkspaceCoreTests")
-if workspace_core_tests is None:
-    errors.append("RepoPromptWorkspaceCoreTests target missing")
-else:
-    test_dependencies = [dependency["byName"][0] for dependency in workspace_core_tests.get("dependencies", []) if dependency.get("byName")]
-    if workspace_core_tests.get("type") != "test": errors.append("RepoPromptWorkspaceCoreTests must remain a test target")
-    if workspace_core_tests.get("path") != "Tests/RepoPromptWorkspaceCoreTests": errors.append("RepoPromptWorkspaceCoreTests target path drifted")
-    if test_dependencies != ["RepoPromptWorkspaceCore"] or len(workspace_core_tests.get("dependencies", [])) != 1:
-        errors.append("RepoPromptWorkspaceCoreTests must depend only on RepoPromptWorkspaceCore")
-
-app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
-if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
+if [d["byName"][0] for d in repo_prompt_dependencies if d.get("byName")] != ["RepoPromptApp"] or len(repo_prompt_dependencies) != 1:
+    errors.append("RepoPrompt executable must depend only on RepoPromptApp")
+if repo_prompt_app.get("type") != "regular" or repo_prompt_app.get("path") != "Sources/RepoPrompt":
+    errors.append("RepoPromptApp target ownership drifted")
+app_dependencies = repo_prompt_app.get("dependencies", [])
+app_by_name = [d["byName"][0] for d in app_dependencies if d.get("byName")]
+app_products = {(d["product"][0], d["product"][1]) for d in app_dependencies if "product" in d}
+if app_by_name.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
-for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "RepoPromptTests"):
-    dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
-    if "RepoPromptWorkspaceCore" in dependencies: errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
-for product in package.get("products", []):
-    if "RepoPromptWorkspaceCore" in product.get("targets", []): errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
+for product in ("RepoPromptRuntimeModel", "RepoPromptAgentRuntimeCore", "RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptRegexCore", "RepoPromptC"):
+    if (product, "RepoPromptPortableRuntime") not in app_products:
+        errors.append(f"RepoPromptApp missing portable product dependency: {product}")
 
+workspace_core = root_targets.get("RepoPromptWorkspaceCore")
+if workspace_core is None or workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore" or workspace_core.get("dependencies", []):
+    errors.append("RepoPromptWorkspaceCore root target contract drifted")
+workspace_tests = root_targets.get("RepoPromptWorkspaceCoreTests")
+if workspace_tests is None or workspace_tests.get("path") != "Tests/RepoPromptWorkspaceCoreTests":
+    errors.append("RepoPromptWorkspaceCoreTests root target contract drifted")
+
+allowed_edges = {
+    "RepoPromptRuntimeModel": set(),
+    "RepoPromptAuthorityAPI": {"RepoPromptRuntimeModel"},
+    "RepoPromptShared": {"Crypto"},
+    "RepoPromptAgentRuntimeCore": {"RepoPromptRuntimeModel"},
+    "RepoPromptWorkspaceRuntimeCore": {"RepoPromptRuntimeModel", "RepoPromptShared"},
+    "RepoPromptDomainRuntime": {"RepoPromptShared", "RepoPromptRuntimeModel", "RepoPromptC", "RepoPromptCodeMapCore", "Crypto", "Logging", "MCP"},
+    "RepoPromptHeadlessRuntime": {"RepoPromptRuntimeModel", "RepoPromptAuthorityAPI", "RepoPromptShared", "RepoPromptAgentRuntimeCore", "RepoPromptWorkspaceRuntimeCore", "RepoPromptDomainRuntime"},
+    "RepoPromptLinuxSupport": set(),
+    "RepoPromptRegexCore": {"CSwiftPCRE2"},
+    "RepoPromptC": set(),
+    "CSwiftPCRE2": set(),
+    "TreeSitterScannerSupport": set(),
+}
+for target_name, expected in allowed_edges.items():
+    target = portable_targets.get(target_name, {})
+    actual = set()
+    for dependency in target.get("dependencies", []):
+        if dependency.get("byName"):
+            actual.add(dependency["byName"][0])
+        elif dependency.get("product"):
+            actual.add(dependency["product"][0])
+    if actual != expected:
+        errors.append(f"{target_name} dependency drift: expected {sorted(expected)}, got {sorted(actual)}")
+
+code_map = portable_targets.get("RepoPromptCodeMapCore", {})
+code_map_dependencies = code_map.get("dependencies", [])
+code_map_products = {(d["product"][0], d["product"][1]) for d in code_map_dependencies if "product" in d}
+code_map_by_name = [d["byName"][0] for d in code_map_dependencies if d.get("byName")]
+if code_map_by_name.count("TreeSitterScannerSupport") != 1 or code_map_by_name.count("RepoPromptRegexCore") != 1:
+    errors.append("RepoPromptCodeMapCore low-level target edges drifted")
 for identity, (url, version, revision, product) in expected_packages.items():
-    requirement = f'exact: "{version}"' if version is not None else f'revision: "{revision}"'
-    manifest_pin = f'.package(url: "{url}", {requirement})'
-    if manifest_pin not in manifest_text:
-        errors.append(f"Package.swift missing exact pin: {identity} {version or revision}")
-    pin = resolved_pins.get(identity)
-    state = pin.get("state", {}) if pin is not None else {}
-    if pin is None:
-        errors.append(f"Package.resolved missing pin: {identity}")
-    elif pin.get("location") != url or state.get("revision") != revision or state.get("version") != version:
-        errors.append(f"Package.resolved pin drift: {identity}")
-    if (product, identity) not in repo_prompt_code_map_core_products:
-        errors.append(f"RepoPromptCodeMapCore missing upstream grammar product dependency: {product} ({identity})")
+    if f'.package(url: "{url}", exact: "{version}")' not in portable_manifest:
+        errors.append(f"Portable manifest missing exact pin: {identity} {version}")
+    pin = portable_pins.get(identity)
+    state = pin.get("state", {}) if pin else {}
+    if not pin or pin.get("location") != url or state.get("revision") != revision or state.get("version") != version:
+        errors.append(f"Portable Package.resolved pin drift: {identity}")
+    if (product, identity) not in code_map_products:
+        errors.append(f"RepoPromptCodeMapCore missing grammar product: {product} ({identity})")
 
-wrapper = resolved_pins.get("swift-tree-sitter", {})
 wrapper_url = "https://github.com/repoprompt/swift-tree-sitter.git"
 wrapper_revision = "a778ef4fb7f0d3ad00185f42ce83c688373c4361"
-wrapper_manifest_pattern = re.compile(
-    rf'\.package\(\s*url:\s*"{re.escape(wrapper_url)}",\s*revision:\s*"{wrapper_revision}"\s*\)'
-)
-if wrapper_manifest_pattern.search(manifest_text) is None:
-    errors.append("Package.swift must use the unnamed URL/revision declaration for the approved RepoPrompt SwiftTreeSitter fork")
+if re.search(rf'\.package\(\s*url:\s*"{re.escape(wrapper_url)}",\s*revision:\s*"{wrapper_revision}"\s*\)', portable_manifest) is None:
+    errors.append("Portable manifest must pin the approved RepoPrompt SwiftTreeSitter fork")
+wrapper = portable_pins.get("swift-tree-sitter", {})
 if wrapper.get("location") != wrapper_url or wrapper.get("state", {}) != {"revision": wrapper_revision}:
-    errors.append("SwiftTreeSitter fork location/revision drifted")
-if ("SwiftTreeSitter", "swift-tree-sitter") in repo_prompt_app_products:
-    errors.append("RepoPromptApp must not directly depend on SwiftTreeSitter")
-if ("SwiftTreeSitter", "swift-tree-sitter") not in repo_prompt_code_map_core_products:
-    errors.append("RepoPromptCodeMapCore missing direct SwiftTreeSitter product dependency")
-if "https://github.com/ChimeHQ/SwiftTreeSitter" in manifest_text or "swifttreesitter" in resolved_pins:
-    errors.append("ChimeHQ SwiftTreeSitter must not coexist with the RepoPrompt fork")
-if "https://github.com/ChimeHQ/Neon" in manifest_text or '.product(name: "Neon"' in manifest_text or "neon" in resolved_pins:
-    errors.append("Neon package/product must remain removed")
+    errors.append("Portable SwiftTreeSitter pin drifted")
+if ("SwiftTreeSitter", "swift-tree-sitter") not in code_map_products:
+    errors.append("RepoPromptCodeMapCore missing SwiftTreeSitter product")
 
-runtime = resolved_pins.get("tree-sitter", {})
+runtime = portable_pins.get("tree-sitter", {})
 if runtime.get("location") != "https://github.com/tree-sitter/tree-sitter" or runtime.get("state", {}).get("version") != "0.25.10" or runtime.get("state", {}).get("revision") != "da6fe9beb4f7f67beb75914ca8e0d48ae48d6406":
-    errors.append("Tree-sitter runtime must resolve exactly to 0.25.10 / da6fe9beb4f7f67beb75914ca8e0d48ae48d6406")
+    errors.append("Portable Tree-sitter runtime pin drifted")
 
-support = targets.get("TreeSitterScannerSupport")
-if support is None:
-    errors.append("TreeSitterScannerSupport target missing")
-else:
-    if support.get("path") != "Sources/TreeSitterScannerSupport":
-        errors.append("TreeSitterScannerSupport target path drifted")
-    if sorted(support.get("sources", [])) != ["src/javascript/scanner.c", "src/python/scanner.c"]:
-        errors.append("TreeSitterScannerSupport sources must remain exactly JavaScript/Python scanner.c")
-core_by_name_dependencies = [
-    dependency["byName"][0]
-    for dependency in repo_prompt_code_map_core_dependencies
-    if dependency.get("byName")
-]
-if core_by_name_dependencies.count("TreeSitterScannerSupport") != 1:
-    errors.append("RepoPromptCodeMapCore must directly depend exactly once on TreeSitterScannerSupport")
-if app_by_name_dependencies.count("TreeSitterScannerSupport") != 0:
-    errors.append("RepoPromptApp must not directly depend on TreeSitterScannerSupport")
-if app_by_name_dependencies.count("RepoPromptCodeMapCore") != 1:
-    errors.append("RepoPromptApp must depend exactly once on RepoPromptCodeMapCore")
+support = portable_targets.get("TreeSitterScannerSupport", {})
+if sorted(support.get("sources", [])) != ["src/javascript/scanner.c", "src/python/scanner.c"]:
+    errors.append("Portable TreeSitterScannerSupport contract drifted")
 
-# M1 headless domain runtime is an internal AppKit-free owner boundary. During the
-# two-commit migration it may be staged in Swift 5 or promoted to Swift 6, but the
-# runtime and owner tests must move together and retain complete checking.
-domain_runtime = targets.get("RepoPromptDomainRuntime")
-domain_runtime_tests = targets.get("RepoPromptDomainRuntimeTests")
-if domain_runtime is None:
-    errors.append("RepoPromptDomainRuntime target missing")
-else:
-    if domain_runtime.get("type") != "regular": errors.append("RepoPromptDomainRuntime must remain an internal regular target")
-    if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime": errors.append("RepoPromptDomainRuntime target path drifted")
-    runtime_by_name = [
-        dependency["byName"][0]
-        for dependency in domain_runtime.get("dependencies", [])
-        if dependency.get("byName")
-    ]
-    runtime_products = {
-        (dependency["product"][0], dependency["product"][1])
-        for dependency in domain_runtime.get("dependencies", [])
-        if "product" in dependency
-    }
-    if runtime_by_name != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 5:
-        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
-if domain_runtime_tests is None:
-    errors.append("RepoPromptDomainRuntimeTests target missing")
-else:
-    owner_by_name = [dependency["byName"][0] for dependency in domain_runtime_tests.get("dependencies", []) if dependency.get("byName")]
-    owner_products = {
-        (dependency["product"][0], dependency["product"][1])
-        for dependency in domain_runtime_tests.get("dependencies", [])
-        if "product" in dependency
-    }
-    if domain_runtime_tests.get("type") != "test": errors.append("RepoPromptDomainRuntimeTests must remain a test target")
-    if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests": errors.append("RepoPromptDomainRuntimeTests target path drifted")
-    if owner_by_name != ["RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 2:
-        errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptDomainRuntime and MCP")
+code_map_tests = portable_targets.get("RepoPromptCodeMapCoreTests", {})
+if code_map_tests.get("type") != "test":
+    errors.append("Portable RepoPromptCodeMapCoreTests target drifted")
+domain_tests = portable_targets.get("RepoPromptDomainRuntimeTests", {})
+if domain_tests.get("type") != "test":
+    errors.append("Portable RepoPromptDomainRuntimeTests target drifted")
 
-def swift_language_modes(target):
-    return [
-        setting.get("kind", {}).get("swiftLanguageMode", {}).get("_0")
-        for setting in target.get("settings", [])
-        if setting.get("kind", {}).get("swiftLanguageMode")
-    ]
-
-def strict_concurrency_features(target):
-    return [
-        setting.get("kind", {}).get("enableExperimentalFeature", {}).get("_0")
-        for setting in target.get("settings", [])
-        if setting.get("kind", {}).get("enableExperimentalFeature")
-    ]
-
-if domain_runtime is not None and domain_runtime_tests is not None:
-    runtime_modes = swift_language_modes(domain_runtime)
-    owner_modes = swift_language_modes(domain_runtime_tests)
-    if runtime_modes != owner_modes:
-        errors.append("RepoPromptDomainRuntime and owner tests must use the same Swift language mode")
-    elif runtime_modes == ["5"]:
-        if strict_concurrency_features(domain_runtime) != ["StrictConcurrency"] or strict_concurrency_features(domain_runtime_tests) != ["StrictConcurrency"]:
-            errors.append("Swift 5 domain runtime and owner tests must retain complete StrictConcurrency checking")
-    elif runtime_modes != ["6"]:
-        errors.append("RepoPromptDomainRuntime and owner tests must be either Swift 5 + StrictConcurrency or Swift 6")
-if app_by_name_dependencies.count("RepoPromptDomainRuntime") != 1:
-    errors.append("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
-repo_prompt_tests_dependencies = [dependency["byName"][0] for dependency in targets.get("RepoPromptTests", {}).get("dependencies", []) if dependency.get("byName")]
-if repo_prompt_tests_dependencies.count("RepoPromptDomainRuntime") != 1:
-    errors.append("RepoPromptTests must directly consume RepoPromptDomainRuntime for adapter evidence")
-
-code_map_core_tests = targets.get("RepoPromptCodeMapCoreTests", {})
-core_test_dependencies = [
-    dependency["byName"][0]
-    for dependency in code_map_core_tests.get("dependencies", [])
-    if dependency.get("byName")
-]
-if code_map_core_tests.get("path") != "Tests/RepoPromptCodeMapCoreTests":
-    errors.append("RepoPromptCodeMapCoreTests target path drifted")
-if core_test_dependencies != ["RepoPromptCodeMapCore"]:
-    errors.append("RepoPromptCodeMapCoreTests must depend only on RepoPromptCodeMapCore")
-
-core_syntax_source = Path("Sources/RepoPromptCodeMapCore/CodeMapSyntaxEngine.swift").read_text()
-required_core_imports = {
+core_syntax = (portable_root / "Sources/RepoPromptCodeMapCore/CodeMapSyntaxEngine.swift").read_text()
+required_imports = {
     "SwiftTreeSitter", "TreeSitterC", "TreeSitterCPP", "TreeSitterCSharp",
-    "TreeSitterGo", "TreeSitterJava", "TreeSitterJavaScript", "TreeSitterPHP", "TreeSitterPython",
-    "TreeSitterRuby", "TreeSitterRust", "TreeSitterSwift", "TreeSitterTSX", "TreeSitterTypeScript",
+    "TreeSitterGo", "TreeSitterJava", "TreeSitterJavaScript", "TreeSitterPHP",
+    "TreeSitterPython", "TreeSitterRuby", "TreeSitterRust", "TreeSitterSwift",
+    "TreeSitterTSX", "TreeSitterTypeScript",
 }
-for module in sorted(required_core_imports):
-    if f"import {module}\n" not in core_syntax_source:
-        errors.append(f"CodeMapSyntaxEngine missing direct grammar/wrapper module import: {module}")
-bridging_header = Path("Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").read_text()
-if "tree_sitter_" in bridging_header or "TSLanguage" in bridging_header:
-    errors.append("bridging header must not redeclare Tree-sitter grammar APIs")
+for module in sorted(required_imports):
+    if f"import {module}\n" not in core_syntax:
+        errors.append(f"CodeMapSyntaxEngine missing direct import: {module}")
 
 if errors:
     raise SystemExit("\n".join(errors))
 PY
 )"; then
-  fail "Tree-sitter dependency, product, or scanner-support contract drifted"
-  printf '%s\n' "$tree_sitter_dependency_manifest_output" >&2
+  fail "Portable package dependency, product, or scanner-support contract drifted"
+  printf '%s\n' "$portable_manifest_output" >&2
 fi
 
 retired_tree_sitter_grammar_dirs=(
@@ -391,7 +469,7 @@ fi
 # workspace/context authorities, M3 shared reads, M4 protected mutation policy, and
 # M5 long-running lifecycle wrappers. Physical app backends remain injected and the
 # owner stays free of UI/provider implementations.
-domain_runtime_source_dir="Sources/RepoPromptDomainRuntime"
+domain_runtime_source_dir="Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime"
 if [[ -d "$domain_runtime_source_dir" ]]; then
   unexpected_domain_runtime_files="$(find "$domain_runtime_source_dir" -type f ! -name '*.swift' -print)"
   if [[ -n "$unexpected_domain_runtime_files" ]]; then
@@ -622,9 +700,9 @@ print_matches \
 mcp_control_files=()
 while IFS= read -r file; do
   mcp_control_files+=("$file")
-done < <(find Sources -name MCPControlMessages.swift -type f -print | sort)
-if [[ "${#mcp_control_files[@]}" -ne 1 || "${mcp_control_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
-  fail "MCPControlMessages.swift must exist only at Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
+done < <(find Sources Packages/RepoPromptPortableRuntime/Sources -name MCPControlMessages.swift -type f -print | sort)
+if [[ "${#mcp_control_files[@]}" -ne 1 || "${mcp_control_files[0]:-}" != "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
+  fail "MCPControlMessages.swift must exist only at Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
   printf '%s\n' "${mcp_control_files[@]}" >&2
 fi
 
@@ -632,14 +710,14 @@ fi
 mcp_identity_files=()
 while IFS= read -r file; do
   mcp_identity_files+=("$file")
-done < <(find Sources -name MCPFilesystemIdentity.swift -type f -print | sort)
-if [[ "${#mcp_identity_files[@]}" -ne 1 || "${mcp_identity_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift" ]]; then
+done < <(find Sources Packages/RepoPromptPortableRuntime/Sources -name MCPFilesystemIdentity.swift -type f -print | sort)
+if [[ "${#mcp_identity_files[@]}" -ne 1 || "${mcp_identity_files[0]:-}" != "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift" ]]; then
   fail "MCPFilesystemIdentity.swift must exist only under RepoPromptShared"
   printf '%s\n' "${mcp_identity_files[@]}" >&2
 fi
 
-mcp_event_declarations="$(grep -R -l -E '^(public )?struct MCPExternalClientEvent' Sources --include='*.swift' | sort || true)"
-if [[ "$mcp_event_declarations" != "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift" ]]; then
+mcp_event_declarations="$(grep -R -l -E '^(public )?struct MCPExternalClientEvent' Sources Packages/RepoPromptPortableRuntime/Sources --include='*.swift' | sort || true)"
+if [[ "$mcp_event_declarations" != "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift" ]]; then
   fail "MCPExternalClientEvent wire DTO must be declared only under RepoPromptShared"
   printf '%s\n' "$mcp_event_declarations" >&2
 fi
@@ -771,8 +849,11 @@ print_matches \
 allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
-  "docs/architecture/headless-mcp-runtime.md"
-  "docs/architecture/provider-plugins.md"
+  "docs/architecture/desktop-agent-authority.md"
+    "docs/architecture/headless-mcp-runtime.md"
+    "docs/architecture/portable-runtime-semantic-owners.md"
+    "docs/architecture/portable-runtime-prototype-extraction.md"
+    "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"

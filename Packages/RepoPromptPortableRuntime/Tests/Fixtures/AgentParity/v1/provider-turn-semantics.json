@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "prototypeCommit": "45c42d65e444884d1681f4504c10d25dcb7d858a",
+  "generatedFrom": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/ProviderTurnConfigurationAdapters.swift",
+  "interpretationRevision": "provider-turn-configuration-v3-desktop-profile",
+  "requiredMCPServers": ["repoprompt"],
+  "directProviderSettingsIDKey": "provider.settingsID",
+  "families": [
+    {
+      "providerIds": ["codex"],
+      "controls": ["codex.bash", "codex.goals", "codex.mcpServers", "codex.memories", "codex.reasoningSummaries", "codex.search"],
+      "permissionModes": {
+        "codex.autoReview": "workspaceWrite",
+        "codex.defaultPermission": "workspaceWrite",
+        "codex.fullAccess": "fullAccess",
+        "codex.readOnly": "readOnly"
+      }
+    },
+    {
+      "providerIds": ["claudeCompatible", "claudeGLM", "claudeKimi", "claudeCustom"],
+      "controls": ["claude.bash", "claude.mcpStrictMode", "claude.promptDelivery", "claude.toolSearch"],
+      "promptDeliveries": ["nativeSystemPrompt", "userMessageXML", "userMessageXMLWithEmptySystemPrompt"],
+      "permissionModes": {
+        "claude.auto": "workspaceWrite",
+        "claude.autoApproveEdits": "workspaceWrite",
+        "claude.fullAccess": "fullAccess",
+        "claude.requireApproval": "workspaceWrite"
+      }
+    },
+    {
+      "providerIds": ["openCodeACP"],
+      "controls": [],
+      "permissionModes": {
+        "opencode.fullAccess": "fullAccess",
+        "opencode.managedDefault": "workspaceWrite"
+      }
+    },
+    {
+      "providerIds": ["cursorACP"],
+      "controls": [],
+      "permissionModes": {
+        "cursor.fullAccess": "fullAccess",
+        "cursor.managedDefault": "workspaceWrite"
+      }
+    },
+    {
+      "providerIds": ["grokBuildACP"],
+      "controls": [],
+      "permissionModes": {
+        "grok.fullAccess": "fullAccess",
+        "grok.managedDefault": "workspaceWrite"
+      }
+    },
+    {
+      "providerIds": ["openAIAPI", "anthropicAPI", "openRouter", "customOpenAICompatible", "gemini", "azure", "deepseek", "fireworks", "xAI", "groq", "zAI", "ollama"],
+      "controls": [],
+      "fixedExecutionMode": "workspaceWrite",
+      "permissionModes": {}
+    }
+  ]
+}

@@ -60,7 +60,7 @@ final class ToolOutputFormatterCodeStructureTests: XCTestCase {
         let unavailable = try formatted(Self.unavailableFixture())
 
         XCTAssertEqual(pending, """
-        ## Code Structure ⏳ pending — `Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift` is not in the code graph yet
+        ## Code Structure ⏳ pending — `Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift` is not in the code graph yet
         - Retry shortly. If this persists, the file may be excluded or of an unsupported type.
         """)
         XCTAssertEqual(unavailable, """
@@ -499,7 +499,7 @@ final class ToolOutputFormatterCodeStructureTests: XCTestCase {
     }
 
     private static func pendingFixture() -> ToolResultDTOs.CodeStructureReplyDTO {
-        let path = "\(root)/Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"
+        let path = "\(root)/Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"
         let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
             code: "seed_not_indexed",
             phase: "graph_snapshot",

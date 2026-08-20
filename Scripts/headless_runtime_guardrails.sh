@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-runtime_sources="Sources/RepoPromptDomainRuntime"
+runtime_sources="Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime"
 direct_sources="Sources/RepoPromptMCP"
 
 if grep -R -n -E '^[[:space:]]*import[[:space:]]+(AppKit|SwiftUI)([[:space:]]|$)' "$runtime_sources"; then

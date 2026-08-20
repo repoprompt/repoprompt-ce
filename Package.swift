@@ -20,39 +20,25 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.8.0"),
     .package(url: "https://github.com/apple/swift-system.git", exact: "1.6.4"),
     .package(url: "https://github.com/repoprompt/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
-    // RepoPromptApp and RepoPromptCodeMapCore share this customized wrapper/runtime graph.
-    .package(
-        url: "https://github.com/repoprompt/swift-tree-sitter.git",
-        revision: "a778ef4fb7f0d3ad00185f42ce83c688373c4361"
-    ),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-c", exact: "0.24.2"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-go", exact: "0.25.0"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-java", exact: "0.23.5"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-javascript", exact: "0.25.0"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-python", exact: "0.25.0"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-rust", exact: "0.24.2"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-typescript", exact: "0.23.2"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-ruby", exact: "0.23.1"),
-    .package(url: "https://github.com/alex-pinkus/tree-sitter-swift", exact: "0.7.3-with-generated-files"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-c-sharp.git", exact: "0.23.5"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-cpp", exact: "0.23.4"),
-    .package(url: "https://github.com/tree-sitter/tree-sitter-php.git", exact: "0.24.2"),
     .package(url: "https://github.com/jamesrochabrun/SwiftAnthropic", revision: "b7d030cd7453f314c780f5492385f73d704cbd5d"),
     .package(url: "https://github.com/repoprompt/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
     .package(path: "Vendor/UniversalCharsetDetection"),
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
-    .package(path: "Packages/RepoPromptAgentProviders")
+    .package(path: "Packages/RepoPromptAgentProviders"),
+    .package(path: "Packages/RepoPromptPortableRuntime")
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
-    "RepoPromptDomainRuntime",
-    "RepoPromptCodeMapCore",
-    "RepoPromptRegexCore",
+    .product(name: "RepoPromptRuntimeModel", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptAgentRuntimeCore", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptCodeMapCore", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptRegexCore", package: "RepoPromptPortableRuntime"),
     "RepoPromptWorkspaceCore",
-    "RepoPromptShared",
-    "RepoPromptC", "CSwiftPCRE2",
+    .product(name: "RepoPromptShared", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptC", package: "RepoPromptPortableRuntime"),
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
     .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
@@ -79,18 +65,16 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
-    "RepoPromptDomainRuntime",
-    "RepoPromptCodeMapCore",
+    .product(name: "RepoPromptRuntimeModel", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptAgentRuntimeCore", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
+    .product(name: "RepoPromptCodeMapCore", package: "RepoPromptPortableRuntime"),
     "RepoPromptMCP",
-    "RepoPromptShared",
+    .product(name: "RepoPromptShared", package: "RepoPromptPortableRuntime"),
     .product(name: "Markdown", package: "swift-markdown")
 ]
 
 var repoPromptTestSwiftSettings: [SwiftSetting] = [
-    .define("DEBUG", .when(configuration: .debug))
-]
-
-var repoPromptCodeMapTestSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug))
 ]
 
@@ -104,12 +88,7 @@ if sentryEnabled {
 
 if benchmarkTestsEnabled {
     repoPromptTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
-    repoPromptCodeMapTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
-
-let swift6LanguageMode: [SwiftSetting] = [
-    .swiftLanguageMode(.v6)
-]
 
 let package = Package(
     name: "RepoPromptCE",
@@ -126,52 +105,8 @@ let package = Package(
             path: "Sources/RepoPromptExecutable"
         ),
         .target(
-            name: "RepoPromptDomainRuntime",
-            dependencies: [
-                "RepoPromptShared",
-                "RepoPromptC",
-                "RepoPromptCodeMapCore",
-                .product(name: "Logging", package: "swift-log"),
-                .product(name: "MCP", package: "swift-sdk")
-            ],
-            path: "Sources/RepoPromptDomainRuntime",
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
-        ),
-        .target(
             name: "RepoPromptWorkspaceCore",
             path: "Sources/RepoPromptWorkspaceCore"
-        ),
-        .target(
-            name: "RepoPromptRegexCore",
-            dependencies: ["CSwiftPCRE2"],
-            path: "Sources/RepoPromptRegexCore",
-            swiftSettings: swift6LanguageMode
-        ),
-        .target(
-            name: "RepoPromptCodeMapCore",
-            dependencies: [
-                "RepoPromptRegexCore",
-                "TreeSitterScannerSupport",
-                .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
-                .product(name: "TreeSitterC", package: "tree-sitter-c"),
-                .product(name: "TreeSitterGo", package: "tree-sitter-go"),
-                .product(name: "TreeSitterJava", package: "tree-sitter-java"),
-                .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
-                .product(name: "TreeSitterPython", package: "tree-sitter-python"),
-                .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
-                .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
-                .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
-                .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
-                .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
-                .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
-                .product(name: "TreeSitterPHP", package: "tree-sitter-php")
-            ],
-            path: "Sources/RepoPromptCodeMapCore",
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
         ),
         .target(
             name: "RepoPromptApp",
@@ -181,52 +116,24 @@ let package = Package(
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: [
+                .product(name: "RepoPromptShared", package: "RepoPromptPortableRuntime"),
+                .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
+                .product(name: "RepoPromptCodeMapCore", package: "RepoPromptPortableRuntime"),
+                .product(name: "RepoPromptC", package: "RepoPromptPortableRuntime"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+                .product(name: "SystemPackage", package: "swift-system")
+            ],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
-        .target(
-            name: "RepoPromptShared",
-            path: "Sources/RepoPromptShared",
-            swiftSettings: swift6LanguageMode + [
-                .define("DEBUG", .when(configuration: .debug))
-            ]
-        ),
-        .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
-        .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
-        // Exact-snapshot scanner ABI fallback for the JavaScript/Python manifests, whose
-        // FileManager source probe evaluates false in this root package graph.
-        .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
-        .testTarget(
-            name: "RepoPromptDomainRuntimeTests",
-            dependencies: [
-                "RepoPromptDomainRuntime",
-                .product(name: "MCP", package: "swift-sdk")
-            ],
-            path: "Tests/RepoPromptDomainRuntimeTests",
-            swiftSettings: swift6LanguageMode
-        ),
         .testTarget(
             name: "RepoPromptWorkspaceCoreTests",
             dependencies: ["RepoPromptWorkspaceCore"],
             path: "Tests/RepoPromptWorkspaceCoreTests"
-        ),
-        .testTarget(
-            name: "RepoPromptRegexCoreTests",
-            dependencies: ["RepoPromptRegexCore"],
-            path: "Tests/RepoPromptRegexCoreTests",
-            swiftSettings: swift6LanguageMode
-        ),
-        .testTarget(
-            name: "RepoPromptCodeMapCoreTests",
-            dependencies: ["RepoPromptCodeMapCore"],
-            path: "Tests/RepoPromptCodeMapCoreTests",
-            resources: [
-                .copy("Fixtures"),
-                .copy("Goldens")
-            ],
-            swiftSettings: swift6LanguageMode + repoPromptCodeMapTestSwiftSettings
         ),
         .testTarget(
             name: "RepoPromptTests",

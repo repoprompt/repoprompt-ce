@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "prototypeCommit": "45c42d65e444884d1681f4504c10d25dcb7d858a",
+  "generatedFrom": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/AgentCatalogAuthority.swift",
+  "cases": [
+    {"providerId":"codex","raw":"gpt-5.6-sol-high","modelId":"gpt-5.6-sol","effortId":"high","displayName":"5.6 Sol"},
+    {"providerId":"codex","raw":"gpt-5.6-terra","modelId":"gpt-5.6-terra","effortId":null,"displayName":"5.6 Terra"},
+    {"providerId":"claudeCompatible","raw":"claude-fable-4-8","modelId":"claude-fable-4-8","effortId":null,"displayName":"Fable 4.8"},
+    {"providerId":"claudeCompatible","raw":"claude-opus-4-8","modelId":"claude-opus-4-8","effortId":null,"displayName":"Opus 4.8"}
+  ],
+  "suppressedRawModelIds": ["", "Default", " default "]
+}

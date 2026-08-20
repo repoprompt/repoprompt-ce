@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 2,
+  "prototypeCommit": "45c42d65e444884d1681f4504c10d25dcb7d858a",
+  "generatedFrom": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptHeadlessRuntime/AgentTurnIntentCompiler.swift",
+  "sectionOrder": ["continuation-context", "provider-instructions", "workflow-guidance", "goal-guidance", "skill", "native-command", "tagged-file", "user-request"],
+  "nativeImagesSeparate": true,
+  "attachmentOnlyRequiresNativeImageCapability": true
+}

@@ -351,7 +351,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertTrue(try strings(token, key: "host_record_bindings").contains("restricted_tools"))
         XCTAssertTrue(try Set(strings(token, key: "rules")).isSuperset(of: ["single_use", "memory_only", "never_logged", "never_persisted"]))
 
-        let packageManifest = try source("Package.swift")
+        let packageManifest = try source("Packages/RepoPromptPortableRuntime/Package.swift")
         XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntime\""))
         XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntimeTests\""))
         let hostAuthority = try dictionary(token, key: "host_authority")
@@ -406,8 +406,8 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let approvalManager = try source("Sources/RepoPrompt/Infrastructure/MCP/WorkspaceApproval/WorkspaceApprovalManager.swift")
         XCTAssertTrue(approvalManager.contains("AppKit presenter and compatibility-policy façade"))
         XCTAssertTrue(approvalManager.contains("case .denied, .cancelled, .presenterUnavailable:"))
-        let approvalBroker = try source("Sources/RepoPromptDomainRuntime/DomainMutationApproval.swift")
-        XCTAssertTrue(approvalBroker.contains("package actor DomainMutationApprovalBroker"))
+        let approvalBroker = try source("Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainMutationApproval.swift")
+        XCTAssertTrue(approvalBroker.contains("public actor DomainMutationApprovalBroker"))
         XCTAssertTrue(approvalBroker.contains("guard active?.request.id == requestID else { return }"))
 
         let actorInventory = try dictionary(manifest, key: "main_actor")
@@ -415,17 +415,17 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             try strings(actorInventory, key: "m4_non_main_actor_authorities"),
             ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "DomainMutationJournal", "DomainMutationPathFence", "MCPDomainProtectedMutationToolProvider"]
         )
-        let journalSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationJournal.swift")
-        XCTAssertTrue(journalSource.contains("package actor DomainMutationJournal"))
+        let journalSource = try source("Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainMutationJournal.swift")
+        XCTAssertTrue(journalSource.contains("public actor DomainMutationJournal"))
         XCTAssertTrue(journalSource.contains("case indeterminateAfterCommit"))
         XCTAssertFalse(journalSource.contains("import AppKit"))
-        let pathFenceSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPathFence.swift")
+        let pathFenceSource = try source("Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainMutationPathFence.swift")
         XCTAssertTrue(pathFenceSource.contains("rootIdentityChanged"))
         XCTAssertTrue(pathFenceSource.contains("pathResolutionChanged"))
         XCTAssertFalse(pathFenceSource.contains("import AppKit"))
         XCTAssertEqual(try string(actorInventory, key: "m4_" + "main_actor_presenter"), "WorkspaceApprovalManager")
-        let policySource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPolicy.swift")
-        XCTAssertTrue(policySource.contains("package actor DomainMutationPolicyStore"))
+        let policySource = try source("Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/DomainMutationPolicy.swift")
+        XCTAssertTrue(policySource.contains("public actor DomainMutationPolicyStore"))
         XCTAssertFalse(policySource.contains("import AppKit"))
         let scannerFixture = """
         @MainActor final class InlineActor {}
