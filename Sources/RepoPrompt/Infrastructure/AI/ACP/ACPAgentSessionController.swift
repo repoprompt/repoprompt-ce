@@ -1184,9 +1184,9 @@ actor ACPAgentSessionController {
     /// Shuts down a completed one-shot prompt without discarding bytes that become
     /// readable while the ACP process responds to stdin closure.
     ///
-    /// Returns `true` only when the process settles cooperatively before the bounded
-    /// timeout. A forced termination still drains its pipes, but cannot prove that the
-    /// provider finished writing the response.
+    /// Returns `true` only when the process and its transport settle cooperatively
+    /// before the bounded timeout. Forced termination discards bytes still buffered
+    /// in the pipes and cannot prove that the provider finished writing the response.
     func shutdownAfterPromptTransportDrain() async -> Bool {
         await shutdown(drainTransport: true)
     }
@@ -1207,16 +1207,8 @@ actor ACPAgentSessionController {
         var transportSettled = !drainTransport
         if drainTransport, let process {
             process.stdin?.closeFile()
-            transportSettled = await waitForProcessExitDuringTransportDrain()
-            process.stdout.readabilityHandler = nil
-            process.stderr.readabilityHandler = nil
+            transportSettled = await waitForTransportSettlementDuringDrain()
             if transportSettled {
-                drainRemainingBytes(from: process.stdout, into: stdoutChannel)
-                drainRemainingBytes(from: process.stderr, into: stderrChannel)
-                stdoutChannel?.finish()
-                stderrChannel?.finish()
-                await stdoutConsumerTask?.value
-                await stderrConsumerTask?.value
                 stdoutFramer.flush { lineData in
                     handleJSONLine(lineData)
                 }
@@ -1224,6 +1216,8 @@ actor ACPAgentSessionController {
                     handleStderrLine(lineData)
                 }
             } else {
+                process.stdout.readabilityHandler = nil
+                process.stderr.readabilityHandler = nil
                 stdoutChannel?.finish()
                 stderrChannel?.finish()
                 stdoutConsumerTask?.cancel()
@@ -1278,36 +1272,35 @@ actor ACPAgentSessionController {
         return transportSettled
     }
 
-    private func waitForProcessExitDuringTransportDrain() async -> Bool {
-        guard let processWaitTask else { return true }
+    private func waitForTransportSettlementDuringDrain() async -> Bool {
+        guard let processWaitTask,
+              let stdoutConsumerTask,
+              let stderrConsumerTask
+        else { return false }
         let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
         return await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await processWaitTask.value
+                await stdoutConsumerTask.value
+                await stderrConsumerTask.value
                 return true
             }
             group.addTask {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 } catch {
-                    processWaitTask.cancel()
                     return false
                 }
-                processWaitTask.cancel()
                 return false
             }
             let settled = await group.next() ?? false
+            if !settled {
+                processWaitTask.cancel()
+                stdoutConsumerTask.cancel()
+                stderrConsumerTask.cancel()
+            }
             group.cancelAll()
             return settled
-        }
-    }
-
-    private func drainRemainingBytes(from handle: FileHandle, into channel: FileHandleChunkChannel?) {
-        guard let channel else { return }
-        while true {
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            channel.yield(data)
         }
     }
 
