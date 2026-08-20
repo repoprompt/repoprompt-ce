@@ -25,6 +25,23 @@ extension DomainAgentRunSnapshot.WorktreeBinding {
     }
 }
 
+extension DomainAgentRunSnapshot.HookGate {
+    init(audit: AgentCodexHookGateAudit) {
+        let status: Status = switch audit.status {
+        case .approvedAll: .approvedAll
+        case .approvedSelected: .approvedSelected
+        case .continuedWithoutHooks: .continuedWithoutHooks
+        case .resolvedExternally: .resolvedExternally
+        }
+        self.init(
+            status: status,
+            approvedHookCount: audit.approvedCount,
+            skippedHookCount: audit.skippedCount,
+            resolvedAt: audit.resolvedAt
+        )
+    }
+}
+
 extension DomainAgentRunSnapshot {
     init(
         sessionID: UUID,
@@ -39,6 +56,7 @@ extension DomainAgentRunSnapshot {
         statusText: String?,
         latestAssistantPreview: String?,
         interaction: Interaction?,
+        hookGate: HookGate? = nil,
         transcriptItemCount: Int,
         updatedAt: Date,
         parentSessionID: UUID?,
@@ -59,6 +77,7 @@ extension DomainAgentRunSnapshot {
             statusText: statusText,
             latestAssistantPreview: latestAssistantPreview,
             interaction: interaction,
+            hookGate: hookGate,
             transcriptItemCount: transcriptItemCount,
             updatedAt: updatedAt,
             parentSessionID: parentSessionID,
@@ -136,6 +155,8 @@ extension DomainAgentRunSnapshot.Interaction.Kind {
         switch self {
         case .approval:
             "approval needed"
+        case .hookApproval:
+            "project hook approval"
         case .question:
             "question"
         case .instruction:

@@ -14,6 +14,7 @@ extension AgentModeViewModel {
             pendingAskUser: pendingAskUser(for: tabID),
             pendingUserInputRequest: pendingUserInputRequest(for: tabID),
             pendingApproval: pendingApproval(for: tabID),
+            pendingCodexHookReview: pendingCodexHookReview(for: tabID),
             pendingPermissionsRequest: pendingPermissionsRequest(for: tabID),
             pendingMCPElicitationRequest: pendingMCPElicitationRequest(for: tabID),
             pendingApplyEditsReview: pendingApplyEditsReview(for: tabID),

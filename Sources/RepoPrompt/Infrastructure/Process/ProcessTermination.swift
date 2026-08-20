@@ -545,7 +545,13 @@ enum ProcessTermination {
             var info = siginfo_t()
             let result = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
             if result == 0 {
-                return info.si_pid == pid
+                guard info.si_pid == pid else { return false }
+                switch info.si_code {
+                case CLD_EXITED, CLD_KILLED, CLD_DUMPED:
+                    return true
+                default:
+                    return false
+                }
             }
             if errno == EINTR {
                 continue

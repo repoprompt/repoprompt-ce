@@ -279,16 +279,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let readEndpoint = try fixture.endpointA()
             let freshEndpoint = try fixture.endpointARead()
             let context = fixture.contextA
-            let workspace = try XCTUnwrap(
-                context.window.workspaceManager.workspaces.first(where: { $0.id == context.workspaceID })
-            )
-            await context.window.workspaceManager.switchWorkspace(
-                to: workspace,
-                saveState: false,
-                reason: "readSelectionPersistenceCheckpoint"
-            )
-            context.window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
-            try await Self.bind(readEndpoint, to: context.tabID)
+            try await Self.bind(readEndpoint, to: context)
             _ = try await readEndpoint.callTool(
                 name: MCPWindowToolName.manageSelection,
                 arguments: ["op": "clear"]
@@ -343,7 +334,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await fixture.networkManager.debugRemoveConnection(readEndpoint.connectionID)
             context.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
 
-            try await Self.bind(freshEndpoint, to: context.tabID)
+            try await Self.bind(freshEndpoint, to: context)
             let freshSelectionResponse = try await freshEndpoint.callTool(
                 name: MCPWindowToolName.manageSelection,
                 arguments: [
@@ -387,7 +378,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 try await endpoints.append(fixture.makeAdditionalEndpoint(label: "shared-search-\(index)"))
             }
             for endpoint in endpoints {
-                try await Self.bind(endpoint, to: fixture.contextA.tabID)
+                try await Self.bind(endpoint, to: fixture.contextA)
             }
 
             let searchFiles = fixture.contextA.searchFileURLs
@@ -649,8 +640,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 excludes: fixture.contextA.sentinel
             )
 
-            try await Self.bind(endpointA, to: fixture.contextA.tabID)
-            try await Self.bind(endpointB, to: fixture.contextB.tabID)
+            try await Self.bind(endpointA, to: fixture.contextA)
+            try await Self.bind(endpointB, to: fixture.contextB)
             fixture.assertStableBindings()
 
             let baselineA = await fixture.snapshot(endpointA, context: fixture.contextA)
@@ -733,9 +724,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let endpointAOverflow = try fixture.endpointAOverflowSearch()
             let endpointARead = try fixture.endpointARead()
             let endpointB = try fixture.endpointB()
-            try await Self.bind(endpointAQueued, to: fixture.contextA.tabID)
-            try await Self.bind(endpointAOverflow, to: fixture.contextA.tabID)
-            try await Self.bind(endpointARead, to: fixture.contextA.tabID)
+            try await Self.bind(endpointAQueued, to: fixture.contextA)
+            try await Self.bind(endpointAOverflow, to: fixture.contextA)
+            try await Self.bind(endpointARead, to: fixture.contextA)
             fixture.assertStableBindings(includeAdditionalContextAEndpoints: true)
 
             let heldStore = fixture.contextA.window.workspaceFileContextStore
@@ -1266,12 +1257,24 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             }
         }
 
-        static func bind(_ endpoint: PersistentMCPTestEndpoint, to tabID: UUID) async throws {
+        static func bind(_ endpoint: PersistentMCPTestEndpoint, to context: PersistentMCPTestContext) async throws {
+            let workspace = try XCTUnwrap(
+                context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+            )
+            await context.window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "PersistentMCPDistinctConnectionConcurrencyTests"
+            )
+            context.window.promptManager.loadComposeTabsFromWorkspace(
+                workspace,
+                syncPromptText: true
+            )
             let response = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: [
                     "op": "bind",
-                    "context_id": tabID.uuidString
+                    "context_id": context.tabID.uuidString
                 ]
             )
             _ = try toolText(from: response)

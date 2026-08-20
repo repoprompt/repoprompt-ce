@@ -51,7 +51,7 @@ final class CodexIntegratedAgentModeRunner {
                 guard mcpServerReady else {
                     return .failed(message: "MCP catalog registration failed before Agent launch.")
                 }
-                return await codexCoordinator.sendCodexNativeMessage(
+                let outcome = await self.codexCoordinator.sendCodexNativeMessage(
                     session: session,
                     text: initialMessageForRun,
                     attachments: attachments,
@@ -59,6 +59,13 @@ final class CodexIntegratedAgentModeRunner {
                     attachmentReservationID: attachmentReservationID,
                     terminalizeRejectedSend: createdOwnership
                 )
+                // Explicit cancellation can terminalize the original run before its
+                // suspended send observes CancellationError. Preserve the caller-level
+                // cancellation signal when there is no active successor to protect.
+                if case .stale = outcome, Task.isCancelled, !session.runState.isActive {
+                    return .cancelled
+                }
+                return outcome
             }
             let outcome = execution.nativeOutcome
             hooks.providerInput.recordPendingHandoffSendOutcome(session, outcome.didSend)

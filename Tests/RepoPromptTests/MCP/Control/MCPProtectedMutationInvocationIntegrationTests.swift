@@ -638,6 +638,18 @@ import XCTest
             _ endpoint: PersistentMCPTestEndpoint,
             to context: PersistentMCPTestContext
         ) async throws {
+            let workspace = try XCTUnwrap(
+                context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+            )
+            await context.window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "MCPProtectedMutationInvocationIntegrationTests"
+            )
+            context.window.promptManager.loadComposeTabsFromWorkspace(
+                workspace,
+                syncPromptText: true
+            )
             let response = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]

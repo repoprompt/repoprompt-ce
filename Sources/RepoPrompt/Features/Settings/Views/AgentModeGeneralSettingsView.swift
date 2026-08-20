@@ -1,6 +1,45 @@
 import Combine
 import SwiftUI
 
+enum CodexHookApprovalWorkspaceSetting: CaseIterable, Hashable {
+    case appDefault
+    case alwaysRequireApproval
+    case dontRequireApproval
+
+    init(workspaceOverride: Bool?) {
+        switch workspaceOverride {
+        case true:
+            self = .alwaysRequireApproval
+        case false:
+            self = .dontRequireApproval
+        case nil:
+            self = .appDefault
+        }
+    }
+
+    var workspaceOverride: Bool? {
+        switch self {
+        case .appDefault:
+            nil
+        case .alwaysRequireApproval:
+            true
+        case .dontRequireApproval:
+            false
+        }
+    }
+
+    func label(globalStrictModeEnabled: Bool) -> String {
+        switch self {
+        case .appDefault:
+            "App default (currently: \(globalStrictModeEnabled ? "required" : "not required"))"
+        case .alwaysRequireApproval:
+            "Always require approval"
+        case .dontRequireApproval:
+            "Don't require approval"
+        }
+    }
+}
+
 /// Consolidated settings view for Agent Mode — the "Overview" tab.
 ///
 /// Model choices (Oracle, Context Builder Agent, Agent Role Defaults) are now
@@ -25,6 +64,7 @@ import SwiftUI
 struct AgentModeGeneralSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
+    var workspaceID: UUID?
     var onNavigate: ((SettingsTab) -> Void)?
 
     /// Observe secure permission-store changes so the read-only summary rebuilds
@@ -128,6 +168,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providerCleanupActionCard
 
+            codexHookApprovalStrictModeCard
+
             handoffInstructionsCard
 
             agentPermissionsCard
@@ -205,6 +247,66 @@ struct AgentModeGeneralSettingsView: View {
         Binding(
             get: { globalSettings.providerConversationCleanupAction() },
             set: { globalSettings.setProviderConversationCleanupAction($0) }
+        )
+    }
+
+    // MARK: - Codex hook approval
+
+    private var codexHookApprovalStrictModeCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "checkmark.shield")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Toggle("Require Codex project-hook approval", isOn: codexHookApprovalStrictModeBinding)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                if workspaceID != nil {
+                    Picker("In this workspace:", selection: codexHookApprovalWorkspaceSettingBinding) {
+                        ForEach(CodexHookApprovalWorkspaceSetting.allCases, id: \.self) { setting in
+                            Text(setting.label(
+                                globalStrictModeEnabled: globalSettings.globalCodexHookApprovalStrictModeEnabled()
+                            ))
+                            .tag(setting)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                }
+                Text("When enabled, Continue Without Hooks is unavailable. Codex first turns remain blocked until the displayed project hooks are approved or become trusted externally.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var codexHookApprovalStrictModeBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.globalCodexHookApprovalStrictModeEnabled() },
+            set: { globalSettings.setGlobalCodexHookApprovalStrictModeEnabled($0) }
+        )
+    }
+
+    private var codexHookApprovalWorkspaceSettingBinding: Binding<CodexHookApprovalWorkspaceSetting> {
+        Binding(
+            get: {
+                guard let workspaceID else { return .appDefault }
+                return CodexHookApprovalWorkspaceSetting(
+                    workspaceOverride: globalSettings.codexHookApprovalStrictModeWorkspaceOverride(
+                        workspaceID: workspaceID
+                    )
+                )
+            },
+            set: { setting in
+                guard let workspaceID else { return }
+                globalSettings.setCodexHookApprovalStrictModeOverride(
+                    setting.workspaceOverride,
+                    for: workspaceID
+                )
+            }
         )
     }
 

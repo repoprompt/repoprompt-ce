@@ -133,6 +133,118 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "hooks/list",
+      "alwaysSent": [
+        "cwds"
+      ],
+      "responseSchema": "v2/HooksListResponse.json",
+      "consumedResponse": [
+        {
+          "path": "data",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].cwd",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].errors",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].warnings",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].key",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].currentHash",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].enabled",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].eventName",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].handlerType",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].command",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "data[].hooks[].sourcePath",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].source",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].trustStatus",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "consumedEnumValues": {
+        "data[].hooks[].trustStatus": [
+          "managed",
+          "untrusted",
+          "trusted",
+          "modified"
+        ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "config/batchWrite",
+      "alwaysSent": [
+        "edits",
+        "edits[].keyPath",
+        "edits[].value",
+        "edits[].mergeStrategy",
+        "reloadUserConfig"
+      ],
+      "enumValues": {
+        "edits[].mergeStrategy": [
+          "upsert"
+        ]
+      },
+      "responseSchema": "v2/ConfigWriteResponse.json",
+      "consumedResponse": [
+        {
+          "path": "status",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "skills/extraRoots/set",
       "alwaysSent": [
         "extraRoots"

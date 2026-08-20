@@ -4986,6 +4986,19 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func bindingCandidate(forContextID id: UUID) -> ComposeTabBindingCandidate? {
+        guard let workspace = activeWorkspace,
+              let tab = workspace.composeTabs.first(where: { $0.id == id })
+        else { return nil }
+        return ComposeTabBindingCandidate(
+            tabID: tab.id,
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            isActiveInWorkspace: workspace.activeComposeTabID == tab.id,
+            repoPaths: workspace.repoPaths
+        )
+    }
+
+    func storedBindingCandidate(forContextID id: UUID) -> ComposeTabBindingCandidate? {
         for workspace in workspaces {
             guard let tab = workspace.composeTabs.first(where: { $0.id == id }) else { continue }
             return ComposeTabBindingCandidate(

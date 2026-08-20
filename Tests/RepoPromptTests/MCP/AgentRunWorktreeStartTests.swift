@@ -4392,7 +4392,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                         initialDelayNanoseconds: 10_000_000,
                         maximumDelayNanoseconds: 100_000_000
                     ) {
-                        trackedSession.agentTask != nil
+                        trackedSession.agentTask != nil || trackedSession.runState != .idle
                     }
                 } catch is AsyncTestConditionTimeout {
                     throw FixtureError.trackedAgentTaskDidNotStart

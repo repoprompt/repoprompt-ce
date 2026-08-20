@@ -9,6 +9,10 @@ import RepoPromptDomainRuntime
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
     static let toolName = MCPGlobalToolName.appSettings
+    private static let humanOnlySettingKeys: Set<String> = [
+        "agent_mode.codex_hook_approval_strict_mode_enabled",
+        "agent_mode.codex_hook_approval_strict_mode_workspace_overrides"
+    ]
 
     let domainRegistrationID = MCPDomainToolRegistrationID()
 
@@ -174,6 +178,11 @@ final class AppSettingsMCPService: Service {
         }
         guard let rawValue = args["value"] else {
             throw MCPError.invalidParams("app_settings op='set' requires 'value'.")
+        }
+        guard !Self.humanOnlySettingKeys.contains(key) else {
+            throw MCPError.invalidParams(
+                "Setting '\(key)' is security-sensitive and can only be changed by a human in RepoPrompt Settings."
+            )
         }
 
         let definition = try AppSettingsMCPRegistry.definition(forKey: key)
