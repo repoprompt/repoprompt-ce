@@ -667,6 +667,8 @@ final class CodexNativeSessionController {
         /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
         /// Agent Mode omits this so thread start/resume config is authoritative.
         var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
+        /// Preserve Codex's stable app defaults only when this surface can resolve MCP elicitation.
+        var preserveUpstreamAppDefaults = false
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
@@ -728,6 +730,7 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 processModelReasoningSummary: nil,
+                preserveUpstreamAppDefaults: true,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
@@ -2779,7 +2782,8 @@ final class CodexNativeSessionController {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
-                computerUseEnabled: options.computerUseEnabledProvider()
+                computerUseEnabled: options.computerUseEnabledProvider(),
+                preserveUpstreamAppDefaults: options.preserveUpstreamAppDefaults
             )
         }
     }
@@ -9130,7 +9134,8 @@ final class CodexNativeSessionController {
             featurePolicy: .resolved(
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled
+                computerUseEnabled: computerUseEnabled,
+                preserveUpstreamAppDefaults: true
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(

@@ -81,7 +81,7 @@ differences:
    eligibility, but resume config does not reconcile an existing stored thread's persisted mode. RPCE
    therefore calls experimental `thread/memoryMode/set` with `enabled` or `disabled` before
    `thread/resume` so resumed startup observes the requested mode. It does not issue a redundant
-   post-start request. The 0.147.0 runtime floor and `experimentalApi` initialization capability make
+   post-start request. The 0.149.0 runtime floor and `experimentalApi` initialization capability make
    resume reconciliation a required contract rather than an optional compatibility fallback.
 6. The generated `goal.status` enum includes `blocked` and `usageLimited`, while RPCE previously
    rejected both as invalid responses. The same six-value enum is also declared for
@@ -153,10 +153,12 @@ Codex 0.149.0 [removes the ChatGPT workspace-settings gate from app and plugin
 availability](https://github.com/openai/codex/pull/38994). A live
 probe using RepoPrompt's existing isolated `CODEX_HOME` confirmed that enabling the upstream
 features makes already connected apps installed, enabled, and callable without sharing the Codex
-Desktop home or adding a RepoPrompt-specific authentication path. RepoPrompt therefore stops
-forcing `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
+Desktop home or adding a RepoPrompt-specific authentication path. Native Agent Mode therefore
+stops forcing `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
 `features.tool_suggest` off and leaves those defaults to the pinned Codex runtime. RepoPrompt's
-existing MCP elicitation handler remains the client-side approval boundary.
+existing MCP elicitation handler remains the client-side approval boundary. Non-Agent chat and
+headless `codex exec` continue to disable those features because they cannot present or resolve an
+MCP elicitation request.
 
 ## Files and tests
 

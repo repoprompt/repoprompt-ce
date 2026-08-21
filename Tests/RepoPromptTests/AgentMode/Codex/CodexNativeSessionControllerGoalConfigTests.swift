@@ -791,6 +791,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         XCTAssertEqual(try recordedRequests(for: "skills/extraRoots/set", at: recordURL).count, 0)
         XCTAssertEqual(try recordedRequests(for: "thread/start", at: recordURL).count, 1)
+        try assertProcessAppFeatureConfig(
+            at: recordURL,
+            expectedEnabled: false,
+            label: "standard provider process"
+        )
     }
 
     func testSchemaAlignedThreadRequestsOmitUndeclaredFieldsAndAcceptMissingGoal() async throws {
@@ -994,6 +999,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             label: "thread/start process"
         )
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: startRecordURL, label: "thread/start process")
+        try assertProcessAppFeatureConfig(
+            at: startRecordURL,
+            expectedEnabled: nil,
+            label: "thread/start process"
+        )
         XCTAssertEqual(
             try recordedRequests(for: "thread/memoryMode/set", at: startRecordURL).count,
             0,
@@ -1025,6 +1035,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             label: "thread/resume process"
         )
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: resumeRecordURL, label: "thread/resume process")
+        try assertProcessAppFeatureConfig(
+            at: resumeRecordURL,
+            expectedEnabled: nil,
+            label: "thread/resume process"
+        )
         try assertMemoryModeRequest(
             at: resumeRecordURL,
             expectedThreadID: "existing-thread",
@@ -1399,5 +1414,25 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             arguments.contains { $0.hasPrefix("features.code_mode.direct_only_tool_namespaces=") },
             label
         )
+    }
+
+    private func assertProcessAppFeatureConfig(
+        at recordURL: URL,
+        expectedEnabled: Bool?,
+        label: String
+    ) throws {
+        let arguments = try recordedProcessArguments(at: recordURL)
+        for key in [
+            "features.apps",
+            "features.plugins",
+            "features.tool_call_mcp_elicitation",
+            "features.tool_suggest"
+        ] {
+            if let expectedEnabled {
+                XCTAssertTrue(arguments.contains("\(key)=\(expectedEnabled)"), "\(label): \(key)")
+            } else {
+                XCTAssertFalse(arguments.contains { $0.hasPrefix("\(key)=") }, "\(label): \(key)")
+            }
+        }
     }
 }
