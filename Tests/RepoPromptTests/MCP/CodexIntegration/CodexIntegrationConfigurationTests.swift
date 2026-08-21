@@ -514,6 +514,43 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(execArguments.contains { $0.contains("features.parallel_tool_calls") })
     }
 
+    func testRuntimePoliciesPreserveCodexAppAndPluginDefaults() {
+        let policy = CodexOverrides.ToolPolicy(
+            toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
+            shellToolEnabled: false,
+            webSearchRequestEnabled: false,
+            multiAgentEnabled: false
+        )
+
+        let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
+        let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
+        let upstreamOwnedFeatures = [
+            "features.apps",
+            "features.plugins",
+            "features.tool_call_mcp_elicitation",
+            "features.tool_suggest"
+        ]
+        for key in upstreamOwnedFeatures {
+            XCTAssertFalse(cliOverrides.contains { $0.contains(key) }, key)
+            XCTAssertNil(appServerOverrides[key], key)
+        }
+
+        let computerUseCLIOverrides = CodexOverrides.cliConfigArgs(
+            toolPolicy: policy,
+            featurePolicy: .enabledForComputerUse
+        )
+        let computerUseAppServerOverrides = CodexOverrides.appServerConfigMap(
+            toolPolicy: policy,
+            featurePolicy: .enabledForComputerUse
+        )
+        XCTAssertTrue(computerUseCLIOverrides.contains("features.computer_use=true"))
+        XCTAssertEqual(computerUseAppServerOverrides["features.computer_use"] as? Bool, true)
+        for key in upstreamOwnedFeatures {
+            XCTAssertFalse(computerUseCLIOverrides.contains { $0.contains(key) }, key)
+            XCTAssertNil(computerUseAppServerOverrides[key], key)
+        }
+    }
+
     func testOwnedCodeModePolicyIsExactIdempotentAndPreservesUnrelatedSettings() {
         let input = """
         model = "user-model"
@@ -612,7 +649,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
 
         XCTAssertFalse(result.changed)
         XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.147.0") == true)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.149.0") == true)
         XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
     }
 

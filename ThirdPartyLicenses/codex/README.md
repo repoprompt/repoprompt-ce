@@ -1,13 +1,13 @@
-# OpenAI Codex 0.147.0
+# OpenAI Codex 0.149.0
 
 RepoPrompt CE packages the complete official OpenAI Codex standalone package
 for the selected macOS architecture. Codex is licensed under Apache-2.0. The
 package also includes the upstream Zsh 5.9 executable under `codex-resources/zsh/bin/zsh`.
 
 - Source: https://github.com/openai/codex
-- Pinned release: https://github.com/openai/codex/releases/tag/rust-v0.147.0
-- License at the pinned tag: https://github.com/openai/codex/blob/rust-v0.147.0/LICENSE
-- Notice at the pinned tag: https://github.com/openai/codex/blob/rust-v0.147.0/NOTICE
+- Pinned release: https://github.com/openai/codex/releases/tag/rust-v0.149.0
+- License at the pinned tag: https://github.com/openai/codex/blob/rust-v0.149.0/LICENSE
+- Notice at the pinned tag: https://github.com/openai/codex/blob/rust-v0.149.0/NOTICE
 - Package/checksum contract: `Vendor/Codex/manifest.json`
 - Bundled Zsh source: https://github.com/zsh-users/zsh/tree/zsh-5.9
 - Bundled Zsh licence: https://github.com/zsh-users/zsh/blob/zsh-5.9/LICENCE
@@ -17,7 +17,7 @@ package also includes the upstream Zsh 5.9 executable under `codex-resources/zsh
 application preserves the full standalone package layout and the upstream
 signatures of its primary macOS executables.
 
-For the 0.147.0 rotation, the pinned upstream `LICENSE` and `NOTICE` are
-byte-identical to the prior 0.145.0 copies. The verified candidate manifest also
+For the 0.149.0 rotation, the pinned upstream `LICENSE` and `NOTICE` are
+byte-identical to the prior 0.147.0 copies. The verified candidate manifest also
 retains the Zsh 5.9 path and unchanged normalized payload, so no legal text
 changed; only this version/source inventory and its checksum were refreshed.

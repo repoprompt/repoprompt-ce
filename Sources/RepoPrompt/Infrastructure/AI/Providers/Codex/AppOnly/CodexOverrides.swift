@@ -2,26 +2,15 @@ import Foundation
 
 enum CodexOverrides {
     private static let forcedDisabledConfig: [String: Bool] = [
-        "features.apps": false,
         "features.memories": false,
         "features.goals": false,
         "features.computer_use": false,
-        "features.plugins": false,
-        // Disable MCP elicitation until RepoPrompt supports the mcpServer/elicitation/request
-        // server request and its {action, content, _meta} response contract. Without this,
-        // Codex routes MCP tool approvals through elicitation by default (ToolCallMcpElicitation
-        // is stable + enabled), which RepoPrompt treats as unsupported and fails the run.
-        "features.tool_call_mcp_elicitation": false,
-        "features.tool_suggest": false,
         "memories.generate_memories": false,
         "memories.use_memories": false
     ]
 
     private static let computerUseEnabledConfig: [String: Bool] = [
-        "features.computer_use": true,
-        "features.plugins": true,
-        "features.tool_call_mcp_elicitation": true,
-        "features.tool_suggest": true
+        "features.computer_use": true
     ]
 
     enum ReasoningSummary: String {

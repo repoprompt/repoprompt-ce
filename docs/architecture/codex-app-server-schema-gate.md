@@ -21,9 +21,9 @@ consumes at its current integration boundary.
 
 ## Version contract
 
-- The contract floor is **Codex CLI 0.147.0**.
-- Local validation accepts 0.147.0 or newer so a developer can detect drift before CI moves.
-- CI installs exactly `@openai/codex@0.147.0`, making the required check deterministic.
+- The contract floor is **Codex CLI 0.149.0**.
+- Local validation accepts 0.149.0 or newer so a developer can detect drift before CI moves.
+- CI installs exactly `@openai/codex@0.149.0`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
 
 When advancing Codex, install the intended version, run the gate, reconcile RPCE with the generated
@@ -60,7 +60,7 @@ hook-key → `{trusted_hash}` object shape cannot be expressed by the current ch
 After a trust write, the post-write `hooks/list` result is the semantic success authority;
 `config/batchWrite.status` alone is not.
 
-The hardened 0.147.0 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
+The hardened 0.149.0 baseline checks 45 methods, 193 parameter paths, and 93 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -141,6 +141,22 @@ The bounded comparison also recorded these explicit gaps rather than hiding them
 - `item/tool/call` is recognized but deliberately rejected with a JSON-RPC error because RPCE does
   not implement dynamic client-side tool execution; therefore the success response is not part of
   this contract.
+
+## 0.149.0 rotation findings (2026-08-21)
+
+The repository candidate flow verified both official `rust-v0.149.0` macOS packages, including
+their complete layouts, architectures, OpenAI signing identities, and trusted timestamps. The
+pinned CLI passes the bounded app-server projection after recording that a hook `command` is now
+conditionally present and non-null. RepoPrompt's decoder already accepts the conditional shape.
+
+Codex 0.149.0 [removes the ChatGPT workspace-settings gate from app and plugin
+availability](https://github.com/openai/codex/pull/38994). A live
+probe using RepoPrompt's existing isolated `CODEX_HOME` confirmed that enabling the upstream
+features makes already connected apps installed, enabled, and callable without sharing the Codex
+Desktop home or adding a RepoPrompt-specific authentication path. RepoPrompt therefore stops
+forcing `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
+`features.tool_suggest` off and leaves those defaults to the pinned Codex runtime. RepoPrompt's
+existing MCP elicitation handler remains the client-side approval boundary.
 
 ## Files and tests
 
